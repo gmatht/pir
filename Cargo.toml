@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "gtk_dynamic_loader",
+    "rustxwidgets",
+]
