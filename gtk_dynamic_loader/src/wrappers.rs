@@ -77,9 +77,26 @@ impl Window {
     }
 
     pub fn present(&self) {
-        // Show children first (GTK3) then present
-        if let Some(show_all) = self.loader.symbols.gtk_widget_show_all { unsafe { show_all(self.inner); } }
-        if let Some(present) = self.loader.symbols.gtk_window_present { unsafe { present(self.inner); return; } }
+        let loader = &self.loader;
+        if let Some(show_all) = loader.symbols.gtk_widget_show_all {
+            // GTK3: show_all forces synchronous layout, then present
+            unsafe { show_all(self.inner); }
+        }
+        if let Some(present) = loader.symbols.gtk_window_present {
+            unsafe { present(self.inner); }
+            // GTK4: gtk_window_present defers layout to the next loop iteration.
+            // Force one iteration so widgets appear immediately, not a frame later.
+            if loader.symbols.gtk_widget_show_all.is_none() {
+                if let Some(glib_lib) = loader.libs.get("libglib") {
+                    type Iteration = unsafe extern "C" fn(*mut std::ffi::c_void, i32) -> i32;
+                    if let Ok(iter_fn) = unsafe { glib_lib.get::<Iteration>(b"g_main_context_iteration") } {
+                        let iter = *iter_fn;
+                        unsafe { iter(std::ptr::null_mut(), 0); }
+                    }
+                }
+            }
+            return;
+        }
     }
 
     pub fn set_application(&self, app_ptr: *mut c_void) {
