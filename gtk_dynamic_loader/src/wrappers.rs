@@ -30,7 +30,7 @@ impl BoxWidget {
         if let Some(box_append) = symbols.gtk_box_append {
             unsafe { box_append(self.inner, child_ptr); }
         } else if let Some(pack) = symbols.gtk_box_pack_start {
-            unsafe { pack(self.inner, child_ptr, 1, 1, 0); }
+            unsafe { pack(self.inner, child_ptr, 0, 0, 0); }
         }
     }
 }

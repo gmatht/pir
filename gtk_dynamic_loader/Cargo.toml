@@ -12,10 +12,3 @@ libloading = "0.8"
 name = "gtk_dynamic_loader"
 path = "src/lib.rs"
 
-[profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
-panic = "abort"
-debug = false
-incremental = false

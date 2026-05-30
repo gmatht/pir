@@ -1,5 +1,14 @@
 [workspace]
+resolver = "2"
 members = [
     "gtk_dynamic_loader",
     "rustxwidgets",
 ]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false
+incremental = false
