@@ -136,6 +136,8 @@ pub type GtkTextViewSetWrapMode = unsafe extern "C" fn(text_view: *mut c_void, w
 // GtkWidget helper for visibility/event handling
 pub type GtkWidgetSetHexpand = unsafe extern "C" fn(widget: *mut c_void, expand: i32);
 pub type GtkWidgetSetVexpand = unsafe extern "C" fn(widget: *mut c_void, expand: i32);
+pub type GtkWidgetGetHexpand = unsafe extern "C" fn(widget: *mut c_void) -> i32;
+pub type GtkWidgetGetVexpand = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 
 // GtkEditable (GTK4 replacement for gtk_entry_get_text/set_text)
 pub type GtkEditableGetText = unsafe extern "C" fn(editable: *mut c_void) -> *const i8;
@@ -328,6 +330,8 @@ pub struct Symbols {
     // Widget helpers
     pub gtk_widget_set_hexpand: Option<GtkWidgetSetHexpand>,
     pub gtk_widget_set_vexpand: Option<GtkWidgetSetVexpand>,
+    pub gtk_widget_get_hexpand: Option<GtkWidgetGetHexpand>,
+    pub gtk_widget_get_vexpand: Option<GtkWidgetGetVexpand>,
 
     // GtkEditable (GTK4)
     pub gtk_editable_get_text: Option<GtkEditableGetText>,
@@ -525,6 +529,8 @@ impl Symbols {
         // Widget helpers
         let gtk_widget_set_hexpand = unsafe { sym::<GtkWidgetSetHexpand>(gtk, "gtk_widget_set_hexpand") };
         let gtk_widget_set_vexpand = unsafe { sym::<GtkWidgetSetVexpand>(gtk, "gtk_widget_set_vexpand") };
+        let gtk_widget_get_hexpand = unsafe { sym::<GtkWidgetGetHexpand>(gtk, "gtk_widget_get_hexpand") };
+        let gtk_widget_get_vexpand = unsafe { sym::<GtkWidgetGetVexpand>(gtk, "gtk_widget_get_vexpand") };
 
         // GtkEditable (GTK4, replaces gtk_entry_get_text/set_text)
         let gtk_editable_get_text = unsafe { sym::<GtkEditableGetText>(gtk, "gtk_editable_get_text") };
@@ -573,6 +579,7 @@ impl Symbols {
             gtk_radio_button_new_with_label,
             gtk_text_view_new, gtk_text_buffer_new, gtk_text_view_get_buffer, gtk_text_buffer_set_text, gtk_text_buffer_get_text, gtk_text_buffer_get_start_iter, gtk_text_buffer_get_end_iter, gtk_text_iter_copy, gtk_text_iter_free, gtk_text_view_set_wrap_mode,
             gtk_widget_set_hexpand, gtk_widget_set_vexpand,
+            gtk_widget_get_hexpand, gtk_widget_get_vexpand,
             gtk_editable_get_text, gtk_editable_set_text,
             gtk_widget_unparent,
             gtk_window_set_default_size,

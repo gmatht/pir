@@ -494,6 +494,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 if col < VISIBLE_COLS && row < VISIBLE_ROWS {
+                    println!("Cell clicked: row={}, col={}", row + 1, col_to_label(col));
                     commit_fn();
                     if let Ok(sc_b) = sc.try_borrow() {
                         for rr in 0..sc_b.len() {
@@ -549,9 +550,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = gtk_dynamic_loader::connect_signal_bool(loader.symbols.as_ref(), grid_ptr, "button-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
                     type GetEventCoords = unsafe extern "C" fn(*mut std::ffi::c_void, *mut f64, *mut f64) -> i32;
                     let loader_tmp = match rustxwidgets::backends::gtk::loader() { Some(l) => l, None => return 0, };
-                    let gtk_lib = match loader_tmp.libs.get("libgtk") { Some(l) => l.clone(), None => return 0, };
-                    let lib = &*gtk_lib;
-                    if let Ok(get_coords) = lib.get::<GetEventCoords>(b"gdk_event_get_coords") {
+                    let get_coords = loader_tmp.libs.get("libgdk").and_then(|gdk_lib| {
+                        unsafe { (*gdk_lib).get::<GetEventCoords>(b"gdk_event_get_coords").ok().map(|s| *s) }
+                    }).or_else(|| {
+                        loader_tmp.libs.get("libgtk").and_then(|gtk_lib| {
+                            unsafe { (*gtk_lib).get::<GetEventCoords>(b"gdk_event_get_coords").ok().map(|s| *s) }
+                        })
+                    });
+                    if let Some(get_coords) = get_coords {
                         let mut x: f64 = 0.0;
                         let mut y: f64 = 0.0;
                         if get_coords(ev, &mut x as *mut f64, &mut y as *mut f64) != 0 {
@@ -894,9 +900,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     gtk_dynamic_loader::connect_signal_bool(loader.symbols.as_ref(), grid_ptr, "button-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
                         type GetEventCoords = unsafe extern "C" fn(*mut std::ffi::c_void, *mut f64, *mut f64) -> i32;
                         let loader_tmp = match rustxwidgets::backends::gtk::loader() { Some(l) => l, None => return 0, };
-                        let gtk_lib = match loader_tmp.libs.get("libgtk") { Some(l) => l.clone(), None => return 0, };
-                        let lib = &*gtk_lib;
-                        if let Ok(get_coords) = lib.get::<GetEventCoords>(b"gdk_event_get_coords") {
+                        let get_coords = loader_tmp.libs.get("libgdk").and_then(|gdk_lib| {
+                            unsafe { (*gdk_lib).get::<GetEventCoords>(b"gdk_event_get_coords").ok().map(|s| *s) }
+                        }).or_else(|| {
+                            loader_tmp.libs.get("libgtk").and_then(|gtk_lib| {
+                                unsafe { (*gtk_lib).get::<GetEventCoords>(b"gdk_event_get_coords").ok().map(|s| *s) }
+                            })
+                        });
+                        if let Some(get_coords) = get_coords {
                             let mut x: f64 = 0.0;
                             let mut y: f64 = 0.0;
                             if get_coords(ev, &mut x as *mut f64, &mut y as *mut f64) != 0 {
@@ -988,9 +999,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if rs_m.borrow().is_none() { return 0; }
                         type GetEventCoords = unsafe extern "C" fn(*mut std::ffi::c_void, *mut f64, *mut f64) -> i32;
                         let loader_tmp = match rustxwidgets::backends::gtk::loader() { Some(l) => l, None => return 0, };
-                        let gtk_lib = match loader_tmp.libs.get("libgtk") { Some(l) => l.clone(), None => return 0, };
-                        let lib = &*gtk_lib;
-                        if let Ok(get_coords) = lib.get::<GetEventCoords>(b"gdk_event_get_coords") {
+                        let get_coords = loader_tmp.libs.get("libgdk").and_then(|gdk_lib| {
+                            unsafe { (*gdk_lib).get::<GetEventCoords>(b"gdk_event_get_coords").ok().map(|s| *s) }
+                        }).or_else(|| {
+                            loader_tmp.libs.get("libgtk").and_then(|gtk_lib| {
+                                unsafe { (*gtk_lib).get::<GetEventCoords>(b"gdk_event_get_coords").ok().map(|s| *s) }
+                            })
+                        });
+                        if let Some(get_coords) = get_coords {
                             let mut x: f64 = 0.0;
                             let mut y: f64 = 0.0;
                             if get_coords(ev, &mut x as *mut f64, &mut y as *mut f64) != 0 {
@@ -1132,6 +1148,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         unsafe { set_vexpand(fg_ptr, 1); }
     }
     let vbox_ptr = *vbox.as_ref();
+    if let Some(set_vexpand) = lookup_sym::<unsafe extern "C" fn(*mut std::ffi::c_void, i32)>(&loader, "gtk_widget_set_vexpand") {
+        unsafe { set_vexpand(vbox_ptr, 1); }
+    }
     if let Some(set_hexpand) = lookup_sym::<unsafe extern "C" fn(*mut std::ffi::c_void, i32)>(&loader, "gtk_widget_set_hexpand") {
         unsafe { set_hexpand(vbox_ptr, 1); }
     }

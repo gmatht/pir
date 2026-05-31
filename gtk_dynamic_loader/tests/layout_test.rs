@@ -179,22 +179,23 @@ fn test_spreadsheet_layout() {
         *sym
     };
 
-    let check = |name: &str, w: *mut c_void, min_w: i32, min_h: i32| {
+    let check = |name: &str, w: *mut c_void, min_w: i32, min_h: i32, max_h: i32| {
         let mut r = GdkRectangle { x: 0, y: 0, width: 0, height: 0 };
         unsafe { get_allocation(w, &mut r as *mut GdkRectangle); }
         assert!(r.width >= min_w, "{} width {} < {}", name, r.width, min_w);
         assert!(r.height >= min_h, "{} height {} < {}", name, r.height, min_h);
+        assert!(r.height <= max_h, "{} height {} > {}", name, r.height, max_h);
     };
 
-    check("win", win_ptr, 200, 80);
-    check("vbox", vbox_ptr, 200, 80);
-    check("toolbar", toolbar_ptr, 100, 10);
-    check("open_btn", open_ptr, 40, 10);
-    check("save_btn", save_ptr, 40, 10);
-    check("formula_box", formula_ptr, 100, 10);
-    check("grid", grid_ptr, 100, 40);
-    check("hdr_a", hdr_a_ptr, 80, 20);
-    check("cell_a1", cell_a1_ptr, 80, 20);
-    check("cell_b1", cell_b1_ptr, 80, 20);
-    check("row_marker", row_marker_ptr, 30, 20);
+    check("win", win_ptr, 200, 80, 200);
+    check("vbox", vbox_ptr, 200, 80, 200);
+    check("toolbar", toolbar_ptr, 100, 10, 60);
+    check("open_btn", open_ptr, 40, 10, 50);
+    check("save_btn", save_ptr, 40, 10, 50);
+    check("formula_box", formula_ptr, 100, 10, 60);
+    check("grid", grid_ptr, 100, 40, 100);
+    check("hdr_a", hdr_a_ptr, 80, 20, 40);
+    check("cell_a1", cell_a1_ptr, 80, 20, 40);
+    check("cell_b1", cell_b1_ptr, 80, 20, 40);
+    check("row_marker", row_marker_ptr, 30, 20, 40);
 }

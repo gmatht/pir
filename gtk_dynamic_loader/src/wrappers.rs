@@ -9,9 +9,11 @@ use std::sync::Arc;
 pub struct BoxWidget {
     inner: *mut c_void,
     loader: Arc<Loader>,
+    orientation: Orientation,
     _not_send: PhantomData<Rc<()>>,
 }
 
+#[derive(Clone, Copy)]
 pub enum Orientation { Horizontal = 0, Vertical = 1 }
 
 impl BoxWidget {
@@ -20,7 +22,7 @@ impl BoxWidget {
         let gtk_box_new = symbols.gtk_box_new.ok_or(Error::MissingSymbol("gtk_box_new".into()))?;
         let inner = unsafe { gtk_box_new(orientation as i32, spacing) };
         take_ownership(&symbols, &loader.version, inner);
-        Ok(BoxWidget { inner, loader, _not_send: PhantomData })
+        Ok(BoxWidget { inner, loader, orientation, _not_send: PhantomData })
     }
 
     pub fn append(&self, child: &impl AsRef<*mut c_void>) {
@@ -29,7 +31,11 @@ impl BoxWidget {
         if let Some(box_append) = symbols.gtk_box_append {
             unsafe { box_append(self.inner, child_ptr); }
         } else if let Some(pack) = symbols.gtk_box_pack_start {
-            unsafe { pack(self.inner, child_ptr, 0, 0, 0); }
+            let expand = match self.orientation {
+                Orientation::Horizontal => symbols.gtk_widget_get_hexpand.map(|f| unsafe { f(child_ptr) }).unwrap_or(0),
+                Orientation::Vertical => symbols.gtk_widget_get_vexpand.map(|f| unsafe { f(child_ptr) }).unwrap_or(0),
+            };
+            unsafe { pack(self.inner, child_ptr, expand, expand, 0); }
         }
     }
 }
