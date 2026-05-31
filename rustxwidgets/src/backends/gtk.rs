@@ -77,10 +77,25 @@ mod gtk_backend {
         gtk_dynamic_loader::Entry::new(loader.clone())
     }
 
+    pub fn create_menu() -> Result<gtk_dynamic_loader::Menu, gtk_dynamic_loader::Error> {
+        let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
+        gtk_dynamic_loader::Menu::new(loader.clone())
+    }
+
+    pub fn create_simple_action(name: &str) -> Result<gtk_dynamic_loader::SimpleAction, gtk_dynamic_loader::Error> {
+        let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
+        gtk_dynamic_loader::SimpleAction::new(loader.clone(), name)
+    }
+
+    pub fn create_menubar(model: &gtk_dynamic_loader::Menu, action_group: *mut std::os::raw::c_void) -> Result<gtk_dynamic_loader::MenuBar, gtk_dynamic_loader::Error> {
+        let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
+        gtk_dynamic_loader::MenuBar::new(loader.clone(), model, action_group)
+    }
+
     /// Return the Arc<Loader> if the backend has been initialized.
     pub fn loader() -> Option<Arc<Loader>> {
         LOADER.get().cloned()
     }
 }
 
-pub use gtk_backend::{init, create_window, create_button, create_label, create_box, create_grid, create_entry, loader};
+pub use gtk_backend::{init, create_window, create_button, create_label, create_box, create_grid, create_entry, create_menu, create_simple_action, create_menubar, loader};

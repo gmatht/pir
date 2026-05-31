@@ -27,6 +27,10 @@ mod gtk_adapter {
         pub fn present(&self) {
             self.0.present();
         }
+
+        pub fn insert_action_group(&self, name: &str, group_ptr: *mut std::os::raw::c_void) {
+            self.0.insert_action_group(name, group_ptr);
+        }
     }
 
     #[repr(transparent)]
@@ -140,6 +144,51 @@ mod gtk_adapter {
     pub fn create_entry() -> Result<Entry, Error> {
         let e = crate::backends::gtk::create_entry().map_err(|e| Error::Backend(format!("{}", e)))?;
         Ok(Entry(e))
+    }
+
+    // ---- Menu types ----
+
+    #[repr(transparent)]
+    pub struct Menu(pub gtk_dynamic_loader::Menu);
+
+    impl Menu {
+        pub fn append(&mut self, label: &str, detailed_action: &str) {
+            self.0.append(label, detailed_action);
+        }
+
+        pub fn append_submenu(&mut self, label: &str, submenu: &Menu) {
+            self.0.append_submenu(label, &submenu.0);
+        }
+    }
+
+    pub fn create_menu() -> Result<Menu, Error> {
+        let m = crate::backends::gtk::create_menu().map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(Menu(m))
+    }
+
+    #[repr(transparent)]
+    pub struct MenuBar(pub gtk_dynamic_loader::MenuBar);
+
+    impl Widget for MenuBar { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
+    impl AsRef<*mut c_void> for MenuBar { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+
+    pub fn create_menubar(model: &Menu, action_group: *mut std::os::raw::c_void) -> Result<MenuBar, Error> {
+        let b = crate::backends::gtk::create_menubar(&model.0, action_group).map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(MenuBar(b))
+    }
+
+    #[repr(transparent)]
+    pub struct SimpleAction(pub gtk_dynamic_loader::SimpleAction);
+
+    impl SimpleAction {
+        pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {
+            self.0.connect_activate(f).map_err(|e| Error::Backend(format!("{}", e)))
+        }
+    }
+
+    pub fn create_simple_action(name: &str) -> Result<SimpleAction, Error> {
+        let a = crate::backends::gtk::create_simple_action(name).map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(SimpleAction(a))
     }
 
 }

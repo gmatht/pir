@@ -66,6 +66,21 @@ impl App {
         crate::backends_gtk_adapter::create_entry().map_err(|e| e)
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn create_menu(&self) -> Result<crate::backends_gtk_adapter::Menu, Error> {
+        crate::backends_gtk_adapter::create_menu().map_err(|e| e)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn create_menubar(&self, model: &crate::backends_gtk_adapter::Menu, action_group: *mut std::os::raw::c_void) -> Result<crate::backends_gtk_adapter::MenuBar, Error> {
+        crate::backends_gtk_adapter::create_menubar(model, action_group).map_err(|e| e)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn create_simple_action(&self, name: &str) -> Result<crate::backends_gtk_adapter::SimpleAction, Error> {
+        crate::backends_gtk_adapter::create_simple_action(name).map_err(|e| e)
+    }
+
     /// Run the backend main loop
     pub fn run(self) -> Result<(), Error> {
         // take ownership if possible
