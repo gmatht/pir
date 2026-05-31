@@ -92,10 +92,35 @@ mod gtk_backend {
         gtk_dynamic_loader::MenuBar::new(loader.clone(), model, action_group)
     }
 
+    pub fn create_dialog() -> Result<gtk_dynamic_loader::Dialog, gtk_dynamic_loader::Error> {
+        let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
+        gtk_dynamic_loader::Dialog::new(loader.clone())
+    }
+
+    pub fn create_dropdown(items: &[&str]) -> Result<gtk_dynamic_loader::DropDown, gtk_dynamic_loader::Error> {
+        let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
+        gtk_dynamic_loader::DropDown::new(loader.clone(), items)
+    }
+
+    pub fn create_checkbutton(label: &str) -> Result<gtk_dynamic_loader::CheckButton, gtk_dynamic_loader::Error> {
+        let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
+        gtk_dynamic_loader::CheckButton::new(loader.clone(), label)
+    }
+
+    pub fn create_radiobutton(group: Option<&gtk_dynamic_loader::RadioButton>, label: &str) -> Result<gtk_dynamic_loader::RadioButton, gtk_dynamic_loader::Error> {
+        let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
+        gtk_dynamic_loader::RadioButton::new(loader.clone(), group, label)
+    }
+
+    pub fn create_textview() -> Result<gtk_dynamic_loader::TextView, gtk_dynamic_loader::Error> {
+        let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
+        gtk_dynamic_loader::TextView::new(loader.clone())
+    }
+
     /// Return the Arc<Loader> if the backend has been initialized.
     pub fn loader() -> Option<Arc<Loader>> {
         LOADER.get().cloned()
     }
 }
 
-pub use gtk_backend::{init, create_window, create_button, create_label, create_box, create_grid, create_entry, create_menu, create_simple_action, create_menubar, loader};
+pub use gtk_backend::{init, create_window, create_button, create_label, create_box, create_grid, create_entry, create_menu, create_simple_action, create_menubar, create_dialog, create_dropdown, create_checkbutton, create_radiobutton, create_textview, loader};

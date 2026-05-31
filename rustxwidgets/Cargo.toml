@@ -12,7 +12,8 @@ libloading = "0.8"
 gtk_dynamic_loader = { path = "../gtk_dynamic_loader" }
 
 [target.'cfg(windows)'.dependencies]
-native-windows-gui = "1.0"
+native-windows-gui = { version = "1.0", features = ["flexbox", "menu"] }
+winapi = { version = "0.3", features = ["winuser"] }
 
 [features]
 default = []

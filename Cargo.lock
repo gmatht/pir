@@ -196,6 +196,7 @@ dependencies = [
  "native-windows-gui",
  "once_cell",
  "thiserror",
+ "winapi",
 ]
 
 [[package]]

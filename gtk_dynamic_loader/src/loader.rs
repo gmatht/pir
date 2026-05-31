@@ -78,6 +78,12 @@ impl Loader {
         };
         libs.insert("libgtk".into(), Arc::new(libgtk));
 
+        // Open libgdk (separate library in GTK3; GTK4 bundles GDK into libgtk-4)
+        if version == Version::Gtk3 {
+            let gdk_cands = ["libgdk-3.so.0", "libgdk-3.so"];
+            if let Some(g) = open_first(&gdk_cands) { libs.insert("libgdk".into(), Arc::new(g)); }
+        }
+
         // Resolve symbols
         let symbols = Symbols::load(&libs).map_err(|e| Error::Other(format!("symbol error: {:?}", e)))?;
 
@@ -91,6 +97,34 @@ impl Loader {
         // Call gtk_init if available so type system and runtime are prepared
         if let Some(gtk_init) = symbols.gtk_init {
             unsafe { gtk_init(std::ptr::null_mut(), std::ptr::null_mut()); }
+        }
+
+        // In GTK4, gtk_init is a no-op, so widget types may not be registered.
+        // Call _get_type() for each widget type to ensure type registration.
+        unsafe fn ensure_type(lib: &Library, name: &str) {
+            if let Ok(sym) = lib.get::<unsafe extern "C" fn() -> usize>(name.as_bytes()) {
+                let get_type = *sym;
+                get_type();
+            }
+        }
+        if let Some(gtk) = libs.get("libgtk") {
+            unsafe {
+                ensure_type(gtk, "gtk_window_get_type");
+                ensure_type(gtk, "gtk_button_get_type");
+                ensure_type(gtk, "gtk_label_get_type");
+                ensure_type(gtk, "gtk_box_get_type");
+                ensure_type(gtk, "gtk_grid_get_type");
+                ensure_type(gtk, "gtk_entry_get_type");
+                ensure_type(gtk, "gtk_dialog_get_type");
+                ensure_type(gtk, "gtk_combo_box_get_type");
+                ensure_type(gtk, "gtk_drop_down_get_type");
+                ensure_type(gtk, "gtk_check_button_get_type");
+                ensure_type(gtk, "gtk_radio_button_get_type");
+                ensure_type(gtk, "gtk_text_view_get_type");
+                ensure_type(gtk, "gtk_text_buffer_get_type");
+                ensure_type(gtk, "gtk_string_list_get_type");
+                ensure_type(gtk, "gtk_toggle_button_get_type");
+            }
         }
 
         Ok(Arc::new(Loader { libs, symbols: Arc::new(symbols), version }))

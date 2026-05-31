@@ -36,8 +36,7 @@ fn make_overlay(loader: &std::sync::Arc<gtk_dynamic_loader::Loader>) -> Option<*
     let overlay_new = loader.symbols.gtk_overlay_new?;
     let overlay = unsafe { overlay_new() };
     if overlay.is_null() { return None; }
-    if let Some(ref_sink) = loader.symbols.g_object_ref_sink { unsafe { ref_sink(overlay); } }
-    else if let Some(gref) = loader.symbols.g_object_ref { unsafe { gref(overlay); } }
+    gtk_dynamic_loader::take_ownership(&*loader.symbols, &loader.version(), overlay);
     Some(overlay)
 }
 
@@ -129,6 +128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = App::init()?;
     let win = app.create_window()?;
     win.set_title("Spreadsheet");
+    win.set_default_size(1600, 1000);
 
     // Data model
     let texts: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
@@ -315,7 +315,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         label.negative { color: #cc0000; }
         label.numeric { font-family: monospace; }
         label.formula { color: #006600; font-style: italic; }
-        label.selected { background-color: #d4e8ff !important; border: 2px solid #1a73e8 !important; }
+        label.selected { background-color: #d4e8ff; border: 2px solid #1a73e8; }
         label.bold-cell { font-weight: bold; }
         label.italic-cell { font-style: italic; }
         button { font-size: 11px; padding: 1px 8px; min-height: 20px; }
@@ -337,8 +337,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(scrolled_new) = lookup_sym::<ScrolledNew>(&loader, "gtk_scrolled_window_new") {
             let sw = scrolled_new(std::ptr::null_mut(), std::ptr::null_mut());
             if sw.is_null() { panic!("scrolled_window_new returned null"); }
-            if let Some(ref_sink) = loader.symbols.g_object_ref_sink { ref_sink(sw); }
-            else if let Some(gref) = loader.symbols.g_object_ref { gref(sw); }
+            gtk_dynamic_loader::take_ownership(&*loader.symbols, &loader.version(), sw);
             if let Some(set_policy) = lookup_sym::<SetPolicy>(&loader, "gtk_scrolled_window_set_policy") {
                 set_policy(sw, 0, 0);
             }
@@ -446,97 +445,123 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Click to select and edit via grid button-press-event
+    // Click to select and edit
     {
         let grid_ptr = *grid_widget.as_ref();
-        let sc = static_cells.clone();
-        let sel = selected_coord.clone();
-        let fe = formula_entry.clone();
-        let txt = texts.clone();
-        let syms = loader.symbols.clone();
-        let edit_e = editing_entry.clone();
-        let commit_fn = commit_edit.clone();
-        let start_fn = start_edit.clone();
-        let fmts = cell_formats.clone();
-        let cw = col_widths.clone();
-        let _ = unsafe {
-            gtk_dynamic_loader::connect_signal_bool(syms.as_ref(), grid_ptr, "button-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
-                type GetEventCoords = unsafe extern "C" fn(*mut std::ffi::c_void, *mut f64, *mut f64) -> i32;
-                let loader_tmp = match rustxwidgets::backends::gtk::loader() { Some(l) => l, None => return 0, };
-                let gtk_lib = match loader_tmp.libs.get("libgtk") { Some(l) => l.clone(), None => return 0, };
-                let lib = &*gtk_lib;
-                if let Ok(get_coords) = lib.get::<GetEventCoords>(b"gdk_event_get_coords") {
-                    let mut x: f64 = 0.0;
-                    let mut y: f64 = 0.0;
-                    if get_coords(ev, &mut x as *mut f64, &mut y as *mut f64) != 0 {
-                        let col_hdr_w = 46;
-                        let col_widths_b = cw.borrow();
-                        let col = {
-                            let mut cx = x - col_hdr_w as f64;
-                            let mut ci = 0;
-                            while ci < VISIBLE_COLS && cx > 0.0 {
-                                cx -= col_widths_b[ci] as f64;
-                                ci += 1;
-                            }
-                            ci.saturating_sub(1).min(VISIBLE_COLS - 1)
-                        };
-                        drop(col_widths_b);
-                        let row = ((y - CELL_H as f64) / CELL_H as f64).floor() as usize;
+        let sc2 = static_cells.clone();
+        let sel2 = selected_coord.clone();
+        let fe2 = formula_entry.clone();
+        let txt2 = texts.clone();
+        let edit_e2 = editing_entry.clone();
+        let commit_fn2 = commit_edit.clone();
+        let start_fn2 = start_edit.clone();
+        let fmts2 = cell_formats.clone();
+        let cw2 = col_widths.clone();
 
-                        if row == 0 && col < VISIBLE_COLS {
-                            // Header click: log to console
-                            println!("Header clicked: col={}", col_to_label(col));
-                            return 1;
-                        }
-                        if col == 0 && row >= 1 && row <= VISIBLE_ROWS {
-                            // Row marker click: log to console
-                            println!("Row header clicked: row={}", row);
-                            return 1;
-                        }
+        let click_logic: Rc<RefCell<Option<Box<dyn FnMut(f64, f64)>>>> = Rc::new(RefCell::new(None));
+        {
+            let sc = sc2.clone();
+            let sel = sel2.clone();
+            let fe = fe2.clone();
+            let txt = txt2.clone();
+            let edit_e = edit_e2.clone();
+            let commit_fn = commit_fn2.clone();
+            let start_fn = start_fn2.clone();
+            let fmts = fmts2.clone();
+            let cw = cw2.clone();
+            *click_logic.borrow_mut() = Some(Box::new(move |x: f64, y: f64| {
+                let col_hdr_w = 46;
+                let col_widths_b = cw.borrow();
+                let col = {
+                    let mut cx = x - col_hdr_w as f64;
+                    let mut ci = 0;
+                    while ci < VISIBLE_COLS && cx > 0.0 {
+                        cx -= col_widths_b[ci] as f64;
+                        ci += 1;
+                    }
+                    ci.saturating_sub(1).min(VISIBLE_COLS - 1)
+                };
+                drop(col_widths_b);
+                let row = (y / CELL_H as f64).floor() as usize;
 
-                        if col < VISIBLE_COLS && row < VISIBLE_ROWS {
-                            // Commit any ongoing edit first
-                            commit_fn();
-                            // Select cell
-                            if let Ok(sc_b) = sc.try_borrow() {
-                                for rr in 0..sc_b.len() {
-                                    for cc in 0..sc_b[rr].len() {
-                                        sc_b[rr][cc].remove_class("selected");
-                                    }
-                                }
-                                if row < sc_b.len() && col < sc_b[row].len() {
-                                    sc_b[row][col].add_class("selected");
-                                }
+                if row == 0 && col < VISIBLE_COLS {
+                    println!("Header clicked: col={}", col_to_label(col));
+                    return;
+                }
+                if col == 0 && row >= 1 && row <= VISIBLE_ROWS {
+                    println!("Row header clicked: row={}", row);
+                    return;
+                }
+
+                if col < VISIBLE_COLS && row < VISIBLE_ROWS {
+                    commit_fn();
+                    if let Ok(sc_b) = sc.try_borrow() {
+                        for rr in 0..sc_b.len() {
+                            for cc in 0..sc_b[rr].len() {
+                                sc_b[rr][cc].remove_class("selected");
                             }
-                            if let Ok(mut cs) = sel.try_borrow_mut() {
-                                *cs = Some((row, col));
-                            }
-                            let t = txt.borrow();
-                            let fmt = fmts.borrow()[row][col].clone();
-                            if row < t.len() && col < t[row].len() {
-                                let text = &t[row][col];
-                                // Update formula bar with formatted text
-                                if fmt.0 { fe.set_text(&format!("*{}*", text)); }
-                                else if fmt.1 { fe.set_text(&format!("/{}/", text)); }
-                                else { fe.set_text(text); }
-                            }
-                            // Start editing the cell on click
-                            drop(t);
-                            // Position entry
-                            if edit_e.borrow().is_none() {
-                                start_fn(row, col);
-                                // Put the clicked position into the new entry
-                                if let Some(e) = edit_e.borrow().as_ref() {
-                                    let text = txt.borrow()[row][col].clone();
-                                    e.set_text(&text);
-                                }
-                            }
+                        }
+                        if row < sc_b.len() && col < sc_b[row].len() {
+                            sc_b[row][col].add_class("selected");
+                        }
+                    }
+                    if let Ok(mut cs) = sel.try_borrow_mut() {
+                        *cs = Some((row, col));
+                    }
+                    let t = txt.borrow();
+                    let fmt = fmts.borrow()[row][col].clone();
+                    if row < t.len() && col < t[row].len() {
+                        let text = &t[row][col];
+                        if fmt.0 { fe.set_text(&format!("*{}*", text)); }
+                        else if fmt.1 { fe.set_text(&format!("/{}/", text)); }
+                        else { fe.set_text(text); }
+                    }
+                    drop(t);
+                    if edit_e.borrow().is_none() {
+                        start_fn(row, col);
+                        if let Some(e) = edit_e.borrow().as_ref() {
+                            let text = txt.borrow()[row][col].clone();
+                            e.set_text(&text);
                         }
                     }
                 }
-                0
-            }))
-        };
+            }));
+        }
+
+        if is_gtk4 {
+            if let Some(gesture_new) = loader.symbols.gtk_gesture_click_new {
+                let gesture = unsafe { gesture_new() };
+                if !gesture.is_null() {
+                    if let Some(add_ctrl) = loader.symbols.gtk_widget_add_controller {
+                        unsafe { add_ctrl(grid_ptr, gesture); }
+                    }
+                    let cl = click_logic.clone();
+                    unsafe {
+                        let _ = gtk_dynamic_loader::connect_signal_gesture(loader.symbols.as_ref(), gesture, "pressed", Box::new(move |_n: i32, x: f64, y: f64| {
+                            if let Some(f) = cl.borrow_mut().as_mut() { f(x, y); }
+                        }));
+                    }
+                }
+            }
+        } else {
+            let cl = click_logic.clone();
+            unsafe {
+                let _ = gtk_dynamic_loader::connect_signal_bool(loader.symbols.as_ref(), grid_ptr, "button-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
+                    type GetEventCoords = unsafe extern "C" fn(*mut std::ffi::c_void, *mut f64, *mut f64) -> i32;
+                    let loader_tmp = match rustxwidgets::backends::gtk::loader() { Some(l) => l, None => return 0, };
+                    let gtk_lib = match loader_tmp.libs.get("libgtk") { Some(l) => l.clone(), None => return 0, };
+                    let lib = &*gtk_lib;
+                    if let Ok(get_coords) = lib.get::<GetEventCoords>(b"gdk_event_get_coords") {
+                        let mut x: f64 = 0.0;
+                        let mut y: f64 = 0.0;
+                        if get_coords(ev, &mut x as *mut f64, &mut y as *mut f64) != 0 {
+                            if let Some(f) = cl.borrow_mut().as_mut() { f(x, y); }
+                        }
+                    }
+                    0
+                }));
+            }
+        }
     }
 
     // Formatting button handlers
@@ -820,46 +845,81 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Column resize
+            // Column resize
         {
-            let cw_r = cw_nav.clone();
-            let rs_r = rs_nav.clone();
-            let rsx_r = rsx_nav.clone();
-            let rsw_r = rsw_nav.clone();
-            let ch_r = col_headers.clone();
-            let sc_r = sc_nav.clone();
-            let ref_r = refresh_nav.clone();
-            let ld_r = loader_for_resize.clone();
-            let btn_syms = loader.symbols.clone();
-            let _ = unsafe {
-                gtk_dynamic_loader::connect_signal_bool(btn_syms.as_ref(), grid_ptr, "button-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
-                    type GetEventCoords = unsafe extern "C" fn(*mut std::ffi::c_void, *mut f64, *mut f64) -> i32;
-                    let loader_tmp = match rustxwidgets::backends::gtk::loader() { Some(l) => l, None => return 0, };
-                    let gtk_lib = match loader_tmp.libs.get("libgtk") { Some(l) => l.clone(), None => return 0, };
-                    let lib = &*gtk_lib;
-                    if let Ok(get_coords) = lib.get::<GetEventCoords>(b"gdk_event_get_coords") {
-                        let mut x: f64 = 0.0;
-                        let mut y: f64 = 0.0;
-                        if get_coords(ev, &mut x as *mut f64, &mut y as *mut f64) != 0 {
-                            if y <= CELL_H as f64 {
-                                let cw_b = cw_r.borrow();
-                                let mut edge_x = 46.0f64;
-                                for ci in 0..VISIBLE_COLS {
-                                    let w = cw_b[ci] as f64;
-                                    if (x - (edge_x + w)).abs() <= 6.0 && x >= edge_x + w - 6.0 {
-                                        *rs_r.borrow_mut() = Some(ci);
-                                        *rsx_r.borrow_mut() = x as i32;
-                                        *rsw_r.borrow_mut() = cw_b[ci];
-                                        return 1;
+            // Resize-press detection
+            if is_gtk4 {
+                if let Some(gesture_new) = loader.symbols.gtk_gesture_click_new {
+                    let gesture = unsafe { gesture_new() };
+                    if !gesture.is_null() {
+                        if let Some(add_ctrl) = loader.symbols.gtk_widget_add_controller {
+                            unsafe { add_ctrl(grid_ptr, gesture); }
+                        }
+                        let cw_r = cw_nav.clone();
+                        let rs_r = rs_nav.clone();
+                        let rsx_r = rsx_nav.clone();
+                        let rsw_r = rsw_nav.clone();
+                        unsafe {
+                            let _ = gtk_dynamic_loader::connect_signal_gesture(loader.symbols.as_ref(), gesture, "pressed", Box::new(move |_: i32, x: f64, y: f64| {
+                                if y <= CELL_H as f64 {
+                                    let cw_b = cw_r.borrow();
+                                    let mut edge_x = 46.0f64;
+                                    for ci in 0..VISIBLE_COLS {
+                                        let w = cw_b[ci] as f64;
+                                        if (x - (edge_x + w)).abs() <= 6.0 && x >= edge_x + w - 6.0 {
+                                            *rs_r.borrow_mut() = Some(ci);
+                                            *rsx_r.borrow_mut() = x as i32;
+                                            *rsw_r.borrow_mut() = cw_b[ci];
+                                            return;
+                                        }
+                                        edge_x += w;
                                     }
-                                    edge_x += w;
+                                }
+                            }));
+                        }
+                        let rs_end = rs_nav.clone();
+                        unsafe {
+                            let _ = gtk_dynamic_loader::connect_signal_gesture(loader.symbols.as_ref(), gesture, "released", Box::new(move |_: i32, _: f64, _: f64| {
+                                *rs_end.borrow_mut() = None;
+                            }));
+                        }
+                    }
+                }
+            } else {
+                let cw_r = cw_nav.clone();
+                let rs_r = rs_nav.clone();
+                let rsx_r = rsx_nav.clone();
+                let rsw_r = rsw_nav.clone();
+                let _ = unsafe {
+                    gtk_dynamic_loader::connect_signal_bool(loader.symbols.as_ref(), grid_ptr, "button-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
+                        type GetEventCoords = unsafe extern "C" fn(*mut std::ffi::c_void, *mut f64, *mut f64) -> i32;
+                        let loader_tmp = match rustxwidgets::backends::gtk::loader() { Some(l) => l, None => return 0, };
+                        let gtk_lib = match loader_tmp.libs.get("libgtk") { Some(l) => l.clone(), None => return 0, };
+                        let lib = &*gtk_lib;
+                        if let Ok(get_coords) = lib.get::<GetEventCoords>(b"gdk_event_get_coords") {
+                            let mut x: f64 = 0.0;
+                            let mut y: f64 = 0.0;
+                            if get_coords(ev, &mut x as *mut f64, &mut y as *mut f64) != 0 {
+                                if y <= CELL_H as f64 {
+                                    let cw_b = cw_r.borrow();
+                                    let mut edge_x = 46.0f64;
+                                    for ci in 0..VISIBLE_COLS {
+                                        let w = cw_b[ci] as f64;
+                                        if (x - (edge_x + w)).abs() <= 6.0 && x >= edge_x + w - 6.0 {
+                                            *rs_r.borrow_mut() = Some(ci);
+                                            *rsx_r.borrow_mut() = x as i32;
+                                            *rsw_r.borrow_mut() = cw_b[ci];
+                                            return 1;
+                                        }
+                                        edge_x += w;
+                                    }
                                 }
                             }
                         }
-                    }
-                    0
-                }))
-            };
+                        0
+                    }))
+                };
+            }
 
             // Motion handler for resize
             let motion_syms = loader.symbols.clone();
@@ -962,17 +1022,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         0
                     }))
                 };
-            }
-
-            if is_gtk4 {
-                let rs_end = rs_nav.clone();
-                let btn_rel_syms = loader.symbols.clone();
-                unsafe {
-                    let _ = gtk_dynamic_loader::connect_signal_bool(btn_rel_syms.as_ref(), *win.as_ref(), "button-release-event", Box::new(move |_ev: *mut std::ffi::c_void| -> i32 {
-                        *rs_end.borrow_mut() = None;
-                        0
-                    }));
-                }
             }
         }
     }

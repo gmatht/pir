@@ -88,6 +88,64 @@ pub type GtkStyleContextAddProviderForScreen = unsafe extern "C" fn(screen: *mut
 pub type GtkLabelSetXalign = unsafe extern "C" fn(label: *mut c_void, xalign: f32);
 pub type GtkEventControllerKeyNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkWidgetAddController = unsafe extern "C" fn(widget: *mut c_void, controller: *mut c_void);
+pub type GtkGestureClickNew = unsafe extern "C" fn() -> *mut c_void;
+
+// Dialog
+pub type GtkDialogNew = unsafe extern "C" fn() -> *mut c_void;
+pub type GtkDialogAddButton = unsafe extern "C" fn(dialog: *mut c_void, button_text: *const i8, response_id: i32) -> *mut c_void;
+pub type GtkDialogGetContentArea = unsafe extern "C" fn(dialog: *mut c_void) -> *mut c_void;
+pub type GtkDialogRun = unsafe extern "C" fn(dialog: *mut c_void) -> i32;
+pub type GtkDialogSetDefaultSize = unsafe extern "C" fn(dialog: *mut c_void, width: i32, height: i32);
+
+// Dropdown - GTK3 ComboBoxText
+pub type GtkComboBoxTextNew = unsafe extern "C" fn() -> *mut c_void;
+pub type GtkComboBoxTextAppendText = unsafe extern "C" fn(combo: *mut c_void, text: *const i8);
+pub type GtkComboBoxTextGetActiveText = unsafe extern "C" fn(combo: *mut c_void) -> *const i8;
+pub type GtkComboBoxSetActive = unsafe extern "C" fn(combo: *mut c_void, index_: i32);
+pub type GtkComboBoxGetActive = unsafe extern "C" fn(combo: *mut c_void) -> i32;
+
+// Dropdown - GTK4 DropDown
+pub type GtkDropDownNew = unsafe extern "C" fn(model: *mut c_void, expression: *mut c_void) -> *mut c_void;
+pub type GtkDropDownSetSelected = unsafe extern "C" fn(dropdown: *mut c_void, selected: u32);
+pub type GtkDropDownGetSelected = unsafe extern "C" fn(dropdown: *mut c_void) -> u32;
+pub type GtkStringListNew = unsafe extern "C" fn(strings: *const *const i8) -> *mut c_void;
+
+// Checkbox / CheckButton
+pub type GtkCheckButtonNewWithLabel = unsafe extern "C" fn(label: *const i8) -> *mut c_void;
+pub type GtkCheckButtonGetActive = unsafe extern "C" fn(check_button: *mut c_void) -> i32;
+pub type GtkCheckButtonSetActive = unsafe extern "C" fn(check_button: *mut c_void, is_active: i32);
+pub type GtkCheckButtonSetGroup = unsafe extern "C" fn(check_button: *mut c_void, group: *mut c_void);
+pub type GtkToggleButtonGetActive = unsafe extern "C" fn(toggle_button: *mut c_void) -> i32;
+pub type GtkToggleButtonSetActive = unsafe extern "C" fn(toggle_button: *mut c_void, is_active: i32);
+
+// RadioButton
+pub type GtkRadioButtonNewWithLabel = unsafe extern "C" fn(group: *mut c_void, label: *const i8) -> *mut c_void;
+
+// TextView / TextArea
+pub type GtkTextViewNew = unsafe extern "C" fn() -> *mut c_void;
+pub type GtkTextBufferNew = unsafe extern "C" fn(table: *mut c_void) -> *mut c_void;
+pub type GtkTextViewGetBuffer = unsafe extern "C" fn(text_view: *mut c_void) -> *mut c_void;
+pub type GtkTextBufferSetText = unsafe extern "C" fn(buffer: *mut c_void, text: *const i8, len: i32);
+pub type GtkTextBufferGetText = unsafe extern "C" fn(buffer: *mut c_void, start: *mut c_void, end: *mut c_void, include_hidden_chars: i32) -> *mut c_void;
+pub type GtkTextBufferGetStartIter = unsafe extern "C" fn(buffer: *mut c_void, iter: *mut c_void);
+pub type GtkTextBufferGetEndIter = unsafe extern "C" fn(buffer: *mut c_void, iter: *mut c_void);
+pub type GtkTextIterCopy = unsafe extern "C" fn(iter: *mut c_void) -> *mut c_void;
+pub type GtkTextIterFree = unsafe extern "C" fn(iter: *mut c_void);
+pub type GtkTextViewSetWrapMode = unsafe extern "C" fn(text_view: *mut c_void, wrap_mode: i32);
+
+// GtkWidget helper for visibility/event handling
+pub type GtkWidgetSetHexpand = unsafe extern "C" fn(widget: *mut c_void, expand: i32);
+pub type GtkWidgetSetVexpand = unsafe extern "C" fn(widget: *mut c_void, expand: i32);
+
+// GtkEditable (GTK4 replacement for gtk_entry_get_text/set_text)
+pub type GtkEditableGetText = unsafe extern "C" fn(editable: *mut c_void) -> *const i8;
+pub type GtkEditableSetText = unsafe extern "C" fn(editable: *mut c_void, text: *const i8);
+
+// GtkWidget parent handling
+pub type GtkWidgetUnparent = unsafe extern "C" fn(widget: *mut c_void);
+
+// GtkWindow default size
+pub type GtkWindowSetDefaultSize = unsafe extern "C" fn(window: *mut c_void, width: i32, height: i32);
 
 // Grid/Entry related
 pub type GtkGridNew = unsafe extern "C" fn() -> *mut c_void;
@@ -216,12 +274,70 @@ pub struct Symbols {
     pub gtk_label_set_xalign: Option<GtkLabelSetXalign>,
     pub gtk_event_controller_key_new: Option<GtkEventControllerKeyNew>,
     pub gtk_widget_add_controller: Option<GtkWidgetAddController>,
+    pub gtk_gesture_click_new: Option<GtkGestureClickNew>,
     // GMenuModel iteration (for GTK3 fallback)
     pub g_menu_model_get_n_items: Option<GMenuModelGetNItems>,
     pub g_menu_model_get_item_attribute_value: Option<GMenuModelGetItemAttributeValue>,
     pub g_menu_model_get_item_link: Option<GMenuModelGetItemLink>,
     pub g_variant_get_string: Option<GVariantGetString>,
     pub g_variant_unref: Option<GVariantUnref>,
+
+    // Dialog
+    pub gtk_dialog_new: Option<GtkDialogNew>,
+    pub gtk_dialog_add_button: Option<GtkDialogAddButton>,
+    pub gtk_dialog_get_content_area: Option<GtkDialogGetContentArea>,
+    pub gtk_dialog_run: Option<GtkDialogRun>,
+    pub gtk_dialog_set_default_size: Option<GtkDialogSetDefaultSize>,
+
+    // Dropdown - GTK3 ComboBoxText
+    pub gtk_combo_box_text_new: Option<GtkComboBoxTextNew>,
+    pub gtk_combo_box_text_append_text: Option<GtkComboBoxTextAppendText>,
+    pub gtk_combo_box_text_get_active_text: Option<GtkComboBoxTextGetActiveText>,
+    pub gtk_combo_box_set_active: Option<GtkComboBoxSetActive>,
+    pub gtk_combo_box_get_active: Option<GtkComboBoxGetActive>,
+
+    // Dropdown - GTK4 DropDown
+    pub gtk_drop_down_new: Option<GtkDropDownNew>,
+    pub gtk_drop_down_set_selected: Option<GtkDropDownSetSelected>,
+    pub gtk_drop_down_get_selected: Option<GtkDropDownGetSelected>,
+    pub gtk_string_list_new: Option<GtkStringListNew>,
+
+    // Checkbox / CheckButton
+    pub gtk_check_button_new_with_label: Option<GtkCheckButtonNewWithLabel>,
+    pub gtk_check_button_get_active: Option<GtkCheckButtonGetActive>,
+    pub gtk_check_button_set_active: Option<GtkCheckButtonSetActive>,
+    pub gtk_check_button_set_group: Option<GtkCheckButtonSetGroup>,
+    pub gtk_toggle_button_get_active: Option<GtkToggleButtonGetActive>,
+    pub gtk_toggle_button_set_active: Option<GtkToggleButtonSetActive>,
+
+    // RadioButton
+    pub gtk_radio_button_new_with_label: Option<GtkRadioButtonNewWithLabel>,
+
+    // TextView / TextArea
+    pub gtk_text_view_new: Option<GtkTextViewNew>,
+    pub gtk_text_buffer_new: Option<GtkTextBufferNew>,
+    pub gtk_text_view_get_buffer: Option<GtkTextViewGetBuffer>,
+    pub gtk_text_buffer_set_text: Option<GtkTextBufferSetText>,
+    pub gtk_text_buffer_get_text: Option<GtkTextBufferGetText>,
+    pub gtk_text_buffer_get_start_iter: Option<GtkTextBufferGetStartIter>,
+    pub gtk_text_buffer_get_end_iter: Option<GtkTextBufferGetEndIter>,
+    pub gtk_text_iter_copy: Option<GtkTextIterCopy>,
+    pub gtk_text_iter_free: Option<GtkTextIterFree>,
+    pub gtk_text_view_set_wrap_mode: Option<GtkTextViewSetWrapMode>,
+
+    // Widget helpers
+    pub gtk_widget_set_hexpand: Option<GtkWidgetSetHexpand>,
+    pub gtk_widget_set_vexpand: Option<GtkWidgetSetVexpand>,
+
+    // GtkEditable (GTK4)
+    pub gtk_editable_get_text: Option<GtkEditableGetText>,
+    pub gtk_editable_set_text: Option<GtkEditableSetText>,
+
+    // GtkWidget parent handling
+    pub gtk_widget_unparent: Option<GtkWidgetUnparent>,
+
+    // GtkWindow default size
+    pub gtk_window_set_default_size: Option<GtkWindowSetDefaultSize>,
 }
 
 impl Symbols {
@@ -331,6 +447,7 @@ impl Symbols {
         let gtk_label_set_xalign = unsafe { sym::<GtkLabelSetXalign>(gtk, "gtk_label_set_xalign") };
         let gtk_event_controller_key_new = unsafe { sym::<GtkEventControllerKeyNew>(gtk, "gtk_event_controller_key_new") };
         let gtk_widget_add_controller = unsafe { sym::<GtkWidgetAddController>(gtk, "gtk_widget_add_controller") };
+        let gtk_gesture_click_new = unsafe { sym::<GtkGestureClickNew>(gtk, "gtk_gesture_click_new") };
 
         // application/menu/action symbols (try glib/gio)
         // try gio first then glib for the app/menu symbols
@@ -362,6 +479,63 @@ impl Symbols {
         let g_variant_get_string = unsafe { sym::<GVariantGetString>(glib, "g_variant_get_string") };
         let g_variant_unref = unsafe { sym::<GVariantUnref>(glib, "g_variant_unref") };
 
+        // Dialog
+        let gtk_dialog_new = unsafe { sym::<GtkDialogNew>(gtk, "gtk_dialog_new") };
+        let gtk_dialog_add_button = unsafe { sym::<GtkDialogAddButton>(gtk, "gtk_dialog_add_button") };
+        let gtk_dialog_get_content_area = unsafe { sym::<GtkDialogGetContentArea>(gtk, "gtk_dialog_get_content_area") };
+        let gtk_dialog_run = unsafe { sym::<GtkDialogRun>(gtk, "gtk_dialog_run") };
+        let gtk_dialog_set_default_size = unsafe { sym::<GtkDialogSetDefaultSize>(gtk, "gtk_dialog_set_default_size") };
+
+        // Dropdown - GTK3 ComboBoxText
+        let gtk_combo_box_text_new = unsafe { sym::<GtkComboBoxTextNew>(gtk, "gtk_combo_box_text_new") };
+        let gtk_combo_box_text_append_text = unsafe { sym::<GtkComboBoxTextAppendText>(gtk, "gtk_combo_box_text_append_text") };
+        let gtk_combo_box_text_get_active_text = unsafe { sym::<GtkComboBoxTextGetActiveText>(gtk, "gtk_combo_box_text_get_active_text") };
+        let gtk_combo_box_set_active = unsafe { sym::<GtkComboBoxSetActive>(gtk, "gtk_combo_box_set_active") };
+        let gtk_combo_box_get_active = unsafe { sym::<GtkComboBoxGetActive>(gtk, "gtk_combo_box_get_active") };
+
+        // Dropdown - GTK4 DropDown
+        let gtk_drop_down_new = unsafe { sym::<GtkDropDownNew>(gtk, "gtk_drop_down_new") };
+        let gtk_drop_down_set_selected = unsafe { sym::<GtkDropDownSetSelected>(gtk, "gtk_drop_down_set_selected") };
+        let gtk_drop_down_get_selected = unsafe { sym::<GtkDropDownGetSelected>(gtk, "gtk_drop_down_get_selected") };
+        let gtk_string_list_new = unsafe { sym::<GtkStringListNew>(gtk, "gtk_string_list_new") };
+
+        // Checkbox / CheckButton
+        let gtk_check_button_new_with_label = unsafe { sym::<GtkCheckButtonNewWithLabel>(gtk, "gtk_check_button_new_with_label") };
+        let gtk_check_button_get_active = unsafe { sym::<GtkCheckButtonGetActive>(gtk, "gtk_check_button_get_active") };
+        let gtk_check_button_set_active = unsafe { sym::<GtkCheckButtonSetActive>(gtk, "gtk_check_button_set_active") };
+        let gtk_check_button_set_group = unsafe { sym::<GtkCheckButtonSetGroup>(gtk, "gtk_check_button_set_group") };
+        let gtk_toggle_button_get_active = unsafe { sym::<GtkToggleButtonGetActive>(gtk, "gtk_toggle_button_get_active") };
+        let gtk_toggle_button_set_active = unsafe { sym::<GtkToggleButtonSetActive>(gtk, "gtk_toggle_button_set_active") };
+
+        // RadioButton
+        let gtk_radio_button_new_with_label = unsafe { sym::<GtkRadioButtonNewWithLabel>(gtk, "gtk_radio_button_new_with_label") };
+
+        // TextView / TextArea
+        let gtk_text_view_new = unsafe { sym::<GtkTextViewNew>(gtk, "gtk_text_view_new") };
+        let gtk_text_buffer_new = unsafe { sym::<GtkTextBufferNew>(gtk, "gtk_text_buffer_new") };
+        let gtk_text_view_get_buffer = unsafe { sym::<GtkTextViewGetBuffer>(gtk, "gtk_text_view_get_buffer") };
+        let gtk_text_buffer_set_text = unsafe { sym::<GtkTextBufferSetText>(gtk, "gtk_text_buffer_set_text") };
+        let gtk_text_buffer_get_text = unsafe { sym::<GtkTextBufferGetText>(gtk, "gtk_text_buffer_get_text") };
+        let gtk_text_buffer_get_start_iter = unsafe { sym::<GtkTextBufferGetStartIter>(gtk, "gtk_text_buffer_get_start_iter") };
+        let gtk_text_buffer_get_end_iter = unsafe { sym::<GtkTextBufferGetEndIter>(gtk, "gtk_text_buffer_get_end_iter") };
+        let gtk_text_iter_copy = unsafe { sym::<GtkTextIterCopy>(gtk, "gtk_text_iter_copy") };
+        let gtk_text_iter_free = unsafe { sym::<GtkTextIterFree>(gtk, "gtk_text_iter_free") };
+        let gtk_text_view_set_wrap_mode = unsafe { sym::<GtkTextViewSetWrapMode>(gtk, "gtk_text_view_set_wrap_mode") };
+
+        // Widget helpers
+        let gtk_widget_set_hexpand = unsafe { sym::<GtkWidgetSetHexpand>(gtk, "gtk_widget_set_hexpand") };
+        let gtk_widget_set_vexpand = unsafe { sym::<GtkWidgetSetVexpand>(gtk, "gtk_widget_set_vexpand") };
+
+        // GtkEditable (GTK4, replaces gtk_entry_get_text/set_text)
+        let gtk_editable_get_text = unsafe { sym::<GtkEditableGetText>(gtk, "gtk_editable_get_text") };
+        let gtk_editable_set_text = unsafe { sym::<GtkEditableSetText>(gtk, "gtk_editable_set_text") };
+
+        // GtkWidget parent handling
+        let gtk_widget_unparent = unsafe { sym::<GtkWidgetUnparent>(gtk, "gtk_widget_unparent") };
+
+        // GtkWindow default size
+        let gtk_window_set_default_size = unsafe { sym::<GtkWindowSetDefaultSize>(gtk, "gtk_window_set_default_size") };
+
         Ok(Symbols {
             g_main_loop_new, g_main_loop_run, g_main_loop_quit,
             g_object_ref, g_object_unref, g_object_ref_sink, g_signal_connect_data, g_signal_connect,
@@ -391,6 +565,17 @@ impl Symbols {
             gtk_label_set_xalign,
             gtk_event_controller_key_new,
             gtk_widget_add_controller,
+            gtk_gesture_click_new,
+            gtk_dialog_new, gtk_dialog_add_button, gtk_dialog_get_content_area, gtk_dialog_run, gtk_dialog_set_default_size,
+            gtk_combo_box_text_new, gtk_combo_box_text_append_text, gtk_combo_box_text_get_active_text, gtk_combo_box_set_active, gtk_combo_box_get_active,
+            gtk_drop_down_new, gtk_drop_down_set_selected, gtk_drop_down_get_selected, gtk_string_list_new,
+            gtk_check_button_new_with_label, gtk_check_button_get_active, gtk_check_button_set_active, gtk_check_button_set_group, gtk_toggle_button_get_active, gtk_toggle_button_set_active,
+            gtk_radio_button_new_with_label,
+            gtk_text_view_new, gtk_text_buffer_new, gtk_text_view_get_buffer, gtk_text_buffer_set_text, gtk_text_buffer_get_text, gtk_text_buffer_get_start_iter, gtk_text_buffer_get_end_iter, gtk_text_iter_copy, gtk_text_iter_free, gtk_text_view_set_wrap_mode,
+            gtk_widget_set_hexpand, gtk_widget_set_vexpand,
+            gtk_editable_get_text, gtk_editable_set_text,
+            gtk_widget_unparent,
+            gtk_window_set_default_size,
         })
     }
 }

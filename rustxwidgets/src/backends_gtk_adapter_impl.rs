@@ -3,7 +3,7 @@
 mod gtk_adapter {
     use std::os::raw::c_void;
     use crate::core::{Error, Widget};
-    use gtk_dynamic_loader::{Window as GWindow, Button as GButton, Label as GLabel, BoxWidget as GBox, Grid as GGrid, Entry as GEntry};
+    use gtk_dynamic_loader::{Window as GWindow, Button as GButton, Label as GLabel, BoxWidget as GBox, Grid as GGrid, Entry as GEntry, Dialog as GDialog, DropDown as GDropDown, CheckButton as GCheckButton, RadioButton as GRadioButton, TextView as GTextView};
 
     /// A thin transparent wrapper around gtk_compat::Window
     #[repr(transparent)]
@@ -30,6 +30,10 @@ mod gtk_adapter {
 
         pub fn insert_action_group(&self, name: &str, group_ptr: *mut std::os::raw::c_void) {
             self.0.insert_action_group(name, group_ptr);
+        }
+
+        pub fn set_default_size(&self, width: i32, height: i32) {
+            self.0.set_default_size(width, height);
         }
     }
 
@@ -114,6 +118,10 @@ mod gtk_adapter {
     }
 
     impl Clone for Entry { fn clone(&self) -> Self { Entry(self.0.clone()) } }
+    impl Clone for DropDown { fn clone(&self) -> Self { DropDown(self.0.clone()) } }
+    impl Clone for CheckButton { fn clone(&self) -> Self { CheckButton(self.0.clone()) } }
+    impl Clone for RadioButton { fn clone(&self) -> Self { RadioButton(self.0.clone()) } }
+    impl Clone for TextView { fn clone(&self) -> Self { TextView(self.0.clone()) } }
 
     // Factories delegate to backend so they share the App-owned loader
     pub fn create_window() -> Result<Window, Error> {
@@ -189,6 +197,111 @@ mod gtk_adapter {
     pub fn create_simple_action(name: &str) -> Result<SimpleAction, Error> {
         let a = crate::backends::gtk::create_simple_action(name).map_err(|e| Error::Backend(format!("{}", e)))?;
         Ok(SimpleAction(a))
+    }
+
+    // ---- Dialog ----
+
+    #[repr(transparent)]
+    pub struct Dialog(pub GDialog);
+    impl Widget for Dialog { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
+    impl AsRef<*mut c_void> for Dialog { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+
+    impl Dialog {
+        pub fn set_title(&self, title: &str) { self.0.set_title(title); }
+        pub fn set_default_size(&self, w: i32, h: i32) { self.0.set_default_size(w, h); }
+        pub fn add_button(&self, text: &str, response_id: i32) { self.0.add_button(text, response_id); }
+        pub fn get_content_area(&self) -> *mut c_void { self.0.get_content_area() }
+        pub fn present(&self) { self.0.present(); }
+        pub fn connect_response<F: FnMut(i32) + 'static>(&self, f: F) -> Result<u64, Error> {
+            self.0.connect_response(f).map_err(|e| Error::Backend(format!("{}", e)))
+        }
+    }
+
+    pub fn create_dialog() -> Result<Dialog, Error> {
+        let d = crate::backends::gtk::create_dialog().map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(Dialog(d))
+    }
+
+    // ---- DropDown ----
+
+    #[repr(transparent)]
+    pub struct DropDown(pub GDropDown);
+    impl Widget for DropDown { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
+    impl AsRef<*mut c_void> for DropDown { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+
+    impl DropDown {
+        pub fn set_active(&self, index: u32) { self.0.set_active(index); }
+        pub fn get_active(&self) -> i32 { self.0.get_active() }
+        pub fn connect_changed<F: FnMut() + 'static>(&self, f: F) -> Result<u64, Error> {
+            self.0.connect_changed(f).map_err(|e| Error::Backend(format!("{}", e)))
+        }
+    }
+
+    pub fn create_dropdown(items: &[&str]) -> Result<DropDown, Error> {
+        let d = crate::backends::gtk::create_dropdown(items).map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(DropDown(d))
+    }
+
+    // ---- CheckButton ----
+
+    #[repr(transparent)]
+    pub struct CheckButton(pub GCheckButton);
+    impl Widget for CheckButton { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
+    impl AsRef<*mut c_void> for CheckButton { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+
+    impl CheckButton {
+        pub fn is_active(&self) -> bool { self.0.is_active() }
+        pub fn set_active(&self, active: bool) { self.0.set_active(active); }
+        pub fn connect_toggled<F: FnMut() + 'static>(&self, f: F) -> Result<u64, Error> {
+            self.0.connect_toggled(f).map_err(|e| Error::Backend(format!("{}", e)))
+        }
+    }
+
+    pub fn create_checkbutton(label: &str) -> Result<CheckButton, Error> {
+        let c = crate::backends::gtk::create_checkbutton(label).map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(CheckButton(c))
+    }
+
+    // ---- RadioButton ----
+
+    #[repr(transparent)]
+    pub struct RadioButton(pub GRadioButton);
+    impl Widget for RadioButton { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
+    impl AsRef<*mut c_void> for RadioButton { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+
+    impl RadioButton {
+        pub fn is_active(&self) -> bool { self.0.is_active() }
+        pub fn set_active(&self, active: bool) { self.0.set_active(active); }
+        pub fn connect_toggled<F: FnMut() + 'static>(&self, f: F) -> Result<u64, Error> {
+            self.0.connect_toggled(f).map_err(|e| Error::Backend(format!("{}", e)))
+        }
+    }
+
+    pub fn create_radiobutton(group: Option<&RadioButton>, label: &str) -> Result<RadioButton, Error> {
+        let inner_group = group.map(|g| &g.0);
+        let r = crate::backends::gtk::create_radiobutton(inner_group, label).map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(RadioButton(r))
+    }
+
+    // ---- TextView ----
+
+    #[repr(transparent)]
+    pub struct TextView(pub GTextView);
+    impl Widget for TextView { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
+    impl AsRef<*mut c_void> for TextView { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+
+    impl TextView {
+        pub fn set_text(&self, text: &str) { self.0.set_text(text); }
+        pub fn get_text(&self) -> Option<String> { self.0.get_text() }
+        pub fn set_wrap_mode(&self, wrap_mode: i32) { self.0.set_wrap_mode(wrap_mode); }
+        pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
+        pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
+        pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
+    }
+
+    pub fn create_textview() -> Result<TextView, Error> {
+        let t = crate::backends::gtk::create_textview().map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(TextView(t))
     }
 
 }

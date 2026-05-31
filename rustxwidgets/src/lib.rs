@@ -8,5 +8,7 @@ pub mod backends;
 #[cfg(target_os = "linux")]
 mod backends_gtk_adapter_impl;
 pub mod backends_gtk_adapter;
+#[cfg(windows)]
+pub mod backends_nwg_adapter;
 
 pub use prelude::*;

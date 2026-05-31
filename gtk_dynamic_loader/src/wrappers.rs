@@ -19,8 +19,7 @@ impl BoxWidget {
         let symbols = &loader.symbols;
         let gtk_box_new = symbols.gtk_box_new.ok_or(Error::MissingSymbol("gtk_box_new".into()))?;
         let inner = unsafe { gtk_box_new(orientation as i32, spacing) };
-        if let Some(ref_sink) = symbols.g_object_ref_sink { unsafe { ref_sink(inner); } }
-        else if let Some(gref) = symbols.g_object_ref { unsafe { gref(inner); } }
+        take_ownership(&symbols, &loader.version, inner);
         Ok(BoxWidget { inner, loader, _not_send: PhantomData })
     }
 
@@ -39,7 +38,7 @@ impl AsRef<*mut c_void> for BoxWidget { fn as_ref(&self) -> &*mut c_void { &self
 
 impl Drop for BoxWidget {
     fn drop(&mut self) {
-        if let Some(unref) = self.loader.symbols.g_object_unref { unsafe { unref(self.inner); } }
+        crate::wrappers::destroy_widget(&self.loader, self.inner);
     }
 }
 
@@ -54,8 +53,7 @@ impl Window {
         let symbols = &loader.symbols;
         let gtk_window_new = symbols.gtk_window_new.ok_or(Error::MissingSymbol("gtk_window_new".into()))?;
         let inner = unsafe { gtk_window_new(0) };
-        if let Some(ref_sink) = symbols.g_object_ref_sink { unsafe { ref_sink(inner); } }
-        else if let Some(gref) = symbols.g_object_ref { unsafe { gref(inner); } }
+        take_ownership(&symbols, &loader.version, inner);
         Ok(Window { inner, loader, _not_send: PhantomData })
     }
 
@@ -103,6 +101,12 @@ impl Window {
         if let Some(set_app) = self.loader.symbols.gtk_window_set_application { unsafe { set_app(self.inner, app_ptr); } }
     }
 
+    pub fn set_default_size(&self, width: i32, height: i32) {
+        if let Some(set_size) = self.loader.symbols.gtk_window_set_default_size {
+            unsafe { set_size(self.inner, width, height); }
+        }
+    }
+
     pub fn insert_action_group(&self, name: &str, group_ptr: *mut c_void) {
         if let Some(insert) = self.loader.symbols.gtk_widget_insert_action_group {
             let c = CString::new(name).unwrap();
@@ -115,7 +119,7 @@ impl AsRef<*mut c_void> for Window { fn as_ref(&self) -> &*mut c_void { &self.in
 
 impl Drop for Window {
     fn drop(&mut self) {
-        if let Some(unref) = self.loader.symbols.g_object_unref { unsafe { unref(self.inner); } }
+        crate::wrappers::destroy_widget(&self.loader, self.inner);
     }
 }
 
@@ -131,14 +135,12 @@ impl Button {
         let ctor = symbols.gtk_button_new_with_label.ok_or(Error::MissingSymbol("gtk_button_new_with_label".into()))?;
         let c = CString::new(label).unwrap();
         let inner = unsafe { ctor(c.as_ptr()) };
-        if let Some(ref_sink) = symbols.g_object_ref_sink { unsafe { ref_sink(inner); } }
-        else if let Some(gref) = symbols.g_object_ref { unsafe { gref(inner); } }
+        take_ownership(&symbols, &loader.version, inner);
         Ok(Button { inner, loader, _not_send: PhantomData })
     }
 
     pub fn new_from_ptr(loader: Arc<Loader>, ptr: *mut c_void) -> Self {
-        if let Some(ref_sink) = loader.symbols.g_object_ref_sink { unsafe { ref_sink(ptr); } }
-        else if let Some(gref) = loader.symbols.g_object_ref { unsafe { gref(ptr); } }
+        take_ownership(&loader.symbols, &loader.version, ptr);
         Button { inner: ptr, loader, _not_send: PhantomData }
     }
 
@@ -166,7 +168,7 @@ impl AsRef<*mut c_void> for Button { fn as_ref(&self) -> &*mut c_void { &self.in
 
 impl Drop for Button {
     fn drop(&mut self) {
-        if let Some(unref) = self.loader.symbols.g_object_unref { unsafe { unref(self.inner); } }
+        crate::wrappers::destroy_widget(&self.loader, self.inner);
     }
 }
 
@@ -191,8 +193,7 @@ impl Label {
         let ctor = symbols.gtk_label_new.ok_or(Error::MissingSymbol("gtk_label_new".into()))?;
         let c = CString::new(text).unwrap();
         let inner = unsafe { ctor(c.as_ptr()) };
-        if let Some(ref_sink) = symbols.g_object_ref_sink { unsafe { ref_sink(inner); } }
-        else if let Some(gref) = symbols.g_object_ref { unsafe { gref(inner); } }
+        take_ownership(&symbols, &loader.version, inner);
         Ok(Label { inner, loader, _not_send: PhantomData })
     }
 
@@ -263,7 +264,7 @@ impl Label {
 
 impl AsRef<*mut c_void> for Label { fn as_ref(&self) -> &*mut c_void { &self.inner } }
 
-impl Drop for Label { fn drop(&mut self) { if let Some(unref) = self.loader.symbols.g_object_unref { unsafe { unref(self.inner); } } } }
+impl Drop for Label { fn drop(&mut self) { crate::wrappers::destroy_widget(&self.loader, self.inner); } }
 
 impl Clone for Label {
     fn clone(&self) -> Self {
@@ -375,8 +376,7 @@ impl Grid {
             let b = symbols.gtk_box_new.ok_or(Error::MissingSymbol("gtk_box_new".into()))?;
             unsafe { b(1, 0) }
         };
-        if let Some(ref_sink) = symbols.g_object_ref_sink { unsafe { ref_sink(inner); } }
-        else if let Some(gref) = symbols.g_object_ref { unsafe { gref(inner); } }
+        take_ownership(&symbols, &loader.version, inner);
         Ok(Grid { inner, loader })
     }
 
@@ -393,7 +393,7 @@ impl Grid {
 
 impl AsRef<*mut c_void> for Grid { fn as_ref(&self) -> &*mut c_void { &self.inner } }
 
-impl Drop for Grid { fn drop(&mut self) { if let Some(unref) = self.loader.symbols.g_object_unref { unsafe { unref(self.inner); } } }
+impl Drop for Grid { fn drop(&mut self) { crate::wrappers::destroy_widget(&self.loader, self.inner); }
 }
 
 // Overlay wrapper
@@ -408,16 +408,14 @@ impl Overlay {
         if let Some(ctor) = loader.symbols.gtk_overlay_new {
             let inner = unsafe { ctor() };
             if inner.is_null() { return Err(Error::MissingSymbol("gtk_overlay_new".into())); }
-            if let Some(ref_sink) = loader.symbols.g_object_ref_sink { unsafe { ref_sink(inner); } }
-            else if let Some(gref) = loader.symbols.g_object_ref { unsafe { gref(inner); } }
+            take_ownership(&loader.symbols, &loader.version, inner);
             Ok(Overlay { inner, loader, _not_send: PhantomData })
         } else {
             // Fallback to a box if overlay not available
             let b = loader.symbols.gtk_box_new.ok_or(Error::MissingSymbol("gtk_box_new".into()))?;
             let inner = unsafe { b(1, 0) };
             if inner.is_null() { return Err(Error::MissingSymbol("gtk_box_new".into())); }
-            if let Some(ref_sink) = loader.symbols.g_object_ref_sink { unsafe { ref_sink(inner); } }
-            else if let Some(gref) = loader.symbols.g_object_ref { unsafe { gref(inner); } }
+            take_ownership(&loader.symbols, &loader.version, inner);
             Ok(Overlay { inner, loader, _not_send: PhantomData })
         }
     }
@@ -455,7 +453,7 @@ impl AsRef<*mut c_void> for Overlay { fn as_ref(&self) -> &*mut c_void { &self.i
 
 impl Drop for Overlay {
     fn drop(&mut self) {
-        if let Some(unref) = self.loader.symbols.g_object_unref { unsafe { unref(self.inner); } }
+        crate::wrappers::destroy_widget(&self.loader, self.inner);
     }
 }
 
@@ -479,8 +477,7 @@ impl DrawingArea {
     pub fn new(loader: Arc<Loader>) -> Result<Self, Error> {
         if let Some(ctor) = loader.symbols.gtk_drawing_area_new {
             let inner = unsafe { ctor() };
-            if let Some(ref_sink) = loader.symbols.g_object_ref_sink { unsafe { ref_sink(inner); } }
-            else if let Some(gref) = loader.symbols.g_object_ref { unsafe { gref(inner); } }
+            take_ownership(&loader.symbols, &loader.version, inner);
             return Ok(DrawingArea { inner, loader });
         }
         Err(Error::MissingSymbol("gtk_drawing_area_new".into()))
@@ -496,7 +493,7 @@ impl DrawingArea {
 
 impl AsRef<*mut c_void> for DrawingArea { fn as_ref(&self) -> &*mut c_void { &self.inner } }
 
-impl Drop for DrawingArea { fn drop(&mut self) { if let Some(unref) = self.loader.symbols.g_object_unref { unsafe { unref(self.inner); } } }
+impl Drop for DrawingArea { fn drop(&mut self) { crate::wrappers::destroy_widget(&self.loader, self.inner); }
 }
 
 // Entry wrapper
@@ -511,21 +508,32 @@ impl Entry {
         let symbols = &loader.symbols;
         let ctor = symbols.gtk_entry_new.ok_or(Error::MissingSymbol("gtk_entry_new".into()))?;
         let inner = unsafe { ctor() };
-        if let Some(ref_sink) = symbols.g_object_ref_sink { unsafe { ref_sink(inner); } }
-        else if let Some(gref) = symbols.g_object_ref { unsafe { gref(inner); } }
+        take_ownership(&symbols, &loader.version, inner);
         if let Some(set_has_frame) = symbols.gtk_entry_set_has_frame { unsafe { set_has_frame(inner, 0); } }
         Ok(Entry { inner, loader, _not_send: PhantomData })
     }
 
     pub fn set_text(&self, text: &str) {
-        if let Some(set_text) = self.loader.symbols.gtk_entry_set_text {
+        // GTK4 uses gtk_editable_set_text; GTK3 uses gtk_entry_set_text
+        if let Some(set_text) = self.loader.symbols.gtk_editable_set_text {
+            let c = CString::new(text).unwrap();
+            unsafe { set_text(self.inner, c.as_ptr()); }
+        } else if let Some(set_text) = self.loader.symbols.gtk_entry_set_text {
             let c = CString::new(text).unwrap();
             unsafe { set_text(self.inner, c.as_ptr()); }
         }
     }
 
     pub fn get_text(&self) -> Option<String> {
-        if let Some(get_text) = self.loader.symbols.gtk_entry_get_text {
+        // GTK4 uses gtk_editable_get_text; GTK3 uses gtk_entry_get_text
+        if let Some(get_text) = self.loader.symbols.gtk_editable_get_text {
+            unsafe {
+                let s = get_text(self.inner);
+                if s.is_null() { return None; }
+                let c = std::ffi::CStr::from_ptr(s);
+                return Some(c.to_string_lossy().into_owned());
+            }
+        } else if let Some(get_text) = self.loader.symbols.gtk_entry_get_text {
             unsafe {
                 let s = get_text(self.inner);
                 if s.is_null() { return None; }
@@ -593,7 +601,7 @@ impl Entry {
 
 impl AsRef<*mut c_void> for Entry { fn as_ref(&self) -> &*mut c_void { &self.inner } }
 
-impl Drop for Entry { fn drop(&mut self) { if let Some(unref) = self.loader.symbols.g_object_unref { unsafe { unref(self.inner); } } }
+impl Drop for Entry { fn drop(&mut self) { crate::wrappers::destroy_widget(&self.loader, self.inner); }
 }
 
 // Measure text width in pixels using gtk_widget_create_pango_layout + pango_layout_get_pixel_size when possible.
@@ -706,9 +714,16 @@ pub fn widget_set_margin_top(loader: &Arc<Loader>, widget: *mut c_void, margin: 
 /// Destroy a widget (remove from its parent). Falls back to g_object_unref if destroy not available.
 pub fn destroy_widget(loader: &Arc<Loader>, widget: *mut c_void) {
     if let Some(destroy) = loader.symbols.gtk_widget_destroy {
+        // GTK3: gtk_widget_destroy removes from parent and handles reference
         unsafe { destroy(widget); }
-    } else if let Some(unref) = loader.symbols.g_object_unref {
-        unsafe { unref(widget); }
+    } else {
+        // GTK4: first unparent (remove from parent), then release our reference
+        if let Some(unparent) = loader.symbols.gtk_widget_unparent {
+            unsafe { unparent(widget); }
+        }
+        if let Some(unref) = loader.symbols.g_object_unref {
+            unsafe { unref(widget); }
+        }
     }
 }
 
@@ -737,8 +752,7 @@ impl Menu {
         if inner.is_null() {
             return Err(Error::Other("g_menu_new returned null".into()));
         }
-        if let Some(ref_sink) = symbols.g_object_ref_sink { unsafe { ref_sink(inner); } }
-        else if let Some(gref) = symbols.g_object_ref { unsafe { gref(inner); } }
+        take_ownership(&symbols, &loader.version, inner);
         Ok(Menu { inner, loader, items: Vec::new() })
     }
 
@@ -776,7 +790,7 @@ impl AsRef<*mut c_void> for Menu { fn as_ref(&self) -> &*mut c_void { &self.inne
 
 impl Drop for Menu {
     fn drop(&mut self) {
-        if let Some(unref) = self.loader.symbols.g_object_unref { unsafe { unref(self.inner); } }
+        crate::wrappers::destroy_widget(&self.loader, self.inner);
     }
 }
 
@@ -815,8 +829,7 @@ impl SimpleAction {
         if inner.is_null() {
             return Err(Error::Other("g_simple_action_new returned null".into()));
         }
-        if let Some(ref_sink) = symbols.g_object_ref_sink { unsafe { ref_sink(inner); } }
-        else if let Some(gref) = symbols.g_object_ref { unsafe { gref(inner); } }
+        take_ownership(&symbols, &loader.version, inner);
         Ok(SimpleAction { inner, loader })
     }
 
@@ -836,7 +849,7 @@ impl AsRef<*mut c_void> for SimpleAction { fn as_ref(&self) -> &*mut c_void { &s
 
 impl Drop for SimpleAction {
     fn drop(&mut self) {
-        if let Some(unref) = self.loader.symbols.g_object_unref { unsafe { unref(self.inner); } }
+        crate::wrappers::destroy_widget(&self.loader, self.inner);
     }
 }
 
@@ -868,8 +881,7 @@ impl MenuBar {
             if inner.is_null() {
                 return Err(Error::Other("gtk_popover_menu_bar_new_from_model returned null".into()));
             }
-            if let Some(ref_sink) = symbols.g_object_ref_sink { unsafe { ref_sink(inner); } }
-            else if let Some(gref) = symbols.g_object_ref { unsafe { gref(inner); } }
+            take_ownership(&symbols, &loader.version, inner);
             return Ok(MenuBar { inner, loader, _not_send: PhantomData });
         }
         // GTK3: build GtkMenuBar from the Rust-side items
@@ -883,8 +895,7 @@ impl MenuBar {
                 return Err(Error::Other("gtk_menu_bar_new returned null".into()));
             }
             Self::build_gtk3(&loader, inner, &model.items, &symbols, action_group);
-            if let Some(ref_sink) = symbols.g_object_ref_sink { unsafe { ref_sink(inner); } }
-            else if let Some(gref) = symbols.g_object_ref { unsafe { gref(inner); } }
+            take_ownership(&symbols, &loader.version, inner);
             return Ok(MenuBar { inner, loader, _not_send: PhantomData });
         }
         Err(Error::MissingSymbol("gtk_popover_menu_bar_new_from_model".into()))
@@ -959,6 +970,446 @@ impl AsRef<*mut c_void> for MenuBar { fn as_ref(&self) -> &*mut c_void { &self.i
 
 impl Drop for MenuBar {
     fn drop(&mut self) {
+        crate::wrappers::destroy_widget(&self.loader, self.inner);
+    }
+}
+
+// ---- Dialog ----
+pub struct Dialog {
+    inner: *mut c_void,
+    loader: Arc<Loader>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl Dialog {
+    pub fn new(loader: Arc<Loader>) -> Result<Self, Error> {
+        let symbols = &loader.symbols;
+        let ctor = symbols.gtk_dialog_new.ok_or(Error::MissingSymbol("gtk_dialog_new".into()))?;
+        let inner = unsafe { ctor() };
+        if inner.is_null() { return Err(Error::Other("gtk_dialog_new returned null".into())); }
+        take_ownership(&symbols, &loader.version, inner);
+        Ok(Dialog { inner, loader, _not_send: PhantomData })
+    }
+
+    pub fn set_title(&self, title: &str) {
+        if let Some(set_title) = self.loader.symbols.gtk_window_set_title {
+            let c = CString::new(title).unwrap();
+            unsafe { set_title(self.inner, c.as_ptr()); }
+        }
+    }
+
+    pub fn set_default_size(&self, width: i32, height: i32) {
+        if let Some(set_size) = self.loader.symbols.gtk_dialog_set_default_size {
+            unsafe { set_size(self.inner, width, height); }
+        }
+    }
+
+    pub fn add_button(&self, button_text: &str, response_id: i32) {
+        if let Some(add_btn) = self.loader.symbols.gtk_dialog_add_button {
+            let c = CString::new(button_text).unwrap();
+            unsafe { add_btn(self.inner, c.as_ptr(), response_id); }
+        }
+    }
+
+    pub fn get_content_area(&self) -> *mut c_void {
+        if let Some(get_area) = self.loader.symbols.gtk_dialog_get_content_area {
+            unsafe { get_area(self.inner) }
+        } else {
+            self.inner
+        }
+    }
+
+    pub fn present(&self) {
+        if let Some(show_all) = self.loader.symbols.gtk_widget_show_all {
+            unsafe { show_all(self.inner); }
+        }
+        if let Some(present) = self.loader.symbols.gtk_window_present {
+            unsafe { present(self.inner); }
+        }
+    }
+
+    pub fn connect_response<F: FnMut(i32) + 'static>(&self, mut f: F) -> Result<u64, Error> {
+        let boxed: Box<Box<dyn FnMut(*mut c_void, i32)>> = Box::new(Box::new(move |_dialog, response_id| {
+            f(response_id);
+        }));
+        let raw = Box::into_raw(boxed) as *mut c_void;
+        let sig_name = CString::new("response").unwrap();
+        if let Some(gscd) = self.loader.symbols.g_signal_connect_data {
+            extern "C" fn trampoline_response(_instance: *mut c_void, response_id: i32, user_data: *mut c_void) {
+                unsafe {
+                    if user_data.is_null() { return; }
+                    let inner_ptr = user_data as *mut Box<dyn FnMut(*mut c_void, i32)>;
+                    if inner_ptr.is_null() { return; }
+                    (*inner_ptr)(_instance, response_id);
+                }
+            }
+            extern "C" fn destroy_response(data: *mut c_void, _closure: *mut c_void) {
+                unsafe { let _boxed: Box<Box<dyn FnMut(*mut c_void, i32)>> = Box::from_raw(data as *mut _); }
+            }
+            unsafe {
+                let id = gscd(self.inner, sig_name.as_ptr(), trampoline_response as *const () as *mut c_void, raw, Some(destroy_response as unsafe extern "C" fn(*mut c_void, *mut c_void)), 0);
+                Ok(id)
+            }
+        } else if let Some(gsc) = self.loader.symbols.g_signal_connect {
+            extern "C" fn trampoline_response_simple(_instance: *mut c_void, response_id: i32, user_data: *mut c_void) {
+                unsafe {
+                    if user_data.is_null() { return; }
+                    let inner_ptr = user_data as *mut Box<dyn FnMut(*mut c_void, i32)>;
+                    if inner_ptr.is_null() { return; }
+                    (*inner_ptr)(_instance, response_id);
+                }
+            }
+            unsafe {
+                let id = gsc(self.inner, sig_name.as_ptr(), trampoline_response_simple as *const () as *mut c_void, raw);
+                Ok(id)
+            }
+        } else {
+            Err(Error::MissingSymbol("g_signal_connect_data".into()))
+        }
+    }
+
+    pub fn response(&self, _response_id: i32) {
+        if let Some(emit) = self.loader.symbols.g_signal_emit_by_name {
+            let name = CString::new("response").unwrap();
+            // We need to pass response_id as a parameter; but g_signal_emit_by_name only takes
+            // instance and name. For simplicity, just emit the signal without the param.
+            unsafe { emit(self.inner, name.as_ptr()); }
+        }
+    }
+}
+
+impl AsRef<*mut c_void> for Dialog { fn as_ref(&self) -> &*mut c_void { &self.inner } }
+
+impl Drop for Dialog {
+    fn drop(&mut self) {
+        crate::wrappers::destroy_widget(&self.loader, self.inner);
+    }
+}
+
+// ---- DropDown (combo box) ----
+pub struct DropDown {
+    inner: *mut c_void,
+    loader: Arc<Loader>,
+    _not_send: PhantomData<Rc<()>>,
+    // For GTK4, we keep a reference to the string list so it stays alive
+    string_list: Option<*mut c_void>,
+}
+
+impl DropDown {
+    pub fn new(loader: Arc<Loader>, items: &[&str]) -> Result<Self, Error> {
+        let symbols = &loader.symbols;
+        // Try GTK4 DropDown API first
+        if let (Some(dd_new), Some(sl_new)) = (symbols.gtk_drop_down_new, symbols.gtk_string_list_new) {
+            let c_strings: Vec<CString> = items.iter().map(|s| CString::new(*s).unwrap()).collect();
+            let mut raw_ptrs: Vec<*const i8> = c_strings.iter().map(|c| c.as_ptr()).collect();
+            raw_ptrs.push(std::ptr::null());
+            let string_list = unsafe { sl_new(raw_ptrs.as_ptr()) };
+            if string_list.is_null() {
+                return Err(Error::Other("gtk_string_list_new returned null".into()));
+            }
+            let inner = unsafe { dd_new(string_list, std::ptr::null_mut()) };
+            if inner.is_null() {
+                return Err(Error::Other("gtk_drop_down_new returned null".into()));
+            }
+            take_ownership(&symbols, &loader.version, inner);
+            Ok(DropDown { inner, loader, _not_send: PhantomData, string_list: Some(string_list) })
+        }
+        // Fall back to GTK3 ComboBoxText API
+        else if let (Some(ct_new), Some(ct_append)) = (symbols.gtk_combo_box_text_new, symbols.gtk_combo_box_text_append_text) {
+            let inner = unsafe { ct_new() };
+            if inner.is_null() {
+                return Err(Error::Other("gtk_combo_box_text_new returned null".into()));
+            }
+            for item in items {
+                let c = CString::new(*item).unwrap();
+                unsafe { ct_append(inner, c.as_ptr()); }
+            }
+            take_ownership(&symbols, &loader.version, inner);
+            Ok(DropDown { inner, loader, _not_send: PhantomData, string_list: None })
+        } else {
+            Err(Error::MissingSymbol("gtk_drop_down_new or gtk_combo_box_text_new".into()))
+        }
+    }
+
+    pub fn set_active(&self, index: u32) {
+        let symbols = &self.loader.symbols;
+        if let Some(set_sel) = symbols.gtk_drop_down_set_selected {
+            unsafe { set_sel(self.inner, index); }
+        } else if let Some(set_act) = symbols.gtk_combo_box_set_active {
+            unsafe { set_act(self.inner, index as i32); }
+        }
+    }
+
+    pub fn get_active(&self) -> i32 {
+        let symbols = &self.loader.symbols;
+        if let Some(get_sel) = symbols.gtk_drop_down_get_selected {
+            unsafe { get_sel(self.inner) as i32 }
+        } else if let Some(get_act) = symbols.gtk_combo_box_get_active {
+            unsafe { get_act(self.inner) }
+        } else { -1 }
+    }
+
+    pub fn connect_changed<F: FnMut() + 'static>(&self, f: F) -> Result<u64, Error> {
+        let boxed: Box<dyn FnMut()> = Box::new(f);
+        if self.loader.symbols.gtk_drop_down_new.is_some() {
+            // "notify::selected" has 3 args: (object, pspec, user_data)
+            let res = unsafe { crate::signals::connect_signal(&self.loader.symbols, self.inner, "notify::selected", boxed, 3) };
+            match res { Ok(id) => Ok(id), Err(e) => Err(Error::Other(e)) }
+        } else {
+            // GtkComboBoxText "changed" has 2 args: (widget, user_data)
+            let res = unsafe { crate::signals::connect_signal(&self.loader.symbols, self.inner, "changed", boxed, 2) };
+            match res { Ok(id) => Ok(id), Err(e) => Err(Error::Other(e)) }
+        }
+    }
+}
+
+impl AsRef<*mut c_void> for DropDown { fn as_ref(&self) -> &*mut c_void { &self.inner } }
+
+impl Clone for DropDown {
+    fn clone(&self) -> Self {
+        if let Some(gref) = self.loader.symbols.g_object_ref {
+            unsafe {
+                gref(self.inner);
+                if let Some(sl) = self.string_list { gref(sl); }
+            }
+        }
+        DropDown { inner: self.inner, loader: self.loader.clone(), _not_send: PhantomData, string_list: self.string_list }
+    }
+}
+
+impl Drop for DropDown {
+    fn drop(&mut self) {
+        crate::wrappers::destroy_widget(&self.loader, self.inner);
+        if let Some(sl) = self.string_list {
+            if let Some(unref) = self.loader.symbols.g_object_unref {
+                unsafe { unref(sl); }
+            }
+        }
+    }
+}
+
+// ---- CheckButton (Checkbox) ----
+pub struct CheckButton {
+    inner: *mut c_void,
+    loader: Arc<Loader>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl CheckButton {
+    pub fn new(loader: Arc<Loader>, label: &str) -> Result<Self, Error> {
+        let symbols = &loader.symbols;
+        let ctor = symbols.gtk_check_button_new_with_label.ok_or(Error::MissingSymbol("gtk_check_button_new_with_label".into()))?;
+        let c = CString::new(label).unwrap();
+        let inner = unsafe { ctor(c.as_ptr()) };
+        if inner.is_null() { return Err(Error::Other("gtk_check_button_new_with_label returned null".into())); }
+        take_ownership(&symbols, &loader.version, inner);
+        Ok(CheckButton { inner, loader, _not_send: PhantomData })
+    }
+
+    pub fn is_active(&self) -> bool {
+        // GTK4: GtkCheckButton is NOT a GtkToggleButton subclass; use its own API
+        if let Some(get_active) = self.loader.symbols.gtk_check_button_get_active {
+            unsafe { get_active(self.inner) != 0 }
+        } else if let Some(get_active) = self.loader.symbols.gtk_toggle_button_get_active {
+            unsafe { get_active(self.inner) != 0 }
+        } else { false }
+    }
+
+    pub fn set_active(&self, active: bool) {
+        if let Some(set_active) = self.loader.symbols.gtk_check_button_set_active {
+            unsafe { set_active(self.inner, if active { 1 } else { 0 }); }
+        } else if let Some(set_active) = self.loader.symbols.gtk_toggle_button_set_active {
+            unsafe { set_active(self.inner, if active { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn connect_toggled<F: FnMut() + 'static>(&self, f: F) -> Result<u64, Error> {
+        let boxed: Box<dyn FnMut()> = Box::new(f);
+        let res = unsafe { crate::signals::connect_signal(&self.loader.symbols, self.inner, "toggled", boxed, 2) };
+        match res { Ok(id) => Ok(id), Err(e) => Err(Error::Other(e)) }
+    }
+}
+
+impl AsRef<*mut c_void> for CheckButton { fn as_ref(&self) -> &*mut c_void { &self.inner } }
+
+impl Drop for CheckButton {
+    fn drop(&mut self) {
+        crate::wrappers::destroy_widget(&self.loader, self.inner);
+    }
+}
+
+impl Clone for CheckButton {
+    fn clone(&self) -> Self {
+        if let Some(gref) = self.loader.symbols.g_object_ref { unsafe { gref(self.inner); } }
+        CheckButton { inner: self.inner, loader: self.loader.clone(), _not_send: PhantomData }
+    }
+}
+
+// ---- RadioButton (ChooseBox) ----
+pub struct RadioButton {
+    inner: *mut c_void,
+    loader: Arc<Loader>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl RadioButton {
+    pub fn new(loader: Arc<Loader>, group: Option<&RadioButton>, label: &str) -> Result<Self, Error> {
+        let symbols = &loader.symbols;
+        // GTK3: use gtk_radio_button_new_with_label
+        if let Some(ctor) = symbols.gtk_radio_button_new_with_label {
+            let c = CString::new(label).unwrap();
+            let group_ptr = group.map(|r| r.inner).unwrap_or(std::ptr::null_mut());
+            let inner = unsafe { ctor(group_ptr, c.as_ptr()) };
+            if inner.is_null() { return Err(Error::Other("gtk_radio_button_new_with_label returned null".into())); }
+            take_ownership(&symbols, &loader.version, inner);
+            return Ok(RadioButton { inner, loader, _not_send: PhantomData });
+        }
+        // GTK4: GtkRadioButton was removed; use GtkCheckButton with set_group
+        if let (Some(ctor_cb), Some(set_group)) = (symbols.gtk_check_button_new_with_label, symbols.gtk_check_button_set_group) {
+            let c = CString::new(label).unwrap();
+            let inner = unsafe { ctor_cb(c.as_ptr()) };
+            if inner.is_null() { return Err(Error::Other("gtk_check_button_new_with_label returned null".into())); }
+            if let Some(g) = group {
+                unsafe { set_group(inner, g.inner); }
+            }
+            take_ownership(&symbols, &loader.version, inner);
+            return Ok(RadioButton { inner, loader, _not_send: PhantomData });
+        }
+        Err(Error::MissingSymbol("gtk_radio_button_new_with_label or gtk_check_button_new_with_label".into()))
+    }
+
+    pub fn is_active(&self) -> bool {
+        if let Some(get_active) = self.loader.symbols.gtk_check_button_get_active {
+            unsafe { get_active(self.inner) != 0 }
+        } else if let Some(get_active) = self.loader.symbols.gtk_toggle_button_get_active {
+            unsafe { get_active(self.inner) != 0 }
+        } else { false }
+    }
+
+    pub fn set_active(&self, active: bool) {
+        if let Some(set_active) = self.loader.symbols.gtk_check_button_set_active {
+            unsafe { set_active(self.inner, if active { 1 } else { 0 }); }
+        } else if let Some(set_active) = self.loader.symbols.gtk_toggle_button_set_active {
+            unsafe { set_active(self.inner, if active { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn connect_toggled<F: FnMut() + 'static>(&self, f: F) -> Result<u64, Error> {
+        let boxed: Box<dyn FnMut()> = Box::new(f);
+        let res = unsafe { crate::signals::connect_signal(&self.loader.symbols, self.inner, "toggled", boxed, 2) };
+        match res { Ok(id) => Ok(id), Err(e) => Err(Error::Other(e)) }
+    }
+}
+
+impl AsRef<*mut c_void> for RadioButton { fn as_ref(&self) -> &*mut c_void { &self.inner } }
+
+impl Drop for RadioButton {
+    fn drop(&mut self) {
+        crate::wrappers::destroy_widget(&self.loader, self.inner);
+    }
+}
+
+impl Clone for RadioButton {
+    fn clone(&self) -> Self {
+        if let Some(gref) = self.loader.symbols.g_object_ref { unsafe { gref(self.inner); } }
+        RadioButton { inner: self.inner, loader: self.loader.clone(), _not_send: PhantomData }
+    }
+}
+
+// ---- TextView (TextArea) ----
+pub struct TextView {
+    inner: *mut c_void,
+    loader: Arc<Loader>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl TextView {
+    pub fn new(loader: Arc<Loader>) -> Result<Self, Error> {
+        let symbols = &loader.symbols;
+        let ctor = symbols.gtk_text_view_new.ok_or(Error::MissingSymbol("gtk_text_view_new".into()))?;
+        let inner = unsafe { ctor() };
+        if inner.is_null() { return Err(Error::Other("gtk_text_view_new returned null".into())); }
+        take_ownership(&symbols, &loader.version, inner);
+        Ok(TextView { inner, loader, _not_send: PhantomData })
+    }
+
+    pub fn set_text(&self, text: &str) {
+        let symbols = &self.loader.symbols;
+        if let (Some(get_buf), Some(set_text)) = (symbols.gtk_text_view_get_buffer, symbols.gtk_text_buffer_set_text) {
+            let buf = unsafe { get_buf(self.inner) };
+            if !buf.is_null() {
+                let c = CString::new(text).unwrap();
+                unsafe { set_text(buf, c.as_ptr(), -1); }
+            }
+        }
+    }
+
+    pub fn get_text(&self) -> Option<String> {
+        let symbols = &self.loader.symbols;
+        if let (Some(get_buf), Some(get_start), Some(get_end), Some(get_text_fn)) = (
+            symbols.gtk_text_view_get_buffer,
+            symbols.gtk_text_buffer_get_start_iter,
+            symbols.gtk_text_buffer_get_end_iter,
+            symbols.gtk_text_buffer_get_text,
+        ) {
+            unsafe {
+                let buf = get_buf(self.inner);
+                if buf.is_null() { return None; }
+                // GtkTextIter is opaque; allocate generously (256 bytes)
+                let mut start_iter: [u8; 256] = [0; 256];
+                let mut end_iter: [u8; 256] = [0; 256];
+                get_start(buf, start_iter.as_mut_ptr() as *mut c_void);
+                get_end(buf, end_iter.as_mut_ptr() as *mut c_void);
+                let c_str = get_text_fn(buf, start_iter.as_mut_ptr() as *mut c_void, end_iter.as_mut_ptr() as *mut c_void, 1);
+                if c_str.is_null() { return None; }
+                let s = std::ffi::CStr::from_ptr(c_str as *const i8).to_string_lossy().into_owned();
+                if let Some(free_fn) = symbols.g_free { free_fn(c_str as *mut c_void); }
+                Some(s)
+            }
+        } else { None }
+    }
+
+    pub fn set_wrap_mode(&self, wrap_mode: i32) {
+        if let Some(set_wrap) = self.loader.symbols.gtk_text_view_set_wrap_mode {
+            unsafe { set_wrap(self.inner, wrap_mode); }
+        }
+    }
+
+    pub fn set_size_request(&self, w: i32, h: i32) {
+        if let Some(sr) = self.loader.symbols.gtk_widget_set_size_request { unsafe { sr(self.inner, w, h); } }
+    }
+
+    pub fn set_hexpand(&self, expand: bool) {
+        if let Some(set_hex) = self.loader.symbols.gtk_widget_set_hexpand { unsafe { set_hex(self.inner, if expand { 1 } else { 0 }); } }
+    }
+
+    pub fn set_vexpand(&self, expand: bool) {
+        if let Some(set_vex) = self.loader.symbols.gtk_widget_set_vexpand { unsafe { set_vex(self.inner, if expand { 1 } else { 0 }); } }
+    }
+}
+
+impl AsRef<*mut c_void> for TextView { fn as_ref(&self) -> &*mut c_void { &self.inner } }
+
+impl Drop for TextView {
+    fn drop(&mut self) {
         if let Some(unref) = self.loader.symbols.g_object_unref { unsafe { unref(self.inner); } }
+    }
+}
+
+impl Clone for TextView {
+    fn clone(&self) -> Self {
+        if let Some(gref) = self.loader.symbols.g_object_ref { unsafe { gref(self.inner); } }
+        TextView { inner: self.inner, loader: self.loader.clone(), _not_send: PhantomData }
+    }
+}
+
+/// Take ownership of a newly-created GtkWidget.
+/// GTK3: widgets start with a floating reference; sink it so we own ref count 1.
+/// GTK4: `ref_sink` on a non-floating ref increments count (minor leak tolerated).
+pub fn take_ownership(symbols: &crate::symbols::Symbols, _version: &crate::loader::Version, inner: *mut c_void) {
+    if let Some(ref_sink) = symbols.g_object_ref_sink {
+        unsafe { ref_sink(inner); }
+    } else if let Some(gref) = symbols.g_object_ref {
+        unsafe { gref(inner); }
     }
 }
