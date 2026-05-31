@@ -29,11 +29,7 @@ fn compute_spans(grid: &Vec<Vec<gtk::Entry>>, loader: &std::sync::Arc<gtk_dynami
 fn rebuild_overlays(overlay: &gtk_dynamic_loader::Overlay, overlay_labels: &Rc<RefCell<Vec<gtk_dynamic_loader::Label>>>, grid: &Rc<Vec<Vec<gtk::Entry>>>, loader: &std::sync::Arc<gtk_dynamic_loader::Loader>, per_cell_px: i32) {
     // Try to take mutable borrow to remove existing overlay labels. If unavailable (re-entrant), skip.
     if let Ok(mut existing) = overlay_labels.try_borrow_mut() {
-        let drained = existing.drain(..).collect::<Vec<_>>();
-        drop(existing);
-        for lbl in drained.into_iter() {
-            gtk_dynamic_loader::destroy_widget(loader, *lbl.as_ref());
-        }
+        existing.clear();
     } else {
         // Another borrow is active; don't try to mutate now to avoid panic.
         return;
@@ -65,7 +61,7 @@ fn rebuild_overlays(overlay: &gtk_dynamic_loader::Overlay, overlay_labels: &Rc<R
     if let Ok(mut existing) = overlay_labels.try_borrow_mut() {
         existing.extend(new_labels.into_iter());
     } else {
-        for lbl in new_labels.into_iter() { gtk_dynamic_loader::destroy_widget(loader, *lbl.as_ref()); }
+        drop(new_labels);
     }
 }
 
@@ -181,14 +177,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let loader_clone = loader.clone();
     let overlay_labels_ref = overlay_labels.clone();
     let refresh_overlays = move || {
-        // destroy existing overlay labels (drain while holding borrow then drop it)
-        let drained = {
-            let mut old = overlay_labels_ref.borrow_mut();
-            old.drain(..).collect::<Vec<_>>()
-        };
-        for lbl in drained.into_iter() {
-            gtk_dynamic_loader::destroy_widget(&loader_clone, *lbl.as_ref());
-        }
+        // destroy existing overlay labels
+        overlay_labels_ref.borrow_mut().clear();
 
         let spans = compute_spans(&grid_clone, &loader_clone, 120);
         for (r, start_col, len, text) in spans.into_iter() {

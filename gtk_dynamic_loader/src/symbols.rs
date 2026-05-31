@@ -88,7 +88,11 @@ pub type GtkStyleContextAddProviderForScreen = unsafe extern "C" fn(screen: *mut
 pub type GtkLabelSetXalign = unsafe extern "C" fn(label: *mut c_void, xalign: f32);
 pub type GtkEventControllerKeyNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkWidgetAddController = unsafe extern "C" fn(widget: *mut c_void, controller: *mut c_void);
+pub type GtkScrolledWindowGetVadjustment = unsafe extern "C" fn(sw: *mut c_void) -> *mut c_void;
+pub type GtkScrolledWindowGetHadjustment = unsafe extern "C" fn(sw: *mut c_void) -> *mut c_void;
+pub type GtkAdjustmentGetValue = unsafe extern "C" fn(adj: *mut c_void) -> f64;
 pub type GtkGestureClickNew = unsafe extern "C" fn() -> *mut c_void;
+pub type GtkWidgetSetCanTarget = unsafe extern "C" fn(widget: *mut c_void, can_target: i32);
 
 // Dialog
 pub type GtkDialogNew = unsafe extern "C" fn() -> *mut c_void;
@@ -276,7 +280,11 @@ pub struct Symbols {
     pub gtk_label_set_xalign: Option<GtkLabelSetXalign>,
     pub gtk_event_controller_key_new: Option<GtkEventControllerKeyNew>,
     pub gtk_widget_add_controller: Option<GtkWidgetAddController>,
+    pub gtk_widget_set_can_target: Option<GtkWidgetSetCanTarget>,
     pub gtk_gesture_click_new: Option<GtkGestureClickNew>,
+    pub gtk_scrolled_window_get_vadjustment: Option<GtkScrolledWindowGetVadjustment>,
+    pub gtk_scrolled_window_get_hadjustment: Option<GtkScrolledWindowGetHadjustment>,
+    pub gtk_adjustment_get_value: Option<GtkAdjustmentGetValue>,
     // GMenuModel iteration (for GTK3 fallback)
     pub g_menu_model_get_n_items: Option<GMenuModelGetNItems>,
     pub g_menu_model_get_item_attribute_value: Option<GMenuModelGetItemAttributeValue>,
@@ -451,7 +459,11 @@ impl Symbols {
         let gtk_label_set_xalign = unsafe { sym::<GtkLabelSetXalign>(gtk, "gtk_label_set_xalign") };
         let gtk_event_controller_key_new = unsafe { sym::<GtkEventControllerKeyNew>(gtk, "gtk_event_controller_key_new") };
         let gtk_widget_add_controller = unsafe { sym::<GtkWidgetAddController>(gtk, "gtk_widget_add_controller") };
+        let gtk_widget_set_can_target = unsafe { sym::<GtkWidgetSetCanTarget>(gtk, "gtk_widget_set_can_target") };
         let gtk_gesture_click_new = unsafe { sym::<GtkGestureClickNew>(gtk, "gtk_gesture_click_new") };
+        let gtk_scrolled_window_get_vadjustment = unsafe { sym::<GtkScrolledWindowGetVadjustment>(gtk, "gtk_scrolled_window_get_vadjustment") };
+        let gtk_scrolled_window_get_hadjustment = unsafe { sym::<GtkScrolledWindowGetHadjustment>(gtk, "gtk_scrolled_window_get_hadjustment") };
+        let gtk_adjustment_get_value = unsafe { sym::<GtkAdjustmentGetValue>(gtk, "gtk_adjustment_get_value") };
 
         // application/menu/action symbols (try glib/gio)
         // try gio first then glib for the app/menu symbols
@@ -571,7 +583,11 @@ impl Symbols {
             gtk_label_set_xalign,
             gtk_event_controller_key_new,
             gtk_widget_add_controller,
+            gtk_widget_set_can_target,
             gtk_gesture_click_new,
+            gtk_scrolled_window_get_vadjustment,
+            gtk_scrolled_window_get_hadjustment,
+            gtk_adjustment_get_value,
             gtk_dialog_new, gtk_dialog_add_button, gtk_dialog_get_content_area, gtk_dialog_run, gtk_dialog_set_default_size,
             gtk_combo_box_text_new, gtk_combo_box_text_append_text, gtk_combo_box_text_get_active_text, gtk_combo_box_set_active, gtk_combo_box_get_active,
             gtk_drop_down_new, gtk_drop_down_set_selected, gtk_drop_down_get_selected, gtk_string_list_new,

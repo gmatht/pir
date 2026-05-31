@@ -166,6 +166,43 @@ pub unsafe fn connect_signal_gesture(lib_symbols: &crate::symbols::Symbols, inst
     } else { Err("no g_signal_connect available".into()) }
 }
 
+// trampoline for motion signals (e.g. GtkEventControllerMotion::motion) with (x, y, user_data)
+#[no_mangle]
+pub extern "C" fn gtk_compat_trampoline_motion(_instance: *mut c_void, x: f64, y: f64, user_data: *mut c_void) {
+    unsafe {
+        if user_data.is_null() { return; }
+        let inner_ptr = user_data as *mut Box<dyn FnMut(f64, f64)>;
+        if inner_ptr.is_null() { return; }
+        let closure_ref: &mut dyn FnMut(f64, f64) = &mut **inner_ptr;
+        closure_ref(x, y);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gtk_compat_destroy_notify_motion(data: *mut c_void, _closure: *mut c_void) {
+    unsafe {
+        if data.is_null() { return; }
+        let inner_ptr = data as *mut Box<dyn FnMut(f64, f64)>;
+        let _boxed: Box<Box<dyn FnMut(f64, f64)>> = Box::from_raw(inner_ptr);
+    }
+}
+
+pub unsafe fn connect_signal_motion(lib_symbols: &crate::symbols::Symbols, instance: *mut c_void, signal_name: &str, cb: Box<dyn FnMut(f64, f64)>) -> Result<u64, String> {
+    let boxed: Box<Box<dyn FnMut(f64, f64)>> = Box::new(Box::new(cb));
+    let raw = Box::into_raw(boxed) as *mut c_void;
+    let sig_name = CString::new(signal_name).unwrap();
+    if let Some(gscd) = lib_symbols.g_signal_connect_data {
+        let handler_ptr = gtk_compat_trampoline_motion as *const () as *mut c_void;
+        let destroy_ptr = Some(gtk_compat_destroy_notify_motion as unsafe extern "C" fn(*mut c_void, *mut c_void));
+        let id = gscd(instance, sig_name.as_ptr(), handler_ptr, raw, destroy_ptr, 0);
+        Ok(id)
+    } else if let Some(gsc) = lib_symbols.g_signal_connect {
+        let handler_ptr = gtk_compat_trampoline_motion as *const () as *mut c_void;
+        let id = gsc(instance, sig_name.as_ptr(), handler_ptr, raw);
+        Ok(id)
+    } else { Err("no g_signal_connect available".into()) }
+}
+
 // Connect a signal that expects a gboolean/int return from the handler
 pub unsafe fn connect_signal_bool(lib_symbols: &crate::symbols::Symbols, instance: *mut c_void, signal_name: &str, cb: Box<dyn FnMut(*mut c_void) -> i32>) -> Result<u64, String> {
     let boxed: Box<Box<dyn FnMut(*mut c_void) -> i32>> = Box::new(Box::new(cb));

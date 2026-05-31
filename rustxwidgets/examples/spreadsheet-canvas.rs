@@ -67,6 +67,12 @@ fn set_overlay_pass_through(loader: &std::sync::Arc<gtk_dynamic_loader::Loader>,
     }
 }
 
+fn set_can_target(loader: &std::sync::Arc<gtk_dynamic_loader::Loader>, widget: *mut std::ffi::c_void, can_target: bool) {
+    if let Some(set) = loader.symbols.gtk_widget_set_can_target {
+        unsafe { set(widget, if can_target { 1 } else { 0 }); }
+    }
+}
+
 fn compute_col_x(widths: &[i32], col: usize) -> i32 {
     let mut x = 0;
     for i in 0..col {
@@ -274,10 +280,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cw_for_refresh = col_widths.clone();
 
     let refresh = Rc::new(move || {
-        let drained = { let mut ol = overlay_labels_ref.borrow_mut(); ol.drain(..).collect::<Vec<_>>() };
-        for lbl in drained.into_iter() {
-            gtk_dynamic_loader::destroy_widget(&loader_for_refresh, *lbl.as_ref());
-        }
+        let mut ol = overlay_labels_ref.borrow_mut();
+        ol.clear();
+        drop(ol);
         let texts_b = texts_ref.borrow();
         let cw = cw_for_refresh.borrow();
         for r in 0..texts_b.len() {
@@ -291,6 +296,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         lbl.add_class("rwx-overlay");
                         add_overlay_child(&loader_for_refresh, overlay_ptr_for_refresh, *lbl.as_ref());
                         set_overlay_pass_through(&loader_for_refresh, overlay_ptr_for_refresh, *lbl.as_ref(), true);
+                        set_can_target(&loader_for_refresh, *lbl.as_ref(), false);
                         let total_w: i32 = (0..=c).map(|i| cw.get(i).copied().unwrap_or(CELL_W)).sum();
                         let left = 46 + total_w - cw.get(c).copied().unwrap_or(CELL_W);
                         let top = (r as i32 + 1) * CELL_H;
@@ -415,9 +421,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                formula_e.set_text(&new_text);
-                gtk_dynamic_loader::destroy_widget(&loader_nav, *e.as_ref());
-                refresh_nav();
+                    formula_e.set_text(&new_text);
+                    refresh_nav();
             }
         }
     };
@@ -483,19 +488,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ci.saturating_sub(1).min(VISIBLE_COLS - 1)
                 };
                 drop(col_widths_b);
-                let row = (y / CELL_H as f64).floor() as usize;
+                let grid_row = (y / CELL_H as f64).floor() as usize;
 
-                if row == 0 && col < VISIBLE_COLS {
+                if grid_row == 0 && col < VISIBLE_COLS {
                     println!("Header clicked: col={}", col_to_label(col));
                     return;
                 }
-                if col == 0 && row >= 1 && row <= VISIBLE_ROWS {
-                    println!("Row header clicked: row={}", row);
+                if x < col_hdr_w as f64 && grid_row >= 1 && grid_row <= VISIBLE_ROWS {
+                    println!("Row header clicked: row={}", grid_row);
                     return;
                 }
 
-                if col < VISIBLE_COLS && row < VISIBLE_ROWS {
-                    println!("Cell clicked: row={}, col={}", row + 1, col_to_label(col));
+                let data_row = grid_row.saturating_sub(1);
+                if col < VISIBLE_COLS && data_row < VISIBLE_ROWS {
+                    println!("Cell clicked: row={}, col={}", data_row + 1, col_to_label(col));
                     commit_fn();
                     if let Ok(sc_b) = sc.try_borrow() {
                         for rr in 0..sc_b.len() {
@@ -503,26 +509,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 sc_b[rr][cc].remove_class("selected");
                             }
                         }
-                        if row < sc_b.len() && col < sc_b[row].len() {
-                            sc_b[row][col].add_class("selected");
+                        if data_row < sc_b.len() && col < sc_b[data_row].len() {
+                            sc_b[data_row][col].add_class("selected");
                         }
                     }
                     if let Ok(mut cs) = sel.try_borrow_mut() {
-                        *cs = Some((row, col));
+                        *cs = Some((data_row, col));
                     }
                     let t = txt.borrow();
-                    let fmt = fmts.borrow()[row][col].clone();
-                    if row < t.len() && col < t[row].len() {
-                        let text = &t[row][col];
+                    let fmt = fmts.borrow()[data_row][col].clone();
+                    if data_row < t.len() && col < t[data_row].len() {
+                        let text = &t[data_row][col];
                         if fmt.0 { fe.set_text(&format!("*{}*", text)); }
                         else if fmt.1 { fe.set_text(&format!("/{}/", text)); }
                         else { fe.set_text(text); }
                     }
                     drop(t);
                     if edit_e.borrow().is_none() {
-                        start_fn(row, col);
+                        start_fn(data_row, col);
                         if let Some(e) = edit_e.borrow().as_ref() {
-                            let text = txt.borrow()[row][col].clone();
+                            let text = txt.borrow()[data_row][col].clone();
                             e.set_text(&text);
                         }
                     }
@@ -538,17 +544,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         unsafe { add_ctrl(grid_ptr, gesture); }
                     }
                     let cl = click_logic.clone();
+                    let sw_ptr = scrolled_ptr;
+                    let ld = loader.clone();
                     unsafe {
                         let _ = gtk_dynamic_loader::connect_signal_gesture(loader.symbols.as_ref(), gesture, "pressed", Box::new(move |_n: i32, x: f64, y: f64| {
-                            if let Some(f) = cl.borrow_mut().as_mut() { f(x, y); }
+                            let adj_value = |sym: Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void>, get_val: Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> f64>| -> f64 {
+                                sym.and_then(|f| {
+                                    let adj = unsafe { f(sw_ptr) };
+                                    if adj.is_null() { None } else { get_val.map(|gv| unsafe { gv(adj) }) }
+                                }).unwrap_or(0.0)
+                            };
+                            let scroll_x = adj_value(ld.symbols.gtk_scrolled_window_get_hadjustment, ld.symbols.gtk_adjustment_get_value);
+                            let scroll_y = adj_value(ld.symbols.gtk_scrolled_window_get_vadjustment, ld.symbols.gtk_adjustment_get_value);
+                            eprintln!("DEBUG raw=({:.1},{:.1}) scroll=({:.1},{:.1})", x, y, scroll_x, scroll_y);
+                            if let Some(f) = cl.borrow_mut().as_mut() { f(x + scroll_x, y + scroll_y); }
                         }));
                     }
                 }
             }
         } else {
             let cl = click_logic.clone();
+            let ov_ptr = overlay_ptr;
             unsafe {
-                let _ = gtk_dynamic_loader::connect_signal_bool(loader.symbols.as_ref(), grid_ptr, "button-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
+                let _ = gtk_dynamic_loader::connect_signal_bool(loader.symbols.as_ref(), ov_ptr, "button-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
                     type GetEventCoords = unsafe extern "C" fn(*mut std::ffi::c_void, *mut f64, *mut f64) -> i32;
                     let loader_tmp = match rustxwidgets::backends::gtk::loader() { Some(l) => l, None => return 0, };
                     let get_coords = loader_tmp.libs.get("libgdk").and_then(|gdk_lib| {
@@ -562,6 +580,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut x: f64 = 0.0;
                         let mut y: f64 = 0.0;
                         if get_coords(ev, &mut x as *mut f64, &mut y as *mut f64) != 0 {
+                            eprintln!("DEBUG GTK3 raw=({:.1},{:.1})", x, y);
                             if let Some(f) = cl.borrow_mut().as_mut() { f(x, y); }
                         }
                     }
@@ -757,8 +776,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let keyval = unsafe { if let Some(get_kv) = loader_nav.symbols.gdk_event_get_keyval { get_kv(ev) } else { 0 } };
                         if edit_entry_nav.borrow().is_some() {
                             if keyval == 0xFF1B {
-                                let entry = edit_entry_nav.borrow_mut().take();
-                                if let Some(e) = entry { gtk_dynamic_loader::destroy_widget(&loader_nav, *e.as_ref()); }
+                                let _ = edit_entry_nav.borrow_mut().take();
                             } else if keyval == 0xFF0D || keyval == 0xFF8D {
                                 commit_fn();
                             }
@@ -809,8 +827,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let keyval = unsafe { if let Some(get_kv) = loader_gtk3.symbols.gdk_event_get_keyval { get_kv(ev) } else { 0 } };
                 if edit_entry_nav.borrow().is_some() {
                     if keyval == 0xFF1B {
-                        let entry = edit_entry_nav.borrow_mut().take();
-                        if let Some(e) = entry { gtk_dynamic_loader::destroy_widget(&loader_gtk3, *e.as_ref()); }
+                        let _ = edit_entry_nav.borrow_mut().take();
                     } else if keyval == 0xFF0D || keyval == 0xFF8D {
                         commit_fn();
                     }
@@ -866,16 +883,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let rs_r = rs_nav.clone();
                         let rsx_r = rsx_nav.clone();
                         let rsw_r = rsw_nav.clone();
+                        let sw_r = scrolled_ptr;
+                        let ld_r = loader.clone();
                         unsafe {
                             let _ = gtk_dynamic_loader::connect_signal_gesture(loader.symbols.as_ref(), gesture, "pressed", Box::new(move |_: i32, x: f64, y: f64| {
-                                if y <= CELL_H as f64 {
+                                let adj_value = |sym: Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void>, get_val: Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> f64>| -> f64 {
+                                    sym.and_then(|f| {
+                                        let adj = unsafe { f(sw_r) };
+                                        if adj.is_null() { None } else { get_val.map(|gv| unsafe { gv(adj) }) }
+                                    }).unwrap_or(0.0)
+                                };
+                                let scroll_x = adj_value(ld_r.symbols.gtk_scrolled_window_get_hadjustment, ld_r.symbols.gtk_adjustment_get_value);
+                                let scroll_y = adj_value(ld_r.symbols.gtk_scrolled_window_get_vadjustment, ld_r.symbols.gtk_adjustment_get_value);
+                                let ax = x + scroll_x;
+                                let ay = y + scroll_y;
+                                if ay <= CELL_H as f64 {
                                     let cw_b = cw_r.borrow();
                                     let mut edge_x = 46.0f64;
                                     for ci in 0..VISIBLE_COLS {
                                         let w = cw_b[ci] as f64;
-                                        if (x - (edge_x + w)).abs() <= 6.0 && x >= edge_x + w - 6.0 {
+                                        if (ax - (edge_x + w)).abs() <= 6.0 && ax >= edge_x + w - 6.0 {
                                             *rs_r.borrow_mut() = Some(ci);
-                                            *rsx_r.borrow_mut() = x as i32;
+                                            *rsx_r.borrow_mut() = ax as i32;
                                             *rsw_r.borrow_mut() = cw_b[ci];
                                             return;
                                         }
@@ -897,8 +926,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let rs_r = rs_nav.clone();
                 let rsx_r = rsx_nav.clone();
                 let rsw_r = rsw_nav.clone();
+                let ov_resize = overlay_ptr;
                 let _ = unsafe {
-                    gtk_dynamic_loader::connect_signal_bool(loader.symbols.as_ref(), grid_ptr, "button-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
+                    gtk_dynamic_loader::connect_signal_bool(loader.symbols.as_ref(), ov_resize, "button-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
                         type GetEventCoords = unsafe extern "C" fn(*mut std::ffi::c_void, *mut f64, *mut f64) -> i32;
                         let loader_tmp = match rustxwidgets::backends::gtk::loader() { Some(l) => l, None => return 0, };
                         let get_coords = loader_tmp.libs.get("libgdk").and_then(|gdk_lib| {
@@ -952,36 +982,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let sc_m = sc_nav.clone();
                         let ld_m = loader_for_resize.clone();
                         let ref_m = refresh_nav.clone();
+                        let sw_m = scrolled_ptr;
+                        let ld_motion = loader.clone();
                         let _ = unsafe {
-                            gtk_dynamic_loader::connect_signal_bool(motion_syms.as_ref(), ctrl, "motion", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
-                                if rs_m.borrow().is_none() { return 0; }
-                                type GetEventCoords = unsafe extern "C" fn(*mut std::ffi::c_void, *mut f64, *mut f64) -> i32;
-                                let loader_tmp = match rustxwidgets::backends::gtk::loader() { Some(l) => l, None => return 0, };
-                                let gtk_lib = match loader_tmp.libs.get("libgtk") { Some(l) => l.clone(), None => return 0, };
-                                let lib = &*gtk_lib;
-                                if let Ok(get_coords) = lib.get::<GetEventCoords>(b"gdk_event_get_coords") {
-                                    let mut x: f64 = 0.0;
-                                    let mut y: f64 = 0.0;
-                                    if get_coords(ev, &mut x as *mut f64, &mut y as *mut f64) != 0 {
-                                        if let Some(col) = *rs_m.borrow() {
-                                            let delta = (x as i32) - *rsx_m.borrow();
-                                            let new_w = (*rsw_m.borrow() + delta).max(20);
-                                            cw_m.borrow_mut()[col] = new_w;
-                                            if col < ch_m.len() {
-                                                gtk_dynamic_loader::widget_set_size_request(&ld_m, *ch_m[col].as_ref(), new_w, CELL_H);
+                            gtk_dynamic_loader::connect_signal_motion(loader.symbols.as_ref(), ctrl, "motion", Box::new(move |x: f64, y: f64| {
+                                if rs_m.borrow().is_none() { return; }
+                                let adj_value = |sym: Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void>, get_val: Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> f64>| -> f64 {
+                                    sym.and_then(|f| {
+                                        let adj = unsafe { f(sw_m) };
+                                        if adj.is_null() { None } else { get_val.map(|gv| unsafe { gv(adj) }) }
+                                    }).unwrap_or(0.0)
+                                };
+                                let scroll_x = adj_value(ld_motion.symbols.gtk_scrolled_window_get_hadjustment, ld_motion.symbols.gtk_adjustment_get_value);
+                                let scroll_y = adj_value(ld_motion.symbols.gtk_scrolled_window_get_vadjustment, ld_motion.symbols.gtk_adjustment_get_value);
+                                let ax = x + scroll_x;
+                                let ay = y + scroll_y;
+                                if let Some(col) = *rs_m.borrow() {
+                                    let delta = (ax as i32) - *rsx_m.borrow();
+                                    let new_w = (*rsw_m.borrow() + delta).max(20);
+                                    cw_m.borrow_mut()[col] = new_w;
+                                    if col < ch_m.len() {
+                                        gtk_dynamic_loader::widget_set_size_request(&ld_m, *ch_m[col].as_ref(), new_w, CELL_H);
+                                    }
+                                    if let Ok(sc) = sc_m.try_borrow() {
+                                        for row in sc.iter() {
+                                            if col < row.len() {
+                                                gtk_dynamic_loader::widget_set_size_request(&ld_m, *row[col].as_ref(), new_w, CELL_H);
                                             }
-                                            if let Ok(sc) = sc_m.try_borrow() {
-                                                for row in sc.iter() {
-                                                    if col < row.len() {
-                                                        gtk_dynamic_loader::widget_set_size_request(&ld_m, *row[col].as_ref(), new_w, CELL_H);
-                                                    }
-                                                }
-                                            }
-                                            ref_m();
                                         }
                                     }
+                                    ref_m();
                                 }
-                                0
                             }))
                         };
                     }
@@ -995,8 +1026,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let sc_m = sc_nav.clone();
                 let ld_m = loader_for_resize.clone();
                 let ref_m = refresh_nav.clone();
+                let ov_motion = overlay_ptr;
                 let _ = unsafe {
-                    gtk_dynamic_loader::connect_signal_bool(motion_syms.as_ref(), grid_ptr, "motion-notify-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
+                    gtk_dynamic_loader::connect_signal_bool(motion_syms.as_ref(), ov_motion, "motion-notify-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
                         if rs_m.borrow().is_none() { return 0; }
                         type GetEventCoords = unsafe extern "C" fn(*mut std::ffi::c_void, *mut f64, *mut f64) -> i32;
                         let loader_tmp = match rustxwidgets::backends::gtk::loader() { Some(l) => l, None => return 0, };
@@ -1033,8 +1065,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }))
                 };
                 let rs_end = rs_nav.clone();
+                let ov_release = overlay_ptr;
                 let _ = unsafe {
-                    gtk_dynamic_loader::connect_signal_bool(motion_syms.as_ref(), grid_ptr, "button-release-event", Box::new(move |_ev: *mut std::ffi::c_void| -> i32 {
+                    gtk_dynamic_loader::connect_signal_bool(motion_syms.as_ref(), ov_release, "button-release-event", Box::new(move |_ev: *mut std::ffi::c_void| -> i32 {
                         *rs_end.borrow_mut() = None;
                         0
                     }))
