@@ -93,6 +93,14 @@ fn compute_col_x(widths: &[i32], col: usize) -> i32 {
     x
 }
 
+fn compute_row_y(heights: &[i32], row: usize) -> i32 {
+    let mut y = 0;
+    for i in 0..row {
+        if i < heights.len() { y += heights[i]; }
+    }
+    y
+}
+
 fn apply_formatting(lbl: &gtk::Label, text: &str, fmt: &CellFormat) {
     lbl.set_text(text);
     lbl.remove_class("boolval");
@@ -180,6 +188,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Column widths (mutable for resize)
     let col_widths: Rc<RefCell<Vec<i32>>> = Rc::new(RefCell::new(vec![CELL_W; VISIBLE_COLS]));
+    let row_heights: Rc<RefCell<Vec<i32>>> = Rc::new(RefCell::new(vec![CELL_H; VISIBLE_ROWS]));
 
     // Toolbar
     let toolbar = gtk::create_box(gtk::Orientation::Horizontal, 2)?;
@@ -260,7 +269,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rm.add_class("row-marker");
         rm.set_xalign(0.5);
         grid_widget.attach(&rm, 0, (r + 1) as i32, 1, 1);
-        gtk_dynamic_loader::widget_set_size_request(&loader, *rm.as_ref(), 46, CELL_H);
+        gtk_dynamic_loader::widget_set_size_request(&loader, *rm.as_ref(), 46, row_heights.borrow()[r]);
         row_markers.borrow_mut().push(rm);
 
         let mut row_labels = Vec::new();
@@ -271,7 +280,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             apply_formatting(&lbl, &text, &fmt);
             grid_widget.attach(&lbl, (c + 1) as i32, (r + 1) as i32, 1, 1);
             let w = col_widths.borrow()[c];
-            gtk_dynamic_loader::widget_set_size_request(&loader, *lbl.as_ref(), w, CELL_H);
+            gtk_dynamic_loader::widget_set_size_request(&loader, *lbl.as_ref(), w, row_heights.borrow()[r]);
             row_labels.push(lbl);
         }
         static_cells.borrow_mut().push(row_labels);
@@ -290,6 +299,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let loader_for_refresh = loader.clone();
     let overlay_ptr_for_refresh = overlay_ptr;
     let cw_for_refresh = col_widths.clone();
+    let rh_for_refresh = row_heights.clone();
 
     let refresh = Rc::new(move || {
         let mut ol = overlay_labels_ref.borrow_mut();
@@ -297,6 +307,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         drop(ol);
         let texts_b = texts_ref.borrow();
         let cw = cw_for_refresh.borrow();
+        let rh = rh_for_refresh.borrow();
         for r in 0..texts_b.len() {
             for c in 0..texts_b[r].len() {
                 let text = &texts_b[r][c];
@@ -311,8 +322,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         set_can_target(&loader_for_refresh, *lbl.as_ref(), false);
                         let total_w: i32 = (0..=c).map(|i| cw.get(i).copied().unwrap_or(CELL_W)).sum();
                         let left = 46 + total_w - cw.get(c).copied().unwrap_or(CELL_W);
-                        let top = (r as i32 + 1) * CELL_H;
-                        gtk_dynamic_loader::widget_set_size_request(&loader_for_refresh, *lbl.as_ref(), (char_w as i32 + 8).min(total_w), CELL_H);
+                        let top = CELL_H + compute_row_y(&rh, r);
+                        gtk_dynamic_loader::widget_set_size_request(&loader_for_refresh, *lbl.as_ref(), (char_w as i32 + 8).min(total_w), rh.get(r).copied().unwrap_or(CELL_H));
                         gtk_dynamic_loader::widget_set_margin_start(&loader_for_refresh, *lbl.as_ref(), left);
                         gtk_dynamic_loader::widget_set_margin_top(&loader_for_refresh, *lbl.as_ref(), top);
                         set_halign(&loader_for_refresh, *lbl.as_ref(), 1);
@@ -389,22 +400,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let overlay_for_edit = overlay_ptr;
         let loader_for_edit = loader.clone();
         let cw_edit = col_widths.clone();
+        let rh_edit = row_heights.clone();
         move |r: usize, c: usize| {
             if edit_entry_nav.borrow().is_some() { return; }
             if let Ok(entry) = gtk::create_entry() {
                 entry.set_text(&texts_nav.borrow()[r][c]);
-                entry.set_width_chars(12);
                 let cw = cw_edit.borrow();
-                let left = compute_col_x(&cw, c);
-                let top = (r as i32 + 1) * CELL_H;
+                let rh = rh_edit.borrow();
+                let left = 46 + compute_col_x(&cw, c);
+                let top = CELL_H + compute_row_y(&rh, r);
                 drop(cw);
+                drop(rh);
                 gtk_dynamic_loader::widget_set_margin_start(&loader_for_edit, *entry.as_ref(), left);
                 gtk_dynamic_loader::widget_set_margin_top(&loader_for_edit, *entry.as_ref(), top);
                 set_halign(&loader_for_edit, *entry.as_ref(), 1);
                 set_valign(&loader_for_edit, *entry.as_ref(), 1);
                 add_overlay_child(&loader_for_edit, overlay_for_edit, *entry.as_ref());
                 set_overlay_pass_through(&loader_for_edit, overlay_for_edit, *entry.as_ref(), false);
-                entry.set_size_request(cw_edit.borrow()[c], CELL_H);
+                entry.set_size_request(cw_edit.borrow()[c], rh_edit.borrow()[r]);
                 entry.grab_focus();
                 *edit_entry_nav.borrow_mut() = Some(entry);
             }
@@ -479,6 +492,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let start_fn2 = start_edit.clone();
         let fmts2 = cell_formats.clone();
         let cw2 = col_widths.clone();
+        let rh3 = row_heights.clone();
 
         let click_logic: Rc<RefCell<Option<Box<dyn FnMut(f64, f64)>>>> = Rc::new(RefCell::new(None));
         {
@@ -491,6 +505,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let start_fn = start_fn2.clone();
             let fmts = fmts2.clone();
             let cw = cw2.clone();
+            let rh = rh3.clone();
             *click_logic.borrow_mut() = Some(Box::new(move |x: f64, y: f64| {
                 let col_hdr_w = 46;
                 let col_widths_b = cw.borrow();
@@ -504,7 +519,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ci.saturating_sub(1).min(VISIBLE_COLS - 1)
                 };
                 drop(col_widths_b);
-                let grid_row = (y / CELL_H as f64).floor() as usize;
+                let rh_b = rh.borrow();
+                let grid_row = if y < CELL_H as f64 {
+                    drop(rh_b);
+                    0
+                } else {
+                    let data_y = y - CELL_H as f64;
+                    let mut acc = 0.0f64;
+                    let mut ri = 0;
+                    for hi in rh_b.iter() {
+                        if acc + *hi as f64 > data_y { break; }
+                        acc += *hi as f64;
+                        ri += 1;
+                    }
+                    drop(rh_b);
+                    (ri + 1).min(VISIBLE_ROWS)
+                };
 
                 if grid_row == 0 && col < VISIBLE_COLS {
                     println!("Header clicked: col={}", col_to_label(col));
@@ -761,6 +791,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let resize_col: Rc<RefCell<Option<usize>>> = Rc::new(RefCell::new(None));
     let resize_start_x: Rc<RefCell<i32>> = Rc::new(RefCell::new(0));
     let resize_start_w: Rc<RefCell<i32>> = Rc::new(RefCell::new(0));
+    let resize_row: Rc<RefCell<Option<usize>>> = Rc::new(RefCell::new(None));
+    let resize_start_y: Rc<RefCell<i32>> = Rc::new(RefCell::new(0));
+    let resize_start_h: Rc<RefCell<i32>> = Rc::new(RefCell::new(0));
 
     // Keyboard navigation + click-to-edit + resize
     {
@@ -776,7 +809,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rs_nav = resize_col.clone();
         let rsx_nav = resize_start_x.clone();
         let rsw_nav = resize_start_w.clone();
+        let rr_nav = resize_row.clone();
+        let rsy_nav = resize_start_y.clone();
+        let rsh_nav = resize_start_h.clone();
         let cw_nav = col_widths.clone();
+        let rh_nav = row_heights.clone();
+        let rm_nav = row_markers.clone();
         let loader_nav = loader.clone();
         let loader_for_resize = loader_nav.clone();
 
@@ -899,6 +937,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let rs_r = rs_nav.clone();
                         let rsx_r = rsx_nav.clone();
                         let rsw_r = rsw_nav.clone();
+                        let rr_r = rr_nav.clone();
+                        let rsy_r = rsy_nav.clone();
+                        let rsh_r = rsh_nav.clone();
+                        let rh_r = rh_nav.clone();
                         let sw_r = scrolled_ptr;
                         let ld_r = loader.clone();
                         unsafe {
@@ -927,12 +969,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         edge_x += w;
                                     }
                                 }
+                                if ax <= 46.0 && ay > CELL_H as f64 {
+                                    let rh_b = rh_r.borrow();
+                                    let mut edge_y = CELL_H as f64;
+                                    for ri in 0..VISIBLE_ROWS {
+                                        let h = rh_b[ri] as f64;
+                                        if (ay - (edge_y + h)).abs() <= 6.0 && ay >= edge_y + h - 6.0 {
+                                            *rr_r.borrow_mut() = Some(ri);
+                                            *rsy_r.borrow_mut() = ay as i32;
+                                            *rsh_r.borrow_mut() = rh_b[ri];
+                                            return;
+                                        }
+                                        edge_y += h;
+                                    }
+                                }
                             }));
                         }
                         let rs_end = rs_nav.clone();
+                        let rr_end = rr_nav.clone();
                         unsafe {
                             let _ = gtk_dynamic_loader::connect_signal_gesture(loader.symbols.as_ref(), gesture, "released", Box::new(move |_: i32, _: f64, _: f64| {
                                 *rs_end.borrow_mut() = None;
+                                *rr_end.borrow_mut() = None;
                             }));
                         }
                     }
@@ -942,6 +1000,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let rs_r = rs_nav.clone();
                 let rsx_r = rsx_nav.clone();
                 let rsw_r = rsw_nav.clone();
+                let rr_r = rr_nav.clone();
+                let rsy_r = rsy_nav.clone();
+                let rsh_r = rsh_nav.clone();
+                let rh_r = rh_nav.clone();
                 let ov_resize = overlay_ptr;
                 let _ = unsafe {
                     gtk_dynamic_loader::connect_signal_bool(loader.symbols.as_ref(), ov_resize, "button-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
@@ -972,6 +1034,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         edge_x += w;
                                     }
                                 }
+                                if x <= 46.0 && y > CELL_H as f64 {
+                                    let rh_b = rh_r.borrow();
+                                    let mut edge_y = CELL_H as f64;
+                                    for ri in 0..VISIBLE_ROWS {
+                                        let h = rh_b[ri] as f64;
+                                        if (y - (edge_y + h)).abs() <= 6.0 && y >= edge_y + h - 6.0 {
+                                            *rr_r.borrow_mut() = Some(ri);
+                                            *rsy_r.borrow_mut() = y as i32;
+                                            *rsh_r.borrow_mut() = rh_b[ri];
+                                            return 1;
+                                        }
+                                        edge_y += h;
+                                    }
+                                }
                             }
                         }
                         0
@@ -993,6 +1069,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let rs_m = rs_nav.clone();
                         let rsx_m = rsx_nav.clone();
                         let rsw_m = rsw_nav.clone();
+                        let rr_m = rr_nav.clone();
+                        let rsy_m = rsy_nav.clone();
+                        let rsh_m = rsh_nav.clone();
+                        let rh_m = rh_nav.clone();
+                        let rm_m = rm_nav.clone();
                         let cw_m = cw_nav.clone();
                         let ch_m = col_headers.clone();
                         let sc_m = sc_nav.clone();
@@ -1001,7 +1082,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let ld_mot_inner = loader.clone();
                         let _ = unsafe {
                             gtk_dynamic_loader::connect_signal_motion(loader.symbols.as_ref(), ctrl, "motion", Box::new(move |x: f64, y: f64| {
-                                if rs_m.borrow().is_none() { return; }
+                                let is_col = rs_m.borrow().is_some();
+                                let is_row = rr_m.borrow().is_some();
+                                if !is_col && !is_row { return; }
                                 let sw_m = scrolled_ptr;
                                 let adj_value = |sym: Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void>, get_val: Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> f64>| -> f64 {
                                     sym.and_then(|f| {
@@ -1010,22 +1093,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }).unwrap_or(0.0)
                                 };
                                 let scroll_x = adj_value(ld_mot_inner.symbols.gtk_scrolled_window_get_hadjustment, ld_mot_inner.symbols.gtk_adjustment_get_value);
-                                let ax = x + scroll_x;
-                                if let Some(col) = *rs_m.borrow() {
-                                    let delta = (ax as i32) - *rsx_m.borrow();
-                                    let new_w = (*rsw_m.borrow() + delta).max(20);
-                                    cw_m.borrow_mut()[col] = new_w;
-                                    if col < ch_m.len() {
-                                        gtk_dynamic_loader::widget_set_size_request(&ld_m, *ch_m[col].as_ref(), new_w, CELL_H);
-                                    }
-                                    if let Ok(sc) = sc_m.try_borrow() {
-                                        for row in sc.iter() {
-                                            if col < row.len() {
-                                                gtk_dynamic_loader::widget_set_size_request(&ld_m, *row[col].as_ref(), new_w, CELL_H);
+                                let scroll_y = adj_value(ld_mot_inner.symbols.gtk_scrolled_window_get_vadjustment, ld_mot_inner.symbols.gtk_adjustment_get_value);
+                                if is_col {
+                                    let ax = x + scroll_x;
+                                    if let Some(col) = *rs_m.borrow() {
+                                        let delta = (ax as i32) - *rsx_m.borrow();
+                                        let new_w = (*rsw_m.borrow() + delta).max(20);
+                                        cw_m.borrow_mut()[col] = new_w;
+                                        if col < ch_m.len() {
+                                            gtk_dynamic_loader::widget_set_size_request(&ld_m, *ch_m[col].as_ref(), new_w, CELL_H);
+                                        }
+                                        if let Ok(sc) = sc_m.try_borrow() {
+                                            for row in sc.iter() {
+                                                if col < row.len() {
+                                                    gtk_dynamic_loader::widget_set_size_request(&ld_m, *row[col].as_ref(), new_w, CELL_H);
+                                                }
                                             }
                                         }
+                                        ref_m();
                                     }
-                                    ref_m();
+                                }
+                                if is_row {
+                                    let ay = y + scroll_y;
+                                    if let Some(row) = *rr_m.borrow() {
+                                        let delta = (ay as i32) - *rsy_m.borrow();
+                                        let new_h = (*rsh_m.borrow() + delta).max(20);
+                                        rh_m.borrow_mut()[row] = new_h;
+                                        let rms = rm_m.borrow();
+                                        if row < rms.len() {
+                                            gtk_dynamic_loader::widget_set_size_request(&ld_m, *rms[row].as_ref(), 46, new_h);
+                                        }
+                                        drop(rms);
+                                        if let Ok(sc) = sc_m.try_borrow() {
+                                            if row < sc.len() {
+                                                for c in 0..sc[row].len() {
+                                                    let w = cw_m.borrow()[c];
+                                                    gtk_dynamic_loader::widget_set_size_request(&ld_m, *sc[row][c].as_ref(), w, new_h);
+                                                }
+                                            }
+                                        }
+                                        ref_m();
+                                    }
                                 }
                             }))
                         };
@@ -1035,6 +1143,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let rs_m = rs_nav.clone();
                 let rsx_m = rsx_nav.clone();
                 let rsw_m = rsw_nav.clone();
+                let rr_m = rr_nav.clone();
+                let rsy_m = rsy_nav.clone();
+                let rsh_m = rsh_nav.clone();
+                let rh_m = rh_nav.clone();
+                let rm_m = rm_nav.clone();
                 let cw_m = cw_nav.clone();
                 let ch_m = col_headers.clone();
                 let sc_m = sc_nav.clone();
@@ -1043,7 +1156,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let ov_motion = overlay_ptr;
                 let _ = unsafe {
                     gtk_dynamic_loader::connect_signal_bool(motion_syms.as_ref(), ov_motion, "motion-notify-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
-                        if rs_m.borrow().is_none() { return 0; }
+                        let is_col = rs_m.borrow().is_some();
+                        let is_row = rr_m.borrow().is_some();
+                        if !is_col && !is_row { return 0; }
                         type GetEventCoords = unsafe extern "C" fn(*mut std::ffi::c_void, *mut f64, *mut f64) -> i32;
                         let loader_tmp = match rustxwidgets::backends::gtk::loader() { Some(l) => l, None => return 0, };
                         let get_coords = loader_tmp.libs.get("libgdk").and_then(|gdk_lib| {
@@ -1057,21 +1172,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let mut x: f64 = 0.0;
                             let mut y: f64 = 0.0;
                             if get_coords(ev, &mut x as *mut f64, &mut y as *mut f64) != 0 {
-                                if let Some(col) = *rs_m.borrow() {
-                                    let delta = (x as i32) - *rsx_m.borrow();
-                                    let new_w = (*rsw_m.borrow() + delta).max(20);
-                                    cw_m.borrow_mut()[col] = new_w;
-                                    if col < ch_m.len() {
-                                        gtk_dynamic_loader::widget_set_size_request(&ld_m, *ch_m[col].as_ref(), new_w, CELL_H);
-                                    }
-                                    if let Ok(sc) = sc_m.try_borrow() {
-                                        for row in sc.iter() {
-                                            if col < row.len() {
-                                                gtk_dynamic_loader::widget_set_size_request(&ld_m, *row[col].as_ref(), new_w, CELL_H);
+                                if is_col {
+                                    if let Some(col) = *rs_m.borrow() {
+                                        let delta = (x as i32) - *rsx_m.borrow();
+                                        let new_w = (*rsw_m.borrow() + delta).max(20);
+                                        cw_m.borrow_mut()[col] = new_w;
+                                        if col < ch_m.len() {
+                                            gtk_dynamic_loader::widget_set_size_request(&ld_m, *ch_m[col].as_ref(), new_w, CELL_H);
+                                        }
+                                        if let Ok(sc) = sc_m.try_borrow() {
+                                            for row in sc.iter() {
+                                                if col < row.len() {
+                                                    gtk_dynamic_loader::widget_set_size_request(&ld_m, *row[col].as_ref(), new_w, CELL_H);
+                                                }
                                             }
                                         }
+                                        ref_m();
                                     }
-                                    ref_m();
+                                }
+                                if is_row {
+                                    if let Some(row) = *rr_m.borrow() {
+                                        let delta = (y as i32) - *rsy_m.borrow();
+                                        let new_h = (*rsh_m.borrow() + delta).max(20);
+                                        rh_m.borrow_mut()[row] = new_h;
+                                        let rms = rm_m.borrow();
+                                        if row < rms.len() {
+                                            gtk_dynamic_loader::widget_set_size_request(&ld_m, *rms[row].as_ref(), 46, new_h);
+                                        }
+                                        drop(rms);
+                                        if let Ok(sc) = sc_m.try_borrow() {
+                                            if row < sc.len() {
+                                                for c in 0..sc[row].len() {
+                                                    let w = cw_m.borrow()[c];
+                                                    gtk_dynamic_loader::widget_set_size_request(&ld_m, *sc[row][c].as_ref(), w, new_h);
+                                                }
+                                            }
+                                        }
+                                        ref_m();
+                                    }
                                 }
                             }
                         }
@@ -1079,10 +1217,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }))
                 };
                 let rs_end = rs_nav.clone();
+                let rr_end = rr_nav.clone();
                 let ov_release = overlay_ptr;
                 let _ = unsafe {
                     gtk_dynamic_loader::connect_signal_bool(motion_syms.as_ref(), ov_release, "button-release-event", Box::new(move |_ev: *mut std::ffi::c_void| -> i32 {
                         *rs_end.borrow_mut() = None;
+                        *rr_end.borrow_mut() = None;
                         0
                     }))
                 };
