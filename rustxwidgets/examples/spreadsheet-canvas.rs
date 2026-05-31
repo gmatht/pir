@@ -73,6 +73,18 @@ fn set_can_target(loader: &std::sync::Arc<gtk_dynamic_loader::Loader>, widget: *
     }
 }
 
+fn set_halign(loader: &std::sync::Arc<gtk_dynamic_loader::Loader>, widget: *mut std::ffi::c_void, align: i32) {
+    if let Some(set) = loader.symbols.gtk_widget_set_halign {
+        unsafe { set(widget, align); }
+    }
+}
+
+fn set_valign(loader: &std::sync::Arc<gtk_dynamic_loader::Loader>, widget: *mut std::ffi::c_void, align: i32) {
+    if let Some(set) = loader.symbols.gtk_widget_set_valign {
+        unsafe { set(widget, align); }
+    }
+}
+
 fn compute_col_x(widths: &[i32], col: usize) -> i32 {
     let mut x = 0;
     for i in 0..col {
@@ -303,6 +315,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         gtk_dynamic_loader::widget_set_size_request(&loader_for_refresh, *lbl.as_ref(), (char_w as i32 + 8).min(total_w), CELL_H);
                         gtk_dynamic_loader::widget_set_margin_start(&loader_for_refresh, *lbl.as_ref(), left);
                         gtk_dynamic_loader::widget_set_margin_top(&loader_for_refresh, *lbl.as_ref(), top);
+                        set_halign(&loader_for_refresh, *lbl.as_ref(), 1);
+                        set_valign(&loader_for_refresh, *lbl.as_ref(), 1);
                         overlay_labels_ref.borrow_mut().push(lbl);
                     }
                 }
@@ -386,6 +400,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drop(cw);
                 gtk_dynamic_loader::widget_set_margin_start(&loader_for_edit, *entry.as_ref(), left);
                 gtk_dynamic_loader::widget_set_margin_top(&loader_for_edit, *entry.as_ref(), top);
+                set_halign(&loader_for_edit, *entry.as_ref(), 1);
+                set_valign(&loader_for_edit, *entry.as_ref(), 1);
                 add_overlay_child(&loader_for_edit, overlay_for_edit, *entry.as_ref());
                 set_overlay_pass_through(&loader_for_edit, overlay_for_edit, *entry.as_ref(), false);
                 entry.set_size_request(cw_edit.borrow()[c], CELL_H);
