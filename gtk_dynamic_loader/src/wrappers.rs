@@ -102,6 +102,13 @@ impl Window {
     pub fn set_application(&self, app_ptr: *mut c_void) {
         if let Some(set_app) = self.loader.symbols.gtk_window_set_application { unsafe { set_app(self.inner, app_ptr); } }
     }
+
+    pub fn insert_action_group(&self, name: &str, group_ptr: *mut c_void) {
+        if let Some(insert) = self.loader.symbols.gtk_widget_insert_action_group {
+            let c = CString::new(name).unwrap();
+            unsafe { insert(self.inner, c.as_ptr(), group_ptr); }
+        }
+    }
 }
 
 impl AsRef<*mut c_void> for Window { fn as_ref(&self) -> &*mut c_void { &self.inner } }
@@ -311,12 +318,45 @@ impl Application {
         Ok(())
     }
 
+    pub fn register(&self) -> Result<(), Error> {
+        if let Some(reg) = self.loader.symbols.g_application_register {
+            if self.inner.is_null() {
+                return Err(Error::Other("Application has no GApplication pointer".into()));
+            }
+            let mut error: *mut c_void = std::ptr::null_mut();
+            let ok = unsafe { reg(self.inner, std::ptr::null_mut(), &mut error as *mut *mut c_void) };
+            if ok == 0 {
+                return Err(Error::Other("g_application_register failed".into()));
+            }
+            Ok(())
+        } else {
+            // If g_application_register isn't available, just proceed
+            Ok(())
+        }
+    }
+
     pub fn set_app_menu(&self, menu_ptr: *mut c_void) -> Result<(), Error> {
         if let Some(set_app_menu) = self.loader.symbols.g_application_set_app_menu {
             if self.inner.is_null() { return Err(Error::Other("Application has no GApplication pointer".into())); }
             unsafe { set_app_menu(self.inner, menu_ptr); }
             Ok(())
         } else { Err(Error::MissingSymbol("g_application_set_app_menu".into())) }
+    }
+
+    pub fn set_menubar(&self, menu: &Menu) -> Result<(), Error> {
+        if let Some(set_menubar) = self.loader.symbols.g_application_set_menubar {
+            if self.inner.is_null() { return Err(Error::Other("Application has no GApplication pointer".into())); }
+            unsafe { set_menubar(self.inner, menu.ptr()); }
+            Ok(())
+        } else { Err(Error::MissingSymbol("g_application_set_menubar".into())) }
+    }
+
+    pub fn add_action(&self, action: &SimpleAction) -> Result<(), Error> {
+        if let Some(add_act) = self.loader.symbols.g_action_map_add_action {
+            if self.inner.is_null() { return Err(Error::Other("Application has no GActionMap pointer".into())); }
+            unsafe { add_act(self.inner, action.ptr()); }
+            Ok(())
+        } else { Err(Error::MissingSymbol("g_action_map_add_action".into())) }
     }
 }
 
@@ -613,6 +653,35 @@ pub fn add_provider_to_widget(loader: &Arc<Loader>, widget: *mut c_void, provide
     }
 }
 
+/// Add a CSS provider globally so it affects all widgets.
+/// Uses `gtk_style_context_add_provider_for_display` (GTK4) or
+/// `gtk_style_context_add_provider_for_screen` (GTK3) or falls back
+/// to per-widget `add_provider_to_widget`.
+pub fn add_css_provider_global(loader: &Arc<Loader>, widget: *mut c_void, provider: *mut c_void, priority: u32) {
+    // GTK4: per-display provider applies to all widgets
+    if let (Some(get_display), Some(add_for_display)) = (loader.symbols.gdk_display_get_default, loader.symbols.gtk_style_context_add_provider_for_display) {
+        unsafe {
+            let display = get_display();
+            if !display.is_null() {
+                add_for_display(display, provider, priority);
+                return;
+            }
+        }
+    }
+    // GTK3: per-screen provider
+    if let (Some(get_screen), Some(add_for_screen)) = (loader.symbols.gdk_screen_get_default, loader.symbols.gtk_style_context_add_provider_for_screen) {
+        unsafe {
+            let screen = get_screen();
+            if !screen.is_null() {
+                add_for_screen(screen, provider, priority);
+                return;
+            }
+        }
+    }
+    // Fallback: per-widget provider
+    add_provider_to_widget(loader, widget, provider, priority);
+}
+
 /// Set widget size request (width, height)
 pub fn widget_set_size_request(loader: &Arc<Loader>, widget: *mut c_void, w: i32, h: i32) {
     if let Some(sr) = loader.symbols.gtk_widget_set_size_request {
@@ -640,5 +709,256 @@ pub fn destroy_widget(loader: &Arc<Loader>, widget: *mut c_void) {
         unsafe { destroy(widget); }
     } else if let Some(unref) = loader.symbols.g_object_unref {
         unsafe { unref(widget); }
+    }
+}
+
+// ---- Menu wrappers ----
+
+struct MenuItem {
+    label: String,
+    detailed_action: String,
+    submenu: Option<Menu>,
+}
+
+/// A GMenu model for building menu structures.
+/// Stores both a GMenu pointer (for GTK4/GMenuModel consumers) and Rust-side
+/// item data (for building GTK3 GtkMenuBar without GMenuModel iteration).
+pub struct Menu {
+    inner: *mut c_void,
+    loader: Arc<Loader>,
+    items: Vec<MenuItem>,
+}
+
+impl Menu {
+    pub fn new(loader: Arc<Loader>) -> Result<Self, Error> {
+        let symbols = &loader.symbols;
+        let ctor = symbols.g_menu_new.ok_or(Error::MissingSymbol("g_menu_new".into()))?;
+        let inner = unsafe { ctor() };
+        if inner.is_null() {
+            return Err(Error::Other("g_menu_new returned null".into()));
+        }
+        if let Some(ref_sink) = symbols.g_object_ref_sink { unsafe { ref_sink(inner); } }
+        else if let Some(gref) = symbols.g_object_ref { unsafe { gref(inner); } }
+        Ok(Menu { inner, loader, items: Vec::new() })
+    }
+
+    pub fn append(&mut self, label: &str, detailed_action: &str) {
+        if let Some(append) = self.loader.symbols.g_menu_append {
+            let l = CString::new(label).unwrap();
+            let a = CString::new(detailed_action).unwrap();
+            unsafe { append(self.inner, l.as_ptr(), a.as_ptr()); }
+        }
+        self.items.push(MenuItem {
+            label: label.to_string(),
+            detailed_action: detailed_action.to_string(),
+            submenu: None,
+        });
+    }
+
+    pub fn append_submenu(&mut self, label: &str, submenu: &Menu) {
+        if let Some(append_sub) = self.loader.symbols.g_menu_append_submenu {
+            let l = CString::new(label).unwrap();
+            unsafe { append_sub(self.inner, l.as_ptr(), submenu.inner); }
+        } else {
+            self.append(label, "");
+        }
+        self.items.push(MenuItem {
+            label: label.to_string(),
+            detailed_action: String::new(),
+            submenu: Some(submenu.clone()),
+        });
+    }
+
+    pub fn ptr(&self) -> *mut c_void { self.inner }
+}
+
+impl AsRef<*mut c_void> for Menu { fn as_ref(&self) -> &*mut c_void { &self.inner } }
+
+impl Drop for Menu {
+    fn drop(&mut self) {
+        if let Some(unref) = self.loader.symbols.g_object_unref { unsafe { unref(self.inner); } }
+    }
+}
+
+impl Clone for Menu {
+    fn clone(&self) -> Self {
+        if let Some(gref) = self.loader.symbols.g_object_ref {
+            unsafe { gref(self.inner); }
+        }
+        Menu { inner: self.inner, loader: self.loader.clone(), items: self.items.clone() }
+    }
+}
+
+// Manual clone for MenuItem since it contains Option<Menu>
+impl Clone for MenuItem {
+    fn clone(&self) -> Self {
+        MenuItem {
+            label: self.label.clone(),
+            detailed_action: self.detailed_action.clone(),
+            submenu: self.submenu.clone(),
+        }
+    }
+}
+
+/// A GSimpleAction for menu item callbacks
+pub struct SimpleAction {
+    inner: *mut c_void,
+    loader: Arc<Loader>,
+}
+
+impl SimpleAction {
+    pub fn new(loader: Arc<Loader>, name: &str) -> Result<Self, Error> {
+        let symbols = &loader.symbols;
+        let ctor = symbols.g_simple_action_new.ok_or(Error::MissingSymbol("g_simple_action_new".into()))?;
+        let n = CString::new(name).unwrap();
+        let inner = unsafe { ctor(n.as_ptr(), std::ptr::null_mut()) };
+        if inner.is_null() {
+            return Err(Error::Other("g_simple_action_new returned null".into()));
+        }
+        if let Some(ref_sink) = symbols.g_object_ref_sink { unsafe { ref_sink(inner); } }
+        else if let Some(gref) = symbols.g_object_ref { unsafe { gref(inner); } }
+        Ok(SimpleAction { inner, loader })
+    }
+
+    pub fn ptr(&self) -> *mut c_void { self.inner }
+
+    pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {
+        let boxed: Box<Box<dyn FnMut(*mut c_void)>> = Box::new(Box::new(f));
+        let res = unsafe { crate::signals::connect_signal_param(&self.loader.symbols, self.inner, "activate", boxed) };
+        match res {
+            Ok(id) => Ok(id),
+            Err(e) => Err(Error::Other(e)),
+        }
+    }
+}
+
+impl AsRef<*mut c_void> for SimpleAction { fn as_ref(&self) -> &*mut c_void { &self.inner } }
+
+impl Drop for SimpleAction {
+    fn drop(&mut self) {
+        if let Some(unref) = self.loader.symbols.g_object_unref { unsafe { unref(self.inner); } }
+    }
+}
+
+impl Clone for SimpleAction {
+    fn clone(&self) -> Self {
+        if let Some(gref) = self.loader.symbols.g_object_ref {
+            unsafe { gref(self.inner); }
+        }
+        SimpleAction { inner: self.inner, loader: self.loader.clone() }
+    }
+}
+
+/// A menubar widget.
+/// GTK4: uses GtkPopoverMenuBar from GMenuModel.
+/// GTK3: builds GtkMenuBar from the Rust-side Menu item list.
+/// Implements AsRef<*mut c_void> so it can be packed into a Box.
+pub struct MenuBar {
+    inner: *mut c_void,
+    loader: Arc<Loader>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl MenuBar {
+    pub fn new(loader: Arc<Loader>, model: &Menu, action_group: *mut c_void) -> Result<Self, Error> {
+        let symbols = &loader.symbols;
+        // GTK4: GtkPopoverMenuBar — uses the GMenuModel directly
+        if let Some(ctor) = symbols.gtk_popover_menu_bar_new_from_model {
+            let inner = unsafe { ctor(model.ptr()) };
+            if inner.is_null() {
+                return Err(Error::Other("gtk_popover_menu_bar_new_from_model returned null".into()));
+            }
+            if let Some(ref_sink) = symbols.g_object_ref_sink { unsafe { ref_sink(inner); } }
+            else if let Some(gref) = symbols.g_object_ref { unsafe { gref(inner); } }
+            return Ok(MenuBar { inner, loader, _not_send: PhantomData });
+        }
+        // GTK3: build GtkMenuBar from the Rust-side items
+        if let (Some(menu_bar_new), Some(_), Some(_)) = (
+            symbols.gtk_menu_bar_new,
+            symbols.gtk_menu_item_new_with_label,
+            symbols.gtk_menu_shell_append,
+        ) {
+            let inner = unsafe { menu_bar_new() };
+            if inner.is_null() {
+                return Err(Error::Other("gtk_menu_bar_new returned null".into()));
+            }
+            Self::build_gtk3(&loader, inner, &model.items, &symbols, action_group);
+            if let Some(ref_sink) = symbols.g_object_ref_sink { unsafe { ref_sink(inner); } }
+            else if let Some(gref) = symbols.g_object_ref { unsafe { gref(inner); } }
+            return Ok(MenuBar { inner, loader, _not_send: PhantomData });
+        }
+        Err(Error::MissingSymbol("gtk_popover_menu_bar_new_from_model".into()))
+    }
+
+    fn build_gtk3(
+        loader: &Arc<Loader>,
+        shell: *mut c_void,
+        items: &[MenuItem],
+        symbols: &crate::symbols::Symbols,
+        action_group: *mut c_void,
+    ) {
+        for item in items {
+            let c_label = match CString::new(item.label.as_str()) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            if let Some(new_item) = symbols.gtk_menu_item_new_with_label {
+                let gtk_item = unsafe { new_item(c_label.as_ptr()) };
+                if let Some(ref submenu) = item.submenu {
+                    // Submenu item: create GtkMenu and recurse
+                    if let Some(menu_new) = symbols.gtk_menu_new {
+                        let submenu_widget = unsafe { menu_new() };
+                        Self::build_gtk3(loader, submenu_widget, &submenu.items, symbols, action_group);
+                        if let Some(set_sub) = symbols.gtk_menu_item_set_submenu {
+                            unsafe { set_sub(gtk_item, submenu_widget); }
+                        }
+                    }
+                } else if !item.detailed_action.is_empty() && !action_group.is_null() {
+                    let _ = set_detailed_action_name(symbols, gtk_item, &item.detailed_action);
+                    if let (Some(lookup), Some(activate_fn)) = (
+                        symbols.g_action_map_lookup_action,
+                        symbols.g_action_activate,
+                    ) {
+                        let action_name = item.detailed_action.rsplit('.').next()
+                            .unwrap_or(&item.detailed_action).to_string();
+                        // Connect to "button-release-event" (GtkWidget signal, always fires on click)
+                        let cb_action = action_name.clone();
+                        let cb_group = action_group;
+                        let cb_lookup = lookup;
+                        let cb_activate = activate_fn;
+                        let cb = Box::new(move |_event: *mut c_void| -> i32 {
+                            let c = CString::new(cb_action.as_str()).unwrap();
+                            let gaction = unsafe { cb_lookup(cb_group, c.as_ptr()) };
+                            if !gaction.is_null() {
+                                unsafe { cb_activate(gaction, std::ptr::null_mut()); }
+                            }
+                            0 // FALSE = let event propagate to GtkMenuItem default handler
+                        });
+                        let _ = unsafe { crate::signals::connect_signal_bool(
+                            symbols, gtk_item, "button-release-event", cb,
+                        )};
+                    }
+                }
+                if let Some(append) = symbols.gtk_menu_shell_append {
+                    unsafe { append(shell, gtk_item); }
+                }
+            }
+        }
+    }
+}
+
+fn set_detailed_action_name(symbols: &crate::symbols::Symbols, item: *mut c_void, action_str: &str) -> Result<(), ()> {
+    if let Some(set_action) = symbols.gtk_actionable_set_detailed_action_name {
+        let c = CString::new(action_str).unwrap();
+        unsafe { set_action(item, c.as_ptr()); }
+        Ok(())
+    } else { Err(()) }
+}
+
+impl AsRef<*mut c_void> for MenuBar { fn as_ref(&self) -> &*mut c_void { &self.inner } }
+
+impl Drop for MenuBar {
+    fn drop(&mut self) {
+        if let Some(unref) = self.loader.symbols.g_object_unref { unsafe { unref(self.inner); } }
     }
 }

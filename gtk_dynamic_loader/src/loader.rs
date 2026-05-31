@@ -22,7 +22,6 @@ impl Loader {
         let glib_cands = ["libglib-2.0.so.0", "libglib-2.0.so"];
         let gobject_cands = ["libgobject-2.0.so.0", "libgobject-2.0.so"];
         let gio_cands = ["libgio-2.0.so.0", "libgio-2.0.so"];
-        let gdk_cands = ["libgdk-4.so.1", "libgdk-4.so", "libgdk-3.so.0", "libgdk-3.so"];
         let pango_cands = ["libpango-1.0.so.0", "libpango-1.0.so"];
         let gtk4_cands = ["libgtk-4.so.1", "libgtk-4.so"];
         let gtk3_cands = ["libgtk-3.so.0", "libgtk-3.so"];
@@ -39,10 +38,6 @@ impl Loader {
         // gio (optional)
         let libgio = open_first(&gio_cands);
         if let Some(g) = libgio { libs.insert("libgio".into(), Arc::new(g)); }
-
-        // gdk (optional)
-        let libgdk = open_first(&gdk_cands);
-        if let Some(g) = libgdk { libs.insert("libgdk".into(), Arc::new(g)); }
 
         // pango (optional)
         let libpango = open_first(&pango_cands);

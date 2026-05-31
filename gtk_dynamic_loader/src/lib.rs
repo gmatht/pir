@@ -8,6 +8,6 @@ mod signals;
 
 pub use error::Error;
 pub use loader::{Loader, Version};
-pub use wrappers::{Application, Button, Label, Window, BoxWidget, Orientation, Grid, Entry, measure_text_px, DrawingArea, create_css_provider, add_provider_to_widget, Overlay, widget_set_size_request, widget_set_margin_start, widget_set_margin_top, destroy_widget};
+pub use wrappers::{Application, Button, Label, Window, BoxWidget, Orientation, Grid, Entry, Menu, MenuBar, SimpleAction, measure_text_px, DrawingArea, create_css_provider, add_provider_to_widget, add_css_provider_global, Overlay, widget_set_size_request, widget_set_margin_start, widget_set_margin_top, destroy_widget};
 // Re-export connection helpers so examples can attach to low-level GObject signals
 pub use signals::{connect_signal_param, connect_signal_bool, connect_signal};
