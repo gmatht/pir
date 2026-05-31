@@ -381,7 +381,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 entry.set_text(&texts_nav.borrow()[r][c]);
                 entry.set_width_chars(12);
                 let cw = cw_edit.borrow();
-                let left = 46 + compute_col_x(&cw, c);
+                let left = compute_col_x(&cw, c);
                 let top = (r as i32 + 1) * CELL_H;
                 drop(cw);
                 gtk_dynamic_loader::widget_set_margin_start(&loader_for_edit, *entry.as_ref(), left);
@@ -541,7 +541,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let gesture = unsafe { gesture_new() };
                 if !gesture.is_null() {
                     if let Some(add_ctrl) = loader.symbols.gtk_widget_add_controller {
-                        unsafe { add_ctrl(grid_ptr, gesture); }
+                        unsafe { add_ctrl(overlay_ptr, gesture); }
                     }
                     let cl = click_logic.clone();
                     let sw_ptr = scrolled_ptr;
@@ -877,7 +877,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let gesture = unsafe { gesture_new() };
                     if !gesture.is_null() {
                         if let Some(add_ctrl) = loader.symbols.gtk_widget_add_controller {
-                            unsafe { add_ctrl(grid_ptr, gesture); }
+                            unsafe { add_ctrl(overlay_ptr, gesture); }
                         }
                         let cw_r = cw_nav.clone();
                         let rs_r = rs_nav.clone();
@@ -972,7 +972,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let ctrl = unsafe { motion_new() };
                     if !ctrl.is_null() {
                         if let Some(add_ctrl) = loader.symbols.gtk_widget_add_controller {
-                            unsafe { add_ctrl(grid_ptr, ctrl); }
+                            unsafe { add_ctrl(overlay_ptr, ctrl); }
                         }
                         let rs_m = rs_nav.clone();
                         let rsx_m = rsx_nav.clone();
@@ -982,21 +982,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let sc_m = sc_nav.clone();
                         let ld_m = loader_for_resize.clone();
                         let ref_m = refresh_nav.clone();
-                        let sw_m = scrolled_ptr;
-                        let ld_motion = loader.clone();
+                        let ld_mot_inner = loader.clone();
                         let _ = unsafe {
                             gtk_dynamic_loader::connect_signal_motion(loader.symbols.as_ref(), ctrl, "motion", Box::new(move |x: f64, y: f64| {
                                 if rs_m.borrow().is_none() { return; }
+                                let sw_m = scrolled_ptr;
                                 let adj_value = |sym: Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void>, get_val: Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> f64>| -> f64 {
                                     sym.and_then(|f| {
                                         let adj = unsafe { f(sw_m) };
                                         if adj.is_null() { None } else { get_val.map(|gv| unsafe { gv(adj) }) }
                                     }).unwrap_or(0.0)
                                 };
-                                let scroll_x = adj_value(ld_motion.symbols.gtk_scrolled_window_get_hadjustment, ld_motion.symbols.gtk_adjustment_get_value);
-                                let scroll_y = adj_value(ld_motion.symbols.gtk_scrolled_window_get_vadjustment, ld_motion.symbols.gtk_adjustment_get_value);
+                                let scroll_x = adj_value(ld_mot_inner.symbols.gtk_scrolled_window_get_hadjustment, ld_mot_inner.symbols.gtk_adjustment_get_value);
                                 let ax = x + scroll_x;
-                                let ay = y + scroll_y;
                                 if let Some(col) = *rs_m.borrow() {
                                     let delta = (ax as i32) - *rsx_m.borrow();
                                     let new_w = (*rsw_m.borrow() + delta).max(20);
