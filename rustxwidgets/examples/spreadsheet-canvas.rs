@@ -231,6 +231,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Cells
+    let row_markers: Rc<RefCell<Vec<gtk::Label>>> = Rc::new(RefCell::new(Vec::new()));
     let static_cells: Rc<RefCell<Vec<Vec<gtk::Label>>>> = Rc::new(RefCell::new(Vec::new()));
     let selected_coord: Rc<RefCell<Option<(usize, usize)>>> = Rc::new(RefCell::new(Some((0, 0))));
     let editing_entry: Rc<RefCell<Option<gtk::Entry>>> = Rc::new(RefCell::new(None));
@@ -239,10 +240,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rm = app.create_label(&format!("{}", r + 1))?;
         rm.set_text(&format!("{}", r + 1));
         rm.add_class("row-marker");
-        rm.add_class("header");
         rm.set_xalign(0.5);
         grid_widget.attach(&rm, 0, (r + 1) as i32, 1, 1);
         gtk_dynamic_loader::widget_set_size_request(&loader, *rm.as_ref(), 46, CELL_H);
+        row_markers.borrow_mut().push(rm);
 
         let mut row_labels = Vec::new();
         for c in 0..VISIBLE_COLS {
@@ -309,7 +310,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let css = r#"
         label.rwx-overlay { background-color: transparent; padding: 2px 4px; font-family: monospace; font-size: 13px; }
         label.header { font-weight: bold; background-color: #ffffff; color: #000000; font-size: 12px; border: 1px solid #000000; padding: 2px 4px; }
-        label.row-marker { color: #000000; background-color: #f8f8f8; border-right: 1px solid #000000; font-weight: bold; }
+        label.row-marker { color: #000000; background-color: #f8f8f8; font-weight: bold; font-size: 12px; padding: 2px 4px; border-right: 1px solid #000000; border-bottom: 1px solid #000000; }
         label.cell { padding-left: 4px; padding-right: 4px; font-family: monospace; font-size: 13px; background-color: #ffffff; border-right: 1px solid #000000; border-bottom: 1px solid #000000; }
         label.boolval { font-weight: bold; color: #0000cc; }
         label.negative { color: #cc0000; }

@@ -1,4 +1,4 @@
-use crate::loader::Loader;
+use crate::loader::{Loader, Version};
 use crate::error::Error;
 use std::ffi::CString;
 use std::marker::PhantomData;
@@ -647,9 +647,19 @@ pub fn create_css_provider(loader: &Arc<Loader>, css: &str) -> Option<*mut c_voi
         if provider.is_null() { return None; }
         if let Some(load_fn) = loader.symbols.gtk_css_provider_load_from_data {
             let c = CString::new(css).unwrap_or_default();
-            // load_from_data(provider, data, length, error)
-            let mut err: *mut c_void = std::ptr::null_mut();
-            unsafe { let _ = load_fn(provider, c.as_ptr(), c.as_bytes().len() as isize, &mut err as *mut *mut c_void); }
+            match loader.version {
+                Version::Gtk4 => {
+                    // GTK4: gtk_css_provider_load_from_data has no GError** parameter
+                    type LoadGtk4 = unsafe extern "C" fn(*mut c_void, *const i8, isize);
+                    let fn4: LoadGtk4 = unsafe { std::mem::transmute(load_fn) };
+                    unsafe { fn4(provider, c.as_ptr(), c.as_bytes().len() as isize); }
+                }
+                _ => {
+                    // GTK3: gtk_css_provider_load_from_data has GError** parameter
+                    let mut err: *mut c_void = std::ptr::null_mut();
+                    unsafe { load_fn(provider, c.as_ptr(), c.as_bytes().len() as isize, &mut err as *mut *mut c_void); }
+                }
+            }
         }
         Some(provider)
     } else { None }
