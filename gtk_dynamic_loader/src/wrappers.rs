@@ -602,6 +602,9 @@ impl Entry {
     }
 
     pub fn set_size_request(&self, w: i32, h: i32) {
+        if w < 150 {
+            eprintln!("WARNING: Entry width {} is below GTK minimum (150px); the entry may not fit the intended column width", w);
+        }
         if let Some(sr) = self.loader.symbols.gtk_widget_set_size_request { unsafe { sr(self.inner, w, h); } }
     }
 

@@ -6,7 +6,7 @@ use std::ffi::CString;
 
 const VISIBLE_ROWS: usize = 100;
 const VISIBLE_COLS: usize = 26;
-const CELL_W: i32 = 100;
+const CELL_W: i32 = 150;
 const CELL_H: i32 = 28;
 
 type CellFormat = (bool, bool, u8, String, String); // bold, italic, align, fg, bg
@@ -125,6 +125,7 @@ fn draw_grid(
     sel: &RefCell<Option<(usize, usize)>>,
     _col_widths: &RefCell<Vec<i32>>,
     _row_heights: &RefCell<Vec<i32>>,
+    editing: &RefCell<Option<gtk::Entry>>,
 ) {
     let s = &loader.symbols;
     macro_rules! c {
@@ -279,22 +280,23 @@ fn draw_grid(
     }
 
     // Cell text with formatting and overflow clip
+    c!(cairo_save(cr));
+    let edit_target: Option<(usize, usize)> = if editing.borrow().is_some() {
+        *sel.borrow()
+    } else {
+        None
+    };
+
     c!(cairo_set_font_size(cr, 13.0));
     for r in 0..VISIBLE_ROWS {
         for c in 0..VISIBLE_COLS {
             let text = &t[r][c];
             if text.is_empty() { continue; }
+            if Some((r, c)) == edit_target { continue; }
             let (bold, italic, align, fg_hex, bg_hex) = &f[r][c];
 
             let cx = chw + c as f64 * cw;
             let cy = ch + r as f64 * ch;
-
-            if bg_hex != "#ffffff" {
-                let (br, bg, bb) = parse_color(bg_hex);
-                c!(cairo_set_source_rgb(cr, br, bg, bb));
-                c!(cairo_rectangle(cr, cx, cy, cw, ch));
-                c!(cairo_fill(cr));
-            }
 
             if fg_hex != "#000000" {
                 let (fr, fgg, fb) = parse_color(fg_hex);
@@ -320,11 +322,34 @@ fn draw_grid(
             let ty = cy + ch / 2.0 - ext.y_bearing - ext.height / 2.0;
 
             let last_oc = overflow_end_col[r][c];
+            let text_right = tx + ext.x_bearing + ext.width + 2.0;
             let clip_right = if last_oc > c {
-                (chw + (last_oc + 1) as f64 * cw).min(total_w)
+                let mut limit = text_right;
+                for oc in (c + 1)..VISIBLE_COLS {
+                    if !t[r][oc].is_empty() {
+                        limit = limit.min(chw + oc as f64 * cw);
+                        break;
+                    }
+                }
+                limit.min(total_w)
             } else {
                 cx + cw
             };
+
+            if bg_hex != "#ffffff" || last_oc > c {
+                let (br, bg, bb) = parse_color(bg_hex);
+                c!(cairo_set_source_rgb(cr, br, bg, bb));
+                c!(cairo_rectangle(cr, cx, cy + 1.0, clip_right - cx, ch - 2.0));
+                c!(cairo_fill(cr));
+            }
+
+            // Restore text color after background fill
+            if fg_hex != "#000000" {
+                let (fr, fgg, fb) = parse_color(fg_hex);
+                c!(cairo_set_source_rgb(cr, fr, fgg, fb));
+            } else {
+                c!(cairo_set_source_rgb(cr, 0.0, 0.0, 0.0));
+            }
 
             c!(cairo_save(cr));
             c!(cairo_rectangle(cr, cx, cy, clip_right - cx, ch));
@@ -334,6 +359,7 @@ fn draw_grid(
             c!(cairo_restore(cr));
         }
     }
+    c!(cairo_restore(cr));
 
     // Header labels
     c!(cairo_select_font_face(cr, CString::new("monospace").unwrap().as_ptr(), 0, 1));
@@ -491,8 +517,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sl = selected_coord.clone();
         let cw_draw = col_widths.clone();
         let rh_draw = row_heights.clone();
+        let edit_draw = editing_entry.clone();
         drawing_area.set_draw_func(Box::new(move |cr, w, h| {
-            draw_grid(cr, w, h, &ld, &tx, &fm, &sl, &cw_draw, &rh_draw);
+            draw_grid(cr, w, h, &ld, &tx, &fm, &sl, &cw_draw, &rh_draw, &edit_draw);
         })).ok();
         drawing_area.set_content_width(46 + VISIBLE_COLS as i32 * CELL_W);
         drawing_area.set_content_height(CELL_H + VISIBLE_ROWS as i32 * CELL_H);
@@ -503,9 +530,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sl = selected_coord.clone();
         let cw = col_widths.clone();
         let rh = row_heights.clone();
+        let edit_draw = editing_entry.clone();
         unsafe {
             drawing_area.connect_draw_gtk3(Box::new(move |_widget, cr| {
-                draw_grid(cr, 0, 0, &ld, &tx, &fm, &sl, &cw, &rh);
+                draw_grid(cr, 0, 0, &ld, &tx, &fm, &sl, &cw, &rh, &edit_draw);
                 0
             })).ok();
         }
@@ -519,7 +547,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(loader2) = rustxwidgets::backends::gtk::loader() {
         let css = r#"
         button { font-size: 11px; padding: 1px 8px; min-height: 20px; }
-        entry { border: 1px solid #000000; font-family: monospace; font-size: 13px; min-height: 24px; }
+        entry { padding: 0; border: none; font-family: monospace; font-size: 13px; min-height: 0; }
+        entry:focus { outline: none; }
         "#;
         if let Some(provider) = gtk_dynamic_loader::create_css_provider(&loader2, css) {
             gtk_dynamic_loader::add_css_provider_global(&loader2, *win.as_ref(), provider, 600);
@@ -1107,11 +1136,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let result = app.run().map_err(|e| Box::new(e) as Box<dyn std::error::Error>);
 
-    // Cleanup: unparent drawing area from overlay to avoid double-free from Rust Drop
-    *editing_entry.borrow_mut() = None;
-    if let Some(unparent) = loader.symbols.gtk_widget_unparent {
-        unsafe { unparent(draw_ptr_raw); }
+    // Cleanup: unparent editing entry from overlay before Cascade destroys it
+    if let Some(e) = editing_entry.borrow_mut().take() {
+        if let Some(unparent) = loader.symbols.gtk_widget_unparent {
+            unsafe { unparent(*e.as_ref()); }
+        }
     }
+    // DrawingArea was forgotten via std::mem::forget, so its Drop won't run.
+    // Cascade destruction from overlay/scrolled-window will handle it.
 
     result
 }
