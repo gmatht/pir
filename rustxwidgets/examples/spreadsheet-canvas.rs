@@ -778,16 +778,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         } else {
+            type GtkWidgetAddEvents = unsafe extern "C" fn(*mut std::ffi::c_void, i32);
+            const GDK_BUTTON_PRESS_MASK: i32 = 1 << 8;
+            if let Some(add_events) = lookup_sym::<GtkWidgetAddEvents>(&loader, "gtk_widget_add_events") {
+                unsafe { add_events(draw_ptr_raw, GDK_BUTTON_PRESS_MASK); }
+            }
             let cl = click_logic.clone();
-            let ov_ptr = overlay_ptr;
+            let da_for_click = draw_ptr_raw;
+            let ld_for_click = loader.clone();
             unsafe {
-                let _ = gtk_dynamic_loader::connect_signal_bool(loader.symbols.as_ref(), ov_ptr, "button-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
+                let _ = gtk_dynamic_loader::connect_signal_bool(loader.symbols.as_ref(), da_for_click, "button-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
                     type GetEventCoords = unsafe extern "C" fn(*mut std::ffi::c_void, *mut f64, *mut f64) -> i32;
-                    let loader_tmp = match rustxwidgets::backends::gtk::loader() { Some(l) => l, None => return 0, };
-                    let get_coords = loader_tmp.libs.get("libgdk").and_then(|gdk_lib| {
+                    let get_coords = ld_for_click.libs.get("libgdk").and_then(|gdk_lib| {
                         unsafe { (*gdk_lib).get::<GetEventCoords>(b"gdk_event_get_coords").ok().map(|s| *s) }
                     }).or_else(|| {
-                        loader_tmp.libs.get("libgtk").and_then(|gtk_lib| {
+                        ld_for_click.libs.get("libgtk").and_then(|gtk_lib| {
                             unsafe { (*gtk_lib).get::<GetEventCoords>(b"gdk_event_get_coords").ok().map(|s| *s) }
                         })
                     });
