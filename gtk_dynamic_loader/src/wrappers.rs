@@ -495,6 +495,53 @@ impl DrawingArea {
     pub fn set_size_request(&self, w: i32, h: i32) {
         if let Some(sr) = self.loader.symbols.gtk_widget_set_size_request { unsafe { sr(self.inner, w, h); } }
     }
+
+    /// GTK4: set draw function callback (cr, width, height)
+    pub fn set_draw_func(&self, cb: Box<dyn FnMut(*mut std::ffi::c_void, i32, i32)>) -> Result<(), Error> {
+        if let Some(f) = self.loader.symbols.gtk_drawing_area_set_draw_func {
+            let boxed: Box<Box<dyn FnMut(*mut std::ffi::c_void, i32, i32)>> = Box::new(Box::new(cb));
+            let raw = Box::into_raw(boxed) as *mut std::ffi::c_void;
+            unsafe {
+                f(self.inner, Some(crate::signals::gtk_compat_trampoline_draw_gtk4 as unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, i32, i32, *mut std::ffi::c_void)), raw, Some(crate::signals::gtk_compat_destroy_notify_draw_gtk4 as unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void)));
+            }
+            Ok(())
+        } else {
+            Err(Error::MissingSymbol("gtk_drawing_area_set_draw_func".into()))
+        }
+    }
+
+    /// GTK4: set content width for scrollable area
+    pub fn set_content_width(&self, w: i32) {
+        if let Some(f) = self.loader.symbols.gtk_drawing_area_set_content_width {
+            unsafe { f(self.inner, w); }
+        }
+    }
+
+    /// GTK4: set content height for scrollable area
+    pub fn set_content_height(&self, h: i32) {
+        if let Some(f) = self.loader.symbols.gtk_drawing_area_set_content_height {
+            unsafe { f(self.inner, h); }
+        }
+    }
+
+    /// GTK3: connect to the "draw" signal. The closure receives (widget_ptr, cairo_t*) and returns gboolean.
+    pub unsafe fn connect_draw_gtk3(&self, cb: Box<dyn FnMut(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32>) -> Result<u64, String> {
+        let boxed: Box<Box<dyn FnMut(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32>> = Box::new(Box::new(cb));
+        let raw = Box::into_raw(boxed) as *mut std::ffi::c_void;
+        let sig_name = std::ffi::CString::new("draw").unwrap();
+        if let Some(gscd) = self.loader.symbols.g_signal_connect_data {
+            let handler_ptr = crate::signals::gtk_compat_trampoline_draw_gtk3 as *const () as *mut std::ffi::c_void;
+            let destroy_ptr = Some(crate::signals::gtk_compat_destroy_notify_draw_gtk3 as unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void));
+            let id = gscd(self.inner, sig_name.as_ptr(), handler_ptr, raw, destroy_ptr, 0);
+            Ok(id)
+        } else if let Some(gsc) = self.loader.symbols.g_signal_connect {
+            let handler_ptr = crate::signals::gtk_compat_trampoline_draw_gtk3 as *const () as *mut std::ffi::c_void;
+            let id = gsc(self.inner, sig_name.as_ptr(), handler_ptr, raw);
+            Ok(id)
+        } else {
+            Err("no g_signal_connect available".into())
+        }
+    }
 }
 
 impl AsRef<*mut c_void> for DrawingArea { fn as_ref(&self) -> &*mut c_void { &self.inner } }

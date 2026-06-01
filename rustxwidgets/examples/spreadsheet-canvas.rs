@@ -2,6 +2,7 @@ use rustxwidgets::prelude::*;
 use rustxwidgets::backends_gtk_adapter as gtk;
 use std::rc::Rc;
 use std::cell::RefCell;
+use std::ffi::CString;
 
 const VISIBLE_ROWS: usize = 100;
 const VISIBLE_COLS: usize = 26;
@@ -85,14 +86,6 @@ fn set_valign(loader: &std::sync::Arc<gtk_dynamic_loader::Loader>, widget: *mut 
     }
 }
 
-fn compute_col_x(widths: &[i32], col: usize) -> i32 {
-    let mut x = 0;
-    for i in 0..col {
-        if i < widths.len() { x += widths[i]; }
-    }
-    x
-}
-
 fn compute_row_y(heights: &[i32], row: usize) -> i32 {
     let mut y = 0;
     for i in 0..row {
@@ -101,42 +94,175 @@ fn compute_row_y(heights: &[i32], row: usize) -> i32 {
     y
 }
 
-fn apply_formatting(lbl: &gtk::Label, text: &str, fmt: &CellFormat) {
-    lbl.set_text(text);
-    lbl.remove_class("boolval");
-    lbl.remove_class("numeric");
-    lbl.remove_class("formula");
-    lbl.remove_class("bold-cell");
-    lbl.remove_class("italic-cell");
-    let (bold, italic, align, fg, bg) = fmt;
-    if *bold { lbl.add_class("bold-cell"); }
-    if *italic { lbl.add_class("italic-cell"); }
-    lbl.set_xalign(if *align == 1 { 0.5 } else if *align == 2 { 1.0 } else { 0.0 });
-    if !fg.is_empty() && fg != "#000000" {
-        lbl.set_markup(&format!("<span foreground=\"{}\">{}</span>", fg, text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")));
+fn parse_color(hex: &str) -> (f64, f64, f64) {
+    if hex.len() >= 7 && hex.as_bytes()[0] == b'#' {
+        let r = u8::from_str_radix(&hex[1..3], 16).unwrap_or(0) as f64 / 255.0;
+        let g = u8::from_str_radix(&hex[3..5], 16).unwrap_or(0) as f64 / 255.0;
+        let b = u8::from_str_radix(&hex[5..7], 16).unwrap_or(0) as f64 / 255.0;
+        (r, g, b)
     } else {
-        let upper = text.to_uppercase();
-        if upper == "TRUE" || upper == "FALSE" {
-            lbl.add_class("boolval");
-            lbl.set_text(text);
-        } else if text.starts_with('-') || text.parse::<f64>().is_ok() {
-            lbl.add_class("numeric");
-            lbl.set_text(text);
-        } else if text.starts_with('=') {
-            lbl.add_class("formula");
-            lbl.set_text(text);
-        } else {
-            lbl.set_text(text);
+        (0.0, 0.0, 0.0)
+    }
+}
+
+#[repr(C)]
+struct CairoTextExtentsT {
+    x_bearing: f64,
+    y_bearing: f64,
+    width: f64,
+    height: f64,
+    x_advance: f64,
+    y_advance: f64,
+}
+
+fn draw_grid(
+    cr: *mut std::ffi::c_void,
+    _w: i32,
+    _h: i32,
+    loader: &std::sync::Arc<gtk_dynamic_loader::Loader>,
+    texts: &RefCell<Vec<Vec<String>>>,
+    fmts: &RefCell<Vec<Vec<CellFormat>>>,
+    sel: &RefCell<Option<(usize, usize)>>,
+    _col_widths: &RefCell<Vec<i32>>,
+    _row_heights: &RefCell<Vec<i32>>,
+) {
+    let s = &loader.symbols;
+    macro_rules! c {
+        ($f:ident($($a:expr),*)) => {
+            if let Some(f) = s.$f { unsafe { f($($a),*) } }
+        };
+    }
+
+    let chw = 46_f64;
+    let cw = CELL_W as f64;
+    let ch = CELL_H as f64;
+    let total_w = chw + VISIBLE_COLS as f64 * cw;
+    let total_h = ch + VISIBLE_ROWS as f64 * ch;
+
+    c!(cairo_set_source_rgb(cr, 1.0, 1.0, 1.0));
+    c!(cairo_rectangle(cr, 0.0, 0.0, total_w, total_h));
+    c!(cairo_fill(cr));
+
+    c!(cairo_set_source_rgb(cr, 0.91, 0.91, 0.91));
+    c!(cairo_rectangle(cr, 0.0, 0.0, chw, ch));
+    c!(cairo_fill(cr));
+
+    c!(cairo_set_source_rgb(cr, 0.8, 0.8, 0.8));
+    c!(cairo_rectangle(cr, chw, 0.0, VISIBLE_COLS as f64 * cw, ch));
+    c!(cairo_fill(cr));
+    c!(cairo_rectangle(cr, 0.0, ch, chw, VISIBLE_ROWS as f64 * ch));
+    c!(cairo_fill(cr));
+
+    c!(cairo_set_source_rgb(cr, 0.7, 0.7, 0.7));
+    c!(cairo_set_line_width(cr, 0.5));
+    for c in 0..=VISIBLE_COLS {
+        let x = chw + c as f64 * cw;
+        c!(cairo_move_to(cr, x, 0.0));
+        c!(cairo_line_to(cr, x, total_h));
+        c!(cairo_stroke(cr));
+    }
+    for r in 0..=VISIBLE_ROWS {
+        let y = ch + r as f64 * ch;
+        c!(cairo_move_to(cr, 0.0, y));
+        c!(cairo_line_to(cr, total_w, y));
+        c!(cairo_stroke(cr));
+    }
+
+    c!(cairo_select_font_face(cr, CString::new("monospace").unwrap().as_ptr(), 0, 1));
+    c!(cairo_set_font_size(cr, 12.0));
+    c!(cairo_set_source_rgb(cr, 0.0, 0.0, 0.0));
+    for c in 0..VISIBLE_COLS {
+        let lbl = col_to_label(c);
+        let c_lbl = CString::new(lbl.as_str()).unwrap();
+        let mut ext: CairoTextExtentsT = unsafe { std::mem::zeroed() };
+        c!(cairo_text_extents(cr, c_lbl.as_ptr(), &mut ext as *mut _ as *mut std::ffi::c_void));
+        let x = chw + c as f64 * cw + cw / 2.0 - ext.x_bearing - ext.width / 2.0;
+        let y = ch / 2.0 - ext.y_bearing - ext.height / 2.0 + ext.height;
+        c!(cairo_move_to(cr, x, y));
+        c!(cairo_show_text(cr, c_lbl.as_ptr()));
+    }
+
+    c!(cairo_set_font_size(cr, 12.0));
+    for r in 0..VISIBLE_ROWS {
+        let lbl = format!("{}", r + 1);
+        let c_lbl = CString::new(lbl.as_str()).unwrap();
+        let mut ext: CairoTextExtentsT = unsafe { std::mem::zeroed() };
+        c!(cairo_text_extents(cr, c_lbl.as_ptr(), &mut ext as *mut _ as *mut std::ffi::c_void));
+        let x = chw / 2.0 - ext.x_bearing - ext.width / 2.0;
+        let y = ch + r as f64 * ch + ch / 2.0 - ext.y_bearing - ext.height / 2.0 + ext.height;
+        c!(cairo_move_to(cr, x, y));
+        c!(cairo_show_text(cr, c_lbl.as_ptr()));
+    }
+
+    let t = texts.borrow();
+    let f = fmts.borrow();
+    c!(cairo_set_font_size(cr, 13.0));
+    for r in 0..VISIBLE_ROWS {
+        for c in 0..VISIBLE_COLS {
+            let text = &t[r][c];
+            if text.is_empty() { continue; }
+            let (bold, italic, align, fg_hex, bg_hex) = &f[r][c];
+
+            let cx = chw + c as f64 * cw;
+            let cy = ch + r as f64 * ch;
+
+            if bg_hex != "#ffffff" {
+                let (br, bg, bb) = parse_color(bg_hex);
+                c!(cairo_set_source_rgb(cr, br, bg, bb));
+                c!(cairo_rectangle(cr, cx, cy, cw, ch));
+                c!(cairo_fill(cr));
+            }
+
+            if fg_hex != "#000000" {
+                let (fr, fgg, fb) = parse_color(fg_hex);
+                c!(cairo_set_source_rgb(cr, fr, fgg, fb));
+            } else {
+                c!(cairo_set_source_rgb(cr, 0.0, 0.0, 0.0));
+            }
+
+            let slant = if *italic { 1 } else { 0 };
+            let weight = if *bold { 1 } else { 0 };
+            c!(cairo_select_font_face(cr, CString::new("monospace").unwrap().as_ptr(), slant, weight));
+
+            let c_text = CString::new(text.as_str()).unwrap();
+            let mut ext: CairoTextExtentsT = unsafe { std::mem::zeroed() };
+            c!(cairo_text_extents(cr, c_text.as_ptr(), &mut ext as *mut _ as *mut std::ffi::c_void));
+
+            let pad = 4.0;
+            let tx = match *align {
+                0 => cx + pad - ext.x_bearing,
+                1 => cx + cw / 2.0 - ext.x_bearing - ext.width / 2.0,
+                _ => cx + cw - pad - ext.x_bearing - ext.width,
+            };
+            let ty = cy + ch / 2.0 - ext.y_bearing - ext.height / 2.0 + ext.height;
+
+            c!(cairo_save(cr));
+            c!(cairo_rectangle(cr, cx, cy, cw, ch));
+            c!(cairo_clip(cr));
+            c!(cairo_move_to(cr, tx, ty));
+            c!(cairo_show_text(cr, c_text.as_ptr()));
+            c!(cairo_restore(cr));
         }
     }
-    if !bg.is_empty() && bg != "#ffffff" {
-        lbl.set_markup(&format!("<span background=\"{}\">{}</span>", bg,
-            if fg.is_empty() || fg == "#000000" {
-                text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
-            } else {
-                text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
-            }));
+    drop(t);
+    drop(f);
+
+    if let Some((sr, sc)) = *sel.borrow() {
+        let sx = chw + sc as f64 * cw;
+        let sy = ch + sr as f64 * ch;
+        c!(cairo_set_source_rgba(cr, 0.83, 0.91, 1.0, 0.3));
+        c!(cairo_rectangle(cr, sx, sy, cw, ch));
+        c!(cairo_fill(cr));
+        c!(cairo_set_source_rgb(cr, 0.1, 0.45, 0.91));
+        c!(cairo_set_line_width(cr, 2.0));
+        c!(cairo_rectangle(cr, sx + 0.5, sy + 0.5, cw - 1.0, ch - 1.0));
+        c!(cairo_stroke(cr));
     }
+}
+
+struct ScopedDrawingArea(*mut std::ffi::c_void);
+impl AsRef<*mut std::ffi::c_void> for ScopedDrawingArea {
+    fn as_ref(&self) -> &*mut std::ffi::c_void { &self.0 }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -186,7 +312,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (0..VISIBLE_ROWS).map(|_| (0..VISIBLE_COLS).map(|_| (false, false, 0u8, "#000000".into(), "#ffffff".into())).collect()).collect()
     ));
 
-    // Column widths (mutable for resize)
+    // Column widths (constant)
     let col_widths: Rc<RefCell<Vec<i32>>> = Rc::new(RefCell::new(vec![CELL_W; VISIBLE_COLS]));
     let row_heights: Rc<RefCell<Vec<i32>>> = Rc::new(RefCell::new(vec![CELL_H; VISIBLE_ROWS]));
 
@@ -232,134 +358,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     formula_entry.set_size_request(400, 26);
     formula_hbox.append(&formula_entry);
 
-    // Overlay
+    // DrawingArea (canvas) replaces the GtkGrid
+    let drawing_area = gtk_dynamic_loader::DrawingArea::new(loader.clone())?;
     let overlay_ptr = make_overlay(&loader).expect("failed to create overlay");
-    let grid_widget = gtk::create_grid()?;
-    set_overlay_child(&loader, overlay_ptr, *grid_widget.as_ref(), is_gtk4);
+    let draw_ptr_raw = *drawing_area.as_ref();
+    set_overlay_child(&loader, overlay_ptr, draw_ptr_raw, is_gtk4);
 
-    // Cap label natural widths so grid columns use size_request
-    type LabelSetWidthChars = unsafe extern "C" fn(*mut std::ffi::c_void, i32);
-    let set_lbl_width = lookup_sym::<LabelSetWidthChars>(&loader, "gtk_label_set_width_chars");
-
-    // Corner
-    let corner = app.create_label("")?;
-    corner.add_class("header");
-    grid_widget.attach(&corner, 0, 0, 1, 1);
-    gtk_dynamic_loader::widget_set_size_request(&loader, *corner.as_ref(), 46, CELL_H);
-    if let Some(f) = set_lbl_width { unsafe { f(*corner.as_ref(), 1); } }
-
-    // Column headers
-    let mut col_headers: Vec<gtk::Label> = Vec::new();
-    for c in 0..VISIBLE_COLS {
-        let lbl = col_to_label(c);
-        let hdr = app.create_label(&lbl)?;
-        hdr.set_text(&lbl);
-        hdr.add_class("header");
-        hdr.set_xalign(0.5);
-        grid_widget.attach(&hdr, (c + 1) as i32, 0, 1, 1);
-        gtk_dynamic_loader::widget_set_size_request(&loader, *hdr.as_ref(), CELL_W, CELL_H);
-        if let Some(f) = set_lbl_width { unsafe { f(*hdr.as_ref(), 1); } }
-        col_headers.push(hdr);
-    }
-
-    // Cells
-    let row_markers: Rc<RefCell<Vec<gtk::Label>>> = Rc::new(RefCell::new(Vec::new()));
-    let static_cells: Rc<RefCell<Vec<Vec<gtk::Label>>>> = Rc::new(RefCell::new(Vec::new()));
+    // Draw callback
     let selected_coord: Rc<RefCell<Option<(usize, usize)>>> = Rc::new(RefCell::new(Some((0, 0))));
     let editing_entry: Rc<RefCell<Option<gtk::Entry>>> = Rc::new(RefCell::new(None));
 
-    for r in 0..VISIBLE_ROWS {
-        let rm = app.create_label(&format!("{}", r + 1))?;
-        rm.set_text(&format!("{}", r + 1));
-        rm.add_class("row-marker");
-        rm.set_xalign(0.5);
-        grid_widget.attach(&rm, 0, (r + 1) as i32, 1, 1);
-        gtk_dynamic_loader::widget_set_size_request(&loader, *rm.as_ref(), 46, row_heights.borrow()[r]);
-        if let Some(f) = set_lbl_width { unsafe { f(*rm.as_ref(), 1); } }
-        row_markers.borrow_mut().push(rm);
-
-        let mut row_labels = Vec::new();
-        for c in 0..VISIBLE_COLS {
-            let text = texts.borrow()[r][c].clone();
-            let lbl = app.create_label(&text)?;
-            let fmt = cell_formats.borrow()[r][c].clone();
-            apply_formatting(&lbl, &text, &fmt);
-            grid_widget.attach(&lbl, (c + 1) as i32, (r + 1) as i32, 1, 1);
-            let w = CELL_W;
-            gtk_dynamic_loader::widget_set_size_request(&loader, *lbl.as_ref(), w, row_heights.borrow()[r]);
-            if let Some(f) = set_lbl_width { unsafe { f(*lbl.as_ref(), 1); } }
-            row_labels.push(lbl);
-        }
-        static_cells.borrow_mut().push(row_labels);
-    }
-
-    if let Ok(sc) = static_cells.try_borrow() {
-        if !sc.is_empty() && !sc[0].is_empty() {
-            sc[0][0].add_class("selected");
+    if is_gtk4 {
+        let ld = loader.clone();
+        let tx = texts.clone();
+        let fm = cell_formats.clone();
+        let sl = selected_coord.clone();
+        let cw_draw = col_widths.clone();
+        let rh_draw = row_heights.clone();
+        drawing_area.set_draw_func(Box::new(move |cr, w, h| {
+            draw_grid(cr, w, h, &ld, &tx, &fm, &sl, &cw_draw, &rh_draw);
+        })).ok();
+        drawing_area.set_content_width(46 + VISIBLE_COLS as i32 * CELL_W);
+        drawing_area.set_content_height(CELL_H + VISIBLE_ROWS as i32 * CELL_H);
+    } else {
+        let ld = loader.clone();
+        let tx = texts.clone();
+        let fm = cell_formats.clone();
+        let sl = selected_coord.clone();
+        let cw = col_widths.clone();
+        let rh = row_heights.clone();
+        unsafe {
+            drawing_area.connect_draw_gtk3(Box::new(move |_widget, cr| {
+                draw_grid(cr, 0, 0, &ld, &tx, &fm, &sl, &cw, &rh);
+                0
+            })).ok();
         }
     }
 
-    // Refresh function - rebuilds overflow overlay labels
-    let overlay_labels: Rc<RefCell<Vec<gtk_dynamic_loader::Label>>> = Rc::new(RefCell::new(Vec::new()));
-    let overlay_labels_ref = overlay_labels.clone();
-    let texts_ref = texts.clone();
-    let loader_for_refresh = loader.clone();
-    let overlay_ptr_for_refresh = overlay_ptr;
-    let cw_for_refresh = col_widths.clone();
-    let rh_for_refresh = row_heights.clone();
+    // Prevent Rust Drop from double-freeing (overlay owns it now)
+    let da_ptr = ScopedDrawingArea(*drawing_area.as_ref());
+    std::mem::forget(drawing_area);
 
-    let refresh = Rc::new(move || {
-        let mut ol = overlay_labels_ref.borrow_mut();
-        ol.clear();
-        drop(ol);
-        let texts_b = texts_ref.borrow();
-        let cw = cw_for_refresh.borrow();
-        let rh = rh_for_refresh.borrow();
-        for r in 0..texts_b.len() {
-            for c in 0..texts_b[r].len() {
-                let text = &texts_b[r][c];
-                if text.is_empty() { continue; }
-                let char_w = gtk_dynamic_loader::measure_text_px(&loader_for_refresh, None, text);
-                let cell_w = cw.get(c).copied().unwrap_or(CELL_W) as f64;
-                if char_w as f64 > cell_w - 8.0 {
-                    if let Ok(lbl) = gtk_dynamic_loader::Label::new(loader_for_refresh.clone(), &text) {
-                        lbl.add_class("rwx-overlay");
-                        add_overlay_child(&loader_for_refresh, overlay_ptr_for_refresh, *lbl.as_ref());
-                        set_overlay_pass_through(&loader_for_refresh, overlay_ptr_for_refresh, *lbl.as_ref(), true);
-                        set_can_target(&loader_for_refresh, *lbl.as_ref(), false);
-                        let total_w: i32 = (0..=c).map(|i| cw.get(i).copied().unwrap_or(CELL_W)).sum();
-                        let left = 46 + total_w - cw.get(c).copied().unwrap_or(CELL_W);
-                        let top = CELL_H + compute_row_y(&rh, r);
-                        gtk_dynamic_loader::widget_set_size_request(&loader_for_refresh, *lbl.as_ref(), (char_w as i32 + 8).min(total_w), rh.get(r).copied().unwrap_or(CELL_H));
-                        gtk_dynamic_loader::widget_set_margin_start(&loader_for_refresh, *lbl.as_ref(), left);
-                        gtk_dynamic_loader::widget_set_margin_top(&loader_for_refresh, *lbl.as_ref(), top);
-                        set_halign(&loader_for_refresh, *lbl.as_ref(), 1);
-                        set_valign(&loader_for_refresh, *lbl.as_ref(), 1);
-                        overlay_labels_ref.borrow_mut().push(lbl);
-                    }
-                }
-            }
-        }
-    });
-    refresh();
-
-    // CSS
+    // CSS for toolbar/entry only (no label styles needed anymore)
     if let Some(loader2) = rustxwidgets::backends::gtk::loader() {
         let css = r#"
-        label.rwx-overlay { background-color: transparent; padding: 2px 4px; font-family: monospace; font-size: 13px; }
-        label.header { font-weight: bold; background-color: #ffffff; color: #000000; font-size: 12px; border: 1px solid #000000; padding: 2px 4px; }
-        label.row-marker { color: #000000; background-color: #f8f8f8; font-weight: bold; font-size: 12px; padding: 2px 4px; border-right: 1px solid #000000; border-bottom: 1px solid #000000; }
-        label.cell { padding-left: 4px; padding-right: 4px; font-family: monospace; font-size: 13px; background-color: #ffffff; border-right: 1px solid #000000; border-bottom: 1px solid #000000; }
-        label.boolval { font-weight: bold; color: #0000cc; }
-        label.negative { color: #cc0000; }
-        label.numeric { font-family: monospace; }
-        label.formula { color: #006600; font-style: italic; }
-        label.selected { background-color: #d4e8ff; border: 2px solid #1a73e8; }
-        label.bold-cell { font-weight: bold; }
-        label.italic-cell { font-style: italic; }
         button { font-size: 11px; padding: 1px 8px; min-height: 20px; }
         entry { border: 1px solid #000000; font-family: monospace; font-size: 13px; min-height: 24px; }
-        grid { border: 1px solid #000000; }
         "#;
         if let Some(provider) = gtk_dynamic_loader::create_css_provider(&loader2, css) {
             gtk_dynamic_loader::add_css_provider_global(&loader2, *win.as_ref(), provider, 600);
@@ -381,14 +425,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 set_policy(sw, 0, 0);
             }
             if is_gtk4 {
-                let total_w: i32 = 46 + VISIBLE_COLS as i32 * CELL_W;
-                let total_h = CELL_H + (VISIBLE_ROWS as i32) * CELL_H;
-                if let Some(set_min_w) = lookup_sym::<unsafe extern "C" fn(*mut std::ffi::c_void, i32)>(&loader, "gtk_scrolled_window_set_min_content_width") {
-                    set_min_w(sw, total_w);
-                }
-                if let Some(set_min_h) = lookup_sym::<unsafe extern "C" fn(*mut std::ffi::c_void, i32)>(&loader, "gtk_scrolled_window_set_min_content_height") {
-                    set_min_h(sw, total_h);
-                }
                 if let Some(set_child) = lookup_sym::<SetChild>(&loader, "gtk_scrolled_window_set_child") {
                     set_child(sw, overlay_ptr);
                 }
@@ -401,12 +437,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(set_v) = lookup_sym::<SetExpand>(&loader, "gtk_widget_set_vexpand") { set_v(sw, 1); }
             if let Some(set_h) = lookup_sym::<SetExpand>(&loader, "gtk_widget_set_hexpand") { set_h(overlay_ptr, 1); }
             if let Some(set_v) = lookup_sym::<SetExpand>(&loader, "gtk_widget_set_vexpand") { set_v(overlay_ptr, 1); }
-            let total_w: i32 = 46 + VISIBLE_COLS as i32 * CELL_W;
-            let total_h = CELL_H + (VISIBLE_ROWS as i32) * CELL_H;
-            gtk_dynamic_loader::widget_set_size_request(&loader, *grid_widget.as_ref(), total_w, total_h);
+            let total_w = 46 + VISIBLE_COLS as i32 * CELL_W;
+            let total_h = CELL_H + VISIBLE_ROWS as i32 * CELL_H;
+            gtk_dynamic_loader::widget_set_size_request(&loader, draw_ptr_raw, total_w, total_h);
             sw
         } else { panic!("gtk_scrolled_window_new not available"); }
     };
+
+    // Queue redraw helper
+    let loader_qr = loader.clone();
+    let queue_redraw = {
+        let da = da_ptr.as_ref();
+        let d = *da;
+        move || {
+            if let Some(q) = loader_qr.symbols.gtk_widget_queue_draw { unsafe { q(d); } }
+        }
+    };
+    let queue_redraw = Rc::new(queue_redraw);
 
     // Helper to start editing a cell
     let start_edit = {
@@ -414,7 +461,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let edit_entry_nav = editing_entry.clone();
         let overlay_for_edit = overlay_ptr;
         let loader_for_edit = loader.clone();
-        let cw_edit = col_widths.clone();
         let rh_edit = row_heights.clone();
         move |r: usize, c: usize| {
             if edit_entry_nav.borrow().is_some() { return; }
@@ -430,7 +476,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 set_valign(&loader_for_edit, *entry.as_ref(), 1);
                 add_overlay_child(&loader_for_edit, overlay_for_edit, *entry.as_ref());
                 set_overlay_pass_through(&loader_for_edit, overlay_for_edit, *entry.as_ref(), false);
-                entry.set_size_request(cw_edit.borrow()[c], rh_edit.borrow()[r]);
+                entry.set_size_request(CELL_W, rh_edit.borrow()[r]);
                 entry.grab_focus();
                 *edit_entry_nav.borrow_mut() = Some(entry);
             }
@@ -441,11 +487,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let commit_edit = {
         let texts_nav = texts.clone();
         let edit_entry_nav = editing_entry.clone();
-        let sc_nav = static_cells.clone();
         let formula_e = formula_entry.clone();
-        let refresh_nav = refresh.clone();
-        let fmts_nav = cell_formats.clone();
-        let loader_nav = loader.clone();
+        let qr = queue_redraw.clone();
         let sel_nav = selected_coord.clone();
         move || {
             let entry_opt = edit_entry_nav.borrow_mut().take();
@@ -456,47 +499,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Ok(mut t) = texts_nav.try_borrow_mut() {
                         if r < t.len() && c < t[r].len() { t[r][c] = new_text.clone(); }
                     }
-                    if let Ok(sc) = sc_nav.try_borrow() {
-                        if r < sc.len() && c < sc[r].len() {
-                            let fmt = fmts_nav.borrow()[r][c].clone();
-                            apply_formatting(&sc[r][c], &new_text, &fmt);
-                        }
-                    }
                 }
-                    formula_e.set_text(&new_text);
-                    refresh_nav();
+                formula_e.set_text(&new_text);
+                qr();
             }
         }
     };
 
-    // Refresh cell display when selection moves (update display classes etc.)
+    // Refresh cell display when selection moves
     let refresh_selection = {
         let texts_nav = texts.clone();
-        let sc_nav = static_cells.clone();
         let formula_e = formula_entry.clone();
         let sel = selected_coord.clone();
-        let fmts_nav = cell_formats.clone();
+        let qr = queue_redraw.clone();
         move || {
             let coord = *sel.borrow();
             if let Some((r, c)) = coord {
-                if let Ok(sc) = sc_nav.try_borrow() {
-                    for rr in 0..sc.len() {
-                        for cc in 0..sc[rr].len() { sc[rr][cc].remove_class("selected"); }
-                    }
-                    if r < sc.len() && c < sc[r].len() { sc[r][c].add_class("selected"); }
-                }
                 let t = texts_nav.borrow();
                 if r < t.len() && c < t[r].len() {
                     formula_e.set_text(&t[r][c]);
                 }
             }
+            qr();
         }
     };
 
     // Click to select and edit
     {
-        let grid_ptr = *grid_widget.as_ref();
-        let sc2 = static_cells.clone();
         let sel2 = selected_coord.clone();
         let fe2 = formula_entry.clone();
         let txt2 = texts.clone();
@@ -504,12 +533,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let commit_fn2 = commit_edit.clone();
         let start_fn2 = start_edit.clone();
         let fmts2 = cell_formats.clone();
-        let cw2 = col_widths.clone();
         let rh3 = row_heights.clone();
+        let qr = queue_redraw.clone();
 
         let click_logic: Rc<RefCell<Option<Box<dyn FnMut(f64, f64)>>>> = Rc::new(RefCell::new(None));
         {
-            let sc = sc2.clone();
             let sel = sel2.clone();
             let fe = fe2.clone();
             let txt = txt2.clone();
@@ -517,8 +545,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let commit_fn = commit_fn2.clone();
             let start_fn = start_fn2.clone();
             let fmts = fmts2.clone();
-            let cw = cw2.clone();
             let rh = rh3.clone();
+            let qr2 = qr.clone();
             *click_logic.borrow_mut() = Some(Box::new(move |x: f64, y: f64| {
                 let col_hdr_w = 46;
                 let col = {
@@ -555,16 +583,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if col < VISIBLE_COLS && data_row < VISIBLE_ROWS {
                     println!("Cell clicked: row={}, col={}", data_row + 1, col_to_label(col));
                     commit_fn();
-                    if let Ok(sc_b) = sc.try_borrow() {
-                        for rr in 0..sc_b.len() {
-                            for cc in 0..sc_b[rr].len() {
-                                sc_b[rr][cc].remove_class("selected");
-                            }
-                        }
-                        if data_row < sc_b.len() && col < sc_b[data_row].len() {
-                            sc_b[data_row][col].add_class("selected");
-                        }
-                    }
                     if let Ok(mut cs) = sel.try_borrow_mut() {
                         *cs = Some((data_row, col));
                     }
@@ -577,6 +595,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         else { fe.set_text(text); }
                     }
                     drop(t);
+                    qr2();
                     if edit_e.borrow().is_none() {
                         start_fn(data_row, col);
                         if let Some(e) = edit_e.borrow().as_ref() {
@@ -608,7 +627,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             };
                             let scroll_x = adj_value(ld.symbols.gtk_scrolled_window_get_hadjustment, ld.symbols.gtk_adjustment_get_value);
                             let scroll_y = adj_value(ld.symbols.gtk_scrolled_window_get_vadjustment, ld.symbols.gtk_adjustment_get_value);
-                            eprintln!("DEBUG raw=({:.1},{:.1}) scroll=({:.1},{:.1})", x, y, scroll_x, scroll_y);
                             if let Some(f) = cl.borrow_mut().as_mut() { f(x + scroll_x, y + scroll_y); }
                         }));
                     }
@@ -632,7 +650,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut x: f64 = 0.0;
                         let mut y: f64 = 0.0;
                         if get_coords(ev, &mut x as *mut f64, &mut y as *mut f64) != 0 {
-                            eprintln!("DEBUG GTK3 raw=({:.1},{:.1})", x, y);
                             if let Some(f) = cl.borrow_mut().as_mut() { f(x, y); }
                         }
                     }
@@ -646,19 +663,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let sel = selected_coord.clone();
         let fmts = cell_formats.clone();
-        let sc = static_cells.clone();
-        let txt = texts.clone();
+        let qr = queue_redraw.clone();
         let _ = bold_btn.on_click(move || {
             if let Some((r, c)) = *sel.borrow() {
                 let mut f = fmts.borrow_mut();
                 if r < f.len() && c < f[r].len() {
                     f[r][c].0 = !f[r][c].0;
-                    if let Ok(sc_b) = sc.try_borrow() {
-                        if r < sc_b.len() && c < sc_b[r].len() {
-                            let fmt = f[r][c].clone();
-                            apply_formatting(&sc_b[r][c], &txt.borrow()[r][c], &fmt);
-                        }
-                    }
+                    qr();
                 }
             }
         });
@@ -666,19 +677,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let sel = selected_coord.clone();
         let fmts = cell_formats.clone();
-        let sc = static_cells.clone();
-        let txt = texts.clone();
+        let qr = queue_redraw.clone();
         let _ = italic_btn.on_click(move || {
             if let Some((r, c)) = *sel.borrow() {
                 let mut f = fmts.borrow_mut();
                 if r < f.len() && c < f[r].len() {
                     f[r][c].1 = !f[r][c].1;
-                    if let Ok(sc_b) = sc.try_borrow() {
-                        if r < sc_b.len() && c < sc_b[r].len() {
-                            let fmt = f[r][c].clone();
-                            apply_formatting(&sc_b[r][c], &txt.borrow()[r][c], &fmt);
-                        }
-                    }
+                    qr();
                 }
             }
         });
@@ -686,19 +691,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let sel = selected_coord.clone();
         let fmts = cell_formats.clone();
-        let sc = static_cells.clone();
-        let txt = texts.clone();
+        let qr = queue_redraw.clone();
         let _ = al_l_btn.on_click(move || {
             if let Some((r, c)) = *sel.borrow() {
                 let mut f = fmts.borrow_mut();
                 if r < f.len() && c < f[r].len() {
                     f[r][c].2 = 0;
-                    if let Ok(sc_b) = sc.try_borrow() {
-                        if r < sc_b.len() && c < sc_b[r].len() {
-                            let fmt = f[r][c].clone();
-                            apply_formatting(&sc_b[r][c], &txt.borrow()[r][c], &fmt);
-                        }
-                    }
+                    qr();
                 }
             }
         });
@@ -706,19 +705,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let sel = selected_coord.clone();
         let fmts = cell_formats.clone();
-        let sc = static_cells.clone();
-        let txt = texts.clone();
+        let qr = queue_redraw.clone();
         let _ = al_c_btn.on_click(move || {
             if let Some((r, c)) = *sel.borrow() {
                 let mut f = fmts.borrow_mut();
                 if r < f.len() && c < f[r].len() {
                     f[r][c].2 = 1;
-                    if let Ok(sc_b) = sc.try_borrow() {
-                        if r < sc_b.len() && c < sc_b[r].len() {
-                            let fmt = f[r][c].clone();
-                            apply_formatting(&sc_b[r][c], &txt.borrow()[r][c], &fmt);
-                        }
-                    }
+                    qr();
                 }
             }
         });
@@ -726,29 +719,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let sel = selected_coord.clone();
         let fmts = cell_formats.clone();
-        let sc = static_cells.clone();
-        let txt = texts.clone();
+        let qr = queue_redraw.clone();
         let _ = al_r_btn.on_click(move || {
             if let Some((r, c)) = *sel.borrow() {
                 let mut f = fmts.borrow_mut();
                 if r < f.len() && c < f[r].len() {
                     f[r][c].2 = 2;
-                    if let Ok(sc_b) = sc.try_borrow() {
-                        if r < sc_b.len() && c < sc_b[r].len() {
-                            let fmt = f[r][c].clone();
-                            apply_formatting(&sc_b[r][c], &txt.borrow()[r][c], &fmt);
-                        }
-                    }
+                    qr();
                 }
             }
         });
     }
-    // Highlight toggle (cycles through: none -> yellow -> green -> none)
     {
         let sel = selected_coord.clone();
         let fmts = cell_formats.clone();
-        let sc = static_cells.clone();
-        let txt = texts.clone();
+        let qr = queue_redraw.clone();
         let _ = hl_btn.on_click(move || {
             if let Some((r, c)) = *sel.borrow() {
                 let mut f = fmts.borrow_mut();
@@ -757,22 +742,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     f[r][c].4 = if bg == "#ffff00" { "#88ff88".into() }
                                else if bg == "#88ff88" { "#ffffff".into() }
                                else { "#ffff00".into() };
-                    if let Ok(sc_b) = sc.try_borrow() {
-                        if r < sc_b.len() && c < sc_b[r].len() {
-                            let fmt = f[r][c].clone();
-                            apply_formatting(&sc_b[r][c], &txt.borrow()[r][c], &fmt);
-                        }
-                    }
+                    qr();
                 }
             }
         });
     }
-    // Text color toggle (cycles through: black -> red -> blue -> green -> black)
     {
         let sel = selected_coord.clone();
         let fmts = cell_formats.clone();
-        let sc = static_cells.clone();
-        let txt = texts.clone();
+        let qr = queue_redraw.clone();
         let _ = fg_btn.on_click(move || {
             if let Some((r, c)) = *sel.borrow() {
                 let mut f = fmts.borrow_mut();
@@ -782,12 +760,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                else if fg == "#cc0000" { "#0000cc".into() }
                                else if fg == "#0000cc" { "#006600".into() }
                                else { "#000000".into() };
-                    if let Ok(sc_b) = sc.try_borrow() {
-                        if r < sc_b.len() && c < sc_b[r].len() {
-                            let fmt = f[r][c].clone();
-                            apply_formatting(&sc_b[r][c], &txt.borrow()[r][c], &fmt);
-                        }
-                    }
+                    qr();
                 }
             }
         });
@@ -795,18 +768,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Keyboard navigation + click-to-edit
     {
-        let grid_ptr = *grid_widget.as_ref();
-        let sc_nav = static_cells.clone();
         let sel_coord = selected_coord.clone();
         let texts_nav = texts.clone();
         let edit_entry_nav = editing_entry.clone();
         let formula_e = formula_entry.clone();
-        let refresh_nav = refresh.clone();
         let commit_fn = commit_edit.clone();
         let refresh_sel = refresh_selection.clone();
         let loader_nav = loader.clone();
 
-        // Keyboard navigation
         if is_gtk4 {
             if let Some(ctrl_new) = loader.symbols.gtk_event_controller_key_new {
                 let ctrl = unsafe { ctrl_new() };
@@ -910,15 +879,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = gtk_dynamic_loader::connect_signal_bool(syms_arc.as_ref(), instance, "key-press-event", Box::new(key_handler));
             }
         }
-
     }
 
     // File operations
     {
         let syms_arc = loader.symbols.clone();
         let texts_open = texts.clone();
-        let sc_open = static_cells.clone();
-        let refresh_open = refresh.clone();
+        let qr = queue_redraw.clone();
         let _ = open_btn.on_click(move || {
             let syms = syms_arc.as_ref();
             if let (Some(chooser_new), Some(native_run), Some(get_fn), Some(destroy_widget_fn), Some(gfree)) = (
@@ -944,15 +911,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                         }
                                     }
-                                    if let Ok(sc) = sc_open.try_borrow() {
-                                        for r in 0..sc.len() {
-                                            for c in 0..sc[r].len() {
-                                                let text = texts_open.borrow()[r][c].clone();
-                                                apply_formatting(&sc[r][c], &text, &(false, false, 0, "#000000".into(), "#ffffff".into()));
-                                            }
-                                        }
-                                    }
-                                    refresh_open();
+                                    qr();
                                 }
                             }
                         }
@@ -1032,15 +991,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let result = app.run().map_err(|e| Box::new(e) as Box<dyn std::error::Error>);
 
-    // Destroy grid children explicitly before containers are cascade-destroyed
-    col_headers.clear();
-    row_markers.borrow_mut().clear();
-    static_cells.borrow_mut().clear();
-    overlay_labels.borrow_mut().clear();
+    // Cleanup: unparent drawing area from overlay to avoid double-free from Rust Drop
     *editing_entry.borrow_mut() = None;
-    // Unparent grid from overlay so cascade doesn't double-free it
     if let Some(unparent) = loader.symbols.gtk_widget_unparent {
-        unsafe { unparent(*grid_widget.as_ref()); }
+        unsafe { unparent(draw_ptr_raw); }
     }
 
     result

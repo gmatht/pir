@@ -174,6 +174,31 @@ pub type GtkOverlaySetOverlayPassThrough = unsafe extern "C" fn(overlay: *mut c_
 pub type GtkWidgetSetMarginStart = unsafe extern "C" fn(widget: *mut c_void, margin: i32);
 pub type GtkWidgetSetMarginTop = unsafe extern "C" fn(widget: *mut c_void, margin: i32);
 
+// DrawingArea canvas
+pub type GtkDrawingAreaSetDrawFunc = unsafe extern "C" fn(area: *mut c_void, draw_func: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, i32, i32, *mut c_void)>, user_data: *mut c_void, destroy: Option<unsafe extern "C" fn(*mut c_void, *mut c_void)>);
+pub type GtkDrawingAreaSetContentWidth = unsafe extern "C" fn(area: *mut c_void, width: i32);
+pub type GtkDrawingAreaSetContentHeight = unsafe extern "C" fn(area: *mut c_void, height: i32);
+
+// Cairo additions
+pub type CairoTextExtents = unsafe extern "C" fn(cr: *mut c_void, utf8: *const i8, extents: *mut c_void);
+pub type CairoSave = unsafe extern "C" fn(cr: *mut c_void);
+pub type CairoRestore = unsafe extern "C" fn(cr: *mut c_void);
+pub type CairoClip = unsafe extern "C" fn(cr: *mut c_void);
+
+// Cairo line drawing
+pub type CairoLineTo = unsafe extern "C" fn(cr: *mut c_void, x: f64, y: f64);
+pub type CairoPaint = unsafe extern "C" fn(cr: *mut c_void);
+
+#[repr(C)]
+pub struct CairoTextExtentsT {
+    pub x_bearing: f64,
+    pub y_bearing: f64,
+    pub width: f64,
+    pub height: f64,
+    pub x_advance: f64,
+    pub y_advance: f64,
+}
+
 pub struct Symbols {
     // glib
     pub g_main_loop_new: Option<GMainLoopNew>,
@@ -358,6 +383,19 @@ pub struct Symbols {
 
     // GtkWindow default size
     pub gtk_window_set_default_size: Option<GtkWindowSetDefaultSize>,
+
+    // DrawingArea canvas (GTK4)
+    pub gtk_drawing_area_set_draw_func: Option<GtkDrawingAreaSetDrawFunc>,
+    pub gtk_drawing_area_set_content_width: Option<GtkDrawingAreaSetContentWidth>,
+    pub gtk_drawing_area_set_content_height: Option<GtkDrawingAreaSetContentHeight>,
+
+    // Cairo canvas drawing
+    pub cairo_text_extents: Option<CairoTextExtents>,
+    pub cairo_save: Option<CairoSave>,
+    pub cairo_restore: Option<CairoRestore>,
+    pub cairo_clip: Option<CairoClip>,
+    pub cairo_line_to: Option<CairoLineTo>,
+    pub cairo_paint: Option<CairoPaint>,
 }
 
 impl Symbols {
@@ -463,6 +501,15 @@ impl Symbols {
         let cairo_select_font_face = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, *const i8, i32, i32), "cairo_select_font_face").or_else(|| None);
         let cairo_set_font_size = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, f64), "cairo_set_font_size").or_else(|| None);
         let cairo_show_text = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, *const i8), "cairo_show_text").or_else(|| None);
+        let cairo_text_extents = open_sym_try!(libs, "libcairo", CairoTextExtents, "cairo_text_extents").or_else(|| None);
+        let cairo_save = open_sym_try!(libs, "libcairo", CairoSave, "cairo_save").or_else(|| None);
+        let cairo_restore = open_sym_try!(libs, "libcairo", CairoRestore, "cairo_restore").or_else(|| None);
+        let cairo_clip = open_sym_try!(libs, "libcairo", CairoClip, "cairo_clip").or_else(|| None);
+        let cairo_line_to = open_sym_try!(libs, "libcairo", CairoLineTo, "cairo_line_to").or_else(|| None);
+        let cairo_paint = open_sym_try!(libs, "libcairo", CairoPaint, "cairo_paint").or_else(|| None);
+        let gtk_drawing_area_set_draw_func = unsafe { sym::<GtkDrawingAreaSetDrawFunc>(gtk, "gtk_drawing_area_set_draw_func") };
+        let gtk_drawing_area_set_content_width = unsafe { sym::<GtkDrawingAreaSetContentWidth>(gtk, "gtk_drawing_area_set_content_width") };
+        let gtk_drawing_area_set_content_height = unsafe { sym::<GtkDrawingAreaSetContentHeight>(gtk, "gtk_drawing_area_set_content_height") };
         let gtk_widget_queue_draw = unsafe { sym::<unsafe extern "C" fn(*mut c_void)>(gtk, "gtk_widget_queue_draw") };
         let gtk_label_set_xalign = unsafe { sym::<GtkLabelSetXalign>(gtk, "gtk_label_set_xalign") };
         let gtk_event_controller_key_new = unsafe { sym::<GtkEventControllerKeyNew>(gtk, "gtk_event_controller_key_new") };
@@ -615,6 +662,8 @@ impl Symbols {
             gtk_editable_get_text, gtk_editable_set_text,
             gtk_widget_unparent,
             gtk_window_set_default_size,
+            gtk_drawing_area_set_draw_func, gtk_drawing_area_set_content_width, gtk_drawing_area_set_content_height,
+            cairo_text_extents, cairo_save, cairo_restore, cairo_clip, cairo_line_to, cairo_paint,
         })
     }
 }

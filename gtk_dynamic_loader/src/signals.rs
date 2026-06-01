@@ -219,3 +219,45 @@ pub unsafe fn connect_signal_bool(lib_symbols: &crate::symbols::Symbols, instanc
         Ok(id)
     } else { Err("no g_signal_connect available".into()) }
 }
+
+// trampoline for GTK3 "draw" signal — passes (widget, cairo_t*) to closure returning gboolean
+#[no_mangle]
+pub extern "C" fn gtk_compat_trampoline_draw_gtk3(instance: *mut c_void, cr: *mut c_void, user_data: *mut c_void) -> i32 {
+    unsafe {
+        if user_data.is_null() { return 0; }
+        let inner_ptr = user_data as *mut Box<dyn FnMut(*mut c_void, *mut c_void) -> i32>;
+        if inner_ptr.is_null() { return 0; }
+        let closure_ref: &mut dyn FnMut(*mut c_void, *mut c_void) -> i32 = &mut **inner_ptr;
+        closure_ref(instance, cr)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gtk_compat_destroy_notify_draw_gtk3(data: *mut c_void, _closure: *mut c_void) {
+    unsafe {
+        if data.is_null() { return; }
+        let inner_ptr = data as *mut Box<dyn FnMut(*mut c_void, *mut c_void) -> i32>;
+        let _boxed: Box<Box<dyn FnMut(*mut c_void, *mut c_void) -> i32>> = Box::from_raw(inner_ptr);
+    }
+}
+
+// trampoline for GTK4 gtk_drawing_area_set_draw_func — passes (cr, width, height)
+#[no_mangle]
+pub extern "C" fn gtk_compat_trampoline_draw_gtk4(_area: *mut c_void, cr: *mut c_void, w: i32, h: i32, user_data: *mut c_void) {
+    unsafe {
+        if user_data.is_null() { return; }
+        let inner_ptr = user_data as *mut Box<dyn FnMut(*mut c_void, i32, i32)>;
+        if inner_ptr.is_null() { return; }
+        let closure_ref: &mut dyn FnMut(*mut c_void, i32, i32) = &mut **inner_ptr;
+        closure_ref(cr, w, h);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gtk_compat_destroy_notify_draw_gtk4(data: *mut c_void, _closure: *mut c_void) {
+    unsafe {
+        if data.is_null() { return; }
+        let inner_ptr = data as *mut Box<dyn FnMut(*mut c_void, i32, i32)>;
+        let _boxed: Box<Box<dyn FnMut(*mut c_void, i32, i32)>> = Box::from_raw(inner_ptr);
+    }
+}
