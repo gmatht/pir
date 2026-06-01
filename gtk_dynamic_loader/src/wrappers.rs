@@ -727,16 +727,23 @@ pub fn widget_set_margin_top(loader: &Arc<Loader>, widget: *mut c_void, margin: 
     }
 }
 
-/// Destroy a widget (remove from its parent). Falls back to g_object_unref if destroy not available.
+/// Destroy a widget (remove from parent) and release the reference held by
+/// [`take_ownership`] (via `g_object_ref_sink`).  Without the extra unref the
+/// widget is never freed and a later reuse of the pointer causes a segfault.
 pub fn destroy_widget(loader: &Arc<Loader>, widget: *mut c_void) {
     if let Some(destroy) = loader.symbols.gtk_widget_destroy {
-        // GTK3: gtk_widget_destroy removes from parent and handles reference
+        // GTK3: gtk_widget_destroy removes from parent and container ref
         unsafe { destroy(widget); }
+        // Release the reference take_ownership acquired
+        if let Some(unref) = loader.symbols.g_object_unref {
+            unsafe { unref(widget); }
+        }
     } else {
-        // GTK4: first unparent (remove from parent), then release our reference
+        // GTK4: first unparent (remove from parent)
         if let Some(unparent) = loader.symbols.gtk_widget_unparent {
             unsafe { unparent(widget); }
         }
+        // then release the reference take_ownership acquired
         if let Some(unref) = loader.symbols.g_object_unref {
             unsafe { unref(widget); }
         }

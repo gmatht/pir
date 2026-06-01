@@ -95,6 +95,8 @@ pub type GtkGestureClickNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkWidgetSetCanTarget = unsafe extern "C" fn(widget: *mut c_void, can_target: i32);
 pub type GtkWidgetSetHalign = unsafe extern "C" fn(widget: *mut c_void, align: i32);
 pub type GtkWidgetSetValign = unsafe extern "C" fn(widget: *mut c_void, align: i32);
+pub type GtkWidgetGetAllocatedWidth = unsafe extern "C" fn(widget: *mut c_void) -> i32;
+pub type GtkWidgetGetAllocatedHeight = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 
 // Dialog
 pub type GtkDialogNew = unsafe extern "C" fn() -> *mut c_void;
@@ -285,6 +287,8 @@ pub struct Symbols {
     pub gtk_widget_set_can_target: Option<GtkWidgetSetCanTarget>,
     pub gtk_widget_set_halign: Option<GtkWidgetSetHalign>,
     pub gtk_widget_set_valign: Option<GtkWidgetSetValign>,
+    pub gtk_widget_get_allocated_width: Option<GtkWidgetGetAllocatedWidth>,
+    pub gtk_widget_get_allocated_height: Option<GtkWidgetGetAllocatedHeight>,
     pub gtk_gesture_click_new: Option<GtkGestureClickNew>,
     pub gtk_scrolled_window_get_vadjustment: Option<GtkScrolledWindowGetVadjustment>,
     pub gtk_scrolled_window_get_hadjustment: Option<GtkScrolledWindowGetHadjustment>,
@@ -466,6 +470,8 @@ impl Symbols {
         let gtk_widget_set_can_target = unsafe { sym::<GtkWidgetSetCanTarget>(gtk, "gtk_widget_set_can_target") };
         let gtk_widget_set_halign = unsafe { sym::<GtkWidgetSetHalign>(gtk, "gtk_widget_set_halign") };
         let gtk_widget_set_valign = unsafe { sym::<GtkWidgetSetValign>(gtk, "gtk_widget_set_valign") };
+        let gtk_widget_get_allocated_width = unsafe { sym::<GtkWidgetGetAllocatedWidth>(gtk, "gtk_widget_get_allocated_width") };
+        let gtk_widget_get_allocated_height = unsafe { sym::<GtkWidgetGetAllocatedHeight>(gtk, "gtk_widget_get_allocated_height") };
         let gtk_gesture_click_new = unsafe { sym::<GtkGestureClickNew>(gtk, "gtk_gesture_click_new") };
         let gtk_scrolled_window_get_vadjustment = unsafe { sym::<GtkScrolledWindowGetVadjustment>(gtk, "gtk_scrolled_window_get_vadjustment") };
         let gtk_scrolled_window_get_hadjustment = unsafe { sym::<GtkScrolledWindowGetHadjustment>(gtk, "gtk_scrolled_window_get_hadjustment") };
@@ -592,6 +598,8 @@ impl Symbols {
             gtk_widget_set_can_target,
             gtk_widget_set_halign,
             gtk_widget_set_valign,
+            gtk_widget_get_allocated_width,
+            gtk_widget_get_allocated_height,
             gtk_gesture_click_new,
             gtk_scrolled_window_get_vadjustment,
             gtk_scrolled_window_get_hadjustment,
