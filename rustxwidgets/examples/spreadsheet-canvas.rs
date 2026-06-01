@@ -196,6 +196,89 @@ fn draw_grid(
 
     let t = texts.borrow();
     let f = fmts.borrow();
+    let mut overflow_end_col = vec![vec![0usize; VISIBLE_COLS]; VISIBLE_ROWS];
+
+    // Pass 1: measure text and compute overflow_end_col
+    c!(cairo_set_font_size(cr, 13.0));
+    for r in 0..VISIBLE_ROWS {
+        for c in 0..VISIBLE_COLS {
+            let text = &t[r][c];
+            if text.is_empty() { continue; }
+            let (bold, italic, _align, _fg_hex, _bg_hex) = &f[r][c];
+            let slant = if *italic { 1 } else { 0 };
+            let weight = if *bold { 1 } else { 0 };
+            c!(cairo_select_font_face(cr, CString::new("monospace").unwrap().as_ptr(), slant, weight));
+            let c_text = CString::new(text.as_str()).unwrap();
+            let mut ext: CairoTextExtentsT = unsafe { std::mem::zeroed() };
+            c!(cairo_text_extents(cr, c_text.as_ptr(), &mut ext as *mut _ as *mut std::ffi::c_void));
+            let cx = chw + c as f64 * cw;
+            let pad = 4.0;
+            let tx = match *_align {
+                0 => cx + pad - ext.x_bearing,
+                1 => cx + cw / 2.0 - ext.x_bearing - ext.width / 2.0,
+                _ => cx + cw - pad - ext.x_bearing - ext.width,
+            };
+            let text_right = tx + ext.x_bearing + ext.width;
+            if text_right > cx + cw {
+                let mut lo = c;
+                for oc in (c + 1)..VISIBLE_COLS {
+                    if !t[r][oc].is_empty() { break; }
+                    lo = oc;
+                }
+                overflow_end_col[r][c] = lo;
+            }
+        }
+    }
+
+    // Pass 2: draw everything
+    // Background
+    c!(cairo_set_source_rgb(cr, 1.0, 1.0, 1.0));
+    c!(cairo_rectangle(cr, 0.0, 0.0, total_w, total_h));
+    c!(cairo_fill(cr));
+
+    // Corner
+    c!(cairo_set_source_rgb(cr, 0.91, 0.91, 0.91));
+    c!(cairo_rectangle(cr, 0.0, 0.0, chw, ch));
+    c!(cairo_fill(cr));
+
+    // Header backgrounds
+    c!(cairo_set_source_rgb(cr, 0.8, 0.8, 0.8));
+    c!(cairo_rectangle(cr, chw, 0.0, VISIBLE_COLS as f64 * cw, ch));
+    c!(cairo_fill(cr));
+    c!(cairo_rectangle(cr, 0.0, ch, chw, VISIBLE_ROWS as f64 * ch));
+    c!(cairo_fill(cr));
+
+    // Horizontal grid lines
+    c!(cairo_set_source_rgb(cr, 0.7, 0.7, 0.7));
+    c!(cairo_set_line_width(cr, 0.5));
+    for r in 0..=VISIBLE_ROWS {
+        let y = ch + r as f64 * ch;
+        c!(cairo_move_to(cr, 0.0, y));
+        c!(cairo_line_to(cr, total_w, y));
+        c!(cairo_stroke(cr));
+    }
+
+    // Vertical grid lines - skip segments at overflow boundaries
+    for bc in 0..=VISIBLE_COLS {
+        let x = chw + bc as f64 * cw;
+        // Segment in header row
+        c!(cairo_move_to(cr, x, 0.0));
+        c!(cairo_line_to(cr, x, ch));
+        c!(cairo_stroke(cr));
+        // Segments per data row
+        for r in 0..VISIBLE_ROWS {
+            let skip = bc > 0 && overflow_end_col[r][bc - 1] >= bc;
+            if !skip {
+                let y1 = ch + r as f64 * ch;
+                let y2 = ch + (r + 1) as f64 * ch;
+                c!(cairo_move_to(cr, x, y1));
+                c!(cairo_line_to(cr, x, y2));
+                c!(cairo_stroke(cr));
+            }
+        }
+    }
+
+    // Cell text with formatting and overflow clip
     c!(cairo_set_font_size(cr, 13.0));
     for r in 0..VISIBLE_ROWS {
         for c in 0..VISIBLE_COLS {
@@ -236,24 +319,14 @@ fn draw_grid(
             };
             let ty = cy + ch / 2.0 - ext.y_bearing - ext.height / 2.0;
 
-            c!(cairo_save(cr));
-            let text_left = tx + ext.x_bearing;
-            let text_right = text_left + ext.width;
-            let cell_right = cx + cw;
-            let clip_right = if text_right > cell_right {
-                let mut cr2 = text_right;
-                for oc in (c + 1)..VISIBLE_COLS {
-                    if !t[r][oc].is_empty() {
-                        let ocx = chw + oc as f64 * cw;
-                        cr2 = cr2.min(ocx);
-                        break;
-                    }
-                    cr2 = (chw + (oc + 1) as f64 * cw).max(cr2);
-                }
-                cr2.min(total_w)
+            let last_oc = overflow_end_col[r][c];
+            let clip_right = if last_oc > c {
+                (chw + (last_oc + 1) as f64 * cw).min(total_w)
             } else {
-                cell_right
+                cx + cw
             };
+
+            c!(cairo_save(cr));
             c!(cairo_rectangle(cr, cx, cy, clip_right - cx, ch));
             c!(cairo_clip(cr));
             c!(cairo_move_to(cr, tx, ty));
@@ -261,8 +334,34 @@ fn draw_grid(
             c!(cairo_restore(cr));
         }
     }
-    drop(t);
-    drop(f);
+
+    // Header labels
+    c!(cairo_select_font_face(cr, CString::new("monospace").unwrap().as_ptr(), 0, 1));
+    c!(cairo_set_font_size(cr, 12.0));
+    c!(cairo_set_source_rgb(cr, 0.0, 0.0, 0.0));
+    for c in 0..VISIBLE_COLS {
+        let lbl = col_to_label(c);
+        let c_lbl = CString::new(lbl.as_str()).unwrap();
+        let mut ext: CairoTextExtentsT = unsafe { std::mem::zeroed() };
+        c!(cairo_text_extents(cr, c_lbl.as_ptr(), &mut ext as *mut _ as *mut std::ffi::c_void));
+        let x = chw + c as f64 * cw + cw / 2.0 - ext.x_bearing - ext.width / 2.0;
+        let y = ch / 2.0 - ext.y_bearing - ext.height / 2.0;
+        c!(cairo_move_to(cr, x, y));
+        c!(cairo_show_text(cr, c_lbl.as_ptr()));
+    }
+
+    // Row markers
+    c!(cairo_set_font_size(cr, 12.0));
+    for r in 0..VISIBLE_ROWS {
+        let lbl = format!("{}", r + 1);
+        let c_lbl = CString::new(lbl.as_str()).unwrap();
+        let mut ext: CairoTextExtentsT = unsafe { std::mem::zeroed() };
+        c!(cairo_text_extents(cr, c_lbl.as_ptr(), &mut ext as *mut _ as *mut std::ffi::c_void));
+        let x = chw / 2.0 - ext.x_bearing - ext.width / 2.0;
+        let y = ch + r as f64 * ch + ch / 2.0 - ext.y_bearing - ext.height / 2.0;
+        c!(cairo_move_to(cr, x, y));
+        c!(cairo_show_text(cr, c_lbl.as_ptr()));
+    }
 
     if let Some((sr, sc)) = *sel.borrow() {
         let sx = chw + sc as f64 * cw;
