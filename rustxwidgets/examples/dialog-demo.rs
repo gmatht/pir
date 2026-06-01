@@ -2,13 +2,10 @@ use rustxwidgets::prelude::*;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = App::init()?;
-    let loader = rustxwidgets::backends::gtk::loader().expect("loader");
 
     let dialog = app.create_dialog()?;
     dialog.set_title("Widget Test Dialog");
     dialog.set_default_size(450, 500);
-
-    let content_area = dialog.get_content_area();
 
     let vbox = rustxwidgets::backends_gtk_adapter::create_box(
         rustxwidgets::backends_gtk_adapter::Orientation::Vertical, 6,
@@ -75,9 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     vbox.append(&tv);
 
     // Append the vbox into the dialog's content area
-    if let Some(box_append) = loader.symbols.gtk_box_append {
-        unsafe { box_append(content_area, *vbox.as_ref()); }
-    }
+    dialog.append_content_area(&vbox);
 
     dialog.add_button("OK", 1);
     dialog.add_button("Cancel", 0);

@@ -115,6 +115,12 @@ mod gtk_adapter {
         pub fn add_class(&self, class_name: &str) { self.0.add_class(class_name); }
         pub fn remove_class(&self, class_name: &str) { self.0.remove_class(class_name); }
         pub fn grab_focus(&self) { self.0.grab_focus(); }
+        pub fn connect_focus_in_event<F: FnMut(*mut c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
+            self.0.connect_focus_in_event(f).map_err(|e| Error::Backend(format!("{}", e)))
+        }
+        pub fn connect_focus_out_event<F: FnMut(*mut c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
+            self.0.connect_focus_out_event(f).map_err(|e| Error::Backend(format!("{}", e)))
+        }
     }
 
     impl Clone for Entry { fn clone(&self) -> Self { Entry(self.0.clone()) } }
@@ -211,6 +217,7 @@ mod gtk_adapter {
         pub fn set_default_size(&self, w: i32, h: i32) { self.0.set_default_size(w, h); }
         pub fn add_button(&self, text: &str, response_id: i32) { self.0.add_button(text, response_id); }
         pub fn get_content_area(&self) -> *mut c_void { self.0.get_content_area() }
+        pub fn append_content_area(&self, child: &impl AsRef<*mut c_void>) { self.0.append_content_area(child); }
         pub fn present(&self) { self.0.present(); }
         pub fn connect_response<F: FnMut(i32) + 'static>(&self, f: F) -> Result<u64, Error> {
             self.0.connect_response(f).map_err(|e| Error::Backend(format!("{}", e)))

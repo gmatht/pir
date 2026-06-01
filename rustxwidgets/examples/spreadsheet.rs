@@ -124,37 +124,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // When the user finishes editing (focus-out), recompute overflow for the grid.
             let grid_for_update = grid_cells.clone();
-            let loader_for_update = loader.clone();
-            // connect focus-out-event via low-level signal helper; clone symbols Arc first so
-            // we don't borrow loader_for_update while moving it into the closure below
-            let syms_arc = loader_for_update.symbols.clone();
-            let syms_ref = syms_arc.as_ref();
-            // connect the handler; closure will own loader_for_update
-            let instance = *e_handle_for_focus.as_ref();
             let overlay_for_rebuild = overlay.clone();
             let overlay_labels_for_rebuild = overlay_labels.clone();
             let grid_for_rebuild = grid_for_update.clone();
-            let loader_for_rebuild = loader_for_update.clone();
-            let _ = unsafe { gtk_dynamic_loader::connect_signal_bool(syms_ref, instance, "focus-out-event", Box::new(move |_ev: *mut std::os::raw::c_void| -> i32 {
+            let loader_for_rebuild = loader.clone();
+            e_handle_for_focus.connect_focus_out_event(move |_ev| {
                 // rebuild overlays when editing is finished
                 rebuild_overlays(&overlay_for_rebuild, &overlay_labels_for_rebuild, &grid_for_rebuild, &loader_for_rebuild, 120);
                 // show overlays again (collect first to avoid re-borrowing while iterating if rebuild mutates)
                 let visible_now = overlay_labels_for_rebuild.borrow().iter().map(|l| l.clone()).collect::<Vec<_>>();
                 for lbl in visible_now.iter() { lbl.set_visible(true); }
                 0
-            })) }.ok();
+            }).ok();
 
             // Also hide overlays when editing begins (focus-in)
             let overlay_labels_for_hide = overlay_labels.clone();
-            let _loader_for_hide = loader.clone();
-            let instance2 = instance;
-            let _ = unsafe { gtk_dynamic_loader::connect_signal_bool(syms_ref, instance2, "focus-in-event", Box::new(move |_ev: *mut std::os::raw::c_void| -> i32 {
+            let e_for_focus_in = e_handle_for_focus.clone();
+            e_for_focus_in.connect_focus_in_event(move |_ev| {
                 // hide all overlay labels
                 for lbl in overlay_labels_for_hide.borrow().iter() {
                     lbl.set_visible(false);
                 }
                 0
-            })) }.ok();
+            }).ok();
         }
     }
 

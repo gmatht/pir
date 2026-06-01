@@ -171,8 +171,14 @@ pub type GtkDrawingAreaNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkOverlayNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkOverlayAddOverlay = unsafe extern "C" fn(overlay: *mut c_void, widget: *mut c_void);
 pub type GtkOverlaySetOverlayPassThrough = unsafe extern "C" fn(overlay: *mut c_void, widget: *mut c_void, pass_through: i32);
+pub type GtkOverlaySetChild = unsafe extern "C" fn(overlay: *mut c_void, child: *mut c_void);
 pub type GtkWidgetSetMarginStart = unsafe extern "C" fn(widget: *mut c_void, margin: i32);
 pub type GtkWidgetSetMarginTop = unsafe extern "C" fn(widget: *mut c_void, margin: i32);
+
+// ScrolledWindow
+pub type GtkScrolledWindowNew = unsafe extern "C" fn(hadjustment: *mut c_void, vadjustment: *mut c_void) -> *mut c_void;
+pub type GtkScrolledWindowSetPolicy = unsafe extern "C" fn(scrolled: *mut c_void, h_policy: u32, v_policy: u32);
+pub type GtkScrolledWindowSetChild = unsafe extern "C" fn(scrolled: *mut c_void, child: *mut c_void);
 
 // DrawingArea canvas
 pub type GtkDrawingAreaSetDrawFunc = unsafe extern "C" fn(area: *mut c_void, draw_func: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, i32, i32, *mut c_void)>, user_data: *mut c_void, destroy: Option<unsafe extern "C" fn(*mut c_void, *mut c_void)>);
@@ -251,6 +257,7 @@ pub struct Symbols {
     pub gtk_overlay_new: Option<GtkOverlayNew>,
     pub gtk_overlay_add_overlay: Option<GtkOverlayAddOverlay>,
     pub gtk_overlay_set_overlay_pass_through: Option<GtkOverlaySetOverlayPassThrough>,
+    pub gtk_overlay_set_child: Option<GtkOverlaySetChild>,
     pub gtk_widget_set_margin_start: Option<GtkWidgetSetMarginStart>,
     pub gtk_widget_set_margin_top: Option<GtkWidgetSetMarginTop>,
     pub gtk_file_chooser_native_new: Option<GtkFileChooserNativeNew>,
@@ -315,6 +322,9 @@ pub struct Symbols {
     pub gtk_widget_get_allocated_width: Option<GtkWidgetGetAllocatedWidth>,
     pub gtk_widget_get_allocated_height: Option<GtkWidgetGetAllocatedHeight>,
     pub gtk_gesture_click_new: Option<GtkGestureClickNew>,
+    pub gtk_scrolled_window_new: Option<GtkScrolledWindowNew>,
+    pub gtk_scrolled_window_set_policy: Option<GtkScrolledWindowSetPolicy>,
+    pub gtk_scrolled_window_set_child: Option<GtkScrolledWindowSetChild>,
     pub gtk_scrolled_window_get_vadjustment: Option<GtkScrolledWindowGetVadjustment>,
     pub gtk_scrolled_window_get_hadjustment: Option<GtkScrolledWindowGetHadjustment>,
     pub gtk_adjustment_get_value: Option<GtkAdjustmentGetValue>,
@@ -478,6 +488,7 @@ impl Symbols {
         let gtk_overlay_new = unsafe { sym::<GtkOverlayNew>(gtk, "gtk_overlay_new") };
         let gtk_overlay_add_overlay = unsafe { sym::<GtkOverlayAddOverlay>(gtk, "gtk_overlay_add_overlay") };
         let gtk_overlay_set_overlay_pass_through = unsafe { sym::<GtkOverlaySetOverlayPassThrough>(gtk, "gtk_overlay_set_overlay_pass_through") };
+        let gtk_overlay_set_child = unsafe { sym::<GtkOverlaySetChild>(gtk, "gtk_overlay_set_child") };
         let gtk_widget_set_margin_start = unsafe { sym::<GtkWidgetSetMarginStart>(gtk, "gtk_widget_set_margin_start") };
         let gtk_widget_set_margin_top = unsafe { sym::<GtkWidgetSetMarginTop>(gtk, "gtk_widget_set_margin_top") };
         let gtk_init = unsafe { sym::<GtkInit>(gtk, "gtk_init") };
@@ -520,6 +531,9 @@ impl Symbols {
         let gtk_widget_get_allocated_width = unsafe { sym::<GtkWidgetGetAllocatedWidth>(gtk, "gtk_widget_get_allocated_width") };
         let gtk_widget_get_allocated_height = unsafe { sym::<GtkWidgetGetAllocatedHeight>(gtk, "gtk_widget_get_allocated_height") };
         let gtk_gesture_click_new = unsafe { sym::<GtkGestureClickNew>(gtk, "gtk_gesture_click_new") };
+        let gtk_scrolled_window_new = unsafe { sym::<GtkScrolledWindowNew>(gtk, "gtk_scrolled_window_new") };
+        let gtk_scrolled_window_set_policy = unsafe { sym::<GtkScrolledWindowSetPolicy>(gtk, "gtk_scrolled_window_set_policy") };
+        let gtk_scrolled_window_set_child = unsafe { sym::<GtkScrolledWindowSetChild>(gtk, "gtk_scrolled_window_set_child") };
         let gtk_scrolled_window_get_vadjustment = unsafe { sym::<GtkScrolledWindowGetVadjustment>(gtk, "gtk_scrolled_window_get_vadjustment") };
         let gtk_scrolled_window_get_hadjustment = unsafe { sym::<GtkScrolledWindowGetHadjustment>(gtk, "gtk_scrolled_window_get_hadjustment") };
         let gtk_adjustment_get_value = unsafe { sym::<GtkAdjustmentGetValue>(gtk, "gtk_adjustment_get_value") };
@@ -624,7 +638,7 @@ impl Symbols {
             gtk_label_set_markup, gtk_widget_set_visible, gtk_widget_grab_focus,
             gtk_widget_get_style_context, gtk_style_context_add_class, gtk_style_context_remove_class,
             gtk_css_provider_new, gtk_css_provider_load_from_data, gtk_style_context_add_provider,
-            gtk_overlay_new, gtk_overlay_add_overlay, gtk_overlay_set_overlay_pass_through,
+            gtk_overlay_new, gtk_overlay_add_overlay, gtk_overlay_set_overlay_pass_through, gtk_overlay_set_child,
             gtk_widget_set_margin_start, gtk_widget_set_margin_top,
             gtk_init,
             g_signal_emit_by_name,
@@ -648,6 +662,9 @@ impl Symbols {
             gtk_widget_get_allocated_width,
             gtk_widget_get_allocated_height,
             gtk_gesture_click_new,
+            gtk_scrolled_window_new,
+            gtk_scrolled_window_set_policy,
+            gtk_scrolled_window_set_child,
             gtk_scrolled_window_get_vadjustment,
             gtk_scrolled_window_get_hadjustment,
             gtk_adjustment_get_value,
