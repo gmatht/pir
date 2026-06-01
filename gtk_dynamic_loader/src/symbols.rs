@@ -26,6 +26,7 @@ pub type GtkBoxNew = unsafe extern "C" fn(orientation: i32, spacing: i32) -> *mu
 pub type GtkBoxAppend = unsafe extern "C" fn(box_: *mut c_void, child: *mut c_void);
 pub type GtkBoxPackStart = unsafe extern "C" fn(box_: *mut c_void, child: *mut c_void, expand: i32, fill: i32, padding: u32);
 pub type GtkContainerAdd = unsafe extern "C" fn(container: *mut c_void, widget: *mut c_void);
+pub type GtkContainerRemove = unsafe extern "C" fn(container: *mut c_void, widget: *mut c_void);
 pub type GtkWindowSetChild = unsafe extern "C" fn(window: *mut c_void, child: *mut c_void);
 pub type GtkWidgetShowAll = unsafe extern "C" fn(widget: *mut c_void);
 pub type GtkWindowPresent = unsafe extern "C" fn(window: *mut c_void);
@@ -229,6 +230,7 @@ pub struct Symbols {
     pub gtk_box_append: Option<GtkBoxAppend>,
     pub gtk_box_pack_start: Option<GtkBoxPackStart>,
     pub gtk_container_add: Option<GtkContainerAdd>,
+    pub gtk_container_remove: Option<GtkContainerRemove>,
     pub gtk_window_set_child: Option<GtkWindowSetChild>,
     pub gtk_widget_show_all: Option<GtkWidgetShowAll>,
     pub gtk_window_present: Option<GtkWindowPresent>,
@@ -451,6 +453,7 @@ impl Symbols {
         let gtk_box_append = unsafe { sym::<GtkBoxAppend>(gtk, "gtk_box_append") };
         let gtk_box_pack_start = unsafe { sym::<GtkBoxPackStart>(gtk, "gtk_box_pack_start") };
         let gtk_container_add = unsafe { sym::<GtkContainerAdd>(gtk, "gtk_container_add") };
+        let gtk_container_remove = unsafe { sym::<GtkContainerRemove>(gtk, "gtk_container_remove") };
         let gtk_window_set_child = unsafe { sym::<GtkWindowSetChild>(gtk, "gtk_window_set_child") };
         let gtk_widget_show_all = unsafe { sym::<GtkWidgetShowAll>(gtk, "gtk_widget_show_all") };
         let gtk_window_present = unsafe { sym::<GtkWindowPresent>(gtk, "gtk_window_present") };
@@ -631,7 +634,7 @@ impl Symbols {
             g_main_loop_new, g_main_loop_run, g_main_loop_quit,
             g_object_ref, g_object_unref, g_object_ref_sink, g_signal_connect_data, g_signal_connect,
             gtk_window_new, gtk_window_set_title, gtk_button_new_with_label, gtk_label_new, gtk_label_set_text,
-            gtk_box_new, gtk_box_append, gtk_box_pack_start, gtk_container_add, gtk_window_set_child,
+            gtk_box_new, gtk_box_append, gtk_box_pack_start, gtk_container_add, gtk_container_remove, gtk_window_set_child,
             gtk_widget_show_all, gtk_window_present,
             gtk_grid_new, gtk_grid_attach, gtk_entry_new, gtk_entry_set_text, gtk_entry_get_text,
             gtk_entry_set_width_chars, gtk_widget_set_size_request, gtk_entry_set_has_frame,

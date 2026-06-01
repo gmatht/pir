@@ -1171,6 +1171,13 @@ pub fn widget_set_can_target(loader: &Arc<Loader>, widget: *mut c_void, can_targ
     }
 }
 
+/// Set widget visibility
+pub fn widget_set_visible(loader: &Arc<Loader>, widget: *mut c_void, visible: bool) {
+    if let Some(f) = loader.symbols.gtk_widget_set_visible {
+        unsafe { f(widget, if visible { 1 } else { 0 }); }
+    }
+}
+
 /// Unparent a widget (GTK4) — remove from its parent container
 pub fn widget_unparent(loader: &Arc<Loader>, widget: *mut c_void) {
     if let Some(unparent) = loader.symbols.gtk_widget_unparent {
@@ -1250,6 +1257,18 @@ pub fn destroy_widget(loader: &Arc<Loader>, widget: *mut c_void) {
 pub fn unref_widget(loader: &Arc<Loader>, widget: *mut c_void) {
     if let Some(unref) = loader.symbols.g_object_unref {
         unsafe { unref(widget); }
+    }
+}
+
+/// Remove a child widget from its parent without unreffing.
+/// GTK4: uses gtk_widget_unparent. GTK3: uses gtk_widget_destroy (which only
+/// removes from parent and emits "destroy" — it does NOT free the widget
+/// while references are held).
+pub fn remove_from_parent(loader: &Arc<Loader>, widget: *mut c_void) {
+    if let Some(unparent) = loader.symbols.gtk_widget_unparent {
+        unsafe { unparent(widget); }
+    } else if let Some(destroy) = loader.symbols.gtk_widget_destroy {
+        unsafe { destroy(widget); }
     }
 }
 

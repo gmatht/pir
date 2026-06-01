@@ -481,6 +481,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let commit_edit = {
+        let loader_commit = loader.clone();
         let texts_nav = texts.clone();
         let edit_entry_nav = editing_entry.clone();
         let formula_e = formula_entry.clone();
@@ -497,6 +498,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 formula_e.set_text(&new_text);
+                // Destroy the entry widget (removes from overlay, frees GTK resources).
+                gtk_dynamic_loader::destroy_widget(&loader_commit, *e.as_ref());
+                // Prevent Rust Drop from double-freeing — destroy_widget already
+                // handled both the destroy and the unref.
+                std::mem::forget(e);
                 qr();
             }
         }
@@ -926,9 +932,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let result = app.run().map_err(|e| Box::new(e) as Box<dyn std::error::Error>);
 
-    // Cleanup: unparent editing entry from overlay
+    // GTK cascade has already destroyed children; prevent Rust Drop from
+    // double-freeing any leftover editing entry.
     if let Some(e) = editing_entry.borrow_mut().take() {
-        gtk_dynamic_loader::widget_unparent(&loader, *e.as_ref());
+        std::mem::forget(e);
     }
 
     result
