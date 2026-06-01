@@ -394,6 +394,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let selected_coord: Rc<RefCell<Option<(usize, usize)>>> = Rc::new(RefCell::new(Some((0, 0))));
     let editing_entry: Rc<RefCell<Option<gtk::Entry>>> = Rc::new(RefCell::new(None));
+    let text_input_active: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+
+    {
+        let text_input_active = text_input_active.clone();
+        let _ = formula_entry.connect_focus_in_event(move |_ev| {
+            *text_input_active.borrow_mut() = true;
+            0
+        });
+    }
+    {
+        let text_input_active = text_input_active.clone();
+        let _ = formula_entry.connect_focus_out_event(move |_ev| {
+            *text_input_active.borrow_mut() = false;
+            0
+        });
+    }
 
     if is_gtk4 {
         let ld = loader.clone();
@@ -495,6 +511,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_edit: Rc<dyn Fn(usize, usize)> = {
         let texts_nav = texts.clone();
         let edit_entry_nav = editing_entry.clone();
+        let text_input_active = text_input_active.clone();
         let overlay_for_edit = overlay.clone();
         let loader_for_edit = loader.clone();
         let rh_edit = row_heights.clone();
@@ -517,12 +534,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 gtk_dynamic_loader::widget_set_valign(&loader_for_edit, *entry.as_ref(), 1);
                 overlay_for_edit.add_overlay(&entry);
                 overlay_for_edit.set_overlay_pass_through(&entry, false);
+                gtk_dynamic_loader::widget_set_visible(&loader_for_edit, *entry.as_ref(), true);
                 entry.set_size_request(CELL_W, rh_edit.borrow()[r]);
+
+                {
+                    let text_input_active = text_input_active.clone();
+                    let _ = entry.connect_focus_in_event(move |_ev| {
+                        *text_input_active.borrow_mut() = true;
+                        0
+                    });
+                }
+                {
+                    let text_input_active = text_input_active.clone();
+                    let _ = entry.connect_focus_out_event(move |_ev| {
+                        *text_input_active.borrow_mut() = false;
+                        0
+                    });
+                }
 
                 let commit_on_activate = commit_on_activate.clone();
                 let sel_on_activate = sel_on_activate.clone();
                 let refresh_on_activate = refresh_on_activate.clone();
                 let start_again = self_ref_inner.clone();
+                let entry_for_focus = entry.clone();
+                let loader_for_focus = loader_for_edit.clone();
                 let _ = entry.connect_activate(move |_param| {
                     commit_on_activate();
                     let next = sel_on_activate.borrow().map(|(row, col)| (row + 1, col)).filter(|(row, _)| *row < VISIBLE_ROWS);
@@ -535,7 +570,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
 
-                entry.grab_focus();
+                gtk_dynamic_loader::idle_add_once(&loader_for_focus, Box::new(move || {
+                    entry_for_focus.grab_focus();
+                }));
                 *edit_entry_nav.borrow_mut() = Some(entry);
             }
         });
@@ -645,6 +682,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             gtk_dynamic_loader::widget_connect_signal_bool(&loader, drawing_area_ptr, "button-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
                 if let Some((x, y)) = gtk_dynamic_loader::gdk_event_get_coords(&ld, ev) {
                     if let Some(f) = cl.borrow_mut().as_mut() { f(x, y); }
+                    return 1;
                 }
                 0
             })).ok();
@@ -762,6 +800,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let sel_coord = selected_coord.clone();
         let edit_entry_nav = editing_entry.clone();
+        let text_input_active = text_input_active.clone();
         let commit_fn = commit_edit.clone();
         let start_edit_kb = start_edit.clone();
         let refresh_sel = refresh_selection.clone();
@@ -771,6 +810,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ctrl.add_to_widget(&win);
                 let start_edit_gtk4 = start_edit_kb.clone();
                 ctrl.connect_key_pressed(Box::new(move |keyval: u32| -> i32 {
+                    if *text_input_active.borrow() {
+                        return 0;
+                    }
                     if edit_entry_nav.borrow().is_some() {
                         if keyval == 0xFF1B {
                             let _ = edit_entry_nav.borrow_mut().take();
@@ -824,6 +866,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let loader_kb = loader.clone();
             let start_edit_gtk3 = start_edit_kb.clone();
             gtk_dynamic_loader::widget_connect_signal_bool(&loader, win_ptr, "key-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
+                if *text_input_active.borrow() {
+                    return 0;
+                }
                 let keyval = gtk_dynamic_loader::EventControllerKey::get_keyval_static(&loader_kb, ev);
                 if edit_entry_nav.borrow().is_some() {
                     if keyval == 0xFF1B {

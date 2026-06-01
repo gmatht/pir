@@ -6,6 +6,18 @@ use std::os::raw::c_void;
 use std::rc::Rc;
 use std::sync::Arc;
 
+extern "C" fn idle_once_trampoline(data: *mut c_void) -> i32 {
+    unsafe {
+        if data.is_null() {
+            return 0;
+        }
+        let boxed: Box<Box<dyn FnMut()>> = Box::from_raw(data as *mut Box<dyn FnMut()>);
+        let mut cb = boxed;
+        (*cb)();
+    }
+    0
+}
+
 pub struct BoxWidget {
     inner: *mut c_void,
     loader: Arc<Loader>,
@@ -1207,6 +1219,17 @@ pub fn widget_set_can_target(loader: &Arc<Loader>, widget: *mut c_void, can_targ
 pub fn widget_set_visible(loader: &Arc<Loader>, widget: *mut c_void, visible: bool) {
     if let Some(f) = loader.symbols.gtk_widget_set_visible {
         unsafe { f(widget, if visible { 1 } else { 0 }); }
+    }
+}
+
+/// Run a callback on the next GTK main-loop idle turn.
+pub fn idle_add_once(loader: &Arc<Loader>, cb: Box<dyn FnMut()>) {
+    if let Some(idle_add) = loader.symbols.g_idle_add {
+        let raw = Box::into_raw(Box::new(cb)) as *mut c_void;
+        unsafe { idle_add(Some(idle_once_trampoline), raw); }
+    } else {
+        let mut cb = cb;
+        cb();
     }
 }
 
