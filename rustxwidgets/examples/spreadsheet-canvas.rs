@@ -426,8 +426,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })).ok();
     }
 
-    // Prevent double-free: overlay owns the child reference, so we leak drawing_area.
-    std::mem::forget(drawing_area);
+    let scrolled = gtk_dynamic_loader::ScrolledWindow::new(loader.clone())?;
+    scrolled.set_policy(0, 0);
+    scrolled.set_child(&overlay);
+    gtk_dynamic_loader::widget_set_hexpand(&loader, *scrolled.as_ref(), true);
+    gtk_dynamic_loader::widget_set_vexpand(&loader, *scrolled.as_ref(), true);
+    gtk_dynamic_loader::widget_set_hexpand(&loader, *overlay.as_ref(), true);
+    gtk_dynamic_loader::widget_set_vexpand(&loader, *overlay.as_ref(), true);
+    let total_w = 46 + VISIBLE_COLS as i32 * CELL_W;
+    let total_h = CELL_H + VISIBLE_ROWS as i32 * CELL_H;
+    gtk_dynamic_loader::widget_set_size_request(&loader, drawing_area_ptr, total_w, total_h);
 
     if let Some(loader2) = rustxwidgets::backends::gtk::loader() {
         let css = r#"
@@ -439,17 +447,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             gtk_dynamic_loader::add_css_provider_global(&loader2, *win.as_ref(), provider, 600);
         }
     }
-
-    let scrolled = gtk_dynamic_loader::ScrolledWindow::new(loader.clone())?;
-    scrolled.set_policy(0, 0);
-    scrolled.set_child(&overlay);
-    gtk_dynamic_loader::widget_set_hexpand(&loader, *scrolled.as_ref(), true);
-    gtk_dynamic_loader::widget_set_vexpand(&loader, *scrolled.as_ref(), true);
-    gtk_dynamic_loader::widget_set_hexpand(&loader, *overlay.as_ref(), true);
-    gtk_dynamic_loader::widget_set_vexpand(&loader, *overlay.as_ref(), true);
-    let total_w = 46 + VISIBLE_COLS as i32 * CELL_W;
-    let total_h = CELL_H + VISIBLE_ROWS as i32 * CELL_H;
-    gtk_dynamic_loader::widget_set_size_request(&loader, drawing_area_ptr, total_w, total_h);
 
     let queue_redraw = Rc::new({
         let ld = loader.clone();
@@ -738,18 +735,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Keyboard navigation + click-to-edit
     {
         let sel_coord = selected_coord.clone();
-        let texts_nav = texts.clone();
         let edit_entry_nav = editing_entry.clone();
-        let formula_e = formula_entry.clone();
         let commit_fn = commit_edit.clone();
         let refresh_sel = refresh_selection.clone();
 
         if is_gtk4 {
-            let loader_nav = loader.clone();
             if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(loader.clone()) {
                 ctrl.add_to_widget(&win);
+                let loader_ctrl = loader.clone();
                 ctrl.connect_key_pressed(Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
-                    let keyval = ctrl.get_keyval(ev);
+                    let keyval = gtk_dynamic_loader::EventControllerKey::get_keyval_static(&loader_ctrl, ev);
                     if edit_entry_nav.borrow().is_some() {
                         if keyval == 0xFF1B {
                             let _ = edit_entry_nav.borrow_mut().take();
@@ -792,8 +787,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         } else {
             let win_ptr = *win.as_ref();
+            let loader_kb = loader.clone();
             gtk_dynamic_loader::widget_connect_signal_bool(&loader, win_ptr, "key-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
-                let keyval = gtk_dynamic_loader::EventControllerKey::get_keyval_static(&loader, ev);
+                let keyval = gtk_dynamic_loader::EventControllerKey::get_keyval_static(&loader_kb, ev);
                 if edit_entry_nav.borrow().is_some() {
                     if keyval == 0xFF1B {
                         let _ = edit_entry_nav.borrow_mut().take();
@@ -838,10 +834,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // File operations
     {
+        let loader_open = loader.clone();
         let texts_open = texts.clone();
         let qr = queue_redraw.clone();
         let _ = open_btn.on_click(move || {
-            if let Ok(chooser) = gtk_dynamic_loader::FileChooserNative::open(loader.clone(), "Open spreadsheet", std::ptr::null_mut()) {
+            if let Ok(chooser) = gtk_dynamic_loader::FileChooserNative::open(loader_open.clone(), "Open spreadsheet", std::ptr::null_mut()) {
                 if chooser.run() == -3 {
                     if let Some(fname) = chooser.get_filename() {
                         if let Ok(data) = std::fs::read_to_string(&fname) {
@@ -863,9 +860,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
+        let loader_save = loader.clone();
         let texts_save = texts.clone();
         let _ = save_btn.on_click(move || {
-            if let Ok(chooser) = gtk_dynamic_loader::FileChooserNative::save(loader.clone(), "Save spreadsheet as", std::ptr::null_mut()) {
+            if let Ok(chooser) = gtk_dynamic_loader::FileChooserNative::save(loader_save.clone(), "Save spreadsheet as", std::ptr::null_mut()) {
+                if chooser.run() == -3 {
+                    if let Some(fname) = chooser.get_filename() {
+                        let mut out = String::new();
+                        if let Ok(t) = texts_save.try_borrow() {
+                            for row in t.iter() {
+                                for (j, val) in row.iter().enumerate() {
+                                    if j > 0 { out.push('\t'); }
+                                    out.push_str(val);
+                                }
+                                out.push('\n');
+                            }
+                        }
+                        let _ = std::fs::write(&fname, &out);
+                    }
+                }
+            }
+        });
+    }
+    {
+        let loader_save = loader.clone();
+        let texts_save = texts.clone();
+        let _ = save_btn.on_click(move || {
+            if let Ok(chooser) = gtk_dynamic_loader::FileChooserNative::save(loader_save.clone(), "Save spreadsheet as", std::ptr::null_mut()) {
                 if chooser.run() == -3 {
                     if let Some(fname) = chooser.get_filename() {
                         let mut out = String::new();

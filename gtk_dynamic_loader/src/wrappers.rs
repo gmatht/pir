@@ -44,7 +44,7 @@ impl AsRef<*mut c_void> for BoxWidget { fn as_ref(&self) -> &*mut c_void { &self
 
 impl Drop for BoxWidget {
     fn drop(&mut self) {
-        crate::wrappers::destroy_widget(&self.loader, self.inner);
+        crate::wrappers::unref_widget(&self.loader, self.inner);
     }
 }
 
@@ -125,7 +125,7 @@ impl AsRef<*mut c_void> for Window { fn as_ref(&self) -> &*mut c_void { &self.in
 
 impl Drop for Window {
     fn drop(&mut self) {
-        crate::wrappers::destroy_widget(&self.loader, self.inner);
+        crate::wrappers::unref_widget(&self.loader, self.inner);
     }
 }
 
@@ -174,7 +174,7 @@ impl AsRef<*mut c_void> for Button { fn as_ref(&self) -> &*mut c_void { &self.in
 
 impl Drop for Button {
     fn drop(&mut self) {
-        crate::wrappers::destroy_widget(&self.loader, self.inner);
+        crate::wrappers::unref_widget(&self.loader, self.inner);
     }
 }
 
@@ -270,7 +270,7 @@ impl Label {
 
 impl AsRef<*mut c_void> for Label { fn as_ref(&self) -> &*mut c_void { &self.inner } }
 
-impl Drop for Label { fn drop(&mut self) { crate::wrappers::destroy_widget(&self.loader, self.inner); } }
+impl Drop for Label { fn drop(&mut self) { crate::wrappers::unref_widget(&self.loader, self.inner); } }
 
 impl Clone for Label {
     fn clone(&self) -> Self {
@@ -399,7 +399,7 @@ impl Grid {
 
 impl AsRef<*mut c_void> for Grid { fn as_ref(&self) -> &*mut c_void { &self.inner } }
 
-impl Drop for Grid { fn drop(&mut self) { crate::wrappers::destroy_widget(&self.loader, self.inner); }
+impl Drop for Grid { fn drop(&mut self) { crate::wrappers::unref_widget(&self.loader, self.inner); }
 }
 
 // Overlay wrapper
@@ -469,7 +469,7 @@ impl AsRef<*mut c_void> for Overlay { fn as_ref(&self) -> &*mut c_void { &self.i
 
 impl Drop for Overlay {
     fn drop(&mut self) {
-        crate::wrappers::destroy_widget(&self.loader, self.inner);
+        crate::wrappers::unref_widget(&self.loader, self.inner);
     }
 }
 
@@ -556,7 +556,7 @@ impl DrawingArea {
 
 impl AsRef<*mut c_void> for DrawingArea { fn as_ref(&self) -> &*mut c_void { &self.inner } }
 
-impl Drop for DrawingArea { fn drop(&mut self) { crate::wrappers::destroy_widget(&self.loader, self.inner); }
+impl Drop for DrawingArea { fn drop(&mut self) { crate::wrappers::unref_widget(&self.loader, self.inner); }
 }
 
 // ---- ScrolledWindow wrapper ----
@@ -625,7 +625,7 @@ impl AsRef<*mut c_void> for ScrolledWindow { fn as_ref(&self) -> &*mut c_void { 
 
 impl Drop for ScrolledWindow {
     fn drop(&mut self) {
-        crate::wrappers::destroy_widget(&self.loader, self.inner);
+        crate::wrappers::unref_widget(&self.loader, self.inner);
     }
 }
 
@@ -1016,7 +1016,7 @@ impl Entry {
 
 impl AsRef<*mut c_void> for Entry { fn as_ref(&self) -> &*mut c_void { &self.inner } }
 
-impl Drop for Entry { fn drop(&mut self) { crate::wrappers::destroy_widget(&self.loader, self.inner); }
+impl Drop for Entry { fn drop(&mut self) { crate::wrappers::unref_widget(&self.loader, self.inner); }
 }
 
 // Measure text width in pixels using gtk_widget_create_pango_layout + pango_layout_get_pixel_size when possible.
@@ -1243,6 +1243,16 @@ pub fn destroy_widget(loader: &Arc<Loader>, widget: *mut c_void) {
     }
 }
 
+/// Release a widget reference without destroying or unparenting.
+/// This is used in Drop impls to balance `g_object_ref` from Clone /
+/// `g_object_ref_sink` from take_ownership, without interfering with
+/// GTK's own parent-child destruction cascade.
+pub fn unref_widget(loader: &Arc<Loader>, widget: *mut c_void) {
+    if let Some(unref) = loader.symbols.g_object_unref {
+        unsafe { unref(widget); }
+    }
+}
+
 // ---- Menu wrappers ----
 
 struct MenuItem {
@@ -1306,7 +1316,7 @@ impl AsRef<*mut c_void> for Menu { fn as_ref(&self) -> &*mut c_void { &self.inne
 
 impl Drop for Menu {
     fn drop(&mut self) {
-        crate::wrappers::destroy_widget(&self.loader, self.inner);
+        crate::wrappers::unref_widget(&self.loader, self.inner);
     }
 }
 
@@ -1365,7 +1375,7 @@ impl AsRef<*mut c_void> for SimpleAction { fn as_ref(&self) -> &*mut c_void { &s
 
 impl Drop for SimpleAction {
     fn drop(&mut self) {
-        crate::wrappers::destroy_widget(&self.loader, self.inner);
+        crate::wrappers::unref_widget(&self.loader, self.inner);
     }
 }
 
@@ -1486,7 +1496,7 @@ impl AsRef<*mut c_void> for MenuBar { fn as_ref(&self) -> &*mut c_void { &self.i
 
 impl Drop for MenuBar {
     fn drop(&mut self) {
-        crate::wrappers::destroy_widget(&self.loader, self.inner);
+        crate::wrappers::unref_widget(&self.loader, self.inner);
     }
 }
 
@@ -1607,7 +1617,7 @@ impl AsRef<*mut c_void> for Dialog { fn as_ref(&self) -> &*mut c_void { &self.in
 
 impl Drop for Dialog {
     fn drop(&mut self) {
-        crate::wrappers::destroy_widget(&self.loader, self.inner);
+        crate::wrappers::unref_widget(&self.loader, self.inner);
     }
 }
 
@@ -1704,7 +1714,7 @@ impl Clone for DropDown {
 
 impl Drop for DropDown {
     fn drop(&mut self) {
-        crate::wrappers::destroy_widget(&self.loader, self.inner);
+        crate::wrappers::unref_widget(&self.loader, self.inner);
         if let Some(sl) = self.string_list {
             if let Some(unref) = self.loader.symbols.g_object_unref {
                 unsafe { unref(sl); }
@@ -1759,7 +1769,7 @@ impl AsRef<*mut c_void> for CheckButton { fn as_ref(&self) -> &*mut c_void { &se
 
 impl Drop for CheckButton {
     fn drop(&mut self) {
-        crate::wrappers::destroy_widget(&self.loader, self.inner);
+        crate::wrappers::unref_widget(&self.loader, self.inner);
     }
 }
 
@@ -1830,7 +1840,7 @@ impl AsRef<*mut c_void> for RadioButton { fn as_ref(&self) -> &*mut c_void { &se
 
 impl Drop for RadioButton {
     fn drop(&mut self) {
-        crate::wrappers::destroy_widget(&self.loader, self.inner);
+        crate::wrappers::unref_widget(&self.loader, self.inner);
     }
 }
 
