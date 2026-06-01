@@ -85,14 +85,6 @@ fn set_valign(loader: &std::sync::Arc<gtk_dynamic_loader::Loader>, widget: *mut 
     }
 }
 
-fn get_allocated_width(loader: &std::sync::Arc<gtk_dynamic_loader::Loader>, widget: *mut std::ffi::c_void) -> i32 {
-    loader.symbols.gtk_widget_get_allocated_width.map(|f| unsafe { f(widget) }).unwrap_or(0)
-}
-
-fn get_allocated_height(loader: &std::sync::Arc<gtk_dynamic_loader::Loader>, widget: *mut std::ffi::c_void) -> i32 {
-    loader.symbols.gtk_widget_get_allocated_height.map(|f| unsafe { f(widget) }).unwrap_or(0)
-}
-
 fn compute_col_x(widths: &[i32], col: usize) -> i32 {
     let mut x = 0;
     for i in 0..col {
@@ -286,7 +278,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let lbl = app.create_label(&text)?;
             let fmt = cell_formats.borrow()[r][c].clone();
             apply_formatting(&lbl, &text, &fmt);
-            lbl.add_class("cell");
             grid_widget.attach(&lbl, (c + 1) as i32, (r + 1) as i32, 1, 1);
             let w = col_widths.borrow()[c];
             gtk_dynamic_loader::widget_set_size_request(&loader, *lbl.as_ref(), w, row_heights.borrow()[r]);
@@ -349,9 +340,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(loader2) = rustxwidgets::backends::gtk::loader() {
         let css = r#"
         label.rwx-overlay { background-color: transparent; padding: 2px 4px; font-family: monospace; font-size: 13px; }
-        label.header { font-weight: bold; background-color: #ffffff; color: #000000; font-size: 12px; border: 1px solid #555555; padding: 2px 4px; }
-        label.row-marker { color: #000000; background-color: #f8f8f8; font-weight: bold; font-size: 12px; padding: 2px 4px; border-right: 1px solid #555555; border-bottom: 1px solid #555555; }
-        label.cell { padding-left: 4px; padding-right: 4px; font-family: monospace; font-size: 13px; background-color: #ffffff; border-right: 1px solid #555555; border-bottom: 1px solid #555555; }
+        label.header { font-weight: bold; background-color: #ffffff; color: #000000; font-size: 12px; border: 1px solid #000000; padding: 2px 4px; }
+        label.row-marker { color: #000000; background-color: #f8f8f8; font-weight: bold; font-size: 12px; padding: 2px 4px; border-right: 1px solid #000000; border-bottom: 1px solid #000000; }
+        label.cell { padding-left: 4px; padding-right: 4px; font-family: monospace; font-size: 13px; background-color: #ffffff; border-right: 1px solid #000000; border-bottom: 1px solid #000000; }
         label.boolval { font-weight: bold; color: #0000cc; }
         label.negative { color: #cc0000; }
         label.numeric { font-family: monospace; }
@@ -383,6 +374,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 set_policy(sw, 0, 0);
             }
             if is_gtk4 {
+                let total_w: i32 = 46 + col_widths.borrow().iter().sum::<i32>();
+                let total_h = CELL_H + (VISIBLE_ROWS as i32) * CELL_H;
+                if let Some(set_min_w) = lookup_sym::<unsafe extern "C" fn(*mut std::ffi::c_void, i32)>(&loader, "gtk_scrolled_window_set_min_content_width") {
+                    set_min_w(sw, total_w);
+                }
+                if let Some(set_min_h) = lookup_sym::<unsafe extern "C" fn(*mut std::ffi::c_void, i32)>(&loader, "gtk_scrolled_window_set_min_content_height") {
+                    set_min_h(sw, total_h);
+                }
                 if let Some(set_child) = lookup_sym::<SetChild>(&loader, "gtk_scrolled_window_set_child") {
                     set_child(sw, overlay_ptr);
                 }
@@ -824,7 +823,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cw_nav = col_widths.clone();
         let rh_nav = row_heights.clone();
         let rm_nav = row_markers.clone();
-        let ch_nav = col_headers.clone();
         let loader_nav = loader.clone();
         let loader_for_resize = loader_nav.clone();
 
@@ -951,8 +949,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let rsy_r = rsy_nav.clone();
                         let rsh_r = rsh_nav.clone();
                         let rh_r = rh_nav.clone();
-                        let ch_r = ch_nav.clone();
-                        let rm_r = rm_nav.clone();
                         let sw_r = scrolled_ptr;
                         let ld_r = loader.clone();
                         unsafe {
@@ -971,7 +967,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let cw_b = cw_r.borrow();
                                     let mut edge_x = 46.0f64;
                                     for ci in 0..VISIBLE_COLS {
-                                        let w = get_allocated_width(&ld_r, *ch_r[ci].as_ref()) as f64;
+                                        let w = cw_b[ci] as f64;
                                         if (ax - (edge_x + w)).abs() <= 6.0 && ax >= edge_x + w - 6.0 {
                                             *rs_r.borrow_mut() = Some(ci);
                                             *rsx_r.borrow_mut() = ax as i32;
@@ -983,10 +979,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 if ax <= 46.0 && ay > CELL_H as f64 {
                                     let rh_b = rh_r.borrow();
-                                    let rm_b = rm_r.borrow();
                                     let mut edge_y = CELL_H as f64;
                                     for ri in 0..VISIBLE_ROWS {
-                                        let h = get_allocated_height(&ld_r, *rm_b[ri].as_ref()) as f64;
+                                        let h = rh_b[ri] as f64;
                                         if (ay - (edge_y + h)).abs() <= 6.0 && ay >= edge_y + h - 6.0 {
                                             *rr_r.borrow_mut() = Some(ri);
                                             *rsy_r.borrow_mut() = ay as i32;
@@ -995,8 +990,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                         edge_y += h;
                                     }
-                                    drop(rh_b);
-                                    drop(rm_b);
                                 }
                             }));
                         }
@@ -1019,8 +1012,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let rsy_r = rsy_nav.clone();
                 let rsh_r = rsh_nav.clone();
                 let rh_r = rh_nav.clone();
-                let ch_r = ch_nav.clone();
-                let rm_r = rm_nav.clone();
                 let ov_resize = overlay_ptr;
                 let _ = unsafe {
                     gtk_dynamic_loader::connect_signal_bool(loader.symbols.as_ref(), ov_resize, "button-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
@@ -1041,7 +1032,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let cw_b = cw_r.borrow();
                                     let mut edge_x = 46.0f64;
                                     for ci in 0..VISIBLE_COLS {
-                                        let w = get_allocated_width(&loader_tmp, *ch_r[ci].as_ref()) as f64;
+                                        let w = cw_b[ci] as f64;
                                         if (x - (edge_x + w)).abs() <= 6.0 && x >= edge_x + w - 6.0 {
                                             *rs_r.borrow_mut() = Some(ci);
                                             *rsx_r.borrow_mut() = x as i32;
@@ -1053,10 +1044,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 if x <= 46.0 && y > CELL_H as f64 {
                                     let rh_b = rh_r.borrow();
-                                    let rm_b = rm_r.borrow();
                                     let mut edge_y = CELL_H as f64;
                                     for ri in 0..VISIBLE_ROWS {
-                                        let h = get_allocated_height(&loader_tmp, *rm_b[ri].as_ref()) as f64;
+                                        let h = rh_b[ri] as f64;
                                         if (y - (edge_y + h)).abs() <= 6.0 && y >= edge_y + h - 6.0 {
                                             *rr_r.borrow_mut() = Some(ri);
                                             *rsy_r.borrow_mut() = y as i32;
@@ -1065,8 +1055,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                         edge_y += h;
                                     }
-                                    drop(rh_b);
-                                    drop(rm_b);
                                 }
                             }
                         }
@@ -1367,5 +1355,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     win.set_child(&vbox);
     win.present();
 
-    app.run().map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    let result = app.run().map_err(|e| Box::new(e) as Box<dyn std::error::Error>);
+
+    // Explicitly tear down overlay children BEFORE Rust drops the GTK
+    // containers (vbox, formula_and_grid, etc) that own the overlay.
+    overlay_labels.borrow_mut().clear();
+    *editing_entry.borrow_mut() = None;
+
+    result
 }
