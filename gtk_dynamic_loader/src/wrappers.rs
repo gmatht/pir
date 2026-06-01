@@ -1222,6 +1222,13 @@ pub fn widget_set_visible(loader: &Arc<Loader>, widget: *mut c_void, visible: bo
     }
 }
 
+/// Show a widget and all its descendants (GTK3).
+pub fn widget_show_all(loader: &Arc<Loader>, widget: *mut c_void) {
+    if let Some(show_all) = loader.symbols.gtk_widget_show_all {
+        unsafe { show_all(widget); }
+    }
+}
+
 /// Run a callback on the next GTK main-loop idle turn.
 pub fn idle_add_once(loader: &Arc<Loader>, cb: Box<dyn FnMut()>) {
     if let Some(idle_add) = loader.symbols.g_idle_add {
