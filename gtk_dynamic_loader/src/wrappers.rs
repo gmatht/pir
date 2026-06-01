@@ -689,10 +689,26 @@ impl EventControllerKey {
         Ok(EventControllerKey { inner, loader, _not_send: PhantomData })
     }
 
-    pub fn connect_key_pressed<F: FnMut(*mut c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
-        let boxed: Box<dyn FnMut(*mut c_void) -> i32> = Box::new(f);
-        let res = unsafe { crate::signals::connect_signal_bool(&self.loader.symbols, self.inner, "key-pressed", boxed) };
-        match res { Ok(id) => Ok(id), Err(e) => Err(Error::Other(e)) }
+    pub fn connect_key_pressed<F: FnMut(u32) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
+        let boxed: Box<Box<dyn FnMut(u32) -> i32>> = Box::new(Box::new(f));
+        let raw = Box::into_raw(boxed) as *mut c_void;
+        unsafe { self.connect_key_pressed_raw(raw) }
+    }
+
+    unsafe fn connect_key_pressed_raw(&self, raw: *mut c_void) -> Result<u64, Error> {
+        let sig_name = std::ffi::CString::new("key-pressed").unwrap();
+        if let Some(gscd) = self.loader.symbols.g_signal_connect_data {
+            let handler_ptr = crate::signals::gtk_compat_trampoline_key_pressed as *const () as *mut c_void;
+            let destroy_ptr = Some(crate::signals::gtk_compat_destroy_notify_key_pressed as unsafe extern "C" fn(*mut c_void, *mut c_void));
+            let id = gscd(self.inner, sig_name.as_ptr(), handler_ptr, raw, destroy_ptr, 0);
+            Ok(id)
+        } else if let Some(gsc) = self.loader.symbols.g_signal_connect {
+            let handler_ptr = crate::signals::gtk_compat_trampoline_key_pressed as *const () as *mut c_void;
+            let id = gsc(self.inner, sig_name.as_ptr(), handler_ptr, raw);
+            Ok(id)
+        } else {
+            Err(Error::Other("no g_signal_connect available".into()))
+        }
     }
 
     pub fn connect_key_press_event<F: FnMut(*mut c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
@@ -964,6 +980,15 @@ impl Entry {
         }
     }
 
+    pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {
+        let boxed: Box<Box<dyn FnMut(*mut c_void)>> = Box::new(Box::new(f));
+        let res = unsafe { crate::signals::connect_signal_param(&self.loader.symbols, self.inner, "activate", boxed) };
+        match res {
+            Ok(id) => Ok(id),
+            Err(e) => Err(Error::Other(e)),
+        }
+    }
+
     pub fn connect_button_press<F: FnMut() + 'static>(&self, f: F) -> Result<u64, Error> {
         let boxed: Box<dyn FnMut()> = Box::new(f);
         let res = unsafe { crate::signals::connect_signal(&self.loader.symbols, self.inner, "button-press-event", boxed, 3) };
@@ -1203,6 +1228,33 @@ pub fn widget_connect_signal_bool(
 /// Queue a redraw on a widget
 pub fn widget_queue_draw(loader: &Arc<Loader>, widget: *mut c_void) {
     if let Some(q) = loader.symbols.gtk_widget_queue_draw { unsafe { q(widget); } }
+}
+
+/// Create a GtkGestureClick, add it to `target_widget`, and connect its `pressed` signal.
+/// The widget takes full ownership of the gesture — no Rust handle is returned.
+/// Returns the signal handler ID on success.
+pub fn connect_gesture_click_pressed(
+    loader: &Arc<Loader>,
+    target_widget: *mut c_void,
+    cb: Box<dyn FnMut(i32, f64, f64)>,
+) -> Result<u64, Error> {
+    if let Some(ctor) = loader.symbols.gtk_gesture_click_new {
+        let gesture = unsafe { ctor() };
+        if gesture.is_null() {
+            return Err(Error::Other("gtk_gesture_click_new returned null".into()));
+        }
+        // The gesture has a floating ref. gtk_widget_add_controller takes ownership.
+        if let Some(add_ctrl) = loader.symbols.gtk_widget_add_controller {
+            unsafe { add_ctrl(target_widget, gesture); }
+        }
+        let res = unsafe { crate::signals::connect_signal_gesture(&loader.symbols, gesture, "pressed", cb) };
+        match res {
+            Ok(id) => Ok(id),
+            Err(e) => Err(Error::Other(e)),
+        }
+    } else {
+        Err(Error::MissingSymbol("gtk_gesture_click_new".into()))
+    }
 }
 
 /// Get coordinates from a GDK event. Returns `None` if the symbol is unavailable.

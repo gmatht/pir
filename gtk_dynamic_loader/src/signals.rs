@@ -241,6 +241,28 @@ pub extern "C" fn gtk_compat_destroy_notify_draw_gtk3(data: *mut c_void, _closur
     }
 }
 
+// trampoline for GTK4 GtkEventControllerKey::key-pressed signal
+// passes (keyval, keycode, state) as u32 triple — NOT an event pointer
+#[no_mangle]
+pub extern "C" fn gtk_compat_trampoline_key_pressed(_instance: *mut c_void, keyval: u32, _keycode: u32, _state: u32, user_data: *mut c_void) -> i32 {
+    unsafe {
+        if user_data.is_null() { return 0; }
+        let inner_ptr = user_data as *mut Box<dyn FnMut(u32) -> i32>;
+        if inner_ptr.is_null() { return 0; }
+        let closure_ref: &mut dyn FnMut(u32) -> i32 = &mut **inner_ptr;
+        closure_ref(keyval)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gtk_compat_destroy_notify_key_pressed(data: *mut c_void, _closure: *mut c_void) {
+    unsafe {
+        if data.is_null() { return; }
+        let inner_ptr = data as *mut Box<dyn FnMut(u32) -> i32>;
+        let _boxed: Box<Box<dyn FnMut(u32) -> i32>> = Box::from_raw(inner_ptr);
+    }
+}
+
 // trampoline for GTK4 gtk_drawing_area_set_draw_func — passes (cr, width, height)
 #[no_mangle]
 pub extern "C" fn gtk_compat_trampoline_draw_gtk4(_area: *mut c_void, cr: *mut c_void, w: i32, h: i32, user_data: *mut c_void) {

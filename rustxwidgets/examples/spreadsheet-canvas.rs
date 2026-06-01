@@ -308,13 +308,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::set_var("GTK_DLOPEN_PREFER_GTK3", "1");
     }
 
-    let loader = match rustxwidgets::backends::gtk::loader() {
-        Some(l) => l,
-        None => { let _ = App::init()?; rustxwidgets::backends::gtk::loader().expect("loader") }
-    };
-
-    let is_gtk4 = loader.symbols.gtk_container_add.is_none();
     let app = App::init()?;
+    let loader = rustxwidgets::backends::gtk::loader().expect("no GTK loader after App::init");
+    let is_gtk4 = loader.symbols.gtk_container_add.is_none();
     let win = app.create_window()?;
     win.set_title("Spreadsheet");
     win.set_default_size(1600, 1000);
@@ -453,33 +449,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         move || gtk_dynamic_loader::widget_queue_draw(&ld, drawing_area_ptr)
     });
 
-    let start_edit = {
-        let texts_nav = texts.clone();
-        let edit_entry_nav = editing_entry.clone();
-        let overlay_for_edit = overlay.clone();
-        let loader_for_edit = loader.clone();
-        let rh_edit = row_heights.clone();
-        move |r: usize, c: usize| {
-            if edit_entry_nav.borrow().is_some() { return; }
-            if let Ok(entry) = gtk::create_entry() {
-                entry.set_text(&texts_nav.borrow()[r][c]);
-                let rh = rh_edit.borrow();
-                let left = 46 + c as i32 * CELL_W;
-                let top = CELL_H + compute_row_y(&rh, r);
-                drop(rh);
-                gtk_dynamic_loader::widget_set_margin_start(&loader_for_edit, *entry.as_ref(), left);
-                gtk_dynamic_loader::widget_set_margin_top(&loader_for_edit, *entry.as_ref(), top);
-                gtk_dynamic_loader::widget_set_halign(&loader_for_edit, *entry.as_ref(), 1);
-                gtk_dynamic_loader::widget_set_valign(&loader_for_edit, *entry.as_ref(), 1);
-                overlay_for_edit.add_overlay(&entry);
-                overlay_for_edit.set_overlay_pass_through(&entry, false);
-                entry.set_size_request(CELL_W, rh_edit.borrow()[r]);
-                entry.grab_focus();
-                *edit_entry_nav.borrow_mut() = Some(entry);
-            }
-        }
-    };
-
     let commit_edit = {
         let loader_commit = loader.clone();
         let texts_nav = texts.clone();
@@ -498,11 +467,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 formula_e.set_text(&new_text);
-                // Destroy the entry widget (removes from overlay, frees GTK resources).
-                gtk_dynamic_loader::destroy_widget(&loader_commit, *e.as_ref());
-                // Prevent Rust Drop from double-freeing — destroy_widget already
-                // handled both the destroy and the unref.
-                std::mem::forget(e);
+                // Remove the entry from the overlay so it doesn't remain visible.
+                // Drop will safely call g_object_unref to release our ref.
+                gtk_dynamic_loader::remove_from_parent(&loader_commit, *e.as_ref());
                 qr();
             }
         }
@@ -523,6 +490,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             qr();
         }
+    };
+
+    let start_edit: Rc<dyn Fn(usize, usize)> = {
+        let texts_nav = texts.clone();
+        let edit_entry_nav = editing_entry.clone();
+        let overlay_for_edit = overlay.clone();
+        let loader_for_edit = loader.clone();
+        let rh_edit = row_heights.clone();
+        let commit_on_activate = commit_edit.clone();
+        let sel_on_activate = selected_coord.clone();
+        let refresh_on_activate = refresh_selection.clone();
+        let self_ref: Rc<RefCell<Option<Rc<dyn Fn(usize, usize)>>>> = Rc::new(RefCell::new(None));
+        let self_ref_inner = self_ref.clone();
+        let start: Rc<dyn Fn(usize, usize)> = Rc::new(move |r: usize, c: usize| {
+            if edit_entry_nav.borrow().is_some() { return; }
+            if let Ok(entry) = gtk::create_entry() {
+                entry.set_text(&texts_nav.borrow()[r][c]);
+                let rh = rh_edit.borrow();
+                let left = 46 + c as i32 * CELL_W;
+                let top = CELL_H + compute_row_y(&rh, r);
+                drop(rh);
+                gtk_dynamic_loader::widget_set_margin_start(&loader_for_edit, *entry.as_ref(), left);
+                gtk_dynamic_loader::widget_set_margin_top(&loader_for_edit, *entry.as_ref(), top);
+                gtk_dynamic_loader::widget_set_halign(&loader_for_edit, *entry.as_ref(), 1);
+                gtk_dynamic_loader::widget_set_valign(&loader_for_edit, *entry.as_ref(), 1);
+                overlay_for_edit.add_overlay(&entry);
+                overlay_for_edit.set_overlay_pass_through(&entry, false);
+                entry.set_size_request(CELL_W, rh_edit.borrow()[r]);
+
+                let commit_on_activate = commit_on_activate.clone();
+                let sel_on_activate = sel_on_activate.clone();
+                let refresh_on_activate = refresh_on_activate.clone();
+                let start_again = self_ref_inner.clone();
+                let _ = entry.connect_activate(move |_param| {
+                    commit_on_activate();
+                    let next = sel_on_activate.borrow().map(|(row, col)| (row + 1, col)).filter(|(row, _)| *row < VISIBLE_ROWS);
+                    if let Some((next_r, next_c)) = next {
+                        *sel_on_activate.borrow_mut() = Some((next_r, next_c));
+                        refresh_on_activate();
+                        if let Some(start_edit_again) = start_again.borrow().as_ref().cloned() {
+                            start_edit_again(next_r, next_c);
+                        }
+                    }
+                });
+
+                entry.grab_focus();
+                *edit_entry_nav.borrow_mut() = Some(entry);
+            }
+        });
+        *self_ref.borrow_mut() = Some(start.clone());
+        start
     };
 
     // Click to select and edit
@@ -609,16 +627,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if is_gtk4 {
-            if let Ok(gesture) = gtk_dynamic_loader::GestureClick::new(loader.clone()) {
-                gesture.add_to_widget(&overlay);
-                let cl = click_logic.clone();
-                let sw = scrolled.clone();
-                gesture.connect_pressed(move |_n: i32, x: f64, y: f64| {
-                    let scroll_x = sw.get_hadjustment_value();
-                    let scroll_y = sw.get_vadjustment_value();
+            let cl = click_logic.clone();
+            let sw_for_click = scrolled.clone();
+            let _ = gtk_dynamic_loader::connect_gesture_click_pressed(
+                &loader, overlay_ptr,
+                Box::new(move |_n: i32, x: f64, y: f64| {
+                    let scroll_x = sw_for_click.get_hadjustment_value();
+                    let scroll_y = sw_for_click.get_vadjustment_value();
                     if let Some(f) = cl.borrow_mut().as_mut() { f(x + scroll_x, y + scroll_y); }
-                }).ok();
-            }
+                }),
+            );
         } else {
             let cl = click_logic.clone();
             let ld = loader.clone();
@@ -743,19 +761,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sel_coord = selected_coord.clone();
         let edit_entry_nav = editing_entry.clone();
         let commit_fn = commit_edit.clone();
+        let start_edit_kb = start_edit.clone();
         let refresh_sel = refresh_selection.clone();
 
         if is_gtk4 {
             if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(loader.clone()) {
                 ctrl.add_to_widget(&win);
-                let loader_ctrl = loader.clone();
-                ctrl.connect_key_pressed(Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
-                    let keyval = gtk_dynamic_loader::EventControllerKey::get_keyval_static(&loader_ctrl, ev);
+                let start_edit_gtk4 = start_edit_kb.clone();
+                ctrl.connect_key_pressed(Box::new(move |keyval: u32| -> i32 {
                     if edit_entry_nav.borrow().is_some() {
                         if keyval == 0xFF1B {
                             let _ = edit_entry_nav.borrow_mut().take();
                         } else if keyval == 0xFF0D || keyval == 0xFF8D {
                             commit_fn();
+                            // Move to cell below and start editing
+                            let next = sel_coord.borrow().map(|(r, c)| (r + 1, c)).filter(|(r, _)| *r < VISIBLE_ROWS);
+                            if let Some((r, c)) = next {
+                                *sel_coord.borrow_mut() = Some((r, c));
+                                refresh_sel();
+                                start_edit_gtk4(r, c);
+                            }
+                            return 1;
                         }
                         return 0;
                     }
@@ -769,14 +795,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             0xFF0D | 0xFF8D => {
                                 drop(coord);
                                 commit_fn();
-                                start_edit(r, c);
+                                start_edit_gtk4(r, c);
                                 return 1;
                             }
                             _ => {
                                 if keyval >= 0x20 && keyval <= 0x7E {
                                     drop(coord);
                                     commit_fn();
-                                    start_edit(r, c);
+                                    start_edit_gtk4(r, c);
                                     if let Some(entry) = edit_entry_nav.borrow().as_ref() {
                                         let ch = std::char::from_u32(keyval).unwrap_or(' ');
                                         entry.set_text(&ch.to_string());
@@ -794,47 +820,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             let win_ptr = *win.as_ref();
             let loader_kb = loader.clone();
+            let start_edit_gtk3 = start_edit_kb.clone();
             gtk_dynamic_loader::widget_connect_signal_bool(&loader, win_ptr, "key-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
                 let keyval = gtk_dynamic_loader::EventControllerKey::get_keyval_static(&loader_kb, ev);
                 if edit_entry_nav.borrow().is_some() {
                     if keyval == 0xFF1B {
                         let _ = edit_entry_nav.borrow_mut().take();
-                    } else if keyval == 0xFF0D || keyval == 0xFF8D {
-                        commit_fn();
-                    }
-                    return 0;
-                }
-                let mut coord = sel_coord.borrow_mut();
-                if let Some((r, c)) = *coord {
-                    match keyval {
-                        0xFF52 | 0xFE52 => { if r > 0 { *coord = Some((r - 1, c)); } }
-                        0xFF54 | 0xFE54 => { if r + 1 < VISIBLE_ROWS { *coord = Some((r + 1, c)); } }
-                        0xFF51 | 0xFE51 => { if c > 0 { *coord = Some((r, c - 1)); } }
-                        0xFF53 | 0xFE53 => { if c + 1 < VISIBLE_COLS { *coord = Some((r, c + 1)); } }
-                        0xFF0D | 0xFF8D => {
-                            drop(coord);
+                        } else if keyval == 0xFF0D || keyval == 0xFF8D {
                             commit_fn();
-                            start_edit(r, c);
+                            // Move to cell below and start editing
+                            let next = sel_coord.borrow().map(|(r, c)| (r + 1, c)).filter(|(r, _)| *r < VISIBLE_ROWS);
+                            if let Some((r, c)) = next {
+                                *sel_coord.borrow_mut() = Some((r, c));
+                                refresh_sel();
+                                start_edit_gtk3(r, c);
+                            }
                             return 1;
                         }
-                        _ => {
-                            if keyval >= 0x20 && keyval <= 0x7E {
+                        return 0;
+                    }
+                    let mut coord = sel_coord.borrow_mut();
+                    if let Some((r, c)) = *coord {
+                        match keyval {
+                            0xFF52 | 0xFE52 => { if r > 0 { *coord = Some((r - 1, c)); } }
+                            0xFF54 | 0xFE54 => { if r + 1 < VISIBLE_ROWS { *coord = Some((r + 1, c)); } }
+                            0xFF51 | 0xFE51 => { if c > 0 { *coord = Some((r, c - 1)); } }
+                            0xFF53 | 0xFE53 => { if c + 1 < VISIBLE_COLS { *coord = Some((r, c + 1)); } }
+                            0xFF0D | 0xFF8D => {
                                 drop(coord);
                                 commit_fn();
-                                start_edit(r, c);
-                                if let Some(entry) = edit_entry_nav.borrow().as_ref() {
-                                    let ch = std::char::from_u32(keyval).unwrap_or(' ');
-                                    entry.set_text(&ch.to_string());
-                                }
+                                start_edit_gtk3(r, c);
                                 return 1;
+                            }
+                            _ => {
+                                if keyval >= 0x20 && keyval <= 0x7E {
+                                    drop(coord);
+                                    commit_fn();
+                                    start_edit_gtk3(r, c);
+                                    if let Some(entry) = edit_entry_nav.borrow().as_ref() {
+                                        let ch = std::char::from_u32(keyval).unwrap_or(' ');
+                                        entry.set_text(&ch.to_string());
+                                    }
+                                    return 1;
+                                }
                             }
                         }
                     }
-                }
-                drop(coord);
-                refresh_sel();
-                0
-            })).ok();
+                    drop(coord);
+                    refresh_sel();
+                    0
+                })).ok();
         }
     }
 
@@ -932,10 +967,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let result = app.run().map_err(|e| Box::new(e) as Box<dyn std::error::Error>);
 
-    // GTK cascade has already destroyed children; prevent Rust Drop from
-    // double-freeing any leftover editing entry.
+    // Unparent any leftover editing entry so it's no longer visible.
+    // Drop will safely call g_object_unref to release our ref.
     if let Some(e) = editing_entry.borrow_mut().take() {
-        std::mem::forget(e);
+        gtk_dynamic_loader::remove_from_parent(&loader, *e.as_ref());
     }
 
     result

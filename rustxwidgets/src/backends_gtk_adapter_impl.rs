@@ -111,6 +111,9 @@ mod gtk_adapter {
         pub fn set_width_chars(&self, n: i32) { self.0.set_width_chars(n); }
         pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
         pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, Error> { self.0.connect_changed(f).map_err(|e| Error::Backend(format!("{}", e))) }
+        pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {
+            self.0.connect_activate(f).map_err(|e| Error::Backend(format!("{}", e)))
+        }
         pub fn connect_button_press(&self, f: impl FnMut() + 'static) -> Result<u64, Error> { self.0.connect_button_press(f).map_err(|e| Error::Backend(format!("{}", e))) }
         pub fn add_class(&self, class_name: &str) { self.0.add_class(class_name); }
         pub fn remove_class(&self, class_name: &str) { self.0.remove_class(class_name); }
