@@ -177,7 +177,7 @@ fn draw_grid(
         let mut ext: CairoTextExtentsT = unsafe { std::mem::zeroed() };
         c!(cairo_text_extents(cr, c_lbl.as_ptr(), &mut ext as *mut _ as *mut std::ffi::c_void));
         let x = chw + c as f64 * cw + cw / 2.0 - ext.x_bearing - ext.width / 2.0;
-        let y = ch / 2.0 - ext.y_bearing - ext.height / 2.0 + ext.height;
+        let y = ch / 2.0 - ext.y_bearing - ext.height / 2.0;
         c!(cairo_move_to(cr, x, y));
         c!(cairo_show_text(cr, c_lbl.as_ptr()));
     }
@@ -189,7 +189,7 @@ fn draw_grid(
         let mut ext: CairoTextExtentsT = unsafe { std::mem::zeroed() };
         c!(cairo_text_extents(cr, c_lbl.as_ptr(), &mut ext as *mut _ as *mut std::ffi::c_void));
         let x = chw / 2.0 - ext.x_bearing - ext.width / 2.0;
-        let y = ch + r as f64 * ch + ch / 2.0 - ext.y_bearing - ext.height / 2.0 + ext.height;
+        let y = ch + r as f64 * ch + ch / 2.0 - ext.y_bearing - ext.height / 2.0;
         c!(cairo_move_to(cr, x, y));
         c!(cairo_show_text(cr, c_lbl.as_ptr()));
     }
@@ -234,10 +234,27 @@ fn draw_grid(
                 1 => cx + cw / 2.0 - ext.x_bearing - ext.width / 2.0,
                 _ => cx + cw - pad - ext.x_bearing - ext.width,
             };
-            let ty = cy + ch / 2.0 - ext.y_bearing - ext.height / 2.0 + ext.height;
+            let ty = cy + ch / 2.0 - ext.y_bearing - ext.height / 2.0;
 
             c!(cairo_save(cr));
-            c!(cairo_rectangle(cr, cx, cy, cw, ch));
+            let text_left = tx + ext.x_bearing;
+            let text_right = text_left + ext.width;
+            let cell_right = cx + cw;
+            let clip_right = if text_right > cell_right {
+                let mut cr2 = text_right;
+                for oc in (c + 1)..VISIBLE_COLS {
+                    if !t[r][oc].is_empty() {
+                        let ocx = chw + oc as f64 * cw;
+                        cr2 = cr2.min(ocx);
+                        break;
+                    }
+                    cr2 = (chw + (oc + 1) as f64 * cw).max(cr2);
+                }
+                cr2.min(total_w)
+            } else {
+                cell_right
+            };
+            c!(cairo_rectangle(cr, cx, cy, clip_right - cx, ch));
             c!(cairo_clip(cr));
             c!(cairo_move_to(cr, tx, ty));
             c!(cairo_show_text(cr, c_text.as_ptr()));
