@@ -640,7 +640,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             let cl = click_logic.clone();
             let ld = loader.clone();
-            gtk_dynamic_loader::widget_connect_signal_bool(&loader, overlay_ptr, "button-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
+            const GDK_BUTTON_PRESS_MASK: i32 = 1 << 8;
+            gtk_dynamic_loader::widget_add_events(&loader, drawing_area_ptr, GDK_BUTTON_PRESS_MASK);
+            gtk_dynamic_loader::widget_connect_signal_bool(&loader, drawing_area_ptr, "button-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
                 if let Some((x, y)) = gtk_dynamic_loader::gdk_event_get_coords(&ld, ev) {
                     if let Some(f) = cl.borrow_mut().as_mut() { f(x, y); }
                 }

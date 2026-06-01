@@ -1161,6 +1161,13 @@ pub fn widget_set_margin_top(loader: &Arc<Loader>, widget: *mut c_void, margin: 
     }
 }
 
+/// Add GTK event mask bits to a widget (GTK3).
+pub fn widget_add_events(loader: &Arc<Loader>, widget: *mut c_void, events: i32) {
+    if let Some(add_events) = loader.symbols.gtk_widget_add_events {
+        unsafe { add_events(widget, events); }
+    }
+}
+
 /// Set widget hexpand
 pub fn widget_set_hexpand(loader: &Arc<Loader>, widget: *mut c_void, expand: bool) {
     if let Some(set) = loader.symbols.gtk_widget_set_hexpand {

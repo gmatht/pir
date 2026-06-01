@@ -175,6 +175,7 @@ pub type GtkOverlaySetOverlayPassThrough = unsafe extern "C" fn(overlay: *mut c_
 pub type GtkOverlaySetChild = unsafe extern "C" fn(overlay: *mut c_void, child: *mut c_void);
 pub type GtkWidgetSetMarginStart = unsafe extern "C" fn(widget: *mut c_void, margin: i32);
 pub type GtkWidgetSetMarginTop = unsafe extern "C" fn(widget: *mut c_void, margin: i32);
+pub type GtkWidgetAddEvents = unsafe extern "C" fn(widget: *mut c_void, events: i32);
 
 // ScrolledWindow
 pub type GtkScrolledWindowNew = unsafe extern "C" fn(hadjustment: *mut c_void, vadjustment: *mut c_void) -> *mut c_void;
@@ -262,6 +263,7 @@ pub struct Symbols {
     pub gtk_overlay_set_child: Option<GtkOverlaySetChild>,
     pub gtk_widget_set_margin_start: Option<GtkWidgetSetMarginStart>,
     pub gtk_widget_set_margin_top: Option<GtkWidgetSetMarginTop>,
+    pub gtk_widget_add_events: Option<GtkWidgetAddEvents>,
     pub gtk_file_chooser_native_new: Option<GtkFileChooserNativeNew>,
     pub gtk_native_dialog_run: Option<GtkNativeDialogRun>,
     pub gtk_file_chooser_get_filename: Option<GtkFileChooserGetFilename>,
@@ -494,6 +496,7 @@ impl Symbols {
         let gtk_overlay_set_child = unsafe { sym::<GtkOverlaySetChild>(gtk, "gtk_overlay_set_child") };
         let gtk_widget_set_margin_start = unsafe { sym::<GtkWidgetSetMarginStart>(gtk, "gtk_widget_set_margin_start") };
         let gtk_widget_set_margin_top = unsafe { sym::<GtkWidgetSetMarginTop>(gtk, "gtk_widget_set_margin_top") };
+        let gtk_widget_add_events = unsafe { sym::<GtkWidgetAddEvents>(gtk, "gtk_widget_add_events") };
         let gtk_init = unsafe { sym::<GtkInit>(gtk, "gtk_init") };
         let g_signal_emit_by_name = unsafe { sym::<GSignalEmitByName>(gobject, "g_signal_emit_by_name") };
         let g_idle_add = unsafe { sym::<unsafe extern "C" fn(func: Option<unsafe extern "C" fn(*mut c_void) -> i32>, data: *mut c_void) -> u32>(glib, "g_idle_add") };
@@ -642,7 +645,7 @@ impl Symbols {
             gtk_widget_get_style_context, gtk_style_context_add_class, gtk_style_context_remove_class,
             gtk_css_provider_new, gtk_css_provider_load_from_data, gtk_style_context_add_provider,
             gtk_overlay_new, gtk_overlay_add_overlay, gtk_overlay_set_overlay_pass_through, gtk_overlay_set_child,
-            gtk_widget_set_margin_start, gtk_widget_set_margin_top,
+            gtk_widget_set_margin_start, gtk_widget_set_margin_top, gtk_widget_add_events,
             gtk_init,
             g_signal_emit_by_name,
             gtk_label_get_text,
