@@ -35,9 +35,7 @@ impl Lcg {
     }
 
     fn range_i32(&mut self, upper: i32) -> i32 {
-        if upper <= 1 {
-            return 0;
-        }
+        if upper <= 1 { return 0; }
         (self.next_u32() % (upper as u32)) as i32
     }
 }
@@ -45,24 +43,19 @@ impl Lcg {
 fn parse_config() -> Config {
     let mut cfg = Config {
         seed: 1,
-        steps: 400,
+        steps: 200_000,
         prefer_gtk3: false,
         verbose: false,
         trace: false,
     };
-
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seed" => {
-                if let Some(v) = args.next() {
-                    cfg.seed = v.parse().unwrap_or(cfg.seed);
-                }
+                if let Some(v) = args.next() { cfg.seed = v.parse().unwrap_or(cfg.seed); }
             }
             "--steps" => {
-                if let Some(v) = args.next() {
-                    cfg.steps = v.parse().unwrap_or(cfg.steps);
-                }
+                if let Some(v) = args.next() { cfg.steps = v.parse().unwrap_or(cfg.steps); }
             }
             "--prefer-gtk3" | "-3" => cfg.prefer_gtk3 = true,
             "--verbose" | "-v" => cfg.verbose = true,
@@ -70,27 +63,11 @@ fn parse_config() -> Config {
             _ => {}
         }
     }
-
     cfg
 }
 
-// This harness is intended for two modes:
-// - low step counts: reproducible smoke coverage for lifecycle operations
-// - higher step counts: crash-finding fuzzing that may still reproduce known
-//   GTK3 overlay/editor teardown bugs under investigation
-
 fn schedule_idle(loader: &Arc<gtk_dynamic_loader::Loader>, cb: impl FnMut() + 'static) {
     unsafe { gtk_dynamic_loader::idle_add_once(loader, Box::new(cb)); }
-}
-
-fn position_editor(loader: &Arc<gtk_dynamic_loader::Loader>, editor: &gtk::Entry, x: i32, y: i32, visible: bool) {
-    unsafe {
-        gtk_dynamic_loader::widget_set_margin_start(loader, *editor.as_ref(), x);
-        gtk_dynamic_loader::widget_set_margin_top(loader, *editor.as_ref(), y);
-        gtk_dynamic_loader::widget_set_halign(loader, *editor.as_ref(), 1);
-        gtk_dynamic_loader::widget_set_valign(loader, *editor.as_ref(), 1);
-        gtk_dynamic_loader::widget_set_visible(loader, *editor.as_ref(), visible);
-    }
 }
 
 fn set_widget_visible(loader: &Arc<gtk_dynamic_loader::Loader>, widget: *mut c_void, visible: bool) {
@@ -104,97 +81,112 @@ fn set_widget_expand(loader: &Arc<gtk_dynamic_loader::Loader>, widget: *mut c_vo
     }
 }
 
-fn queue_widget_draw(loader: &Arc<gtk_dynamic_loader::Loader>, widget: *mut c_void) {
-    unsafe { gtk_dynamic_loader::widget_queue_draw(loader, widget) }
-}
-
 fn remove_from_parent(loader: &Arc<gtk_dynamic_loader::Loader>, widget: *mut c_void) {
     unsafe { gtk_dynamic_loader::remove_from_parent(loader, widget) }
 }
 
-fn schedule_entry_focus(
-    loader: &Arc<gtk_dynamic_loader::Loader>,
-    entry: gtk::Entry,
-    current_focus_entry_id: &Rc<Cell<u64>>,
-    expected_entry_id: u64,
-) {
-    let loader = loader.clone();
-    let current_focus_entry_id = current_focus_entry_id.clone();
-    schedule_idle(&loader, move || {
-        if current_focus_entry_id.get() != expected_entry_id {
-            return;
-        }
-        entry.grab_focus();
-    });
-}
-
 fn schedule_formula_focus(loader: &Arc<gtk_dynamic_loader::Loader>, formula: gtk::Entry) {
     let loader = loader.clone();
-    schedule_idle(&loader, move || {
-        formula.grab_focus();
-    });
+    schedule_idle(&loader, move || { formula.grab_focus(); });
 }
 
-fn schedule_editor_remove(
-    loader: &Arc<gtk_dynamic_loader::Loader>,
-    overlay: &gtk_dynamic_loader::Overlay,
-    formula: &gtk::Entry,
-    entry: gtk::Entry,
-    use_overlay_remove: bool,
-    pending_detach: &Rc<Cell<bool>>,
-    current_focus_entry_id: &Rc<Cell<u64>>,
-    retired_entries: &Rc<RefCell<Vec<gtk::Entry>>>,
-) {
-    pending_detach.set(true);
-    current_focus_entry_id.set(0);
-    set_widget_visible(loader, *entry.as_ref(), false);
-    let loader_for_idle = loader.clone();
-    let loader_for_outer_idle = loader.clone();
-    let loader_for_remove = loader.clone();
-    let overlay = overlay.clone();
-    let formula = formula.clone();
-    let pending_detach = pending_detach.clone();
-    let retired_entries = retired_entries.clone();
-    schedule_idle(&loader_for_outer_idle, move || {
-        let overlay = overlay.clone();
-        let loader_for_remove = loader_for_remove.clone();
-        let entry = entry.clone();
-        let formula = formula.clone();
-        let pending_detach = pending_detach.clone();
-        let retired_entries = retired_entries.clone();
-        schedule_idle(&loader_for_idle, move || {
-            let keepalive_entry = entry.clone();
-            if use_overlay_remove {
-                overlay.remove(&entry);
-            } else {
-                remove_from_parent(&loader_for_remove, *entry.as_ref());
-            }
-            let loader_for_finalize = loader_for_remove.clone();
-            let pending_detach_for_finalize = pending_detach.clone();
-            let formula_for_finalize = formula.clone();
-            let retired_entries_for_finalize = retired_entries.clone();
-            schedule_idle(&loader_for_remove, move || {
-                pending_detach_for_finalize.set(false);
-                schedule_formula_focus(&loader_for_finalize, formula_for_finalize.clone());
-                retired_entries_for_finalize.borrow_mut().push(keepalive_entry.clone());
-            });
-        });
-    });
+fn widget_ptr(w: &AnyWidget) -> *mut c_void {
+    match w {
+        AnyWidget::Button(b) => *b.as_ref(),
+        AnyWidget::Label(l) => *l.as_ref(),
+        AnyWidget::Entry(e) => *e.as_ref(),
+        AnyWidget::CheckButton(c) => *c.as_ref(),
+        AnyWidget::RadioButton(r) => *r.as_ref(),
+        AnyWidget::DropDown(d) => *d.as_ref(),
+        AnyWidget::TextView(t) => *t.as_ref(),
+    }
 }
 
-fn attach_editor(
-    loader: &Arc<gtk_dynamic_loader::Loader>,
-    overlay: &gtk_dynamic_loader::Overlay,
-    editor: &gtk::Entry,
-    text: &str,
-    rng: &mut Lcg,
-) {
-    editor.set_text(text);
-    editor.set_size_request(150 + rng.range_i32(90), 28 + rng.range_i32(18));
-    position_editor(loader, editor, 12 + rng.range_i32(260), 12 + rng.range_i32(180), true);
-    overlay.add_overlay(editor);
-    overlay.set_overlay_pass_through(editor, false);
-    set_widget_visible(loader, *editor.as_ref(), true);
+enum AnyWidget {
+    Button(gtk::Button),
+    Label(gtk::Label),
+    Entry(gtk::Entry),
+    CheckButton(gtk::CheckButton),
+    RadioButton(gtk::RadioButton),
+    DropDown(gtk::DropDown),
+    TextView(gtk::TextView),
+}
+
+impl AsRef<*mut c_void> for AnyWidget {
+    fn as_ref(&self) -> &*mut c_void {
+        match self {
+            AnyWidget::Button(b) => b.as_ref(),
+            AnyWidget::Label(l) => l.as_ref(),
+            AnyWidget::Entry(e) => e.as_ref(),
+            AnyWidget::CheckButton(c) => c.as_ref(),
+            AnyWidget::RadioButton(r) => r.as_ref(),
+            AnyWidget::DropDown(d) => d.as_ref(),
+            AnyWidget::TextView(t) => t.as_ref(),
+        }
+    }
+}
+
+const KIND_NAMES: &[&str] = &["button","label","entry","chkbtn","radbtn","dropdown","textview"];
+
+fn kind_index(w: &AnyWidget) -> usize {
+    match w {
+        AnyWidget::Button(_) => 0,
+        AnyWidget::Label(_) => 1,
+        AnyWidget::Entry(_) => 2,
+        AnyWidget::CheckButton(_) => 3,
+        AnyWidget::RadioButton(_) => 4,
+        AnyWidget::DropDown(_) => 5,
+        AnyWidget::TextView(_) => 6,
+    }
+}
+
+struct WidgetPool {
+    items: Vec<(AnyWidget, bool)>, // (widget, in_overlay)
+    kind_counts: [usize; 7],
+}
+
+impl WidgetPool {
+    fn new() -> Self {
+        WidgetPool { items: Vec::new(), kind_counts: [0; 7] }
+    }
+
+    fn add(&mut self, w: AnyWidget, in_overlay: bool) {
+        let ki = kind_index(&w);
+        self.kind_counts[ki] += 1;
+        self.items.push((w, in_overlay));
+    }
+
+    fn remove_random(&mut self, rng: &mut Lcg) -> Option<(AnyWidget, bool)> {
+        if self.items.is_empty() { return None; }
+        let idx = rng.range_i32(self.items.len() as i32) as usize;
+        let (w, in_ov) = self.items.remove(idx);
+        let ki = kind_index(&w);
+        self.kind_counts[ki] = self.kind_counts[ki].saturating_sub(1);
+        Some((w, in_ov))
+    }
+
+    fn len(&self) -> usize { self.items.len() }
+
+    fn random_idx(&self, rng: &mut Lcg) -> Option<usize> {
+        if self.items.is_empty() { return None; }
+        Some(rng.range_i32(self.items.len() as i32) as usize)
+    }
+}
+
+fn mutate_widget(w: &mut AnyWidget, label: &str, rng: &mut Lcg) {
+    match w {
+        AnyWidget::Button(b) => {
+            let _ = b;
+        }
+        AnyWidget::Label(l) => { l.set_text(label); }
+        AnyWidget::Entry(e) => { e.set_text(label); }
+        AnyWidget::CheckButton(c) => { c.set_active(!c.is_active()); }
+        AnyWidget::RadioButton(r) => { r.set_active(!r.is_active()); }
+        AnyWidget::DropDown(d) => {
+            d.set_active(rng.next_u32() % 8);
+        }
+        AnyWidget::TextView(t) => { t.set_text(label); }
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -208,23 +200,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let win = app.create_window()?;
     win.set_title("GTK Lifecycle Stress");
-    win.set_default_size(720, 420);
+    win.set_default_size(960, 600);
 
-    let root = app.create_box(gtk::Orientation::Vertical, 6)?;
+    let root = app.create_box(gtk::Orientation::Vertical, 4)?;
     let status = app.create_label("starting lifecycle stress")?;
     let summary = app.create_label("")?;
     let formula = app.create_entry()?;
     formula.set_text("formula");
-    formula.set_width_chars(24);
-    root.append(&status);
-    root.append(&formula);
+    formula.set_width_chars(32);
+
+    let hbox = Rc::new(app.create_box(gtk::Orientation::Horizontal, 4)?);
+    let grid = Rc::new(app.create_grid()?);
 
     let drawing = gtk_dynamic_loader::DrawingArea::new(loader.clone())?;
     let drawing_ptr = *drawing.as_ref();
-    drawing.set_size_request(640, 260);
+    drawing.set_size_request(640, 200);
     if loader.symbols.gtk_container_add.is_none() {
         drawing.set_content_width(640);
-        drawing.set_content_height(260);
+        drawing.set_content_height(200);
     }
 
     let overlay = gtk_dynamic_loader::Overlay::new(loader.clone())?;
@@ -233,177 +226,189 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scrolled = gtk_dynamic_loader::ScrolledWindow::new(loader.clone())?;
     scrolled.set_policy(0, 0);
     scrolled.set_child(&overlay);
-    set_widget_expand(&loader, *scrolled.as_ref(), true, true);
+
+    root.append(&status);
+    root.append(&formula);
+    root.append(&*hbox);
+    root.append(&*grid);
     root.append(&scrolled);
     root.append(&summary);
     win.set_child(&root);
     win.present();
 
     let rng = Rc::new(RefCell::new(Lcg::new(cfg.seed)));
-    let editor = Rc::new(RefCell::new(None::<gtk::Entry>));
     let step = Rc::new(Cell::new(0usize));
-    let counts = Rc::new(RefCell::new([0usize; 8]));
-    let active_entry_id = Rc::new(Cell::new(0u64));
-    let current_focus_entry_id = Rc::new(Cell::new(0u64));
-    let pending_detach = Rc::new(Cell::new(false));
-    let retired_entries = Rc::new(RefCell::new(Vec::<gtk::Entry>::new()));
+    let counts = Rc::new(RefCell::new([0usize; 9]));
+    let pool = Rc::new(RefCell::new(WidgetPool::new()));
+    let retired: Rc<RefCell<Vec<AnyWidget>>> = Rc::new(RefCell::new(Vec::new()));
+    let pulse_count = Rc::new(Cell::new(0u32));
 
     let runner: Rc<RefCell<Option<Box<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
     let runner_for_init = runner.clone();
     let loader_for_run = loader.clone();
     let overlay_for_run = overlay.clone();
-    let status_for_run = status.clone();
-    let summary_for_run = summary.clone();
+    let hbox_for_run = hbox.clone();
+    let grid_for_run = grid.clone();
+    let _status_for_run = status;
+    let _summary_for_run = summary;
     let formula_for_run = formula.clone();
     let rng_for_run = rng.clone();
-    let editor_for_run = editor.clone();
-    let active_entry_id_for_run = active_entry_id.clone();
-    let current_focus_entry_id_for_run = current_focus_entry_id.clone();
-    let pending_detach_for_run = pending_detach.clone();
-    let retired_entries_for_run = retired_entries.clone();
+    let pool_for_run = pool.clone();
+    let retired_for_run = retired.clone();
+    let pulse_count_for_run = pulse_count.clone();
     let step_for_run = step.clone();
     let counts_for_run = counts.clone();
+    let win_ptr = *win.as_ref();
 
     *runner.borrow_mut() = Some(Box::new(move || {
         let current = step_for_run.get();
         if current >= cfg.steps {
             let counts = counts_for_run.borrow();
-            let editor_alive = editor_for_run.borrow().is_some();
+            let p = pool_for_run.borrow();
             println!(
-                "completed seed={} steps={} editor_alive={} spawn={} mutate={} hide={} show={} remove={} redraw={} labels={} focus={}",
-                cfg.seed,
-                cfg.steps,
-                editor_alive,
-                counts[0],
-                counts[1],
-                counts[2],
-                counts[3],
-                counts[4],
-                counts[5],
-                counts[6],
-                counts[7],
+                "completed seed={} steps={} live_widgets={}",
+                cfg.seed, cfg.steps, p.len(),
             );
+            print!("  ops:");
+            for (i, name) in ["add","remove","mutate","visible","expand","focus","resize_win","pulse","resize_wid"].iter().enumerate() {
+                print!(" {}={}", name, counts[i]);
+            }
+            println!();
+            print!("  live:");
+            for (i, name) in KIND_NAMES.iter().enumerate() {
+                print!(" {}={}", name, p.kind_counts[i]);
+            }
+            println!();
             let _ = gtk::quit_main_loop();
             return;
         }
 
-        let op = {
-            let mut rng = rng_for_run.borrow_mut();
-            Op::from_index(rng.next_u32())
+        let mut rng = rng_for_run.borrow_mut();
+        let raw_op = Op::from_index(rng.next_u32());
+        let op = if raw_op == Op::RemoveWidget && rng.next_u32() % 100 < 60 {
+            Op::AddWidget
+        } else {
+            raw_op
         };
+
         step_for_run.set(current + 1);
         counts_for_run.borrow_mut()[op as usize] += 1;
 
         match op {
-            Op::SpawnEditor => {
-                if editor_for_run.borrow().is_none() && !pending_detach_for_run.get() {
-                    if let Ok(entry) = gtk::create_entry() {
-                        let entry_id = active_entry_id_for_run.get() + 1;
-                        active_entry_id_for_run.set(entry_id);
-                        let trace = cfg.trace;
-                        let _ = entry.connect_focus_in_event(move |_| {
-                            if trace {
-                                eprintln!("trace entry#{entry_id} focus-in");
-                            }
-                            0
-                        });
-                        let trace = cfg.trace;
-                        let _ = entry.connect_focus_out_event(move |_| {
-                            if trace {
-                                eprintln!("trace entry#{entry_id} focus-out");
-                            }
-                            0
-                        });
-                        let _ = entry.connect_activate(|_| {});
-                        let text = format!("seed:{} step:{}", cfg.seed, current);
-                        let mut rng = rng_for_run.borrow_mut();
-                        attach_editor(&loader_for_run, &overlay_for_run, &entry, &text, &mut rng);
-                        current_focus_entry_id_for_run.set(entry_id);
-                        let should_focus = rng.next_bool();
-                        if cfg.trace {
-                            eprintln!("trace entry#{entry_id} spawned should_focus={should_focus}");
-                        }
-                        if should_focus {
-                            schedule_entry_focus(
-                                &loader_for_run,
-                                entry.clone(),
-                                &current_focus_entry_id_for_run,
-                                entry_id,
-                            );
-                        }
-                        *editor_for_run.borrow_mut() = Some(entry);
+            Op::AddWidget => {
+                let kind = rng.next_u32() % 7;
+                let label_str = format!("{}{}", KIND_NAMES[kind as usize], current);
+
+                let w = match kind {
+                    0 => gtk::create_button(&label_str).ok().map(AnyWidget::Button),
+                    1 => gtk::create_label(&label_str).ok().map(AnyWidget::Label),
+                    2 => {
+                        gtk::create_entry().ok().map(|e| {
+                            e.set_text(&label_str);
+                            AnyWidget::Entry(e)
+                        })
                     }
-                }
-            }
-            Op::MutateEditor => {
-                if let Some(entry) = editor_for_run.borrow().as_ref() {
-                    let mut rng = rng_for_run.borrow_mut();
-                    let text = format!("mut:{}:{}", current, rng.next_u32() % 1000);
-                    entry.set_text(&text);
-                    entry.set_size_request(150 + rng.range_i32(70), 28 + rng.range_i32(18));
-                    position_editor(&loader_for_run, entry, 8 + rng.range_i32(280), 8 + rng.range_i32(190), true);
-                }
-            }
-            Op::HideEditor => {
-                if let Some(entry) = editor_for_run.borrow().as_ref() {
-                    set_widget_visible(&loader_for_run, *entry.as_ref(), false);
-                }
-            }
-            Op::ShowEditor => {
-                if let Some(entry) = editor_for_run.borrow().as_ref() {
-                    set_widget_visible(&loader_for_run, *entry.as_ref(), true);
-                }
-            }
-            Op::RemoveEditor => {
-                if let Some(entry) = editor_for_run.borrow_mut().take() {
-                    let use_overlay_remove = rng_for_run.borrow_mut().next_bool();
-                    if cfg.trace {
-                        let entry_id = active_entry_id_for_run.get();
-                        eprintln!("trace entry#{entry_id} remove use_overlay_remove={use_overlay_remove}");
+                    3 => gtk::create_checkbutton(&label_str).ok().map(AnyWidget::CheckButton),
+                    4 => gtk::create_radiobutton(None, &label_str).ok().map(AnyWidget::RadioButton),
+                    5 => {
+                        let items: Vec<&str> = vec!["a","b","c","d","e"];
+                        gtk::create_dropdown(&items).ok().map(|dd| {
+                            dd.set_active(rng.range_i32(5).max(0) as u32);
+                            AnyWidget::DropDown(dd)
+                        })
                     }
-                    schedule_editor_remove(
-                        &loader_for_run,
-                        &overlay_for_run,
-                        &formula_for_run,
-                        entry,
-                        use_overlay_remove,
-                        &pending_detach_for_run,
-                        &current_focus_entry_id_for_run,
-                        &retired_entries_for_run,
-                    );
+                    _ => gtk::create_textview().ok().map(|tv| {
+                        tv.set_text(&label_str);
+                        AnyWidget::TextView(tv)
+                    }),
+                };
+
+                if let Some(w) = w {
+                    let ptr = widget_ptr(&w);
+                    hbox_for_run.append(&w);
+                    set_widget_visible(&loader_for_run, ptr, true);
+                    pool_for_run.borrow_mut().add(w, false);
                 }
             }
-            Op::QueueRedraw => {
-                queue_widget_draw(&loader_for_run, drawing_ptr);
-                set_widget_visible(&loader_for_run, drawing_ptr, rng_for_run.borrow_mut().next_bool());
-                set_widget_visible(&loader_for_run, drawing_ptr, true);
+            Op::RemoveWidget => {
+                if let Some((w, _)) = pool_for_run.borrow_mut().remove_random(&mut rng) {
+                    let ptr = widget_ptr(&w);
+                    set_widget_visible(&loader_for_run, ptr, false);
+                    retired_for_run.borrow_mut().push(w);
+                }
             }
-            Op::MutateLabels => {
-                let next = rng_for_run.borrow_mut().next_u32() % 10_000;
-                status_for_run.set_text(&format!("op={} step={}", op.as_str(), current));
-                summary_for_run.set_text(&format!("seed={} next={}", cfg.seed, next));
-                formula_for_run.set_text(&format!("={}+{}", current, next));
+            Op::MutateWidget => {
+                let mut p = pool_for_run.borrow_mut();
+                if let Some(idx) = p.random_idx(&mut rng) {
+                    let label = format!("mut:{}:{}", current, rng.next_u32() % 1000);
+                    mutate_widget(&mut p.items[idx].0, &label, &mut rng);
+                }
+            }
+            Op::ToggleVisible => {
+                let p = pool_for_run.borrow();
+                if let Some(idx) = p.random_idx(&mut rng) {
+                    let ptr = widget_ptr(&p.items[idx].0);
+                    drop(p);
+                    set_widget_visible(&loader_for_run, ptr, rng.next_bool());
+                }
+            }
+            Op::ToggleExpand => {
+                set_widget_expand(&loader_for_run, drawing_ptr, rng.next_bool(), rng.next_bool());
             }
             Op::FocusShuffle => {
-                if let Some(entry) = editor_for_run.borrow().as_ref() {
-                    if rng_for_run.borrow_mut().next_bool() {
-                        schedule_entry_focus(
-                            &loader_for_run,
-                            entry.clone(),
-                            &current_focus_entry_id_for_run,
-                            current_focus_entry_id_for_run.get(),
-                        );
-                    } else {
-                        schedule_formula_focus(&loader_for_run, formula_for_run.clone());
-                    }
-                } else {
+                if rng.next_bool() {
                     schedule_formula_focus(&loader_for_run, formula_for_run.clone());
+                } else {
+                    let p = pool_for_run.borrow();
+                    if let Some(idx) = p.random_idx(&mut rng) {
+                        if let AnyWidget::Entry(e) = &p.items[idx].0 {
+                            let e = e.clone();
+                            drop(p);
+                            let f = formula_for_run.clone();
+                            let loader = loader_for_run.clone();
+                            schedule_idle(&loader, move || {
+                                e.grab_focus();
+                                let _ = &f;
+                            });
+                        }
+                    }
+                }
+            }
+            Op::ResizeWindow => {
+                let w = 400 + rng.range_i32(600);
+                let h = 200 + rng.range_i32(400);
+                if let Some(set_size) = loader_for_run.symbols.gtk_window_set_default_size {
+                    unsafe { set_size(win_ptr, w, h); }
+                }
+            }
+            Op::PulseChild => {
+                if pulse_count_for_run.get() < 1000 {
+                    if let Ok(label) = gtk::create_label("pulse") {
+                        let ptr = *label.as_ref();
+                        hbox_for_run.append(&label);
+                        set_widget_visible(&loader_for_run, ptr, true);
+                        pool_for_run.borrow_mut().add(AnyWidget::Label(label), false);
+                        pulse_count_for_run.set(pulse_count_for_run.get() + 1);
+                    }
+                }
+            }
+            Op::ResizeWidget => {
+                let p = pool_for_run.borrow();
+                if let Some(idx) = p.random_idx(&mut rng) {
+                    let ptr = widget_ptr(&p.items[idx].0);
+                    let w = 50 + rng.range_i32(200);
+                    let h = 20 + rng.range_i32(100);
+                    drop(p);
+                    unsafe { gtk_dynamic_loader::widget_set_size_request(&loader_for_run, ptr, w, h); }
                 }
             }
         }
 
         if cfg.verbose {
-            println!("step={} op={}", current, op.as_str());
+            if current % 1000 == 0 {
+                let p = pool_for_run.borrow();
+                println!("step={} live={}", current, p.len());
+            }
         }
 
         let runner_for_next = runner_for_init.clone();
@@ -422,5 +427,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    app.run().map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    let _ = app.run();
+    Ok(())
 }

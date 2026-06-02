@@ -16,6 +16,24 @@ pub extern "C" fn gtk_compat_trampoline_2(_instance: *mut c_void, user_data: *mu
     }
 }
 
+// trampoline for GTK4 EventControllerFocus enter/leave — calls FnMut(*mut c_void)->i32 with null
+#[no_mangle]
+pub extern "C" fn gtk_compat_trampoline_focus(_instance: *mut c_void, user_data: *mut c_void) -> i32 {
+    unsafe {
+        if user_data.is_null() { return 0; }
+        let inner_ptr = user_data as *mut Box<dyn FnMut(*mut c_void) -> i32>;
+        if inner_ptr.is_null() { return 0; }
+        let closure_ref: &mut dyn FnMut(*mut c_void) -> i32 = &mut **inner_ptr;
+        closure_ref(std::ptr::null_mut())
+    }
+}
+
+pub unsafe extern "C" fn gtk_compat_destroy_notify_focus(_data: *mut c_void, _closure: *mut c_void) {
+    if !_data.is_null() {
+        drop(Box::from_raw(_data as *mut Box<dyn FnMut(*mut c_void) -> i32>));
+    }
+}
+
 // trampoline for signals with (instance, param, user_data)
 #[no_mangle]
 pub extern "C" fn gtk_compat_trampoline_3(_instance: *mut c_void, _param: *mut c_void, user_data: *mut c_void) {

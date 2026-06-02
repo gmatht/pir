@@ -88,6 +88,7 @@ pub type GtkStyleContextAddProviderForDisplay = unsafe extern "C" fn(display: *m
 pub type GtkStyleContextAddProviderForScreen = unsafe extern "C" fn(screen: *mut c_void, provider: *mut c_void, priority: u32);
 pub type GtkLabelSetXalign = unsafe extern "C" fn(label: *mut c_void, xalign: f32);
 pub type GtkEventControllerKeyNew = unsafe extern "C" fn() -> *mut c_void;
+pub type GtkEventControllerFocusNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkWidgetAddController = unsafe extern "C" fn(widget: *mut c_void, controller: *mut c_void);
 pub type GtkScrolledWindowGetVadjustment = unsafe extern "C" fn(sw: *mut c_void) -> *mut c_void;
 pub type GtkScrolledWindowGetHadjustment = unsafe extern "C" fn(sw: *mut c_void) -> *mut c_void;
@@ -320,6 +321,7 @@ pub struct Symbols {
     pub gtk_widget_queue_draw: Option<unsafe extern "C" fn(widget: *mut c_void)>,
     pub gtk_label_set_xalign: Option<GtkLabelSetXalign>,
     pub gtk_event_controller_key_new: Option<GtkEventControllerKeyNew>,
+    pub gtk_event_controller_focus_new: Option<GtkEventControllerFocusNew>,
     pub gtk_widget_add_controller: Option<GtkWidgetAddController>,
     pub gtk_widget_set_can_target: Option<GtkWidgetSetCanTarget>,
     pub gtk_widget_set_halign: Option<GtkWidgetSetHalign>,
@@ -532,6 +534,7 @@ impl Symbols {
         let gtk_widget_queue_draw = unsafe { sym::<unsafe extern "C" fn(*mut c_void)>(gtk, "gtk_widget_queue_draw") };
         let gtk_label_set_xalign = unsafe { sym::<GtkLabelSetXalign>(gtk, "gtk_label_set_xalign") };
         let gtk_event_controller_key_new = unsafe { sym::<GtkEventControllerKeyNew>(gtk, "gtk_event_controller_key_new") };
+        let gtk_event_controller_focus_new = unsafe { sym::<GtkEventControllerFocusNew>(gtk, "gtk_event_controller_focus_new") };
         let gtk_widget_add_controller = unsafe { sym::<GtkWidgetAddController>(gtk, "gtk_widget_add_controller") };
         let gtk_widget_set_can_target = unsafe { sym::<GtkWidgetSetCanTarget>(gtk, "gtk_widget_set_can_target") };
         let gtk_widget_set_halign = unsafe { sym::<GtkWidgetSetHalign>(gtk, "gtk_widget_set_halign") };
@@ -664,6 +667,7 @@ impl Symbols {
             g_menu_new, g_menu_append, g_application_set_app_menu, g_application_set_menubar, g_menu_append_submenu, gtk_popover_menu_bar_new_from_model, gtk_menu_bar_new, gtk_menu_new, gtk_menu_item_new_with_label, gtk_menu_shell_append, gtk_menu_item_set_submenu, gtk_window_set_application, gtk_widget_insert_action_group, gtk_actionable_set_detailed_action_name, g_menu_model_get_n_items, g_menu_model_get_item_attribute_value, g_menu_model_get_item_link, g_variant_get_string, g_variant_unref,
             gtk_label_set_xalign,
             gtk_event_controller_key_new,
+            gtk_event_controller_focus_new,
             gtk_widget_add_controller,
             gtk_widget_set_can_target,
             gtk_widget_set_halign,

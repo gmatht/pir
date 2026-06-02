@@ -1214,6 +1214,30 @@ impl Entry {
 
     pub fn connect_focus_in_event<F: FnMut(*mut c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
         guard_widget_or!(self, "Entry", "connect_focus_in_event", Err(Error::Other("entry dropped".into())));
+        if self.loader.version() == crate::loader::Version::Gtk4 {
+            if let (Some(new_ctrl), Some(add_ctrl), Some(connect)) = (
+                self.loader.symbols.gtk_event_controller_focus_new,
+                self.loader.symbols.gtk_widget_add_controller,
+                self.loader.symbols.g_signal_connect_data,
+            ) {
+                let cb: Box<dyn FnMut(*mut c_void) -> i32> = Box::new(f);
+                let cb_ptr = Box::into_raw(Box::new(cb));
+                let signal = CString::new("enter").unwrap();
+                unsafe {
+                    let ctrl = new_ctrl();
+                    connect(
+                        ctrl,
+                        signal.as_ptr(),
+                        crate::signals::gtk_compat_trampoline_focus as *const () as *mut c_void,
+                        cb_ptr as *mut c_void,
+                        Some(crate::signals::gtk_compat_destroy_notify_focus as unsafe extern "C" fn(*mut c_void, *mut c_void)),
+                        0,
+                    );
+                    add_ctrl(self.inner, ctrl);
+                }
+                return Ok(0);
+            }
+        }
         let cb: Box<dyn FnMut(*mut c_void) -> i32> = Box::new(f);
         let res = unsafe { crate::signals::connect_signal_bool(&self.loader.symbols, self.inner, "focus-in-event", cb) };
         match res { Ok(id) => Ok(id), Err(e) => Err(Error::Other(e)) }
@@ -1221,6 +1245,30 @@ impl Entry {
 
     pub fn connect_focus_out_event<F: FnMut(*mut c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
         guard_widget_or!(self, "Entry", "connect_focus_out_event", Err(Error::Other("entry dropped".into())));
+        if self.loader.version() == crate::loader::Version::Gtk4 {
+            if let (Some(new_ctrl), Some(add_ctrl), Some(connect)) = (
+                self.loader.symbols.gtk_event_controller_focus_new,
+                self.loader.symbols.gtk_widget_add_controller,
+                self.loader.symbols.g_signal_connect_data,
+            ) {
+                let cb: Box<dyn FnMut(*mut c_void) -> i32> = Box::new(f);
+                let cb_ptr = Box::into_raw(Box::new(cb));
+                let signal = CString::new("leave").unwrap();
+                unsafe {
+                    let ctrl = new_ctrl();
+                    connect(
+                        ctrl,
+                        signal.as_ptr(),
+                        crate::signals::gtk_compat_trampoline_focus as *const () as *mut c_void,
+                        cb_ptr as *mut c_void,
+                        Some(crate::signals::gtk_compat_destroy_notify_focus as unsafe extern "C" fn(*mut c_void, *mut c_void)),
+                        0,
+                    );
+                    add_ctrl(self.inner, ctrl);
+                }
+                return Ok(0);
+            }
+        }
         let cb: Box<dyn FnMut(*mut c_void) -> i32> = Box::new(f);
         let res = unsafe { crate::signals::connect_signal_bool(&self.loader.symbols, self.inner, "focus-out-event", cb) };
         match res { Ok(id) => Ok(id), Err(e) => Err(Error::Other(e)) }
@@ -2280,12 +2328,18 @@ impl Clone for TextView {
 
 /// Take ownership of a newly-created GtkWidget.
 /// GTK3: widgets start with a floating reference; sink it so we own ref count 1.
-/// GTK4: `ref_sink` on a non-floating ref increments count (minor leak tolerated).
-pub unsafe fn take_ownership(symbols: &crate::symbols::Symbols, _version: &crate::loader::Version, inner: *mut c_void) {
+/// GTK4: constructors return a normal ref — `g_object_ref_sink` would add
+/// an extra ref that nothing balances, causing a leak.  Skip it for GTK4.
+pub unsafe fn take_ownership(symbols: &crate::symbols::Symbols, version: &crate::loader::Version, inner: *mut c_void) {
     if inner.is_null() { return; }
-    if let Some(ref_sink) = symbols.g_object_ref_sink {
-        ref_sink(inner);
-    } else if let Some(gref) = symbols.g_object_ref {
-        gref(inner);
+    if *version == crate::loader::Version::Gtk3 {
+        if let Some(ref_sink) = symbols.g_object_ref_sink {
+            ref_sink(inner);
+        } else if let Some(gref) = symbols.g_object_ref {
+            gref(inner);
+        }
     }
+    // GTK4: the constructor gave us a normal ref (refcount 1).
+    // The container adds its own ref.  Our Drop balances the constructor's ref.
+    // Nothing extra needed here.
 }
