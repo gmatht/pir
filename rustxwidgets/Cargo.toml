@@ -7,6 +7,7 @@ edition = "2021"
 once_cell = "1.19"
 thiserror = "1.0"
 libloading = "0.8"
+rustyline = { version = "14", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk_dynamic_loader = { path = "../gtk_dynamic_loader" }
@@ -15,5 +16,34 @@ gtk_dynamic_loader = { path = "../gtk_dynamic_loader" }
 native-windows-gui = { version = "1.0", features = ["flexbox", "menu"] }
 winapi = { version = "0.3", features = ["winuser"] }
 
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.21", default-features = false, features = ["invocation"] }
+ndk = "0.9"
+ndk-context = "0.1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+  "console",
+  "Document", "Element", "HtmlElement", "Node", "EventTarget",
+  "HtmlButtonElement", "HtmlInputElement", "HtmlSelectElement",
+  "HtmlTextAreaElement", "HtmlCanvasElement", "HtmlDialogElement",
+  "HtmlDivElement", "HtmlSpanElement", "HtmlUListElement",   "HtmlLiElement",
+  "HtmlOptionElement", "HtmlFormElement",   "HtmlHeadingElement", "HtmlBrElement",
+  "MouseEvent", "KeyboardEvent", "Event", "FocusEvent",
+  "CanvasRenderingContext2d", "CssStyleDeclaration", "DomTokenList",
+  "HtmlCollection", "Window",
+  "Text",
+] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pancurses = { version = "0.17", optional = true }
+
 [features]
 default = []
+pancurses = ["dep:pancurses"]
+zork = ["dep:rustyline"]
+
+[dev-dependencies]
+proptest = "1.6"

@@ -154,6 +154,7 @@ pub type GtkEditableSetText = unsafe extern "C" fn(editable: *mut c_void, text: 
 
 // GtkWidget parent handling
 pub type GtkWidgetUnparent = unsafe extern "C" fn(widget: *mut c_void);
+pub type GtkWidgetGetParent = unsafe extern "C" fn(widget: *mut c_void) -> *mut c_void;
 
 // GtkWindow default size
 pub type GtkWindowSetDefaultSize = unsafe extern "C" fn(window: *mut c_void, width: i32, height: i32);
@@ -394,6 +395,7 @@ pub struct Symbols {
 
     // GtkWidget parent handling
     pub gtk_widget_unparent: Option<GtkWidgetUnparent>,
+    pub gtk_widget_get_parent: Option<GtkWidgetGetParent>,
 
     // GtkWindow default size
     pub gtk_window_set_default_size: Option<GtkWindowSetDefaultSize>,
@@ -629,6 +631,7 @@ impl Symbols {
 
         // GtkWidget parent handling
         let gtk_widget_unparent = unsafe { sym::<GtkWidgetUnparent>(gtk, "gtk_widget_unparent") };
+        let gtk_widget_get_parent = unsafe { sym::<GtkWidgetGetParent>(gtk, "gtk_widget_get_parent") };
 
         // GtkWindow default size
         let gtk_window_set_default_size = unsafe { sym::<GtkWindowSetDefaultSize>(gtk, "gtk_window_set_default_size") };
@@ -683,7 +686,7 @@ impl Symbols {
             gtk_widget_set_hexpand, gtk_widget_set_vexpand,
             gtk_widget_get_hexpand, gtk_widget_get_vexpand,
             gtk_editable_get_text, gtk_editable_set_text,
-            gtk_widget_unparent,
+            gtk_widget_unparent, gtk_widget_get_parent,
             gtk_window_set_default_size,
             gtk_drawing_area_set_draw_func, gtk_drawing_area_set_content_width, gtk_drawing_area_set_content_height,
             cairo_text_extents, cairo_save, cairo_restore, cairo_clip, cairo_line_to, cairo_paint,

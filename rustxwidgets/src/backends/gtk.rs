@@ -6,6 +6,7 @@ mod gtk_backend {
     use gtk_dynamic_loader::Loader;
 
     static LOADER: OnceCell<Arc<Loader>> = OnceCell::new();
+    static MAIN_LOOP: OnceCell<usize> = OnceCell::new();
 
     pub struct GtkApp {
         loader: Arc<Loader>,
@@ -33,6 +34,7 @@ mod gtk_backend {
             let loop_run = symbols.g_main_loop_run.ok_or("missing g_main_loop_run")?;
             unsafe {
                 let loop_ptr = loop_new(std::ptr::null_mut(), 0);
+                let _ = MAIN_LOOP.set(loop_ptr as usize);
                 loop_run(loop_ptr);
             }
             Ok(())
@@ -87,7 +89,9 @@ mod gtk_backend {
         gtk_dynamic_loader::SimpleAction::new(loader.clone(), name)
     }
 
-    pub fn create_menubar(model: &gtk_dynamic_loader::Menu, action_group: *mut std::os::raw::c_void) -> Result<gtk_dynamic_loader::MenuBar, gtk_dynamic_loader::Error> {
+    /// # Safety
+    /// `action_group` must be a valid GActionGroup pointer or null.
+    pub unsafe fn create_menubar(model: &gtk_dynamic_loader::Menu, action_group: *mut std::os::raw::c_void) -> Result<gtk_dynamic_loader::MenuBar, gtk_dynamic_loader::Error> {
         let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
         gtk_dynamic_loader::MenuBar::new(loader.clone(), model, action_group)
     }
@@ -121,6 +125,16 @@ mod gtk_backend {
     pub fn loader() -> Option<Arc<Loader>> {
         LOADER.get().cloned()
     }
+
+    pub fn quit_main_loop() -> Result<(), gtk_dynamic_loader::Error> {
+        let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
+        let loop_ptr = MAIN_LOOP.get().copied().ok_or(gtk_dynamic_loader::Error::Other("main loop not running".into()))?;
+        let loop_quit = loader.symbols.g_main_loop_quit.ok_or(gtk_dynamic_loader::Error::MissingSymbol("g_main_loop_quit".into()))?;
+        unsafe {
+            loop_quit(loop_ptr as *mut std::ffi::c_void);
+        }
+        Ok(())
+    }
 }
 
-pub use gtk_backend::{init, create_window, create_button, create_label, create_box, create_grid, create_entry, create_menu, create_simple_action, create_menubar, create_dialog, create_dropdown, create_checkbutton, create_radiobutton, create_textview, loader};
+pub use gtk_backend::{init, create_window, create_button, create_label, create_box, create_grid, create_entry, create_menu, create_simple_action, create_menubar, create_dialog, create_dropdown, create_checkbutton, create_radiobutton, create_textview, loader, quit_main_loop};

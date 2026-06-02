@@ -9,12 +9,32 @@ pub trait BackendApp {
     fn run(self: Box<Self>) -> Result<(), BackendError>;
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
 pub mod gtk;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
 pub use self::gtk::init;
 
-#[cfg(windows)]
+#[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
 pub mod nwg;
-#[cfg(windows)]
+#[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
 pub use self::nwg::init;
+
+#[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+pub mod wasm;
+#[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+pub use self::wasm::init;
+
+#[cfg(all(target_os = "android", not(feature = "zork")))]
+pub mod android;
+#[cfg(all(target_os = "android", not(feature = "zork")))]
+pub use self::android::init_backend as init;
+
+#[cfg(feature = "pancurses")]
+pub mod pancurses;
+#[cfg(feature = "pancurses")]
+pub use self::pancurses::init;
+
+#[cfg(feature = "zork")]
+pub mod zork;
+#[cfg(feature = "zork")]
+pub use self::zork::init;

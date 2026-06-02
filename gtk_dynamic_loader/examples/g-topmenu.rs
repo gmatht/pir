@@ -80,10 +80,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Insert the application's action group so menu items can resolve "app.*" actions
-    win.insert_action_group("app", app.as_ptr());
+    unsafe { win.insert_action_group("app", app.as_ptr()); }
 
-    // Create MenuBar widget from the model (pass GApplication as action group for GTK3)
-    let menubar = MenuBar::new(loader.clone(), &menubar_model, app.as_ptr())?;
+    let menubar = unsafe { MenuBar::new(loader.clone(), &menubar_model, app.as_ptr())? };
 
     // Pack menubar + status label in a vertical box
     let vbox = BoxWidget::new(loader.clone(), Orientation::Vertical, 0)?;

@@ -23,7 +23,7 @@ fn update_overflow(grid: &Vec<Vec<Entry>>, loader: &std::sync::Arc<crate::Loader
             let widget_ptr = *row[i].as_ref();
             let w = if let Some(&v) = measure_cache.get(&(widget_ptr as usize, s.clone())) { v }
                     else {
-                        let m = measure_text_px(loader, Some(widget_ptr), &s);
+                        let m = unsafe { measure_text_px(loader, Some(widget_ptr), &s) };
                         measure_cache.insert((widget_ptr as usize, s.clone()), m);
                         m
                     };
@@ -52,7 +52,7 @@ fn update_overflow(grid: &Vec<Vec<Entry>>, loader: &std::sync::Arc<crate::Loader
                 if let Some(&cached_full) = measure_cache.get(&full_key) {
                     if cached_full <= per_cell_px { orig[t] = remaining.clone(); remaining.clear(); continue; }
                 } else {
-                    let measured_full = measure_text_px(loader, Some(widget_ptr_t), &remaining);
+                    let measured_full = unsafe { measure_text_px(loader, Some(widget_ptr_t), &remaining) };
                     measure_cache.insert(full_key.clone(), measured_full);
                     if measured_full <= per_cell_px { orig[t] = remaining.clone(); remaining.clear(); continue; }
                 }
@@ -66,7 +66,7 @@ fn update_overflow(grid: &Vec<Vec<Entry>>, loader: &std::sync::Arc<crate::Loader
                     let prefix: String = chars.iter().take(mid).collect();
                     let key = (widget_ptr_t as usize, prefix.clone());
                     let measured = if let Some(&cached) = measure_cache.get(&key) { cached }
-                                   else { let m = measure_text_px(loader, Some(widget_ptr_t), &prefix); measure_cache.insert(key.clone(), m); m };
+                                   else { let m = unsafe { measure_text_px(loader, Some(widget_ptr_t), &prefix) }; measure_cache.insert(key.clone(), m); m };
                     if measured <= per_cell_px { low = mid; } else { if mid == 0 { break; } high = mid - 1; }
                 }
                 let max_chars = if low == 0 { 1 } else { low };

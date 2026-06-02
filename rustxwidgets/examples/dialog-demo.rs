@@ -7,8 +7,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     dialog.set_title("Widget Test Dialog");
     dialog.set_default_size(450, 500);
 
-    let vbox = rustxwidgets::backends_gtk_adapter::create_box(
-        rustxwidgets::backends_gtk_adapter::Orientation::Vertical, 6,
+    let vbox = app.create_box(
+        rustxwidgets::prelude::Orientation::Vertical, 1,
     )?;
 
     // --- DropDown ---

@@ -3,6 +3,11 @@ resolver = "2"
 members = [
     "gtk_dynamic_loader",
     "rustxwidgets",
+    "examples/android",
+]
+default-members = [
+    "gtk_dynamic_loader",
+    "rustxwidgets",
 ]
 
 [profile.release]

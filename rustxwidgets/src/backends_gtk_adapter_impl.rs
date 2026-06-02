@@ -28,7 +28,9 @@ mod gtk_adapter {
             self.0.present();
         }
 
-        pub fn insert_action_group(&self, name: &str, group_ptr: *mut std::os::raw::c_void) {
+        /// # Safety
+        /// `group_ptr` must be a valid GActionGroup pointer or null.
+        pub unsafe fn insert_action_group(&self, name: &str, group_ptr: *mut std::os::raw::c_void) {
             self.0.insert_action_group(name, group_ptr);
         }
 
@@ -189,7 +191,9 @@ mod gtk_adapter {
     impl Widget for MenuBar { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
     impl AsRef<*mut c_void> for MenuBar { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
 
-    pub fn create_menubar(model: &Menu, action_group: *mut std::os::raw::c_void) -> Result<MenuBar, Error> {
+    /// # Safety
+    /// `action_group` must be a valid GActionGroup pointer or null.
+    pub unsafe fn create_menubar(model: &Menu, action_group: *mut std::os::raw::c_void) -> Result<MenuBar, Error> {
         let b = crate::backends::gtk::create_menubar(&model.0, action_group).map_err(|e| Error::Backend(format!("{}", e)))?;
         Ok(MenuBar(b))
     }
@@ -312,6 +316,10 @@ mod gtk_adapter {
     pub fn create_textview() -> Result<TextView, Error> {
         let t = crate::backends::gtk::create_textview().map_err(|e| Error::Backend(format!("{}", e)))?;
         Ok(TextView(t))
+    }
+
+    pub fn quit_main_loop() -> Result<(), Error> {
+        crate::backends::gtk::quit_main_loop().map_err(|e| Error::Backend(format!("{}", e)))
     }
 
 }
