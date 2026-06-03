@@ -81,10 +81,6 @@ fn set_widget_expand(loader: &Arc<gtk_dynamic_loader::Loader>, widget: *mut c_vo
     }
 }
 
-fn remove_from_parent(loader: &Arc<gtk_dynamic_loader::Loader>, widget: *mut c_void) {
-    unsafe { gtk_dynamic_loader::remove_from_parent(loader, widget) }
-}
-
 fn schedule_formula_focus(loader: &Arc<gtk_dynamic_loader::Loader>, formula: gtk::Entry) {
     let loader = loader.clone();
     schedule_idle(&loader, move || { formula.grab_focus(); });
@@ -165,6 +161,14 @@ impl WidgetPool {
         Some((w, in_ov))
     }
 
+    fn remove_first(&mut self) -> Option<(AnyWidget, bool)> {
+        if self.items.is_empty() { return None; }
+        let (w, in_ov) = self.items.remove(0);
+        let ki = kind_index(&w);
+        self.kind_counts[ki] = self.kind_counts[ki].saturating_sub(1);
+        Some((w, in_ov))
+    }
+
     fn len(&self) -> usize { self.items.len() }
 
     fn random_idx(&self, rng: &mut Lcg) -> Option<usize> {
@@ -210,10 +214,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     formula.set_width_chars(32);
 
     let hbox = Rc::new(app.create_box(gtk::Orientation::Horizontal, 4)?);
+    let vbox = Rc::new(app.create_box(gtk::Orientation::Vertical, 4)?);
     let grid = Rc::new(app.create_grid()?);
 
     let drawing = gtk_dynamic_loader::DrawingArea::new(loader.clone())?;
-    let drawing_ptr = *drawing.as_ref();
+    let _drawing_ptr = *drawing.as_ref();
     drawing.set_size_request(640, 200);
     if loader.symbols.gtk_container_add.is_none() {
         drawing.set_content_width(640);
@@ -230,6 +235,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     root.append(&status);
     root.append(&formula);
     root.append(&*hbox);
+    root.append(&*vbox);
     root.append(&*grid);
     root.append(&scrolled);
     root.append(&summary);
@@ -238,7 +244,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let rng = Rc::new(RefCell::new(Lcg::new(cfg.seed)));
     let step = Rc::new(Cell::new(0usize));
-    let counts = Rc::new(RefCell::new([0usize; 9]));
+    let counts = Rc::new(RefCell::new([0usize; 10]));
     let pool = Rc::new(RefCell::new(WidgetPool::new()));
     let retired: Rc<RefCell<Vec<AnyWidget>>> = Rc::new(RefCell::new(Vec::new()));
     let pulse_count = Rc::new(Cell::new(0u32));
@@ -246,9 +252,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runner: Rc<RefCell<Option<Box<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
     let runner_for_init = runner.clone();
     let loader_for_run = loader.clone();
-    let overlay_for_run = overlay.clone();
+    let _overlay_for_run = overlay;
     let hbox_for_run = hbox.clone();
-    let grid_for_run = grid.clone();
+    let vbox_for_run = vbox.clone();
+    let grid_for_run = grid;
     let _status_for_run = status;
     let _summary_for_run = summary;
     let formula_for_run = formula.clone();
@@ -270,7 +277,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cfg.seed, cfg.steps, p.len(),
             );
             print!("  ops:");
-            for (i, name) in ["add","remove","mutate","visible","expand","focus","resize_win","pulse","resize_wid"].iter().enumerate() {
+            for (i, name) in ["add","remove","mutate","style","visible","expand","focus","resize_win","pulse","resize_wid"].iter().enumerate() {
                 print!(" {}={}", name, counts[i]);
             }
             println!();
@@ -284,13 +291,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let mut rng = rng_for_run.borrow_mut();
-        let raw_op = Op::from_index(rng.next_u32());
-        let op = if raw_op == Op::RemoveWidget && rng.next_u32() % 100 < 60 {
-            Op::AddWidget
-        } else {
-            raw_op
-        };
-
+        let op = Op::pick_weighted(rng.next_u32());
         step_for_run.set(current + 1);
         counts_for_run.borrow_mut()[op as usize] += 1;
 
@@ -324,10 +325,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 if let Some(w) = w {
+                    let mut p = pool_for_run.borrow_mut();
+                    // Cap at 100 live widgets
+                    if p.len() >= 100 {
+                        if let Some((old, _)) = p.remove_first() {
+                            let old_ptr = widget_ptr(&old);
+                            set_widget_visible(&loader_for_run, old_ptr, false);
+                            retired_for_run.borrow_mut().push(old);
+                        }
+                    }
                     let ptr = widget_ptr(&w);
-                    hbox_for_run.append(&w);
+                    let layout = rng.next_u32() % 3;
+                    match layout {
+                        0 => hbox_for_run.append(&w),
+                        1 => vbox_for_run.append(&w),
+                        _ => {
+                            let col = rng.range_i32(4);
+                            let row = rng.range_i32(8);
+                            grid_for_run.attach(&w, col, row, 1, 1);
+                        }
+                    }
                     set_widget_visible(&loader_for_run, ptr, true);
-                    pool_for_run.borrow_mut().add(w, false);
+                    p.add(w, false);
                 }
             }
             Op::RemoveWidget => {
@@ -353,7 +372,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Op::ToggleExpand => {
-                set_widget_expand(&loader_for_run, drawing_ptr, rng.next_bool(), rng.next_bool());
+                let p = pool_for_run.borrow();
+                if let Some(idx) = p.random_idx(&mut rng) {
+                    let ptr = widget_ptr(&p.items[idx].0);
+                    drop(p);
+                    set_widget_expand(&loader_for_run, ptr, rng.next_bool(), rng.next_bool());
+                }
             }
             Op::FocusShuffle => {
                 if rng.next_bool() {
@@ -375,8 +399,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Op::ResizeWindow => {
-                let w = 400 + rng.range_i32(600);
-                let h = 200 + rng.range_i32(400);
+                let w = 400 + rng.range_i32(300);
+                let h = 200 + rng.range_i32(200);
                 if let Some(set_size) = loader_for_run.symbols.gtk_window_set_default_size {
                     unsafe { set_size(win_ptr, w, h); }
                 }
@@ -428,5 +452,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let _ = app.run();
-    Ok(())
+
+    // Exit cleanly without running GTK's widget tree teardown cascade
+    // (which races with Rust's Drop order for widget wrappers).
+    // The OS reclaims all GTK resources on process exit.
+    std::process::exit(0);
 }

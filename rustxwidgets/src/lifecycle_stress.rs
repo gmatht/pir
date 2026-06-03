@@ -3,6 +3,7 @@ pub enum Op {
     AddWidget,
     RemoveWidget,
     MutateWidget,
+    CycleStyle,
     ToggleVisible,
     ToggleExpand,
     FocusShuffle,
@@ -13,17 +14,27 @@ pub enum Op {
 
 impl Op {
     pub fn from_index(index: u32) -> Self {
-        match index % 9 {
+        match index % 10 {
             0 => Self::AddWidget,
             1 => Self::RemoveWidget,
             2 => Self::MutateWidget,
-            3 => Self::ToggleVisible,
-            4 => Self::ToggleExpand,
-            5 => Self::FocusShuffle,
-            6 => Self::ResizeWindow,
-            7 => Self::PulseChild,
+            3 => Self::CycleStyle,
+            4 => Self::ToggleVisible,
+            5 => Self::ToggleExpand,
+            6 => Self::FocusShuffle,
+            7 => Self::ResizeWindow,
+            8 => Self::PulseChild,
             _ => Self::ResizeWidget,
         }
+    }
+
+    /// Weighted: 55% add, 18% remove, 7% style, 20% other
+    pub fn pick_weighted(roll: u32) -> Self {
+        let band = roll % 100;
+        if band < 55 { return Self::AddWidget; }
+        if band < 73 { return Self::RemoveWidget; }
+        if band < 80 { return Self::CycleStyle; }
+        Self::from_index(band)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -31,6 +42,7 @@ impl Op {
             Self::AddWidget => "add_widget",
             Self::RemoveWidget => "remove_widget",
             Self::MutateWidget => "mutate_widget",
+            Self::CycleStyle => "cycle_style",
             Self::ToggleVisible => "toggle_visible",
             Self::ToggleExpand => "toggle_expand",
             Self::FocusShuffle => "focus_shuffle",
@@ -60,6 +72,7 @@ impl LifecycleModel {
                 }
             }
             Op::MutateWidget
+            | Op::CycleStyle
             | Op::ToggleVisible
             | Op::ToggleExpand
             | Op::FocusShuffle
@@ -80,6 +93,7 @@ mod tests {
             Just(Op::AddWidget),
             Just(Op::RemoveWidget),
             Just(Op::MutateWidget),
+            Just(Op::CycleStyle),
             Just(Op::ToggleVisible),
             Just(Op::ToggleExpand),
             Just(Op::FocusShuffle),
