@@ -12,8 +12,20 @@ pub type HandlerId = u64;
 pub trait DrawContext {
     fn fill_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, a: f64);
     fn stroke_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, a: f64, lw: f64);
-    fn draw_text(&mut self, x: f64, y: f64, text: &str, font: &str, size: f64, r: f64, g: f64, b: f64, a: f64);
-    fn text_extents(&self, text: &str, font: &str, size: f64) -> (f64, f64, f64, f64);
+    /// Draw text with normal (non-bold, non-italic) style.
+    fn draw_text(&mut self, x: f64, y: f64, text: &str, font: &str, size: f64, r: f64, g: f64, b: f64, a: f64) {
+        self.draw_text_styled(x, y, text, font, size, r, g, b, a, 0, 0)
+    }
+    /// Draw text with explicit Cairo slant (0=normal, 1=italic, 2=oblique) and
+    /// weight (0=normal, 1=bold).
+    fn draw_text_styled(&mut self, x: f64, y: f64, text: &str, font: &str, size: f64,
+                        r: f64, g: f64, b: f64, a: f64, slant: i32, weight: i32);
+    /// Measure text extents with normal (non-bold) weight.
+    fn text_extents(&self, text: &str, font: &str, size: f64) -> (f64, f64, f64, f64) {
+        self.text_extents_styled(text, font, size, 0, 0)
+    }
+    /// Measure text extents with explicit Cairo slant and weight.
+    fn text_extents_styled(&self, text: &str, font: &str, size: f64, slant: i32, weight: i32) -> (f64, f64, f64, f64);
     fn clear(&mut self, r: f64, g: f64, b: f64, a: f64);
     fn save(&mut self);
     fn restore(&mut self);

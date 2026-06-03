@@ -54,8 +54,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = App::init()?;
     let win = app.create_window()?;
-    win.set_title("x-sheet");
-    win.set_default_size(1200, 800);
+    win.set_title("Spreadsheet");
+    win.set_default_size(1600, 1000);
 
     // Data model
     let texts: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(
@@ -97,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Toolbar
     let toolbar = app.create_box(Orientation::Horizontal, 2)?;
     let open_btn = app.create_button("Open")?;
-    let save_btn = app.create_button("Save")?;
+    let save_btn = app.create_button("Save As")?;
     let quit_btn = app.create_button("Quit")?;
     let bold_btn = app.create_button("B")?;
     let italic_btn = app.create_button("I")?;
@@ -107,7 +107,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hl_btn = app.create_button("HL")?;
     let fg_btn = app.create_button("FG")?;
 
-    for b in [&open_btn, &save_btn, &quit_btn] { b.set_size_request(60, 24); }
+    open_btn.set_size_request(60, 24);
+    save_btn.set_size_request(70, 24);
+    quit_btn.set_size_request(50, 24);
     for b in [&bold_btn, &italic_btn, &al_l, &al_c, &al_r, &hl_btn, &fg_btn] { b.set_size_request(28, 24); }
     toolbar.append(&open_btn);
     toolbar.append(&save_btn);
@@ -131,11 +133,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     formula_entry.set_size_request(400, 26);
     formula_bar.append(&formula_entry);
 
+    // Load the GTK backend loader for CSS/compat checks
+    let gtk_loader = rustxwidgets::backends::gtk::loader()
+        .expect("GTK loader not initialized");
+    let is_gtk4 = gtk_loader.symbols.gtk_container_add.is_none();
+
     // Canvas + Overlay
     let overlay = app.create_overlay()?;
     let canvas = app.create_canvas()?;
-    canvas.set_size_request(total_w as i32, total_h as i32);
-    canvas.set_content_size(total_w as i32, total_h as i32);
+    let total_w_i = total_w as i32;
+    let total_h_i = total_h as i32;
+    canvas.set_size_request(total_w_i, total_h_i);
+    if is_gtk4 {
+        canvas.set_content_size(total_w_i, total_h_i);
+    }
+    overlay.set_child(&canvas);
+    overlay.set_hexpand(true);
+    overlay.set_vexpand(true);
+
+    // ScrolledWindow wrapping the overlay (same as g-spreadsheet-canvas)
+    let scrolled = gtk_dynamic_loader::ScrolledWindow::new(gtk_loader.clone())?;
+    scrolled.set_policy(0, 0);
+    scrolled.set_child(&overlay);
+    scrolled.set_hexpand(true);
+    scrolled.set_vexpand(true);
+
+    // Global CSS (same as g-spreadsheet-canvas for pixel-perfect rendering)
+    let css = r#"
+    button { font-size: 11px; padding: 1px 8px; min-height: 20px; }
+    entry { padding: 0; border: none; font-family: monospace; font-size: 13px; min-height: 0; }
+    entry:focus { outline: none; }
+    .cell-bold { font-weight: bold; }
+    .cell-italic { font-style: italic; }
+    .cell-both { font-weight: bold; font-style: italic; }
+    .cell-fg-red { color: #cc0000; }
+    .cell-fg-blue { color: #0000cc; }
+    .cell-fg-green { color: #006600; }
+    "#;
+    if let Some(provider) = gtk_dynamic_loader::create_css_provider(&gtk_loader, css) {
+        gtk_dynamic_loader::add_css_provider_global(&gtk_loader, *win.as_ref(), provider, 600);
+    }
 
     // Focus tracking for formula entry
     let text_input_active2 = text_input_active.clone();
@@ -186,6 +223,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start editing a cell (creates floating entry on overlay)
     let start_edit: Rc<dyn Fn(usize, usize)> = {
         let texts_edit = texts.clone();
+        let fmts_edit = fmts.clone();
         let edit_entry = editing_entry.clone();
         let text_active = text_input_active.clone();
         let overlay_edit = overlay.clone();
@@ -200,6 +238,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(entry) = gtk::create_entry() {
                 *text_active.borrow_mut() = true;
                 entry.set_text(&texts_edit.borrow()[r][c]);
+                // Apply cell formatting to the entry widget
+                let fmt = &fmts_edit.borrow()[r][c];
+                if fmt.0 && fmt.1 { entry.add_class("cell-both"); }
+                else if fmt.0 { entry.add_class("cell-bold"); }
+                else if fmt.1 { entry.add_class("cell-italic"); }
+                match fmt.3.as_str() {
+                    "#cc0000" => { entry.add_class("cell-fg-red"); }
+                    "#0000cc" => { entry.add_class("cell-fg-blue"); }
+                    "#006600" => { entry.add_class("cell-fg-green"); }
+                    _ => {}
+                }
                 let rh_b = rh.borrow();
                 let left = chw as i32 + c as i32 * CELL_W;
                 let top = CELL_H + compute_row_y(&rh_b, r);
@@ -220,8 +269,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let start_again = self_ref2.clone();
                 let _ = entry.connect_activate(move |_param| {
                     commit2();
-                    if let Some((_, c2)) = *sel2.borrow() {
-                        let next = sel2.borrow().map(|(row, col)| (row + 1, col)).filter(|(row, _)| *row < ROWS);
+                    let current = *sel2.borrow();
+                    if let Some((_, _)) = current {
+                        let next = current.map(|(row, col)| (row + 1, col)).filter(|(row, _)| *row < ROWS);
                         if let Some((nr, nc)) = next {
                             *sel2.borrow_mut() = Some((nr, nc));
                             refresh2();
@@ -267,14 +317,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Column headers
         for c in 0..COLS {
             let lbl = col_label(c);
-            let (xb, _, w, _) = ctx.text_extents(&lbl, "monospace", 12.0);
+            let (xb, _, w, _) = ctx.text_extents_styled(&lbl, "monospace", 12.0, 0, 0);
             let x = chw + c as f64 * cw + cw / 2.0 - xb - w / 2.0;
             ctx.draw_text(x, ch / 2.0, &lbl, "monospace", 12.0, 0.0, 0.0, 0.0, 1.0);
         }
         // Row headers
         for r in 0..ROWS {
             let lbl = format!("{}", r + 1);
-            let (xb, _, w, _) = ctx.text_extents(&lbl, "monospace", 12.0);
+            let (xb, _, w, _) = ctx.text_extents_styled(&lbl, "monospace", 12.0, 0, 0);
             let x = chw / 2.0 - xb - w / 2.0;
             ctx.draw_text(x, ch + r as f64 * ch + ch / 2.0, &lbl, "monospace", 12.0, 0.0, 0.0, 0.0, 1.0);
         }
@@ -287,7 +337,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for c in 0..COLS {
                 let text = &t[r][c];
                 if text.is_empty() { continue; }
-                let (_, _, tw, _) = ctx.text_extents(text, "monospace", 13.0);
+                let cb = f[r][c].0;
+                let ci = f[r][c].1;
+                let (_, _, tw, _) = ctx.text_extents_styled(text, "monospace", 13.0, if ci { 1 } else { 0 }, if cb { 1 } else { 0 });
                 let cx = chw + c as f64 * cw;
                 if cx + tw > cx + cw {
                     let mut lo = c;
@@ -343,6 +395,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let (fr, fgg, fb) = if fg_hex != "#000000" { parse_hex(fg_hex) } else { (0.0, 0.0, 0.0) };
                 let slant = if *italic { 1 } else { 0 };
+                let weight = if *bold { 1 } else { 0 };
                 let (xb, _, tw, _) = ctx.text_extents(text, "monospace", 13.0);
                 let pad = 4.0;
                 let tx = match *align {
@@ -367,7 +420,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 ctx.save();
                 ctx.clip(cx, cy, clip_right - cx, ch);
-                ctx.draw_text(tx, ty, text, "monospace", 13.0, fr, fgg, fb, 1.0);
+                ctx.draw_text_styled(tx, ty, text, "monospace", 13.0, fr, fgg, fb, 1.0, slant, weight);
                 ctx.restore();
             }
         }
@@ -598,7 +651,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Assemble layout
     vbox.append(&toolbar_box);
     vbox.append(&formula_bar);
-    vbox.append(&overlay);
+    vbox.append(&scrolled);
     vbox.set_vexpand(true);
     vbox.set_hexpand(true);
     win.set_child(&vbox);

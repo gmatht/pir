@@ -463,7 +463,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Exercise stupid API misuse patterns that should be handled gracefully.
                 let p = pool_for_run.borrow();
                 if let Some(idx) = p.random_idx(&mut rng) {
-                    let abuse = rng.next_u32() % 13;
+                    let abuse = rng.next_u32() % 14;
                     match abuse {
                         // 0-1: Set size to degenerate values
                         0 => p.items[idx].0.set_size_request(0, 0),
@@ -583,6 +583,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 p.items[idx].0.set_visible(true);
                             }
                         },
+                        // 13: RefCell borrow-before-borrow_mut (x-sheet crash pattern).
+                        13 => {
+                            if let AnyWidget::Entry(e) = &p.items[idx].0 {
+                                let cell = Rc::new(RefCell::new(0u32));
+                                let c2 = cell.clone();
+                                let _ = e.connect_activate(move |_param| {
+                                    let current = *c2.borrow();
+                                    if current < 100 {
+                                        // borrow_mut after borrow guard was dropped
+                                        *c2.borrow_mut() = current + 1;
+                                    }
+                                });
+                                // Test that the RefCell borrow pattern works
+                                e.grab_focus();
+                            }
+                        },
+
                         _ => {}
                     }
                 }

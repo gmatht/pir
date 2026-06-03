@@ -2,6 +2,8 @@
 #[cfg(target_os = "linux")]
 mod gtk_adapter {
     use std::os::raw::c_void;
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use crate::core::{Error, Widget};
     use gtk_dynamic_loader::{Window as GWindow, Button as GButton, Label as GLabel, BoxWidget as GBox, Grid as GGrid, Entry as GEntry, Dialog as GDialog, DropDown as GDropDown, CheckButton as GCheckButton, RadioButton as GRadioButton, TextView as GTextView};
 
@@ -380,13 +382,21 @@ mod gtk_adapter {
             self.cc.stroke();
         }
         fn draw_text(&mut self, x: f64, y: f64, text: &str, font: &str, size: f64, r: f64, g: f64, b: f64, a: f64) {
+            self.draw_text_styled(x, y, text, font, size, r, g, b, a, 0, 0)
+        }
+        fn draw_text_styled(&mut self, x: f64, y: f64, text: &str, font: &str, size: f64, r: f64, g: f64, b: f64, a: f64, slant: i32, weight: i32) {
             self.cc.set_source_rgba(r, g, b, a);
-            self.cc.select_font_face(font, 0, 1);
+            self.cc.select_font_face(font, slant, weight);
             self.cc.set_font_size(size);
             self.cc.move_to(x, y);
             self.cc.show_text(text);
         }
-        fn text_extents(&self, text: &str, _font: &str, _size: f64) -> (f64, f64, f64, f64) {
+        fn text_extents(&self, text: &str, font: &str, size: f64) -> (f64, f64, f64, f64) {
+            self.text_extents_styled(text, font, size, 0, 0)
+        }
+        fn text_extents_styled(&self, text: &str, font: &str, size: f64, slant: i32, weight: i32) -> (f64, f64, f64, f64) {
+            self.cc.select_font_face(font, slant, weight);
+            self.cc.set_font_size(size);
             let e = self.cc.text_extents(text);
             (e.x_bearing, e.y_bearing, e.width, e.height)
         }
@@ -403,11 +413,27 @@ mod gtk_adapter {
     }
 
     /// Canvas wraps a DrawingArea into the cross-platform Canvas API.
-    pub struct Canvas(pub gtk_dynamic_loader::DrawingArea);
+    /// Stores event controllers in a reference-counted slot so they outlive
+    /// the constructor scope (GTK4 controllers are freed if dropped).
+    pub struct Canvas {
+        pub drawing_area: gtk_dynamic_loader::DrawingArea,
+        _controllers: Rc<RefCell<Vec<Box<dyn std::any::Any>>>>,
+    }
 
-    impl Clone for Canvas { fn clone(&self) -> Self { Canvas(self.0.clone()) } }
-    impl AsRef<*mut c_void> for Canvas { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
-    impl Widget for Canvas { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
+    impl Clone for Canvas {
+        fn clone(&self) -> Self {
+            Canvas {
+                drawing_area: self.drawing_area.clone(),
+                _controllers: self._controllers.clone(),
+            }
+        }
+    }
+    impl AsRef<*mut c_void> for Canvas {
+        fn as_ref(&self) -> &*mut c_void { self.drawing_area.as_ref() }
+    }
+    impl Widget for Canvas {
+        fn raw_handle(&self) -> *mut c_void { *self.drawing_area.as_ref() }
+    }
 
     impl Canvas {
         pub fn set_draw_callback(&self, cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) {
@@ -417,13 +443,13 @@ mod gtk_adapter {
             let symbols = &loader.symbols;
             if symbols.gtk_drawing_area_set_draw_func.is_some() {
                 // GTK4 path
-                let _ = self.0.set_draw_func(Box::new(move |cr: *mut c_void, w: i32, h: i32| {
+                let _ = self.drawing_area.set_draw_func(Box::new(move |cr: *mut c_void, w: i32, h: i32| {
                     let mut ctx = GtkDrawContext::new(cr, &loader);
                     cb(&mut ctx, w, h);
                 }));
             } else {
                 // GTK3 path
-                let _ = self.0.connect_draw_gtk3(Box::new(move |_widget: *mut c_void, cr: *mut c_void| -> i32 {
+                let _ = self.drawing_area.connect_draw_gtk3(Box::new(move |_widget: *mut c_void, cr: *mut c_void| -> i32 {
                     let mut ctx = GtkDrawContext::new(cr, &loader);
                     cb(&mut ctx, 0, 0);
                     0
@@ -432,34 +458,36 @@ mod gtk_adapter {
         }
 
         pub fn queue_redraw(&self) {
-            self.0.queue_draw();
+            self.drawing_area.queue_draw();
         }
 
         pub fn set_size_request(&self, w: i32, h: i32) {
-            self.0.set_size_request(w, h);
+            self.drawing_area.set_size_request(w, h);
         }
 
         pub fn set_content_size(&self, w: i32, h: i32) {
-            self.0.set_content_width(w);
-            self.0.set_content_height(h);
+            self.drawing_area.set_content_width(w);
+            self.drawing_area.set_content_height(h);
         }
 
         pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) {
             let loader = crate::backends::gtk::loader()
                 .expect("GTK loader not initialized after Canvas creation");
             let symbols = &loader.symbols;
-            let inner = *self.0.as_ref();
-            if symbols.gtk_gesture_click_new.is_some() {
-                // GTK4: use GestureClick
+            let inner = *self.drawing_area.as_ref();
+            let is_gtk4 = symbols.gtk_gesture_click_new.is_some();
+            if is_gtk4 {
+                // GTK4: use GestureClick — store in _controllers to keep alive
                 if let Ok(gesture) = gtk_dynamic_loader::GestureClick::new(loader.clone()) {
                     let mut cb = cb;
                     let _ = gesture.connect_pressed(Box::new(move |_n: i32, x: f64, y: f64| {
                         cb(x, y);
                     }));
-                    gesture.add_to_widget(&self.0);
+                    gesture.add_to_widget(&self.drawing_area);
+                    self._controllers.borrow_mut().push(Box::new(gesture));
                 }
-            } else if symbols.gtk_widget_add_events.is_some() {
-                // GTK3: use button-press-event signal
+            } else {
+                // GTK3: use button-press-event signal (no controller lifetime issue)
                 let mask = 1 << 8; // GDK_BUTTON_PRESS_MASK
                 unsafe { gtk_dynamic_loader::widget_add_events(&loader, inner, mask); }
                 let mut cb = cb;
@@ -484,18 +512,20 @@ mod gtk_adapter {
             let loader = crate::backends::gtk::loader()
                 .expect("GTK loader not initialized after Canvas creation");
             let symbols = &loader.symbols;
-            let inner = *self.0.as_ref();
-            if symbols.gtk_event_controller_key_new.is_some() {
-                // GTK4: use EventControllerKey
+            let inner = *self.drawing_area.as_ref();
+            let is_gtk4 = symbols.gtk_gesture_click_new.is_some();
+            if is_gtk4 {
+                // GTK4: use EventControllerKey — store pointer to keep alive
                 if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(loader.clone()) {
                     let mut cb = cb;
                     let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32| -> i32 {
                         if cb(keyval) { 1 } else { 0 }
                     }));
-                    ctrl.add_to_widget(&self.0);
+                    ctrl.add_to_widget(&self.drawing_area);
+                    self._controllers.borrow_mut().push(Box::new(ctrl));
                 }
             } else {
-                // GTK3: use key-press-event signal on the drawing area
+                // GTK3: use key-press-event signal (no controller lifetime issue)
                 let mut cb = cb;
                 let l2 = loader.clone();
                 let l3 = l2.clone();
@@ -514,7 +544,10 @@ mod gtk_adapter {
 
     pub fn create_canvas() -> Result<Canvas, Error> {
         let da = crate::backends::gtk::create_drawing_area().map_err(|e| Error::Backend(format!("{}", e)))?;
-        Ok(Canvas(da))
+        Ok(Canvas {
+            drawing_area: da,
+            _controllers: Rc::new(RefCell::new(Vec::new())),
+        })
     }
 
     // ---- Overlay (cross-platform stacking container) ----
@@ -542,6 +575,8 @@ mod gtk_adapter {
         pub fn show_all(&self) {
             self.0.show_all();
         }
+        pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
+        pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
     }
 
     pub fn create_overlay() -> Result<Overlay, Error> {
