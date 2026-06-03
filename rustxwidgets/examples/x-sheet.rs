@@ -550,43 +550,105 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         false
     }));
 
-    // Formatting buttons
+    // Helper: apply cell formatting CSS classes to an entry widget
+    fn apply_fmt(entry: &Entry, r: usize, c: usize, fmts: &RefCell<Vec<Vec<CellFormat>>>) {
+        let b = fmts.borrow();
+        if r >= b.len() || c >= b[r].len() { return; }
+        let fmt = &b[r][c];
+        entry.remove_class("cell-bold");
+        entry.remove_class("cell-italic");
+        entry.remove_class("cell-both");
+        entry.remove_class("cell-fg-red");
+        entry.remove_class("cell-fg-blue");
+        entry.remove_class("cell-fg-green");
+        if fmt.0 && fmt.1 { entry.add_class("cell-both"); }
+        else if fmt.0 { entry.add_class("cell-bold"); }
+        else if fmt.1 { entry.add_class("cell-italic"); }
+        match fmt.3.as_str() {
+            "#cc0000" => entry.add_class("cell-fg-red"),
+            "#0000cc" => entry.add_class("cell-fg-blue"),
+            "#006600" => entry.add_class("cell-fg-green"),
+            _ => {}
+        }
+    }
+
+    // Formatting buttons — each also updates the active editing entry's appearance
+    let edit_entry_fmt = editing_entry.clone();
     let sel_fmt = sel.clone();
     let fmts_fmt = fmts.clone();
     let cv_fmt = canvas.clone();
     let _ = bold_btn.on_click(move || {
-        if let Some((r, c)) = *sel_fmt.borrow() {
+        let coord = *sel_fmt.borrow();
+        if let Some((r, c)) = coord {
             let mut f = fmts_fmt.borrow_mut();
             if r < f.len() && c < f[r].len() { f[r][c].0 = !f[r][c].0; cv_fmt.queue_redraw(); }
         }
+        if let Some((r, c)) = coord {
+            if let Some(ee) = edit_entry_fmt.borrow().as_ref() {
+                apply_fmt(ee, r, c, &fmts_fmt);
+            }
+        }
     });
+
+    let edit_entry_ital = editing_entry.clone();
     let sel_ital = sel.clone();
     let fmts_ital = fmts.clone();
     let cv_ital = canvas.clone();
     let _ = italic_btn.on_click(move || {
-        if let Some((r, c)) = *sel_ital.borrow() {
+        let coord = *sel_ital.borrow();
+        if let Some((r, c)) = coord {
             let mut f = fmts_ital.borrow_mut();
             if r < f.len() && c < f[r].len() { f[r][c].1 = !f[r][c].1; cv_ital.queue_redraw(); }
         }
+        if let Some((r, c)) = coord {
+            if let Some(ee) = edit_entry_ital.borrow().as_ref() {
+                apply_fmt(ee, r, c, &fmts_ital);
+            }
+        }
     });
+
+    let edit_entry_al = editing_entry.clone();
     let _ = al_l.on_click({
         let sel_al = sel.clone(); let fmts_al = fmts.clone(); let cv_al = canvas.clone();
-        move || { if let Some((r, c)) = *sel_al.borrow() { fmts_al.borrow_mut()[r][c].2 = 0; cv_al.queue_redraw(); } }
+        let ed_al = editing_entry.clone();
+        move || {
+            let coord = *sel_al.borrow();
+            if let Some((r, c)) = coord { fmts_al.borrow_mut()[r][c].2 = 0; cv_al.queue_redraw(); }
+            if let Some((r, c)) = coord {
+                if let Some(ee) = ed_al.borrow().as_ref() { apply_fmt(ee, r, c, &fmts_al); }
+            }
+        }
     });
     let _ = al_c.on_click({
         let sel_al = sel.clone(); let fmts_al = fmts.clone(); let cv_al = canvas.clone();
-        move || { if let Some((r, c)) = *sel_al.borrow() { fmts_al.borrow_mut()[r][c].2 = 1; cv_al.queue_redraw(); } }
+        let ed_ac = editing_entry.clone();
+        move || {
+            let coord = *sel_al.borrow();
+            if let Some((r, c)) = coord { fmts_al.borrow_mut()[r][c].2 = 1; cv_al.queue_redraw(); }
+            if let Some((r, c)) = coord {
+                if let Some(ee) = ed_ac.borrow().as_ref() { apply_fmt(ee, r, c, &fmts_al); }
+            }
+        }
     });
     let _ = al_r.on_click({
         let sel_al = sel.clone(); let fmts_al = fmts.clone(); let cv_al = canvas.clone();
-        move || { if let Some((r, c)) = *sel_al.borrow() { fmts_al.borrow_mut()[r][c].2 = 2; cv_al.queue_redraw(); } }
+        let ed_ar = editing_entry.clone();
+        move || {
+            let coord = *sel_al.borrow();
+            if let Some((r, c)) = coord { fmts_al.borrow_mut()[r][c].2 = 2; cv_al.queue_redraw(); }
+            if let Some((r, c)) = coord {
+                if let Some(ee) = ed_ar.borrow().as_ref() { apply_fmt(ee, r, c, &fmts_al); }
+            }
+        }
     });
 
+    let edit_entry_hl = editing_entry.clone();
     let sel_hl = sel.clone();
     let fmts_hl = fmts.clone();
     let cv_hl = canvas.clone();
     let _ = hl_btn.on_click(move || {
-        if let Some((r, c)) = *sel_hl.borrow() {
+        let coord = *sel_hl.borrow();
+        if let Some((r, c)) = coord {
             let mut f = fmts_hl.borrow_mut();
             if r < f.len() && c < f[r].len() {
                 let bg = f[r][c].4.clone();
@@ -594,17 +656,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cv_hl.queue_redraw();
             }
         }
+        if let Some((r, c)) = coord {
+            if let Some(ee) = edit_entry_hl.borrow().as_ref() {
+                apply_fmt(ee, r, c, &fmts_hl);
+            }
+        }
     });
+    let edit_entry_fg = editing_entry.clone();
     let sel_fg = sel.clone();
     let fmts_fg = fmts.clone();
     let cv_fg = canvas.clone();
     let _ = fg_btn.on_click(move || {
-        if let Some((r, c)) = *sel_fg.borrow() {
+        let coord = *sel_fg.borrow();
+        if let Some((r, c)) = coord {
             let mut f = fmts_fg.borrow_mut();
             if r < f.len() && c < f[r].len() {
                 let fg = f[r][c].3.clone();
                 f[r][c].3 = if fg == "#000000" { "#cc0000".into() } else if fg == "#cc0000" { "#0000cc".into() } else if fg == "#0000cc" { "#006600".into() } else { "#000000".into() };
                 cv_fg.queue_redraw();
+            }
+        }
+        if let Some((r, c)) = coord {
+            if let Some(ee) = edit_entry_fg.borrow().as_ref() {
+                apply_fmt(ee, r, c, &fmts_fg);
             }
         }
     });

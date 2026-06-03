@@ -441,17 +441,48 @@ mod pancurses_adapter {
         }
     }
 
+    impl Widget for TextView {
+        fn raw_handle(&self) -> *mut c_void {
+            &self.id as *const usize as *mut c_void
+        }
+    }
+
     impl TextView {
         pub fn set_text(&self, text: &str) {
             crate::backends::pancurses::set_textview_text(self.id, text);
         }
-
         pub fn get_text(&self) -> Option<String> {
             crate::backends::pancurses::get_textview_text(self.id)
         }
-
         pub fn set_wrap_mode(&self, _mode: i32) {}
         pub fn set_size_request(&self, _w: i32, _h: i32) {}
+    }
+
+    // -- Spreadsheet --
+
+    pub struct Spreadsheet {
+        pub(crate) id: usize,
+    }
+
+    impl AsRef<*mut c_void> for Spreadsheet {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.id as *const usize as *const *mut c_void) }
+        }
+    }
+
+    impl Widget for Spreadsheet {
+        fn raw_handle(&self) -> *mut c_void {
+            &self.id as *const usize as *mut c_void
+        }
+    }
+
+    impl Spreadsheet {
+        pub fn set_cell(&self, row: u32, col: u32, text: &str) {
+            crate::backends::pancurses::spreadsheet_set_cell(self.id, row, col, text);
+        }
+        pub fn get_cell(&self, row: u32, col: u32) -> Option<String> {
+            crate::backends::pancurses::spreadsheet_get_cell(self.id, row, col)
+        }
     }
 
     // -- Factory functions --
@@ -541,6 +572,12 @@ mod pancurses_adapter {
     pub fn create_textview() -> Result<TextView, Error> {
         crate::backends::pancurses::create_textview()
             .map(|id| TextView { id })
+            .map_err(|e| Error::Backend(format!("{}", e)))
+    }
+
+    pub fn create_spreadsheet(rows: u32, cols: u32) -> Result<Spreadsheet, Error> {
+        crate::backends::pancurses::create_spreadsheet(rows, cols)
+            .map(|id| Spreadsheet { id })
             .map_err(|e| Error::Backend(format!("{}", e)))
     }
 }

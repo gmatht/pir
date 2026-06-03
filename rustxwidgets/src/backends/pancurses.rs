@@ -2,7 +2,9 @@
 mod pancurses_backend {
     use pancurses::*;
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::os::raw::c_void;
+    use std::rc::Rc;
 
     pub type Callback = Box<dyn FnMut()>;
 
@@ -30,6 +32,19 @@ mod pancurses_backend {
         SimpleAction,
         DropDown { items: Vec<String>, selected: Option<usize> },
         TextView { text: String },
+        Spreadsheet {
+            cells: Rc<RefCell<HashMap<(u32, u32), String>>>,
+            total_rows: u32,
+            total_cols: u32,
+            top_row: u32,
+            left_col: u32,
+            cursor_row: u32,
+            cursor_col: u32,
+            editing: bool,
+            edit_buf: String,
+            edit_pos: usize,
+            col_width: u32,
+        },
     }
 
     pub struct PcWidgetNode {
@@ -311,7 +326,13 @@ mod pancurses_backend {
                                 state.menu_open = false;
                                 vec![]
                             } else if let Some(fid) = state.focus_id {
-                                toggle_focused(state, fid).1
+                                if is_spreadsheet_focused(state, fid) {
+                                    spreadsheet_enter(state, fid);
+                                    spreadsheet_scroll_to_cursor(state, fid);
+                                    vec![]
+                                } else {
+                                    toggle_focused(state, fid).1
+                                }
                             } else {
                                 vec![]
                             }
@@ -323,16 +344,26 @@ mod pancurses_backend {
                             with_state(|state| {
                                 if state.menu_open {
                                     state.menu_open = false;
-                                } else {
-                                    let focusable: Vec<usize> = state.nodes.iter()
-                                        .filter(|n| matches!(n.kind, PcWidgetKind::Button { .. } | PcWidgetKind::Entry { .. } | PcWidgetKind::CheckButton { .. }))
-                                        .map(|n| n.id)
-                                        .collect();
-                                    if let Some(pos) = state.focus_id.and_then(|f| focusable.iter().position(|&x| x == f)) {
-                                        let next = (pos + 1) % focusable.len();
-                                        state.focus_id = Some(focusable[next]);
+                                } else if let Some(fid) = state.focus_id {
+                                    if is_spreadsheet_focused(state, fid) {
+                                        spreadsheet_commit_edit(state, fid);
+                                        if let Some(n) = state.node_mut(fid) {
+                                            if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
+                                                if *cursor_col + 1 < total_cols { *cursor_col += 1; }
+                                            }
+                                        }
+                                        spreadsheet_scroll_to_cursor(state, fid);
                                     } else {
-                                        state.focus_id = focusable.first().copied();
+                                        let focusable: Vec<usize> = state.nodes.iter()
+                                            .filter(|n| matches!(n.kind, PcWidgetKind::Button { .. } | PcWidgetKind::Entry { .. } | PcWidgetKind::CheckButton { .. } | PcWidgetKind::Spreadsheet { .. }))
+                                            .map(|n| n.id)
+                                            .collect();
+                                        if let Some(pos) = state.focus_id.and_then(|f| focusable.iter().position(|&x| x == f)) {
+                                            let next = (pos + 1) % focusable.len();
+                                            state.focus_id = Some(focusable[next]);
+                                        } else {
+                                            state.focus_id = focusable.first().copied();
+                                        }
                                     }
                                 }
                             });
@@ -360,8 +391,20 @@ mod pancurses_backend {
                                     });
                                 }
                                 _ => {
-                                    // No following char within 300ms → bare Escape → close menu or quit
+                                    // No following char within 300ms → bare Escape → close edit/menu or quit
                                     with_state(|state| {
+                                        if let Some(fid) = state.focus_id {
+                                            if is_spreadsheet_focused(state, fid) {
+                                                if let Some(n) = state.node_mut(fid) {
+                                                    if let PcWidgetKind::Spreadsheet { ref mut editing, .. } = n.kind {
+                                                        if *editing {
+                                                            *editing = false; // cancel edit
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                         if state.menu_open {
                                             state.menu_open = false;
                                         } else {
@@ -398,7 +441,20 @@ mod pancurses_backend {
                         } else {
                             with_state(|state| {
                                 if let Some(fid) = state.focus_id {
-                                    if let Some(n) = state.node_mut(fid) {
+                                    if is_spreadsheet_focused(state, fid) {
+                                        if let Some(n) = state.node_mut(fid) {
+                                            if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                                                if !*editing {
+                                                    *editing = true;
+                                                    *edit_buf = c.to_string();
+                                                    *edit_pos = 1;
+                                                } else {
+                                                    edit_buf.insert(*edit_pos, c);
+                                                    *edit_pos += 1;
+                                                }
+                                            }
+                                        }
+                                    } else if let Some(n) = state.node_mut(fid) {
                                         if let PcWidgetKind::Entry { ref mut buffer, ref mut cursor } = n.kind {
                                             buffer.insert(*cursor, c);
                                             *cursor += 1;
@@ -411,7 +467,16 @@ mod pancurses_backend {
                     Some(Input::KeyBackspace) => {
                         with_state(|state| {
                             if let Some(fid) = state.focus_id {
-                                if let Some(n) = state.node_mut(fid) {
+                                if is_spreadsheet_focused(state, fid) {
+                                    if let Some(n) = state.node_mut(fid) {
+                                        if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                                            if *editing && *edit_pos > 0 {
+                                                *edit_pos -= 1;
+                                                edit_buf.remove(*edit_pos);
+                                            }
+                                        }
+                                    }
+                                } else if let Some(n) = state.node_mut(fid) {
                                     if let PcWidgetKind::Entry { ref mut buffer, ref mut cursor } = n.kind {
                                         if *cursor > 0 {
                                             *cursor -= 1;
@@ -425,7 +490,15 @@ mod pancurses_backend {
                     Some(Input::KeyDC) => {
                         with_state(|state| {
                             if let Some(fid) = state.focus_id {
-                                if let Some(n) = state.node_mut(fid) {
+                                if is_spreadsheet_focused(state, fid) {
+                                    if let Some(n) = state.node_mut(fid) {
+                                        if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                                            if *editing && *edit_pos < edit_buf.len() {
+                                                edit_buf.remove(*edit_pos);
+                                            }
+                                        }
+                                    }
+                                } else if let Some(n) = state.node_mut(fid) {
                                     if let PcWidgetKind::Entry { ref mut buffer, ref mut cursor } = n.kind {
                                         if *cursor < buffer.len() {
                                             buffer.remove(*cursor);
@@ -443,7 +516,15 @@ mod pancurses_backend {
                                     state.active_item = 0;
                                 }
                             } else if let Some(fid) = state.focus_id {
-                                if let Some(n) = state.node_mut(fid) {
+                                if is_spreadsheet_focused(state, fid) {
+                                    spreadsheet_commit_edit(state, fid);
+                                    if let Some(n) = state.node_mut(fid) {
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                                            if *cursor_col > 0 { *cursor_col -= 1; }
+                                        }
+                                    }
+                                    spreadsheet_scroll_to_cursor(state, fid);
+                                } else if let Some(n) = state.node_mut(fid) {
                                     if let PcWidgetKind::Entry { ref mut cursor, .. } = n.kind {
                                         if *cursor > 0 { *cursor -= 1; }
                                     }
@@ -465,7 +546,15 @@ mod pancurses_backend {
                                     }
                                 }
                             } else if let Some(fid) = state.focus_id {
-                                if let Some(n) = state.node_mut(fid) {
+                                if is_spreadsheet_focused(state, fid) {
+                                    spreadsheet_commit_edit(state, fid);
+                                    if let Some(n) = state.node_mut(fid) {
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
+                                            if *cursor_col + 1 < total_cols { *cursor_col += 1; }
+                                        }
+                                    }
+                                    spreadsheet_scroll_to_cursor(state, fid);
+                                } else if let Some(n) = state.node_mut(fid) {
                                     if let PcWidgetKind::Entry { ref mut cursor, ref buffer } = n.kind {
                                         if *cursor < buffer.len() { *cursor += 1; }
                                     }
@@ -486,6 +575,16 @@ mod pancurses_backend {
                                         }
                                     }
                                 }
+                            } else if let Some(fid) = state.focus_id {
+                                if is_spreadsheet_focused(state, fid) {
+                                    spreadsheet_commit_edit(state, fid);
+                                    if let Some(n) = state.node_mut(fid) {
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                                            if *cursor_row > 0 { *cursor_row -= 1; }
+                                        }
+                                    }
+                                    spreadsheet_scroll_to_cursor(state, fid);
+                                }
                             }
                         });
                     }
@@ -499,6 +598,119 @@ mod pancurses_backend {
                                             if si < submenu_items.len() && state.active_item + 1 < submenu_items[si].1.len() {
                                                 state.active_item += 1;
                                             }
+                                        }
+                                    }
+                                }
+                            } else if let Some(fid) = state.focus_id {
+                                if is_spreadsheet_focused(state, fid) {
+                                    spreadsheet_commit_edit(state, fid);
+                                    if let Some(n) = state.node_mut(fid) {
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, total_rows, .. } = n.kind {
+                                            if *cursor_row + 1 < total_rows { *cursor_row += 1; }
+                                        }
+                                    }
+                                    spreadsheet_scroll_to_cursor(state, fid);
+                                }
+                            }
+                        });
+                    }
+                    Some(Input::KeyLeft) => {
+                        with_state(|state| {
+                            if state.menu_open {
+                                if state.active_submenu > 0 {
+                                    state.active_submenu -= 1;
+                                    state.active_item = 0;
+                                }
+                            } else if let Some(fid) = state.focus_id {
+                                if is_spreadsheet_focused(state, fid) {
+                                    spreadsheet_commit_edit(state, fid);
+                                    if let Some(n) = state.node_mut(fid) {
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                                            if *cursor_col > 0 { *cursor_col -= 1; }
+                                        }
+                                    }
+                                    spreadsheet_scroll_to_cursor(state, fid);
+                                } else if let Some(n) = state.node_mut(fid) {
+                                    if let PcWidgetKind::Entry { ref mut cursor, .. } = n.kind {
+                                        if *cursor > 0 { *cursor -= 1; }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Some(Input::KeyRight) => {
+                        with_state(|state| {
+                            if state.menu_open {
+                                if let Some(mid) = state.menu_bar_id {
+                                    if let Some(n) = state.node(mid) {
+                                        if let PcWidgetKind::MenuBar { labels, .. } = &n.kind {
+                                            if state.active_submenu + 1 < labels.len() {
+                                                state.active_submenu += 1;
+                                                state.active_item = 0;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if let Some(fid) = state.focus_id {
+                                if is_spreadsheet_focused(state, fid) {
+                                    spreadsheet_commit_edit(state, fid);
+                                    if let Some(n) = state.node_mut(fid) {
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
+                                            if *cursor_col + 1 < total_cols { *cursor_col += 1; }
+                                        }
+                                    }
+                                } else if let Some(n) = state.node_mut(fid) {
+                                    if let PcWidgetKind::Entry { ref mut cursor, ref buffer } = n.kind {
+                                        if *cursor < buffer.len() { *cursor += 1; }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Some(Input::KeyUp) => {
+                        with_state(|state| {
+                            if state.menu_open {
+                                if let Some(mid) = state.menu_bar_id {
+                                    if let Some(n) = state.node(mid) {
+                                        if let PcWidgetKind::MenuBar { submenu_items, .. } = &n.kind {
+                                            let si = state.active_submenu;
+                                            if si < submenu_items.len() && state.active_item > 0 {
+                                                state.active_item -= 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if let Some(fid) = state.focus_id {
+                                if is_spreadsheet_focused(state, fid) {
+                                    spreadsheet_commit_edit(state, fid);
+                                    if let Some(n) = state.node_mut(fid) {
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                                            if *cursor_row > 0 { *cursor_row -= 1; }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Some(Input::KeyDown) => {
+                        with_state(|state| {
+                            if state.menu_open {
+                                if let Some(mid) = state.menu_bar_id {
+                                    if let Some(n) = state.node(mid) {
+                                        if let PcWidgetKind::MenuBar { submenu_items, .. } = &n.kind {
+                                            let si = state.active_submenu;
+                                            if si < submenu_items.len() && state.active_item + 1 < submenu_items[si].1.len() {
+                                                state.active_item += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if let Some(fid) = state.focus_id {
+                                if is_spreadsheet_focused(state, fid) {
+                                    spreadsheet_commit_edit(state, fid);
+                                    if let Some(n) = state.node_mut(fid) {
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, total_rows, .. } = n.kind {
+                                            if *cursor_row + 1 < total_rows { *cursor_row += 1; }
                                         }
                                     }
                                 }
@@ -733,6 +945,203 @@ mod pancurses_backend {
                     root.attroff(COLOR_PAIR(3));
                 }
             }
+            PcWidgetKind::Spreadsheet { ref cells, total_rows: _, total_cols: _, ref top_row, ref left_col, ref cursor_row, ref cursor_col, ref editing, ref edit_buf, ref edit_pos, ref col_width } => {
+                let cw = *col_width as i32;
+                let rh_w = 4i32; // row header width
+                let sep: char = '║';
+                // clear widget area
+                for dy in 0..rect.h {
+                    for dx in 0..rect.w {
+                        root.mvaddch(rect.y + dy, rect.x + dx, ' ');
+                    }
+                }
+                let max_data_cols = ((rect.w - rh_w - 1) / (cw + 1)).max(1);
+                let max_data_rows = (rect.h - 2).max(1) as u32;
+                // draw column headers
+                if has_colors() { root.attron(COLOR_PAIR(4)); }
+                root.mvaddstr(rect.y, rect.x, "    "); // row header blank
+                root.mvaddch(rect.y, rect.x + rh_w, sep);
+                for vc in 0..max_data_cols {
+                    let col_idx = *left_col + vc as u32;
+                    let label = col_label(col_idx);
+                    let dx = rect.x + rh_w + 1 + vc * (cw + 1);
+                    root.mvaddstr(rect.y, dx, &label);
+                }
+                if has_colors() { root.attroff(COLOR_PAIR(4)); }
+                // draw header separator
+                root.mvaddstr(rect.y + 1, rect.x, "═══╬");
+                for vc in 0..max_data_cols {
+                    let dx = rect.x + rh_w + 1 + vc * (cw + 1);
+                    for i in 0..cw as usize {
+                        root.mvaddch(rect.y + 1, dx + i as i32, '═');
+                    }
+                    root.mvaddch(rect.y + 1, dx + cw, sep);
+                }
+                // draw data rows
+                for vr in 0..max_data_rows {
+                    let row_idx = *top_row + vr as u32;
+                    let ry = rect.y + 2 + vr as i32;
+                    // row header
+                    if has_colors() { root.attron(COLOR_PAIR(4)); }
+                    let rh_text = format!("{:>3} ", row_idx + 1);
+                    root.mvaddstr(ry, rect.x, &rh_text);
+                    root.mvaddch(ry, rect.x + rh_w, sep);
+                    if has_colors() { root.attroff(COLOR_PAIR(4)); }
+                    // data cells
+                    let cells_ref = cells.borrow();
+                    let mut vc = 0i32;
+                    while vc < max_data_cols {
+                        let col_idx = *left_col + vc as u32;
+                        let cell_text = cells_ref.get(&(row_idx, col_idx)).map(|s| s.as_str()).unwrap_or("");
+                        let is_cursor = row_idx == *cursor_row && col_idx == *cursor_col;
+                        let is_editing = is_cursor && *editing;
+                        let dx = rect.x + rh_w + 1 + vc * (cw + 1);
+                        if cell_text.is_empty() && !is_editing {
+                            // draw empty cell
+                            if is_cursor {
+                                if has_colors() { root.attron(COLOR_PAIR(2)); }
+                                for i in 0..cw { root.mvaddch(ry, dx + i, ' '); }
+                                if has_colors() { root.attroff(COLOR_PAIR(2)); }
+                            }
+                            root.mvaddch(ry, dx + cw, sep);
+                            vc += 1;
+                            continue;
+                        }
+                        // determine display text with overflow
+                        let text = if is_editing { &edit_buf } else { cell_text };
+                        let text_len = text.len() as i32;
+                        // scan rightward for overflow into empty cells
+                        let mut overflow_cols = 0i32;
+                        if !is_editing && text_len > cw {
+                            let mut scan = vc + 1;
+                            while scan < max_data_cols {
+                                let sc = *left_col + scan as u32;
+                                if cells_ref.get(&(row_idx, sc)).map_or(true, |s| s.is_empty()) {
+                                    overflow_cols += 1;
+                                    scan += 1;
+                                } else { break; }
+                            }
+                        }
+                        let available = (overflow_cols + 1) * cw;
+                        let display = if text_len > available {
+                            let trunc = (available - 1).max(1) as usize;
+                            let mut s: String = text.chars().take(trunc).collect();
+                            s.push('…');
+                            s
+                        } else {
+                            text.to_string()
+                        };
+                        // draw cell background
+                        if is_cursor && has_colors() { root.attron(COLOR_PAIR(2)); }
+                        for i in 0..(overflow_cols + 1) * cw {
+                            let cx = dx + i;
+                            if cx < rect.x + rect.w {
+                                root.mvaddch(ry, cx, ' ');
+                            }
+                        }
+                        if is_cursor && has_colors() { root.attroff(COLOR_PAIR(2)); }
+                        // draw text
+                        if is_editing {
+                            // show edit buffer: scroll to show cursor position
+                            let buf_len = edit_buf.len();
+                            let scroll = if *edit_pos > ((cw - 1) as usize) { *edit_pos - (cw as usize) + 1 } else { 0 };
+                            let start = scroll.min(buf_len);
+                            let visible: String = edit_buf.chars().skip(start).take(cw as usize).collect();
+                            if is_cursor && has_colors() { root.attron(COLOR_PAIR(2)); }
+                            root.mvaddstr(ry, dx, &visible);
+                            // draw cursor
+                            let cursor_col = (*edit_pos - scroll) as i32;
+                            if cursor_col < cw && cursor_col >= 0 {
+                                let ch = '_' as u32 | A_REVERSE as u32;
+                                let cpos = dx + cursor_col;
+                                if cpos < rect.x + rect.w {
+                                    root.mvaddch(ry, cpos, ch);
+                                }
+                            }
+                            if is_cursor && has_colors() { root.attroff(COLOR_PAIR(2)); }
+                        } else {
+                            if is_cursor && has_colors() { root.attron(COLOR_PAIR(2)); }
+                            root.mvaddstr(ry, dx, &display);
+                            if is_cursor && has_colors() { root.attroff(COLOR_PAIR(2)); }
+                        }
+                        // draw column separators
+                        for i in 0..=overflow_cols {
+                            let sx = dx + (i + 1) * cw;
+                            if sx < rect.x + rect.w {
+                                root.mvaddch(ry, sx, sep);
+                            }
+                        }
+                        vc += 1 + overflow_cols;
+                    }
+                }
+            }
+        }
+    }
+
+    fn is_spreadsheet_focused(state: &PcState, fid: usize) -> bool {
+        state.node(fid).map_or(false, |n| matches!(n.kind, PcWidgetKind::Spreadsheet { .. }))
+    }
+
+    fn spreadsheet_enter(state: &mut PcState, fid: usize) {
+        if let Some(n) = state.node_mut(fid) {
+            if let PcWidgetKind::Spreadsheet { ref cells, ref mut cursor_row, ref mut cursor_col, ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                if *editing {
+                    cells.borrow_mut().insert((*cursor_row, *cursor_col), edit_buf.clone());
+                    *editing = false;
+                    if *cursor_row + 1 < u32::MAX { *cursor_row += 1; }
+                } else {
+                    *editing = true;
+                    let existing = cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
+                    *edit_buf = existing;
+                    *edit_pos = edit_buf.len();
+                }
+            }
+        }
+    }
+
+    fn spreadsheet_scroll_to_cursor(state: &mut PcState, fid: usize) {
+        if let Some(n) = state.node_mut(fid) {
+            if let PcWidgetKind::Spreadsheet { ref mut top_row, ref mut left_col, ref cursor_row, ref cursor_col, ref col_width, .. } = n.kind {
+                let cw = *col_width as i32;
+                let rh_w = 4i32;
+                let max_data_cols = ((n.rect.w - rh_w - 1) / (cw + 1)).max(1);
+                let max_data_rows = (n.rect.h - 2).max(1) as u32;
+                if *cursor_row < *top_row {
+                    *top_row = *cursor_row;
+                } else if *cursor_row >= *top_row + max_data_rows {
+                    *top_row = *cursor_row - max_data_rows + 1;
+                }
+                if *cursor_col < *left_col {
+                    *left_col = *cursor_col;
+                } else if *cursor_col >= *left_col + max_data_cols as u32 {
+                    *left_col = *cursor_col - max_data_cols as u32 + 1;
+                }
+            }
+        }
+    }
+
+    fn spreadsheet_commit_edit(state: &mut PcState, fid: usize) {
+        if let Some(n) = state.node_mut(fid) {
+            if let PcWidgetKind::Spreadsheet { ref cells, cursor_row, cursor_col, ref edit_buf, ref mut editing, .. } = n.kind {
+                if *editing {
+                    cells.borrow_mut().insert((cursor_row, cursor_col), edit_buf.clone());
+                    *editing = false;
+                }
+            }
+        }
+    }
+
+    fn col_label(idx: u32) -> String {
+        if idx < 26 {
+            let c = (b'A' + idx as u8) as char;
+            c.to_string()
+        } else {
+            let prefix = (idx / 26 - 1) as u8;
+            let suffix = (idx % 26) as u8;
+            let mut s = String::new();
+            s.push((b'A' + prefix) as char);
+            s.push((b'A' + suffix) as char);
+            s
         }
     }
 
@@ -844,6 +1253,46 @@ mod pancurses_backend {
 
     pub fn create_textview() -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         Ok(with_state(|s| s.add_node(PcWidgetKind::TextView { text: String::new() }, find_window_id(s))))
+    }
+
+    pub fn create_spreadsheet(rows: u32, cols: u32) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let cells = Rc::new(RefCell::new(HashMap::new()));
+        let id = with_state(|s| s.add_node(PcWidgetKind::Spreadsheet {
+            cells,
+            total_rows: rows,
+            total_cols: cols,
+            top_row: 0,
+            left_col: 0,
+            cursor_row: 0,
+            cursor_col: 0,
+            editing: false,
+            edit_buf: String::new(),
+            edit_pos: 0,
+            col_width: 12,
+        }, find_window_id(s)));
+        Ok(id)
+    }
+
+    pub fn spreadsheet_set_cell(id: usize, r: u32, c: u32, text: &str) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(id) {
+                if let PcWidgetKind::Spreadsheet { ref cells, .. } = n.kind {
+                    cells.borrow_mut().insert((r, c), text.to_string());
+                }
+            }
+        });
+    }
+
+    pub fn spreadsheet_get_cell(id: usize, r: u32, c: u32) -> Option<String> {
+        with_state(|s| {
+            s.node(id).and_then(|n| {
+                if let PcWidgetKind::Spreadsheet { ref cells, .. } = n.kind {
+                    cells.borrow().get(&(r, c)).cloned()
+                } else {
+                    None
+                }
+            })
+        })
     }
 
     pub fn set_window_title(id: usize, title: &str) {

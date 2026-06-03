@@ -292,6 +292,11 @@ impl App {
         crate::backends_pancurses_adapter::create_textview()
     }
 
+    #[cfg(feature = "pancurses")]
+    pub fn create_spreadsheet(&self, rows: u32, cols: u32) -> Result<crate::backends_pancurses_adapter::Spreadsheet, Error> {
+        crate::backends_pancurses_adapter::create_spreadsheet(rows, cols)
+    }
+
     // -- Zork paths --
 
     #[cfg(feature = "zork")]
