@@ -443,11 +443,137 @@ mod gtk_adapter {
             self.0.set_content_width(w);
             self.0.set_content_height(h);
         }
+
+        pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) {
+            let loader = crate::backends::gtk::loader()
+                .expect("GTK loader not initialized after Canvas creation");
+            let symbols = &loader.symbols;
+            let inner = *self.0.as_ref();
+            if symbols.gtk_gesture_click_new.is_some() {
+                // GTK4: use GestureClick
+                if let Ok(gesture) = gtk_dynamic_loader::GestureClick::new(loader.clone()) {
+                    let mut cb = cb;
+                    let _ = gesture.connect_pressed(Box::new(move |_n: i32, x: f64, y: f64| {
+                        cb(x, y);
+                    }));
+                    gesture.add_to_widget(&self.0);
+                }
+            } else if symbols.gtk_widget_add_events.is_some() {
+                // GTK3: use button-press-event signal
+                let mask = 1 << 8; // GDK_BUTTON_PRESS_MASK
+                unsafe { gtk_dynamic_loader::widget_add_events(&loader, inner, mask); }
+                let mut cb = cb;
+                let l2 = loader.clone();
+                let l3 = l2.clone();
+                unsafe {
+                    let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                        &l3, inner, "button-press-event",
+                        Box::new(move |ev: *mut c_void| -> i32 {
+                            if let Some((x, y)) = gtk_dynamic_loader::gdk_event_get_coords(&l2, ev) {
+                                cb(x, y);
+                                return 1;
+                            }
+                            0
+                        }),
+                    );
+                }
+            }
+        }
+
+        pub fn on_key(&self, cb: Box<dyn FnMut(u32) -> bool>) {
+            let loader = crate::backends::gtk::loader()
+                .expect("GTK loader not initialized after Canvas creation");
+            let symbols = &loader.symbols;
+            let inner = *self.0.as_ref();
+            if symbols.gtk_event_controller_key_new.is_some() {
+                // GTK4: use EventControllerKey
+                if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(loader.clone()) {
+                    let mut cb = cb;
+                    let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32| -> i32 {
+                        if cb(keyval) { 1 } else { 0 }
+                    }));
+                    ctrl.add_to_widget(&self.0);
+                }
+            } else {
+                // GTK3: use key-press-event signal on the drawing area
+                let mut cb = cb;
+                let l2 = loader.clone();
+                let l3 = l2.clone();
+                unsafe {
+                    let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                        &l3, inner, "key-press-event",
+                        Box::new(move |ev: *mut c_void| -> i32 {
+                            let keyval = gtk_dynamic_loader::EventControllerKey::get_keyval_static(&l2, ev);
+                            if cb(keyval) { 1 } else { 0 }
+                        }),
+                    );
+                }
+            }
+        }
     }
 
     pub fn create_canvas() -> Result<Canvas, Error> {
         let da = crate::backends::gtk::create_drawing_area().map_err(|e| Error::Backend(format!("{}", e)))?;
         Ok(Canvas(da))
+    }
+
+    // ---- Overlay (cross-platform stacking container) ----
+
+    #[repr(transparent)]
+    pub struct Overlay(pub gtk_dynamic_loader::Overlay);
+
+    impl Clone for Overlay { fn clone(&self) -> Self { Overlay(self.0.clone()) } }
+    impl AsRef<*mut c_void> for Overlay { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+    impl Widget for Overlay { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
+
+    impl Overlay {
+        pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
+            self.0.set_child(child);
+        }
+        pub fn add_overlay(&self, child: &impl AsRef<*mut c_void>) {
+            self.0.add_overlay(child);
+        }
+        pub fn set_overlay_pass_through(&self, child: &impl AsRef<*mut c_void>, pass: bool) {
+            self.0.set_overlay_pass_through(child, pass);
+        }
+        pub fn remove(&self, child: &impl AsRef<*mut c_void>) {
+            self.0.remove(child);
+        }
+        pub fn show_all(&self) {
+            self.0.show_all();
+        }
+    }
+
+    pub fn create_overlay() -> Result<Overlay, Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+        let o = gtk_dynamic_loader::Overlay::new(loader.clone())
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(Overlay(o))
+    }
+
+    // ---- File dialogs ----
+
+    pub fn open_file(title: &str) -> Result<Option<String>, Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+        if let Ok(chooser) = unsafe { gtk_dynamic_loader::FileChooserNative::open(loader.clone(), title, std::ptr::null_mut()) } {
+            if chooser.run() == -3 {
+                return Ok(chooser.get_filename());
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn save_file(title: &str) -> Result<Option<String>, Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+        if let Ok(chooser) = unsafe { gtk_dynamic_loader::FileChooserNative::save(loader.clone(), title, std::ptr::null_mut()) } {
+            if chooser.run() == -3 {
+                return Ok(chooser.get_filename());
+            }
+        }
+        Ok(None)
     }
 
     pub fn quit_main_loop() -> Result<(), Error> {

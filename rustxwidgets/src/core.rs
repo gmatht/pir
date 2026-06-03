@@ -140,6 +140,21 @@ impl App {
         crate::backends_gtk_adapter::create_canvas()
     }
 
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn create_overlay(&self) -> Result<crate::backends_gtk_adapter::Overlay, Error> {
+        crate::backends_gtk_adapter::create_overlay()
+    }
+
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn open_file(&self, title: &str) -> Result<Option<String>, Error> {
+        crate::backends_gtk_adapter::open_file(title)
+    }
+
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn save_file(&self, title: &str) -> Result<Option<String>, Error> {
+        crate::backends_gtk_adapter::save_file(title)
+    }
+
     // -- Windows paths --
 
     #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]

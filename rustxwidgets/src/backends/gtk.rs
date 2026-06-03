@@ -126,6 +126,11 @@ mod gtk_backend {
         gtk_dynamic_loader::DrawingArea::new(loader.clone())
     }
 
+    pub fn create_overlay() -> Result<gtk_dynamic_loader::Overlay, gtk_dynamic_loader::Error> {
+        let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
+        gtk_dynamic_loader::Overlay::new(loader.clone())
+    }
+
     /// Return the Arc<Loader> if the backend has been initialized.
     pub fn loader() -> Option<Arc<Loader>> {
         LOADER.get().cloned()
@@ -142,4 +147,4 @@ mod gtk_backend {
     }
 }
 
-pub use gtk_backend::{init, create_window, create_button, create_label, create_box, create_grid, create_entry, create_menu, create_simple_action, create_menubar, create_dialog, create_dropdown, create_checkbutton, create_radiobutton, create_textview, create_drawing_area, loader, quit_main_loop};
+pub use gtk_backend::{init, create_window, create_button, create_label, create_box, create_grid, create_entry, create_menu, create_simple_action, create_menubar, create_dialog, create_dropdown, create_checkbutton, create_radiobutton, create_textview, create_drawing_area, create_overlay, loader, quit_main_loop};
