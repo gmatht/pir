@@ -9,9 +9,9 @@ pub trait BackendApp {
     fn run(self: Box<Self>) -> Result<(), BackendError>;
 }
 
-#[cfg(all(target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
 pub mod gtk;
-#[cfg(all(target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
 pub use self::gtk::init;
 
 #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]

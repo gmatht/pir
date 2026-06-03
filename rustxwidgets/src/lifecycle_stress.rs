@@ -4,14 +4,14 @@ pub enum Op {
     RemoveWidget,
     MutateWidget,
     CycleStyle,
-    NestLayout,
-    UnnestLayout,
+    TeardownRace,
     ToggleVisible,
     ToggleExpand,
     FocusShuffle,
     ResizeWindow,
     PulseChild,
     ResizeWidget,
+    AbuseWidget,
 }
 
 impl Op {
@@ -21,25 +21,25 @@ impl Op {
             1 => Self::RemoveWidget,
             2 => Self::MutateWidget,
             3 => Self::CycleStyle,
-            4 => Self::NestLayout,
-            5 => Self::UnnestLayout,
-            6 => Self::ToggleVisible,
-            7 => Self::ToggleExpand,
-            8 => Self::FocusShuffle,
-            9 => Self::ResizeWindow,
-            10 => Self::PulseChild,
-            _ => Self::ResizeWidget,
+            4 => Self::TeardownRace,
+            5 => Self::ToggleVisible,
+            6 => Self::ToggleExpand,
+            7 => Self::FocusShuffle,
+            8 => Self::ResizeWindow,
+            9 => Self::PulseChild,
+            10 => Self::ResizeWidget,
+            _ => Self::AbuseWidget,
         }
     }
 
-    /// Weighted: 30% add, 25% remove, 10% nest, 8% unnest, 7% style, 20% other
+    /// Weighted: 27% add, 22% remove, 7% style, 7% teardown, 5% abuse, 32% other
     pub fn pick_weighted(roll: u32) -> Self {
         let band = roll % 100;
-        if band < 30 { return Self::AddWidget; }
-        if band < 55 { return Self::RemoveWidget; }
-        if band < 65 { return Self::NestLayout; }
-        if band < 73 { return Self::UnnestLayout; }
-        if band < 80 { return Self::CycleStyle; }
+        if band < 27 { return Self::AddWidget; }
+        if band < 49 { return Self::RemoveWidget; }
+        if band < 56 { return Self::CycleStyle; }
+        if band < 63 { return Self::TeardownRace; }
+        if band < 68 { return Self::AbuseWidget; }
         Self::from_index(band)
     }
 
@@ -49,14 +49,14 @@ impl Op {
             Self::RemoveWidget => "remove_widget",
             Self::MutateWidget => "mutate_widget",
             Self::CycleStyle => "cycle_style",
-            Self::NestLayout => "nest_layout",
-            Self::UnnestLayout => "unnest_layout",
+            Self::TeardownRace => "teardown_race",
             Self::ToggleVisible => "toggle_visible",
             Self::ToggleExpand => "toggle_expand",
             Self::FocusShuffle => "focus_shuffle",
             Self::ResizeWindow => "resize_window",
             Self::PulseChild => "pulse_child",
             Self::ResizeWidget => "resize_widget",
+            Self::AbuseWidget => "abuse_widget",
         }
     }
 }
@@ -81,14 +81,14 @@ impl LifecycleModel {
             }
             Op::MutateWidget
             | Op::CycleStyle
-            | Op::NestLayout
-            | Op::UnnestLayout
+            | Op::TeardownRace
             | Op::ToggleVisible
             | Op::ToggleExpand
             | Op::FocusShuffle
             | Op::ResizeWindow
             | Op::PulseChild
-            | Op::ResizeWidget => {}
+            | Op::ResizeWidget
+            | Op::AbuseWidget => {}
         }
     }
 }
@@ -104,14 +104,14 @@ mod tests {
             Just(Op::RemoveWidget),
             Just(Op::MutateWidget),
             Just(Op::CycleStyle),
-            Just(Op::NestLayout),
-            Just(Op::UnnestLayout),
+            Just(Op::TeardownRace),
             Just(Op::ToggleVisible),
             Just(Op::ToggleExpand),
             Just(Op::FocusShuffle),
             Just(Op::ResizeWindow),
             Just(Op::PulseChild),
             Just(Op::ResizeWidget),
+            Just(Op::AbuseWidget),
         ]
     }
 

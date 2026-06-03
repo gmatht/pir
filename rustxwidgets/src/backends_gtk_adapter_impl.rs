@@ -54,6 +54,9 @@ mod gtk_adapter {
         }
 
         pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
+        pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
+        pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
+        pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
     }
 
     impl Clone for Button { fn clone(&self) -> Self { Button(self.0.clone()) } }
@@ -75,6 +78,9 @@ mod gtk_adapter {
         pub fn remove_class(&self, class_name: &str) { self.0.remove_class(class_name); }
         pub fn set_markup(&self, markup: &str) { self.0.set_markup(markup); }
         pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
+        pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
+        pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
+        pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
         /// Set the x alignment of the label's text (0.0 left .. 1.0 right)
         pub fn set_xalign(&self, x: f32) { self.0.set_xalign(x); }
     }
@@ -95,6 +101,7 @@ mod gtk_adapter {
         pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
+        pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
     }
 
     #[repr(transparent)]
@@ -106,6 +113,10 @@ mod gtk_adapter {
         pub fn attach(&self, child: &impl AsRef<*mut c_void>, left: i32, top: i32, width: i32, height: i32) {
             self.0.attach(child, left, top, width, height);
         }
+        pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
+        pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
+        pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
+        pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
     }
 
     #[repr(transparent)]
@@ -137,6 +148,8 @@ mod gtk_adapter {
         pub fn set_halign(&self, align: i32) { self.0.set_halign(align); }
         pub fn set_valign(&self, align: i32) { self.0.set_valign(align); }
         pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
+        pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
+        pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
     }
 
     impl Clone for Entry { fn clone(&self) -> Self { Entry(self.0.clone()) } }
@@ -260,6 +273,10 @@ mod gtk_adapter {
         pub fn connect_changed<F: FnMut() + 'static>(&self, f: F) -> Result<u64, Error> {
             self.0.connect_changed(f).map_err(|e| Error::Backend(format!("{}", e)))
         }
+        pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
+        pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
+        pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
+        pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
     }
 
     pub fn create_dropdown(items: &[&str]) -> Result<DropDown, Error> {
@@ -280,6 +297,10 @@ mod gtk_adapter {
         pub fn connect_toggled<F: FnMut() + 'static>(&self, f: F) -> Result<u64, Error> {
             self.0.connect_toggled(f).map_err(|e| Error::Backend(format!("{}", e)))
         }
+        pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
+        pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
+        pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
+        pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
     }
 
     pub fn create_checkbutton(label: &str) -> Result<CheckButton, Error> {
@@ -300,6 +321,10 @@ mod gtk_adapter {
         pub fn connect_toggled<F: FnMut() + 'static>(&self, f: F) -> Result<u64, Error> {
             self.0.connect_toggled(f).map_err(|e| Error::Backend(format!("{}", e)))
         }
+        pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
+        pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
+        pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
+        pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
     }
 
     pub fn create_radiobutton(group: Option<&RadioButton>, label: &str) -> Result<RadioButton, Error> {
@@ -322,6 +347,7 @@ mod gtk_adapter {
         pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
+        pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
     }
 
     pub fn create_textview() -> Result<TextView, Error> {

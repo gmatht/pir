@@ -458,13 +458,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Keep event controllers alive until after win.present(). They are
+    // declared here (function scope) so they outlive the setup blocks below.
+    let mut _gestures: Vec<gtk_dynamic_loader::GestureClick> = Vec::new();
+    let mut _key_ctrl: Option<gtk_dynamic_loader::EventControllerKey> = None;
+
     let queue_redraw = Rc::new({
         let da = drawing_area.clone();
         move || da.queue_draw()
     });
 
     let commit_edit = {
-        let loader_commit = loader.clone();
+        let overlay_commit = overlay.clone();
         let texts_nav = texts.clone();
         let edit_entry_nav = editing_entry.clone();
         let text_input_active = text_input_active.clone();
@@ -483,9 +488,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 formula_e.set_text(&new_text);
-                // Remove the entry from its parent so it doesn't remain visible.
-                // Drop will safely call g_object_unref to release our ref.
-                unsafe { gtk_dynamic_loader::remove_from_parent(&loader_commit, *e.as_ref()); }
+                // Must use overlay.remove() not remove_from_parent() because
+                // GtkOverlay keeps a separate internal children list.
+                overlay_commit.remove(&e);
                 qr();
             }
         }
@@ -655,6 +660,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(f) = cl.borrow_mut().as_mut() { f(x + scroll_x, y + scroll_y); }
                 }));
                 gesture.add_to_widget(&overlay);
+                _gestures.push(gesture);
             }
         } else {
             let cl = click_logic.clone();
@@ -844,6 +850,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     refresh_sel();
                     0
                 })).ok();
+                _key_ctrl = Some(ctrl);
             }
         } else {
             let win_ptr = *win.as_ref();
@@ -998,10 +1005,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let result = app.run().map_err(|e| Box::new(e) as Box<dyn std::error::Error>);
 
-    // Remove any leftover editing entry from its parent so it's no longer visible.
-    // Drop will safely call g_object_unref to release our ref.
+    // Remove any leftover editing entry from the overlay.
     if let Some(e) = editing_entry.borrow_mut().take() {
-        unsafe { gtk_dynamic_loader::remove_from_parent(&loader, *e.as_ref()); }
+        overlay.remove(&e);
     }
 
     result

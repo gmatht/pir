@@ -206,6 +206,8 @@ mod pancurses_adapter {
 
     pub struct Menu {
         pub(crate) id: usize,
+        pub(crate) items: std::cell::RefCell<Vec<(String, String)>>,
+        submenu_data: std::cell::RefCell<Vec<(String, Vec<(String, String)>)>>,
     }
 
     impl AsRef<*mut c_void> for Menu {
@@ -215,10 +217,26 @@ mod pancurses_adapter {
     }
 
     impl Menu {
-        pub fn append(&self, _label: &str, _action_name: &str) {}
-        pub fn append_submenu(&self, _label: &str, _submenu: &Menu) {}
+        pub fn append(&self, label: &str, action_name: &str) {
+            self.items.borrow_mut().push((label.to_string(), action_name.to_string()));
+        }
+        pub fn append_submenu(&self, label: &str, submenu: &Menu) {
+            let sub_items = submenu.items.borrow().clone();
+            self.submenu_data.borrow_mut().push((label.to_string(), sub_items));
+        }
         pub fn append_item(&self, _label: &str, _action: &SimpleAction) {}
         pub fn append_section(&self, _label: &str) {}
+    }
+
+    pub(crate) fn collect_menu_items(menu: &Menu) -> (Vec<String>, Vec<Vec<(String, String)>>) {
+        let submenus = menu.submenu_data.borrow();
+        let mut labels = Vec::new();
+        let mut items_list = Vec::new();
+        for (label, items) in submenus.iter() {
+            labels.push(label.clone());
+            items_list.push(items.clone());
+        }
+        (labels, items_list)
     }
 
     // -- MenuBar --
@@ -477,16 +495,16 @@ mod pancurses_adapter {
 
     pub fn create_menu() -> Result<Menu, Error> {
         crate::backends::pancurses::create_menu()
-            .map(|id| Menu { id })
+            .map(|id| Menu { id, items: std::cell::RefCell::new(vec![]), submenu_data: std::cell::RefCell::new(vec![]) })
             .map_err(|e| Error::Backend(format!("{}", e)))
     }
 
     pub fn create_menubar(model: &Menu, _action_group: *mut c_void) -> Result<MenuBar, Error> {
-        unsafe {
-            crate::backends::pancurses::create_menubar(model.id, _action_group)
-                .map(|id| MenuBar { id })
-                .map_err(|e| Error::Backend(format!("{}", e)))
-        }
+        let (labels, itemss) = collect_menu_items(model);
+        let submenu_items: Vec<(String, Vec<(String, String)>)> = labels.into_iter().zip(itemss.into_iter()).collect();
+        let id = unsafe { crate::backends::pancurses::create_menubar(submenu_items, _action_group) }
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(MenuBar { id })
     }
 
     pub fn create_simple_action(name: &str) -> Result<SimpleAction, Error> {

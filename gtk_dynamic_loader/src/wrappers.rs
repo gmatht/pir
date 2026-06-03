@@ -116,6 +116,13 @@ impl BoxWidget {
             unsafe { set(self.inner, if expand { 1 } else { 0 }); }
         }
     }
+
+    pub fn set_visible(&self, visible: bool) {
+        guard_widget!(self, "BoxWidget", "set_visible");
+        if let Some(f) = self.loader.symbols.gtk_widget_set_visible {
+            unsafe { f(self.inner, if visible { 1 } else { 0 }); }
+        }
+    }
 }
 
 impl AsRef<*mut c_void> for BoxWidget { fn as_ref(&self) -> &*mut c_void { &self.inner } }
@@ -273,6 +280,27 @@ impl Button {
             unsafe { sr(self.inner, w, h); }
         }
     }
+
+    pub fn set_visible(&self, visible: bool) {
+        guard_widget!(self, "Button", "set_visible");
+        if let Some(f) = self.loader.symbols.gtk_widget_set_visible {
+            unsafe { f(self.inner, if visible { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_hexpand(&self, expand: bool) {
+        guard_widget!(self, "Button", "set_hexpand");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_hexpand {
+            unsafe { set(self.inner, if expand { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_vexpand(&self, expand: bool) {
+        guard_widget!(self, "Button", "set_vexpand");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_vexpand {
+            unsafe { set(self.inner, if expand { 1 } else { 0 }); }
+        }
+    }
 }
 
 impl AsRef<*mut c_void> for Button { fn as_ref(&self) -> &*mut c_void { &self.inner } }
@@ -377,6 +405,27 @@ impl Label {
         guard_widget!(self, "Label", "set_xalign");
         if let Some(xalign_fn) = self.loader.symbols.gtk_label_set_xalign {
             unsafe { xalign_fn(self.inner, x); }
+        }
+    }
+
+    pub fn set_hexpand(&self, expand: bool) {
+        guard_widget!(self, "Label", "set_hexpand");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_hexpand {
+            unsafe { set(self.inner, if expand { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_vexpand(&self, expand: bool) {
+        guard_widget!(self, "Label", "set_vexpand");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_vexpand {
+            unsafe { set(self.inner, if expand { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_size_request(&self, w: i32, h: i32) {
+        guard_widget!(self, "Label", "set_size_request");
+        if let Some(sr) = self.loader.symbols.gtk_widget_set_size_request {
+            unsafe { sr(self.inner, w, h); }
         }
     }
 }
@@ -514,6 +563,34 @@ impl Grid {
             unsafe { grid_attach(self.inner, child_ptr, left, top, width, height); }
         } else if let Some(box_append) = symbols.gtk_box_append {
             unsafe { box_append(self.inner, child_ptr); }
+        }
+    }
+
+    pub fn set_visible(&self, visible: bool) {
+        guard_widget!(self, "Grid", "set_visible");
+        if let Some(f) = self.loader.symbols.gtk_widget_set_visible {
+            unsafe { f(self.inner, if visible { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_hexpand(&self, expand: bool) {
+        guard_widget!(self, "Grid", "set_hexpand");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_hexpand {
+            unsafe { set(self.inner, if expand { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_vexpand(&self, expand: bool) {
+        guard_widget!(self, "Grid", "set_vexpand");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_vexpand {
+            unsafe { set(self.inner, if expand { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_size_request(&self, w: i32, h: i32) {
+        guard_widget!(self, "Grid", "set_size_request");
+        if let Some(sr) = self.loader.symbols.gtk_widget_set_size_request {
+            unsafe { sr(self.inner, w, h); }
         }
     }
 }
@@ -1330,6 +1407,20 @@ impl Entry {
         guard_widget!(self, "Entry", "set_visible");
         if let Some(f) = self.loader.symbols.gtk_widget_set_visible {
             unsafe { f(self.inner, if visible { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_hexpand(&self, expand: bool) {
+        guard_widget!(self, "Entry", "set_hexpand");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_hexpand {
+            unsafe { set(self.inner, if expand { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_vexpand(&self, expand: bool) {
+        guard_widget!(self, "Entry", "set_vexpand");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_vexpand {
+            unsafe { set(self.inner, if expand { 1 } else { 0 }); }
         }
     }
 
@@ -2189,6 +2280,34 @@ impl DropDown {
             match res { Ok(id) => Ok(id), Err(e) => Err(Error::Other(e)) }
         }
     }
+
+    pub fn set_visible(&self, visible: bool) {
+        guard_widget!(self, "DropDown", "set_visible");
+        if let Some(f) = self.loader.symbols.gtk_widget_set_visible {
+            unsafe { f(self.inner, if visible { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_hexpand(&self, expand: bool) {
+        guard_widget!(self, "DropDown", "set_hexpand");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_hexpand {
+            unsafe { set(self.inner, if expand { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_vexpand(&self, expand: bool) {
+        guard_widget!(self, "DropDown", "set_vexpand");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_vexpand {
+            unsafe { set(self.inner, if expand { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_size_request(&self, w: i32, h: i32) {
+        guard_widget!(self, "DropDown", "set_size_request");
+        if let Some(sr) = self.loader.symbols.gtk_widget_set_size_request {
+            unsafe { sr(self.inner, w, h); }
+        }
+    }
 }
 
 impl AsRef<*mut c_void> for DropDown { fn as_ref(&self) -> &*mut c_void { &self.inner } }
@@ -2259,6 +2378,34 @@ impl CheckButton {
         let boxed: Box<dyn FnMut()> = Box::new(f);
         let res = unsafe { crate::signals::connect_signal(&self.loader.symbols, self.inner, "toggled", boxed, 2) };
         match res { Ok(id) => Ok(id), Err(e) => Err(Error::Other(e)) }
+    }
+
+    pub fn set_visible(&self, visible: bool) {
+        guard_widget!(self, "CheckButton", "set_visible");
+        if let Some(f) = self.loader.symbols.gtk_widget_set_visible {
+            unsafe { f(self.inner, if visible { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_hexpand(&self, expand: bool) {
+        guard_widget!(self, "CheckButton", "set_hexpand");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_hexpand {
+            unsafe { set(self.inner, if expand { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_vexpand(&self, expand: bool) {
+        guard_widget!(self, "CheckButton", "set_vexpand");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_vexpand {
+            unsafe { set(self.inner, if expand { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_size_request(&self, w: i32, h: i32) {
+        guard_widget!(self, "CheckButton", "set_size_request");
+        if let Some(sr) = self.loader.symbols.gtk_widget_set_size_request {
+            unsafe { sr(self.inner, w, h); }
+        }
     }
 }
 
@@ -2334,6 +2481,34 @@ impl RadioButton {
         let boxed: Box<dyn FnMut()> = Box::new(f);
         let res = unsafe { crate::signals::connect_signal(&self.loader.symbols, self.inner, "toggled", boxed, 2) };
         match res { Ok(id) => Ok(id), Err(e) => Err(Error::Other(e)) }
+    }
+
+    pub fn set_visible(&self, visible: bool) {
+        guard_widget!(self, "RadioButton", "set_visible");
+        if let Some(f) = self.loader.symbols.gtk_widget_set_visible {
+            unsafe { f(self.inner, if visible { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_hexpand(&self, expand: bool) {
+        guard_widget!(self, "RadioButton", "set_hexpand");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_hexpand {
+            unsafe { set(self.inner, if expand { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_vexpand(&self, expand: bool) {
+        guard_widget!(self, "RadioButton", "set_vexpand");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_vexpand {
+            unsafe { set(self.inner, if expand { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_size_request(&self, w: i32, h: i32) {
+        guard_widget!(self, "RadioButton", "set_size_request");
+        if let Some(sr) = self.loader.symbols.gtk_widget_set_size_request {
+            unsafe { sr(self.inner, w, h); }
+        }
     }
 }
 
@@ -2428,6 +2603,13 @@ impl TextView {
     pub fn set_vexpand(&self, expand: bool) {
         guard_widget!(self, "TextView", "set_vexpand");
         if let Some(set_vex) = self.loader.symbols.gtk_widget_set_vexpand { unsafe { set_vex(self.inner, if expand { 1 } else { 0 }); } }
+    }
+
+    pub fn set_visible(&self, visible: bool) {
+        guard_widget!(self, "TextView", "set_visible");
+        if let Some(f) = self.loader.symbols.gtk_widget_set_visible {
+            unsafe { f(self.inner, if visible { 1 } else { 0 }); }
+        }
     }
 }
 

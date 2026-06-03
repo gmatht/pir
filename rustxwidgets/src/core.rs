@@ -50,74 +50,74 @@ impl App {
 
     // -- Linux paths --
 
-    #[cfg(all(target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_window(&self) -> Result<crate::backends_gtk_adapter::Window, Error> {
         crate::backends_gtk_adapter::create_window().map_err(|e| e)
     }
 
-    #[cfg(all(target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_button(&self, label: &str) -> Result<crate::backends_gtk_adapter::Button, Error> {
         crate::backends_gtk_adapter::create_button(label).map_err(|e| e)
     }
 
-    #[cfg(all(target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_label(&self, text: &str) -> Result<crate::backends_gtk_adapter::Label, Error> {
         crate::backends_gtk_adapter::create_label(text).map_err(|e| e)
     }
 
-    #[cfg(all(target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_box(&self, orientation: gtk_dynamic_loader::Orientation, spacing: i32) -> Result<crate::backends_gtk_adapter::BoxWidget, Error> {
         crate::backends_gtk_adapter::create_box(orientation, spacing).map_err(|e| e)
     }
 
-    #[cfg(all(target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_grid(&self) -> Result<crate::backends_gtk_adapter::Grid, Error> {
         crate::backends_gtk_adapter::create_grid().map_err(|e| e)
     }
 
-    #[cfg(all(target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_entry(&self) -> Result<crate::backends_gtk_adapter::Entry, Error> {
         crate::backends_gtk_adapter::create_entry().map_err(|e| e)
     }
 
-    #[cfg(all(target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_menu(&self) -> Result<crate::backends_gtk_adapter::Menu, Error> {
         crate::backends_gtk_adapter::create_menu().map_err(|e| e)
     }
 
-    #[cfg(all(target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
     /// # Safety
     /// `action_group` must be a valid GActionGroup pointer or null.
     pub unsafe fn create_menubar(&self, model: &crate::backends_gtk_adapter::Menu, action_group: *mut c_void) -> Result<crate::backends_gtk_adapter::MenuBar, Error> {
         crate::backends_gtk_adapter::create_menubar(model, action_group).map_err(|e| e)
     }
 
-    #[cfg(all(target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_simple_action(&self, name: &str) -> Result<crate::backends_gtk_adapter::SimpleAction, Error> {
         crate::backends_gtk_adapter::create_simple_action(name).map_err(|e| e)
     }
 
-    #[cfg(all(target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_dialog(&self) -> Result<crate::backends_gtk_adapter::Dialog, Error> {
         crate::backends_gtk_adapter::create_dialog().map_err(|e| e)
     }
 
-    #[cfg(all(target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_dropdown(&self, items: &[&str]) -> Result<crate::backends_gtk_adapter::DropDown, Error> {
         crate::backends_gtk_adapter::create_dropdown(items).map_err(|e| e)
     }
 
-    #[cfg(all(target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_checkbutton(&self, label: &str) -> Result<crate::backends_gtk_adapter::CheckButton, Error> {
         crate::backends_gtk_adapter::create_checkbutton(label).map_err(|e| e)
     }
 
-    #[cfg(all(target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_radiobutton(&self, label: &str) -> Result<crate::backends_gtk_adapter::RadioButton, Error> {
         crate::backends_gtk_adapter::create_radiobutton(None, label).map_err(|e| e)
     }
 
-    #[cfg(all(target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_textview(&self) -> Result<crate::backends_gtk_adapter::TextView, Error> {
         crate::backends_gtk_adapter::create_textview().map_err(|e| e)
     }

@@ -26,7 +26,7 @@ mod pancurses_backend {
         RadioButton { label: String, checked: bool, group_id: usize },
         Dialog { title: String },
         Menu,
-        MenuBar,
+        MenuBar { labels: Vec<String>, submenu_items: Vec<(String, Vec<(String, String)>)> },
         SimpleAction,
         DropDown { items: Vec<String>, selected: Option<usize> },
         TextView { text: String },
@@ -47,6 +47,10 @@ mod pancurses_backend {
         pub next_id: usize,
         pub running: bool,
         pub focus_id: Option<usize>,
+        pub menu_bar_id: Option<usize>,
+        pub menu_open: bool,
+        pub active_submenu: usize,
+        pub active_item: usize,
     }
 
     impl PcState {
@@ -56,6 +60,10 @@ mod pancurses_backend {
                 next_id: 1,
                 running: true,
                 focus_id: None,
+                menu_bar_id: None,
+                menu_open: false,
+                active_submenu: 0,
+                active_item: 0,
             }
         }
 
@@ -113,7 +121,8 @@ mod pancurses_backend {
             noecho();
             root.keypad(true);
             mousemask(ALL_MOUSE_EVENTS | REPORT_MOUSE_POSITION, None);
-            half_delay(1);
+            // Use `root.timeout(100)` so we can temporarily change it for Alt+key detection
+            root.timeout(100);
             curs_set(0);
 
             if has_colors() {
@@ -134,6 +143,9 @@ mod pancurses_backend {
                         PcWidgetKind::Window { .. } | PcWidgetKind::Dialog { .. } => {
                             node.rect = Rect { x: 0, y: 0, w: mx, h: my };
                         }
+                        PcWidgetKind::MenuBar { .. } => {
+                            state.menu_bar_id = Some(node.id);
+                        }
                         _ => {}
                     }
                 }
@@ -145,16 +157,20 @@ mod pancurses_backend {
                 with_state(|state| {
                     let ids: Vec<usize> = state.nodes.iter().map(|n| n.id).collect();
                     for id in &ids {
-                        let rect = state.node(*id).map(|n| n.rect);
-                        if let Some(r) = rect {
-                            if r.w == 0 || r.h == 0 {
-                                if let Some(pid) = state.node(*id).and_then(|n| n.parent) {
-                                    let pr = state.node(pid).map(|p| p.rect).unwrap_or(Rect::default());
-                                    if pr.w > 0 || pr.h > 0 {
-                                        if let Some(n) = state.node_mut(*id) {
-                                            if n.rect.w == 0 { n.rect.w = pr.w; }
-                                            if n.rect.h == 0 { n.rect.h = pr.h; }
-                                        }
+                        let info = state.node(*id).and_then(|n| {
+                            let pid = n.parent?;
+                            let pn = state.node(pid)?;
+                            Some((n.rect, pn.rect, matches!(pn.kind, PcWidgetKind::Dialog { .. })))
+                        });
+                        if let Some((r, pr, is_dialog)) = info {
+                            if (r.w == 0 || r.h == 0) && (pr.w > 0 || pr.h > 0) {
+                                if let Some(n) = state.node_mut(*id) {
+                                    let ins = if is_dialog { 1 } else { 0 };
+                                    if n.rect.w == 0 { n.rect.w = (pr.w - 2 * ins).max(1); }
+                                    if n.rect.h == 0 { n.rect.h = (pr.h - 2 * ins).max(1); }
+                                    if is_dialog {
+                                        if n.rect.x == 0 { n.rect.x = pr.x + 1; }
+                                        if n.rect.y == 0 { n.rect.y = pr.y + 1; }
                                     }
                                 }
                             }
@@ -193,6 +209,41 @@ mod pancurses_backend {
                     if !visible { continue; }
                     render_widget(&root, &kind, rect, id, focus_id);
                 }
+                // render active menu dropdown
+                with_state(|state| {
+                    if state.menu_open {
+                        let mid = state.menu_bar_id.unwrap_or(0);
+                        let (sub_idx, item_idx) = (state.active_submenu, state.active_item);
+                        if let Some(n) = state.node(mid) {
+                            if let PcWidgetKind::MenuBar { labels, submenu_items } = &n.kind {
+                                if sub_idx < submenu_items.len() {
+                                    let (_, items) = &submenu_items[sub_idx];
+                                    let dy = n.rect.y + 1;
+                                    let dx = n.rect.x + 1;
+                                    // find horizontal position of this submenu label
+                                    let mut mx = n.rect.x + 1;
+                                    for i in 0..sub_idx {
+                                        mx += labels[i].len() as i32 + 2;
+                                    }
+                                    let max_w = items.iter().map(|(l,_)| l.len()).max().unwrap_or(0).max(4) as i32;
+                                    if has_colors() { root.attron(COLOR_PAIR(4)); }
+                                    for row in 0..items.len() as i32 {
+                                        for col in 0..max_w + 2 {
+                                            root.mvaddch(dy + row, mx + col, ' ');
+                                        }
+                                    }
+                                    if has_colors() { root.attroff(COLOR_PAIR(4)); }
+                                    for (i, (lbl, _)) in items.iter().enumerate() {
+                                        let bg = if i == item_idx && has_colors() { COLOR_PAIR(2) } else { 0 };
+                                        if bg != 0 { root.attron(bg); }
+                                        root.mvaddstr(dy + i as i32, mx + 1, lbl);
+                                        if bg != 0 { root.attroff(bg); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
 
                 root.refresh();
                 match root.getch() {
@@ -213,7 +264,7 @@ mod pancurses_backend {
                         if let Ok(mevent) = getmouse() {
                             let x = mevent.x;
                             let y = mevent.y;
-                            with_state(|state| {
+                            let callbacks = with_state(|state| {
                                 let hit = state.nodes.iter().rev().find(|n| {
                                     n.visible
                                         && n.rect.x <= x && x < n.rect.x + n.rect.w
@@ -225,66 +276,125 @@ mod pancurses_backend {
                                             let idxs: Vec<usize> = (0..state.nodes.len())
                                                 .filter(|i| state.nodes[*i].id == node.id)
                                                 .collect();
+                                            let mut all_cbs = vec![];
                                             for idx in idxs {
-                                                for cb in &mut state.nodes[idx].callbacks {
-                                                    cb();
-                                                }
+                                                all_cbs.append(&mut std::mem::take(&mut state.nodes[idx].callbacks));
                                             }
+                                            all_cbs
                                         }
                                         PcWidgetKind::CheckButton { .. } => {
                                             if let Some(n) = state.node_mut(node.id) {
                                                 if let PcWidgetKind::CheckButton { ref mut checked, .. } = n.kind {
                                                     *checked = !*checked;
                                                 }
-                                                for cb in &mut n.callbacks {
-                                                    cb();
-                                                }
+                                                std::mem::take(&mut n.callbacks)
+                                            } else {
+                                                vec![]
                                             }
                                         }
                                         PcWidgetKind::Entry { .. } => {
                                             state.focus_id = Some(node.id);
+                                            vec![]
                                         }
-                                        _ => {}
+                                        _ => vec![],
                                     }
+                                } else {
+                                    vec![]
                                 }
                             });
+                            fire_callbacks(callbacks);
                         }
                     }
                     Some(Input::Character('\n')) | Some(Input::Character('\r')) => {
-                        with_state(|state| {
-                            if let Some(fid) = state.focus_id {
-                                let idxs: Vec<usize> = (0..state.nodes.len())
-                                    .filter(|i| state.nodes[*i].id == fid)
-                                    .collect();
-                                for idx in idxs {
-                                    match &state.nodes[idx].kind {
-                                        PcWidgetKind::Button { .. } => {
-                                            for cb in &mut state.nodes[idx].callbacks {
-                                                cb();
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
+                        let callbacks = with_state(|state| {
+                            if state.menu_open {
+                                state.menu_open = false;
+                                vec![]
+                            } else if let Some(fid) = state.focus_id {
+                                toggle_focused(state, fid).1
+                            } else {
+                                vec![]
                             }
                         });
+                        fire_callbacks(callbacks);
                     }
                     Some(Input::Character(c)) => {
                         if c == '\t' {
                             with_state(|state| {
-                                let focusable: Vec<usize> = state.nodes.iter()
-                                    .filter(|n| matches!(n.kind, PcWidgetKind::Button { .. } | PcWidgetKind::Entry { .. } | PcWidgetKind::CheckButton { .. }))
-                                    .map(|n| n.id)
-                                    .collect();
-                                if let Some(pos) = state.focus_id.and_then(|f| focusable.iter().position(|&x| x == f)) {
-                                    let next = (pos + 1) % focusable.len();
-                                    state.focus_id = Some(focusable[next]);
+                                if state.menu_open {
+                                    state.menu_open = false;
                                 } else {
-                                    state.focus_id = focusable.first().copied();
+                                    let focusable: Vec<usize> = state.nodes.iter()
+                                        .filter(|n| matches!(n.kind, PcWidgetKind::Button { .. } | PcWidgetKind::Entry { .. } | PcWidgetKind::CheckButton { .. }))
+                                        .map(|n| n.id)
+                                        .collect();
+                                    if let Some(pos) = state.focus_id.and_then(|f| focusable.iter().position(|&x| x == f)) {
+                                        let next = (pos + 1) % focusable.len();
+                                        state.focus_id = Some(focusable[next]);
+                                    } else {
+                                        state.focus_id = focusable.first().copied();
+                                    }
                                 }
                             });
                         } else if c == '\x1b' {
+                            // Distinguish bare Escape from Alt+key (terminal sends ESC + char)
+                            root.timeout(300);
+                            let alt_key = root.getch();
+                            root.timeout(100);
+                            match alt_key {
+                                Some(Input::Character(ac)) => {
+                                    // Alt+key — activate matching submenu
+                                    with_state(|state| {
+                                        if let Some(mid) = state.menu_bar_id {
+                                            if let Some(n) = state.node(mid) {
+                                                if let PcWidgetKind::MenuBar { labels, .. } = &n.kind {
+                                                    let lower = ac.to_ascii_lowercase();
+                                                    if let Some(pos) = labels.iter().position(|l| l.to_ascii_lowercase().starts_with(&lower.to_string())) {
+                                                        state.active_submenu = pos;
+                                                        state.active_item = 0;
+                                                        state.menu_open = true;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+                                _ => {
+                                    // No following char within 300ms → bare Escape → close menu or quit
+                                    with_state(|state| {
+                                        if state.menu_open {
+                                            state.menu_open = false;
+                                        } else {
+                                            state.running = false;
+                                        }
+                                    });
+                                }
+                            }
+                        } else if c == '\x03' {
+                            // Ctrl+C — quit
                             with_state(|state| state.running = false);
+                        } else if c == ' ' {
+                            let (_, callbacks) = with_state(|state| {
+                                if let Some(fid) = state.focus_id {
+                                    let (toggled, cbs) = toggle_focused(state, fid);
+                                    if !toggled {
+                                        // Not a toggleable widget — insert space as text
+                                        let idxs: Vec<usize> = (0..state.nodes.len())
+                                            .filter(|i| state.nodes[*i].id == fid)
+                                            .collect();
+                                        for idx in idxs {
+                                            if let PcWidgetKind::Entry { ref mut buffer, ref mut cursor } = &mut state.nodes[idx].kind {
+                                                buffer.insert(*cursor, ' ');
+                                                *cursor += 1;
+                                            }
+                                        }
+                                    }
+                                    (toggled, cbs)
+                                } else {
+                                    (false, vec![])
+                                }
+                            });
+                            fire_callbacks(callbacks);
                         } else {
                             with_state(|state| {
                                 if let Some(fid) = state.focus_id {
@@ -327,12 +437,15 @@ mod pancurses_backend {
                     }
                     Some(Input::KeyLeft) => {
                         with_state(|state| {
-                            if let Some(fid) = state.focus_id {
+                            if state.menu_open {
+                                if state.active_submenu > 0 {
+                                    state.active_submenu -= 1;
+                                    state.active_item = 0;
+                                }
+                            } else if let Some(fid) = state.focus_id {
                                 if let Some(n) = state.node_mut(fid) {
                                     if let PcWidgetKind::Entry { ref mut cursor, .. } = n.kind {
-                                        if *cursor > 0 {
-                                            *cursor -= 1;
-                                        }
+                                        if *cursor > 0 { *cursor -= 1; }
                                     }
                                 }
                             }
@@ -340,11 +453,52 @@ mod pancurses_backend {
                     }
                     Some(Input::KeyRight) => {
                         with_state(|state| {
-                            if let Some(fid) = state.focus_id {
+                            if state.menu_open {
+                                if let Some(mid) = state.menu_bar_id {
+                                    if let Some(n) = state.node(mid) {
+                                        if let PcWidgetKind::MenuBar { labels, .. } = &n.kind {
+                                            if state.active_submenu + 1 < labels.len() {
+                                                state.active_submenu += 1;
+                                                state.active_item = 0;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if let Some(fid) = state.focus_id {
                                 if let Some(n) = state.node_mut(fid) {
                                     if let PcWidgetKind::Entry { ref mut cursor, ref buffer } = n.kind {
-                                        if *cursor < buffer.len() {
-                                            *cursor += 1;
+                                        if *cursor < buffer.len() { *cursor += 1; }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Some(Input::KeyUp) => {
+                        with_state(|state| {
+                            if state.menu_open {
+                                if let Some(mid) = state.menu_bar_id {
+                                    if let Some(n) = state.node(mid) {
+                                        if let PcWidgetKind::MenuBar { submenu_items, .. } = &n.kind {
+                                            let si = state.active_submenu;
+                                            if si < submenu_items.len() && state.active_item > 0 {
+                                                state.active_item -= 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Some(Input::KeyDown) => {
+                        with_state(|state| {
+                            if state.menu_open {
+                                if let Some(mid) = state.menu_bar_id {
+                                    if let Some(n) = state.node(mid) {
+                                        if let PcWidgetKind::MenuBar { submenu_items, .. } = &n.kind {
+                                            let si = state.active_submenu;
+                                            if si < submenu_items.len() && state.active_item + 1 < submenu_items[si].1.len() {
+                                                state.active_item += 1;
+                                            }
                                         }
                                     }
                                 }
@@ -516,12 +670,29 @@ mod pancurses_backend {
                 }
                 root.mvaddstr(rect.y, rect.x + 2, title);
             }
-            PcWidgetKind::Menu | PcWidgetKind::MenuBar => {
+            PcWidgetKind::Menu => {
                 if has_colors() {
                     root.attron(COLOR_PAIR(4));
                 }
                 for x in rect.x..rect.x + rect.w {
                     root.mvaddch(rect.y, x, ' ');
+                }
+                if has_colors() {
+                    root.attroff(COLOR_PAIR(4));
+                }
+            }
+            PcWidgetKind::MenuBar { labels, .. } => {
+                if has_colors() {
+                    root.attron(COLOR_PAIR(4));
+                }
+                for x in rect.x..rect.x + rect.w {
+                    root.mvaddch(rect.y, x, ' ');
+                }
+                let mut cx = rect.x + 1;
+                for label in labels {
+                    if cx + label.len() as i32 + 2 > rect.x + rect.w { break; }
+                    root.mvaddstr(rect.y, cx, label);
+                    cx += label.len() as i32 + 2;
                 }
                 if has_colors() {
                     root.attroff(COLOR_PAIR(4));
@@ -563,6 +734,47 @@ mod pancurses_backend {
                 }
             }
         }
+    }
+
+    /// Activate the focused widget: toggle CheckButton/RadioButton or fire Button callbacks.
+    /// Returns `(was_toggleable, callbacks_to_fire)`. Callbacks must be fired *outside* `with_state`.
+    fn toggle_focused(state: &mut PcState, fid: usize) -> (bool, Vec<Callback>) {
+        let idx = match state.nodes.iter().position(|n| n.id == fid) {
+            Some(i) => i,
+            None => return (false, vec![]),
+        };
+        match state.nodes[idx].kind {
+            PcWidgetKind::Button { .. } => {
+                let cbs = std::mem::take(&mut state.nodes[idx].callbacks);
+                (true, cbs)
+            }
+            PcWidgetKind::CheckButton { ref mut checked, .. } => {
+                *checked = !*checked;
+                let cbs = std::mem::take(&mut state.nodes[idx].callbacks);
+                (true, cbs)
+            }
+            PcWidgetKind::RadioButton { group_id, .. } => {
+                let gid = group_id;
+                // Uncheck all radio buttons in the same group
+                for node in &mut state.nodes {
+                    if let PcWidgetKind::RadioButton { checked: ref mut oc, group_id: og, .. } = &mut node.kind {
+                        if *og == gid { *oc = false; }
+                    }
+                }
+                // Check the focused one
+                if let PcWidgetKind::RadioButton { checked: ref mut c, .. } = state.nodes[idx].kind {
+                    *c = true;
+                }
+                let cbs = std::mem::take(&mut state.nodes[idx].callbacks);
+                (true, cbs)
+            }
+            _ => (false, vec![]),
+        }
+    }
+
+    /// Fire a list of callbacks outside of any `with_state` borrow.
+    fn fire_callbacks(callbacks: Vec<Callback>) {
+        for mut cb in callbacks { cb(); }
     }
 
     // -- Factory functions --
@@ -607,8 +819,9 @@ mod pancurses_backend {
         Ok(with_state(|s| s.add_node(PcWidgetKind::SimpleAction, find_window_id(s))))
     }
 
-    pub unsafe fn create_menubar(_model: usize, _action_group: *mut c_void) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(with_state(|s| s.add_node(PcWidgetKind::MenuBar, find_window_id(s))))
+    pub unsafe fn create_menubar(submenu_items: Vec<(String, Vec<(String, String)>)>, _action_group: *mut c_void) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let labels: Vec<String> = submenu_items.iter().map(|(l, _)| l.clone()).collect();
+        Ok(with_state(|s| s.add_node(PcWidgetKind::MenuBar { labels, submenu_items }, find_window_id(s))))
     }
 
     pub fn create_dialog() -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
@@ -848,14 +1061,22 @@ mod pancurses_backend {
                 x += per_child + spacing;
             }
         } else {
-            let total_h = parent_rect.h.saturating_sub(total_spacing).max(1);
-            let per_child = if total_children > 0 { (total_h / total_children).max(1) } else { 1 };
+            // Natural-height vertical layout: each child gets 1 row by default,
+            // last child stretches to fill any remaining space.
             let mut y = parent_rect.y;
-            for child_id in &children {
+            let natural_h = 1i32;
+            let total_used = natural_h * total_children + total_spacing;
+            let remaining = parent_rect.h.saturating_sub(total_used);
+            for (i, child_id) in children.iter().enumerate() {
+                let h = if i as i32 == total_children - 1 {
+                    (natural_h + remaining).max(1)
+                } else {
+                    natural_h
+                };
                 if let Some(n) = s.node_mut(*child_id) {
-                    n.rect = Rect { x: parent_rect.x, y, w: parent_rect.w.max(1), h: per_child };
+                    n.rect = Rect { x: parent_rect.x, y, w: parent_rect.w.max(1), h };
                 }
-                y += per_child + spacing;
+                y += h + spacing;
             }
         }
         children.len()
