@@ -1,6 +1,6 @@
 pub use crate::core::{App, DrawContext, Error, HandlerId, Widget};
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
-pub use crate::backends_gtk_adapter::{Window, Button, Label, BoxWidget, Grid, Entry, Menu, MenuBar, SimpleAction, Dialog, DropDown, CheckButton, RadioButton, TextView, Orientation, Canvas, Overlay};
+pub use crate::backends_gtk_adapter::{Window, Button, Label, BoxWidget, Grid, Entry, Menu, MenuBar, SimpleAction, Dialog, DropDown, CheckButton, RadioButton, TextView, Orientation, Canvas, Overlay, Spreadsheet};
 #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
 pub use crate::backends_nwg_adapter::{Window, Button, Label, Menu, SimpleAction};
 #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]

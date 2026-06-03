@@ -167,6 +167,11 @@ impl App {
         crate::backends_gtk_adapter::save_file(title)
     }
 
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn create_spreadsheet(&self, rows: usize, cols: usize) -> Result<crate::backends_gtk_adapter::Spreadsheet, Error> {
+        crate::backends_gtk_adapter::create_spreadsheet(rows, cols)
+    }
+
     // -- Windows paths --
 
     #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]

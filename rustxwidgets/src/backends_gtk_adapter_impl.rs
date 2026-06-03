@@ -611,6 +611,32 @@ mod gtk_adapter {
         Ok(None)
     }
 
+    // ---- Spreadsheet (cross-platform grid widget) ----
+
+    pub struct Spreadsheet(pub Canvas, pub Overlay);
+
+    impl Clone for Spreadsheet { fn clone(&self) -> Self { Spreadsheet(self.0.clone(), self.1.clone()) } }
+    impl AsRef<*mut c_void> for Spreadsheet { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+    impl Widget for Spreadsheet { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
+
+    impl Spreadsheet {
+        pub fn set_cell(&self, _row: usize, _col: usize, _text: &str) { /* user manages data via callbacks */ }
+        pub fn get_cell(&self, _row: usize, _col: usize) -> Option<String> { None }
+        pub fn queue_redraw(&self) { self.0.queue_redraw(); }
+    }
+
+    pub fn create_spreadsheet(rows: usize, cols: usize) -> Result<Spreadsheet, Error> {
+        let canvas = create_canvas()?;
+        let overlay = create_overlay()?;
+        let cw = 150i32; let ch = 28i32; let chw = 46i32;
+        let total_w = chw + cols as i32 * cw;
+        let total_h = ch + rows as i32 * ch;
+        canvas.set_size_request(total_w, total_h);
+        canvas.set_content_size(total_w, total_h);
+        overlay.set_child(&canvas);
+        Ok(Spreadsheet(canvas, overlay))
+    }
+
     pub fn quit_main_loop() -> Result<(), Error> {
         crate::backends::gtk::quit_main_loop().map_err(|e| Error::Backend(format!("{}", e)))
     }
