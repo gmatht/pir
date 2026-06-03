@@ -355,6 +355,101 @@ mod gtk_adapter {
         Ok(TextView(t))
     }
 
+    // ---- Canvas (cross-platform drawing surface) ----
+
+    pub struct GtkDrawContext<'a> {
+        cc: gtk_dynamic_loader::CairoContext<'a>,
+    }
+
+    impl<'a> GtkDrawContext<'a> {
+        pub fn new(cr: *mut c_void, loader: &'a std::sync::Arc<gtk_dynamic_loader::Loader>) -> Self {
+            GtkDrawContext { cc: gtk_dynamic_loader::CairoContext::new(loader, cr) }
+        }
+    }
+
+    impl crate::core::DrawContext for GtkDrawContext<'_> {
+        fn fill_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, a: f64) {
+            self.cc.set_source_rgba(r, g, b, a);
+            self.cc.rectangle(x, y, w, h);
+            self.cc.fill();
+        }
+        fn stroke_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, a: f64, lw: f64) {
+            self.cc.set_line_width(lw);
+            self.cc.set_source_rgba(r, g, b, a);
+            self.cc.rectangle(x, y, w, h);
+            self.cc.stroke();
+        }
+        fn draw_text(&mut self, x: f64, y: f64, text: &str, font: &str, size: f64, r: f64, g: f64, b: f64, a: f64) {
+            self.cc.set_source_rgba(r, g, b, a);
+            self.cc.select_font_face(font, 0, 1);
+            self.cc.set_font_size(size);
+            self.cc.move_to(x, y);
+            self.cc.show_text(text);
+        }
+        fn text_extents(&self, text: &str, _font: &str, _size: f64) -> (f64, f64, f64, f64) {
+            let e = self.cc.text_extents(text);
+            (e.x_bearing, e.y_bearing, e.width, e.height)
+        }
+        fn clear(&mut self, r: f64, g: f64, b: f64, a: f64) {
+            self.cc.set_source_rgba(r, g, b, a);
+            self.cc.paint();
+        }
+        fn save(&mut self) { self.cc.save(); }
+        fn restore(&mut self) { self.cc.restore(); }
+        fn clip(&mut self, x: f64, y: f64, w: f64, h: f64) {
+            self.cc.rectangle(x, y, w, h);
+            self.cc.clip();
+        }
+    }
+
+    /// Canvas wraps a DrawingArea into the cross-platform Canvas API.
+    pub struct Canvas(pub gtk_dynamic_loader::DrawingArea);
+
+    impl Clone for Canvas { fn clone(&self) -> Self { Canvas(self.0.clone()) } }
+    impl AsRef<*mut c_void> for Canvas { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+    impl Widget for Canvas { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
+
+    impl Canvas {
+        pub fn set_draw_callback(&self, cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) {
+            let loader = crate::backends::gtk::loader()
+                .expect("GTK loader not initialized after Canvas creation");
+            let mut cb = cb;
+            let symbols = &loader.symbols;
+            if symbols.gtk_drawing_area_set_draw_func.is_some() {
+                // GTK4 path
+                let _ = self.0.set_draw_func(Box::new(move |cr: *mut c_void, w: i32, h: i32| {
+                    let mut ctx = GtkDrawContext::new(cr, &loader);
+                    cb(&mut ctx, w, h);
+                }));
+            } else {
+                // GTK3 path
+                let _ = self.0.connect_draw_gtk3(Box::new(move |_widget: *mut c_void, cr: *mut c_void| -> i32 {
+                    let mut ctx = GtkDrawContext::new(cr, &loader);
+                    cb(&mut ctx, 0, 0);
+                    0
+                }));
+            }
+        }
+
+        pub fn queue_redraw(&self) {
+            self.0.queue_draw();
+        }
+
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            self.0.set_size_request(w, h);
+        }
+
+        pub fn set_content_size(&self, w: i32, h: i32) {
+            self.0.set_content_width(w);
+            self.0.set_content_height(h);
+        }
+    }
+
+    pub fn create_canvas() -> Result<Canvas, Error> {
+        let da = crate::backends::gtk::create_drawing_area().map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(Canvas(da))
+    }
+
     pub fn quit_main_loop() -> Result<(), Error> {
         crate::backends::gtk::quit_main_loop().map_err(|e| Error::Backend(format!("{}", e)))
     }

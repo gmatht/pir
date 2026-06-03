@@ -7,6 +7,19 @@ use std::sync::Arc;
 /// Opaque handler id returned when connecting signals
 pub type HandlerId = u64;
 
+/// Cross-platform 2D drawing surface.
+/// Each backend implements this trait with its own drawing primitives.
+pub trait DrawContext {
+    fn fill_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, a: f64);
+    fn stroke_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, a: f64, lw: f64);
+    fn draw_text(&mut self, x: f64, y: f64, text: &str, font: &str, size: f64, r: f64, g: f64, b: f64, a: f64);
+    fn text_extents(&self, text: &str, font: &str, size: f64) -> (f64, f64, f64, f64);
+    fn clear(&mut self, r: f64, g: f64, b: f64, a: f64);
+    fn save(&mut self);
+    fn restore(&mut self);
+    fn clip(&mut self, x: f64, y: f64, w: f64, h: f64);
+}
+
 /// Top-level error type
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -120,6 +133,11 @@ impl App {
     #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_textview(&self) -> Result<crate::backends_gtk_adapter::TextView, Error> {
         crate::backends_gtk_adapter::create_textview().map_err(|e| e)
+    }
+
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn create_canvas(&self) -> Result<crate::backends_gtk_adapter::Canvas, Error> {
+        crate::backends_gtk_adapter::create_canvas()
     }
 
     // -- Windows paths --
