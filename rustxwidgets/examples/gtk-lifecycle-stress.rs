@@ -2,7 +2,7 @@ use rustxwidgets::backends_gtk_adapter as gtk;
 use rustxwidgets::lifecycle_stress::Op;
 use rustxwidgets::prelude::*;
 use std::cell::{Cell, RefCell};
-use std::ffi::c_void;
+use std::ffi::{c_void, CString};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -244,9 +244,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let rng = Rc::new(RefCell::new(Lcg::new(cfg.seed)));
     let step = Rc::new(Cell::new(0usize));
-    let counts = Rc::new(RefCell::new([0usize; 10]));
+    let counts = Rc::new(RefCell::new([0usize; 12]));
     let pool = Rc::new(RefCell::new(WidgetPool::new()));
     let retired: Rc<RefCell<Vec<AnyWidget>>> = Rc::new(RefCell::new(Vec::new()));
+    let nested_boxes: Rc<RefCell<Vec<gtk_dynamic_loader::BoxWidget>>> = Rc::new(RefCell::new(Vec::new()));
     let pulse_count = Rc::new(Cell::new(0u32));
 
     let runner: Rc<RefCell<Option<Box<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
@@ -262,6 +263,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rng_for_run = rng.clone();
     let pool_for_run = pool.clone();
     let retired_for_run = retired.clone();
+    let nested_boxes_for_run = nested_boxes.clone();
     let pulse_count_for_run = pulse_count.clone();
     let step_for_run = step.clone();
     let counts_for_run = counts.clone();
@@ -277,7 +279,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cfg.seed, cfg.steps, p.len(),
             );
             print!("  ops:");
-            for (i, name) in ["add","remove","mutate","style","visible","expand","focus","resize_win","pulse","resize_wid"].iter().enumerate() {
+            for (i, name) in ["add","remove","mutate","style","nest","unnest","visible","expand","focus","resize_win","pulse","resize_wid"].iter().enumerate() {
                 print!(" {}={}", name, counts[i]);
             }
             println!();
@@ -363,6 +365,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     mutate_widget(&mut p.items[idx].0, &label, &mut rng);
                 }
             }
+            Op::NestLayout => {
+                let orient = if rng.next_bool() { gtk::Orientation::Horizontal } else { gtk::Orientation::Vertical };
+                if let Ok(new_box) = gtk::create_box(orient, 3) {
+                    let ptr = *new_box.as_ref();
+                    set_widget_expand(&loader_for_run, ptr, rng.next_bool(), rng.next_bool());
+                    set_widget_visible(&loader_for_run, ptr, true);
+                    nested_boxes_for_run.borrow_mut().push(new_box.0);
+                }
+            }
+            Op::UnnestLayout => {
+                let mut boxes = nested_boxes_for_run.borrow_mut();
+                if !boxes.is_empty() {
+                    let idx = rng.range_i32(boxes.len() as i32).max(0) as usize;
+                    let _b = boxes.remove(idx);
+                }
+            }
             Op::ToggleVisible => {
                 let p = pool_for_run.borrow();
                 if let Some(idx) = p.random_idx(&mut rng) {
@@ -413,6 +431,83 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         set_widget_visible(&loader_for_run, ptr, true);
                         pool_for_run.borrow_mut().add(AnyWidget::Label(label), false);
                         pulse_count_for_run.set(pulse_count_for_run.get() + 1);
+                    }
+                }
+            }
+            Op::CycleStyle => {
+                let meta = {
+                    let p = pool_for_run.borrow();
+                    p.random_idx(&mut rng).map(|idx| {
+                        let ptr = widget_ptr(&p.items[idx].0);
+                        let is_label = matches!(p.items[idx].0, AnyWidget::Label(_));
+                        let is_text = is_label || matches!(p.items[idx].0, AnyWidget::Entry(_) | AnyWidget::TextView(_));
+                        (ptr, is_label, is_text)
+                    })
+                };
+                if let Some((ptr, is_label, is_text)) = meta {
+                    let kind = rng.next_u32() % 8;
+                    match kind {
+                        0..=2 if is_label => {
+                            let tags = ["b","i","u","span foreground='red'","span size='large'","span font='Serif 20'"];
+                            let tag = tags[rng.range_i32(tags.len() as i32).max(0) as usize];
+                            let tag_name = tag.split(' ').next().unwrap_or(tag);
+                            let markup = format!("<{tag}>style{}</{}>", current, tag_name);
+                            if let Ok(l) = gtk::create_label(&markup) {
+                                l.set_markup(&markup);
+                                hbox_for_run.append(&l);
+                                set_widget_visible(&loader_for_run, *l.as_ref(), true);
+                                pool_for_run.borrow_mut().add(AnyWidget::Label(l), false);
+                            }
+                        }
+                        3 => {
+                            let classes = ["test-fuzz-a","test-fuzz-b","test-fuzz-c"];
+                            let cls = classes[rng.range_i32(3).max(0) as usize];
+                        unsafe {
+                            if let (Some(get_ctx), Some(add_cls)) = (
+                                loader_for_run.symbols.gtk_widget_get_style_context,
+                                loader_for_run.symbols.gtk_style_context_add_class,
+                            ) {
+                                let c = CString::new(cls).unwrap();
+                                let ctx = get_ctx(ptr);
+                                if !ctx.is_null() { add_cls(ctx, c.as_ptr()); }
+                            }
+                        }
+                        }
+                        4 if is_text => {
+                            let unicode = ["¡Hola! ñoño ∑∫∂√π","日本語 中文 🔥⚡","αβγδε 🎉"];
+                            let txt = unicode[rng.range_i32(3).max(0) as usize];
+                            // Find matching widget in pool
+                            let p = pool_for_run.borrow();
+                            for (w, _) in p.items.iter() {
+                                if widget_ptr(w) == ptr {
+                                    match w {
+                                        AnyWidget::Label(l) => l.set_text(txt),
+                                        AnyWidget::Entry(e) => e.set_text(txt),
+                                        AnyWidget::TextView(t) => t.set_text(txt),
+                                        _ => {}
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {
+                            if let (Some(new_p), Some(load), Some(add)) = (
+                                loader_for_run.symbols.gtk_css_provider_new,
+                                loader_for_run.symbols.gtk_css_provider_load_from_data,
+                                loader_for_run.symbols.gtk_style_context_add_provider,
+                            ) {
+                                let color = rng.next_u32() & 0xFFFFFF;
+                                let css_text = CString::new(format!("widget {{ background-color: #{color:06x}; }}")).unwrap();
+                                unsafe {
+                                    let prov = new_p();
+                                    load(prov, css_text.as_ptr(), -1, std::ptr::null_mut());
+                                    if let Some(get_ctx) = loader_for_run.symbols.gtk_widget_get_style_context {
+                                        let ctx = get_ctx(ptr);
+                                        if !ctx.is_null() { add(ctx, prov, 800); }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

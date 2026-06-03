@@ -141,79 +141,60 @@ mod pancurses_backend {
             });
 
             while with_state(|s| s.running) {
-                let (_max_y, _max_x) = root.get_max_yx();
-
-                // layout — inherit parent size, then auto-layout containers, then clamp
+                // layout pass
                 with_state(|state| {
-                    // first pass: propagate sizes from parent to zero-sized children
                     let ids: Vec<usize> = state.nodes.iter().map(|n| n.id).collect();
                     for id in &ids {
                         let rect = state.node(*id).map(|n| n.rect);
                         if let Some(r) = rect {
-                            if r.w > 0 && r.h > 0 { continue; }
-                            if let Some(pid) = state.node(*id).and_then(|n| n.parent) {
-                                let pr = state.node(pid).map(|p| p.rect).unwrap_or(Rect::default());
-                                if pr.w > 0 || pr.h > 0 {
-                                    if let Some(n) = state.node_mut(*id) {
-                                        if n.rect.w == 0 { n.rect.w = pr.w; }
-                                        if n.rect.h == 0 { n.rect.h = pr.h; }
+                            if r.w == 0 || r.h == 0 {
+                                if let Some(pid) = state.node(*id).and_then(|n| n.parent) {
+                                    let pr = state.node(pid).map(|p| p.rect).unwrap_or(Rect::default());
+                                    if pr.w > 0 || pr.h > 0 {
+                                        if let Some(n) = state.node_mut(*id) {
+                                            if n.rect.w == 0 { n.rect.w = pr.w; }
+                                            if n.rect.h == 0 { n.rect.h = pr.h; }
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                    // second pass: auto-layout containers
                     for id in &ids {
                         let kind = state.node(*id).map(|n| &n.kind).cloned();
                         match kind {
-                            Some(PcWidgetKind::BoxWidget { .. }) => {
-                                layout_box_inner(*id, state);
-                            }
-                            Some(PcWidgetKind::Grid { .. }) => {
-                                layout_grid_inner(*id, state);
-                            }
+                            Some(PcWidgetKind::BoxWidget { .. }) => { layout_box_inner(*id, state); }
+                            Some(PcWidgetKind::Grid { .. }) => { layout_grid_inner(*id, state); }
                             _ => {}
                         }
                     }
-                    // third pass: clamp to parent bounds
                     for id in &ids {
-                        let node_rect = state.node(*id).map(|n| n.rect);
-                        if let Some(rect) = node_rect {
-                            if let Some(parent_id) = state.node(*id).and_then(|n| n.parent) {
-                                if let Some(parent) = state.node(parent_id) {
-                                    let pw = parent.rect.w.max(1);
-                                    let ph = parent.rect.h.max(1);
-                                    let mut new_rect = rect;
-                                    new_rect.x = rect.x.clamp(0, pw - 1);
-                                    new_rect.y = rect.y.clamp(0, ph - 1);
-                                    new_rect.w = rect.w.min(pw - new_rect.x);
-                                    new_rect.h = rect.h.min(ph - new_rect.y);
-                                    if let Some(n) = state.node_mut(*id) {
-                                        n.rect = new_rect;
-                                    }
-                                }
+                        if let Some(rect) = state.node(*id).map(|n| n.rect) {
+                            if let Some(pid) = state.node(*id).and_then(|n| n.parent) {
+                                let pw = state.node(pid).map(|p| p.rect.w).unwrap_or(1).max(1);
+                                let ph = state.node(pid).map(|p| p.rect.h).unwrap_or(1).max(1);
+                                let mut nr = rect;
+                                nr.x = rect.x.clamp(0, pw - 1);
+                                nr.y = rect.y.clamp(0, ph - 1);
+                                nr.w = rect.w.min(pw - nr.x);
+                                nr.h = rect.h.min(ph - nr.y);
+                                if let Some(n) = state.node_mut(*id) { n.rect = nr; }
                             }
                         }
                     }
                 });
 
-                // render — erase screen, then draw all widgets
-                root.erase();
-                with_state(|state| {
-                    for i in 0..state.nodes.len() {
-                        let id = state.nodes[i].id;
-                        let kind = state.nodes[i].kind.clone();
-                        let rect = state.nodes[i].rect;
-                        let visible = state.nodes[i].visible;
-                        if !visible {
-                            continue;
-                        }
-                        render_widget(&root, &kind, rect, id, state);
-                    }
-                });
-                root.noutrefresh();
+                // render
+                for i in 0..with_state(|s| s.nodes.len()) {
+                    let (kind, rect, visible, id, focus_id) = with_state(|s| {
+                        let n = &s.nodes[i];
+                        (n.kind.clone(), n.rect, n.visible, n.id, s.focus_id)
+                    });
+                    if !visible { continue; }
+                    render_widget(&root, &kind, rect, id, focus_id);
+                }
 
-                // input
+                root.refresh();
                 match root.getch() {
                     Some(Input::KeyResize) => {
                         let (my, mx) = root.get_max_yx();
@@ -396,7 +377,7 @@ mod pancurses_backend {
         }
     }
 
-    fn render_widget(root: &Window, kind: &PcWidgetKind, rect: Rect, id: usize, state: &PcState) {
+    fn render_widget(root: &Window, kind: &PcWidgetKind, rect: Rect, id: usize, focus_id: Option<usize>) {
         match kind {
             PcWidgetKind::Window { title } => {
                 if has_colors() {
@@ -423,7 +404,7 @@ mod pancurses_backend {
                 }
             }
             PcWidgetKind::Button { label } => {
-                let focused = state.focus_id == Some(id);
+                let focused = focus_id == Some(id);
                 if focused && has_colors() {
                     root.attron(COLOR_PAIR(2));
                 } else if has_colors() {
@@ -458,7 +439,7 @@ mod pancurses_backend {
                 }
             }
             PcWidgetKind::Entry { buffer, cursor } => {
-                let focused = state.focus_id == Some(id);
+                let focused = focus_id == Some(id);
                 if focused && has_colors() {
                     root.attron(COLOR_PAIR(1));
                 } else if has_colors() {
@@ -485,7 +466,7 @@ mod pancurses_backend {
                 }
             }
             PcWidgetKind::CheckButton { label, checked } => {
-                let focused = state.focus_id == Some(id);
+                let focused = focus_id == Some(id);
                 if focused && has_colors() {
                     root.attron(COLOR_PAIR(2));
                 } else if has_colors() {

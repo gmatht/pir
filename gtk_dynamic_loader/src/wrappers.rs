@@ -95,6 +95,27 @@ impl BoxWidget {
             unsafe { pack(self.inner, child_ptr, expand, expand, 0); }
         }
     }
+
+    pub fn set_size_request(&self, w: i32, h: i32) {
+        guard_widget!(self, "BoxWidget", "set_size_request");
+        if let Some(sr) = self.loader.symbols.gtk_widget_set_size_request {
+            unsafe { sr(self.inner, w, h); }
+        }
+    }
+
+    pub fn set_vexpand(&self, expand: bool) {
+        guard_widget!(self, "BoxWidget", "set_vexpand");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_vexpand {
+            unsafe { set(self.inner, if expand { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_hexpand(&self, expand: bool) {
+        guard_widget!(self, "BoxWidget", "set_hexpand");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_hexpand {
+            unsafe { set(self.inner, if expand { 1 } else { 0 }); }
+        }
+    }
 }
 
 impl AsRef<*mut c_void> for BoxWidget { fn as_ref(&self) -> &*mut c_void { &self.inner } }
@@ -244,6 +265,13 @@ impl Button {
             let id = unsafe { emit(self.inner, name.as_ptr()) };
             Ok(id)
         } else { Err(Error::MissingSymbol("g_signal_emit_by_name".into())) }
+    }
+
+    pub fn set_size_request(&self, w: i32, h: i32) {
+        guard_widget!(self, "Button", "set_size_request");
+        if let Some(sr) = self.loader.symbols.gtk_widget_set_size_request {
+            unsafe { sr(self.inner, w, h); }
+        }
     }
 }
 
@@ -585,6 +613,34 @@ impl Overlay {
             unsafe { unparent(child_ptr); }
         }
     }
+
+    pub fn set_size_request(&self, w: i32, h: i32) {
+        guard_widget!(self, "Overlay", "set_size_request");
+        if let Some(sr) = self.loader.symbols.gtk_widget_set_size_request {
+            unsafe { sr(self.inner, w, h); }
+        }
+    }
+
+    pub fn set_vexpand(&self, expand: bool) {
+        guard_widget!(self, "Overlay", "set_vexpand");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_vexpand {
+            unsafe { set(self.inner, if expand { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_hexpand(&self, expand: bool) {
+        guard_widget!(self, "Overlay", "set_hexpand");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_hexpand {
+            unsafe { set(self.inner, if expand { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn show_all(&self) {
+        guard_widget!(self, "Overlay", "show_all");
+        if let Some(show_all) = self.loader.symbols.gtk_widget_show_all {
+            unsafe { show_all(self.inner); }
+        }
+    }
 }
 
 impl AsRef<*mut c_void> for Overlay { fn as_ref(&self) -> &*mut c_void { &self.inner } }
@@ -688,6 +744,15 @@ impl AsRef<*mut c_void> for DrawingArea { fn as_ref(&self) -> &*mut c_void { &se
 impl Drop for DrawingArea { fn drop(&mut self) { unsafe { crate::wrappers::unref_widget(&self.loader, self.inner); } self.inner = std::ptr::null_mut(); }
 }
 
+impl Clone for DrawingArea {
+    fn clone(&self) -> Self {
+        if let Some(gref) = self.loader.symbols.g_object_ref {
+            unsafe { gref(self.inner); }
+        }
+        DrawingArea { inner: self.inner, loader: self.loader.clone() }
+    }
+}
+
 // ---- ScrolledWindow wrapper ----
 pub struct ScrolledWindow {
     inner: *mut c_void,
@@ -733,6 +798,27 @@ impl ScrolledWindow {
             unsafe { set_child(self.inner, child_ptr); }
         } else if let Some(container_add) = self.loader.symbols.gtk_container_add {
             unsafe { container_add(self.inner, child_ptr); }
+        }
+    }
+
+    pub fn set_size_request(&self, w: i32, h: i32) {
+        guard_widget!(self, "ScrolledWindow", "set_size_request");
+        if let Some(sr) = self.loader.symbols.gtk_widget_set_size_request {
+            unsafe { sr(self.inner, w, h); }
+        }
+    }
+
+    pub fn set_vexpand(&self, expand: bool) {
+        guard_widget!(self, "ScrolledWindow", "set_vexpand");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_vexpand {
+            unsafe { set(self.inner, if expand { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_hexpand(&self, expand: bool) {
+        guard_widget!(self, "ScrolledWindow", "set_hexpand");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_hexpand {
+            unsafe { set(self.inner, if expand { 1 } else { 0 }); }
         }
     }
 
@@ -984,9 +1070,9 @@ pub struct CairoContext<'a> {
 }
 
 impl<'a> CairoContext<'a> {
-    /// # Safety
-    /// `cr` must be a valid, non-null `cairo_t*` pointer.
-    pub unsafe fn new(loader: &'a Arc<Loader>, cr: *mut c_void) -> Self {
+    /// Create a Cairo context wrapper from a raw `cairo_t*` pointer.
+    /// The caller must ensure `cr` is a valid `cairo_t*` (e.g. from a GTK draw callback).
+    pub fn new(loader: &'a Arc<Loader>, cr: *mut c_void) -> Self {
         CairoContext { cr, loader }
     }
 
@@ -1210,6 +1296,41 @@ impl Entry {
     pub fn grab_focus(&self) {
         guard_widget!(self, "Entry", "grab_focus");
         if let Some(grab) = self.loader.symbols.gtk_widget_grab_focus { unsafe { grab(self.inner); } }
+    }
+
+    pub fn set_margin_start(&self, margin: i32) {
+        guard_widget!(self, "Entry", "set_margin_start");
+        if let Some(set_margin) = self.loader.symbols.gtk_widget_set_margin_start {
+            unsafe { set_margin(self.inner, margin); }
+        }
+    }
+
+    pub fn set_margin_top(&self, margin: i32) {
+        guard_widget!(self, "Entry", "set_margin_top");
+        if let Some(set_margin) = self.loader.symbols.gtk_widget_set_margin_top {
+            unsafe { set_margin(self.inner, margin); }
+        }
+    }
+
+    pub fn set_halign(&self, align: i32) {
+        guard_widget!(self, "Entry", "set_halign");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_halign {
+            unsafe { set(self.inner, align); }
+        }
+    }
+
+    pub fn set_valign(&self, align: i32) {
+        guard_widget!(self, "Entry", "set_valign");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_valign {
+            unsafe { set(self.inner, align); }
+        }
+    }
+
+    pub fn set_visible(&self, visible: bool) {
+        guard_widget!(self, "Entry", "set_visible");
+        if let Some(f) = self.loader.symbols.gtk_widget_set_visible {
+            unsafe { f(self.inner, if visible { 1 } else { 0 }); }
+        }
     }
 
     pub fn connect_focus_in_event<F: FnMut(*mut c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {

@@ -52,6 +52,8 @@ mod gtk_adapter {
         pub fn emit_clicked(&self) -> Result<u64, Error> {
             self.0.emit_clicked().map_err(|e| Error::Backend(format!("{}", e)))
         }
+
+        pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
     }
 
     impl Clone for Button { fn clone(&self) -> Self { Button(self.0.clone()) } }
@@ -89,6 +91,10 @@ mod gtk_adapter {
         pub fn append(&self, child: &impl AsRef<*mut c_void>) {
             self.0.append(child);
         }
+
+        pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
+        pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
+        pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
     }
 
     #[repr(transparent)]
@@ -126,6 +132,11 @@ mod gtk_adapter {
         pub fn connect_focus_out_event<F: FnMut(*mut c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
             self.0.connect_focus_out_event(f).map_err(|e| Error::Backend(format!("{}", e)))
         }
+        pub fn set_margin_start(&self, margin: i32) { self.0.set_margin_start(margin); }
+        pub fn set_margin_top(&self, margin: i32) { self.0.set_margin_top(margin); }
+        pub fn set_halign(&self, align: i32) { self.0.set_halign(align); }
+        pub fn set_valign(&self, align: i32) { self.0.set_valign(align); }
+        pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
     }
 
     impl Clone for Entry { fn clone(&self) -> Self { Entry(self.0.clone()) } }

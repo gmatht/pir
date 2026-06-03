@@ -357,16 +357,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let al_r_btn = app.create_button("AR")?;
     let hl_btn = app.create_button("HL")?;
     let fg_btn = app.create_button("FG")?;
-    gtk_dynamic_loader::widget_set_size_request(&loader, *open_btn.as_ref(), 60, 24);
-    gtk_dynamic_loader::widget_set_size_request(&loader, *save_btn.as_ref(), 70, 24);
-    gtk_dynamic_loader::widget_set_size_request(&loader, *quit_btn.as_ref(), 50, 24);
-    gtk_dynamic_loader::widget_set_size_request(&loader, *bold_btn.as_ref(), 28, 24);
-    gtk_dynamic_loader::widget_set_size_request(&loader, *italic_btn.as_ref(), 28, 24);
-    gtk_dynamic_loader::widget_set_size_request(&loader, *al_l_btn.as_ref(), 28, 24);
-    gtk_dynamic_loader::widget_set_size_request(&loader, *al_c_btn.as_ref(), 28, 24);
-    gtk_dynamic_loader::widget_set_size_request(&loader, *al_r_btn.as_ref(), 28, 24);
-    gtk_dynamic_loader::widget_set_size_request(&loader, *hl_btn.as_ref(), 28, 24);
-    gtk_dynamic_loader::widget_set_size_request(&loader, *fg_btn.as_ref(), 28, 24);
+    open_btn.set_size_request(60, 24);
+    save_btn.set_size_request(70, 24);
+    quit_btn.set_size_request(50, 24);
+    bold_btn.set_size_request(28, 24);
+    italic_btn.set_size_request(28, 24);
+    al_l_btn.set_size_request(28, 24);
+    al_c_btn.set_size_request(28, 24);
+    al_r_btn.set_size_request(28, 24);
+    hl_btn.set_size_request(28, 24);
+    fg_btn.set_size_request(28, 24);
     toolbar.append(&open_btn);
     toolbar.append(&save_btn);
     toolbar.append(&quit_btn);
@@ -387,10 +387,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     formula_hbox.append(&formula_entry);
 
     let drawing_area = gtk_dynamic_loader::DrawingArea::new(loader.clone())?;
-    let drawing_area_ptr = *drawing_area.as_ref();
     let overlay = gtk_dynamic_loader::Overlay::new(loader.clone())?;
     overlay.set_child(&drawing_area);
-    let overlay_ptr = *overlay.as_ref();
 
     let selected_coord: Rc<RefCell<Option<(usize, usize)>>> = Rc::new(RefCell::new(Some((0, 0))));
     let editing_entry: Rc<RefCell<Option<gtk::Entry>>> = Rc::new(RefCell::new(None));
@@ -441,13 +439,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scrolled = gtk_dynamic_loader::ScrolledWindow::new(loader.clone())?;
     scrolled.set_policy(0, 0);
     scrolled.set_child(&overlay);
-    gtk_dynamic_loader::widget_set_hexpand(&loader, *scrolled.as_ref(), true);
-    gtk_dynamic_loader::widget_set_vexpand(&loader, *scrolled.as_ref(), true);
-    gtk_dynamic_loader::widget_set_hexpand(&loader, *overlay.as_ref(), true);
-    gtk_dynamic_loader::widget_set_vexpand(&loader, *overlay.as_ref(), true);
+    scrolled.set_hexpand(true);
+    scrolled.set_vexpand(true);
+    overlay.set_hexpand(true);
+    overlay.set_vexpand(true);
     let total_w = 46 + VISIBLE_COLS as i32 * CELL_W;
     let total_h = CELL_H + VISIBLE_ROWS as i32 * CELL_H;
-    gtk_dynamic_loader::widget_set_size_request(&loader, drawing_area_ptr, total_w, total_h);
+    drawing_area.set_size_request(total_w, total_h);
 
     if let Some(loader2) = rustxwidgets::backends::gtk::loader() {
         let css = r#"
@@ -461,8 +459,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let queue_redraw = Rc::new({
-        let ld = loader.clone();
-        move || gtk_dynamic_loader::widget_queue_draw(&ld, drawing_area_ptr)
+        let da = drawing_area.clone();
+        move || da.queue_draw()
     });
 
     let commit_edit = {
@@ -485,9 +483,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 formula_e.set_text(&new_text);
-                // Remove the entry from the overlay so it doesn't remain visible.
+                // Remove the entry from its parent so it doesn't remain visible.
                 // Drop will safely call g_object_unref to release our ref.
-                gtk_dynamic_loader::remove_from_parent(&loader_commit, *e.as_ref());
+                unsafe { gtk_dynamic_loader::remove_from_parent(&loader_commit, *e.as_ref()); }
                 qr();
             }
         }
@@ -515,7 +513,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let edit_entry_nav = editing_entry.clone();
         let text_input_active = text_input_active.clone();
         let overlay_for_edit = overlay.clone();
-        let loader_for_edit = loader.clone();
         let rh_edit = row_heights.clone();
         let commit_on_activate = commit_edit.clone();
         let sel_on_activate = selected_coord.clone();
@@ -531,14 +528,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let left = 46 + c as i32 * CELL_W;
                 let top = CELL_H + compute_row_y(&rh, r);
                 drop(rh);
-                gtk_dynamic_loader::widget_set_margin_start(&loader_for_edit, *entry.as_ref(), left);
-                gtk_dynamic_loader::widget_set_margin_top(&loader_for_edit, *entry.as_ref(), top);
-                gtk_dynamic_loader::widget_set_halign(&loader_for_edit, *entry.as_ref(), 1);
-                gtk_dynamic_loader::widget_set_valign(&loader_for_edit, *entry.as_ref(), 1);
+                entry.set_margin_start(left);
+                entry.set_margin_top(top);
+                entry.set_halign(1);
+                entry.set_valign(1);
                 overlay_for_edit.add_overlay(&entry);
                 overlay_for_edit.set_overlay_pass_through(&entry, false);
-                gtk_dynamic_loader::widget_set_visible(&loader_for_edit, *entry.as_ref(), true);
-                gtk_dynamic_loader::widget_show_all(&loader_for_edit, *overlay_for_edit.as_ref());
+                entry.set_visible(true);
+                overlay_for_edit.show_all();
                 entry.set_size_request(CELL_W, rh_edit.borrow()[r]);
 
                 let commit_on_activate = commit_on_activate.clone();
@@ -649,28 +646,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if is_gtk4 {
-            let cl = click_logic.clone();
-            let sw_for_click = scrolled.clone();
-            let _ = gtk_dynamic_loader::connect_gesture_click_pressed(
-                &loader, overlay_ptr,
-                Box::new(move |_n: i32, x: f64, y: f64| {
+            if let Ok(gesture) = gtk_dynamic_loader::GestureClick::new(loader.clone()) {
+                let cl = click_logic.clone();
+                let sw_for_click = scrolled.clone();
+                let _ = gesture.connect_pressed(Box::new(move |_n: i32, x: f64, y: f64| {
                     let scroll_x = sw_for_click.get_hadjustment_value();
                     let scroll_y = sw_for_click.get_vadjustment_value();
                     if let Some(f) = cl.borrow_mut().as_mut() { f(x + scroll_x, y + scroll_y); }
-                }),
-            );
+                }));
+                gesture.add_to_widget(&overlay);
+            }
         } else {
             let cl = click_logic.clone();
             let ld = loader.clone();
             const GDK_BUTTON_PRESS_MASK: i32 = 1 << 8;
-            gtk_dynamic_loader::widget_add_events(&loader, drawing_area_ptr, GDK_BUTTON_PRESS_MASK);
-            gtk_dynamic_loader::widget_connect_signal_bool(&loader, drawing_area_ptr, "button-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
-                if let Some((x, y)) = gtk_dynamic_loader::gdk_event_get_coords(&ld, ev) {
-                    if let Some(f) = cl.borrow_mut().as_mut() { f(x, y); }
-                    return 1;
-                }
-                0
-            })).ok();
+            unsafe {
+                gtk_dynamic_loader::widget_add_events(&loader, *drawing_area.as_ref(), GDK_BUTTON_PRESS_MASK);
+                let _ = gtk_dynamic_loader::widget_connect_signal_bool(&loader, *drawing_area.as_ref(), "button-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
+                    if let Some((x, y)) = gtk_dynamic_loader::gdk_event_get_coords(&ld, ev) {
+                        if let Some(f) = cl.borrow_mut().as_mut() { f(x, y); }
+                        return 1;
+                    }
+                    0
+                }));
+            }
         }
     }
 
@@ -850,7 +849,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let win_ptr = *win.as_ref();
             let loader_kb = loader.clone();
             let start_edit_gtk3 = start_edit_kb.clone();
-            gtk_dynamic_loader::widget_connect_signal_bool(&loader, win_ptr, "key-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
+            unsafe {
+                let _ = gtk_dynamic_loader::widget_connect_signal_bool(&loader, win_ptr, "key-press-event", Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
                 if *text_input_active.borrow() {
                     return 0;
                 }
@@ -901,7 +901,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     drop(coord);
                     refresh_sel();
                     0
-                })).ok();
+                }));
+            }
         }
     }
 
@@ -911,7 +912,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let texts_open = texts.clone();
         let qr = queue_redraw.clone();
         let _ = open_btn.on_click(move || {
-            if let Ok(chooser) = gtk_dynamic_loader::FileChooserNative::open(loader_open.clone(), "Open spreadsheet", std::ptr::null_mut()) {
+            if let Ok(chooser) = unsafe { gtk_dynamic_loader::FileChooserNative::open(loader_open.clone(), "Open spreadsheet", std::ptr::null_mut()) } {
                 if chooser.run() == -3 {
                     if let Some(fname) = chooser.get_filename() {
                         if let Ok(data) = std::fs::read_to_string(&fname) {
@@ -936,7 +937,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let loader_save = loader.clone();
         let texts_save = texts.clone();
         let _ = save_btn.on_click(move || {
-            if let Ok(chooser) = gtk_dynamic_loader::FileChooserNative::save(loader_save.clone(), "Save spreadsheet as", std::ptr::null_mut()) {
+            if let Ok(chooser) = unsafe { gtk_dynamic_loader::FileChooserNative::save(loader_save.clone(), "Save spreadsheet as", std::ptr::null_mut()) } {
                 if chooser.run() == -3 {
                     if let Some(fname) = chooser.get_filename() {
                         let mut out = String::new();
@@ -959,7 +960,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let loader_save = loader.clone();
         let texts_save = texts.clone();
         let _ = save_btn.on_click(move || {
-            if let Ok(chooser) = gtk_dynamic_loader::FileChooserNative::save(loader_save.clone(), "Save spreadsheet as", std::ptr::null_mut()) {
+            if let Ok(chooser) = unsafe { gtk_dynamic_loader::FileChooserNative::save(loader_save.clone(), "Save spreadsheet as", std::ptr::null_mut()) } {
                 if chooser.run() == -3 {
                     if let Some(fname) = chooser.get_filename() {
                         let mut out = String::new();
@@ -987,11 +988,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let formula_and_grid = gtk::create_box(gtk::Orientation::Vertical, 2)?;
     formula_and_grid.append(&formula_hbox);
     formula_and_grid.append(&scrolled);
-    let fg_ptr = *formula_and_grid.as_ref();
-
-    gtk_dynamic_loader::widget_set_vexpand(&loader, fg_ptr, true);
-    gtk_dynamic_loader::widget_set_vexpand(&loader, *vbox.as_ref(), true);
-    gtk_dynamic_loader::widget_set_hexpand(&loader, *vbox.as_ref(), true);
+    formula_and_grid.set_vexpand(true);
+    vbox.set_vexpand(true);
+    vbox.set_hexpand(true);
     vbox.append(&toolbar_box);
     vbox.append(&formula_and_grid);
     win.set_child(&vbox);
@@ -999,10 +998,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let result = app.run().map_err(|e| Box::new(e) as Box<dyn std::error::Error>);
 
-    // Unparent any leftover editing entry so it's no longer visible.
+    // Remove any leftover editing entry from its parent so it's no longer visible.
     // Drop will safely call g_object_unref to release our ref.
     if let Some(e) = editing_entry.borrow_mut().take() {
-        gtk_dynamic_loader::remove_from_parent(&loader, *e.as_ref());
+        unsafe { gtk_dynamic_loader::remove_from_parent(&loader, *e.as_ref()); }
     }
 
     result
