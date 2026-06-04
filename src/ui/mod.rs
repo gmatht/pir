@@ -1,5 +1,7 @@
 //! Ratatui front-end: sheet viewport, editing, export, move, file sync.
 
+use crate::ui_core::{self, *};
+pub(crate) use crate::ui_core::format_cell_display;
 use crate::addr::{self, parse_cell_ref_at, parse_sheet_id_prefix_at};
 use crate::agg::{cell_display, compute_aggregate};
 use crate::balance::{self, BalanceDirection};
@@ -43,14 +45,7 @@ use unicode_width::UnicodeWidthChar;
 use std::env;
 use std::fs::OpenOptions;
 
-/// Width of the row-label gutter (`]A~1`, `A1`, `A_1`).
-const ROW_LABEL_CHARS: usize = 5;
-/// Keep at most this many blank lines/cols around the active main data window.
-const DISPLAY_EDGE_BLANK: usize = 1;
-/// Trailing blank main rows allowed before Down transitions into the footer.
-const NAV_BLANK_ROWS: usize = 2;
-/// Trailing blank main cols allowed before Right transitions into the right margin.
-const NAV_BLANK_COLS: usize = 1;
+
 
 // Debug agent helpers removed: logging and sampling statics were debug-only
 
@@ -819,99 +814,8 @@ const HELP_MENU_ITEMS: [MenuItem; 4] = [
     },
 ];
 
-// ── Viewport helpers ──────────────────────────────────────────────────────────
-
-fn main_row_window(
-    state: &SheetState,
-    cursor: SheetCursor,
-    main_order: &[usize],
-) -> (usize, usize) {
-    let g = &state.grid;
-    let hr = HEADER_ROWS;
-    let mr = g.main_rows();
-    if mr == 0 {
-        return (0, 0);
-    }
-
-    let mut lo = usize::MAX;
-    let mut hi = 0usize;
-
-    for (pos, &main_row) in main_order.iter().enumerate() {
-        if g.logical_row_has_content(hr + main_row) || left_margin_template_applies(g, main_row) {
-            lo = lo.min(pos);
-            hi = hi.max(pos);
-        }
-    }
-    if cursor.row >= hr && cursor.row < hr + mr {
-        let ri = main_order
-            .iter()
-            .position(|&r| hr + r == cursor.row)
-            .unwrap_or(0);
-        lo = lo.min(ri);
-        hi = hi.max(ri);
-    }
-    if lo == usize::MAX {
-        lo = 0;
-        hi = 0;
-    }
-
-    lo = lo.saturating_sub(DISPLAY_EDGE_BLANK);
-    hi = hi
-        .saturating_add(DISPLAY_EDGE_BLANK)
-        .min(mr.saturating_sub(1));
-    (lo, hi)
-}
-
-fn main_col_window(state: &SheetState, cursor: SheetCursor) -> (usize, usize) {
-    let g = &state.grid;
-    let lm = MARGIN_COLS;
-    let mc = g.main_cols();
-    if mc == 0 {
-        return (0, 0);
-    }
-
-    let mut lo = usize::MAX;
-    let mut hi = 0usize;
-
-    for c in 0..mc {
-        if g.logical_col_has_content(lm + c)
-            || header_template_applies(g, c)
-            || right_col_agg_func(g, lm + c).is_some()
-        {
-            lo = lo.min(c);
-            hi = hi.max(c);
-        }
-    }
-    if cursor.col >= lm && cursor.col < lm + mc {
-        let ci = cursor.col - lm;
-        lo = lo.min(ci);
-        hi = hi.max(ci);
-    }
-    if lo == usize::MAX {
-        lo = 0;
-        hi = 0;
-    }
-
-    lo = lo.saturating_sub(DISPLAY_EDGE_BLANK);
-    hi = hi
-        .saturating_add(DISPLAY_EDGE_BLANK)
-        .min(mc.saturating_sub(1));
-    (lo, hi)
-}
-
-fn footer_nonblank_end(state: &SheetState) -> Option<usize> {
-    let g = &state.grid;
-    let hr = HEADER_ROWS;
-    let mr = g.main_rows();
-    let fr = FOOTER_ROWS;
-    let mut max_nonblank = None;
-    for i in 0..fr {
-        if g.logical_row_has_content(hr + mr + i) {
-            max_nonblank = Some(i);
-        }
-    }
-    max_nonblank
-}
+// ── Viewport helpers (main_row_window, main_col_window, footer_nonblank_end, etc.)
+// provided by crate::ui_core — imported via `use crate::ui_core::*`.
 
 fn menu_items(section: MenuSection) -> &'static [MenuItem] {
     match section {
@@ -1844,22 +1748,6 @@ mod menu_tests {
     }
 }
 
-fn right_nonblank_end(state: &SheetState) -> Option<usize> {
-    let g = &state.grid;
-    let lm = MARGIN_COLS;
-    let mc = g.main_cols();
-    let rm = MARGIN_COLS;
-    let start = lm + mc;
-    let mut max_nonblank = None;
-    for i in 0..rm {
-        if g.logical_col_has_content(start + i) {
-            max_nonblank = Some(i);
-        }
-    }
-    max_nonblank
-}
-
-/// Row viewport with pinned totals and minimal-scroll movement.
 fn visible_row_indices(
     state: &SheetState,
     cursor: SheetCursor,
@@ -2496,6 +2384,7 @@ fn read_clipboard() -> Result<String, String> {
 // ── App ───────────────────────────────────────────────────────────────────────
 
     pub struct App {
+    pub capturer: Option<crate::capture::HtmlCapture>,
     pub path: Option<PathBuf>,
     /// Set when the workbook was read from a non-`corro` file (e.g. ODS). `path` stays `None` until saved as `.corro`.
     import_source: Option<PathBuf>,
@@ -2685,6 +2574,7 @@ impl App {
 
         let mut app = App {
             path,
+            capturer: None,
             import_source: None,
             source_path,
             revision_limit,
@@ -9313,6 +9203,10 @@ impl App {
         self.state.grid.set_min_extent(min_row, min_col);
     }
 
+    pub fn set_capturer(&mut self, capturer: Option<crate::capture::HtmlCapture>) {
+        self.capturer = capturer;
+    }
+
     pub fn run(&mut self) -> Result<(), RunError> {
         enable_raw_mode()?;
         let mut stdout = stdout();
@@ -10707,6 +10601,24 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             }
             A::MoveRight => {
                 self.move_cursor_one_col_horizontal(true);
+                Ok(false)
+            }
+            A::MovePageUp => {
+                let steps = self.grid_viewport_data_rows.max(1);
+                self.move_cursor_vertical_steps(steps, false);
+                Ok(false)
+            }
+            A::MovePageDown => {
+                let steps = self.grid_viewport_data_rows.max(1);
+                self.move_cursor_vertical_steps(steps, true);
+                Ok(false)
+            }
+            A::MoveHome => {
+                self.jump_cursor_row_horizontal_nonblank(true);
+                Ok(false)
+            }
+            A::MoveEnd => {
+                self.jump_cursor_row_horizontal_nonblank(false);
                 Ok(false)
             }
             A::Quit => Ok(true),
@@ -13328,30 +13240,28 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                         }
                     }
                     KeyCode::Left | KeyCode::Char('h') => {
-                        self.move_cursor_one_col_horizontal(false);
+                        self.execute(crate::core::action::Action::MoveLeft)?;
                     }
                     KeyCode::Right | KeyCode::Char('l') => {
-                        self.move_cursor_one_col_horizontal(true);
+                        self.execute(crate::core::action::Action::MoveRight)?;
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        self.move_cursor_one_row_vertical(false);
+                        self.execute(crate::core::action::Action::MoveUp)?;
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        self.move_cursor_one_row_vertical(true);
+                        self.execute(crate::core::action::Action::MoveDown)?;
                     }
                     KeyCode::PageUp => {
-                        let steps = self.grid_viewport_data_rows.max(1);
-                        self.move_cursor_vertical_steps(steps, false);
+                        self.execute(crate::core::action::Action::MovePageUp)?;
                     }
                     KeyCode::PageDown => {
-                        let steps = self.grid_viewport_data_rows.max(1);
-                        self.move_cursor_vertical_steps(steps, true);
+                        self.execute(crate::core::action::Action::MovePageDown)?;
                     }
                     KeyCode::Home => {
-                        self.jump_cursor_row_horizontal_nonblank(true);
+                        self.execute(crate::core::action::Action::MoveHome)?;
                     }
                     KeyCode::End => {
-                        self.jump_cursor_row_horizontal_nonblank(false);
+                        self.execute(crate::core::action::Action::MoveEnd)?;
                     }
                     KeyCode::Char(c) if !c.is_control() => {
                         self.edit_special_palette = false;
@@ -21447,516 +21357,8 @@ pub(crate) fn tsv_effective_unformatted_string(grid: &Grid, r: usize, c: usize) 
     }
 }
 
-fn normalize_inline_text(text: &str) -> String {
-    text.replace('\n', "¶")
-}
-
-fn measured_width_text_for_stored_literal(raw: &str) -> Option<String> {
-    let t = raw.trim();
-    if is_formula(t) {
-        return None;
-    }
-    let parsed = crate::formula::parse_numeric_or_date_literal(t)?;
-    if crate::formula::parse_number_literal(t).is_some() {
-        let s = format_number_cell_display(&parsed);
-        if s.is_empty() {
-            None
-        } else {
-            Some(s)
-        }
-    } else {
-        Some(t.to_string())
-    }
-}
-
-/// Decimal / generic display: plain decimals for human-scale magnitudes; scientific only when
-/// [`crate::formula::number::prefer_scientific_for_number`] agrees (and for extreme exacts via
-/// `exact_decimal_generic_scientific`).
-fn format_cell_display_decimal_generic(grid: &Grid, addr: &CellAddr, raw: String) -> String {
-    let mut visiting = Vec::new();
-    let mut budget = 10_000usize;
-    // Preserve user-entered date-like textual forms for plain (non-formula)
-    // cells: when the stored value is a raw date string (e.g. "2001/01/01"),
-    // prefer showing that literal in the UI instead of the internal numeric
-    // serial. This keeps the human-entered form visible while allowing the
-    // layout heuristics elsewhere to treat the value as numeric for sizing.
-    {
-        let t = raw.trim();
-        let stored_raw_owned = grid.get(addr);
-        let stored_raw = stored_raw_owned.as_deref().unwrap_or("");
-        // Only preserve for plain non-formula stored text and non-templated cells.
-        if crate::formula::export_templated_formula(grid, addr).is_none() && !is_formula(stored_raw) {
-            // If parsing as a numeric-or-date literal succeeds but parsing as a
-            // plain numeric literal does not, it implies the input was a
-            // date-like textual form (e.g. "2001/01/01"). Preserve the raw
-            // literal in that case so the UI shows the user-entered date.
-            if crate::formula::parse_numeric_or_date_literal(t).is_some()
-                && crate::formula::parse_number_literal(t).is_none()
-            {
-                return raw;
-            }
-        }
-    }
-    if let Some(n) = effective_numeric(grid, addr, &mut visiting, &mut budget) {
-        if matches!(n, crate::formula::number::Number::Complex(_)) {
-            return format_number_cell_display(&n);
-        }
-        if crate::formula::number::prefer_scientific_for_number(&n) {
-            if let Some(sci) = exact_decimal_generic_scientific(&n) {
-                return sci;
-            }
-        }
-        return format_significant_10_local(n.to_f64());
-    }
-    if let Some(n) = crate::formula::parse_number_literal(raw.trim()) {
-        if matches!(n, crate::formula::number::Number::Complex(_)) {
-            return format_number_cell_display(&n);
-        }
-        if crate::formula::number::prefer_scientific_for_number(&n) {
-            if let Some(sci) = exact_decimal_generic_scientific(&n) {
-                return sci;
-            }
-        }
-        return format_significant_10_local(n.to_f64());
-    }
-    raw
-}
-
-pub(crate) fn format_cell_display(grid: &Grid, addr: &CellAddr, raw: String) -> String {
-    let raw = normalize_inline_text(&raw);
-    let fmt = grid.format_for_addr(addr);
-    match fmt.number.unwrap_or(NumberFormat::DecimalGeneric) {
-        NumberFormat::DecimalGeneric => format_cell_display_decimal_generic(grid, addr, raw),
-        NumberFormat::Rational => {
-            let mut visiting = Vec::new();
-            let mut budget = 10_000usize;
-            if let Some(n) = effective_numeric(grid, addr, &mut visiting, &mut budget) {
-                return format_number_cell_display(&n);
-            }
-            let t = raw.trim();
-            if let Some(n) = crate::formula::parse_number_literal(t) {
-                return format_number_cell_display(&n);
-            }
-            raw
-        }
-        NumberFormat::Currency { decimals } => {
-            let mut visiting = Vec::new();
-            let mut budget = 10_000usize;
-            if let Some(n) = effective_numeric(grid, addr, &mut visiting, &mut budget) {
-                if crate::formula::number::prefer_scientific_for_number(&n) {
-                    let sci = match &n {
-                        crate::formula::number::Number::Complex(c) => {
-                            crate::formula::number::format_complex_fixed_decimal(*c, decimals)
-                        }
-                        _ => exact_decimal_generic_scientific(&n)
-                            .unwrap_or_else(|| format_significant_10_local(n.to_f64())),
-                    };
-                    return format!("${sci}");
-                }
-                let value = n.to_f64();
-                if value.is_finite() {
-                    return format!("${value:.decimals$}");
-                }
-                if let crate::formula::number::Number::Complex(c) = &n {
-                    let s = crate::formula::number::format_complex_fixed_decimal(*c, decimals);
-                    return format!("${s}");
-                }
-            }
-            let trimmed = raw.trim();
-            if let Ok(value) = trimmed.parse::<f64>() {
-                if value.is_finite() {
-                    return format!("${value:.decimals$}");
-                }
-                if value.is_infinite() {
-                    if crate::formula::parse_number_literal(trimmed).is_some() {
-                        if let Some(sci) = scientific_from_decimal_literal(trimmed, decimals.min(6)) {
-                            return format!("${sci}");
-                        }
-                    }
-                }
-            } else if crate::formula::parse_number_literal(trimmed).is_some() {
-                if let Some(sci) = scientific_from_decimal_literal(trimmed, decimals.min(6)) {
-                    return format!("${sci}");
-                }
-            }
-            raw
-        }
-        NumberFormat::Fixed { decimals } => {
-            let mut visiting = Vec::new();
-            let mut budget = 10_000usize;
-            if let Some(n) = effective_numeric(grid, addr, &mut visiting, &mut budget) {
-                if crate::formula::number::prefer_scientific_for_number(&n) {
-                    return match &n {
-                        crate::formula::number::Number::Complex(c) => {
-                            crate::formula::number::format_complex_fixed_decimal(*c, decimals)
-                        }
-                        _ => exact_decimal_generic_scientific(&n)
-                            .unwrap_or_else(|| format_significant_10_local(n.to_f64())),
-                    };
-                }
-                let value = n.to_f64();
-                if value.is_finite() {
-                    return format!("{value:.decimals$}");
-                }
-                if let crate::formula::number::Number::Complex(c) = &n {
-                    return crate::formula::number::format_complex_fixed_decimal(*c, decimals);
-                }
-            }
-            let trimmed = raw.trim();
-            if let Ok(value) = trimmed.parse::<f64>() {
-                if value.is_finite() {
-                    return format!("{value:.decimals$}");
-                }
-                if value.is_infinite() {
-                    if crate::formula::parse_number_literal(trimmed).is_some() {
-                        if let Some(sci) = scientific_from_decimal_literal(trimmed, decimals.min(6)) {
-                            return sci;
-                        }
-                    }
-                }
-            } else if crate::formula::parse_number_literal(trimmed).is_some() {
-                if let Some(sci) = scientific_from_decimal_literal(trimmed, decimals.min(6)) {
-                    return sci;
-                }
-            }
-            raw
-        }
-    }
-}
-
-fn text_align_to_utrunc(a: TextAlign) -> UTruncAlign {
-    match a {
-        TextAlign::Left | TextAlign::Default => UTruncAlign::Left,
-        TextAlign::Right => UTruncAlign::Right,
-        TextAlign::Center => UTruncAlign::Center,
-    }
-}
-
-fn align_cell_display(text: String, width: usize, align: Option<TextAlign>) -> String {
-    let width = width.max(1);
-    let ual = text_align_to_utrunc(align.unwrap_or(TextAlign::Default));
-    text.unicode_pad(width, ual, true).into_owned()
-}
-
-fn effective_cell_align(grid: &Grid, addr: &CellAddr, formatted: &str) -> Option<TextAlign> {
-    let fmt = grid.format_for_addr(addr);
-    if fmt.align.is_some() {
-        return fmt.align;
-    }
-    let t = formatted.trim();
-    if t.parse::<f64>().is_ok() {
-        return Some(TextAlign::Right);
-    }
-    // Decimal-generic columns mix numbers and labels: only right-align when this cell is numeric,
-    // so prose stays left-aligned while truncating inside its own cell.
-    match fmt.number {
-        Some(NumberFormat::DecimalGeneric) => {
-            let mut visiting = Vec::new();
-            let mut budget = 10_000usize;
-            if effective_numeric(grid, addr, &mut visiting, &mut budget).is_some() {
-                Some(TextAlign::Right)
-            } else {
-                None
-            }
-        }
-        Some(
-            NumberFormat::Rational | NumberFormat::Fixed { .. } | NumberFormat::Currency { .. },
-        ) => Some(TextAlign::Right),
-        None => None,
-    }
-}
-
-fn truncate_with_ellipsis(text: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    if text.width() <= width {
-        return text.to_string();
-    }
-    let keep = width.saturating_sub(1);
-    if keep == 0 {
-        return "…".to_string();
-    }
-    let (prefix, _) = text.unicode_truncate(keep);
-    format!("{prefix}…")
-}
-
-/// Trailing content after a cell span in the sheet grid: **never** mixed into
-/// [`align_cell_display`] / spill text (regression guard).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum InterColumnTrailing {
-    /// No next column in this viewport row.
-    EndOfVisibleRow,
-    /// Left/right main-block ruler (`│` then gap).
-    PipeAndSpace,
-    /// Default single ASCII space between interior columns.
-    AsciiSpace,
-}
-
-fn inter_column_trailing_after_data_cell(
-    viewport_col_idx: usize,
-    sheet_col: usize,
-    col_ixs: &[usize],
-    lm: usize,
-    mc: usize,
-    show_right_divider: bool,
-) -> InterColumnTrailing {
-    if viewport_col_idx + 1 >= col_ixs.len() {
-        return InterColumnTrailing::EndOfVisibleRow;
-    }
-    if sheet_col == lm.saturating_sub(1) && lm > 0 && col_ixs.contains(&lm) {
-        return InterColumnTrailing::PipeAndSpace;
-    }
-    if sheet_col == lm + mc - 1 && show_right_divider {
-        return InterColumnTrailing::PipeAndSpace;
-    }
-    InterColumnTrailing::AsciiSpace
-}
-
-/// Prefix of `text` consuming at most `display_width` terminal columns (Unicode width-aware).
-fn take_display_prefix(text: &str, display_width: usize) -> (String, String) {
-    use unicode_segmentation::UnicodeSegmentation;
-
-    if display_width == 0 || text.is_empty() {
-        return (String::new(), text.to_string());
-    }
-    let mut acc = 0usize;
-    let mut end = 0usize;
-    for g in text.graphemes(true) {
-        let w = unicode_width::UnicodeWidthStr::width(g);
-        if acc + w > display_width {
-            break;
-        }
-        acc += w;
-        end += g.len();
-    }
-    let (pre, suf) = text.split_at(end);
-    (pre.to_string(), suf.to_string())
-}
-
-fn shrink_numeric_display(text: &str, width: usize) -> Option<String> {
-    let trimmed = text.trim();
-    if let Some((re, im, sep)) = parse_complex_display(trimmed) {
-        for decimals in (0..=9).rev() {
-            let re_s = format_fixed_trimmed(re, decimals);
-            let im_s = format_fixed_trimmed(im.abs(), decimals);
-            let cand = format!("{re_s}{sep}{im_s}i");
-            if cand.width() <= width {
-                return Some(cand);
-            }
-        }
-        for decimals in (0..=4).rev() {
-            let re_s = format!("{re:.decimals$e}");
-            let im_s = format!("{:.decimals$e}", im.abs());
-            let cand = format!("{re_s}{sep}{im_s}i");
-            if cand.width() <= width {
-                return Some(cand);
-            }
-        }
-        return None;
-    }
-
-    if let Some(exp_idx) = trimmed.find(['e', 'E']) {
-        let (mantissa, exponent) = trimmed.split_at(exp_idx);
-        if exponent.len() >= 2 && mantissa.parse::<f64>().is_ok() {
-            let exponent_width = exponent.width();
-            if exponent_width >= width {
-                return None;
-            }
-            let mut mantissa = mantissa.to_string();
-            while format!("{mantissa}{exponent}").width() > width {
-                if let Some(dot_idx) = mantissa.find('.') {
-                    let fractional_len = mantissa[dot_idx + 1..].chars().count();
-                    if fractional_len > 0 {
-                        mantissa.pop();
-                        if mantissa.ends_with('.') {
-                            mantissa.pop();
-                        }
-                        continue;
-                    }
-                }
-                break;
-            }
-            let candidate = format!("{mantissa}{exponent}");
-            if candidate.width() <= width {
-                return Some(candidate);
-            }
-        }
-    }
-    let mut s = trimmed.to_string();
-    if s.parse::<f64>().is_err() || !s.contains('.') {
-        return None;
-    }
-    while s.chars().count() > width {
-        let Some(last) = s.chars().last() else {
-            break;
-        };
-        if last == '.' {
-            s.pop();
-            break;
-        }
-        s.pop();
-    }
-    if s.chars().count() <= width {
-        Some(s)
-    } else {
-        None
-    }
-}
-
-fn parse_complex_display(text: &str) -> Option<(f64, f64, char)> {
-    let body = text.strip_suffix('i')?;
-    let mut split_idx = None;
-    let mut split_sep = '+';
-    let mut prev = '\0';
-    for (idx, ch) in body.char_indices().skip(1) {
-        if (ch == '+' || ch == '-') && prev != 'e' && prev != 'E' {
-            split_idx = Some(idx);
-            split_sep = ch;
-        }
-        prev = ch;
-    }
-    let idx = split_idx?;
-    let (re_s, im_s) = body.split_at(idx);
-    let re = re_s.parse::<f64>().ok()?;
-    let im = im_s.parse::<f64>().ok()?;
-    Some((re, im, split_sep))
-}
-
-fn format_fixed_trimmed(n: f64, decimals: usize) -> String {
-    if decimals == 0 {
-        return format!("{n:.0}");
-    }
-    let s = format!("{n:.decimals$}");
-    if s.contains('.') {
-        s.trim_end_matches('0').trim_end_matches('.').to_string()
-    } else {
-        s
-    }
-}
-
-fn exponential_numeric_display_with_hint(text: &str, width: usize, numeric_hint: Option<f64>) -> Option<String> {
-    let value = numeric_hint.or_else(|| text.trim().parse::<f64>().ok())?;
-    if !value.is_finite() {
-        return None;
-    }
-    let target = width.min(10);
-    for decimals in (0..=6).rev() {
-        let s = format!("{value:.decimals$e}");
-        if s.chars().count() <= target {
-            return Some(s);
-        }
-        if s.contains('.') {
-            let trimmed = s.trim_end_matches('0').trim_end_matches('.').to_string();
-            if trimmed.chars().count() <= target {
-                return Some(trimmed);
-            }
-        }
-    }
-    None
-}
-
-fn exponential_numeric_display(text: &str, width: usize) -> Option<String> {
-    exponential_numeric_display_with_hint(text, width, None)
-}
-
-fn would_ellipsis_hide_decimal_point(text: &str, width: usize) -> bool {
-    if width == 0 {
-        return false;
-    }
-    let trimmed = text.trim();
-    if trimmed.width() <= width {
-        return false;
-    }
-    let Some(dot_idx) = trimmed.find('.') else {
-        return false;
-    };
-    let int_part = &trimmed[..dot_idx];
-    int_part.width() >= width
-}
-
-fn scientific_from_decimal_literal(text: &str, decimals: usize) -> Option<String> {
-    let t = text.trim();
-    if t.is_empty() {
-        return None;
-    }
-    let (sign, body) = if let Some(rest) = t.strip_prefix('-') {
-        ("-", rest)
-    } else {
-        ("", t)
-    };
-    let body = body.trim();
-    if body.is_empty() || !body.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        return None;
-    }
-    let mut parts = body.split('.');
-    let int_part = parts.next().unwrap_or("");
-    let frac_part = parts.next().unwrap_or("");
-    if parts.next().is_some() {
-        return None;
-    }
-    if int_part.is_empty() && frac_part.is_empty() {
-        return None;
-    }
-
-    let int_trim = int_part.trim_start_matches('0');
-    let (lead_digits, exponent) = if !int_trim.is_empty() {
-        (
-            format!("{int_trim}{frac_part}"),
-            (int_trim.chars().count() as i64) - 1,
-        )
-    } else {
-        let first_non_zero = frac_part.chars().position(|c| c != '0')?;
-        (
-            frac_part[first_non_zero..].to_string(),
-            -((first_non_zero as i64) + 1),
-        )
-    };
-
-    let mut chars = lead_digits.chars();
-    let first = chars.next()?;
-    let mut mantissa_tail: String = chars.collect();
-    while mantissa_tail.chars().count() < decimals {
-        mantissa_tail.push('0');
-    }
-    let mantissa_tail = mantissa_tail.chars().take(decimals).collect::<String>();
-    let mantissa = if decimals == 0 {
-        first.to_string()
-    } else {
-        format!("{first}.{mantissa_tail}")
-    };
-    Some(format!("{sign}{mantissa}e{exponent}"))
-}
-
-fn format_significant_10_local(n: f64) -> String {
-    if !n.is_finite() {
-        return n.to_string();
-    }
-    if n == 0.0 {
-        return "0".into();
-    }
-    let abs = n.abs();
-    if (1e-4..1e10).contains(&abs) {
-        let exp = abs.log10().floor() as i32;
-        let decimals = (9 - exp).max(0) as usize;
-        let s = format!("{n:.decimals$}");
-        if s.contains('.') {
-            s.trim_end_matches('0').trim_end_matches('.').to_string()
-        } else {
-            s
-        }
-    } else {
-        format!("{n:.9e}")
-    }
-}
-
-fn sheet_row_label(logical_row: usize, main_rows: usize) -> String {
-    addr::ui_row_label(logical_row, main_rows)
-}
-
-fn col_header_label(global_col: usize, main_cols: usize) -> String {
-    addr::ui_column_fragment(global_col, main_cols)
-}
+// Formatting functions (normalize_inline_text, measured_width_text_for_stored_literal,
+// format_cell_display, etc.) are in crate::ui_core — imported via `use crate::ui_core::*`.
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let popup_layout = Layout::default()
