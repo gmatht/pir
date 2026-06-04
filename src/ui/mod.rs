@@ -332,8 +332,6 @@ enum Mode {
         focus: BalanceBooksFocus,
     },
     QuitPrompt,
-    /// No `.corro` on disk (e.g. opened from ODS/TSV/CSV); user should save to `.corro` or discard.
-    QuitImportPrompt,
     /// Interactive extrapolation: arrow keys extend the selection, Enter extrapolates, Esc cancels.
     Extrapolate,
     /// Interactive duplicate: arrow keys extend the selection, Enter duplicates, Esc cancels.
@@ -1246,8 +1244,8 @@ impl App {
                 buffer: self.start_input_mode(String::new()),
             },
             MenuAction::Exit => {
-                if self.path.is_none() {
-                    Mode::QuitImportPrompt
+                if self.path.is_none() && self.unsaved_file.is_none() {
+                    Mode::QuitPrompt
                 } else {
                     Mode::QuitPrompt
                 }
@@ -1908,9 +1906,17 @@ fn visible_col_indices(
             + right_band.len(),
     );
     if lm > 0 {
-        stable_band.push(lm - 1);
+        if left_band.is_empty() {
+            // Cursor is not in the left margin — pin [A at the left edge.
+            stable_band.push(lm - 1);
+        } else {
+            // Cursor is in the left margin — fill the gap between the cursor
+            // band and the main grid edge so all column labels are sequential
+            // with no visual jump.
+            let band_min = left_band.iter().copied().min().unwrap_or(lm - 1);
+            stable_band.extend(band_min..lm);
+        }
     }
-    stable_band.extend(left_band.iter().copied());
     // Include ALL main columns from the first (0) through the end of the
     // main window so that columns between the left anchor and the window
     // never go missing.
@@ -10298,7 +10304,6 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 "  arrows·extend selection   Enter·duplicate   Esc·cancel".into()
             }
             Mode::QuitPrompt => "  Q·quit   B·back   Esc·cancel".into(),
-            Mode::QuitImportPrompt => "  S·save as .corro   D·discard   B·back".into(),
             Mode::Help => "  up/down·scroll   Esc·close   ?·help   A·about".into(),
             Mode::About => "  up/down·scroll   Esc·close   ?·help   A·about".into(),
             Mode::Menu { .. } => {
@@ -11997,27 +12002,6 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 }
                 _ => {}
             },
-            Mode::QuitImportPrompt => match key.code {
-                KeyCode::Char('s') | KeyCode::Char('S') => {
-                    mode = Mode::SavePath {
-                        buffer: self.start_input_mode(self.suggested_corro_save_path()),
-                    };
-                }
-                KeyCode::Char('d') | KeyCode::Char('D') => {
-                    self.mode = mode;
-                    return Ok(true);
-                }
-                KeyCode::Char('b') | KeyCode::Char('B') | KeyCode::Esc => {
-                    // Clear any pending quick-quit when backing out.
-                    self.pending_quit_esc = false;
-                    self.pending_quit_esc_since = None;
-                    if let Some(prev) = self.pending_quit_prev_status.take() {
-                        self.status = prev;
-                    }
-                    mode = Mode::Normal;
-                }
-                _ => {}
-            },
             Mode::Extrapolate => match key.code {
                 KeyCode::Enter => {
                     if let Some(op) = self.extrapolate_selection() {
@@ -12961,14 +12945,10 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                                 return Ok(true);
                             }
                         }
-                        mode = if self.path.is_none() {
-                            Mode::QuitImportPrompt
-                        } else {
-                            Mode::QuitPrompt
-                        };
+                        mode = Mode::QuitPrompt;
                     }
                 }
-                    KeyCode::Delete => {
+                KeyCode::Delete => {
                         if !self.delete_selection() {
                             let addr = self.cursor.to_addr(&self.state.grid);
                             if self.state.grid.get(&addr).is_some() {
@@ -13472,10 +13452,6 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             .style(prompt_style),
             Mode::QuitPrompt => Paragraph::new(" Quit Corro? (Q)uit, (B)ack ")
                 .style(Style::default().fg(Color::White).bg(Color::Red)),
-            Mode::QuitImportPrompt => {
-                Paragraph::new(" No .corro on disk. (S)ave as .corro, (D)iscard and quit, (B)ack ")
-                    .style(Style::default().fg(Color::White).bg(Color::Red))
-            }
             Mode::Help => Paragraph::new(" Help - Up/Down scroll, Esc closes ")
                 .style(Style::default().fg(Color::White).bg(Color::Blue)),
             Mode::About => Paragraph::new(" About - Up/Down scroll, Esc closes ")
@@ -15976,23 +15952,17 @@ mod tests {
             i += 1;
         }
 
-        // We should see at least `[A` (pinned at left edge) and `[X` (cursor column).
-        assert!(
-            col_labels.iter().any(|l| l == "[A"),
-            "expected [A pinned at left edge: {col_labels:?}\nheader: {header_line}\nall lines:\n{}",
-            lines.join("\n")
-        );
+        // Verify the gap is FILLED: column labels should now be sequential
+        // from the band minimum up to the main grid edge, with no jump.
         assert!(
             col_labels.iter().any(|l| l == "[X"),
-            "expected [X at cursor: {col_labels:?}\nheader: {header_line}\nall lines:\n{}",
+            "expected [X at cursor: {:?}\nheader: {:?}\nall lines:\n{}",
+            col_labels,
+            header_line,
             lines.join("\n")
         );
 
-        // Verify the gap: there should be a non-sequential jump.
-        // The left margin wraps w/ mirror naming: index 701=[A, 700=[B, ..., 678=[X.
-        // If pinned [A (701) is shown AND the band around [X (678) is shown,
-        // indices between 679..=700 are NOT shown — a gap of 22 columns.
-        // We check that fewer left-margin labels exist than the range would imply.
+        // Check that ALL left-margin labels are sequential (no gaps).
         let left_labels: Vec<&str> = col_labels
             .iter()
             .filter(|l| l.starts_with('['))
@@ -16000,13 +15970,11 @@ mod tests {
             .collect();
 
         if !left_labels.is_empty() {
-            // Get the numeric index for each left margin label.
             let left_nums: Vec<usize> = left_labels
                 .iter()
                 .filter_map(|l| {
                     let name = l.strip_prefix('[')?;
                     let parsed = crate::addr::parse_excel_column(name)?;
-                    // Left margin: index = MARGIN_COLS - 1 - parsed
                     Some(MARGIN_COLS - 1 - parsed as usize)
                 })
                 .collect();
@@ -16014,10 +15982,17 @@ mod tests {
                 let max_idx = left_nums.iter().copied().max().unwrap_or(0);
                 let min_idx = left_nums.iter().copied().min().unwrap_or(0);
                 let range_len = max_idx - min_idx + 1;
-                assert!(
-                    left_nums.len() < range_len,
-                    "expected NON-sequential left margin labels (gap between [A and [X), \
-                     got sequential range {min_idx}..={max_idx}: {left_labels:?}\nheader: {header_line}"
+                assert_eq!(
+                    left_nums.len(),
+                    range_len,
+                    "expected SEQUENTIAL left margin labels (no gaps), \
+                     got {}/{} range {}..={}: {:?}\nheader: {:?}",
+                    left_nums.len(),
+                    range_len,
+                    min_idx,
+                    max_idx,
+                    left_labels,
+                    header_line
                 );
             }
         }
@@ -18938,7 +18913,7 @@ mod tests {
     }
 
     #[test]
-    fn esc_shows_quit_import_prompt_after_tsv_edit_tracked() {
+    fn esc_shows_quit_prompt_after_tsv_edit_tracked() {
         use std::path::PathBuf;
         use crate::grid::CellAddr;
         use crate::ops::Op;
@@ -18962,7 +18937,7 @@ mod tests {
             .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
             .unwrap();
         assert!(!quit);
-        assert!(matches!(app.mode, Mode::QuitImportPrompt));
+        assert!(matches!(app.mode, Mode::QuitPrompt));
     }
 
     #[test]
@@ -22111,5 +22086,14 @@ fn unsaved_app_path_set_and_file_nonempty_after_commit() {
     } else {
         env::remove_var("CORRO_AUTO_UNSAVED_TEST");
     }
+}
+
+#[test]
+fn quit_import_prompt_removed_from_source() {
+    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui/mod.rs"));
+    // Split the search and message strings to avoid self-matching.
+    let needle = format!("Quit{}", "ImportPrompt");
+    let msg = format!("the QuitImport{} variant should have been removed", "Prompt");
+    assert!(!source.contains(&needle), "{}", msg);
 }
 
