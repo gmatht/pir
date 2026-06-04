@@ -87,10 +87,11 @@ impl App {
             match ext.as_str() {
                 "corro" => {
                     let mut active_sheet = self.core.workbook.sheet_id(self.core.workbook.active_sheet);
-                    load_workbook_revisions_partial(
+                    let (_, replay) = load_workbook_revisions_partial(
                         p, self.rev_limit.unwrap_or(usize::MAX),
                         &mut self.core.workbook, &mut active_sheet,
                     ).map_err(|e| format!("failed to load: {e}"))?;
+                    self.core.ops_applied = replay.op_count;
                     if let Some(i) = self.core.workbook.sheets.iter().position(|s| s.id == active_sheet) {
                         self.core.workbook.active_sheet = i;
                     }

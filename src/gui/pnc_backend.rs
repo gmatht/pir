@@ -33,10 +33,26 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         }
     }
 
-    // Build column layout: margin col (width 4), main cols (width 10), right-margin cols (width 4)
-    let default_col_w = 10u32;
+    // Build column layout: margin col (width 4), main cols (content-based widths), right-margin cols (width 4)
     let margin_w = 4u32;
     let right_w = 4u32;
+    // Measure content widths for each main column
+    let mut main_col_widths: Vec<u32> = Vec::new();
+    for ci in 0..main_cols {
+        let mut max_w = 0usize;
+        for r in 0..main_rows {
+            let addr = CellAddr::Main { row: r as u32, col: ci as u32 };
+            if let Some(val) = sheet_rec.grid.get(&addr) {
+                let display = ui_core::format_cell_display(&sheet_rec.grid, &addr, val);
+                max_w = max_w.max(display.chars().count());
+            }
+        }
+        let label = crate::addr::ui_column_fragment(margin_cols + ci, main_cols);
+        let label_w = label.chars().count();
+        let min_w = (label_w + 3).max(4);
+        let w = max_w.max(min_w).min(crate::grid::DEFAULT_MAX_COL_WIDTH) as u32;
+        main_col_widths.push(w);
+    }
     let mut layout: Vec<(u32, u32, String)> = Vec::new();
     // Last left margin column
     if margin_cols > 0 {
@@ -44,10 +60,10 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         layout.push(((margin_cols - 1) as u32, margin_w, label));
     }
     // Main columns
-    for ci in 0..main_cols {
+    for (ci, &w) in main_col_widths.iter().enumerate() {
         let global_ci = margin_cols + ci;
         let label = crate::addr::ui_column_fragment(global_ci, main_cols);
-        layout.push((global_ci as u32, default_col_w, label));
+        layout.push((global_ci as u32, w, label));
     }
     // Right-margin columns (as many as fit)
     for ci in 0..right_margin_cols {
@@ -69,10 +85,10 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Grid config
     spreadsheet.set_grid_config(margin_cols as u32, main_cols as u32);
 
-    // Border title — match ratatui
-    let total_ops = (app.core.offset as usize + main_rows + 1).max(1);
+    // Border title — match ratatui: use ops_applied
+    let total_ops = app.core.ops_applied;
     let border_title = format!("corro  {}r × {}c  ops {}",
-        main_rows, main_cols, total_ops.saturating_sub(1));
+        main_rows, main_cols, total_ops);
     spreadsheet.set_border_title(&border_title);
 
     // Menu — match ratatui default
@@ -81,9 +97,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Status bar — match ratatui hints_line for normal mode
     spreadsheet.set_status_text("  type/F2·edit; Ctrl+C·copy; Ctrl+X·cut; Ctrl+V·paste; Ctrl+;·date; Ctrl+:·time; Ctrl+S·save; F1·help");
 
-    // Formula bar trailing — show loaded workbook status
+    // Formula bar trailing — show loaded workbook status with revision
     if let Some(ref path) = app.core.path {
-        let status = format!("   ·  Loaded workbook {}", path.display());
+        let status = format!("   ·  Loaded workbook {} @ revision {}", path.display(), app.core.ops_applied);
         spreadsheet.set_formula_bar_trailing(&status);
     }
 
