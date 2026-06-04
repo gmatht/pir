@@ -333,16 +333,19 @@ impl GridBox {
     pub fn total_logical_rows(&self) -> usize {
         self.inner.total_logical_rows()
     }
+#[inline(always)]
 
     pub fn get_owned(&self, addr: &CellAddr) -> Option<String> {
         self.inner.get_owned(addr)
     }
 
     /// Convenience owned-get that mirrors the old Grid::get (returns owned String)
+    #[inline(always)]
     pub fn get(&self, addr: &CellAddr) -> Option<String> {
         self.inner.get_owned(addr)
     }
 
+    #[inline(always)]
     pub fn text(&self, addr: &CellAddr) -> String {
         self.inner.text(addr)
     }
@@ -351,6 +354,7 @@ impl GridBox {
         self.inner.set_owned(addr, value)
     }
 
+    #[inline(always)]
     pub fn set(&mut self, addr: &CellAddr, value: String) {
         self.inner.set(addr, value)
     }
@@ -358,6 +362,7 @@ impl GridBox {
     pub fn set_main_size(&mut self, r: usize, c: usize) {
         self.inner.set_main_size(r, c)
     }
+#[inline(always)]
 
     pub fn ensure_extent_for_cursor(&mut self, row: usize, col: usize) -> bool {
         self.inner.ensure_extent_for_cursor(row, col)
@@ -474,6 +479,7 @@ impl GridBox {
     pub fn set_cell_format(&mut self, addr: CellAddr, format: CellFormat) {
         self.inner.set_cell_format(addr, format)
     }
+#[inline(always)]
 
     pub fn format_for_addr(&self, addr: &CellAddr) -> CellFormat {
         self.inner.format_for_addr(addr)
@@ -495,13 +501,16 @@ impl GridBox {
         self.inner.set_spill_error(addr, err)
     }
 
+    #[inline(always)]
     pub fn spill_error(&self, addr: &CellAddr) -> Option<&'static str> {
         self.inner.spill_error(addr)
     }
+#[inline(always)]
 
     pub fn logical_row_has_content(&self, r: usize) -> bool {
         self.inner.logical_row_has_content(r)
     }
+#[inline(always)]
 
     pub fn logical_col_has_content(&self, c: usize) -> bool {
         self.inner.logical_col_has_content(c)
@@ -523,6 +532,7 @@ impl GridBox {
         self.inner.cell_formats()
     }
 
+    #[inline]
     pub fn iter_nonempty(&self) -> Box<dyn Iterator<Item = (CellAddr, String)> + '_> {
         self.inner.iter_nonempty()
     }
@@ -680,15 +690,18 @@ impl Grid {
         self.extent_main_cols as usize
     }
 
+    #[inline(always)]
     pub fn total_cols(&self) -> usize {
         MARGIN_COLS + self.extent_main_cols as usize + MARGIN_COLS
     }
 
+    #[inline(always)]
     pub fn total_logical_rows(&self) -> usize {
         HEADER_ROWS + self.extent_main_rows as usize + FOOTER_ROWS
     }
 
     /// Grow extent so cursor (logical row/col) is addressable in main/margins.
+#[inline(always)]
     /// Returns true if the extent was actually grown (for UI feedback).
     pub fn ensure_extent_for_cursor(&mut self, row: usize, col: usize) -> bool {
         let hr = HEADER_ROWS;
@@ -732,6 +745,7 @@ impl Grid {
         }
         grown
     }
+#[inline(always)]
 
     pub fn logical_row_has_content(&self, r: usize) -> bool {
         let hr = HEADER_ROWS;
@@ -750,6 +764,7 @@ impl Grid {
         let fr = fr as u32;
         self.footer.keys().any(|&(stored_row, _)| stored_row == fr)
     }
+#[inline(always)]
 
     pub fn logical_col_has_content(&self, c: usize) -> bool {
         let tc = self.total_cols();
@@ -1127,6 +1142,7 @@ impl Grid {
             self.cell_formats.insert(addr, format);
         }
     }
+#[inline(always)]
 
     pub fn format_for_addr(&self, addr: &CellAddr) -> CellFormat {
         let global_col = addr_logical_col(addr, self);
@@ -1240,6 +1256,7 @@ impl Grid {
             .join(" ")
     }
 
+    #[inline(always)]
     pub fn get(&self, addr: &CellAddr) -> Option<&str> {
         if let Some(v) = self.spill_followers.get(addr) {
             return Some(v.as_str());
@@ -1261,6 +1278,7 @@ impl Grid {
         self.spill_errors.get(addr).copied()
     }
 
+    #[inline(always)]
     pub fn set(&mut self, addr: &CellAddr, value: String) {
         match addr {
             CellAddr::Header { row, col } => {
@@ -1518,10 +1536,12 @@ impl GridImpl for Grid {
     fn total_cols(&self) -> usize {
         self.total_cols()
     }
+#[inline(always)]
 
     fn get_owned(&self, addr: &CellAddr) -> Option<String> {
         self.get(addr).map(|s| s.to_string())
     }
+#[inline(always)]
 
     fn set_owned(&mut self, addr: &CellAddr, value: String) {
         self.set(addr, value)
@@ -1547,8 +1567,8 @@ impl GridImpl for Grid {
         Grid::mark_spills_stale(self)
     }
 
+    #[inline]
     fn iter_nonempty(&self) -> Box<dyn Iterator<Item = (CellAddr, String)> + '_> {
-        // Build a vec of non-empty cells across regions and return an iterator.
         let mut v: Vec<(CellAddr, String)> = Vec::new();
         for (&(r, col), val) in &self.header {
             v.push((
@@ -1584,6 +1604,7 @@ impl GridImpl for Grid {
         self.total_logical_rows()
     }
 
+    #[inline(always)]
     fn text(&self, addr: &CellAddr) -> String {
         self.get(addr).unwrap_or("").to_string()
     }
@@ -1674,6 +1695,7 @@ impl GridImpl for Grid {
     fn set_cell_format(&mut self, addr: CellAddr, format: CellFormat) {
         self.set_cell_format(addr, format)
     }
+#[inline(always)]
 
     fn format_for_addr(&self, addr: &CellAddr) -> CellFormat {
         self.format_for_addr(addr)
@@ -1744,6 +1766,7 @@ impl GridImpl for Grid {
     fn set_spill_error(&mut self, addr: CellAddr, err: &'static str) {
         self.set_spill_error(addr, err)
     }
+#[inline(always)]
 
     fn spill_error(&self, addr: &CellAddr) -> Option<&'static str> {
         self.spill_error(addr)
@@ -1852,6 +1875,7 @@ fn compare_sort_values(va: &str, vb: &str, desc: bool) -> std::cmp::Ordering {
 }
 
 /// Logical sheet row index (0 = top header row) for addressing.
+#[inline]
 pub fn addr_logical_row(addr: &CellAddr, grid: &Grid) -> usize {
     let hr = HEADER_ROWS;
     match addr {
@@ -1863,6 +1887,7 @@ pub fn addr_logical_row(addr: &CellAddr, grid: &Grid) -> usize {
 }
 
 /// Global column index for addressing.
+#[inline]
 pub fn addr_logical_col(addr: &CellAddr, grid: &Grid) -> usize {
     match addr {
         CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => {

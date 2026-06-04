@@ -113,6 +113,7 @@ pub(super) fn number_from_bool(b: bool) -> Number {
     }
 }
 
+#[inline(always)]
 fn eval_plain_cell_raw(trimmed: &str) -> EvalResult {
     if let Some(n) = parse_number_literal(trimmed) {
         EvalResult::Number(n)
@@ -153,10 +154,12 @@ impl EvalResult {
     }
 }
 
+#[inline(always)]
 pub(crate) fn parse_number_literal(s: &str) -> Option<Number> {
     number::parse_number_literal(s)
 }
 
+#[inline(always)]
 pub(crate) fn parse_numeric_or_date_literal(s: &str) -> Option<Number> {
     #[cfg(test)]
     {
@@ -194,6 +197,7 @@ fn resolve_name(name: &str, bindings: &[(String, EvalResult)]) -> Option<EvalRes
     }
 }
 
+#[inline(always)]
 pub(crate) fn split_labeled_formula(raw: &str) -> Option<(&str, &str)> {
     let t = raw.trim();
     let expr = t.strip_prefix('=')?;
@@ -205,10 +209,12 @@ pub(crate) fn split_labeled_formula(raw: &str) -> Option<(&str, &str)> {
     }
     Some((expr, label))
 }
+#[inline(always)]
 
 fn render_addr(addr: &CellAddr, locks: &A1RefLocks) -> String {
     formula_cell_ref_text(addr, 0, *locks)
 }
+#[inline]
 
 fn render_ast(ast: &Ast) -> String {
     match ast {
@@ -537,6 +543,7 @@ pub fn repair_all_formulas_after_main_col_insert(
         grid.set(&addr, s);
     }
 }
+#[inline]
 
 fn shift_if_unlocked_row(row: u32, locks: &A1RefLocks, gap_start: u32, delta: i32) -> Option<u32> {
     if locks.row_absolute || row < gap_start {
@@ -549,6 +556,7 @@ fn shift_if_unlocked_row(row: u32, locks: &A1RefLocks, gap_start: u32, delta: i3
         Some(r as u32)
     }
 }
+#[inline]
 
 fn shift_if_unlocked_col(col: u32, locks: &A1RefLocks, gap_start: u32, delta: i32) -> Option<u32> {
     if locks.col_absolute || col < gap_start {
@@ -1378,6 +1386,7 @@ fn rewrite_row_template(expr: &str, col: usize) -> String {
     out
 }
 
+#[inline]
 fn control_formula_expr(grid: &Grid, addr: &CellAddr) -> Option<String> {
     let raw_owned = grid.get(addr);
     let raw = raw_owned.as_deref()?;
@@ -1417,6 +1426,7 @@ fn margin_control_label_after_double_equals(t: &str) -> Option<String> {
     }
 }
 
+#[inline]
 fn control_formula_label(grid: &Grid, addr: &CellAddr) -> Option<String> {
     let raw_owned = grid.get(addr);
     let raw = raw_owned.as_deref()?;
@@ -1444,6 +1454,7 @@ fn control_formula_label(grid: &Grid, addr: &CellAddr) -> Option<String> {
     Some(label.to_string())
 }
 
+#[inline]
 fn templated_formula(grid: &Grid, addr: &CellAddr) -> Option<String> {
     let CellAddr::Main { row, col } = addr else {
         return None;
@@ -1517,6 +1528,7 @@ pub fn main_column_label_from_header(grid: &Grid, main_col: usize) -> Option<Str
 
 /// True if the stored cell text is a spreadsheet formula (`=` prefix after trim). `==…`
 /// margin aggregate directives are not formulas here.
+#[inline(always)]
 pub fn is_formula(raw: &str) -> bool {
     let t = raw.trim_start();
     if t.starts_with("==") {
@@ -1525,7 +1537,7 @@ pub fn is_formula(raw: &str) -> bool {
     t.starts_with('=')
 }
 
-/// Numeric value for aggregation: formulas evaluate to a number if possible; plain text uses exact/approx parse.
+#[inline]
 pub fn effective_numeric(
     grid: &Grid,
     addr: &CellAddr,
@@ -1557,6 +1569,7 @@ pub fn effective_numeric(
 }
 
 /// Spreadsheet SUM-style numeric contribution: [`effective_numeric`] plus boolean values as exact `0`/`1`.
+#[inline]
 pub fn summable_numeric(
     grid: &Grid,
     addr: &CellAddr,
@@ -1586,7 +1599,8 @@ pub fn summable_numeric(
     }
 }
 
-/// Evaluate a cell (handles `=...`); used for display and dependencies.
+#[cfg_attr(feature = "nightly", optimize(speed))]
+#[inline]
 pub fn eval_cell(
     grid: &Grid,
     addr: &CellAddr,
@@ -1677,6 +1691,8 @@ fn eval_cell_with_sheet(
     r
 }
 
+#[cfg_attr(feature = "nightly", optimize(speed))]
+#[inline]
 fn eval_cell_inner(
     grid: &Grid,
     addr: &CellAddr,
@@ -1821,6 +1837,8 @@ fn eval_cell_inner(
     r
 }
 
+#[cfg_attr(feature = "nightly", optimize(speed))]
+#[inline]
 fn eval_expr_str(
     expr: &str,
     grid: &Grid,
@@ -1884,10 +1902,12 @@ struct Parser<'a> {
     main_cols: usize,
 }
 
+
 impl<'a> Parser<'a> {
     fn peek(&self) -> Option<u8> {
         self.s.as_bytes().get(self.i).copied()
     }
+#[inline(always)]
 
     fn skip_ws(&mut self) {
         while let Some(b) = self.peek() {
@@ -1898,11 +1918,13 @@ impl<'a> Parser<'a> {
             }
         }
     }
+#[inline]
 
     fn parse_expr(&mut self) -> Result<Ast, ()> {
         self.parse_concat()
     }
 
+#[inline]
     /// Excel-style: `&` is looser than `+` / `-` (concat binds after add/sub).
     fn parse_concat(&mut self) -> Result<Ast, ()> {
         let mut left = self.parse_add_sub()?;
@@ -1918,6 +1940,7 @@ impl<'a> Parser<'a> {
         }
         Ok(left)
     }
+#[inline]
 
     fn parse_add_sub(&mut self) -> Result<Ast, ()> {
         let mut left = self.parse_mul_div()?;
@@ -1939,6 +1962,7 @@ impl<'a> Parser<'a> {
         }
         Ok(left)
     }
+#[inline]
 
     fn parse_mul_div(&mut self) -> Result<Ast, ()> {
         let mut left = self.parse_unary()?;
@@ -1960,6 +1984,7 @@ impl<'a> Parser<'a> {
         }
         Ok(left)
     }
+#[inline]
 
     fn parse_unary(&mut self) -> Result<Ast, ()> {
         self.skip_ws();
@@ -1970,6 +1995,7 @@ impl<'a> Parser<'a> {
         }
         self.parse_power()
     }
+#[inline]
 
     fn parse_power(&mut self) -> Result<Ast, ()> {
         let left = self.parse_primary()?;
@@ -1981,6 +2007,7 @@ impl<'a> Parser<'a> {
         }
         Ok(left)
     }
+#[inline]
 
     fn parse_primary(&mut self) -> Result<Ast, ()> {
         self.skip_ws();
@@ -2149,6 +2176,7 @@ impl<'a> Parser<'a> {
 
         Err(())
     }
+#[inline]
 
     fn parse_number(&mut self) -> Result<Number, ()> {
         let start = self.i;
@@ -2162,6 +2190,7 @@ impl<'a> Parser<'a> {
         number::parse_number_literal(&self.s[start..self.i]).ok_or(())
     }
 
+#[inline]
     /// Find index of closing `)` matching an already-open `(` at depth starting at `from`.
     fn scan_balanced_from(&self, from: usize) -> Result<usize, ()> {
         let bytes = self.s.as_bytes();
@@ -2191,6 +2220,7 @@ impl<'a> Parser<'a> {
         Err(())
     }
 }
+#[inline]
 
 fn parse_sheet_qualified_ref(s: &str) -> Option<(u32, CellAddr, A1RefLocks, usize)> {
     let bytes = s.as_bytes();
@@ -2208,6 +2238,7 @@ fn parse_sheet_qualified_ref(s: &str) -> Option<(u32, CellAddr, A1RefLocks, usiz
     let (addr, locks, len) = parse_cell_ref_at(&s[i + 1..], 0)?;
     Some((sheet_id, addr, locks, i + 1 + len))
 }
+#[inline]
 
 fn parse_sheet_qualified_cell_ref_at_for_workbook(s: &str) -> Option<(u32, CellAddr, A1RefLocks, usize)> {
     let bytes = s.as_bytes();
@@ -2223,6 +2254,7 @@ fn parse_sheet_qualified_cell_ref_at_for_workbook(s: &str) -> Option<(u32, CellA
     let (addr, locks, len) = parse_cell_ref_at(&s[i + 1..], grid.main_cols())?;
     Some((sheet_id, addr, locks, i + 1 + len))
 }
+#[inline]
 
 fn split_top_level_args(s: &str) -> Result<Vec<&str>, ()> {
     let mut depth = 0i32;
@@ -2255,6 +2287,8 @@ fn split_top_level_args(s: &str) -> Result<Vec<&str>, ()> {
     Ok(out)
 }
 
+#[cfg_attr(feature = "nightly", optimize(speed))]
+#[inline]
 fn eval_ast(
     ast: &Ast,
     grid: &Grid,
@@ -2435,6 +2469,7 @@ fn eval_ast(
     }
 }
 
+#[inline(always)]
 fn truthy(e: EvalResult) -> bool {
     match e.scalar_coerce() {
         EvalResult::Bool(b) => b,
@@ -2455,6 +2490,8 @@ enum BinaryOp {
     Pow,
 }
 
+#[cfg_attr(feature = "nightly", optimize(speed))]
+#[inline]
 fn eval_binary_op(
     a: &Ast,
     b: &Ast,
@@ -2501,6 +2538,7 @@ fn eval_binary_op(
     EvalResult::Number(out)
 }
 
+#[inline]
 pub(super) fn coerce_cell_number(e: EvalResult) -> Result<Number, EvalResult> {
     match e {
         EvalResult::Number(n) => Ok(n),
@@ -2518,6 +2556,8 @@ pub(super) fn coerce_cell_number(e: EvalResult) -> Result<Number, EvalResult> {
 }
 
 /// Used by builtins that need float semantics (`POWER`, trigonometry, etc.).
+#[cfg_attr(feature = "nightly", optimize(speed))]
+#[inline]
 pub(super) fn eval_binary_float(
     a: &Ast,
     b: &Ast,
@@ -2558,6 +2598,7 @@ pub(super) fn eval_binary_float(
 }
 
 /// Real-first binary helper with complex fallback for operations that leave the real domain.
+#[inline(always)]
 fn eval_binary_float_with_complex_fallback(
     a: &Ast,
     b: &Ast,
@@ -2598,6 +2639,8 @@ fn eval_binary_float_with_complex_fallback(
     EvalResult::Number(na.apply_binary_f64_with_complex_fallback(nb, real, complex))
 }
 
+#[cfg_attr(feature = "nightly", optimize(speed))]
+#[inline]
 fn eval_sum(
     arg: &Ast,
     grid: &Grid,
@@ -2644,6 +2687,8 @@ fn eval_sum(
     }
 }
 
+#[cfg_attr(feature = "nightly", optimize(speed))]
+#[inline]
 fn sum_main_range(
     grid: &Grid,
     range: &MainRange,
@@ -2665,6 +2710,8 @@ fn sum_main_range(
     s
 }
 
+#[cfg_attr(feature = "nightly", optimize(speed))]
+#[inline]
 pub fn refresh_spills(grid: &mut Grid) {
     if !grid.spills_refresh_dirty() {
         return;
@@ -2713,16 +2760,19 @@ pub fn refresh_spills(grid: &mut Grid) {
     grid.note_spills_refreshed();
 }
 
+#[inline(always)]
 fn format_number(n: &Number) -> String {
     n.format_eval_display(format_significant_10)
 }
 
 /// Display for UI/export when a column uses [`crate::grid::NumberFormat::Rational`]: exact rationals
 /// as literals; approximate values use the same float rendering as evaluation.
+#[inline(always)]
 pub(crate) fn format_number_cell_display(n: &Number) -> String {
     format_number(n)
 }
 
+#[inline(always)]
 fn eval_result_to_string(result: &EvalResult) -> String {
     match result {
         EvalResult::Number(n) => {
@@ -2744,6 +2794,7 @@ fn eval_result_to_string(result: &EvalResult) -> String {
     }
 }
 
+#[inline]
 fn formula_references_all_empty(grid: &Grid, formula: &str) -> bool {
     let t = formula.trim();
     let Some(expr) = t.strip_prefix('=') else {
@@ -2807,6 +2858,7 @@ fn ast_references_all_empty(ast: &Ast, grid: &Grid, saw_ref: &mut bool) -> bool 
     }
 }
 
+#[inline]
 fn cell_reference_is_empty(grid: &Grid, addr: &CellAddr) -> bool {
     grid.get(addr)
         .as_deref()
@@ -2814,6 +2866,8 @@ fn cell_reference_is_empty(grid: &Grid, addr: &CellAddr) -> bool {
 }
 
 /// Display string for a cell: evaluated formula result, or raw text.
+#[cfg_attr(feature = "nightly", optimize(speed))]
+#[inline]
 pub fn cell_effective_display(grid: &Grid, addr: &CellAddr) -> String {
     if let Some(label) = control_formula_label(grid, addr) {
         return label;
@@ -2870,6 +2924,7 @@ pub fn cell_effective_display(grid: &Grid, addr: &CellAddr) -> String {
             .unwrap_or_else(|| "#CALC".to_string()),
     }
 }
+#[inline]
 
 fn format_significant_10(n: f64) -> String {
     if !n.is_finite() {

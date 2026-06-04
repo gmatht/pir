@@ -2,6 +2,7 @@ use crate::grid::{CellAddr, ColumnAddr, GridBox as Grid, MainRange, HEADER_ROWS,
 use crate::ops::{AggFunc, AggregateDef};
 
 // Internal helpers kept private to this module
+#[inline(always)]
 fn right_col_agg_func(grid: &Grid, global_col: usize) -> Option<AggFunc> {
     let main_cols = grid.main_cols();
     let mut labels: Vec<(u32, String)> = grid
@@ -20,12 +21,14 @@ fn right_col_agg_func(grid: &Grid, global_col: usize) -> Option<AggFunc> {
     None
 }
 
+#[inline(always)]
 fn left_margin_agg_func(grid: &Grid, main_row: u32) -> Option<AggFunc> {
     let key_col = MARGIN_COLS - 1;
     let val = grid.get(&CellAddr::Left { col: key_col, row: main_row })?;
     crate::ops::margin_key_agg_func(&val)
 }
 
+#[inline(always)]
 fn row_total_block_start(grid: &Grid, current_main_row: u32) -> u32 {
     for candidate in (0..current_main_row).rev() {
         if left_margin_agg_func(grid, candidate).is_some() {
@@ -35,6 +38,7 @@ fn row_total_block_start(grid: &Grid, current_main_row: u32) -> u32 {
     0
 }
 
+#[inline(always)]
 fn parse_num(s: &str) -> Option<f64> {
     let t = s.trim();
     if t.is_empty() {
@@ -43,6 +47,7 @@ fn parse_num(s: &str) -> Option<f64> {
     t.parse::<f64>().ok()
 }
 
+#[inline(always)]
 fn fold_numbers(func: AggFunc, xs: &[f64]) -> String {
     if xs.is_empty() {
         return String::new();
@@ -74,6 +79,7 @@ fn fold_numbers(func: AggFunc, xs: &[f64]) -> String {
 }
 
 // Shared helper functions used by UI and ODS
+#[inline(always)]
 pub(crate) fn data_main_col_count(grid: &Grid) -> usize {
     let mc = grid.main_cols();
     for c in 0..mc {
@@ -84,6 +90,7 @@ pub(crate) fn data_main_col_count(grid: &Grid) -> usize {
     mc
 }
 
+#[inline(always)]
 pub(crate) fn previous_raw_block(grid: &Grid, current_main_row: u32) -> Option<(u32, u32)> {
     let mut end = current_main_row;
     while end > 0 {
@@ -110,6 +117,7 @@ pub(crate) fn previous_raw_block(grid: &Grid, current_main_row: u32) -> Option<(
     Some((0, current_main_row))
 }
 
+#[inline(always)]
 pub(crate) fn left_margin_main_col_aggregate(
     grid: &Grid,
     subtotal_func: AggFunc,
@@ -138,6 +146,7 @@ pub(crate) fn left_margin_main_col_aggregate(
     )
 }
 
+#[inline(always)]
 pub(crate) fn left_margin_special_col_aggregate(
     grid: &Grid,
     subtotal_func: AggFunc,

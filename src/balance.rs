@@ -40,14 +40,17 @@ pub struct BalanceCopyPlan {
     pub preserve_formulas: bool,
 }
 
+#[inline(always)]
 pub fn parse_amount_cents(raw: &str) -> Option<i64> {
     core::parse_amount_cents(raw)
 }
 
+#[inline(always)]
 pub fn format_amount_cents(cents: i64) -> String {
     core::format_amount_cents(cents)
 }
 
+#[inline(always)]
 pub fn choose_balance_column(grid: &Grid) -> Option<usize> {
     let mut first_numeric = None;
     for col in 0..grid.main_cols() {
@@ -73,6 +76,7 @@ pub fn choose_balance_column(grid: &Grid) -> Option<usize> {
     first_numeric
 }
 
+#[inline(always)]
 pub fn source_rows_from_grid(grid: &Grid, col: usize) -> Vec<BalanceSourceRow> {
     let mut rows = Vec::new();
     for row in 0..grid.main_rows() {
@@ -92,6 +96,7 @@ pub fn source_rows_from_grid(grid: &Grid, col: usize) -> Vec<BalanceSourceRow> {
     rows
 }
 
+#[inline(always)]
 pub fn balance_books(
     rows: &[BalanceSourceRow],
     direction: BalanceDirection,
@@ -120,10 +125,12 @@ pub fn balance_books(
     }
 }
 
+#[inline(always)]
 pub fn build_balance_report(grid: &Grid, col: usize, direction: BalanceDirection) -> BalanceReport {
     balance_books(&source_rows_from_grid(grid, col), direction, col)
 }
 
+#[inline(always)]
 pub fn balance_copy_plan(
     source_sheet_id: u32,
     source_sheet_title: String,
@@ -154,6 +161,7 @@ pub fn balance_copy_plan(
     }
 }
 
+#[inline(always)]
 pub fn apply_balance_copy(source: &SheetState, target: &mut SheetState, plan: &BalanceCopyPlan) {
     let mc = source.grid.main_cols();
     let mr = source.grid.main_rows();
@@ -263,12 +271,14 @@ pub fn apply_balance_copy(source: &SheetState, target: &mut SheetState, plan: &B
     target.grid.set_volatile_seed(0);
 }
 
+#[inline(always)]
 pub fn materialize_report_sheet(source: &SheetState, plan: &BalanceCopyPlan) -> SheetState {
     let mut target = SheetState::new(source.grid.main_rows(), source.grid.main_cols());
     apply_balance_copy(source, &mut target, plan);
     target
 }
 
+#[inline(always)]
 pub fn row_order_from_groups(report: &BalanceReport, total_rows: usize) -> Vec<usize> {
     let mut order = Vec::new();
     for group in &report.groups {
@@ -283,6 +293,7 @@ pub fn row_order_from_groups(report: &BalanceReport, total_rows: usize) -> Vec<u
     order
 }
 
+#[inline(always)]
 pub fn reordered_row_order(report: &BalanceReport, total_rows: usize) -> Vec<usize> {
     row_order_from_groups(report, total_rows)
 }
@@ -297,15 +308,18 @@ mod tests {
     struct TinyRng(u64);
 
     impl TinyRng {
+#[inline(always)]
         fn new(seed: u64) -> Self {
             Self(seed)
         }
 
+#[inline(always)]
         fn next_u32(&mut self) -> u32 {
             self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
             (self.0 >> 32) as u32
         }
 
+#[inline(always)]
         fn usize_inclusive(&mut self, lo: usize, hi: usize) -> usize {
             if lo >= hi {
                 return lo;
@@ -327,6 +341,7 @@ mod tests {
         reimbursement_rows: Vec<usize>,
     }
 
+#[inline(always)]
     fn build_balancing_sheet(
         seed: u64,
         direction: BalanceDirection,
@@ -421,6 +436,7 @@ mod tests {
         (grid, remapped_groups, remapped_leftovers)
     }
 
+#[inline(always)]
     fn report_groups_as_sets(report: &BalanceReport) -> Vec<BTreeSet<usize>> {
         report
             .groups
@@ -430,6 +446,7 @@ mod tests {
     }
 
     #[test]
+#[inline(always)]
     fn balance_books_fuzz_pos_to_neg_groups_match_expected_reimbursements() {
         for seed in 0..120u64 {
             let (grid, expected, expected_leftovers) =
@@ -460,6 +477,7 @@ mod tests {
     }
 
     #[test]
+#[inline(always)]
     fn balance_books_fuzz_neg_to_pos_groups_match_expected_reimbursements() {
         for seed in 200..320u64 {
             let (grid, expected, expected_leftovers) =
@@ -503,6 +521,7 @@ mod tests {
     }
 
     #[test]
+#[inline(always)]
     fn balance_copy_plan_fuzz_materializes_groups_then_unmatched_block() {
         for (seed, direction) in (400..460u64)
             .map(|s| (s, BalanceDirection::PosToNeg))

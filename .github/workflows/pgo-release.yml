@@ -11,6 +11,18 @@ env:
   CARGO_TERM_COLORS: false
 
 jobs:
+  # ── Nightly test: verify `--features nightly` compiles ─────────────
+  test-nightly:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Build with nightly features
+        run: cargo build --features nightly
+      - name: Test with nightly features
+        run: cargo test --features nightly --test render_parity
+
   # ── Linux x86_64: GNU, with PGO ─────────────────────────────────────
   build-linux-release:
     runs-on: ubuntu-latest

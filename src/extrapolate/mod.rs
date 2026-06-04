@@ -18,6 +18,7 @@ pub enum FillDirection {
 /// 3) named-sequence (weekdays/months)
 /// 4) suffix increment (preserve zero-padding width)
 /// 5) fallback to the last seed value
+#[inline(always)]
 pub fn infer_fill_value(
     seed: &[String],
     offset_from_last: i32,
@@ -64,6 +65,7 @@ pub struct PreviewCell {
 /// - target: main-range being filled to (row/col in main-space).
 ///
 /// Returns a Vec of PreviewCell for the target cells in arbitrary order.
+#[inline(always)]
 pub fn generate_preview(
     grid: &GridBox,
     source: &MainRange,
@@ -166,6 +168,7 @@ pub fn generate_preview(
 // The following helpers mirror the original UI inference routines. They are
 // kept private to this module but exposed via `infer_fill_value` above so the
 // UI can call a single centralized function.
+#[inline(always)]
 fn infer_numeric_fill(seed: &[String], offset_from_last: i32) -> Option<String> {
     if !seed.iter().all(|v| v.trim().parse::<f64>().is_ok()) {
         return None;
@@ -180,6 +183,7 @@ fn infer_numeric_fill(seed: &[String], offset_from_last: i32) -> Option<String> 
     Some(format!("{}", last + step * offset_from_last as f64))
 }
 
+#[inline(always)]
 fn infer_named_sequence_fill(seed: &[String], offset_from_last: i32) -> Option<String> {
     // Accept both 3-letter abbreviations and full names for weekdays/months.
     const WEEKDAYS_ABBR: [&str; 7] = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"];
@@ -220,6 +224,7 @@ fn infer_named_sequence_fill(seed: &[String], offset_from_last: i32) -> Option<S
 
     // Split trailing non-alpha suffix (eg. punctuation) so we can re-append it
     // to the inferred token and preserve punctuation like "Feb." -> "Mar.".
+#[inline(always)]
     fn split_trailing_non_alpha(s: &str) -> (&str, &str) {
         let mut last_alpha_end: Option<usize> = None;
         for (i, ch) in s.char_indices() {
@@ -236,6 +241,7 @@ fn infer_named_sequence_fill(seed: &[String], offset_from_last: i32) -> Option<S
     let (original_core, original_suffix) = split_trailing_non_alpha(original_last);
 
     // Helper to apply the original case pattern to the canonical token.
+#[inline(always)]
     fn apply_case_pattern(original: &str, token: &str) -> String {
         if original.is_empty() {
             return token.to_string();
@@ -285,16 +291,20 @@ fn infer_named_sequence_fill(seed: &[String], offset_from_last: i32) -> Option<S
     }
 
     // Classification helpers for tokens (full vs abbr for months/weekdays).
+#[inline(always)]
     fn is_weekday_full(s: &str) -> bool {
         WEEKDAYS_FULL.contains(&s)
     }
+#[inline(always)]
     fn is_weekday_abbr(s: &str) -> bool {
         let first3: String = s.chars().take(3).collect();
         WEEKDAYS_ABBR.contains(&first3.as_str())
     }
+#[inline(always)]
     fn is_month_full(s: &str) -> bool {
         MONTHS_FULL.contains(&s)
     }
+#[inline(always)]
     fn is_month_abbr(s: &str) -> bool {
         let first3: String = s.chars().take(3).collect();
         MONTHS_ABBR.contains(&first3.as_str())
@@ -372,6 +382,7 @@ fn infer_named_sequence_fill(seed: &[String], offset_from_last: i32) -> Option<S
     }
 }
 
+#[inline(always)]
 fn infer_suffix_fill(seed: &[String], offset_from_last: i32) -> Option<String> {
     let last = seed.last()?.trim();
     let (prefix, digits) = split_trailing_digits(last)?;
@@ -393,6 +404,7 @@ fn infer_suffix_fill(seed: &[String], offset_from_last: i32) -> Option<String> {
     Some(format!("{}{:0width$}", prefix, next, width = width))
 }
 
+#[inline(always)]
 fn split_trailing_digits(s: &str) -> Option<(&str, &str)> {
     let bytes = s.as_bytes();
     let mut i = bytes.len();
@@ -408,6 +420,7 @@ fn split_trailing_digits(s: &str) -> Option<(&str, &str)> {
 /// Construct an Op::FillRange or Op::RelFillRange equivalent commit for the
 /// given preview cells. The caller (UI) should wrap this into a WorkbookOp::SheetOp
 /// and commit via the existing IO/ops flow.
+#[inline(always)]
 pub fn commit_from_preview(cells: Vec<PreviewCell>) -> crate::ops::Op {
     let mapped: Vec<(CellAddr, String)> = cells.into_iter().map(|p| (p.addr, p.value)).collect();
     crate::ops::Op::FillRange { cells: mapped }
@@ -419,6 +432,7 @@ pub fn commit_from_preview(cells: Vec<PreviewCell>) -> crate::ops::Op {
         use crate::grid::{Grid, GridBox, CellAddr, MainRange};
 
         #[test]
+#[inline(always)]
         fn named_sequence_month_full_forward() {
             let seed = vec!["January".to_string()];
             let out = infer_named_sequence_fill(&seed, 1).expect("should infer");
@@ -426,6 +440,7 @@ pub fn commit_from_preview(cells: Vec<PreviewCell>) -> crate::ops::Op {
         }
 
         #[test]
+#[inline(always)]
         fn named_sequence_month_abbr_forward() {
             let seed = vec!["Jan".to_string()];
             let out = infer_named_sequence_fill(&seed, 1).expect("should infer");
@@ -433,6 +448,7 @@ pub fn commit_from_preview(cells: Vec<PreviewCell>) -> crate::ops::Op {
         }
 
         #[test]
+#[inline(always)]
         fn named_sequence_month_abbr_uppercase_forward() {
             let seed = vec!["JAN".to_string()];
             let out = infer_named_sequence_fill(&seed, 1).expect("should infer");
@@ -440,6 +456,7 @@ pub fn commit_from_preview(cells: Vec<PreviewCell>) -> crate::ops::Op {
         }
 
         #[test]
+#[inline(always)]
         fn named_sequence_month_abbr_lowercase_forward() {
             let seed = vec!["jan".to_string()];
             let out = infer_named_sequence_fill(&seed, 1).expect("should infer");
@@ -447,6 +464,7 @@ pub fn commit_from_preview(cells: Vec<PreviewCell>) -> crate::ops::Op {
         }
 
         #[test]
+#[inline(always)]
         fn named_sequence_month_full_uppercase_forward() {
             let seed = vec!["JUNE".to_string()];
             let out = infer_named_sequence_fill(&seed, 1).expect("should infer");
@@ -454,6 +472,7 @@ pub fn commit_from_preview(cells: Vec<PreviewCell>) -> crate::ops::Op {
         }
 
         #[test]
+#[inline(always)]
         fn named_sequence_month_full_titlecase_forward() {
             let seed = vec!["June".to_string()];
             let out = infer_named_sequence_fill(&seed, 1).expect("should infer");
@@ -461,6 +480,7 @@ pub fn commit_from_preview(cells: Vec<PreviewCell>) -> crate::ops::Op {
         }
 
         #[test]
+#[inline(always)]
         fn named_sequence_month_full_lowercase_forward() {
             let seed = vec!["june".to_string()];
             let out = infer_named_sequence_fill(&seed, 1).expect("should infer");
@@ -468,6 +488,7 @@ pub fn commit_from_preview(cells: Vec<PreviewCell>) -> crate::ops::Op {
         }
 
         #[test]
+#[inline(always)]
         fn named_sequence_weekday_full_uppercase_forward() {
             let seed = vec!["THURSDAY".to_string()];
             let out = infer_named_sequence_fill(&seed, 1).expect("should infer");
@@ -475,6 +496,7 @@ pub fn commit_from_preview(cells: Vec<PreviewCell>) -> crate::ops::Op {
         }
 
         #[test]
+#[inline(always)]
         fn named_sequence_weekday_full_titlecase_forward() {
             let seed = vec!["Thursday".to_string()];
             let out = infer_named_sequence_fill(&seed, 1).expect("should infer");
@@ -482,6 +504,7 @@ pub fn commit_from_preview(cells: Vec<PreviewCell>) -> crate::ops::Op {
         }
 
         #[test]
+#[inline(always)]
         fn named_sequence_weekday_full_lowercase_forward() {
             let seed = vec!["thursday".to_string()];
             let out = infer_named_sequence_fill(&seed, 1).expect("should infer");
@@ -489,6 +512,7 @@ pub fn commit_from_preview(cells: Vec<PreviewCell>) -> crate::ops::Op {
         }
 
     #[test]
+#[inline(always)]
     fn named_sequence_weekday_full_backward() {
         let seed = vec!["Monday".to_string()];
         let out = infer_named_sequence_fill(&seed, -1).expect("should infer");
@@ -496,6 +520,7 @@ pub fn commit_from_preview(cells: Vec<PreviewCell>) -> crate::ops::Op {
     }
 
     #[test]
+#[inline(always)]
     fn generate_preview_backwards_weekday_not_working_yet() {
         // This test demonstrates a failing case: dragging "Monday" upwards
         // (target above source) should fill "Sunday" but the existing
@@ -516,6 +541,7 @@ pub fn commit_from_preview(cells: Vec<PreviewCell>) -> crate::ops::Op {
     }
 
         #[test]
+#[inline(always)]
         fn named_sequence_weekday_abbr_backward() {
             let seed = vec!["Mon".to_string()];
             let out = infer_named_sequence_fill(&seed, -1).expect("should infer");
@@ -523,6 +549,7 @@ pub fn commit_from_preview(cells: Vec<PreviewCell>) -> crate::ops::Op {
         }
 
         #[test]
+#[inline(always)]
         fn named_sequence_preserves_suffix() {
             let seed = vec!["Jan.".to_string()];
             let out = infer_named_sequence_fill(&seed, 1).expect("should infer");
@@ -530,6 +557,7 @@ pub fn commit_from_preview(cells: Vec<PreviewCell>) -> crate::ops::Op {
         }
 
     #[test]
+#[inline(always)]
     fn generate_preview_translates_single_formula() {
         let mut gb = GridBox::from(Grid::new(4, 1));
         gb.set(&CellAddr::Main { row: 0, col: 0 }, "=A1".into());
@@ -544,6 +572,7 @@ pub fn commit_from_preview(cells: Vec<PreviewCell>) -> crate::ops::Op {
     }
 
     #[test]
+#[inline(always)]
     fn generate_preview_repeats_last_nonempty() {
         let mut gb = GridBox::from(Grid::new(4, 2));
         gb.set(&CellAddr::Main { row: 0, col: 0 }, "one".into());

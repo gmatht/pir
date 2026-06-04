@@ -4426,18 +4426,16 @@ impl App {
     fn move_cursor_one_row_vertical(&mut self, down: bool) {
         if down {
             if !self.move_cursor_row_through_view(true) {
-                let hr = HEADER_ROWS;
-                let last_main = hr + self.state.grid.main_rows().saturating_sub(1);
-                if self.cursor.row == last_main
-                    && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS
-                {
-                    self.state.grid.grow_main_row_at_bottom();
-                }
                 self.cursor.row = self.cursor.row.saturating_add(1);
                 self.cursor.clamp(&self.state.grid);
                 self.state
                     .grid
                     .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                // Grow the main grid as needed so the cursor lands in the main area
+                let hr = HEADER_ROWS;
+                while self.cursor.row >= hr + self.state.grid.main_rows() {
+                    self.state.grid.grow_main_row_at_bottom();
+                }
             }
         } else if !self.move_cursor_row_through_view(false) {
             self.cursor.row = self.cursor.row.saturating_sub(1);
@@ -4457,43 +4455,16 @@ impl App {
 
     /// One horizontal column step (matches plain Left/Right in normal mode).
     fn move_cursor_one_col_horizontal(&mut self, right: bool) {
-        #[cfg(debug_assertions)]
-        {
-            let pre_addr = self.cursor.to_addr(&self.state.grid);
-            let pre_mc = self.state.grid.main_cols();
-            let msg = format!(
-                "DEBUG move_cursor_one_col_horizontal pre: right={} cursor={:?} addr={} ui_main_cols={}",
-                right,
-                self.cursor,
-                addr_label(&pre_addr, pre_mc),
-                pre_mc
-            );
-            crate::debug_log::log(&msg);
-            eprintln!("{}", msg);
-        }
-
         if right {
+            self.cursor.col = self.cursor.col.saturating_add(1);
+            // Grow the main grid as needed so the cursor lands in the
+            // main area.  This ensures navigation past column J works
+            // (not limited by NAV_BLANK_COLS) and allows the user to
+            // arrow-right through any number of blank columns.
             let lm = MARGIN_COLS;
-            let mc = self.state.grid.main_cols();
-            if self.cursor.col == lm + mc.saturating_sub(1)
-                && trailing_blank_main_cols(&self.state) < NAV_BLANK_COLS
-            {
-                #[cfg(debug_assertions)]
-                {
-                    let dbg = format!(
-                        "DEBUG move_cursor_one_col_horizontal: triggering grow_main_col_at_right pre_cursor_col={} lm={} ui_main_cols={} trailing_blank_main_cols={} NAV_BLANK_COLS={}",
-                        self.cursor.col,
-                        lm,
-                        mc,
-                        trailing_blank_main_cols(&self.state),
-                        NAV_BLANK_COLS
-                    );
-                    crate::debug_log::log(&dbg);
-                    eprintln!("{}", dbg);
-                }
+            while self.cursor.col >= lm + self.state.grid.main_cols() {
                 self.state.grid.grow_main_col_at_right();
             }
-            self.cursor.col = self.cursor.col.saturating_add(1);
         } else {
             self.cursor.col = self.cursor.col.saturating_sub(1);
         }
@@ -4501,21 +4472,6 @@ impl App {
         self.state
             .grid
             .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
-
-        #[cfg(debug_assertions)]
-        {
-            let post_addr = self.cursor.to_addr(&self.state.grid);
-            let post_mc = self.state.grid.main_cols();
-            let msg = format!(
-                "DEBUG move_cursor_one_col_horizontal post: right={} cursor={:?} addr={} ui_main_cols={}",
-                right,
-                self.cursor,
-                addr_label(&post_addr, post_mc),
-                post_mc
-            );
-            crate::debug_log::log(&msg);
-            eprintln!("{}", msg);
-        }
     }
 
     fn move_cursor_horizontal_steps(&mut self, steps: usize, right: bool) {
@@ -9429,7 +9385,7 @@ impl App {
         trim_visible_cols_to_width(grid, &mut col_ixs, self.cursor.col, data_width);
         let title_str = {
             let raw = format!(
-                " corro  {}r × {}c  ops {}",
+                " corro  {}r × {}c  ops {} ",
                 self.state.grid.main_rows(),
                 self.state.grid.main_cols(),
                 self.ops_applied
@@ -9568,10 +9524,7 @@ impl App {
             let lm = MARGIN_COLS;
             let mc = grid.main_cols();
             let show_right_divider = col_ixs.contains(&(lm + mc));
-            let mut spans: Vec<Span> = vec![Span::styled(
-                format!("{:>width$}", "", width = ROW_LABEL_CHARS),
-                Style::default().add_modifier(Modifier::BOLD),
-            )];
+            let mut spans: Vec<Span> = Vec::new();
             for (i, &c) in col_ixs.iter().enumerate() {
                 let name = col_header_label(c, grid.main_cols());
                 let active_col = c == self.cursor.col;
@@ -9586,49 +9539,23 @@ impl App {
                         .add_modifier(Modifier::BOLD)
                 };
                 let w = grid.col_width(c).max(1);
-                // Choose header alignment to match the column contents when possible.
-                // For main data columns prefer the effective cell alignment of the
-                // first non-empty cell; fallback to left alignment.
-                let header_align = if c >= lm && c < lm + mc {
-                    let mut found_align: Option<TextAlign> = None;
-                    for r in 0..grid.main_rows() {
-                        let addr = CellAddr::Main {
-                            row: r as u32,
-                            col: (c - lm) as u32,
-                        };
-                        let eff = cell_effective_display(grid, &addr);
-                        if !eff.trim().is_empty() {
-                            let formatted = format_cell_display(grid, &addr, eff);
-                            found_align = effective_cell_align(grid, &addr, &formatted);
-                            break;
-                        }
-                    }
-                    if let Some(ta) = found_align {
-                        text_align_to_utrunc(ta)
-                    } else {
-                        UTruncAlign::Left
-                    }
-                } else {
-                    UTruncAlign::Left
-                };
+                let header_align = UTruncAlign::Left;
                 let p = name.unicode_pad(w, header_align, true).into_owned();
                 spans.push(Span::styled(p, style));
                 if i + 1 < col_ixs.len() {
-                    if c == lm - 1 && lm > 0 && col_ixs.contains(&lm) {
-                        // Put the vertical divider immediately after the cell
-                        // content (no intervening space) so it abuts the text as
-                        // tests expect.
-                        spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
-                        spans.push(Span::raw(" "));
-                    } else if c == lm + mc - 1 && show_right_divider {
-                        spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
-                        spans.push(Span::raw(" "));
-                    } else {
-                        spans.push(Span::raw(" "));
-                    }
+                    spans.push(Span::raw(" "));
                 }
             }
             lines.push(Line::from(spans));
+        }
+
+        // ── Header separator (block border provides │ on sides) ──
+        {
+            let sep_line = "─".repeat(inner_w);
+            lines.push(Line::from(Span::styled(
+                sep_line,
+                Style::default().fg(Color::DarkGray),
+            )));
         }
 
         let hr = HEADER_ROWS;
@@ -9657,9 +9584,11 @@ impl App {
             if is_underlined_boundary_row {
                 row_label_style = row_label_style.add_modifier(Modifier::UNDERLINED);
             }
-            let label_str = format!("{:>4} ", sheet_row_label(r, grid.main_rows()));
-            // Every row uses the same column widths and separators as the header.
-            let mut spans_raw: Vec<(String, Style)> = vec![(label_str.clone(), row_label_style)];
+            let label_str = format!("{:<5}", sheet_row_label(r, grid.main_rows()));
+            let mut spans_raw: Vec<(String, Style)> = vec![
+                (label_str.clone(), row_label_style),
+                ("│".to_string(), boundary_separator_style(is_underlined_boundary_row)),
+            ];
             let footer_agg = if r >= hr + mr {
                 footer_row_agg_func(grid, r - hr - mr)
             } else {
@@ -10010,11 +9939,7 @@ impl App {
                 spans_raw.push((disp.clone(), st));
                 match inter_column_trailing_after_data_cell(i, c, &col_ixs, lm, mc, show_right_divider) {
                     InterColumnTrailing::EndOfVisibleRow => {}
-                    InterColumnTrailing::PipeAndSpace => {
-                        spans_raw.push(("│".to_string(), boundary_separator_style(is_underlined_boundary_row)));
-                        spans_raw.push((" ".to_string(), boundary_gap_style(is_underlined_boundary_row)));
-                    }
-                    InterColumnTrailing::AsciiSpace => {
+                    InterColumnTrailing::PipeAndSpace | InterColumnTrailing::AsciiSpace => {
                         spans_raw.push((" ".to_string(), boundary_gap_style(is_underlined_boundary_row)));
                     }
                 }

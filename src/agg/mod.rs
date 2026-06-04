@@ -6,6 +6,7 @@ use crate::ops::{AggFunc, AggregateDef};
 
 pub mod helpers;
 
+#[inline(always)]
 /// Formatting for margin aggregates when only an [`f64`] is available (`Number::Approx` path).
 fn format_aggregate_approx(value: f64) -> String {
     if !value.is_finite() {
@@ -19,16 +20,19 @@ fn format_aggregate_approx(value: f64) -> String {
     }
 }
 
+#[inline(always)]
 /// Preserve [`Number::Exact`] without a `float` round-trip; match cell-style rational display.
 fn format_aggregate_number(n: &Number) -> String {
     n.format_eval_display(format_aggregate_approx)
 }
+#[inline(always)]
 
 fn cmp_number_aggregate(a: &Number, b: &Number) -> std::cmp::Ordering {
     a.partial_cmp(b)
         .unwrap_or(std::cmp::Ordering::Equal)
 }
 
+#[inline(always)]
 /// Median of sample values using the same ordering as formulas (IEEE-aware `Exact` vs `Approx`).
 fn median_aggregate(mut xs: Vec<Number>) -> Option<Number> {
     if xs.is_empty() {
@@ -45,6 +49,7 @@ fn median_aggregate(mut xs: Vec<Number>) -> Option<Number> {
     }
 }
 
+#[inline(always)]
 fn collect_numbers_summable(grid: &Grid, range: &MainRange) -> Vec<Number> {
     let mut v = Vec::new();
     if range.is_empty() {
@@ -63,6 +68,7 @@ fn collect_numbers_summable(grid: &Grid, range: &MainRange) -> Vec<Number> {
     v
 }
 
+#[inline(always)]
 fn count_numeric_cells(grid: &Grid, range: &MainRange) -> usize {
     let mut n = 0usize;
     if range.is_empty() {
@@ -82,6 +88,7 @@ fn count_numeric_cells(grid: &Grid, range: &MainRange) -> usize {
 }
 
 /// Compute display string for an aggregate over `source` main cells.
+#[inline(always)]
 pub fn compute_aggregate(grid: &Grid, def: &AggregateDef) -> String {
     match def.func {
         AggFunc::Count => {
@@ -134,6 +141,7 @@ pub fn compute_aggregate(grid: &Grid, def: &AggregateDef) -> String {
 }
 
 /// Raw cell value for display.
+#[inline(always)]
 pub fn cell_display(grid: &Grid, addr: &CellAddr) -> String {
     // GridBox provides `text` which returns an owned String for the addr.
     grid.text(addr)

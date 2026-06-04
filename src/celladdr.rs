@@ -43,6 +43,7 @@ pub struct CellRef {
 }
 
 impl fmt::Display for RowRegion {
+#[inline(always)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RowRegion::Header(n) => write!(f, "~{}", n),
@@ -53,6 +54,7 @@ impl fmt::Display for RowRegion {
 }
 
 impl fmt::Display for ColRegion {
+#[inline(always)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ColRegion::Left(i) => {
@@ -71,6 +73,7 @@ impl CellRef {
     /// Create a textual (log) representation for this parsed cell reference.
     /// `main_cols` is used when deciding whether a Data column sits inside
     /// the main region vs. the right margin when formatting global forms.
+#[inline(always)]
     pub fn to_log_text(&self, _main_cols: usize) -> String {
         let col_text = match &self.col {
             ColRegion::Left(i) => format!("[{}", super::addr::mirror_margin_column_name(*i, true)),
@@ -89,6 +92,7 @@ impl CellRef {
 
     /// Convert to the canonical grid::CellAddr using the provided main_cols
     /// hint (needed to compute Right-margin global columns).
+#[inline(always)]
     pub fn to_grid_addr(&self, main_cols: usize) -> CellAddr {
         match (&self.row, &self.col) {
             (RowRegion::Header(r), ColRegion::Left(i)) => CellAddr::Header {
@@ -161,6 +165,7 @@ impl CellRef {
     }
 
     /// Build a CellRef from an existing grid::CellAddr (useful for serializing).
+#[inline(always)]
     pub fn from_grid(addr: &CellAddr, main_cols: usize) -> CellRef {
         match addr {
             CellAddr::Header { row, col } => match col {
@@ -244,6 +249,7 @@ impl CellRef {
     /// Unprefixed Excel column names are interpreted as Data columns
     /// (map to main/data-region columns). Bracketed prefixes (`[`, `]`)
     /// and explicit Global forms are supported as before.
+#[inline(always)]
     pub fn parse_at(s: &str) -> Option<(CellRef, usize)> {
         let bytes = s.as_bytes();
         if bytes.is_empty() {
@@ -388,6 +394,7 @@ mod tests {
     use crate::grid::Grid;
 
     #[test]
+#[inline(always)]
     fn roundtrip_main_cell() {
         let g = Grid::new(2, 3);
         let addr = CellAddr::Main { row: 1, col: 2 };
@@ -399,6 +406,7 @@ mod tests {
     }
 
     #[test]
+#[inline(always)]
     fn roundtrip_header_cell() {
         let mut g = Grid::new(1, 1);
         g.set_main_size(1, 3);

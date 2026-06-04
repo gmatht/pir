@@ -1,7 +1,17 @@
 //! corro — append-only collaborative spreadsheet TUI.
 
-use corro::ui::App;
+#[cfg(feature = "ratatui")]
+use corro::ui::App as TuiApp;
+#[cfg(any(feature = "gui", feature = "pancurses"))]
+use corro::gui::App as GuiApp;
 use std::path::PathBuf;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiKind {
+    Ratatui,
+    Gui,
+    Pancurses,
+}
 
 struct Args {
     revision: Option<RevisionMode>,
@@ -14,6 +24,9 @@ struct Args {
     show_help: bool,
     show_version: bool,
     debug_no_number: bool,
+    ui: UiKind,
+    capture_html: Option<PathBuf>,
+    convert_ansi: Option<PathBuf>,
 }
 
 enum RevisionMode {
@@ -28,6 +41,17 @@ fn cli_option_suggestion(arg: &str) -> Option<&'static str> {
     }
 }
 
+fn determine_default_ui() -> UiKind {
+    #[cfg(feature = "ratatui")]
+    { UiKind::Ratatui }
+    #[cfg(not(feature = "ratatui"))]
+    #[cfg(feature = "gui")]
+    { UiKind::Gui }
+    #[cfg(not(any(feature = "ratatui", feature = "gui")))]
+    #[cfg(feature = "pancurses")]
+    { UiKind::Pancurses }
+}
+
 fn parse_args() -> Result<Args, String> {
     let mut revision = None;
     let mut export = None;
@@ -38,6 +62,9 @@ fn parse_args() -> Result<Args, String> {
     let mut show_help = false;
     let mut show_version = false;
     let mut debug_no_number = false;
+    let mut ui = determine_default_ui();
+    let mut capture_html = None;
+    let mut convert_ansi = None;
     let mut positional = Vec::new();
     let mut it = std::env::args().skip(1).peekable();
 
@@ -68,51 +95,35 @@ fn parse_args() -> Result<Args, String> {
             "--movie" => {
                 movie = true;
             }
-            "--movie-typing-cps" => {
-                let Some(raw) = it.next() else {
-                    return Err("--movie-typing-cps requires a positive number".into());
-                };
-                let Ok(value) = raw.parse::<f64>() else {
-                    return Err(format!("invalid --movie-typing-cps value: {raw}"));
-                };
-                if value <= 0.0 {
-                    return Err("--movie-typing-cps must be > 0".into());
-                }
-                movie_typing_cps = value;
+            "--ratatui" => {
+                #[cfg(feature = "ratatui")]
+                { ui = UiKind::Ratatui; }
+                #[cfg(not(feature = "ratatui"))]
+                { return Err("ratatui UI not compiled in; rebuild with --features ratatui".into()); }
             }
-            "--movie-confirm-ms" => {
-                let Some(raw) = it.next() else {
-                    return Err("--movie-confirm-ms requires a non-negative integer".into());
-                };
-                let Ok(value) = raw.parse::<u64>() else {
-                    return Err(format!("invalid --movie-confirm-ms value: {raw}"));
-                };
-                movie_confirm_ms = value;
+            "--gui" => {
+                #[cfg(feature = "gui")]
+                { ui = UiKind::Gui; }
+                #[cfg(not(feature = "gui"))]
+                { return Err("GTK GUI not compiled in; rebuild with --features gui".into()); }
             }
-            "--movie-menu-hold-ms" => {
-                let Some(raw) = it.next() else {
-                    return Err("--movie-menu-hold-ms requires a non-negative integer".into());
-                };
-                let Ok(value) = raw.parse::<u64>() else {
-                    return Err(format!("invalid --movie-menu-hold-ms value: {raw}"));
-                };
-                movie_menu_hold_ms = value;
+            "--pancurses" => {
+                #[cfg(feature = "pancurses")]
+                { ui = UiKind::Pancurses; }
+                #[cfg(not(feature = "pancurses"))]
+                { return Err("pancurses UI not compiled in; rebuild with --features pancurses".into()); }
             }
-            "--debug-no-number" => {
-                // When set, emit a backtrace and panic if a SET line with a
-                // purely numeric value is about to be appended. The runtime
-                // detection reads CORRO_DEBUG_NO_NUMBER which we set in
-                // try_main after parsing (so the rest of the program can
-                // observe it as an env var).
-                debug_no_number = true;
+            "--capture-html" => {
+                let Some(path) = it.next() else {
+                    return Err("--capture-html requires a file path".into());
+                };
+                capture_html = Some(PathBuf::from(path));
             }
-            _ if arg.starts_with('-') => {
-                if let Some(suggested) = cli_option_suggestion(&arg) {
-                    return Err(format!(
-                        "unrecognized option: {arg} (did you mean {suggested}?)"
-                    ));
-                }
-                return Err(format!("unrecognized option: {arg}"));
+            "--convert-ansi" => {
+                let Some(path) = it.next() else {
+                    return Err("--convert-ansi requires an input file path".into());
+                };
+                convert_ansi = Some(PathBuf::from(path));
             }
             _ => positional.push(arg),
         }
@@ -131,6 +142,9 @@ fn parse_args() -> Result<Args, String> {
         show_help,
         show_version,
         debug_no_number,
+        ui,
+        capture_html,
+        convert_ansi,
     })
 }
 
@@ -187,11 +201,11 @@ fn main() {
     }
 }
 
-fn try_main() -> (Result<(), corro::ui::RunError>, Option<String>) {
+fn try_main() -> (Result<(), Box<dyn std::error::Error>>, Option<String>) {
     // Parse args; return early with no exit message on CLI errors/help/version.
     let args = match parse_args() {
         Ok(a) => a,
-        Err(s) => return (Err(std::io::Error::other(s).into()), None),
+        Err(s) => return (Err(s.into()), None),
     };
 
     // Redirect stderr to a per-user debug log so debug traces do not
@@ -242,73 +256,140 @@ fn try_main() -> (Result<(), corro::ui::RunError>, Option<String>) {
         println!("corro {}", env!("CARGO_PKG_VERSION"));
         return (Ok(()), None);
     }
-    if let Some(export_path) = args.export {
-        let input_path = match args.files.first() {
-            Some(p) => p.clone(),
-            None => {
-                return (
-                    Err(std::io::Error::other("--export requires an input file argument").into()),
-                    None,
-                )
-            }
-        };
-        if args.files.len() > 1 {
-            return (
-                Err(std::io::Error::other("--export accepts exactly one input file").into()),
-                None,
-            );
-        }
-        let workbook = match load_workbook_for_export(&input_path) {
-            Ok(w) => w,
-            Err(e) => return (Err(std::io::Error::other(e).into()), None),
-        };
-        if let Err(e) = export_workbook_to_path(&workbook, &export_path) {
-            return (Err(std::io::Error::other(e).into()), None);
+    if let Some(ref ansi_path) = args.convert_ansi {
+        let out_path = args.files.first().cloned().unwrap_or_else(|| PathBuf::from("output.html"));
+        match corro::capture::convert_ansi_file(ansi_path, &out_path) {
+            Ok(()) => println!("Converted {} to {}", ansi_path.display(), out_path.display()),
+            Err(e) => eprintln!("Conversion failed: {e}"),
         }
         return (Ok(()), None);
     }
-    if args.movie && args.revision.is_some() {
-        return (
-            Err(std::io::Error::other("--movie cannot be combined with --revision").into()),
-            None,
-        );
-    }
-    if args.revision.is_some() && args.files.len() > 1 {
-        return (
-            Err(std::io::Error::other("--revision accepts exactly one input file").into()),
-            None,
-        );
-    }
-    if args.movie && args.files.len() > 1 {
-        return (
-            Err(std::io::Error::other("--movie accepts exactly one input file").into()),
-            None,
-        );
-    }
-    let mut app = match args.revision {
-        None => App::new_with_paths(args.files),
-        Some(RevisionMode::Browse) => App::new_with_revision_browser(args.files.first().cloned()),
-        Some(RevisionMode::Limit(revision)) => {
-            App::new_with_revision_limit(args.files.first().cloned(), Some(revision))
+    if let Some(export_path) = args.export {
+            let input_path = match args.files.first() {
+                Some(p) => p.clone(),
+                None => {
+                    return (
+                        Err("--export requires an input file argument".into()),
+                        None,
+                    )
+                }
+            };
+            if args.files.len() > 1 {
+                return (
+                    Err("--export accepts exactly one input file".into()),
+                    None,
+                );
+            }
+            let workbook = match load_workbook_for_export(&input_path) {
+                Ok(w) => w,
+                Err(e) => return (Err(e.into()), None),
+            };
+            if let Err(e) = export_workbook_to_path(&workbook, &export_path) {
+                return (Err(e.into()), None);
+            }
+            return (Ok(()), None);
+        }
+        if args.movie && args.revision.is_some() {
+            return (
+                Err("--movie cannot be combined with --revision".into()),
+                None,
+            );
+        }
+        if args.revision.is_some() && args.files.len() > 1 {
+            return (
+                Err("--revision accepts exactly one input file".into()),
+                None,
+            );
+        }
+        if args.movie && args.files.len() > 1 {
+            return (
+                Err("--movie accepts exactly one input file".into()),
+                None,
+            );
+        }
+    let (res, exit_msg) = match args.ui {
+        #[cfg(feature = "ratatui")]
+        UiKind::Ratatui => {
+            let capture = match args.capture_html.as_ref() {
+                Some(p) => match corro::capture::HtmlCapture::new(p) {
+                    Ok(c) => Some(c),
+                    Err(e) => return (Err(e.into()), None),
+                },
+                None => None,
+            };
+            let mut app = match args.revision {
+                None => TuiApp::new_with_paths(args.files),
+                Some(RevisionMode::Browse) => TuiApp::new_with_revision_browser(args.files.first().cloned()),
+                Some(RevisionMode::Limit(revision)) => {
+                    TuiApp::new_with_revision_limit(args.files.first().cloned(), Some(revision))
+                }
+            };
+            app.set_capturer(capture);
+            let res = if args.movie {
+                app.run_movie(corro::ui::MovieReplayOptions {
+                    typing_cps: args.movie_typing_cps,
+                    confirm_delay_ms: args.movie_confirm_ms,
+                    menu_hold_ms: args.movie_menu_hold_ms,
+                })
+            } else {
+                match app.load_initial() {
+                    Ok(()) => app.run(),
+                    Err(e) => Err(e.into()),
+                }
+            };
+            let exit_msg = app.take_final_exit_hint();
+            (res.map_err(|e| e.into()), exit_msg)
+        }
+        #[cfg(feature = "gui")]
+        UiKind::Gui => {
+            let mut app = match args.revision {
+                None => GuiApp::new_with_paths(args.files),
+                Some(RevisionMode::Browse) => GuiApp::new_with_revision_browser(args.files.first().cloned()),
+                Some(RevisionMode::Limit(revision)) => {
+                    GuiApp::new_with_revision_limit(args.files.first().cloned(), Some(revision))
+                }
+            };
+            app.set_backend(corro::gui::Backend::Gtk);
+            let res = match app.load_initial() {
+                Ok(()) => app.run(),
+                Err(e) => Err(e),
+            };
+            let exit_msg = app.take_final_exit_hint();
+            (res, exit_msg)
+        }
+        #[cfg(feature = "pancurses")]
+        UiKind::Pancurses => {
+            let mut app = match args.revision {
+                None => GuiApp::new_with_paths(args.files),
+                Some(RevisionMode::Browse) => GuiApp::new_with_revision_browser(args.files.first().cloned()),
+                Some(RevisionMode::Limit(revision)) => {
+                    GuiApp::new_with_revision_limit(args.files.first().cloned(), Some(revision))
+                }
+            };
+            app.set_backend(corro::gui::Backend::Pancurses);
+            let res = match app.load_initial() {
+                Ok(()) => app.run(),
+                Err(e) => Err(e),
+            };
+            let exit_msg = app.take_final_exit_hint();
+            (res, exit_msg)
+        }
+        _ => {
+            let msg = format!("{:?} UI backend not compiled in", args.ui);
+            (Err(msg.into()), None)
         }
     };
-    let res = if args.movie {
-        app.run_movie(corro::ui::MovieReplayOptions {
-            typing_cps: args.movie_typing_cps,
-            confirm_delay_ms: args.movie_confirm_ms,
-            menu_hold_ms: args.movie_menu_hold_ms,
-        })
-    } else {
-        match app.load_initial() {
-            Ok(()) => app.run(),
-            Err(e) => Err(e.into()),
-        }
-    };
-    let exit_msg = app.take_final_exit_hint();
     (res, exit_msg)
 }
 
 fn cli_help_text() -> String {
+    let mut ui_opts = String::new();
+    #[cfg(feature = "ratatui")]
+    { ui_opts.push_str("  --ratatui                Use ratatui terminal UI (default)\n"); }
+    #[cfg(feature = "gui")]
+    { ui_opts.push_str("  --gui                    Use GTK native GUI\n"); }
+    #[cfg(feature = "pancurses")]
+    { ui_opts.push_str("  --pancurses              Use pancurses terminal UI\n"); }
     format!(
         "corro {}\n\
 \n\
@@ -324,10 +405,9 @@ OPTIONS:\n\
   --movie-typing-cps <N>    Movie typing speed in chars/sec (default: 22)\n\
   --movie-confirm-ms <N>    Delay before Enter/confirm per line (default: 120)\n\
   --movie-menu-hold-ms <N>  Hold menu/dialog moments in movie mode (default: 1200)\n\
-\n\
-ARGS:\n\
-  FILE                      Input file(s) (.corro, .ods, .tsv, .csv)\n",
-        env!("CARGO_PKG_VERSION")
+{}",
+        env!("CARGO_PKG_VERSION"),
+        ui_opts,
     )
 }
 
@@ -528,6 +608,9 @@ mod tests {
             show_help,
             show_version,
             debug_no_number: false,
+            ui: super::determine_default_ui(),
+            capture_html: None,
+            convert_ansi: None,
         }
     }
 
