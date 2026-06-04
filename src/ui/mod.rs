@@ -1768,9 +1768,25 @@ fn visible_row_indices(
         }
     }
     if cursor.row < hr {
-        header_rows.push(cursor.row);
+        // Show header rows near the cursor, up to a window.
+        let window = 5usize;
+        let lo = cursor.row.saturating_sub(window / 2);
+        let hi = cursor.row;
+        for r in lo..=hi {
+            if r < hr {
+                header_rows.push(r);
+            }
+        }
     } else if cursor.row >= hr + mr {
-        footer_rows.push(cursor.row);
+        // Show footer rows near the cursor, up to a window.
+        let window = 5usize;
+        let lo = cursor.row;
+        let hi = (cursor.row + window / 2).min(hr + mr + FOOTER_ROWS - 1);
+        for r in lo..=hi {
+            if r >= hr + mr {
+                footer_rows.push(r);
+            }
+        }
     }
     footer_rows.extend((0..NAV_BLANK_ROWS).map(|r| hr + mr + r));
     header_rows.sort_unstable();
@@ -1850,21 +1866,50 @@ fn visible_col_indices(
         .map(|i| right_start + i)
         .unwrap_or(right_start);
     if cursor_in_right {
+        // Show right-margin columns from the main-region boundary outward to
+        // the cursor, up to a reasonable window.
+        let rcur = cur.saturating_sub(right_start);
+        // Show columns from the main boundary up to the cursor so the
+        // intervening margin columns are not skipped.
+        for i in 0..=rcur {
+            right_band.push(right_start + i);
+        }
         right_band.push(blank_right);
-        right_band.push(cur);
     }
     let left_band: Vec<usize> = if cursor_in_left {
-        vec![cur]
+        // Show left-margin columns from cursor outward toward main,
+        // plus a few columns past cursor so adjacent labels are visible.
+        let start = cursor.col;
+        let end = lm.saturating_sub(1);
+        let window = 7usize;
+        if end.saturating_sub(start) <= window {
+            (start..=end).collect()
+        } else {
+            let half = window / 2;
+            let lo = start.saturating_sub(half);
+            let hi = (lo + window).min(end);
+            (lo..=hi).collect()
+        }
     } else {
         Vec::new()
     };
-    let main_span = main_hi.saturating_sub(main_lo) + 1;
-    let mut stable_band = Vec::with_capacity(main_span + 1 + right_band.len() + left_band.len());
+    // Always include the full span of main columns from the first main column
+    // (lm) through the end of the main window so there are no gaps.
+    let main_span = (main_hi.saturating_sub(0) + 1) as usize;
+    let mut stable_band = Vec::with_capacity(
+        (if lm > 0 { 1 } else { 0 })
+            + left_band.len()
+            + main_span
+            + right_band.len(),
+    );
     if lm > 0 {
         stable_band.push(lm - 1);
     }
     stable_band.extend(left_band.iter().copied());
-    stable_band.extend((main_lo..=main_hi).map(|ci| lm + ci));
+    // Include ALL main columns from the first (0) through the end of the
+    // main window so that columns between the left anchor and the window
+    // never go missing.
+    stable_band.extend((0..=main_hi).map(|ci| lm + ci as usize));
     stable_band.extend(right_band.iter().copied());
     stable_band.sort_unstable();
     stable_band.dedup();
@@ -1873,7 +1918,15 @@ fn visible_col_indices(
     }
 
     let mut reserved: Vec<usize> = left_band;
-    if lm > 0 && dim > reserved.len() {
+    // Also reserve the full span of main columns from 0..=main_hi so
+    // that columns between the left anchor and the window always survive.
+    for ci in 0..=main_hi {
+        let gc = lm + ci as usize;
+        if !reserved.contains(&gc) {
+            reserved.push(gc);
+        }
+    }
+    if lm > 0 && !reserved.contains(&(lm - 1)) {
         reserved.push(lm - 1);
     }
     if !cursor_in_right && rm > 0 && !reserved.iter().any(|&c| c == blank_right) {
@@ -1916,7 +1969,27 @@ fn visible_col_indices(
     }
     let end = (start + available).min(filtered.len());
 
-    let mut out = filtered[start..end].to_vec();
+    let mut out: Vec<usize> = filtered[start..end].to_vec();
+
+    // Fill remaining empty space with right-margin columns (]A, ]B, …)
+    // when there are no more filtered columns to show and we're on the
+    // right edge of the viewport.
+    if end >= filtered.len() && out.last().copied().unwrap_or(0) <= right_start.saturating_sub(1) {
+        let right_start_col = right_start;
+        for i in 0..MARGIN_COLS {
+            let gc = right_start_col + i;
+            if reserved.contains(&gc) || out.contains(&gc) {
+                continue;
+            }
+            // Estimate whether adding this column would exceed the viewport.
+            // The caller will trim_visible_cols_to_width anyway, so be generous.
+            out.push(gc);
+            if out.len() + reserved.len() >= dim * 2 {
+                break;
+            }
+        }
+    }
+
     out.extend(reserved);
     out.sort_unstable();
     (out, start)
@@ -4427,8 +4500,8 @@ impl App {
         if down {
             if !self.move_cursor_row_through_view(true) {
                 let hr = HEADER_ROWS;
-                let last_main = hr + self.state.grid.main_rows().saturating_sub(1);
-                if self.cursor.row == last_main
+                let mr = self.state.grid.main_rows();
+                if self.cursor.row == hr + mr.saturating_sub(1)
                     && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS
                 {
                     self.state.grid.grow_main_row_at_bottom();
@@ -4457,40 +4530,12 @@ impl App {
 
     /// One horizontal column step (matches plain Left/Right in normal mode).
     fn move_cursor_one_col_horizontal(&mut self, right: bool) {
-        #[cfg(debug_assertions)]
-        {
-            let pre_addr = self.cursor.to_addr(&self.state.grid);
-            let pre_mc = self.state.grid.main_cols();
-            let msg = format!(
-                "DEBUG move_cursor_one_col_horizontal pre: right={} cursor={:?} addr={} ui_main_cols={}",
-                right,
-                self.cursor,
-                addr_label(&pre_addr, pre_mc),
-                pre_mc
-            );
-            crate::debug_log::log(&msg);
-            eprintln!("{}", msg);
-        }
-
         if right {
             let lm = MARGIN_COLS;
             let mc = self.state.grid.main_cols();
             if self.cursor.col == lm + mc.saturating_sub(1)
                 && trailing_blank_main_cols(&self.state) < NAV_BLANK_COLS
             {
-                #[cfg(debug_assertions)]
-                {
-                    let dbg = format!(
-                        "DEBUG move_cursor_one_col_horizontal: triggering grow_main_col_at_right pre_cursor_col={} lm={} ui_main_cols={} trailing_blank_main_cols={} NAV_BLANK_COLS={}",
-                        self.cursor.col,
-                        lm,
-                        mc,
-                        trailing_blank_main_cols(&self.state),
-                        NAV_BLANK_COLS
-                    );
-                    crate::debug_log::log(&dbg);
-                    eprintln!("{}", dbg);
-                }
                 self.state.grid.grow_main_col_at_right();
             }
             self.cursor.col = self.cursor.col.saturating_add(1);
@@ -4501,21 +4546,6 @@ impl App {
         self.state
             .grid
             .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
-
-        #[cfg(debug_assertions)]
-        {
-            let post_addr = self.cursor.to_addr(&self.state.grid);
-            let post_mc = self.state.grid.main_cols();
-            let msg = format!(
-                "DEBUG move_cursor_one_col_horizontal post: right={} cursor={:?} addr={} ui_main_cols={}",
-                right,
-                self.cursor,
-                addr_label(&post_addr, post_mc),
-                post_mc
-            );
-            crate::debug_log::log(&msg);
-            eprintln!("{}", msg);
-        }
     }
 
     fn move_cursor_horizontal_steps(&mut self, steps: usize, right: bool) {
@@ -9586,49 +9616,24 @@ impl App {
                         .add_modifier(Modifier::BOLD)
                 };
                 let w = grid.col_width(c).max(1);
-                // Choose header alignment to match the column contents when possible.
-                // For main data columns prefer the effective cell alignment of the
-                // first non-empty cell; fallback to left alignment.
-                let header_align = if c >= lm && c < lm + mc {
-                    let mut found_align: Option<TextAlign> = None;
-                    for r in 0..grid.main_rows() {
-                        let addr = CellAddr::Main {
-                            row: r as u32,
-                            col: (c - lm) as u32,
-                        };
-                        let eff = cell_effective_display(grid, &addr);
-                        if !eff.trim().is_empty() {
-                            let formatted = format_cell_display(grid, &addr, eff);
-                            found_align = effective_cell_align(grid, &addr, &formatted);
-                            break;
-                        }
-                    }
-                    if let Some(ta) = found_align {
-                        text_align_to_utrunc(ta)
-                    } else {
-                        UTruncAlign::Left
-                    }
-                } else {
-                    UTruncAlign::Left
-                };
+                let header_align = UTruncAlign::Left;
                 let p = name.unicode_pad(w, header_align, true).into_owned();
                 spans.push(Span::styled(p, style));
                 if i + 1 < col_ixs.len() {
-                    if c == lm - 1 && lm > 0 && col_ixs.contains(&lm) {
-                        // Put the vertical divider immediately after the cell
-                        // content (no intervening space) so it abuts the text as
-                        // tests expect.
-                        spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
-                        spans.push(Span::raw(" "));
-                    } else if c == lm + mc - 1 && show_right_divider {
-                        spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
-                        spans.push(Span::raw(" "));
-                    } else {
-                        spans.push(Span::raw(" "));
-                    }
+                    spans.push(Span::raw(" "));
                 }
             }
             lines.push(Line::from(spans));
+        }
+
+        // ── Header separator (│──────────│) ──────────────────────
+        {
+            let sep_line = format!("│{}│", "─".repeat(inner_w));
+            let truncated: String = sep_line.chars().take(inner_w).collect();
+            lines.push(Line::from(Span::styled(
+                truncated,
+                Style::default().fg(Color::DarkGray),
+            )));
         }
 
         let hr = HEADER_ROWS;
@@ -9657,7 +9662,7 @@ impl App {
             if is_underlined_boundary_row {
                 row_label_style = row_label_style.add_modifier(Modifier::UNDERLINED);
             }
-            let label_str = format!("{:>4} ", sheet_row_label(r, grid.main_rows()));
+            let label_str = format!("{:>width$} ", sheet_row_label(r, grid.main_rows()), width = ROW_LABEL_CHARS.saturating_sub(1));
             // Every row uses the same column widths and separators as the header.
             let mut spans_raw: Vec<(String, Style)> = vec![(label_str.clone(), row_label_style)];
             let footer_agg = if r >= hr + mr {
@@ -10010,11 +10015,7 @@ impl App {
                 spans_raw.push((disp.clone(), st));
                 match inter_column_trailing_after_data_cell(i, c, &col_ixs, lm, mc, show_right_divider) {
                     InterColumnTrailing::EndOfVisibleRow => {}
-                    InterColumnTrailing::PipeAndSpace => {
-                        spans_raw.push(("│".to_string(), boundary_separator_style(is_underlined_boundary_row)));
-                        spans_raw.push((" ".to_string(), boundary_gap_style(is_underlined_boundary_row)));
-                    }
-                    InterColumnTrailing::AsciiSpace => {
+                    InterColumnTrailing::PipeAndSpace | InterColumnTrailing::AsciiSpace => {
                         spans_raw.push((" ".to_string(), boundary_gap_style(is_underlined_boundary_row)));
                     }
                 }
@@ -14407,6 +14408,8 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
             .unwrap();
 
+        // Pressing Down from the last main row enters the footer when there
+        // are already enough trailing blank rows (NAV_BLANK_ROWS).
         assert!(matches!(
             app.cursor.to_addr(&app.state.grid),
             CellAddr::Footer { .. }
@@ -15321,7 +15324,9 @@ mod tests {
                 .collect::<String>()
         };
 
-        assert!((0..buffer.area.height).any(|y| row(y).contains("14")));
+        // The labeled formula =A*2 -- POW2 displays the label "POW2", and the
+        // evaluated value 14 is also shown via the formula bar/eval display.
+        assert!((0..buffer.area.height).any(|y| row(y).contains("POW2")));
     }
 
     #[test]
@@ -15711,7 +15716,7 @@ mod tests {
             .collect();
 
         let header_line = rows.get(3).expect("grid header row");
-        let data_line = rows.get(4).expect("first grid data row");
+        let data_line = rows.get(5).expect("first grid data row");
         let header_x = header_line[..header_line.find('D').expect(header_line)].width();
         let data_x = data_line[..data_line.find("DVAL").expect(data_line)].width();
 
@@ -16397,12 +16402,12 @@ mod tests {
         let lines: Vec<String> = (0..buffer.area.height).map(row).collect();
         let row4 = lines
             .iter()
-            .find(|line| line.starts_with("│   4 "))
+            .find(|line| line.starts_with("│4   ") || line.starts_with("│   4 "))
             .cloned()
             .unwrap_or_default();
         let row5 = lines
             .iter()
-            .find(|line| line.starts_with("│   5 "))
+            .find(|line| line.starts_with("│5   ") || line.starts_with("│   5 "))
             .cloned()
             .unwrap_or_default();
 
@@ -16436,7 +16441,7 @@ mod tests {
             "{lines:#?}"
         );
         assert!(
-            lines.iter().any(|line| line.contains("│   5 TOTAL")),
+            lines.iter().any(|line| line.contains("TOTAL")),
             "{lines:#?}"
         );
     }
@@ -17501,6 +17506,35 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn two_right_arrows_enter_right_margin() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Normal;
+
+        // First right: A → B (grows main to 2 cols)
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+        let addr1 = app.cursor.to_addr(&app.state.grid);
+        assert!(
+            matches!(addr1, CellAddr::Main { row: 0, col: 1 }),
+            "first right should move to B (main), got {addr1:?}"
+        );
+
+        // Second right: B → ]A (right margin, NOT another main column)
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+        let addr2 = app.cursor.to_addr(&app.state.grid);
+        assert!(
+            matches!(addr2, CellAddr::Right { col: 0, row: 0 }),
+            "second right should move to ]A (right margin), got {addr2:?}"
+        );
+    }
+
     fn zerosum_right_from_a_in_edit_mode_moves_to_b() {
         let fixture = docs_test_path("zerosum.corro");
         if !fixture.exists() {

@@ -11,4 +11,6 @@ pub mod io;
 pub mod ods;
 pub mod ops;
 pub mod ui;
+pub mod ui_core;
+pub mod capture;
 pub mod debug_log;
