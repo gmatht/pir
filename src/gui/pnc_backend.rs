@@ -1,6 +1,7 @@
 use crate::grid::CellAddr;
 use crate::ui_core;
 use rustxwidgets::backends_pancurses_adapter::*;
+use unicode_width::UnicodeWidthStr;
 
 pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
     let _backend = rustxwidgets::backends::pancurses::init()
@@ -22,21 +23,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     let spreadsheet = create_spreadsheet(total_rows, total_cols)?;
 
-    // Populate cells with formatted display text (only main data rows, main columns)
-    for r in 0..main_rows {
-        for c in 0..main_cols {
-            let addr = CellAddr::Main { row: r as u32, col: c as u32 };
-            if let Some(val) = sheet_rec.grid.get(&addr) {
-                let display = ui_core::format_cell_display(&sheet_rec.grid, &addr, val);
-                spreadsheet.set_cell(r as u32, c as u32, &display);
-            }
-        }
-    }
-
-    // Build column layout: margin col (width 4), main cols (content-based widths), right-margin cols (width 4)
+    // First pass: measure content widths for each main column
     let margin_w = 4u32;
     let right_w = 4u32;
-    // Measure content widths for each main column
     let mut main_col_widths: Vec<u32> = Vec::new();
     for ci in 0..main_cols {
         let mut max_w = 0usize;
@@ -52,6 +41,28 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         let min_w = (label_w + 3).max(4);
         let w = max_w.max(min_w).min(crate::grid::DEFAULT_MAX_COL_WIDTH) as u32;
         main_col_widths.push(w);
+    }
+
+    // Second pass: populate cells with aligned, width-aware formatted display text
+    for r in 0..main_rows {
+        for c in 0..main_cols {
+            let addr = CellAddr::Main { row: r as u32, col: c as u32 };
+            if let Some(val) = sheet_rec.grid.get(&addr) {
+                let formatted = ui_core::format_cell_display(&sheet_rec.grid, &addr, val);
+                let cw = main_col_widths[c] as usize;
+                let fw = formatted.width();
+                let align = ui_core::effective_cell_align(&sheet_rec.grid, &addr, &formatted);
+                let inner = if fw > cw {
+                    ui_core::shrink_numeric_display(&formatted, cw)
+                        .or_else(|| ui_core::exponential_numeric_display(&formatted, cw))
+                        .unwrap_or_else(|| ui_core::truncate_with_ellipsis(&formatted, cw))
+                } else {
+                    formatted
+                };
+                let disp = ui_core::align_cell_display(inner, cw, align);
+                spreadsheet.set_cell(r as u32, c as u32, &disp);
+            }
+        }
     }
     let mut layout: Vec<(u32, u32, String)> = Vec::new();
     // Last left margin column
