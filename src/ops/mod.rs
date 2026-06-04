@@ -30,7 +30,7 @@ pub enum AggFunc {
 /// Preferred form is `==KEYWORD` (ASCII case-insensitive) so it stays distinct from spreadsheet
 /// formulas like `=MIN(A1)`. Legacy `=TOTAL` (single leading `=`) still maps to sum. Bare `SUM`,
 /// `MIN`, … (no equals) behave as today; bare `TOTAL` is not treated as aggregate.
-#[inline(always)]
+#[optimize(speed)]
 pub fn margin_key_agg_func(val: &str) -> Option<AggFunc> {
     let t = val.trim();
 
@@ -504,7 +504,7 @@ impl WorkbookSnapshot {
 }
 
 impl Op {
-    #[inline(always)]
+    #[optimize(speed)]
     pub fn apply(&self, state: &mut SheetState) {
         match self {
             Op::SetCell { addr, value } => {
@@ -1180,7 +1180,7 @@ fn rel_fill_value_for_cell(base: &str, row_delta: i32, col_delta: i32, main_cols
         .unwrap_or_else(|| base.to_string())
 }
 
-#[inline(always)]
+#[optimize(speed)]
 fn parse_op_text(line: &str) -> Option<Op> {
     let mut parts = line.split_whitespace();
     let cmd = parts.next()?.to_ascii_uppercase();
@@ -1403,7 +1403,7 @@ fn parse_op_text(line: &str) -> Option<Op> {
     }
 }
 
-#[inline(always)]
+#[optimize(speed)]
 pub fn parse_op_line(line: &str) -> Option<Op> {
     parse_op_text(line)
 }
@@ -1609,7 +1609,6 @@ impl Op {
         line
     }
 }
-#[inline(always)]
 
 fn format_text(format: &CellFormat) -> String {
     let mut parts = Vec::new();
@@ -1767,7 +1766,6 @@ fn split_multiline_set_lines(prefix: String, addr_text: String, value: &str) -> 
 }
 
 // parse_sheet_set_addr removed: parsing is handled inline in parse_workbook_line
-#[inline(always)]
 
 fn parse_log_addr(
     addr: &str,
@@ -1809,7 +1807,7 @@ fn parse_log_addr(
     ))
 }
 
-#[inline(always)]
+#[optimize(speed)]
 pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
     let t = line.trim();
     if let Some(raw_rest) = t.strip_prefix("SET ") {
@@ -2071,7 +2069,7 @@ pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
     }
 }
 
-#[inline(always)]
+#[optimize(speed)]
 pub fn apply_workbook_op(
     workbook: &mut WorkbookState,
     active_sheet: &mut u32,
@@ -2486,7 +2484,7 @@ pub fn apply_line(line: &str, state: &mut SheetState) -> Result<(), std::io::Err
     apply_any_line(t, state)
 }
 
-#[inline(always)]
+#[optimize(speed)]
 pub fn apply_log_line_to_workbook(
     line: &str,
     workbook: &mut WorkbookState,
@@ -2523,7 +2521,7 @@ pub fn apply_log_line_to_workbook(
     apply_workbook_op(workbook, active_sheet, op)
 }
 
-#[inline(always)]
+#[optimize(speed)]
 fn apply_any_line(line: &str, state: &mut SheetState) -> Result<(), std::io::Error> {
     if line.starts_with("<<<<<<<") || line.starts_with("=======") || line.starts_with(">>>>>>>") {
         return Ok(());

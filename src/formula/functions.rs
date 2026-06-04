@@ -8,7 +8,7 @@ use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, Timelike};
 use num_traits::Zero;
 use std::hash::{Hash, Hasher};
 
-#[inline]
+#[optimize(speed)]
 pub(crate) fn eval_builtin(
     name: &str,
     args: &[Ast],
@@ -224,7 +224,6 @@ enum NumericAgg {
     Max,
     Product,
 }
-#[inline]
 
 fn eval_abs(
     args: &[Ast],
@@ -260,7 +259,6 @@ fn round_builtin_decimal_places(nd: &Number) -> Option<i32> {
     let p = f.round().clamp(-30.0, 30.0);
     Some(p as i32)
 }
-#[inline]
 
 fn eval_round(
     args: &[Ast],
@@ -309,7 +307,6 @@ fn eval_round(
     let factor = 10f64.powf(digits);
     EvalResult::Number(Number::from_f64_unchecked((n * factor).round() / factor))
 }
-#[inline]
 
 fn eval_mod(
     args: &[Ast],
@@ -371,7 +368,7 @@ fn eval_mod(
     }
 }
 
-#[inline]
+#[optimize(speed)]
 fn eval_numeric_aggregate(
     args: &[Ast],
     grid: &Grid,
@@ -419,7 +416,6 @@ fn eval_numeric_aggregate(
         ),
     }
 }
-#[inline]
 
 fn eval_unary_numeric(
     args: &[Ast],
@@ -445,7 +441,6 @@ fn eval_unary_numeric(
         None => EvalResult::Error("VALUE"),
     }
 }
-#[inline]
 
 fn eval_unary_numeric_with_complex_fallback(
     args: &[Ast],
@@ -537,7 +532,6 @@ pub(crate) fn parse_numeric_or_date_literal(s: &str) -> Option<Number> {
     }
     n
 }
-#[inline]
 
 fn eval_trim(
     args: &[Ast],
@@ -559,7 +553,6 @@ fn eval_trim(
         EvalResult::Array(_) => EvalResult::Error("CALC"),
     }
 }
-#[inline]
 
 fn eval_upper(
     args: &[Ast],
@@ -577,7 +570,6 @@ fn eval_upper(
         Err(e) => EvalResult::Error(e),
     }
 }
-#[inline]
 
 fn eval_lower(
     args: &[Ast],
@@ -595,7 +587,6 @@ fn eval_lower(
         Err(e) => EvalResult::Error(e),
     }
 }
-#[inline]
 
 fn eval_proper(
     args: &[Ast],
@@ -629,7 +620,6 @@ fn eval_proper(
     }
     EvalResult::Text(out)
 }
-#[inline]
 
 fn eval_substitute(
     args: &[Ast],
@@ -691,7 +681,6 @@ fn eval_substitute(
         EvalResult::Text(text)
     }
 }
-#[inline]
 
 fn eval_replace(
     args: &[Ast],
@@ -743,7 +732,6 @@ fn eval_replace(
     out.extend(chars[end..].iter());
     EvalResult::Text(out)
 }
-#[inline]
 
 fn eval_find(
     args: &[Ast],
@@ -785,7 +773,6 @@ fn eval_find(
         None => EvalResult::Error("VALUE"),
     }
 }
-#[inline]
 
 fn eval_search(
     args: &[Ast],
@@ -827,7 +814,6 @@ fn eval_search(
         None => EvalResult::Error("VALUE"),
     }
 }
-#[inline]
 
 fn eval_text(
     args: &[Ast],
@@ -866,7 +852,6 @@ fn eval_text(
         EvalResult::Text(value.to_string())
     }
 }
-#[inline]
 
 fn eval_today(args: &[Ast]) -> EvalResult {
     if !args.is_empty() {
@@ -875,7 +860,6 @@ fn eval_today(args: &[Ast]) -> EvalResult {
     let now = Local::now().date_naive();
     EvalResult::Number(Number::approx(date_to_serial(now)))
 }
-#[inline]
 
 fn eval_now(args: &[Ast]) -> EvalResult {
     if !args.is_empty() {
@@ -884,7 +868,6 @@ fn eval_now(args: &[Ast]) -> EvalResult {
     let now = Local::now().naive_local();
     EvalResult::Number(Number::approx(datetime_to_serial(now)))
 }
-#[inline]
 
 fn eval_date(
     args: &[Ast],
@@ -935,7 +918,6 @@ fn eval_date(
         None => EvalResult::Error("VALUE"),
     }
 }
-#[inline]
 
 fn eval_year(
     args: &[Ast],
@@ -955,7 +937,6 @@ fn eval_year(
         |dt| dt.year() as f64,
     )
 }
-#[inline]
 
 fn eval_month(
     args: &[Ast],
@@ -975,7 +956,6 @@ fn eval_month(
         |dt| dt.month() as f64,
     )
 }
-#[inline]
 
 fn eval_day(
     args: &[Ast],
@@ -995,7 +975,6 @@ fn eval_day(
         |dt| dt.day() as f64,
     )
 }
-#[inline]
 
 fn eval_hour(
     args: &[Ast],
@@ -1015,7 +994,6 @@ fn eval_hour(
         |dt| dt.hour() as f64,
     )
 }
-#[inline]
 
 fn eval_minute(
     args: &[Ast],
@@ -1035,7 +1013,6 @@ fn eval_minute(
         |dt| dt.minute() as f64,
     )
 }
-#[inline]
 
 fn eval_second(
     args: &[Ast],
@@ -1055,7 +1032,6 @@ fn eval_second(
         |dt| dt.second() as f64,
     )
 }
-#[inline]
 
 fn eval_roundup(
     args: &[Ast],
@@ -1075,7 +1051,6 @@ fn eval_roundup(
         true,
     )
 }
-#[inline]
 
 fn eval_rounddown(
     args: &[Ast],
@@ -1095,7 +1070,6 @@ fn eval_rounddown(
         false,
     )
 }
-#[inline]
 
 fn eval_int(
     args: &[Ast],
@@ -1120,7 +1094,6 @@ fn eval_int(
         None => EvalResult::Error("VALUE"),
     }
 }
-#[inline]
 
 fn eval_ceiling(
     args: &[Ast],
@@ -1159,7 +1132,6 @@ fn eval_ceiling(
         (n / significance).ceil() * significance,
     ))
 }
-#[inline]
 
 fn eval_floor(
     args: &[Ast],
@@ -1198,7 +1170,6 @@ fn eval_floor(
         (n / significance).floor() * significance,
     ))
 }
-#[inline]
 
 fn eval_rand(
     args: &[Ast],
@@ -1218,7 +1189,6 @@ fn eval_rand(
         None,
     )))
 }
-#[inline]
 
 fn eval_randbetween(
     args: &[Ast],
@@ -1312,7 +1282,6 @@ where
 {
     date_component(args, grid, visiting, bindings, budget, allow_templates, f)
 }
-#[inline]
 
 fn round_with_mode(
     args: &[Ast],
@@ -1357,7 +1326,6 @@ fn round_with_mode(
     let rounded = if up { scaled.ceil() } else { scaled.floor() };
     EvalResult::Number(Number::from_f64_unchecked(rounded / factor))
 }
-#[inline]
 
 fn date_to_serial(date: NaiveDate) -> f64 {
     let epoch = NaiveDate::from_ymd_opt(1899, 12, 30).expect("valid epoch");
@@ -1386,7 +1354,6 @@ fn current_addr_hash(visiting: &[CellAddr]) -> Option<u64> {
         hasher.finish()
     })
 }
-#[inline]
 
 fn deterministic_rand(grid: &Grid, c: Option<u64>, a: Option<u64>, b: Option<u64>) -> f64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1397,7 +1364,6 @@ fn deterministic_rand(grid: &Grid, c: Option<u64>, a: Option<u64>, b: Option<u64
     let v = hasher.finish();
     (v as f64) / (u64::MAX as f64)
 }
-#[inline]
 
 fn eval_text_arg(
     ast: &Ast,
@@ -1417,7 +1383,7 @@ fn eval_text_arg(
     }
 }
 
-#[inline]
+#[optimize(speed)]
 fn eval_sumproduct(
     args: &[Ast],
     grid: &Grid,
@@ -1469,7 +1435,6 @@ fn eval_sumproduct(
     }
     EvalResult::Number(sum)
 }
-#[inline]
 
 fn eval_ifs(
     args: &[Ast],
@@ -1490,7 +1455,6 @@ fn eval_ifs(
     }
     EvalResult::Error("NA")
 }
-#[inline]
 
 fn eval_iferror(
     args: &[Ast],
@@ -1510,7 +1474,6 @@ fn eval_iferror(
         value
     }
 }
-#[inline]
 
 fn eval_ifna(
     args: &[Ast],
@@ -1531,7 +1494,6 @@ fn eval_ifna(
         _ => value,
     }
 }
-#[inline]
 
 fn eval_len(
     args: &[Ast],
@@ -1558,7 +1520,6 @@ fn eval_len(
         EvalResult::Array(_) => EvalResult::Error("CALC"),
     }
 }
-#[inline]
 
 fn eval_left(
     args: &[Ast],
@@ -1598,7 +1559,6 @@ fn eval_left(
     };
     EvalResult::Text(text.chars().take(n).collect())
 }
-#[inline]
 
 fn eval_right(
     args: &[Ast],
@@ -1640,7 +1600,6 @@ fn eval_right(
     let start = chars.len().saturating_sub(n);
     EvalResult::Text(chars[start..].iter().collect())
 }
-#[inline]
 
 fn eval_mid(
     args: &[Ast],
@@ -1689,7 +1648,6 @@ fn eval_mid(
     let start = start.saturating_sub(1);
     EvalResult::Text(chars.into_iter().skip(start).take(len).collect())
 }
-#[inline]
 
 fn eval_concat(
     args: &[Ast],
@@ -1712,7 +1670,6 @@ fn eval_concat(
     }
     EvalResult::Text(out)
 }
-#[inline]
 
 fn eval_textjoin(
     args: &[Ast],
@@ -1754,7 +1711,6 @@ fn eval_textjoin(
     }
     EvalResult::Text(parts.join(&delim))
 }
-#[inline]
 
 fn eval_not(
     args: &[Ast],
@@ -1780,7 +1736,6 @@ fn eval_not(
         Number::one()
     })
 }
-#[inline]
 
 fn eval_and(
     args: &[Ast],
@@ -1804,7 +1759,6 @@ fn eval_and(
     }
     EvalResult::Number(Number::one())
 }
-#[inline]
 
 fn eval_or(
     args: &[Ast],
@@ -1829,7 +1783,7 @@ fn eval_or(
     EvalResult::Number(Number::exact_zero())
 }
 
-#[inline]
+#[optimize(speed)]
 fn eval_match(
     args: &[Ast],
     grid: &Grid,
@@ -1899,7 +1853,6 @@ fn eval_match(
     }
     EvalResult::Error("NA")
 }
-#[inline]
 
 fn eval_xmatch(
     args: &[Ast],
@@ -1999,7 +1952,7 @@ fn eval_xmatch(
     EvalResult::Error("NA")
 }
 
-#[inline]
+#[optimize(speed)]
 fn eval_index(
     args: &[Ast],
     grid: &Grid,
@@ -2059,7 +2012,6 @@ fn eval_index(
     }
     matrix[row_idx][col - 1].clone()
 }
-#[inline]
 
 fn eval_countifs(
     args: &[Ast],
@@ -2101,7 +2053,6 @@ fn eval_countifs(
     }
     EvalResult::Number(Number::from_i64(count as i64))
 }
-#[inline]
 
 fn eval_sumifs(
     args: &[Ast],
@@ -2161,7 +2112,6 @@ fn eval_sumifs(
     }
     EvalResult::Number(sum)
 }
-#[inline]
 
 fn eval_averageifs(
     args: &[Ast],
@@ -2230,7 +2180,7 @@ fn eval_averageifs(
     }
 }
 
-#[inline]
+#[optimize(speed)]
 fn eval_sort(
     args: &[Ast],
     grid: &Grid,
@@ -2312,7 +2262,6 @@ fn eval_sort(
     }
     EvalResult::Array(matrix)
 }
-#[inline]
 
 fn eval_take(
     args: &[Ast],
@@ -2342,7 +2291,6 @@ fn eval_take(
         true,
     )
 }
-#[inline]
 
 fn eval_drop(
     args: &[Ast],
@@ -2372,7 +2320,6 @@ fn eval_drop(
         false,
     )
 }
-#[inline]
 
 fn eval_choosecols(
     args: &[Ast],
@@ -2401,7 +2348,6 @@ fn eval_choosecols(
         true,
     )
 }
-#[inline]
 
 fn eval_chooserows(
     args: &[Ast],
@@ -2431,7 +2377,7 @@ fn eval_chooserows(
     )
 }
 
-#[inline]
+#[optimize(speed)]
 fn collect_matrix_values(
     arg: &Ast,
     grid: &Grid,
@@ -2474,7 +2420,6 @@ fn collect_matrix_values(
         },
     }
 }
-#[inline]
 
 fn collect_criteria_pairs(
     args: &[Ast],
@@ -2504,17 +2449,14 @@ fn collect_criteria_pairs(
     }
     Ok(out)
 }
-#[inline]
 
 fn range_height(r: &MainRange) -> u32 {
     r.row_end.saturating_sub(r.row_start)
 }
-#[inline]
 
 fn range_width(r: &MainRange) -> u32 {
     r.col_end.saturating_sub(r.col_start)
 }
-#[inline]
 
 fn compare_eval_cells(a: &EvalResult, b: &EvalResult) -> std::cmp::Ordering {
     use std::cmp::Ordering;
@@ -2533,7 +2475,6 @@ fn compare_eval_cells(a: &EvalResult, b: &EvalResult) -> std::cmp::Ordering {
         _ => Ordering::Equal,
     }
 }
-#[inline]
 
 fn transpose_matrix(matrix: &mut Vec<Vec<EvalResult>>) {
     if matrix.is_empty() {
@@ -2549,7 +2490,6 @@ fn transpose_matrix(matrix: &mut Vec<Vec<EvalResult>>) {
     }
     *matrix = out;
 }
-#[inline]
 
 fn slice_take_drop(
     matrix: Vec<Vec<EvalResult>>,
@@ -2602,7 +2542,6 @@ fn slice_take_drop(
     }
     EvalResult::Array(out)
 }
-#[inline]
 
 fn slice_rows(mut matrix: Vec<Vec<EvalResult>>, n: isize, take: bool) -> Vec<Vec<EvalResult>> {
     if matrix.is_empty() {
@@ -2626,7 +2565,6 @@ fn slice_rows(mut matrix: Vec<Vec<EvalResult>>, n: isize, take: bool) -> Vec<Vec
         matrix
     }
 }
-#[inline]
 
 fn slice_cols(matrix: Vec<Vec<EvalResult>>, n: isize, take: bool) -> Vec<Vec<EvalResult>> {
     if matrix.is_empty() {
@@ -2650,7 +2588,6 @@ fn slice_cols(matrix: Vec<Vec<EvalResult>>, n: isize, take: bool) -> Vec<Vec<Eva
         })
         .collect()
 }
-#[inline]
 
 fn choose_axes(
     matrix: Vec<Vec<EvalResult>>,
@@ -2703,7 +2640,6 @@ fn choose_axes(
         EvalResult::Array(out)
     }
 }
-#[inline]
 
 fn resolve_index(idx: isize, len: usize) -> Option<usize> {
     if idx > 0 {
@@ -2716,7 +2652,6 @@ fn resolve_index(idx: isize, len: usize) -> Option<usize> {
         None
     }
 }
-#[inline]
 
 fn eval_count(
     args: &[Ast],
@@ -2734,7 +2669,6 @@ fn eval_count(
         Err(e) => EvalResult::Error(e),
     }
 }
-#[inline]
 
 fn eval_counta(
     args: &[Ast],
@@ -2752,7 +2686,6 @@ fn eval_counta(
         Err(e) => EvalResult::Error(e),
     }
 }
-#[inline]
 
 fn eval_countblank(
     args: &[Ast],
@@ -2801,7 +2734,6 @@ fn eval_countblank(
     };
     EvalResult::Number(Number::from_i64(count as i64))
 }
-#[inline]
 
 fn eval_typeof(
     args: &[Ast],
@@ -2844,7 +2776,6 @@ fn eval_typeof(
         EvalResult::Array(_) => EvalResult::Text("array".into()),
     }
 }
-#[inline]
 
 fn eval_type(
     args: &[Ast],
@@ -2906,7 +2837,6 @@ fn eval_type(
         EvalResult::Array(_) => EvalResult::Number(Number::from_i64(64)),
     }
 }
-#[inline]
 
 fn eval_isnumber(
     args: &[Ast],
@@ -2926,7 +2856,6 @@ fn eval_isnumber(
         |v| matches!(v.scalar_coerce(), EvalResult::Number(_)),
     )
 }
-#[inline]
 
 fn eval_istext(
     args: &[Ast],
@@ -2946,7 +2875,6 @@ fn eval_istext(
         |v| matches!(v.scalar_coerce(), EvalResult::Text(_)),
     )
 }
-#[inline]
 
 fn eval_isblank(
     args: &[Ast],
@@ -2966,7 +2894,6 @@ fn eval_isblank(
         Number::exact_zero()
     })
 }
-#[inline]
 
 fn eval_iserror(
     args: &[Ast],
@@ -2986,7 +2913,6 @@ fn eval_iserror(
         |v| matches!(v.scalar_coerce(), EvalResult::Error(_)),
     )
 }
-#[inline]
 
 fn eval_isna(
     args: &[Ast],
@@ -3032,7 +2958,6 @@ where
     ));
     EvalResult::Number(Number::from_i64(if p { 1 } else { 0 }))
 }
-#[inline]
 
 fn matches_blank_ref(
     ast: &Ast,
@@ -3060,7 +2985,6 @@ fn matches_blank_ref(
         ),
     }
 }
-#[inline]
 
 fn cell_is_blank_raw(grid: &Grid, addr: &CellAddr) -> bool {
     match grid.get(addr) {
@@ -3068,7 +2992,6 @@ fn cell_is_blank_raw(grid: &Grid, addr: &CellAddr) -> bool {
         Some(raw) => raw.trim().is_empty(),
     }
 }
-#[inline]
 
 fn cell_is_blank_for_count(
     grid: &Grid,
@@ -3094,7 +3017,6 @@ fn cell_is_blank_for_count(
         }
     }
 }
-#[inline]
 
 fn count_blank_range(
     grid: &Grid,
@@ -3115,7 +3037,7 @@ fn count_blank_range(
     count
 }
 
-#[inline]
+#[optimize(speed)]
 fn eval_countif(
     args: &[Ast],
     grid: &Grid,
@@ -3147,7 +3069,7 @@ fn eval_countif(
     EvalResult::Number(Number::from_i64(count as i64))
 }
 
-#[inline]
+#[optimize(speed)]
 fn eval_sumif(
     args: &[Ast],
     grid: &Grid,
@@ -3210,7 +3132,7 @@ fn eval_sumif(
     EvalResult::Number(sum)
 }
 
-#[inline]
+#[optimize(speed)]
 fn collect_numeric_values(
     arg: &Ast,
     grid: &Grid,
@@ -3249,12 +3171,10 @@ fn collect_numeric_values(
         },
     }
 }
-#[inline]
 
 fn trim_spaces(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
-#[inline]
 
 fn numeric_value(result: EvalResult) -> Option<f64> {
     match result {
@@ -3265,7 +3185,6 @@ fn numeric_value(result: EvalResult) -> Option<f64> {
         EvalResult::Array(_) => None,
     }
 }
-#[inline]
 
 fn as_main_range(ast: &Ast) -> Option<MainRange> {
     match ast {
@@ -3274,7 +3193,7 @@ fn as_main_range(ast: &Ast) -> Option<MainRange> {
     }
 }
 
-#[inline]
+#[optimize(speed)]
 fn count_numeric_values(
     arg: &Ast,
     grid: &Grid,
@@ -3318,7 +3237,7 @@ fn count_numeric_values(
     }
 }
 
-#[inline]
+#[optimize(speed)]
 fn count_nonempty_values(
     arg: &Ast,
     grid: &Grid,
@@ -3394,7 +3313,7 @@ fn compare_str(op: CriteriaOp, left: &str, right: &str) -> bool {
     }
 }
 
-#[inline]
+#[optimize(speed)]
 fn criteria_from_ast(
     ast: &Ast,
     grid: &Grid,
@@ -3435,7 +3354,7 @@ fn criteria_from_ast(
     })
 }
 
-#[inline]
+#[optimize(speed)]
 fn criteria_matches(
     criteria: &Criteria,
     grid: &Grid,
@@ -3476,7 +3395,6 @@ enum LookupValue {
     Number(Number),
     Text(String),
 }
-#[inline]
 
 fn eval_lookup(
     args: &[Ast],
@@ -3568,7 +3486,6 @@ fn eval_lookup(
     }
     EvalResult::Error("NA")
 }
-#[inline]
 
 fn eval_vlookup(
     args: &[Ast],
@@ -3649,7 +3566,6 @@ fn eval_vlookup(
     }
     EvalResult::Error("NA")
 }
-#[inline]
 
 fn eval_xlookup(
     args: &[Ast],
@@ -3753,7 +3669,6 @@ fn eval_xlookup(
     }
     EvalResult::Error("NA")
 }
-#[inline]
 
 fn eval_let(
     args: &[Ast],
@@ -3802,7 +3717,6 @@ fn eval_let(
     bindings.truncate(base_len);
     result
 }
-#[inline]
 
 fn eval_choose(
     args: &[Ast],
@@ -3832,7 +3746,6 @@ fn eval_choose(
         None => EvalResult::Error("VALUE"),
     }
 }
-#[inline]
 
 fn eval_switch(
     args: &[Ast],
@@ -3876,7 +3789,6 @@ fn eval_switch(
         EvalResult::Error("NA")
     }
 }
-#[inline]
 
 fn eval_sortby(
     args: &[Ast],
@@ -3941,7 +3853,6 @@ fn eval_sortby(
     let sorted = idxs.into_iter().map(|i| matrix[i].clone()).collect();
     EvalResult::Array(sorted)
 }
-#[inline]
 
 fn eval_sequence(
     args: &[Ast],
@@ -4000,7 +3911,6 @@ fn eval_sequence(
     }
     EvalResult::Array(out)
 }
-#[inline]
 
 fn eval_unique(
     args: &[Ast],
@@ -4029,7 +3939,6 @@ fn eval_unique(
     }
     EvalResult::Array(out)
 }
-#[inline]
 
 fn eval_filter(
     args: &[Ast],
@@ -4066,7 +3975,6 @@ fn eval_filter(
     }
     EvalResult::Array(out)
 }
-#[inline]
 
 fn collect_array_values(
     arg: &Ast,
@@ -4114,7 +4022,6 @@ fn collect_array_values(
         )]),
     }
 }
-#[inline]
 
 fn eval_result_to_key(result: &EvalResult) -> String {
     match result {

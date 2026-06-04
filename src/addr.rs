@@ -14,7 +14,6 @@ pub struct MainRows(pub usize);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct MainCols(pub usize);
 
-#[inline(always)]
 /// Parse Excel-style column name `A`..`ZZZ` → 0-based main column index.
 pub fn parse_excel_column(name: &str) -> Option<u32> {
     let mut n: u32 = 0;
@@ -28,7 +27,7 @@ pub fn parse_excel_column(name: &str) -> Option<u32> {
 }
 
 /// 0-based main column index → Excel column letters.
-#[inline(always)]
+#[optimize(speed)]
 pub fn excel_column_name(main_col_index: usize) -> String {
     let mut n = main_col_index + 1;
     let mut s = String::new();
@@ -40,7 +39,6 @@ pub fn excel_column_name(main_col_index: usize) -> String {
     s.chars().rev().collect()
 }
 
-#[inline(always)]
 /// Margin label (`A` nearest the main grid/right edge, up to `ZZ`).
 pub fn mirror_margin_column_name(margin_col_index: usize, left_side: bool) -> String {
     // Map the margin_col_index (0..MARGIN_COLS-1) into a letter sequence.
@@ -162,7 +160,6 @@ pub fn addr_to_sheet_cursor(
     row_col
 }
 
-#[inline(always)]
 /// Parse a column fragment at the start of a cell ref.
 pub fn parse_ui_column_fragment(s: &str, main_cols: usize) -> Option<(u32, usize)> {
     if let Some(rest) = s.strip_prefix('[') {
@@ -197,7 +194,6 @@ pub fn ui_column_name(global_col: usize, main_cols: usize) -> String {
     ui_column_fragment(global_col, main_cols)
 }
 
-#[inline(always)]
 /// Parse a sheet id prefix like `$12` at the start of `s`.
 pub fn parse_sheet_id_prefix_at(s: &str) -> Option<(u32, usize)> {
     let bytes = s.as_bytes();
@@ -215,7 +211,6 @@ pub fn parse_sheet_id_prefix_at(s: &str) -> Option<(u32, usize)> {
     Some((sheet_id, i))
 }
 
-#[inline(always)]
 /// Parse a sheet-qualified cell ref like `$2:A1` at the start of `s`.
 pub fn parse_sheet_qualified_cell_ref_at(
     s: &str,
@@ -257,7 +252,7 @@ pub struct A1RefLocks {
 /// Returns `(address, lock flags for main-style A1 translation, byte length consumed)`.
 ///
 /// `$` locking applies only to plain `A1`/`$A1`/`A$1`/`$A$1` forms (no `[` / `]` / `~` / `_`).
-#[inline(always)]
+#[optimize(speed)]
 pub fn parse_cell_ref_at(s: &str, main_cols: usize) -> Option<(CellAddr, A1RefLocks, usize)> {
     let bytes = s.as_bytes();
     if bytes.is_empty() {
@@ -388,7 +383,7 @@ pub fn parse_cell_ref_at(s: &str, main_cols: usize) -> Option<(CellAddr, A1RefLo
     Some((addr, locks, i + row_digits))
 }
 
-#[inline(always)]
+#[optimize(speed)]
 pub fn cell_ref_text(addr: &CellAddr, main_cols: usize) -> String {
     // Keep this function quiet in normal operation; debug traces should go
     // to the configured debug log via stderr redirection in main.
@@ -481,7 +476,6 @@ pub(crate) fn corner_locks_for_bbox(
     (pick(tl_r, tl_c), pick(br_r, br_c))
 }
 
-#[inline(always)]
 /// Parse `A1:B2` at start of `s`; both ends must be main cells with lock metadata for translation.
 pub fn parse_main_range_formula_at(
     s: &str,
@@ -519,7 +513,7 @@ pub fn parse_main_range_formula_at(
 }
 
 /// Parse `A1:B2` at start of `s`; both ends must be main cells. Returns range + consumed length.
-#[inline(always)]
+#[optimize(speed)]
 pub fn parse_main_range_at(s: &str) -> Option<(crate::grid::MainRange, usize)> {
     let (range, locks_a, locks_b, na) = parse_main_range_formula_at(s)?;
     let _ = (locks_a, locks_b);

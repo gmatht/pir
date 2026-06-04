@@ -1,5 +1,5 @@
 
-#![cfg_attr(feature = "nightly", feature(optimize_attribute))]
+#![feature(optimize_attribute)]
 
 pub mod capture;
 pub mod core;
