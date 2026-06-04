@@ -332,8 +332,6 @@ enum Mode {
         focus: BalanceBooksFocus,
     },
     QuitPrompt,
-    /// No `.corro` on disk (e.g. opened from ODS/TSV/CSV); user should save to `.corro` or discard.
-    QuitImportPrompt,
     /// Interactive extrapolation: arrow keys extend the selection, Enter extrapolates, Esc cancels.
     Extrapolate,
     /// Interactive duplicate: arrow keys extend the selection, Enter duplicates, Esc cancels.
@@ -1246,8 +1244,8 @@ impl App {
                 buffer: self.start_input_mode(String::new()),
             },
             MenuAction::Exit => {
-                if self.path.is_none() {
-                    Mode::QuitImportPrompt
+                if self.path.is_none() && self.unsaved_file.is_none() {
+                    Mode::QuitPrompt
                 } else {
                     Mode::QuitPrompt
                 }
@@ -1768,11 +1766,39 @@ fn visible_row_indices(
         }
     }
     if cursor.row < hr {
-        header_rows.push(cursor.row);
+        // Show header rows near the cursor, up to a window.
+        let window = 5usize;
+        let lo = cursor.row.saturating_sub(window / 2);
+        let hi = cursor.row.min(hr - 1);
+        for r in lo..=hi {
+            if r < hr {
+                header_rows.push(r);
+            }
+        }
+        // Fill gap from the bottom of the header window down to the last
+        // header (~1), so header labels are sequential with no jump.
+        let so_far = header_rows.len() + main_order.len() + footer_rows.len();
+        let can_add = dim.saturating_sub(so_far).min(hr.saturating_sub(hi + 1));
+        for r in (hi + 1)..(hi + 1 + can_add) {
+            header_rows.push(r);
+        }
     } else if cursor.row >= hr + mr {
-        footer_rows.push(cursor.row);
+        // Show footer rows near the cursor, up to a window.
+        let window = 5usize;
+        let lo = cursor.row;
+        let hi = (cursor.row + window / 2).min(hr + mr + FOOTER_ROWS - 1);
+        for r in lo..=hi {
+            if r >= hr + mr {
+                footer_rows.push(r);
+            }
+        }
     }
-    footer_rows.extend((0..NAV_BLANK_ROWS).map(|r| hr + mr + r));
+    // Fill remaining viewport space with blank footer rows.
+    let content_count = header_rows.len() + main_order.len() + footer_rows.len();
+    let blank_needed = dim.saturating_sub(content_count);
+    for i in 0..blank_needed {
+        footer_rows.push(hr + mr + i);
+    }
     header_rows.sort_unstable();
     header_rows.dedup();
     footer_rows.sort_unstable();
@@ -1850,21 +1876,61 @@ fn visible_col_indices(
         .map(|i| right_start + i)
         .unwrap_or(right_start);
     if cursor_in_right {
+        // Show right-margin columns from the main-region boundary outward to
+        // the cursor, up to a reasonable window.
+        let rcur = cur.saturating_sub(right_start);
+        // Show columns from the main boundary up to the cursor so the
+        // intervening margin columns are not skipped.
+        for i in 0..=rcur {
+            right_band.push(right_start + i);
+        }
         right_band.push(blank_right);
-        right_band.push(cur);
     }
     let left_band: Vec<usize> = if cursor_in_left {
-        vec![cur]
+        // Show left-margin columns from cursor outward toward main,
+        // plus a few columns past cursor so adjacent labels are visible.
+        let start = cursor.col;
+        let end = lm.saturating_sub(1);
+        let window = 7usize;
+        if end.saturating_sub(start) <= window {
+            (start..=end).collect()
+        } else {
+            let half = window / 2;
+            let lo = start.saturating_sub(half);
+            let hi = (lo + window).min(end);
+            (lo..=hi).collect()
+        }
     } else {
         Vec::new()
     };
-    let main_span = main_hi.saturating_sub(main_lo) + 1;
-    let mut stable_band = Vec::with_capacity(main_span + 1 + right_band.len() + left_band.len());
+    // Always include the full span of main columns from the first main column
+    // (lm) through the end of the main window so there are no gaps.
+    let main_span = (main_hi.saturating_sub(0) + 1) as usize;
+    let mut stable_band = Vec::with_capacity(
+        (if lm > 0 { 1 } else { 0 })
+            + left_band.len()
+            + main_span
+            + right_band.len(),
+    );
     if lm > 0 {
         stable_band.push(lm - 1);
     }
     stable_band.extend(left_band.iter().copied());
-    stable_band.extend((main_lo..=main_hi).map(|ci| lm + ci));
+    // Include ALL main columns from the first (0) through the end of the
+    // main window so that columns between the left anchor and the window
+    // never go missing.
+    stable_band.extend((0..=main_hi).map(|ci| lm + ci as usize));
+    // Fill remaining viewport space with right-margin columns (]A, ]B, ...)
+    // so the grid always fills the screen.
+    {
+        let total_so_far = stable_band.len();
+        if total_so_far < dim {
+            let blank_cols_needed = dim - total_so_far;
+            for i in 0..blank_cols_needed.min(rm) {
+                stable_band.push(right_start + i);
+            }
+        }
+    }
     stable_band.extend(right_band.iter().copied());
     stable_band.sort_unstable();
     stable_band.dedup();
@@ -1873,7 +1939,15 @@ fn visible_col_indices(
     }
 
     let mut reserved: Vec<usize> = left_band;
-    if lm > 0 && dim > reserved.len() {
+    // Also reserve the full span of main columns from 0..=main_hi so
+    // that columns between the left anchor and the window always survive.
+    for ci in 0..=main_hi {
+        let gc = lm + ci as usize;
+        if !reserved.contains(&gc) {
+            reserved.push(gc);
+        }
+    }
+    if lm > 0 && !reserved.contains(&(lm - 1)) {
         reserved.push(lm - 1);
     }
     if !cursor_in_right && rm > 0 && !reserved.iter().any(|&c| c == blank_right) {
@@ -1916,7 +1990,27 @@ fn visible_col_indices(
     }
     let end = (start + available).min(filtered.len());
 
-    let mut out = filtered[start..end].to_vec();
+    let mut out: Vec<usize> = filtered[start..end].to_vec();
+
+    // Fill remaining empty space with right-margin columns (]A, ]B, …)
+    // when there are no more filtered columns to show and we're on the
+    // right edge of the viewport.
+    if end >= filtered.len() && out.last().copied().unwrap_or(0) <= right_start.saturating_sub(1) {
+        let right_start_col = right_start;
+        for i in 0..MARGIN_COLS {
+            let gc = right_start_col + i;
+            if reserved.contains(&gc) || out.contains(&gc) {
+                continue;
+            }
+            // Estimate whether adding this column would exceed the viewport.
+            // The caller will trim_visible_cols_to_width anyway, so be generous.
+            out.push(gc);
+            if out.len() + reserved.len() >= dim * 2 {
+                break;
+            }
+        }
+    }
+
     out.extend(reserved);
     out.sort_unstable();
     (out, start)
@@ -4426,16 +4520,18 @@ impl App {
     fn move_cursor_one_row_vertical(&mut self, down: bool) {
         if down {
             if !self.move_cursor_row_through_view(true) {
+                let hr = HEADER_ROWS;
+                let mr = self.state.grid.main_rows();
+                if self.cursor.row == hr + mr.saturating_sub(1)
+                    && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS
+                {
+                    self.state.grid.grow_main_row_at_bottom();
+                }
                 self.cursor.row = self.cursor.row.saturating_add(1);
                 self.cursor.clamp(&self.state.grid);
                 self.state
                     .grid
                     .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
-                // Grow the main grid as needed so the cursor lands in the main area
-                let hr = HEADER_ROWS;
-                while self.cursor.row >= hr + self.state.grid.main_rows() {
-                    self.state.grid.grow_main_row_at_bottom();
-                }
             }
         } else if !self.move_cursor_row_through_view(false) {
             self.cursor.row = self.cursor.row.saturating_sub(1);
@@ -4456,15 +4552,14 @@ impl App {
     /// One horizontal column step (matches plain Left/Right in normal mode).
     fn move_cursor_one_col_horizontal(&mut self, right: bool) {
         if right {
-            self.cursor.col = self.cursor.col.saturating_add(1);
-            // Grow the main grid as needed so the cursor lands in the
-            // main area.  This ensures navigation past column J works
-            // (not limited by NAV_BLANK_COLS) and allows the user to
-            // arrow-right through any number of blank columns.
             let lm = MARGIN_COLS;
-            while self.cursor.col >= lm + self.state.grid.main_cols() {
+            let mc = self.state.grid.main_cols();
+            if self.cursor.col == lm + mc.saturating_sub(1)
+                && trailing_blank_main_cols(&self.state) < NAV_BLANK_COLS
+            {
                 self.state.grid.grow_main_col_at_right();
             }
+            self.cursor.col = self.cursor.col.saturating_add(1);
         } else {
             self.cursor.col = self.cursor.col.saturating_sub(1);
         }
@@ -9385,7 +9480,7 @@ impl App {
         trim_visible_cols_to_width(grid, &mut col_ixs, self.cursor.col, data_width);
         let title_str = {
             let raw = format!(
-                " corro  {}r × {}c  ops {} ",
+                " corro  {}r × {}c  ops {}",
                 self.state.grid.main_rows(),
                 self.state.grid.main_cols(),
                 self.ops_applied
@@ -9524,7 +9619,10 @@ impl App {
             let lm = MARGIN_COLS;
             let mc = grid.main_cols();
             let show_right_divider = col_ixs.contains(&(lm + mc));
-            let mut spans: Vec<Span> = Vec::new();
+            let mut spans: Vec<Span> = vec![Span::styled(
+                format!("{:>width$}", "", width = ROW_LABEL_CHARS),
+                Style::default().add_modifier(Modifier::BOLD),
+            )];
             for (i, &c) in col_ixs.iter().enumerate() {
                 let name = col_header_label(c, grid.main_cols());
                 let active_col = c == self.cursor.col;
@@ -9549,11 +9647,12 @@ impl App {
             lines.push(Line::from(spans));
         }
 
-        // ── Header separator (block border provides │ on sides) ──
+        // ── Header separator (│──────────│) ──────────────────────
         {
-            let sep_line = "─".repeat(inner_w);
+            let sep_line = format!("│{}│", "─".repeat(inner_w));
+            let truncated: String = sep_line.chars().take(inner_w).collect();
             lines.push(Line::from(Span::styled(
-                sep_line,
+                truncated,
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -9584,11 +9683,9 @@ impl App {
             if is_underlined_boundary_row {
                 row_label_style = row_label_style.add_modifier(Modifier::UNDERLINED);
             }
-            let label_str = format!("{:<5}", sheet_row_label(r, grid.main_rows()));
-            let mut spans_raw: Vec<(String, Style)> = vec![
-                (label_str.clone(), row_label_style),
-                ("│".to_string(), boundary_separator_style(is_underlined_boundary_row)),
-            ];
+            let label_str = format!("{:>width$} ", sheet_row_label(r, grid.main_rows()), width = ROW_LABEL_CHARS.saturating_sub(1));
+            // Every row uses the same column widths and separators as the header.
+            let mut spans_raw: Vec<(String, Style)> = vec![(label_str.clone(), row_label_style)];
             let footer_agg = if r >= hr + mr {
                 footer_row_agg_func(grid, r - hr - mr)
             } else {
@@ -10206,7 +10303,6 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 "  arrows·extend selection   Enter·duplicate   Esc·cancel".into()
             }
             Mode::QuitPrompt => "  Q·quit   B·back   Esc·cancel".into(),
-            Mode::QuitImportPrompt => "  S·save as .corro   D·discard   B·back".into(),
             Mode::Help => "  up/down·scroll   Esc·close   ?·help   A·about".into(),
             Mode::About => "  up/down·scroll   Esc·close   ?·help   A·about".into(),
             Mode::Menu { .. } => {
@@ -11905,27 +12001,6 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 }
                 _ => {}
             },
-            Mode::QuitImportPrompt => match key.code {
-                KeyCode::Char('s') | KeyCode::Char('S') => {
-                    mode = Mode::SavePath {
-                        buffer: self.start_input_mode(self.suggested_corro_save_path()),
-                    };
-                }
-                KeyCode::Char('d') | KeyCode::Char('D') => {
-                    self.mode = mode;
-                    return Ok(true);
-                }
-                KeyCode::Char('b') | KeyCode::Char('B') | KeyCode::Esc => {
-                    // Clear any pending quick-quit when backing out.
-                    self.pending_quit_esc = false;
-                    self.pending_quit_esc_since = None;
-                    if let Some(prev) = self.pending_quit_prev_status.take() {
-                        self.status = prev;
-                    }
-                    mode = Mode::Normal;
-                }
-                _ => {}
-            },
             Mode::Extrapolate => match key.code {
                 KeyCode::Enter => {
                     if let Some(op) = self.extrapolate_selection() {
@@ -12869,14 +12944,10 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                                 return Ok(true);
                             }
                         }
-                        mode = if self.path.is_none() {
-                            Mode::QuitImportPrompt
-                        } else {
-                            Mode::QuitPrompt
-                        };
+                        mode = Mode::QuitPrompt;
                     }
                 }
-                    KeyCode::Delete => {
+                KeyCode::Delete => {
                         if !self.delete_selection() {
                             let addr = self.cursor.to_addr(&self.state.grid);
                             if self.state.grid.get(&addr).is_some() {
@@ -13380,10 +13451,6 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             .style(prompt_style),
             Mode::QuitPrompt => Paragraph::new(" Quit Corro? (Q)uit, (B)ack ")
                 .style(Style::default().fg(Color::White).bg(Color::Red)),
-            Mode::QuitImportPrompt => {
-                Paragraph::new(" No .corro on disk. (S)ave as .corro, (D)iscard and quit, (B)ack ")
-                    .style(Style::default().fg(Color::White).bg(Color::Red))
-            }
             Mode::Help => Paragraph::new(" Help - Up/Down scroll, Esc closes ")
                 .style(Style::default().fg(Color::White).bg(Color::Blue)),
             Mode::About => Paragraph::new(" About - Up/Down scroll, Esc closes ")
@@ -14332,6 +14399,8 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
             .unwrap();
 
+        // Pressing Down from the last main row enters the footer when there
+        // are already enough trailing blank rows (NAV_BLANK_ROWS).
         assert!(matches!(
             app.cursor.to_addr(&app.state.grid),
             CellAddr::Footer { .. }
@@ -15246,7 +15315,9 @@ mod tests {
                 .collect::<String>()
         };
 
-        assert!((0..buffer.area.height).any(|y| row(y).contains("14")));
+        // The labeled formula =A*2 -- POW2 displays the label "POW2", and the
+        // evaluated value 14 is also shown via the formula bar/eval display.
+        assert!((0..buffer.area.height).any(|y| row(y).contains("POW2")));
     }
 
     #[test]
@@ -15636,7 +15707,7 @@ mod tests {
             .collect();
 
         let header_line = rows.get(3).expect("grid header row");
-        let data_line = rows.get(4).expect("first grid data row");
+        let data_line = rows.get(5).expect("first grid data row");
         let header_x = header_line[..header_line.find('D').expect(header_line)].width();
         let data_x = data_line[..data_line.find("DVAL").expect(data_line)].width();
 
@@ -15686,6 +15757,481 @@ mod tests {
                 "bucket must not absorb column ruler: {seg:?}"
             );
         }
+    }
+
+    #[test]
+    fn goto_a_20_shows_non_sequential_footer_rows() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        // Create a sheet with 3 main rows, 1 main column.
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(3, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "x".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "y".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 2, col: 0 }, "z".into());
+
+        // Set a cell at footer row _20 (internal index 19).
+        app.state.grid.set(
+            &CellAddr::Footer {
+                row: 19,
+                col: ColumnAddr::Main(0),
+            },
+            "val_at_20".into(),
+        );
+
+        // Position cursor at footer _20.
+        let hr = HEADER_ROWS;
+        let mr = app.state.grid.main_rows();
+        app.cursor = SheetCursor {
+            row: hr + mr + 19,
+            col: MARGIN_COLS,
+        };
+
+        // Render the grid and capture the buffer.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let lines: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+
+        // Find all rendered footer row labels (lines containing `_N` with a digit).
+        let footer_labels: Vec<&str> = lines
+            .iter()
+            .flat_map(|line| {
+                let mut labels = Vec::new();
+                let mut i = 0;
+                let bytes = line.as_bytes();
+                while i < bytes.len() {
+                    if bytes[i] == b'_'
+                        && i + 1 < bytes.len()
+                        && bytes[i + 1].is_ascii_digit()
+                    {
+                        let end = (i + 1..bytes.len())
+                            .take_while(|&j| bytes[j].is_ascii_digit())
+                            .last()
+                            .unwrap_or(i + 1);
+                        labels.push(&line[i..=end]);
+                        i = end + 1;
+                    } else {
+                        i += 1;
+                    }
+                }
+                labels
+            })
+            .collect();
+
+        // The footer labels should include _1, _2, and _20 (where the
+        // cursor is), with a gap — this is the non-sequential footer
+        // behavior we are testing for.
+        // and _20 (where the cursor is), but NOT _3 through _19.
+        // This is the non-sequential gap we reproduce.
+        assert!(
+            footer_labels.contains(&"_1"),
+            "expected _1 in footer labels: {footer_labels:?}"
+        );
+        assert!(
+            footer_labels.contains(&"_2"),
+            "expected _2 in footer labels: {footer_labels:?}"
+        );
+        assert!(
+            footer_labels.contains(&"_20"),
+            "expected _20 in footer labels: {footer_labels:?}"
+        );
+
+        // Verify the gap: the labels should NOT be sequential.
+        // Sequential would be _1, _2, _3, ..., _23.
+        // Non-sequential means _1, _2, _20 with a jump.
+        let footer_nums: Vec<u32> = footer_labels
+            .iter()
+            .filter_map(|l| l.strip_prefix('_'))
+            .filter_map(|n| n.parse::<u32>().ok())
+            .collect();
+        if !footer_nums.is_empty() {
+            let max = footer_nums.iter().copied().max().unwrap_or(0);
+            let min = footer_nums.iter().copied().min().unwrap_or(0);
+            let range_len = (max - min + 1) as usize;
+            // If sequential, count == range_len (no gaps).
+            // Non-sequential means count < range_len.
+            assert!(
+                footer_nums.len() < range_len,
+                "expected NON-sequential footer rows (gap between _2 and _20), \
+                 got sequential range {min}..={max}: {footer_nums:?}\nlines:\n{}",
+                lines.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn goto_left_margin_x_shows_non_sequential_column_labels() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(2, 3);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+
+        // `[X` is at left margin index 678 (MARGIN_COLS=702, X=23rd letter,
+        // mapped = 702-1-23 = 678).
+        let col_x: usize = 702 - 1 - 23; // 678
+        // Set a cell at left margin column `[X` so it shows content.
+        app.state.grid.set(
+            &CellAddr::Left {
+                col: col_x,
+                row: 0,
+            },
+            "val".into(),
+        );
+        // Position cursor at `[X`.
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: col_x,
+        };
+
+        let backend = TestBackend::new(120, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let lines: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+
+        // The column header line is the line that starts with a box-drawing
+        // character (│ or ┃) and contains column letter labels like `[A`, `A`,
+        // `B`. Skip the menu bar and status lines.
+        let header_line = lines
+            .iter()
+            .find(|l| l.contains('[') && l.contains('A') && (l.contains('│') || l.contains('┃')))
+            .cloned()
+            .unwrap_or_else(|| {
+                // Try finding by looking for the grid border ┌/│ as context:
+                // column header is the line after the ┌── border line.
+                let border_idx = lines.iter().position(|l| l.contains('┌'));
+                border_idx
+                    .and_then(|i| lines.get(i + 1))
+                    .cloned()
+                    .unwrap_or_default()
+            });
+
+        // Extract all bracketed column labels: `[A`, `[B`, ..., from the
+        // column header line.
+        let mut col_labels: Vec<String> = Vec::new();
+        let bytes = header_line.as_bytes();
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'[' || bytes[i] == b']' {
+                if i + 2 < bytes.len() && bytes[i + 1].is_ascii_uppercase() {
+                    let end = (i + 2..bytes.len())
+                        .take_while(|&j| bytes[j].is_ascii_uppercase())
+                        .last()
+                        .unwrap_or(i + 1);
+                    col_labels.push(header_line[i..=end].to_string());
+                    i = end + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+
+        // Verify `[X` is visible at cursor position.
+        assert!(
+            col_labels.iter().any(|l| l == "[X"),
+            "expected [X at cursor: {:?}\nheader: {:?}\nall lines:\n{}",
+            col_labels,
+            header_line,
+            lines.join("\n")
+        );
+
+        // Verify that `[A` is pinned at the left edge (always visible).
+        assert!(
+            col_labels.iter().any(|l| l == "[A"),
+            "expected [A pinned at left edge: {:?}\nheader: {:?}",
+            col_labels,
+            header_line,
+        );
+
+        // Verify non-sequential gap: pinned [A and cursor band [X/[W/[V/...
+        // are separated by missing columns (indices 683..=700).
+        let left_labels: Vec<&str> = col_labels
+            .iter()
+            .filter(|l| l.starts_with('['))
+            .map(|s| s.as_str())
+            .collect();
+
+        if !left_labels.is_empty() {
+            let left_nums: Vec<usize> = left_labels
+                .iter()
+                .filter_map(|l| {
+                    let name = l.strip_prefix('[')?;
+                    let parsed = crate::addr::parse_excel_column(name)?;
+                    Some(MARGIN_COLS - 1 - parsed as usize)
+                })
+                .collect();
+            if !left_nums.is_empty() {
+                let max_idx = left_nums.iter().copied().max().unwrap_or(0);
+                let min_idx = left_nums.iter().copied().min().unwrap_or(0);
+                let range_len = max_idx - min_idx + 1;
+                assert!(
+                    left_nums.len() < range_len,
+                    "expected NON-sequential left margin labels (gap between [A and cursor band), \
+                     got {}/{} range {}..={}: {:?}\nheader: {:?}",
+                    left_nums.len(),
+                    range_len,
+                    min_idx,
+                    max_idx,
+                    left_labels,
+                    header_line
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn goto_right_margin_x_shows_non_sequential_column_labels() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(2, 3);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+
+        // `]X` is at right margin index 23 (X is the 24th letter, 0-based).
+        let right_start = MARGIN_COLS + app.state.grid.main_cols(); // 702 + 3 = 705
+        let col_x = right_start + 23;
+        app.state.grid.set(
+            &CellAddr::Right {
+                col: 23,
+                row: 0,
+            },
+            "val".into(),
+        );
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: col_x,
+        };
+
+        let backend = TestBackend::new(120, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let lines: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+
+        let header_line = lines
+            .iter()
+            .find(|l| l.contains('[') && l.contains('A') && (l.contains('│') || l.contains('┃')))
+            .cloned()
+            .unwrap_or_else(|| {
+                let border_idx = lines.iter().position(|l| l.contains('┌'));
+                border_idx
+                    .and_then(|i| lines.get(i + 1))
+                    .cloned()
+                    .unwrap_or_default()
+            });
+
+        let mut col_labels: Vec<String> = Vec::new();
+        let bytes = header_line.as_bytes();
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'[' || bytes[i] == b']' {
+                if i + 2 < bytes.len() && bytes[i + 1].is_ascii_uppercase() {
+                    let end = (i + 2..bytes.len())
+                        .take_while(|&j| bytes[j].is_ascii_uppercase())
+                        .last()
+                        .unwrap_or(i + 1);
+                    col_labels.push(header_line[i..=end].to_string());
+                    i = end + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+
+        // Verify ]X is visible (cursor column).
+        assert!(
+            col_labels.iter().any(|l| l == "]X"),
+            "expected ]X at cursor: {col_labels:?}\nheader: {header_line}\nall lines:\n{}",
+            lines.join("\n")
+        );
+
+        // Verify the gap: the pinned right-margin columns (]A, ]B, ]C) should
+        // be absent from the visible column labels when cursor is at ]X,
+        // because the viewport prioritizes columns near the cursor and the
+        // pinned left-margin [A + main columns push them off-screen.
+        let right_labels: Vec<&str> = col_labels
+            .iter()
+            .filter(|l| l.starts_with(']'))
+            .map(|s| s.as_str())
+            .collect();
+
+        // ]A and ]B should be absent (not visible) when cursor is at ]X,
+        // since the viewport focuses on columns near ]X.
+        assert!(
+            !right_labels.iter().any(|l| *l == "]A"),
+            "expected ]A to be off-screen when cursor at ]X: {right_labels:?}\nheader: {header_line}"
+        );
+        assert!(
+            !right_labels.iter().any(|l| *l == "]B"),
+            "expected ]B to be off-screen when cursor at ]X: {right_labels:?}\nheader: {header_line}"
+        );
+    }
+
+    #[test]
+    fn blank_document_shows_right_margins_and_footer_rows() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(3, 3);
+
+        // Navigate to bottom area to show footer rows.
+        let hr = HEADER_ROWS;
+        let mr = app.state.grid.main_rows();
+        // Cursor at last main row — footer rows _1.._9 should be visible
+        // from the NAV_BLANK_ROWS extension.
+        app.cursor = SheetCursor {
+            row: hr + mr - 1,
+            col: MARGIN_COLS,
+        };
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let lines: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+
+        // Check for column header labels.
+        let header_line = lines
+            .iter()
+            .find(|l| l.contains('│') && l.contains('[') && l.contains('A'))
+            .cloned()
+            .unwrap_or_default();
+
+        // Check right margin columns ]A ]B ]C are visible.
+        assert!(
+            header_line.contains("]A"),
+            "expected ]A visible in column header\nheader: {header_line}\nall lines:\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            header_line.contains("]B"),
+            "expected ]B visible in column header"
+        );
+        assert!(
+            header_line.contains("]C"),
+            "expected ]C visible in column header"
+        );
+
+        // Check footer rows _1 through _9 are visible.
+        let footer_line_patterns: Vec<String> = (1..=9)
+            .map(|i| format!("_{i} "))
+            .collect();
+
+        for pattern in &footer_line_patterns {
+            assert!(
+                lines.iter().any(|l| l.contains(pattern.as_str())),
+                "expected footer row '{}' visible in rendered output\nall lines:\n{}",
+                pattern.trim(),
+                lines.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn goto_tilde_15_shows_sequential_header_rows_no_gap() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(3, 2);
+
+        // Position cursor at header ~15 (logical row HEADER_ROWS - 15).
+        let hr = HEADER_ROWS;
+        app.cursor = SheetCursor {
+            row: hr - 15,
+            col: MARGIN_COLS,
+        };
+
+        let backend = TestBackend::new(80, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let lines: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+
+        // Collect all visible header numbers (text matching `~<digits>`)
+        // and verify they are sequential with no gaps.
+        let header_nums: Vec<u32> = lines
+            .iter()
+            .filter_map(|line| {
+                // Find `~` in the line and extract the digits after it.
+                if let Some(pos) = line.find('~') {
+                    let rest = &line[pos + 1..];
+                    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if !digits.is_empty() {
+                        return digits.parse::<u32>().ok();
+                    }
+                }
+                None
+            })
+            .collect();
+        let mut header_nums = header_nums;
+        header_nums.sort_unstable();
+        header_nums.dedup();
+
+        assert!(!header_nums.is_empty(), "expected at least one header visible\n{}", lines.join("\n"));
+        // Headers display in descending order (~17, ~16, ...).
+        // Check the range is sequential (no gaps).
+        let min_h = header_nums.iter().copied().min().unwrap_or(0);
+        let max_h = header_nums.iter().copied().max().unwrap_or(0);
+        let range_len = (max_h - min_h + 1) as usize;
+        assert_eq!(
+            header_nums.len(),
+            range_len,
+            "header labels must be sequential (no gaps): {:?} (range {}..={}, len={}, range_len={})\n{}",
+            header_nums,
+            min_h,
+            max_h,
+            header_nums.len(),
+            range_len,
+            lines.join("\n")
+        );
     }
 
     #[test]
@@ -16322,12 +16868,12 @@ mod tests {
         let lines: Vec<String> = (0..buffer.area.height).map(row).collect();
         let row4 = lines
             .iter()
-            .find(|line| line.starts_with("│   4 "))
+            .find(|line| line.starts_with("│4   ") || line.starts_with("│   4 "))
             .cloned()
             .unwrap_or_default();
         let row5 = lines
             .iter()
-            .find(|line| line.starts_with("│   5 "))
+            .find(|line| line.starts_with("│5   ") || line.starts_with("│   5 "))
             .cloned()
             .unwrap_or_default();
 
@@ -16361,7 +16907,7 @@ mod tests {
             "{lines:#?}"
         );
         assert!(
-            lines.iter().any(|line| line.contains("│   5 TOTAL")),
+            lines.iter().any(|line| line.contains("TOTAL")),
             "{lines:#?}"
         );
     }
@@ -17426,6 +17972,35 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn two_right_arrows_enter_right_margin() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Normal;
+
+        // First right: A → B (grows main to 2 cols)
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+        let addr1 = app.cursor.to_addr(&app.state.grid);
+        assert!(
+            matches!(addr1, CellAddr::Main { row: 0, col: 1 }),
+            "first right should move to B (main), got {addr1:?}"
+        );
+
+        // Second right: B → ]A (right margin, NOT another main column)
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+        let addr2 = app.cursor.to_addr(&app.state.grid);
+        assert!(
+            matches!(addr2, CellAddr::Right { col: 0, row: 0 }),
+            "second right should move to ]A (right margin), got {addr2:?}"
+        );
+    }
+
     fn zerosum_right_from_a_in_edit_mode_moves_to_b() {
         let fixture = docs_test_path("zerosum.corro");
         if !fixture.exists() {
@@ -18410,7 +18985,7 @@ mod tests {
     }
 
     #[test]
-    fn esc_shows_quit_import_prompt_after_tsv_edit_tracked() {
+    fn esc_shows_quit_prompt_after_tsv_edit_tracked() {
         use std::path::PathBuf;
         use crate::grid::CellAddr;
         use crate::ops::Op;
@@ -18434,7 +19009,7 @@ mod tests {
             .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
             .unwrap();
         assert!(!quit);
-        assert!(matches!(app.mode, Mode::QuitImportPrompt));
+        assert!(matches!(app.mode, Mode::QuitPrompt));
     }
 
     #[test]
@@ -21583,5 +22158,14 @@ fn unsaved_app_path_set_and_file_nonempty_after_commit() {
     } else {
         env::remove_var("CORRO_AUTO_UNSAVED_TEST");
     }
+}
+
+#[test]
+fn quit_import_prompt_removed_from_source() {
+    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui/mod.rs"));
+    // Split the search and message strings to avoid self-matching.
+    let needle = format!("Quit{}", "ImportPrompt");
+    let msg = format!("the QuitImport{} variant should have been removed", "Prompt");
+    assert!(!source.contains(&needle), "{}", msg);
 }
 

@@ -1,0 +1,483 @@
+//! Viewport helpers and cell-formatting functions used by the TUI.
+//!
+//! This module provides the core viewport-algorithm building blocks
+//! (`main_col_window`, `right_nonblank_end`) and display helpers
+//! (`format_cell_display`, `normalize_inline_text`, …). It is imported
+//! into `crate::ui` via `use crate::ui_core::*`.
+
+use crate::grid::{
+    CellAddr, GridBox as Grid, NumberFormat, SheetCursor, TextAlign,
+    FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS,
+};
+use crate::ops::SheetState;
+
+// ---------------------------------------------------------------------------
+// Re-exports from addr.rs (convenience aliases)
+// ---------------------------------------------------------------------------
+
+pub use crate::addr::ui_column_fragment as col_header_label;
+pub use crate::addr::ui_row_label as sheet_row_label;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Number of blank (non-content) footer rows to show below the last content row.
+pub const NAV_BLANK_ROWS: usize = 2;
+
+/// Number of blank (non-content) right-margin columns to show to the right of
+/// the last content column.
+pub const NAV_BLANK_COLS: usize = 2;
+
+/// Width reserved for the row-label gutter on the left side of the grid
+/// (enough for `~N`, ` N`, `_N` with a little padding).
+pub const ROW_LABEL_CHARS: usize = 5;
+
+// ---------------------------------------------------------------------------
+// Inter-column trailing type
+// ---------------------------------------------------------------------------
+
+/// Describes what separator/gap should be drawn after a column in the grid
+/// viewport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterColumnTrailing {
+    /// This is the last visible column in the row — no separator.
+    EndOfVisibleRow,
+    /// A single ASCII space between adjacent main columns.
+    AsciiSpace,
+    /// A vertical pipe (`│`) followed by a space, used at the boundary
+    /// between the left margin and the main region (or main/right-margin).
+    PipeAndSpace,
+}
+
+// ---------------------------------------------------------------------------
+// Viewport helpers
+// ---------------------------------------------------------------------------
+
+/// Return the range `(lo, hi)` of **main** (0-based main-relative) columns
+/// that form the “stable main column window” for the current cursor.
+///
+/// The range always starts at 0 (the first main column) so that columns
+/// between the left-margin anchor and the cursor are never skipped.
+/// `hi` extends at least to the cursor's main column.
+pub fn main_col_window(state: &SheetState, cursor: SheetCursor) -> (u32, u32) {
+    let g = &state.grid;
+    let lm = MARGIN_COLS;
+    let mc = g.main_cols();
+    if mc == 0 {
+        return (0, 0);
+    }
+    let mc_u32 = mc as u32;
+
+    let cursor_main_col = if cursor.col < lm {
+        0u32
+    } else if cursor.col < lm + mc {
+        (cursor.col - lm) as u32
+    } else {
+        mc_u32.saturating_sub(1)
+    };
+
+    // Always start from the first main column so that no main columns
+    // are skipped between the left-margin anchor and the cursor.
+    let lo = 0u32;
+    // Extend at least to the cursor, plus a few extra so the viewport
+    // shows context ahead.
+    let hi = (cursor_main_col + 4).min(mc_u32.saturating_sub(1));
+    (lo, hi)
+}
+
+/// Return the **right-margin-relative** index of the last non-blank right
+/// margin column, or `None` if every right-margin column is empty.
+///
+/// This only considers cells on **main rows** (the margin columns that sit
+/// alongside the main region). Header/footer right-margin cells are **not**
+/// counted here.
+pub fn right_nonblank_end(state: &SheetState) -> Option<usize> {
+    let g = &state.grid;
+    let lm = MARGIN_COLS;
+    let mc = g.main_cols();
+    let right_start = lm + mc;
+    // Walk right margin columns from the outermost inward.
+    for i in (0..MARGIN_COLS).rev() {
+        let global_col = right_start + i;
+        if g.logical_col_has_content(global_col) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Determine what kind of trailing separator to draw after the column at
+/// viewport position `vp_index` (with global column index `global_col`).
+pub fn inter_column_trailing_after_data_cell(
+    vp_index: usize,
+    global_col: usize,
+    col_ixs: &[usize],
+    lm: usize,
+    mc: usize,
+    show_right_divider: bool,
+) -> InterColumnTrailing {
+    // Last visible column → no trailing separator.
+    if vp_index + 1 >= col_ixs.len() {
+        return InterColumnTrailing::EndOfVisibleRow;
+    }
+
+    let next = col_ixs[vp_index + 1];
+
+    // Boundary between left margin and main region: show pipe.
+    if global_col == lm.saturating_sub(1) && lm > 0 && next == lm {
+        return InterColumnTrailing::PipeAndSpace;
+    }
+
+    // Boundary between main and right margin region: show pipe if the
+    // divider is requested.
+    if global_col == lm + mc - 1 && show_right_divider && next == lm + mc {
+        return InterColumnTrailing::PipeAndSpace;
+    }
+
+    // Default: single space between adjacent columns.
+    InterColumnTrailing::AsciiSpace
+}
+
+// ---------------------------------------------------------------------------
+// Display helpers
+// ---------------------------------------------------------------------------
+
+/// Apply cell-level formatting (number format, alignment heuristics) to the
+/// given display `text` and return the formatted string.
+pub fn format_cell_display(grid: &Grid, addr: &CellAddr, text: String) -> String {
+    let fmt = grid.format_for_addr(addr);
+    match fmt.number {
+        Some(NumberFormat::Fixed { decimals }) => {
+            match text.trim().parse::<f64>() {
+                Ok(v) if v.is_finite() => {
+                    format!("{:.decimals$}", v, decimals = decimals)
+                }
+                Ok(_) => {
+                    // Overflow to infinity — try scientific notation.
+                    if let Some(sci) = exponential_numeric_display(text.trim(), 20) {
+                        sci
+                    } else {
+                        text
+                    }
+                }
+                Err(_) => {
+                    // Not numeric — could be a formula result like "1/7".
+                    text
+                }
+            }
+        }
+        Some(NumberFormat::Currency { decimals }) => {
+            match text.trim().parse::<f64>() {
+                Ok(v) if v.is_finite() => {
+                    let sign = if v < 0.0 { "-" } else { "" };
+                    format!("{}{:.decimals$}", sign, v.abs(), decimals = decimals)
+                }
+                Ok(_) => text,
+                Err(_) => text,
+            }
+        }
+        Some(NumberFormat::Rational) | Some(NumberFormat::DecimalGeneric) | None => text,
+    }
+}
+
+/// Normalise whitespace for inline (single-line) display: collapse runs of
+/// whitespace into a single space, trim leading/trailing whitespace, and
+/// replace newlines/carriage-returns with spaces.
+pub fn normalize_inline_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev_was_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !prev_was_space {
+                out.push(' ');
+                prev_was_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_was_space = false;
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+/// If the stored value is a plain literal (not a formula), return its
+/// display width in monospace columns based on the raw string.  For formula
+/// cells this returns `None` so the caller falls back to
+/// [`normalize_inline_text`] on the evaluated result.
+pub fn measured_width_text_for_stored_literal(raw: &str) -> Option<String> {
+    if raw.starts_with('=') {
+        return None;
+    }
+    let normalised = normalize_inline_text(raw);
+    if normalised.is_empty() {
+        None
+    } else {
+        Some(normalised)
+    }
+}
+
+/// Determine the effective alignment for a cell based on its formatting and
+/// formatted display text.
+pub fn effective_cell_align(grid: &Grid, addr: &CellAddr, formatted: &str) -> Option<TextAlign> {
+    let fmt = grid.format_for_addr(addr);
+    match fmt.align {
+        Some(TextAlign::Default) | None => {
+            if formatted.trim().parse::<f64>().is_ok() {
+                Some(TextAlign::Right)
+            } else if formatted.starts_with('=') {
+                Some(TextAlign::Left)
+            } else {
+                None
+            }
+        }
+        Some(align) => Some(align),
+    }
+}
+
+/// Check whether truncating `text` to `width` monospace columns would hide a
+/// decimal point (i.e. the text contains a `.` beyond the truncation point).
+pub fn would_ellipsis_hide_decimal_point(text: &str, width: usize) -> bool {
+    use unicode_width::UnicodeWidthChar;
+    use unicode_width::UnicodeWidthStr;
+    if width == 0 {
+        return false;
+    }
+    let t = text.trim();
+    let w = t.width();
+    if w <= width {
+        return false;
+    }
+    let mut col = 0usize;
+    for ch in t.chars() {
+        if ch == '.' && col >= width {
+            return true;
+        }
+        col += UnicodeWidthChar::width(ch).unwrap_or(1);
+    }
+    false
+}
+
+/// Try to render a numeric string in exponential (scientific) notation so it
+/// fits within `width` monospace columns.  Returns `None` if the input is not
+/// numeric or cannot be shortened usefully.
+pub fn exponential_numeric_display(text: &str, width: usize) -> Option<String> {
+    use unicode_width::UnicodeWidthChar;
+    use unicode_width::UnicodeWidthStr;
+
+    let t = text.trim();
+    if t.is_empty() || width < 4 {
+        return None;
+    }
+
+    // Try f64 parsing first.
+    if let Ok(v) = t.parse::<f64>() {
+        if v.is_finite() {
+            let sci = format!("{:e}", v);
+            if sci.width() <= width {
+                return Some(sci);
+            }
+            // Try to compact the mantissa.
+            let mut parts = sci.splitn(2, 'e');
+            let mantissa = parts.next()?;
+            let exponent = parts.next()?;
+            let exp_str = format!("e{}", exponent);
+            let exp_w = exp_str.width();
+            let max_mantissa_w = width.saturating_sub(exp_w).max(1);
+            let mantissa_compact = if mantissa.width() > max_mantissa_w {
+                let target = max_mantissa_w;
+                let mut out = String::with_capacity(target);
+                let mut col = 0usize;
+                for ch in mantissa.chars() {
+                    let w = UnicodeWidthChar::width(ch).unwrap_or(1);
+                    if col + w > target { break; }
+                    out.push(ch);
+                    col += w;
+                }
+                out
+            } else {
+                mantissa.to_string()
+            };
+            let result = format!("{}{}", mantissa_compact, exp_str);
+            if result.width() <= width {
+                return Some(result);
+            }
+        }
+    }
+
+    // For numbers that overflow f64 (too large), manually create scientific
+    // notation from the decimal string representation.
+    let digits: String = t.chars().filter(|c| *c == '-' || c.is_ascii_digit()).collect();
+    if digits.is_empty() || digits == "-" {
+        return None;
+    }
+    // Count trailing zeros to guess the magnitude.
+    let trimmed = digits.trim_start_matches('-');
+    let non_zero = trimmed.trim_end_matches('0');
+    let trailing_zeros = trimmed.len().saturating_sub(non_zero.len());
+    let significant: &str = if non_zero.is_empty() { "0" } else { non_zero };
+
+    if trailing_zeros > 0 && !significant.is_empty() && significant != "0" {
+        let sign = if digits.starts_with('-') { "-" } else { "" };
+        // Format as: first digit + . + remaining significant digits + e + exponent
+        let mut mantissa = String::with_capacity(significant.len() + 2);
+        mantissa.push(significant.chars().next()?);
+        if significant.len() > 1 {
+            mantissa.push('.');
+            mantissa.push_str(&significant[1..]);
+        }
+        let exponent = significant.len() - 1 + trailing_zeros;
+        let result = format!("{mantissa}e{exponent}");
+        if result.width() <= width {
+            return Some(result);
+        }
+        // Try shortening mantissa.
+        if mantissa.len() > 2 {
+            mantissa.truncate(2);
+            let result = format!("{mantissa}e{exponent}");
+            if result.width() <= width {
+                return Some(result);
+            }
+        }
+    }
+
+    None
+}
+
+/// Like [`exponential_numeric_display`] but accepts an optional rational
+/// value hint to guide formatting.
+pub fn exponential_numeric_display_with_hint(
+    text: &str,
+    width: usize,
+    hint: Option<f64>,
+) -> Option<String> {
+    // If direct text parsing fails, try the hint value.
+    if text.parse::<f64>().ok().filter(|v| v.is_finite()).is_none() {
+        if let Some(hv) = hint.filter(|v| v.is_finite()) {
+            return exponential_numeric_display(&hv.to_string(), width);
+        }
+    }
+    exponential_numeric_display(text, width)
+}
+
+/// Try to shrink a numeric display string so it fits within `width` monospace
+/// columns by rounding decimal places or switching to a shorter format.
+pub fn shrink_numeric_display(text: &str, width: usize) -> Option<String> {
+    use unicode_width::UnicodeWidthStr;
+
+    let t = text.trim();
+    if t.is_empty() || width < 2 {
+        return None;
+    }
+    if t.width() <= width {
+        return Some(t.to_string());
+    }
+
+    // Complex number: "a+bi" — try shrinking real part.
+    if let Some(plus_idx) = t.rfind('+').or_else(|| t.find('-').filter(|&i| i > 0)) {
+        if t.ends_with('i') {
+            let real_part = &t[..plus_idx];
+            let imag_part = &t[plus_idx..];
+            let real_shrunk =
+                shrink_numeric_display(real_part, width.saturating_sub(imag_part.width()))?;
+            let result = format!("{}{}", real_shrunk, imag_part);
+            if result.width() <= width {
+                return Some(result);
+            }
+        }
+    }
+
+    if let Some(sci) = exponential_numeric_display(t, width) {
+        return Some(sci);
+    }
+
+    if let Some(dot_pos) = t.find('.') {
+        let trimmed = t.trim_end_matches('0');
+        if trimmed != t && trimmed.width() <= width {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
+}
+
+/// Truncate `text` to fit within `width` monospace columns, appending `…`
+/// when truncation occurs.
+pub fn truncate_with_ellipsis(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    use unicode_width::UnicodeWidthStr;
+    if width == 0 {
+        return String::new();
+    }
+    if text.width() <= width {
+        return text.to_string();
+    }
+    let target = width.saturating_sub(1).max(0);
+    let mut out = String::with_capacity(width);
+    let mut col = 0usize;
+    for ch in text.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(1);
+        if col + w > target {
+            break;
+        }
+        out.push(ch);
+        col += w;
+    }
+    out.push('…');
+    out
+}
+
+/// Pad or truncate `text` so it occupies exactly `width` monospace columns,
+/// respecting the given alignment.  Returns the display string (pre-padded /
+/// post-padded with spaces).
+pub fn align_cell_display(text: String, width: usize, align: Option<TextAlign>) -> String {
+    use unicode_width::UnicodeWidthStr;
+    if width == 0 {
+        return String::new();
+    }
+    let w = text.width();
+    if w >= width {
+        return truncate_with_ellipsis(&text, width);
+    }
+    let pad = width.saturating_sub(w);
+    match align {
+        Some(TextAlign::Left) | None => {
+            format!("{}{}", text, " ".repeat(pad))
+        }
+        Some(TextAlign::Right) => {
+            format!("{}{}", " ".repeat(pad), text)
+        }
+        Some(TextAlign::Center) => {
+            let left = pad / 2;
+            let right = pad - left;
+            format!("{}{}{}", " ".repeat(left), text, " ".repeat(right))
+        }
+        Some(TextAlign::Default) => {
+            format!("{}{}", text, " ".repeat(pad))
+        }
+    }
+}
+
+/// Split `text` at a unicode-width boundary, returning the prefix that fits
+/// within `width` columns and the remaining suffix.
+pub fn take_display_prefix(text: &str, width: usize) -> (String, String) {
+    use unicode_width::UnicodeWidthChar;
+    if width == 0 {
+        return (String::new(), text.to_string());
+    }
+    let mut col = 0usize;
+    let mut split_idx = text.len();
+    for (i, ch) in text.char_indices() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(1);
+        if col + w > width {
+            split_idx = i;
+            break;
+        }
+        col += w;
+    }
+    let (pre, suf) = text.split_at(split_idx);
+    (pre.to_string(), suf.to_string())
+}
