@@ -461,7 +461,14 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             let formatted = ui_core::format_cell_display(g, &addr, effective);
             let fw = formatted.width();
             let align = ui_core::effective_cell_align(g, &addr, &formatted);
-            let is_agg_cell = row_agg.is_some() || rca.is_some();
+            let is_left_margin = c < lm;
+            let is_agg_cell = if is_left_margin {
+                false
+            } else if c < lm + mc {
+                row_agg.is_some() || rca.is_some()
+            } else {
+                rca.is_some()
+            };
             let is_cursor_cell = logical_row == cursor.row && c == cursor.col;
             let cell_style = if is_cursor_cell {
                 CELL_STYLE_CURSOR
@@ -544,7 +551,10 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     } else {
                         align_cell_display(pre_total, total_spill_gaps, align)
                     };
-                    if !store_text.is_empty() || (c >= lm && c < lm + mc) {
+                let should_store = !store_text.is_empty()
+                    || (c >= lm && c < lm + mc)
+                    || (c >= lm + mc && is_agg_cell);
+                if should_store {
                         // Store by global column index so margin and main cells
                         // don't collide at (row, 0)/(row, 1).
                         spreadsheet.set_cell(ri as u32, c as u32, &store_text);
@@ -587,7 +597,10 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 } else {
                     display_text
                 };
-                if !store_text.is_empty() || (c >= lm && c < lm + mc) {
+                let should_store = !store_text.is_empty()
+                    || (c >= lm && c < lm + mc)
+                    || (c >= lm + mc && is_agg_cell);
+                if should_store {
                     // Store by global column index to avoid margin/main collision.
                     spreadsheet.set_cell(ri as u32, c as u32, &store_text);
                     spreadsheet.set_cell_style(ri as u32, c as u32, cell_style);
