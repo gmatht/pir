@@ -609,6 +609,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                         // don't collide at (row, 0)/(row, 1).
                         spreadsheet.set_cell(ri as u32, c as u32, &store_text);
                         spreadsheet.set_cell_style(ri as u32, c as u32, cell_style);
+                    if let Some(raw_val) = g.get(&addr) {
+                        spreadsheet.set_raw_cell(ri as u32, c as u32, &raw_val);
+                    }
                     }
                     col_ix = next_ix;
                 }
@@ -654,6 +657,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     // Store by global column index to avoid margin/main collision.
                     spreadsheet.set_cell(ri as u32, c as u32, &store_text);
                     spreadsheet.set_cell_style(ri as u32, c as u32, cell_style);
+                    if let Some(raw_val) = g.get(&addr) {
+                        spreadsheet.set_raw_cell(ri as u32, c as u32, &raw_val);
+                    }
                 }
                 col_ix += 1;
             }
