@@ -194,9 +194,8 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let dim_rows = 44usize;
     let blank_needed = dim_rows.saturating_sub(content_count);
     if blank_needed > 0 {
-        let base = footer_rows.last().copied().map(|r| r + 1).unwrap_or(hr + mr);
         for i in 0..blank_needed {
-            footer_rows.push(base + i);
+            footer_rows.push(hr + mr + i);
         }
     }
     footer_rows.sort_unstable();
@@ -360,11 +359,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
             // ── Aggregate computation ──────────────────────────────────
             // Determine if this cell should show an aggregate result.
-            let rca = if c >= lm && c < lm + mc {
-                right_col_agg(g, c)
-            } else {
-                None
-            };
+            let rca = right_col_agg(g, c);
 
             let effective = if let Some(func) = row_agg {
                 if let Some(ftr_row) = footer_row_idx {
@@ -443,23 +438,19 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 }
             } else if let (Some(mri), Some(agg_func)) = (main_row, rca) {
                 // ── Plain main row with right-col aggregate ──────────
-                if c >= lm && c < lm + mc {
-                    let data_cols = data_main_col_count(g);
-                    compute_aggregate(
-                        g,
-                        &AggregateDef {
-                            func: agg_func,
-                            source: MainRange {
-                                row_start: mri,
-                                row_end: mri + 1,
-                                col_start: 0,
-                                col_end: data_cols as u32,
-                            },
+                let data_cols = data_main_col_count(g);
+                compute_aggregate(
+                    g,
+                    &AggregateDef {
+                        func: agg_func,
+                        source: MainRange {
+                            row_start: mri,
+                            row_end: mri + 1,
+                            col_start: 0,
+                            col_end: data_cols as u32,
                         },
-                    )
-                } else {
-                    cell_effective_display(g, &addr)
-                }
+                    },
+                )
             } else {
                 cell_effective_display(g, &addr)
             };
