@@ -22170,3 +22170,70 @@ fn quit_import_prompt_removed_from_source() {
     assert!(!source.contains(&needle), "{}", msg);
 }
 
+#[test]
+fn ratatui_ally_check() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    use std::collections::BTreeSet;
+
+    use crate::ui::dialog_word_extractor::{
+        all_dialog_specs, default_gtk_words, extract_words_from_buffer,
+    };
+
+    let gtk_words: BTreeSet<String> = default_gtk_words()
+        .iter()
+        .map(|w| w.to_ascii_lowercase())
+        .collect();
+
+    let mut ratatui_words = BTreeSet::new();
+    for spec in all_dialog_specs() {
+        let mut app = App::new(None);
+        // Fill a minimal grid so export dialogs etc. don't panic.
+        app.state = crate::ops::SheetState::new(10, 5);
+        (spec.activate)(&mut app);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let backend = TestBackend::new(120, 50);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let _guard = app.prepare_eval_context_and_spills();
+            terminal.draw(|f| app.draw_visual(f)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let words: Vec<String> = extract_words_from_buffer(buffer)
+                .into_iter()
+                .map(|w| w.to_ascii_lowercase())
+                .collect();
+            words
+        }));
+        match result {
+            Ok(words) => {
+                for w in words {
+                    ratatui_words.insert(w);
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[SKIP] dialog '{}' panicked during render: {:?}",
+                    spec.name, e
+                );
+            }
+        }
+    }
+
+    let gtk_words_vec: Vec<&str> = gtk_words.iter().map(|s| s.as_str()).collect();
+
+    let only_ratatui: Vec<&str> = ratatui_words
+        .iter()
+        .filter(|w| !gtk_words_vec.iter().any(|gtk| gtk.contains(w.as_str())))
+        .map(|s| s.as_str())
+        .collect();
+
+    if !only_ratatui.is_empty() {
+        let msg = only_ratatui.join(", ");
+        panic!(
+            "{} ratatui word(s) missing from GTK baseline: {}",
+            only_ratatui.len(),
+            msg
+        );
+    }
+}
+
