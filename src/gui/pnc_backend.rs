@@ -59,8 +59,10 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 } else {
                     formatted
                 };
-                let disp = ui_core::align_cell_display(inner, cw, align);
+                let disp = ui_core::align_cell_display(inner.clone(), cw, align);
                 spreadsheet.set_cell(r as u32, c as u32, &disp);
+                // Store the raw (unpadded) display value for the formula bar
+                spreadsheet.set_raw_cell(r as u32, c as u32, &inner);
             }
         }
     }
