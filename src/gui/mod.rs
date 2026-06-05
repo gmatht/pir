@@ -114,21 +114,21 @@ impl App {
         Ok(())
     }
 
-    /// Cap main-column widths to max_col_width (matching ratatui's
+    /// Fit all main columns to their rendered content (matching ratatui's
     /// fit_column_to_rendered_content called during load_initial).
     pub fn fit_main_columns_to_max_width(&mut self) {
+        // Use rendered_width_for_column (which evaluates formulas and uses
+        // Unicode width) to match ratatui's fit_column_to_rendered_content.
+        // The Grid's fit_column_to_content only measures raw cell text, which
+        // undercounts formula results that render wider (e.g. =e^i → "0.5403023…").
         let sheet = self.core.workbook.active_sheet_mut();
         let grid = &mut sheet.grid;
         let mc = grid.main_cols();
-        let max_col_w = grid.max_col_width();
         for c in 0..mc {
             let global_col = MARGIN_COLS + c;
-            let current = grid.col_width(global_col);
             if let Some(rw) = crate::ui_core::rendered_width_for_column(grid, global_col) {
-                let capped = rw.min(max_col_w);
-                if capped < current {
-                    grid.set_col_width(global_col, Some(capped));
-                }
+                let capped = rw.min(grid.max_col_width());
+                grid.set_col_width(global_col, Some(capped));
             }
         }
     }
