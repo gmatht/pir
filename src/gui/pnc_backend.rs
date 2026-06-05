@@ -7,6 +7,7 @@ use crate::ui_core::align_cell_display;
 use crate::ui_core::{
     self, main_col_window,
 };
+use std::collections::HashMap;
 use rustxwidgets::backends_pancurses_adapter::*;
 use unicode_width::UnicodeWidthStr;
 
@@ -46,6 +47,45 @@ fn right_col_agg(grid: &GridBox, global_col: usize) -> Option<AggFunc> {
     None
 }
 
+/// Compute the total render width (col widths + separators) for a list of
+/// visible column indices, matching ratatui's visible_cols_render_width.
+fn visible_cols_render_width(g: &GridBox, cols: &[usize]) -> usize {
+    let lm = MARGIN_COLS;
+    let mc = g.main_cols();
+    let show_right_divider = cols.contains(&(lm + mc));
+    cols.iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            let sep = if i + 1 >= cols.len() {
+                0
+            } else if (c == lm - 1 && lm > 0 && cols.contains(&lm))
+                || (c == lm + mc - 1 && show_right_divider)
+            {
+                2
+            } else {
+                1
+            };
+            g.col_width(c).max(1) + sep
+        })
+        .sum()
+}
+
+/// Trim trailing columns from `cols` until the total render width fits
+/// within `width`, matching ratatui's trim_visible_cols_to_width.
+fn trim_visible_cols_to_width(g: &GridBox, cols: &mut Vec<usize>, cursor_col: usize, width: usize) {
+    while cols.len() > 1 && visible_cols_render_width(g, cols) > width {
+        let first = cols.first().copied().unwrap_or(cursor_col);
+        let last = cols.last().copied().unwrap_or(cursor_col);
+        if last > cursor_col {
+            cols.pop();
+        } else if first < cursor_col {
+            cols.remove(0);
+        } else {
+            break;
+        }
+    }
+}
+
 pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
     let _backend = rustxwidgets::backends::pancurses::init()
         .map_err(|e| format!("pancurses init failed: {e}"))?;
@@ -58,11 +98,10 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // auto_fit_column leaves columns wider than max_col_width in place.
     app.fit_main_columns_to_max_width();
 
-    let sheet_rec = app.core.workbook.active_sheet().clone();
-    let g = &sheet_rec.grid;
+    let mut sheet_rec = app.core.workbook.active_sheet().clone();
     let hr = HEADER_ROWS;
-    let mr = g.main_rows();
-    let mc = g.main_cols();
+    let mr = sheet_rec.grid.main_rows();
+    let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
     let rm = MARGIN_COLS;
     let cursor = app.core.cursor;
@@ -70,14 +109,14 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // ── Visible rows (matching ratatui's visible_row_indices) ──────────
     let mut header_rows: Vec<usize> = Vec::new();
     let mut footer_rows: Vec<usize> = Vec::new();
-    for (addr, _) in g.iter_nonempty() {
+    for (addr, _) in sheet_rec.grid.iter_nonempty() {
         match addr {
             CellAddr::Header { row, .. } => header_rows.push(row as usize),
             CellAddr::Footer { row, .. } => footer_rows.push(hr + mr + row as usize),
             _ => {}
         }
     }
-    let main_order = g.sorted_main_rows();
+    let main_order = sheet_rec.grid.sorted_main_rows();
     header_rows.sort_unstable();
     header_rows.dedup();
     footer_rows.sort_unstable();
@@ -111,12 +150,24 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         col_ixs.push(lm - 1);
     }
     col_ixs.extend((0..=main_hi as usize).map(|ci| lm + ci));
-    // Fill remaining viewport space with right-margin columns (]A, ]B, ...)
-    // so the grid always fills the screen (matching ratatui's approach).
-    // A generous count ensures the viewport fills even when right_nonblank_end
-    // returns None; the widget's render truncates at the actual terminal width.
-    let generous_count = 100usize.min(rm);
-    for i in 0..generous_count {
+    // Include right-margin columns with content (matching ratatui's
+    // right_nonblank_end approach), and a few blank columns for fill.
+    if let Some(end) = ui_core::right_nonblank_end(&sheet_rec) {
+        for i in 0..=end {
+            let gc = right_start + i;
+            if !col_ixs.contains(&gc) {
+                col_ixs.push(gc);
+            }
+        }
+    }
+    // Add a limited number of blank right-margin columns for viewport fill
+    // (matching ratatui's fill-until-dim approach).
+    let existing_right: Vec<usize> = col_ixs.iter()
+        .filter(|&&c| c >= right_start)
+        .copied()
+        .collect();
+    let max_blank = 30usize.min(rm);
+    for i in 0..max_blank {
         let gc = right_start + i;
         if !col_ixs.contains(&gc) {
             col_ixs.push(gc);
@@ -125,9 +176,33 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     col_ixs.sort_unstable();
     col_ixs.dedup();
 
+    // ── Refit visible columns to available terminal width ─────────────
+    let data_width = {
+        let cols = unsafe {
+            let mut ws: libc::winsize = std::mem::zeroed();
+            if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+                ws.ws_col as usize
+            } else {
+                std::env::var("COLUMNS").ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(80)
+            }
+        };
+        cols.saturating_sub(2).saturating_sub(ui_core::ROW_LABEL_CHARS).max(1)
+    };
+    ui_core::fit_visible_columns_capped(
+        &mut sheet_rec.grid,
+        &col_ixs,
+        data_width,
+        cursor.col,
+    );
+    // Now trim columns that still don't fit within data_width.
+    trim_visible_cols_to_width(&sheet_rec.grid, &mut col_ixs, cursor.col, data_width);
+
     // ── Column layout with widths matching ratatui's grid.col_width() ──
+    let g = &sheet_rec.grid;
     let mut layout: Vec<(u32, u32, String)> = Vec::new();
-    let mut col_widths: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut col_widths: HashMap<usize, usize> = HashMap::new();
     for &c in &col_ixs {
         let w = g.col_width(c).max(1);
         col_widths.insert(c, w);
@@ -291,7 +366,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
             let allow_spill = fw > cw
                 && (align.is_none() || align == Some(crate::grid::TextAlign::Left));
-            let display_text = if allow_spill {
+            let display_text = if formatted.is_empty() {
+                String::new()
+            } else if allow_spill {
                 formatted.to_string()
             } else if fw > cw {
                 let inner = ui_core::shrink_numeric_display(&formatted, cw)
@@ -303,13 +380,18 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             };
 
             // Only store cells with content (or empty markers for main cols)
-            if !display_text.is_empty() || (c >= lm && c < lm + mc) {
+            let store_text = if display_text.trim().is_empty() {
+                String::new()
+            } else {
+                display_text
+            };
+            if !store_text.is_empty() || (c >= lm && c < lm + mc) {
                 if c < lm {
                     // Left-margin cells: store by global column index so the
                     // widget can look them up separately from main cells.
-                    spreadsheet.set_cell(ri as u32, c as u32, &display_text);
+                    spreadsheet.set_cell(ri as u32, c as u32, &store_text);
                 } else {
-                    spreadsheet.set_cell(ri as u32, widget_col as u32, &display_text);
+                    spreadsheet.set_cell(ri as u32, widget_col as u32, &store_text);
                 }
             }
         }
