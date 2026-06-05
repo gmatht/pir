@@ -7,6 +7,7 @@ use crate::agg::{cell_display, compute_aggregate};
 use crate::balance::{self, BalanceDirection};
 use crate::export;
 mod debug_instrumentation;
+pub mod dialog_word_extractor;
 use crate::formula::translate_formula_text_by_offset;
 use crate::formula::{
     cell_effective_display, effective_numeric, exact_decimal_generic_scientific,
@@ -257,7 +258,7 @@ impl PlainArrowAxis {
 
 /// Logical cursor position across header+main+footer rows × total global columns.
 #[derive(Clone, Debug)]
-enum Mode {
+pub(crate) enum Mode {
     Normal,
     RevisionBrowse,
     Edit {
@@ -339,7 +340,7 @@ enum Mode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BalanceBooksFocus {
+pub(crate) enum BalanceBooksFocus {
     Column,
     ReportViewOnly,
     ReportPersisted,
@@ -353,7 +354,7 @@ enum BalanceBooksFocus {
 const SPECIAL_VALUE_CHOICES: [&str; 10] = ["∞", "Σ", "Ω", "π", "μ", "Δ", "√", "φ", "λ", "θ"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MenuSection {
+pub(crate) enum MenuSection {
     Edit,
     File,
     Format,
@@ -378,25 +379,25 @@ enum FormatTarget {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FormatDecimalsFor {
+pub(crate) enum FormatDecimalsFor {
     Currency,
     Fixed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MenuTarget {
+pub(crate) enum MenuTarget {
     Action(MenuAction),
     Submenu(MenuSection),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct MenuLevel {
-    section: MenuSection,
-    item: usize,
+pub(crate) struct MenuLevel {
+    pub(crate) section: MenuSection,
+    pub(crate) item: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MenuAction {
+pub(crate) enum MenuAction {
     Cut,
     Copy,
     Paste,
@@ -831,7 +832,7 @@ fn menu_items(section: MenuSection) -> &'static [MenuItem] {
     }
 }
 
-fn menu_title(section: MenuSection) -> &'static str {
+pub(crate) fn menu_title(section: MenuSection) -> &'static str {
     match section {
         MenuSection::Edit => "Edit",
         MenuSection::File => "File",

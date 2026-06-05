@@ -457,6 +457,18 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             let fw = formatted.width();
             let align = ui_core::effective_cell_align(g, &addr, &formatted);
             let is_agg_cell = row_agg.is_some() || rca.is_some();
+            let is_cursor_cell = logical_row == cursor.row && c == cursor.col;
+            let cell_style = if is_cursor_cell {
+                CELL_STYLE_CURSOR
+            } else if is_agg_cell {
+                if footer_row_idx.is_some() && row_agg.is_some() {
+                    CELL_STYLE_FOOTER_AGGREGATE
+                } else {
+                    CELL_STYLE_AGGREGATE
+                }
+            } else {
+                CELL_STYLE_DEFAULT
+            };
 
             let allow_spill = fw > cw
                 && (align.is_none() || align == Some(crate::grid::TextAlign::Left))
@@ -531,6 +543,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                         // Store by global column index so margin and main cells
                         // don't collide at (row, 0)/(row, 1).
                         spreadsheet.set_cell(ri as u32, c as u32, &store_text);
+                        spreadsheet.set_cell_style(ri as u32, c as u32, cell_style);
                     }
                     col_ix = next_ix;
                 }
@@ -572,6 +585,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 if !store_text.is_empty() || (c >= lm && c < lm + mc) {
                     // Store by global column index to avoid margin/main collision.
                     spreadsheet.set_cell(ri as u32, c as u32, &store_text);
+                    spreadsheet.set_cell_style(ri as u32, c as u32, cell_style);
                 }
                 col_ix += 1;
             }
@@ -580,6 +594,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     spreadsheet.set_column_layout(layout);
     spreadsheet.set_grid_config(lm as u32, mc as u32);
+    spreadsheet.set_row_counts(hr as u32, mr as u32);
 
     // Store cursor cell raw value at (0, 0) for formula bar lookup
     {

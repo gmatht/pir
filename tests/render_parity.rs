@@ -1,3 +1,4 @@
+use ratatui::style::{Color, Modifier};
 use std::path::PathBuf;
 
 /// Format cells via `ui_core::format_cell_display` and count non-empty cells.
@@ -33,7 +34,7 @@ fn test_corro_formatting(rel_path: &str) {
     }).unwrap().join().unwrap();
 }
 
-/// Verify the ratatui render has expected structural elements.
+/// Verify the ratatui render has expected structural elements and fg/bg colors.
 fn test_render_structure(rel_path: &str) {
     let rel_path = rel_path.to_string();
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&rel_path);
@@ -60,6 +61,49 @@ fn test_render_structure(rel_path: &str) {
         assert!(render_text.contains("   1 "), "{}: ratatui render missing row label '1'", rel_path);
         let has_unicode = render_text.contains('┌') || render_text.contains('│') || render_text.contains('─');
         assert!(has_unicode, "{}: ratatui render has no box-drawing characters", rel_path);
+
+        // ── fg/bg color assertions ──────────────────────────────────────
+
+        // Menu bar (row 0): fg=Black, bg=Cyan
+        let menu_style = buffer[(0, 0)].style();
+        assert_eq!(menu_style.fg, Some(Color::Black),
+            "{}: menu bar fg should be Black", rel_path);
+        assert_eq!(menu_style.bg, Some(Color::Cyan),
+            "{}: menu bar bg should be Cyan", rel_path);
+
+        // Formula bar (row 1, Normal mode): address text has fg=Cyan
+        let prompt_style = buffer[(0, 1)].style();
+        assert_eq!(prompt_style.fg, Some(Color::Cyan),
+            "{}: formula bar fg should be Cyan (Normal mode)", rel_path);
+
+        // Hints line (last row for single-sheet workbook): fg=DarkGray
+        let hints_style = buffer[(0, 39)].style();
+        assert_eq!(hints_style.fg, Some(Color::DarkGray),
+            "{}: hints fg should be DarkGray", rel_path);
+
+        // Active column header (cursor starts at col A): fg=Black, bg=Yellow, Bold
+        let has_active_header = (0..buffer.area.height).any(|y| {
+            (0..buffer.area.width).any(|x| {
+                let cell = &buffer[(x, y)];
+                cell.style().fg == Some(Color::Black)
+                    && cell.style().bg == Some(Color::Yellow)
+                    && cell.style().add_modifier.contains(Modifier::BOLD)
+            })
+        });
+        assert!(has_active_header,
+            "{}: expected active column header with fg=Black, bg=Yellow, Bold", rel_path);
+
+        // Cursor cell: bg=DarkGray with user-visible text content
+        let has_cursor_cell = (0..buffer.area.height).any(|y| {
+            (0..buffer.area.width).any(|x| {
+                let cell = &buffer[(x, y)];
+                cell.style().bg == Some(Color::DarkGray)
+                    && cell.style().fg != Some(Color::White) // not formula-bar text
+                    && !cell.symbol().trim().is_empty()
+            })
+        });
+        assert!(has_cursor_cell,
+            "{}: expected cursor cell with bg=DarkGray", rel_path);
     }).unwrap().join().unwrap();
 }
 
