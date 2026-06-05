@@ -596,7 +596,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     spreadsheet.set_grid_config(lm as u32, mc as u32);
     spreadsheet.set_row_counts(hr as u32, mr as u32);
 
-    // Store cursor cell raw value at (0, 0) for formula bar lookup
+    // Store cursor cell raw value at the cursor's position for formula bar lookup
     {
         let cursor_main_row = cursor.row.saturating_sub(hr);
         let cursor_main_col = cursor.col.saturating_sub(lm);
@@ -607,29 +607,13 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         } else {
             CellAddr::Footer { row: (cursor.row - hr - mr) as u32, col: ColumnAddr::Main(cursor_main_col as u32) }
         };
+        let cursor_display_ri = display_rows.iter().position(|&r| r == cursor.row).unwrap_or(0);
         if let Some(raw_val) = g.get(&cursor_addr) {
-            spreadsheet.set_raw_cell(0, 0, &raw_val);
+            spreadsheet.set_raw_cell(cursor_display_ri as u32, cursor.col as u32, &raw_val);
         } else {
-            spreadsheet.set_raw_cell(0, 0, "");
+            spreadsheet.set_raw_cell(cursor_display_ri as u32, cursor.col as u32, "");
         }
-    }
-
-    // Store cursor cell raw value at (0, 0) for formula bar lookup
-    {
-        let cursor_main_row = cursor.row.saturating_sub(hr);
-        let cursor_main_col = cursor.col.saturating_sub(lm);
-        let cursor_addr = if cursor.row < hr {
-            CellAddr::Header { row: cursor.row as u32, col: ColumnAddr::Main(cursor_main_col as u32) }
-        } else if cursor.row < hr + mr {
-            CellAddr::Main { row: cursor_main_row as u32, col: cursor_main_col as u32 }
-        } else {
-            CellAddr::Footer { row: (cursor.row - hr - mr) as u32, col: ColumnAddr::Main(cursor_main_col as u32) }
-        };
-        if let Some(raw_val) = g.get(&cursor_addr) {
-            spreadsheet.set_raw_cell(0, 0, &raw_val);
-        } else {
-            spreadsheet.set_raw_cell(0, 0, "");
-        }
+        spreadsheet.set_cursor(cursor_display_ri as u32, cursor.col as u32);
     }
 
     // Tab bar (match ratatui format: " Sheet1    Sheet2    Sheet3    Sheet1 Copy ")
