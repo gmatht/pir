@@ -1,5 +1,8 @@
 use crate::agg::compute_aggregate;
-use crate::agg::helpers::{data_main_col_count, left_margin_main_col_aggregate};
+use crate::agg::helpers::{
+    data_main_col_count, left_margin_main_col_aggregate, left_margin_special_col_aggregate,
+    previous_raw_block,
+};
 use crate::formula::cell_effective_display;
 use crate::formula::effective_numeric;
 use crate::grid::{CellAddr, ColumnAddr, GridBox, MainRange, NumberFormat, HEADER_ROWS, MARGIN_COLS};
@@ -47,6 +50,18 @@ fn right_col_agg(grid: &GridBox, global_col: usize) -> Option<AggFunc> {
         }
     }
     None
+}
+
+/// Find the start of the aggregate block for a given main row (the row after
+/// the preceding left-margin aggregate marker), matching ratatui's
+/// row_total_block_start.
+fn row_total_block_start(g: &GridBox, current_main_row: u32) -> u32 {
+    for candidate in (0..current_main_row).rev() {
+        if left_margin_agg(g, candidate).is_some() {
+            return candidate + 1;
+        }
+    }
+    0
 }
 
 /// Compute the total render width (col widths + separators) for a list of
@@ -325,12 +340,48 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     // ── Left-margin aggregate ─────────────────────────
                     if c >= lm && c < lm + mc {
                         if rca.is_some() {
+                            // Column has its own per-column aggregate in the
+                            // header.  Use left_margin_special_col_aggregate
+                            // (computes per-row subtotals across all data
+                            // columns, then folds them), matching ratatui.
                             let data_cols = data_main_col_count(g);
-                            left_margin_main_col_aggregate(g, func, mri, (c - lm) as u32)
+                            let block_start = row_total_block_start(g, mri);
+                            let result = if block_start < mri {
+                                left_margin_special_col_aggregate(
+                                    g, func, c, block_start, mri, data_cols,
+                                )
+                            } else {
+                                previous_raw_block(g, mri).and_then(
+                                    |(start, end)| {
+                                        left_margin_special_col_aggregate(
+                                            g, func, c, start, end, data_cols,
+                                        )
+                                    },
+                                )
+                            };
+                            result.unwrap_or_else(|| cell_effective_display(g, &addr))
                         } else {
                             let main_col = (c - lm) as u32;
                             left_margin_main_col_aggregate(g, func, mri, main_col)
                         }
+                    } else if rca.is_some() {
+                        // Right-margin column with column-level aggregate.
+                        let data_cols = data_main_col_count(g);
+                        let block_start = row_total_block_start(g, mri);
+                        let result = if block_start < mri {
+                            left_margin_special_col_aggregate(
+                                g, func, c, block_start, mri, data_cols,
+                            )
+                        } else {
+                            previous_raw_block(g, mri).and_then(
+                                |(start, end)| {
+                                    left_margin_special_col_aggregate(
+                                        g, func, c, start, end, data_cols,
+                                    )
+                                },
+                            )
+                        };
+                        result.unwrap_or_else(|| cell_effective_display(g, &addr))
                     } else {
                         cell_effective_display(g, &addr)
                     }
