@@ -175,3 +175,16 @@ fn test_row_labels_match(rel_path: &str) {
 #[test] fn row_labels_overflow() { test_row_labels_match("docs/tests/overflow.corro"); }
 #[test] fn row_labels_align() { test_row_labels_match("docs/tests/align.corro"); }
 #[test] fn row_labels_date() { test_row_labels_match("docs/tests/date.corro"); }
+
+#[test]
+fn inspect_state_align() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/tests/align.corro");
+    let mut app = corro::ui::App::new(Some(path));
+    app.load_initial().unwrap();
+    let sheet = app.workbook.active_sheet().clone();
+    eprintln!("INSPECT main_rows={} main_cols={}", sheet.grid.main_rows(), sheet.grid.main_cols());
+    eprintln!("INSPECT cursor row={} col={}", app.cursor.row, app.cursor.col);
+    assert!(true);
+}
+
+

@@ -185,14 +185,21 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         }
     }
     let main_order = sheet_rec.grid.sorted_main_rows();
-    // Always include a window of header rows so the user can navigate up
-    // into the header section (matching ratatui's visible_row_indices).
-    {
-        let win = 5usize;
-        // Center the header window: show 5 rows ending at hr-1 (the ~1 row).
-        let hi = hr.saturating_sub(1);
-        let lo = hi.saturating_sub(win.saturating_sub(1));
+    // Show a window of header rows around the cursor when it's in the
+    // header section, matching ratatui's visible_row_indices logic.
+    if cursor.row < hr {
+        let window = 5usize;
+        let lo = cursor.row.saturating_sub(window / 2);
+        let hi = cursor.row.min(hr - 1);
         for r in lo..=hi {
+            if r < hr {
+                header_rows.push(r);
+            }
+        }
+        // Fill gap from bottom of header window down to ~1
+        let so_far = header_rows.len() + main_order.len() + footer_rows.len();
+        let can_add = dim_rows.saturating_sub(so_far).min(hr.saturating_sub(hi + 1));
+        for r in (hi + 1)..(hi + 1 + can_add) {
             header_rows.push(r);
         }
     }
@@ -237,12 +244,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let (_main_lo, main_hi) = main_col_window(&sheet_rec, cursor);
 
     let mut col_ixs: Vec<usize> = Vec::new();
+    // Build left-margin band (matching ratatui's visible_col_indices).
     if lm > 0 {
-        // Include the rightmost left-margin column nearest the main grid
         col_ixs.push(lm - 1);
-        // If the cursor is in a left-margin column, include a window of
-        // left-margin columns around it, plus all columns between that
-        // window and the main grid (so the sequence is never broken).
         if cursor.col < lm {
             let start = cursor.col;
             let end = lm.saturating_sub(1);
@@ -259,29 +263,12 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     if !col_ixs.contains(&c) { col_ixs.push(c); }
                 }
             }
-        } else {
-            // Cursor is in main or right margin: still include a few
-            // left-margin columns so they are visible for reference.
-            let extra_left = 7usize.min(lm.saturating_sub(1));
-            for c in (lm.saturating_sub(extra_left)..lm).rev() {
-                if !col_ixs.contains(&c) { col_ixs.push(c); }
-            }
         }
     }
     col_ixs.extend((0..=main_hi as usize).map(|ci| lm + ci));
-    // Include right-margin columns with content (matching ratatui's
-    // right_nonblank_end approach).
-    if let Some(end) = ui_core::right_nonblank_end(&sheet_rec) {
-        for i in 0..=end {
-            let gc = right_start + i;
-            if !col_ixs.contains(&gc) {
-                col_ixs.push(gc);
-            }
-        }
-    }
     // Fill remaining viewport space with blank right-margin columns
-    // (]A, ]B, …) so the grid always fills the screen, matching
-    // ratatui's visible_col_indices: fill to dim = data_width / 2.
+    // so the grid always fills the screen, matching ratatui:
+    // fill FIRST, then add right_band.
     {
         let data_cols = data_width.checked_div(2).unwrap_or(1).max(1);
         let total_so_far = col_ixs.len();
@@ -292,6 +279,15 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 if !col_ixs.contains(&gc) {
                     col_ixs.push(gc);
                 }
+            }
+        }
+    }
+    // Then add right-margin columns with content (right_band).
+    if let Some(end) = ui_core::right_nonblank_end(&sheet_rec) {
+        for i in 0..=end {
+            let gc = right_start + i;
+            if !col_ixs.contains(&gc) {
+                col_ixs.push(gc);
             }
         }
     }
