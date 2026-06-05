@@ -191,16 +191,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         };
         cols.saturating_sub(2).saturating_sub(ui_core::ROW_LABEL_CHARS).max(1)
     };
-    // Trim columns to fit data_width FIRST (matching ratatui order)
+    // Trim columns to fit data_width (matching ratatui draw() order;
+    // ratatui's draw() does NOT call fit_visible_columns_capped).
     trim_visible_cols_to_width(&sheet_rec.grid, &mut col_ixs, cursor.col, data_width);
-    // Then refit visible columns so budget is distributed among columns
-    // that actually fit in the viewport.
-    ui_core::fit_visible_columns_capped(
-        &mut sheet_rec.grid,
-        &col_ixs,
-        data_width,
-        cursor.col,
-    );
 
     // ── Column layout with widths matching ratatui's grid.col_width() ──
     let g = &sheet_rec.grid;
