@@ -1,8 +1,8 @@
 use crate::formula::cell_effective_display;
-use crate::grid::{CellAddr, ColumnAddr, TextAlign, HEADER_ROWS, MARGIN_COLS};
+use crate::grid::{CellAddr, ColumnAddr, HEADER_ROWS, MARGIN_COLS};
 use crate::ui_core::align_cell_display;
 use crate::ui_core::{
-    self, main_col_window, rendered_width_for_column, right_nonblank_end,
+    self, main_col_window, right_nonblank_end,
 };
 use rustxwidgets::backends_pancurses_adapter::*;
 use unicode_width::UnicodeWidthStr;
@@ -79,14 +79,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     col_ixs.sort_unstable();
     col_ixs.dedup();
 
-    // ── Column layout with content-aware widths ────────────────────────
+    // ── Column layout with widths matching ratatui's grid.col_width() ──
     let mut layout: Vec<(u32, u32, String)> = Vec::new();
     let mut col_widths: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for &c in &col_ixs {
-        let w = rendered_width_for_column(g, c)
-            .map(|w| w.min(g.max_col_width()))
-            .unwrap_or(4)
-            .max(1);
+        let w = g.col_width(c).max(1);
         col_widths.insert(c, w);
         let label = crate::addr::ui_column_fragment(c, mc);
         layout.push((c as u32, w as u32, label));
@@ -159,21 +156,13 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     let fw = formatted.width();
                     let align = ui_core::effective_cell_align(g, &addr, &formatted);
 
-                    let display_text = if fw > cw {
-                        let shrunk = if align == Some(TextAlign::Right) || align == Some(TextAlign::Default) {
-                            ui_core::shrink_numeric_display(&formatted, cw)
-                                .or_else(|| {
-                                    ui_core::exponential_numeric_display(&formatted, cw)
-                                })
-                                .unwrap_or_else(|| {
-                                    ui_core::truncate_with_ellipsis(&formatted, cw)
-                                })
-                        } else {
-                            ui_core::truncate_with_ellipsis(&formatted, cw)
-                        };
-                        align_cell_display(shrunk, cw, align)
-                    } else {
+                    // When text fits within the column width, pad it for
+                    // proper alignment.  When it overflows, let the widget
+                    // handle overflow/truncation (matching ratatui).
+                    let display_text = if fw <= cw {
                         align_cell_display(formatted.to_string(), cw, align)
+                    } else {
+                        formatted.to_string()
                     };
 
                     spreadsheet.set_cell(ri as u32, widget_col as u32, &display_text);
