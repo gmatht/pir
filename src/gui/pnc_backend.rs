@@ -5,7 +5,7 @@ use crate::agg::helpers::{
 };
 use crate::formula::cell_effective_display;
 use crate::formula::effective_numeric;
-use crate::grid::{CellAddr, ColumnAddr, GridBox, MainRange, NumberFormat, HEADER_ROWS, MARGIN_COLS};
+use crate::grid::{CellAddr, ColumnAddr, GridBox, MainRange, NumberFormat, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::{margin_key_agg_func, AggFunc, AggregateDef};
 use crate::ui_core::align_cell_display;
 use crate::ui_core::{
@@ -174,6 +174,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let cursor = app.core.cursor;
 
     // ── Visible rows (matching ratatui's visible_row_indices) ──────────
+    let dim_rows = 44usize;
     let mut header_rows: Vec<usize> = Vec::new();
     let mut footer_rows: Vec<usize> = Vec::new();
     for (addr, _) in sheet_rec.grid.iter_nonempty() {
@@ -184,14 +185,23 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         }
     }
     let main_order = sheet_rec.grid.sorted_main_rows();
-    // Match ratatui's visible_row_indices order: compute content_count
-    // BEFORE sorting/dedup so that duplicate entries inflate the count
-    // and produce the same blank_needed value.
-    let content_count = header_rows.len() + main_order.len() + footer_rows.len();
-    let dim_rows = 44usize;
-    let blank_needed = dim_rows.saturating_sub(content_count);
-    for i in 0..blank_needed {
-        footer_rows.push(hr + mr + i);
+    // Always include a window of header rows so the user can navigate up
+    // into the header section (matching ratatui's visible_row_indices).
+    {
+        let win = 5usize;
+        // Center the header window: show 5 rows ending at hr-1 (the ~1 row).
+        let hi = hr.saturating_sub(1);
+        let lo = hi.saturating_sub(win.saturating_sub(1));
+        for r in lo..=hi {
+            header_rows.push(r);
+        }
+    }
+    {
+        let content_count = header_rows.len() + main_order.len() + footer_rows.len();
+        let blank_needed = dim_rows.saturating_sub(content_count);
+        for i in 0..blank_needed {
+            footer_rows.push(hr + mr + i);
+        }
     }
     header_rows.sort_unstable();
     header_rows.dedup();
@@ -228,7 +238,35 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     let mut col_ixs: Vec<usize> = Vec::new();
     if lm > 0 {
+        // Include the rightmost left-margin column nearest the main grid
         col_ixs.push(lm - 1);
+        // If the cursor is in a left-margin column, include a window of
+        // left-margin columns around it, plus all columns between that
+        // window and the main grid (so the sequence is never broken).
+        if cursor.col < lm {
+            let start = cursor.col;
+            let end = lm.saturating_sub(1);
+            let window = 7usize;
+            if end.saturating_sub(start) <= window {
+                for c in start..=end {
+                    if !col_ixs.contains(&c) { col_ixs.push(c); }
+                }
+            } else {
+                let half = window / 2;
+                let lo = start.saturating_sub(half);
+                let hi = (lo + window).min(end);
+                for c in lo..=hi {
+                    if !col_ixs.contains(&c) { col_ixs.push(c); }
+                }
+            }
+        } else {
+            // Cursor is in main or right margin: still include a few
+            // left-margin columns so they are visible for reference.
+            let extra_left = 7usize.min(lm.saturating_sub(1));
+            for c in (lm.saturating_sub(extra_left)..lm).rev() {
+                if !col_ixs.contains(&c) { col_ixs.push(c); }
+            }
+        }
     }
     col_ixs.extend((0..=main_hi as usize).map(|ci| lm + ci));
     // Include right-margin columns with content (matching ratatui's
