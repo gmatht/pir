@@ -1,5 +1,6 @@
 use crate::formula::cell_effective_display;
 use crate::grid::{CellAddr, ColumnAddr, TextAlign, HEADER_ROWS, MARGIN_COLS};
+use crate::ui_core::align_cell_display;
 use crate::ui_core::{
     self, main_col_window, rendered_width_for_column, right_nonblank_end,
 };
@@ -159,7 +160,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     let align = ui_core::effective_cell_align(g, &addr, &formatted);
 
                     let display_text = if fw > cw {
-                        if align == Some(TextAlign::Right) || align == Some(TextAlign::Default) {
+                        let shrunk = if align == Some(TextAlign::Right) || align == Some(TextAlign::Default) {
                             ui_core::shrink_numeric_display(&formatted, cw)
                                 .or_else(|| {
                                     ui_core::exponential_numeric_display(&formatted, cw)
@@ -168,10 +169,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                                     ui_core::truncate_with_ellipsis(&formatted, cw)
                                 })
                         } else {
-                            formatted.to_string()
-                        }
+                            ui_core::truncate_with_ellipsis(&formatted, cw)
+                        };
+                        align_cell_display(shrunk, cw, align)
                     } else {
-                        formatted.to_string()
+                        align_cell_display(formatted.to_string(), cw, align)
                     };
 
                     spreadsheet.set_cell(ri as u32, widget_col as u32, &display_text);
@@ -185,6 +187,39 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     spreadsheet.set_column_layout(layout);
     spreadsheet.set_grid_config(lm as u32, mc as u32);
+
+    // Store cursor cell raw value at (0, 0) for formula bar lookup
+    {
+        let cursor_main_row = cursor.row.saturating_sub(hr);
+        let cursor_main_col = cursor.col.saturating_sub(lm);
+        let cursor_addr = if cursor.row < hr {
+            CellAddr::Header { row: cursor.row as u32, col: ColumnAddr::Main(cursor_main_col as u32) }
+        } else if cursor.row < hr + mr {
+            CellAddr::Main { row: cursor_main_row as u32, col: cursor_main_col as u32 }
+        } else {
+            CellAddr::Footer { row: (cursor.row - hr - mr) as u32, col: ColumnAddr::Main(cursor_main_col as u32) }
+        };
+        if let Some(raw_val) = g.get(&cursor_addr) {
+            spreadsheet.set_raw_cell(0, 0, &raw_val);
+        } else {
+            spreadsheet.set_raw_cell(0, 0, "");
+        }
+    }
+
+    // Tab bar (match ratatui format: " Sheet1    Sheet2    Sheet3    Sheet1 Copy ")
+    if app.core.workbook.sheet_count() > 1 {
+        let tabs: String = app.core.workbook.sheets.iter().enumerate()
+            .flat_map(|(idx, sheet)| {
+                let mut parts = Vec::new();
+                if idx > 0 {
+                    parts.push("  ".to_string());
+                }
+                parts.push(format!(" {} ", sheet.title));
+                parts
+            })
+            .collect();
+        spreadsheet.set_tab_text(&tabs);
+    }
 
     // Border title
     let total_ops = app.core.ops_applied;
