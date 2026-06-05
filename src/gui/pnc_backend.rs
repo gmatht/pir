@@ -647,13 +647,19 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     );
 
     // Formula bar trailing
-    if let Some(ref path) = app.core.path {
-        let status = format!(
+    let fb_status = if !app.core.status.is_empty() {
+        format!("   ·  {}", app.core.status)
+    } else if let Some(ref path) = app.core.path {
+        format!(
             "   ·  Loaded workbook {} @ revision {}",
             path.display(),
             app.core.ops_applied
-        );
-        spreadsheet.set_formula_bar_trailing(&status);
+        )
+    } else {
+        String::new()
+    };
+    if !fb_status.is_empty() {
+        spreadsheet.set_formula_bar_trailing(&fb_status);
     }
 
     win.set_child(&spreadsheet);

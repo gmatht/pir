@@ -1,6 +1,8 @@
 use crate::core::state::CoreApp;
 use crate::grid::{CellAddr, SheetCursor, HEADER_ROWS, MARGIN_COLS};
 use crate::io::load_workbook_revisions_partial;
+use crate::io::PartialReplay;
+use std::path::Path;
 use crate::ops::WorkbookState;
 use std::path::PathBuf;
 
@@ -92,6 +94,7 @@ impl App {
                         &mut self.core.workbook, &mut active_sheet,
                     ).map_err(|e| format!("failed to load: {e}"))?;
                     self.core.ops_applied = replay.op_count;
+                    self.core.status = Self::replay_status("Loaded workbook", p, &replay);
                     if let Some(i) = self.core.workbook.sheets.iter().position(|s| s.id == active_sheet) {
                         self.core.workbook.active_sheet = i;
                     }
@@ -112,6 +115,19 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn replay_status(prefix: &str, path: &Path, replay: &PartialReplay) -> String {
+        match (replay.failed_line, replay.error.as_deref()) {
+            (Some(line), Some(err)) => {
+                format!(
+                    "{prefix} {} @ revision {} stopped at line {line}: {err}",
+                    path.display(),
+                    replay.op_count
+                )
+            }
+            _ => format!("{prefix} {} @ revision {}", path.display(), replay.op_count),
+        }
     }
 
     /// Fit all main columns to their rendered content (matching ratatui's
