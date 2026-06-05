@@ -2,7 +2,7 @@ use crate::formula::cell_effective_display;
 use crate::grid::{CellAddr, ColumnAddr, HEADER_ROWS, MARGIN_COLS};
 use crate::ui_core::align_cell_display;
 use crate::ui_core::{
-    self, main_col_window, right_nonblank_end,
+    self, main_col_window,
 };
 use rustxwidgets::backends_pancurses_adapter::*;
 use unicode_width::UnicodeWidthStr;
@@ -64,27 +64,22 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let right_start = lm + mc;
     let (_main_lo, main_hi) = main_col_window(&sheet_rec, cursor);
 
-    let right_band: Vec<usize> = match right_nonblank_end(&sheet_rec) {
-        Some(end) => (0..=end).map(|i| right_start + i).collect(),
-        None => Vec::new(),
-    };
-
     let mut col_ixs: Vec<usize> = Vec::new();
     if lm > 0 {
         col_ixs.push(lm - 1);
     }
     col_ixs.extend((0..=main_hi as usize).map(|ci| lm + ci));
-    // Only add right-margin columns that actually have content (from right_band)
-    // plus a few extra blank columns after the last non-empty one.
-    let right_extra = 4usize;
-    let max_right = right_band.last().copied().map(|last| last + right_extra).unwrap_or(right_start);
-    for i in 0..rm.min(max_right.saturating_sub(right_start).saturating_add(1)) {
+    // Fill remaining viewport space with right-margin columns (]A, ]B, ...)
+    // so the grid always fills the screen (matching ratatui's approach).
+    // A generous count ensures the viewport fills even when right_nonblank_end
+    // returns None; the widget's render truncates at the actual terminal width.
+    let generous_count = 100usize.min(rm);
+    for i in 0..generous_count {
         let gc = right_start + i;
         if !col_ixs.contains(&gc) {
             col_ixs.push(gc);
         }
     }
-    col_ixs.extend(right_band.iter());
     col_ixs.sort_unstable();
     col_ixs.dedup();
 
