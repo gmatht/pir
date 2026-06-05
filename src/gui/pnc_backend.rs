@@ -14,6 +14,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let win = create_window()?;
     win.set_title("corro");
 
+    // Tighten main columns against max_col_width (matching ratatui's
+    // fit_column_to_rendered_content during load_initial). Without this,
+    // auto_fit_column leaves columns wider than max_col_width in place.
+    app.fit_main_columns_to_max_width();
+
     let sheet_rec = app.core.workbook.active_sheet().clone();
     let g = &sheet_rec.grid;
     let hr = HEADER_ROWS;
@@ -38,10 +43,10 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     header_rows.dedup();
     footer_rows.sort_unstable();
     footer_rows.dedup();
-
-    // Fill remaining viewport space with blank footer rows (~ 43 total visible rows)
+    // Fill remaining viewport space with blank footer rows to fill roughly
+    // 44 visible grid rows (matching ratatui's visible_row_indices dim).
     let content_count = header_rows.len() + main_order.len() + footer_rows.len();
-    let dim_rows = 43usize;
+    let dim_rows = 41usize;
     let blank_needed = dim_rows.saturating_sub(content_count);
     for i in 0..blank_needed {
         footer_rows.push(hr + mr + i);
@@ -69,7 +74,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         col_ixs.push(lm - 1);
     }
     col_ixs.extend((0..=main_hi as usize).map(|ci| lm + ci));
-    for i in 0..rm {
+    // Only add right-margin columns that actually have content (from right_band)
+    // plus a few extra blank columns after the last non-empty one.
+    let right_extra = 4usize;
+    let max_right = right_band.last().copied().map(|last| last + right_extra).unwrap_or(right_start);
+    for i in 0..rm.min(max_right.saturating_sub(right_start).saturating_add(1)) {
         let gc = right_start + i;
         if !col_ixs.contains(&gc) {
             col_ixs.push(gc);
@@ -157,12 +166,22 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     let align = ui_core::effective_cell_align(g, &addr, &formatted);
 
                     // When text fits within the column width, pad it for
-                    // proper alignment.  When it overflows, let the widget
-                    // handle overflow/truncation (matching ratatui).
-                    let display_text = if fw <= cw {
-                        align_cell_display(formatted.to_string(), cw, align)
-                    } else {
+                    // proper alignment.  When it overflows, apply the
+                    // same shrink/exp logic as ratatui's non-spill path.
+                    // Text that can spill (left-aligned, non-numeric) is
+                    // left as-is so the widget's overflow handling displays it.
+                    let allow_spill = fw > cw
+                        && (align.is_none() || align == Some(crate::grid::TextAlign::Left));
+                    let display_text = if allow_spill {
+                        // Let the widget's overflow rendering handle the spill
                         formatted.to_string()
+                    } else if fw > cw {
+                        let inner = ui_core::shrink_numeric_display(&formatted, cw)
+                            .or_else(|| ui_core::exponential_numeric_display(&formatted, cw))
+                            .unwrap_or_else(|| ui_core::truncate_with_ellipsis(&formatted, cw));
+                        align_cell_display(inner, cw, align)
+                    } else {
+                        align_cell_display(formatted.to_string(), cw, align)
                     };
 
                     spreadsheet.set_cell(ri as u32, widget_col as u32, &display_text);

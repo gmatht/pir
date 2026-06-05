@@ -114,6 +114,25 @@ impl App {
         Ok(())
     }
 
+    /// Cap main-column widths to max_col_width (matching ratatui's
+    /// fit_column_to_rendered_content called during load_initial).
+    pub fn fit_main_columns_to_max_width(&mut self) {
+        let sheet = self.core.workbook.active_sheet_mut();
+        let grid = &mut sheet.grid;
+        let mc = grid.main_cols();
+        let max_col_w = grid.max_col_width();
+        for c in 0..mc {
+            let global_col = MARGIN_COLS + c;
+            let current = grid.col_width(global_col);
+            if let Some(rw) = crate::ui_core::rendered_width_for_column(grid, global_col) {
+                let capped = rw.min(max_col_w);
+                if capped < current {
+                    grid.set_col_width(global_col, Some(capped));
+                }
+            }
+        }
+    }
+
     pub fn set_backend(&mut self, backend: Backend) {
         self.backend = Some(backend);
     }
