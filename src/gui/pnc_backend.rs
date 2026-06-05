@@ -1,11 +1,50 @@
+use crate::agg::compute_aggregate;
+use crate::agg::helpers::{data_main_col_count, left_margin_main_col_aggregate};
 use crate::formula::cell_effective_display;
-use crate::grid::{CellAddr, ColumnAddr, HEADER_ROWS, MARGIN_COLS};
+use crate::grid::{CellAddr, ColumnAddr, GridBox, MainRange, HEADER_ROWS, MARGIN_COLS};
+use crate::ops::{margin_key_agg_func, AggFunc, AggregateDef};
 use crate::ui_core::align_cell_display;
 use crate::ui_core::{
     self, main_col_window,
 };
 use rustxwidgets::backends_pancurses_adapter::*;
 use unicode_width::UnicodeWidthStr;
+
+// ── Aggregate helpers (mirroring ratatui's visible_row_indices) ────────────
+
+fn left_margin_agg(grid: &GridBox, main_row: u32) -> Option<AggFunc> {
+    let key_col = MARGIN_COLS - 1;
+    let val = grid.get(&CellAddr::Left { col: key_col, row: main_row })?;
+    margin_key_agg_func(&val)
+}
+
+fn footer_agg(grid: &GridBox, footer_row: u32) -> Option<AggFunc> {
+    let val = grid.get(&CellAddr::Footer {
+        row: footer_row,
+        col: ColumnAddr::Left(MARGIN_COLS - 1),
+    })?;
+    margin_key_agg_func(&val)
+}
+
+fn right_col_agg(grid: &GridBox, global_col: usize) -> Option<AggFunc> {
+    let main_cols = grid.main_cols();
+    let mut labels: Vec<(u32, String)> = grid
+        .iter_nonempty()
+        .filter_map(|(addr, val)| match addr {
+            CellAddr::Header { row, col } if col.to_global(main_cols) == global_col => {
+                Some((row, val))
+            }
+            _ => None,
+        })
+        .collect();
+    labels.sort_unstable_by_key(|(row, _)| *row);
+    for (_, val) in labels {
+        if let Some(f) = margin_key_agg_func(&val) {
+            return Some(f);
+        }
+    }
+    None
+}
 
 pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
     let _backend = rustxwidgets::backends::pancurses::init()
@@ -43,13 +82,16 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     header_rows.dedup();
     footer_rows.sort_unstable();
     footer_rows.dedup();
-    // Fill remaining viewport space with blank footer rows to fill roughly
-    // 44 visible grid rows (matching ratatui's visible_row_indices dim).
+    // Fill remaining viewport space with blank footer rows to fill the
+    // visible grid area (matching ratatui's visible_row_indices dim).
     let content_count = header_rows.len() + main_order.len() + footer_rows.len();
-    let dim_rows = 41usize;
+    let dim_rows = 44usize;
     let blank_needed = dim_rows.saturating_sub(content_count);
-    for i in 0..blank_needed {
-        footer_rows.push(hr + mr + i);
+    if blank_needed > 0 {
+        let base = footer_rows.last().copied().map(|r| r + 1).unwrap_or(hr + mr);
+        for i in 0..blank_needed {
+            footer_rows.push(base + i);
+        }
     }
     footer_rows.sort_unstable();
     footer_rows.dedup();
@@ -93,6 +135,22 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         layout.push((c as u32, w as u32, label));
     }
 
+    // ── Precompute aggregate info for each visible row ────────────────
+    // For each display row index, determine if it's a left-margin aggregate
+    // row or a footer aggregate row (the row_index is the main-relative or
+    // footer-relative index).
+    let mut row_agg_func: Vec<Option<AggFunc>> = Vec::with_capacity(display_rows.len());
+    for &lr in &display_rows {
+        let func = if lr < hr {
+            None
+        } else if lr < hr + mr {
+            left_margin_agg(g, (lr - hr) as u32)
+        } else {
+            footer_agg(g, (lr - hr - mr) as u32)
+        };
+        row_agg_func.push(func);
+    }
+
     // ── Spreadsheet ────────────────────────────────────────────────────
     let total_rows = display_rows.len() as u32;
     let total_cols = layout.len() as u32;
@@ -108,10 +166,22 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     // ── Cell data for ALL visible rows and columns ────────────────────
     for (ri, &logical_row) in display_rows.iter().enumerate() {
+        let main_row = if logical_row >= hr && logical_row < hr + mr {
+            Some((logical_row - hr) as u32)
+        } else {
+            None
+        };
+        let footer_row_idx = if logical_row >= hr + mr {
+            Some((logical_row - hr - mr) as u32)
+        } else {
+            None
+        };
+        let row_agg = row_agg_func[ri];
+
         for &c in &col_ixs {
             // Determine the CellAddr for this visible cell
             let addr = if logical_row < hr {
-                let hdr_row = (hr - 1 - logical_row) as u32;
+                let hdr_row = logical_row as u32;
                 if c < lm {
                     CellAddr::Header { row: hdr_row, col: ColumnAddr::Left(c) }
                 } else if c < lm + mc {
@@ -142,54 +212,129 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             let cw = *col_widths.get(&c).unwrap_or(&4);
 
             // Widget column index in the cells map:
-            // For main columns (c in [lm, lm+mc)): c - lm
+            // For main columns (c in [lm, lm+mc)): c - lm (the main column index)
             // For right-margin columns: c - lm = mc + right_idx
-            // Left-margin columns are not stored (widget doesn't render them)
+            // For left-margin columns: not used; stored by global col index instead.
             let widget_col = c.saturating_sub(lm);
 
-            let raw_opt = g.get(&addr);
-            if let Some(ref raw) = raw_opt {
-                // Only store cell content for main and right-margin columns
-                if c >= lm {
-                    // Store raw value in raw_cells for formula bar display
-                    spreadsheet.set_raw_cell(ri as u32, widget_col as u32, raw);
+            // ── Aggregate computation ──────────────────────────────────
+            // Determine if this cell should show an aggregate result.
+            let rca = if c >= lm && c < lm + mc {
+                right_col_agg(g, c)
+            } else {
+                None
+            };
 
-                    // For display: use evaluated/formatted text
-                    let effective = cell_effective_display(g, &addr);
-                    let formatted = ui_core::format_cell_display(g, &addr, effective);
-                    let fw = formatted.width();
-                    let align = ui_core::effective_cell_align(g, &addr, &formatted);
-
-                    // When text fits within the column width, pad it for
-                    // proper alignment.  When it overflows, apply the
-                    // same shrink/exp logic as ratatui's non-spill path.
-                    // Text that can spill (left-aligned, non-numeric) is
-                    // left as-is so the widget's overflow handling displays it.
-                    let allow_spill = fw > cw
-                        && (align.is_none() || align == Some(crate::grid::TextAlign::Left));
-                    let display_text = if allow_spill {
-                        // Let the widget's overflow rendering handle the spill
-                        formatted.to_string()
-                    } else if fw > cw {
-                        let inner = ui_core::shrink_numeric_display(&formatted, cw)
-                            .or_else(|| ui_core::exponential_numeric_display(&formatted, cw))
-                            .unwrap_or_else(|| ui_core::truncate_with_ellipsis(&formatted, cw));
-                        align_cell_display(inner, cw, align)
+            let effective = if let Some(func) = row_agg {
+                if let Some(ftr_row) = footer_row_idx {
+                    // ── Footer aggregate ──────────────────────────────
+                    if c >= lm && c < lm + mc {
+                        let main_col = (c - lm) as u32;
+                        compute_aggregate(
+                            g,
+                            &AggregateDef {
+                                func,
+                                source: MainRange {
+                                    row_start: 0,
+                                    row_end: mr as u32,
+                                    col_start: main_col,
+                                    col_end: main_col + 1,
+                                },
+                            },
+                        )
                     } else {
-                        align_cell_display(formatted.to_string(), cw, align)
-                    };
+                        cell_effective_display(g, &addr)
+                    }
+                } else if let Some(mri) = main_row {
+                    // ── Left-margin aggregate ─────────────────────────
+                    if c >= lm && c < lm + mc {
+                        if rca.is_some() {
+                            let data_cols = data_main_col_count(g);
+                            left_margin_main_col_aggregate(g, func, mri, (c - lm) as u32)
+                        } else {
+                            let main_col = (c - lm) as u32;
+                            left_margin_main_col_aggregate(g, func, mri, main_col)
+                        }
+                    } else {
+                        cell_effective_display(g, &addr)
+                    }
+                } else {
+                    cell_effective_display(g, &addr)
+                }
+            } else if let (Some(mri), Some(agg_func)) = (main_row, rca) {
+                // ── Plain main row with right-col aggregate ──────────
+                if c >= lm && c < lm + mc {
+                    let data_cols = data_main_col_count(g);
+                    compute_aggregate(
+                        g,
+                        &AggregateDef {
+                            func: agg_func,
+                            source: MainRange {
+                                row_start: mri,
+                                row_end: mri + 1,
+                                col_start: 0,
+                                col_end: data_cols as u32,
+                            },
+                        },
+                    )
+                } else {
+                    cell_effective_display(g, &addr)
+                }
+            } else {
+                cell_effective_display(g, &addr)
+            };
 
+            // ── Format and store ──────────────────────────────────────
+            let formatted = ui_core::format_cell_display(g, &addr, effective);
+            let fw = formatted.width();
+            let align = ui_core::effective_cell_align(g, &addr, &formatted);
+
+            let allow_spill = fw > cw
+                && (align.is_none() || align == Some(crate::grid::TextAlign::Left));
+            let display_text = if allow_spill {
+                formatted.to_string()
+            } else if fw > cw {
+                let inner = ui_core::shrink_numeric_display(&formatted, cw)
+                    .or_else(|| ui_core::exponential_numeric_display(&formatted, cw))
+                    .unwrap_or_else(|| ui_core::truncate_with_ellipsis(&formatted, cw));
+                align_cell_display(inner, cw, align)
+            } else {
+                align_cell_display(formatted.to_string(), cw, align)
+            };
+
+            // Only store cells with content (or empty markers for main cols)
+            if !display_text.is_empty() || (c >= lm && c < lm + mc) {
+                if c < lm {
+                    // Left-margin cells: store by global column index so the
+                    // widget can look them up separately from main cells.
+                    spreadsheet.set_cell(ri as u32, c as u32, &display_text);
+                } else {
                     spreadsheet.set_cell(ri as u32, widget_col as u32, &display_text);
                 }
-            } else if c >= lm && c < lm + mc {
-                // Empty cell marker for main columns (stops overflow from previous column)
-                spreadsheet.set_cell(ri as u32, widget_col as u32, "");
             }
         }
     }
 
     spreadsheet.set_column_layout(layout);
     spreadsheet.set_grid_config(lm as u32, mc as u32);
+
+    // Store cursor cell raw value at (0, 0) for formula bar lookup
+    {
+        let cursor_main_row = cursor.row.saturating_sub(hr);
+        let cursor_main_col = cursor.col.saturating_sub(lm);
+        let cursor_addr = if cursor.row < hr {
+            CellAddr::Header { row: cursor.row as u32, col: ColumnAddr::Main(cursor_main_col as u32) }
+        } else if cursor.row < hr + mr {
+            CellAddr::Main { row: cursor_main_row as u32, col: cursor_main_col as u32 }
+        } else {
+            CellAddr::Footer { row: (cursor.row - hr - mr) as u32, col: ColumnAddr::Main(cursor_main_col as u32) }
+        };
+        if let Some(raw_val) = g.get(&cursor_addr) {
+            spreadsheet.set_raw_cell(0, 0, &raw_val);
+        } else {
+            spreadsheet.set_raw_cell(0, 0, "");
+        }
+    }
 
     // Store cursor cell raw value at (0, 0) for formula bar lookup
     {
