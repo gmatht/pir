@@ -20,25 +20,195 @@ pub fn file_save_dialog() -> Option<PathBuf> {
 }
 
 pub fn show_about_dialog() {
+    #[cfg(feature = "gui")]
+    {
+        use rustxwidgets::backends_gtk_adapter::*;
+        let dialog = create_dialog();
+        let label = create_label(&format!(
+            "corro {}\n\nAppend-only collaborative spreadsheet\n\nBuilt with Rust + GTK",
+            env!("CARGO_PKG_VERSION"),
+        ));
+        if let (Ok(dialog), Ok(label)) = (&dialog, &label) {
+            dialog.set_title("About corro");
+            dialog.append_content_area(label);
+            dialog.add_button("Close", 0);
+            dialog.connect_response(|_| {}).ok();
+            dialog.present();
+        }
+    }
+    #[cfg(not(feature = "gui"))]
     eprintln!("corro {} - append-only collaborative spreadsheet", env!("CARGO_PKG_VERSION"));
 }
 
 pub fn show_keybinds_help() {
+    #[cfg(feature = "gui")]
+    {
+        use rustxwidgets::backends_gtk_adapter::*;
+        let dialog = create_dialog();
+        let tv = create_textview();
+        if let (Ok(dialog), Ok(tv)) = (&dialog, &tv) {
+            dialog.set_title("Keybindings");
+            tv.set_text(
+                "Navigation:    Arrow keys / Page Up/Down / Home / End\n\
+                 Edit:          Enter (edit cell), F2 (edit cell)\n\
+                 Cancel:        Escape\n\
+                 Help:          F1\n\
+                 Quit:          Ctrl+Q\n\
+                 Menu:          Alt+underlined letter\n\
+                 \n\
+                 File menu:     Ctrl+O (open), Ctrl+S (save)\n\
+                 Edit menu:     Ctrl+Z (undo), Ctrl+Y (redo)\n\
+                                Ctrl+X (cut), Ctrl+C (copy), Ctrl+V (paste)\n\
+                                Ctrl+F (find), Ctrl+H (replace)"
+            );
+            tv.set_wrap_mode(0);
+            tv.set_size_request(400, 300);
+            dialog.append_content_area(tv);
+            dialog.add_button("Close", 0);
+            dialog.connect_response(|_| {}).ok();
+            dialog.present();
+        }
+    }
+    #[cfg(not(feature = "gui"))]
     eprintln!("Keybindings: arrows=navigate, Enter=edit, Esc=cancel, F1=help, Ctrl+Q=quit");
 }
 
-pub fn find_dialog() -> Option<String> {
-    None
+pub fn find_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
+    #[cfg(feature = "gui")]
+    {
+        use rustxwidgets::backends_gtk_adapter::*;
+        if let (Ok(dialog), Ok(entry)) = (create_dialog(), create_entry()) {
+            dialog.set_title("Find");
+            entry.set_hexpand(true);
+            dialog.append_content_area(&entry);
+            dialog.add_button("Cancel", 0);
+            dialog.add_button("Find", 1);
+            let mut on_result = Some(on_result);
+            dialog.connect_response(move |response_id| {
+                if let Some(f) = on_result.take() {
+                    if response_id == 1 {
+                        f(entry.get_text());
+                    } else {
+                        f(None);
+                    }
+                }
+            }).ok();
+            dialog.present();
+            return;
+        }
+    }
+    on_result(None);
 }
 
-pub fn replace_dialog() -> Option<(String, String)> {
-    None
+pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: F) {
+    #[cfg(feature = "gui")]
+    {
+        use rustxwidgets::backends_gtk_adapter::*;
+        if let (Ok(dialog), Ok(find_entry), Ok(replace_entry), Ok(vbox)) =
+            (create_dialog(), create_entry(), create_entry(), create_box(Orientation::Vertical, 4))
+        {
+            dialog.set_title("Replace");
+            dialog.set_default_size(350, 150);
+            if let Ok(find_label) = create_label("Find:") {
+                vbox.append(&find_label);
+            }
+            find_entry.set_hexpand(true);
+            vbox.append(&find_entry);
+            if let Ok(replace_label) = create_label("Replace with:") {
+                vbox.append(&replace_label);
+            }
+            replace_entry.set_hexpand(true);
+            vbox.append(&replace_entry);
+            dialog.append_content_area(&vbox);
+            dialog.add_button("Cancel", 0);
+            dialog.add_button("Replace", 1);
+            let mut on_result = Some(on_result);
+            dialog.connect_response(move |response_id| {
+                if let Some(f) = on_result.take() {
+                    if response_id == 1 {
+                        f(Some((
+                            find_entry.get_text().unwrap_or_default(),
+                            replace_entry.get_text().unwrap_or_default(),
+                        )));
+                    } else {
+                        f(None);
+                    }
+                }
+            }).ok();
+            dialog.present();
+            return;
+        }
+    }
+    on_result(None);
 }
 
-pub fn sort_dialog(_workbook: &WorkbookState) -> Option<(usize, bool)> {
-    None
+pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &WorkbookState, on_result: F) {
+    #[cfg(feature = "gui")]
+    {
+        use rustxwidgets::backends_gtk_adapter::*;
+        let cols: &[&str] = &["Column A", "Column B", "Column C", "Column D", "Column E"];
+        if let (Ok(dialog), Ok(sort_col), Ok(ascending), Ok(vbox)) =
+            (create_dialog(), create_dropdown(cols), create_checkbutton("Ascending"),
+             create_box(Orientation::Vertical, 4))
+        {
+            dialog.set_title("Sort");
+            dialog.set_default_size(300, 150);
+            if let Ok(label) = create_label("Sort column:") {
+                vbox.append(&label);
+            }
+            sort_col.set_hexpand(true);
+            vbox.append(&sort_col);
+            ascending.set_active(true);
+            vbox.append(&ascending);
+            dialog.append_content_area(&vbox);
+            dialog.add_button("Cancel", 0);
+            dialog.add_button("Sort", 1);
+            let mut on_result = Some(on_result);
+            dialog.connect_response(move |response_id| {
+                if let Some(f) = on_result.take() {
+                    if response_id == 1 {
+                        let col = sort_col.get_active().max(0) as usize;
+                        let asc = ascending.is_active();
+                        f(Some((col, asc)));
+                    } else {
+                        f(None);
+                    }
+                }
+            }).ok();
+            dialog.present();
+            return;
+        }
+    }
+    on_result(None);
 }
 
-pub fn balance_dialog() -> Option<String> {
-    None
+pub fn balance_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
+    #[cfg(feature = "gui")]
+    {
+        use rustxwidgets::backends_gtk_adapter::*;
+        if let (Ok(dialog), Ok(entry)) = (create_dialog(), create_entry()) {
+            dialog.set_title("Balance Books");
+            if let Ok(label) = create_label("Column to balance:") {
+                dialog.append_content_area(&label);
+            }
+            entry.set_text("A");
+            entry.set_hexpand(true);
+            dialog.append_content_area(&entry);
+            dialog.add_button("Cancel", 0);
+            dialog.add_button("Balance", 1);
+            let mut on_result = Some(on_result);
+            dialog.connect_response(move |response_id| {
+                if let Some(f) = on_result.take() {
+                    if response_id == 1 {
+                        f(entry.get_text());
+                    } else {
+                        f(None);
+                    }
+                }
+            }).ok();
+            dialog.present();
+            return;
+        }
+    }
+    on_result(None);
 }

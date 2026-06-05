@@ -33,7 +33,15 @@ pub fn run_gtk(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
     win.set_title(&format!("corro {}", env!("CARGO_PKG_VERSION")));
     win.set_default_size(1200, 800);
 
+    // Create application (action group host for menus)
+    let gtk_app = create_application()?;
+    gtk_app.register()?;
+
+    // Build menu bar
+    let menubar = crate::gui::menu::build_menu_bar(&gtk_app, &win)?;
+
     let vbox = create_box(Orientation::Vertical, 0)?;
+    vbox.append(&menubar);
 
     let formula_bar = create_box(Orientation::Horizontal, 2)?;
     let addr_label = create_label("A1")?;
