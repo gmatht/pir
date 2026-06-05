@@ -443,16 +443,12 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             }
 
             if !did_spill {
-                // Include the inter-column gap in available width so that
-                // cell text can use the gap character as overflow room,
-                // matching ratatui's rendering.
-                let avail_width = if fw > cw { cw + gap_width } else { cw };
                 let display_text = if formatted.is_empty() {
                     String::new()
                 } else if fw > cw {
                     let cell_fmt = g.format_for_addr(&addr);
                     let rational_hint = if matches!(cell_fmt.number, None | Some(NumberFormat::Rational | NumberFormat::DecimalGeneric))
-                        && would_ellipsis_hide_decimal_point(&formatted, avail_width)
+                        && would_ellipsis_hide_decimal_point(&formatted, cw)
                     {
                         effective_numeric(g, &addr, &mut Vec::new(), &mut 10_000usize)
                             .map(|n| n.to_f64())
@@ -460,21 +456,16 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     } else {
                         None
                     };
-                    let exp_preferred = if would_ellipsis_hide_decimal_point(&formatted, avail_width) {
-                        exponential_numeric_display_with_hint(&formatted, avail_width, rational_hint)
+                    let exp_preferred = if would_ellipsis_hide_decimal_point(&formatted, cw) {
+                        exponential_numeric_display_with_hint(&formatted, cw, rational_hint)
                     } else {
                         None
                     };
-                    let inner = if fw <= avail_width {
-                        // Text fits within column + gap, no truncation needed
-                        formatted.to_string()
-                    } else {
-                        exp_preferred
-                            .or_else(|| ui_core::shrink_numeric_display(&formatted, avail_width))
-                            .or_else(|| ui_core::exponential_numeric_display(&formatted, avail_width))
-                            .unwrap_or_else(|| ui_core::truncate_with_ellipsis(&formatted, avail_width))
-                    };
-                    align_cell_display(inner, avail_width, align)
+                    let inner = exp_preferred
+                        .or_else(|| ui_core::shrink_numeric_display(&formatted, cw))
+                        .or_else(|| ui_core::exponential_numeric_display(&formatted, cw))
+                        .unwrap_or_else(|| ui_core::truncate_with_ellipsis(&formatted, cw));
+                    align_cell_display(inner, cw, align)
                 } else {
                     align_cell_display(formatted.to_string(), cw, align)
                 };
