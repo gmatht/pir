@@ -540,6 +540,22 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     }
                     next_ix += 1;
                 }
+                // Include remaining viewport space (right gap) so spilled
+                // text fills the full row width, matching ratatui.
+                // Use actual column widths + 1-char gaps between columns
+                // (matching the pancurses layout, not visible_cols_render_width
+                // which uses 2-char gaps at certain positions).
+                if next_ix >= col_ixs.len() {
+                    let actual_total: usize = col_ixs.iter()
+                        .map(|&c| (*col_widths.get(&c).unwrap_or(&4)).max(1))
+                        .sum::<usize>()
+                        + col_ixs.len().saturating_sub(1);
+                    // Leave 1-char gap before the right border (matching
+                    // ratatui layout where right-gap is data_width - total
+                    // and the filler provides the gap).
+                    let right_gap = data_width.saturating_sub(actual_total).saturating_sub(1);
+                    total_spill_gaps = total_spill_gaps.saturating_add(right_gap);
+                }
                 if total_spill_gaps > cw && next_ix > col_ix {
                     did_spill = true;
                     let (pre_total, _suf_total) = take_display_prefix(&formatted, total_spill_gaps);
@@ -553,7 +569,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     };
                 let should_store = !store_text.is_empty()
                     || (c >= lm && c < lm + mc)
-                    || (c >= lm + mc && is_agg_cell);
+                    || (c >= lm + mc);
                 if should_store {
                         // Store by global column index so margin and main cells
                         // don't collide at (row, 0)/(row, 1).
@@ -599,7 +615,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 };
                 let should_store = !store_text.is_empty()
                     || (c >= lm && c < lm + mc)
-                    || (c >= lm + mc && is_agg_cell);
+                    || (c >= lm + mc);
                 if should_store {
                     // Store by global column index to avoid margin/main collision.
                     spreadsheet.set_cell(ri as u32, c as u32, &store_text);
