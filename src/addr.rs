@@ -27,7 +27,6 @@ pub fn parse_excel_column(name: &str) -> Option<u32> {
 }
 
 /// 0-based main column index → Excel column letters.
-#[optimize(speed)]
 pub fn excel_column_name(main_col_index: usize) -> String {
     let mut n = main_col_index + 1;
     let mut s = String::new();
@@ -252,7 +251,6 @@ pub struct A1RefLocks {
 /// Returns `(address, lock flags for main-style A1 translation, byte length consumed)`.
 ///
 /// `$` locking applies only to plain `A1`/`$A1`/`A$1`/`$A$1` forms (no `[` / `]` / `~` / `_`).
-#[optimize(speed)]
 pub fn parse_cell_ref_at(s: &str, main_cols: usize) -> Option<(CellAddr, A1RefLocks, usize)> {
     let bytes = s.as_bytes();
     if bytes.is_empty() {
@@ -383,7 +381,6 @@ pub fn parse_cell_ref_at(s: &str, main_cols: usize) -> Option<(CellAddr, A1RefLo
     Some((addr, locks, i + row_digits))
 }
 
-#[optimize(speed)]
 pub fn cell_ref_text(addr: &CellAddr, main_cols: usize) -> String {
     // Keep this function quiet in normal operation; debug traces should go
     // to the configured debug log via stderr redirection in main.
@@ -513,7 +510,6 @@ pub fn parse_main_range_formula_at(
 }
 
 /// Parse `A1:B2` at start of `s`; both ends must be main cells. Returns range + consumed length.
-#[optimize(speed)]
 pub fn parse_main_range_at(s: &str) -> Option<(crate::grid::MainRange, usize)> {
     let (range, locks_a, locks_b, na) = parse_main_range_formula_at(s)?;
     let _ = (locks_a, locks_b);

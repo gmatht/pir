@@ -8,7 +8,6 @@ use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, Timelike};
 use num_traits::Zero;
 use std::hash::{Hash, Hasher};
 
-#[optimize(speed)]
 pub(crate) fn eval_builtin(
     name: &str,
     args: &[Ast],
@@ -368,7 +367,6 @@ fn eval_mod(
     }
 }
 
-#[optimize(speed)]
 fn eval_numeric_aggregate(
     args: &[Ast],
     grid: &Grid,
@@ -1383,7 +1381,6 @@ fn eval_text_arg(
     }
 }
 
-#[optimize(speed)]
 fn eval_sumproduct(
     args: &[Ast],
     grid: &Grid,
@@ -1783,7 +1780,6 @@ fn eval_or(
     EvalResult::Number(Number::exact_zero())
 }
 
-#[optimize(speed)]
 fn eval_match(
     args: &[Ast],
     grid: &Grid,
@@ -1952,7 +1948,6 @@ fn eval_xmatch(
     EvalResult::Error("NA")
 }
 
-#[optimize(speed)]
 fn eval_index(
     args: &[Ast],
     grid: &Grid,
@@ -2180,7 +2175,6 @@ fn eval_averageifs(
     }
 }
 
-#[optimize(speed)]
 fn eval_sort(
     args: &[Ast],
     grid: &Grid,
@@ -2377,7 +2371,6 @@ fn eval_chooserows(
     )
 }
 
-#[optimize(speed)]
 fn collect_matrix_values(
     arg: &Ast,
     grid: &Grid,
@@ -3037,7 +3030,6 @@ fn count_blank_range(
     count
 }
 
-#[optimize(speed)]
 fn eval_countif(
     args: &[Ast],
     grid: &Grid,
@@ -3069,7 +3061,6 @@ fn eval_countif(
     EvalResult::Number(Number::from_i64(count as i64))
 }
 
-#[optimize(speed)]
 fn eval_sumif(
     args: &[Ast],
     grid: &Grid,
@@ -3132,7 +3123,6 @@ fn eval_sumif(
     EvalResult::Number(sum)
 }
 
-#[optimize(speed)]
 fn collect_numeric_values(
     arg: &Ast,
     grid: &Grid,
@@ -3193,7 +3183,6 @@ fn as_main_range(ast: &Ast) -> Option<MainRange> {
     }
 }
 
-#[optimize(speed)]
 fn count_numeric_values(
     arg: &Ast,
     grid: &Grid,
@@ -3237,7 +3226,6 @@ fn count_numeric_values(
     }
 }
 
-#[optimize(speed)]
 fn count_nonempty_values(
     arg: &Ast,
     grid: &Grid,
@@ -3313,7 +3301,6 @@ fn compare_str(op: CriteriaOp, left: &str, right: &str) -> bool {
     }
 }
 
-#[optimize(speed)]
 fn criteria_from_ast(
     ast: &Ast,
     grid: &Grid,
@@ -3354,7 +3341,6 @@ fn criteria_from_ast(
     })
 }
 
-#[optimize(speed)]
 fn criteria_matches(
     criteria: &Criteria,
     grid: &Grid,

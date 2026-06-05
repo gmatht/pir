@@ -113,7 +113,6 @@ pub(super) fn number_from_bool(b: bool) -> Number {
     }
 }
 
-#[optimize(speed)]
 fn eval_plain_cell_raw(trimmed: &str) -> EvalResult {
     if let Some(n) = parse_number_literal(trimmed) {
         EvalResult::Number(n)
@@ -154,12 +153,10 @@ impl EvalResult {
     }
 }
 
-#[optimize(speed)]
 pub(crate) fn parse_number_literal(s: &str) -> Option<Number> {
     number::parse_number_literal(s)
 }
 
-#[optimize(speed)]
 pub(crate) fn parse_numeric_or_date_literal(s: &str) -> Option<Number> {
     #[cfg(test)]
     {
@@ -197,7 +194,6 @@ fn resolve_name(name: &str, bindings: &[(String, EvalResult)]) -> Option<EvalRes
     }
 }
 
-#[optimize(speed)]
 pub(crate) fn split_labeled_formula(raw: &str) -> Option<(&str, &str)> {
     let t = raw.trim();
     let expr = t.strip_prefix('=')?;
@@ -1382,7 +1378,6 @@ fn rewrite_row_template(expr: &str, col: usize) -> String {
     out
 }
 
-#[optimize(speed)]
 fn control_formula_expr(grid: &Grid, addr: &CellAddr) -> Option<String> {
     let raw_owned = grid.get(addr);
     let raw = raw_owned.as_deref()?;
@@ -1422,7 +1417,6 @@ fn margin_control_label_after_double_equals(t: &str) -> Option<String> {
     }
 }
 
-#[optimize(speed)]
 fn control_formula_label(grid: &Grid, addr: &CellAddr) -> Option<String> {
     let raw_owned = grid.get(addr);
     let raw = raw_owned.as_deref()?;
@@ -1450,7 +1444,6 @@ fn control_formula_label(grid: &Grid, addr: &CellAddr) -> Option<String> {
     Some(label.to_string())
 }
 
-#[optimize(speed)]
 fn templated_formula(grid: &Grid, addr: &CellAddr) -> Option<String> {
     let CellAddr::Main { row, col } = addr else {
         return None;
@@ -1524,7 +1517,6 @@ pub fn main_column_label_from_header(grid: &Grid, main_col: usize) -> Option<Str
 
 /// True if the stored cell text is a spreadsheet formula (`=` prefix after trim). `==…`
 /// margin aggregate directives are not formulas here.
-#[optimize(speed)]
 pub fn is_formula(raw: &str) -> bool {
     let t = raw.trim_start();
     if t.starts_with("==") {
@@ -1533,7 +1525,7 @@ pub fn is_formula(raw: &str) -> bool {
     t.starts_with('=')
 }
 
-#[optimize(speed)]
+/// Numeric value for aggregation: formulas evaluate to a number if possible; plain text uses exact/approx parse.
 pub fn effective_numeric(
     grid: &Grid,
     addr: &CellAddr,
@@ -1565,7 +1557,6 @@ pub fn effective_numeric(
 }
 
 /// Spreadsheet SUM-style numeric contribution: [`effective_numeric`] plus boolean values as exact `0`/`1`.
-#[optimize(speed)]
 pub fn summable_numeric(
     grid: &Grid,
     addr: &CellAddr,
@@ -1596,7 +1587,6 @@ pub fn summable_numeric(
 }
 
 /// Evaluate a cell (handles `=...`); used for display and dependencies.
-#[optimize(speed)]
 pub fn eval_cell(
     grid: &Grid,
     addr: &CellAddr,
@@ -1687,7 +1677,6 @@ fn eval_cell_with_sheet(
     r
 }
 
-#[optimize(speed)]
 fn eval_cell_inner(
     grid: &Grid,
     addr: &CellAddr,
@@ -1832,7 +1821,6 @@ fn eval_cell_inner(
     r
 }
 
-#[optimize(speed)]
 fn eval_expr_str(
     expr: &str,
     grid: &Grid,
@@ -2267,7 +2255,6 @@ fn split_top_level_args(s: &str) -> Result<Vec<&str>, ()> {
     Ok(out)
 }
 
-#[optimize(speed)]
 fn eval_ast(
     ast: &Ast,
     grid: &Grid,
@@ -2448,7 +2435,6 @@ fn eval_ast(
     }
 }
 
-#[optimize(speed)]
 fn truthy(e: EvalResult) -> bool {
     match e.scalar_coerce() {
         EvalResult::Bool(b) => b,
@@ -2469,7 +2455,6 @@ enum BinaryOp {
     Pow,
 }
 
-#[optimize(speed)]
 fn eval_binary_op(
     a: &Ast,
     b: &Ast,
@@ -2516,7 +2501,6 @@ fn eval_binary_op(
     EvalResult::Number(out)
 }
 
-#[optimize(speed)]
 pub(super) fn coerce_cell_number(e: EvalResult) -> Result<Number, EvalResult> {
     match e {
         EvalResult::Number(n) => Ok(n),
@@ -2534,7 +2518,6 @@ pub(super) fn coerce_cell_number(e: EvalResult) -> Result<Number, EvalResult> {
 }
 
 /// Used by builtins that need float semantics (`POWER`, trigonometry, etc.).
-#[optimize(speed)]
 pub(super) fn eval_binary_float(
     a: &Ast,
     b: &Ast,
@@ -2575,7 +2558,6 @@ pub(super) fn eval_binary_float(
 }
 
 /// Real-first binary helper with complex fallback for operations that leave the real domain.
-#[optimize(speed)]
 fn eval_binary_float_with_complex_fallback(
     a: &Ast,
     b: &Ast,
@@ -2616,7 +2598,6 @@ fn eval_binary_float_with_complex_fallback(
     EvalResult::Number(na.apply_binary_f64_with_complex_fallback(nb, real, complex))
 }
 
-#[optimize(speed)]
 fn eval_sum(
     arg: &Ast,
     grid: &Grid,
@@ -2663,7 +2644,6 @@ fn eval_sum(
     }
 }
 
-#[optimize(speed)]
 fn sum_main_range(
     grid: &Grid,
     range: &MainRange,
@@ -2685,7 +2665,6 @@ fn sum_main_range(
     s
 }
 
-#[optimize(speed)]
 pub fn refresh_spills(grid: &mut Grid) {
     if !grid.spills_refresh_dirty() {
         return;
@@ -2734,19 +2713,16 @@ pub fn refresh_spills(grid: &mut Grid) {
     grid.note_spills_refreshed();
 }
 
-#[optimize(speed)]
 fn format_number(n: &Number) -> String {
     n.format_eval_display(format_significant_10)
 }
 
 /// Display for UI/export when a column uses [`crate::grid::NumberFormat::Rational`]: exact rationals
 /// as literals; approximate values use the same float rendering as evaluation.
-#[optimize(speed)]
 pub(crate) fn format_number_cell_display(n: &Number) -> String {
     format_number(n)
 }
 
-#[optimize(speed)]
 fn eval_result_to_string(result: &EvalResult) -> String {
     match result {
         EvalResult::Number(n) => {
@@ -2768,7 +2744,6 @@ fn eval_result_to_string(result: &EvalResult) -> String {
     }
 }
 
-#[optimize(speed)]
 fn formula_references_all_empty(grid: &Grid, formula: &str) -> bool {
     let t = formula.trim();
     let Some(expr) = t.strip_prefix('=') else {
@@ -2832,7 +2807,6 @@ fn ast_references_all_empty(ast: &Ast, grid: &Grid, saw_ref: &mut bool) -> bool 
     }
 }
 
-#[optimize(speed)]
 fn cell_reference_is_empty(grid: &Grid, addr: &CellAddr) -> bool {
     grid.get(addr)
         .as_deref()
@@ -2840,7 +2814,6 @@ fn cell_reference_is_empty(grid: &Grid, addr: &CellAddr) -> bool {
 }
 
 /// Display string for a cell: evaluated formula result, or raw text.
-#[optimize(speed)]
 pub fn cell_effective_display(grid: &Grid, addr: &CellAddr) -> String {
     if let Some(label) = control_formula_label(grid, addr) {
         return label;

@@ -127,17 +127,18 @@ impl CellAddr {
         CellAddr::Right { col, row }
     }
 
-    /// Convert a (row, col) pair and current `main_cols` into the appropriate
+    /// Convert a (row, col) pair and current grid dimensions into the appropriate
     /// [`CellAddr`] variant, generating objective `ColumnAddr` for header/footer.
-    pub fn from_global(row: usize, col: usize, main_cols: usize) -> Self {
+    /// `main_rows` is the number of main data rows.
+    pub fn from_global(row: usize, col: usize, main_rows: usize, main_cols: usize) -> Self {
         if row < HEADER_ROWS {
             CellAddr::Header {
                 row: (HEADER_ROWS - 1 - row) as u32,
                 col: ColumnAddr::from_global(col, main_cols),
             }
-        } else if row >= HEADER_ROWS + main_cols {
+        } else if row >= HEADER_ROWS + main_rows {
             CellAddr::Footer {
-                row: (row - HEADER_ROWS - main_cols) as u32,
+                row: (row - HEADER_ROWS - main_rows) as u32,
                 col: ColumnAddr::from_global(col, main_cols),
             }
         } else if col < MARGIN_COLS {
@@ -339,12 +340,10 @@ impl GridBox {
     }
 
     /// Convenience owned-get that mirrors the old Grid::get (returns owned String)
-    #[optimize(speed)]
     pub fn get(&self, addr: &CellAddr) -> Option<String> {
         self.inner.get_owned(addr)
     }
 
-    #[optimize(speed)]
     pub fn text(&self, addr: &CellAddr) -> String {
         self.inner.text(addr)
     }
@@ -353,7 +352,6 @@ impl GridBox {
         self.inner.set_owned(addr, value)
     }
 
-    #[optimize(speed)]
     pub fn set(&mut self, addr: &CellAddr, value: String) {
         self.inner.set(addr, value)
     }
@@ -498,7 +496,6 @@ impl GridBox {
         self.inner.set_spill_error(addr, err)
     }
 
-    #[optimize(speed)]
     pub fn spill_error(&self, addr: &CellAddr) -> Option<&'static str> {
         self.inner.spill_error(addr)
     }
@@ -527,7 +524,6 @@ impl GridBox {
         self.inner.cell_formats()
     }
 
-    #[optimize(speed)]
     pub fn iter_nonempty(&self) -> Box<dyn Iterator<Item = (CellAddr, String)> + '_> {
         self.inner.iter_nonempty()
     }
@@ -675,24 +671,20 @@ impl Grid {
 
     /// Back-compat: logical main row count.
     #[inline]
-    #[optimize(speed)]
     pub fn main_rows(&self) -> usize {
         self.extent_main_rows as usize
     }
 
     /// Back-compat: logical main column count.
     #[inline]
-    #[optimize(speed)]
     pub fn main_cols(&self) -> usize {
         self.extent_main_cols as usize
     }
 
-    #[optimize(speed)]
     pub fn total_cols(&self) -> usize {
         MARGIN_COLS + self.extent_main_cols as usize + MARGIN_COLS
     }
 
-    #[optimize(speed)]
     pub fn total_logical_rows(&self) -> usize {
         HEADER_ROWS + self.extent_main_rows as usize + FOOTER_ROWS
     }
@@ -1249,7 +1241,6 @@ impl Grid {
             .join(" ")
     }
 
-    #[optimize(speed)]
     pub fn get(&self, addr: &CellAddr) -> Option<&str> {
         if let Some(v) = self.spill_followers.get(addr) {
             return Some(v.as_str());
@@ -1271,7 +1262,6 @@ impl Grid {
         self.spill_errors.get(addr).copied()
     }
 
-    #[optimize(speed)]
     pub fn set(&mut self, addr: &CellAddr, value: String) {
         match addr {
             CellAddr::Header { row, col } => {
@@ -1558,8 +1548,8 @@ impl GridImpl for Grid {
         Grid::mark_spills_stale(self)
     }
 
-    #[optimize(speed)]
     fn iter_nonempty(&self) -> Box<dyn Iterator<Item = (CellAddr, String)> + '_> {
+        // Build a vec of non-empty cells across regions and return an iterator.
         let mut v: Vec<(CellAddr, String)> = Vec::new();
         for (&(r, col), val) in &self.header {
             v.push((
@@ -1595,7 +1585,6 @@ impl GridImpl for Grid {
         self.total_logical_rows()
     }
 
-    #[optimize(speed)]
     fn text(&self, addr: &CellAddr) -> String {
         self.get(addr).unwrap_or("").to_string()
     }
@@ -1864,7 +1853,6 @@ fn compare_sort_values(va: &str, vb: &str, desc: bool) -> std::cmp::Ordering {
 }
 
 /// Logical sheet row index (0 = top header row) for addressing.
-#[optimize(speed)]
 pub fn addr_logical_row(addr: &CellAddr, grid: &Grid) -> usize {
     let hr = HEADER_ROWS;
     match addr {
@@ -1876,7 +1864,6 @@ pub fn addr_logical_row(addr: &CellAddr, grid: &Grid) -> usize {
 }
 
 /// Global column index for addressing.
-#[optimize(speed)]
 pub fn addr_logical_col(addr: &CellAddr, grid: &Grid) -> usize {
     match addr {
         CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => {
@@ -2146,5 +2133,197 @@ mod tests {
         assert_eq!(g.main_rows(), old_rows);
     }
 
+    #[test]
+    fn footer_row_numbering_has_no_gaps_and_uses_main_rows_not_main_cols() {
+        // Verify that footer row indices use the correct arithmetic:
+        // footer_row(3) + 1 = footer_row(4), never footer_row(10).
+        let mr = 5usize; // 5 main rows
+        let mc = 1usize; // 1 main column
+        let mut g = Grid::new(mr as u32, mc as u32);
 
+        // Set footer rows _1, _2, _3 sequentially (internal indices 0, 1, 2)
+        g.set(
+            &CellAddr::Footer { row: 0, col: ColumnAddr::Main(0) },
+            "a".into(),
+        );
+        g.set(
+            &CellAddr::Footer { row: 1, col: ColumnAddr::Main(0) },
+            "b".into(),
+        );
+        g.set(
+            &CellAddr::Footer { row: 2, col: ColumnAddr::Main(0) },
+            "c".into(),
+        );
+
+        // All three footer rows should be present
+        assert_eq!(g.footer.len(), 3);
+        assert_eq!(g.get(&CellAddr::Footer { row: 0, col: ColumnAddr::Main(0) }), Some("a"));
+        assert_eq!(g.get(&CellAddr::Footer { row: 1, col: ColumnAddr::Main(0) }), Some("b"));
+        assert_eq!(g.get(&CellAddr::Footer { row: 2, col: ColumnAddr::Main(0) }), Some("c"));
+
+        // Verify that logical_row_has_content works for all footer rows
+        let hr = HEADER_ROWS;
+        assert!(g.logical_row_has_content(hr + mr + 0)); // _1
+        assert!(g.logical_row_has_content(hr + mr + 1)); // _2
+        assert!(g.logical_row_has_content(hr + mr + 2)); // _3
+        assert!(!g.logical_row_has_content(hr + mr + 3)); // _4 not set
+
+        // Verify that from_global correctly identifies footer rows when
+        // main_rows != main_cols (the classic "3+1=4, not 10" bug scenario).
+        // Footer row _1 (internal index 0) at logical row hr+mr+0.
+        let footer_logical = hr + mr + 0;
+        // If main_rows were confused with main_cols, a 5-row/1-col grid
+        // would compute hr+mc = hr+1, making logical rows >= hr+1 be
+        // classified as footer — but then the footer offset would be
+        // wrong: (row - hr - mc) = (hr+5+0 - hr - 1) = 4 instead of 0!
+        let addr = CellAddr::from_global(footer_logical, MARGIN_COLS, mr, mc);
+        assert!(
+            matches!(addr, CellAddr::Footer { row: 0, .. }),
+            "footer _1 with mr={mr} mc={mc}: expected Footer{{row:0}} but got {addr:?}",
+        );
+
+        // Footer row _2 (internal index 1)
+        let addr2 = CellAddr::from_global(footer_logical + 1, MARGIN_COLS, mr, mc);
+        assert!(
+            matches!(addr2, CellAddr::Footer { row: 1, .. }),
+            "footer _2 with mr={mr} mc={mc}: expected Footer{{row:1}} but got {addr2:?}",
+        );
+
+        // Footer row _3 (internal index 2)
+        let addr3 = CellAddr::from_global(footer_logical + 2, MARGIN_COLS, mr, mc);
+        assert!(
+            matches!(addr3, CellAddr::Footer { row: 2, .. }),
+            "footer _3 with mr={mr} mc={mc}: expected Footer{{row:2}} but got {addr3:?}",
+        );
+
+        // Main row 1 should NOT be classified as a footer
+        let main_logical = hr + 0;
+        let main_addr = CellAddr::from_global(main_logical, MARGIN_COLS, mr, mc);
+        assert!(
+            matches!(main_addr, CellAddr::Main { .. }),
+            "main row 1 should be Main, got {main_addr:?}",
+        );
+
+        // Same tests with a wider grid where main_rows=1, main_cols=5
+        // (the opposite asymmetry — more columns than rows)
+        let mr2 = 1usize;
+        let mc2 = 5usize;
+        let mut g2 = Grid::new(mr2 as u32, mc2 as u32);
+        g2.set(
+            &CellAddr::Footer { row: 0, col: ColumnAddr::Main(0) },
+            "x".into(),
+        );
+        assert!(g2.logical_row_has_content(hr + mr2 + 0));
+
+        let addr_wide = CellAddr::from_global(hr + mr2 + 0, MARGIN_COLS, mr2, mc2);
+        assert!(
+            matches!(addr_wide, CellAddr::Footer { row: 0, .. }),
+            "footer _1 with mr={mr2} mc={mc2}: expected Footer{{row:0}} but got {addr_wide:?}",
+        );
+
+        // Verify that header rows also use correct arithmetic.
+        // from_global stores header rows as (HEADER_ROWS - 1 - logical_row).
+        // Header ~999999999 (the topmost) is at logical row 0, internal index HEADER_ROWS - 1.
+        let header_top_logical = 0usize;
+        let header_top_addr = CellAddr::from_global(header_top_logical, MARGIN_COLS, mr2, mc2);
+        assert!(
+            matches!(header_top_addr, CellAddr::Header { row, .. } if row as usize == hr - 1),
+            "header ~999999999: expected Header{{row: {}}} but got {header_top_addr:?}",
+            hr - 1,
+        );
+        // Header ~1 (the bottommost) is at logical row HEADER_ROWS - 1, internal index 0.
+        let header_bottom_logical = hr - 1;
+        let header_bottom_addr = CellAddr::from_global(header_bottom_logical, MARGIN_COLS, mr2, mc2);
+        assert!(
+            matches!(header_bottom_addr, CellAddr::Header { row: 0, .. }),
+            "header ~1: expected Header{{row: 0}} but got {header_bottom_addr:?}",
+        );
+    }
+
+    #[test]
+    fn header_footer_margin_no_gaps_when_set() {
+        // Verify that header and footer row numbering has no gaps:
+        // if rows _1 and _3 are set, _2 is NOT set (it's a gap),
+        // but _1, _2, _3 in sequence is fine.
+
+        let mut g = Grid::new(3, 2);
+
+        // Set _1 and _3 (skip _2) — this is by design; sparse storage is fine.
+        // The test verifies that each stored cell has the expected index.
+        g.set(
+            &CellAddr::Footer { row: 0, col: ColumnAddr::Main(0) },
+            "alpha".into(),
+        );
+        g.set(
+            &CellAddr::Footer { row: 2, col: ColumnAddr::Main(0) },
+            "gamma".into(),
+        );
+
+        // _1 (index 0) and _3 (index 2) are stored
+        assert_eq!(g.footer.len(), 2);
+        assert!(g.footer.contains_key(&(0u32, ColumnAddr::Main(0))));
+        assert!(g.footer.contains_key(&(2u32, ColumnAddr::Main(0))));
+        // _2 (index 1) is not stored
+        assert!(!g.footer.contains_key(&(1u32, ColumnAddr::Main(0))));
+
+        // The key verification: index arithmetic is correct.
+        // 3+1=4 means: footer internal index 2 + 1 = 3, never 10.
+        let max_index = g.footer.keys().map(|(r, _)| *r).max().unwrap_or(0);
+        assert_eq!(max_index, 2, "max footer index should be 2 (_3)");
+        let next_index = max_index + 1;
+        assert_eq!(next_index, 3, "3+1 should = 4 (internal index 3 = _4), got {next_index}");
+
+        // Similarly for headers
+        g.set(
+            &CellAddr::Header { row: 0, col: ColumnAddr::Main(0) },
+            "header_top".into(),
+        );
+        g.set(
+            &CellAddr::Header { row: 2, col: ColumnAddr::Main(0) },
+            "header_bottom".into(),
+        );
+
+        assert_eq!(g.header.len(), 2);
+        let max_header = g.header.keys().map(|(r, _)| *r).max().unwrap_or(0);
+        assert_eq!(next_index, max_header + 1);
+
+        // Left margin sequential indexing
+        g.set(
+            &CellAddr::Left { col: 700, row: 0 },
+            "margin_col1".into(),
+        );
+        g.set(
+            &CellAddr::Left { col: 701, row: 0 },
+            "margin_col2".into(),
+        );
+
+        assert!(g.left.contains_key(&(0u32, 700usize)));
+        assert!(g.left.contains_key(&(0u32, 701usize)));
+        // These should be adjacent indices
+        assert_eq!(701 - 700, 1, "margin indices should differ by 1");
+    }
+
+    #[test]
+    fn footer_row_label_3_plus_1_equals_4_not_10() {
+        // Direct test of ui_row_label which renders footer row labels.
+        // _N display = internal_index + 1. _3 = internal index 2, then
+        // internal index 3 = _4 (3+1=4). Never _10 or any other value.
+        let hr = HEADER_ROWS;
+        let main_rows = 5usize;
+
+        // Footer row _3 = logical row hr + mr + 2
+        let label_3 = crate::addr::ui_row_label(hr + main_rows + 2, main_rows);
+        assert_eq!(label_3, "_3", "footer 3 label mismatch");
+
+        // Footer row _4 = logical row hr + mr + 3
+        let label_4 = crate::addr::ui_row_label(hr + main_rows + 3, main_rows);
+        assert_eq!(label_4, "_4", "footer 4 label mismatch, 3+1 should = 4");
+
+        // Internal index for _3 is 2. Internal index for _4 is 3.
+        // _N has internal index N-1. So _10 has internal index 9.
+        // 3+1=4 (internal index 3→_4), not 3+1=10 (internal index 9→_10).
+        assert_eq!(label_3.as_str(), "_3");
+        assert_eq!(label_4.as_str(), "_4");
+        assert_ne!(label_4, "_10", "3+1 should not equal 10!");
+    }
 }

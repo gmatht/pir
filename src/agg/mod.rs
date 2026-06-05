@@ -45,7 +45,6 @@ fn median_aggregate(mut xs: Vec<Number>) -> Option<Number> {
     }
 }
 
-#[optimize(speed)]
 fn collect_numbers_summable(grid: &Grid, range: &MainRange) -> Vec<Number> {
     let mut v = Vec::new();
     if range.is_empty() {
@@ -64,7 +63,6 @@ fn collect_numbers_summable(grid: &Grid, range: &MainRange) -> Vec<Number> {
     v
 }
 
-#[optimize(speed)]
 fn count_numeric_cells(grid: &Grid, range: &MainRange) -> usize {
     let mut n = 0usize;
     if range.is_empty() {
@@ -84,7 +82,6 @@ fn count_numeric_cells(grid: &Grid, range: &MainRange) -> usize {
 }
 
 /// Compute display string for an aggregate over `source` main cells.
-#[optimize(speed)]
 pub fn compute_aggregate(grid: &Grid, def: &AggregateDef) -> String {
     match def.func {
         AggFunc::Count => {
@@ -137,7 +134,6 @@ pub fn compute_aggregate(grid: &Grid, def: &AggregateDef) -> String {
 }
 
 /// Raw cell value for display.
-#[optimize(speed)]
 pub fn cell_display(grid: &Grid, addr: &CellAddr) -> String {
     // GridBox provides `text` which returns an owned String for the addr.
     grid.text(addr)

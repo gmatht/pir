@@ -37,7 +37,6 @@ pub struct DelimitedExportOptions {
 }
 
 impl Default for DelimitedExportOptions {
-#[inline(always)]
     fn default() -> Self {
         Self {
             include_header_row: true,
@@ -48,12 +47,10 @@ impl Default for DelimitedExportOptions {
     }
 }
 
-#[inline(always)]
 pub fn export_tsv(grid: &Grid, out: &mut dyn Write) {
     export_tsv_with_options(grid, out, &DelimitedExportOptions::default());
 }
 
-#[inline(always)]
 pub fn export_tsv_with_options(
     grid: &Grid,
     out: &mut dyn Write,
@@ -62,12 +59,10 @@ pub fn export_tsv_with_options(
     export_delimited(grid, out, '\t', options);
 }
 
-#[inline(always)]
 pub fn export_csv(grid: &Grid, out: &mut dyn Write) {
     export_csv_with_options(grid, out, &DelimitedExportOptions::default());
 }
 
-#[inline(always)]
 pub fn export_csv_with_options(
     grid: &Grid,
     out: &mut dyn Write,
@@ -77,7 +72,6 @@ pub fn export_csv_with_options(
 }
 
 /// Pad/truncate to `width` by Unicode scalar values; right-align (pads on the left) with `pad`.
-#[inline(always)]
 fn ascii_field(s: &str, width: usize, pad: char) -> String {
     if width == 0 {
         return String::new();
@@ -133,7 +127,6 @@ pub struct AsciiTableOptions {
 }
 
 impl Default for AsciiTableOptions {
-#[inline(always)]
     fn default() -> Self {
         Self {
             include_margins: true,
@@ -148,7 +141,6 @@ impl Default for AsciiTableOptions {
     }
 }
 
-#[inline(always)]
 fn ascii_pre(opts: &AsciiTableOptions) -> char {
     match opts.inter_cell_space {
         AsciiInterCellSpace::Space => ' ',
@@ -157,7 +149,6 @@ fn ascii_pre(opts: &AsciiTableOptions) -> char {
 }
 
 /// Append one cell: `pre` + right-aligned `text` in `w` (pad) + pre + `|`.
-#[inline(always)]
 fn ascii_push_cell(s: &mut String, pre: char, pad: char, text: &str, w: usize) {
     s.push(pre);
     s.push_str(&ascii_field(text, w, pad));
@@ -167,7 +158,6 @@ fn ascii_push_cell(s: &mut String, pre: char, pad: char, text: &str, w: usize) {
 
 /// `+---...---+` — optional row-label run (first block) is `-`. When `use_equals_in_main`, column
 /// runs for `c in main_c0..main_c1` use `=`, which matches the `data_frame` inner horizontals.
-#[inline(always)]
 fn ascii_border_line(
     with_row_gutter: bool,
     col_start: usize,
@@ -202,7 +192,6 @@ fn ascii_border_line(
     s
 }
 
-#[inline(always)]
 pub fn export_ascii_table_with_options(
     grid: &Grid,
     out: &mut dyn Write,
@@ -399,24 +388,20 @@ pub fn export_ascii_table_with_options(
 
 /// Renders a text table. For backward compatibility, [`export_ascii_table`] fixes `row_dividers`
 /// only; use [`export_ascii_table_with_options`] for full control.
-#[inline(always)]
 pub fn export_ascii_table(grid: &Grid, out: &mut dyn Write, row_dividers: bool) {
     let mut o = AsciiTableOptions::default();
     o.row_dividers = row_dividers;
     export_ascii_table_with_options(grid, out, &o);
 }
 
-#[inline(always)]
 pub fn export_all(grid: &Grid, out: &mut dyn Write) {
     export_all_with_options(grid, out, &DelimitedExportOptions::default());
 }
 
-#[inline(always)]
 pub fn export_all_with_options(grid: &Grid, out: &mut dyn Write, options: &DelimitedExportOptions) {
     export_delimited(grid, out, '\t', options);
 }
 
-#[inline(always)]
 pub fn export_odt_bytes(grid: &Grid) -> Result<Vec<u8>, std::io::Error> {
     let cursor = std::io::Cursor::new(Vec::new());
     let mut zip = zip::ZipWriter::new(cursor);
@@ -436,7 +421,6 @@ pub fn export_odt_bytes(grid: &Grid) -> Result<Vec<u8>, std::io::Error> {
     Ok(cursor.into_inner())
 }
 
-#[inline(always)]
 pub fn export_selection(
     grid: &Grid,
     out: &mut dyn Write,
@@ -482,7 +466,6 @@ pub fn export_selection(
 
 /// TSV/CSV main-only / selection header token: `<`/`>` margins or `A`/`B` (column letters).
 /// Generic mode shows `TAX` etc. on the bottom control header row, not in this synthetic label line.
-#[inline(always)]
 fn col_header_label_for_export(
     _grid: &Grid,
     global_col: usize,
@@ -499,13 +482,11 @@ fn col_header_label_for_export(
     }
 }
 
-#[inline(always)]
 fn ascii_col_header_label(global_col: usize, main_cols: usize) -> String {
     crate::addr::ui_column_fragment(global_col, main_cols)
 }
 
 /// With margins: [A / B / ]C (same in Generic; labeled-column titles appear on the `~1` control row).
-#[inline(always)]
 fn delimited_marginal_header_token(
     _grid: &Grid,
     global_col: usize,
@@ -515,7 +496,6 @@ fn delimited_marginal_header_token(
     crate::addr::ui_column_fragment(global_col, main_cols)
 }
 
-#[inline(always)]
 fn col_header_label(global_col: usize, main_cols: usize) -> String {
     let m = MARGIN_COLS;
     if global_col < m {
@@ -528,7 +508,6 @@ fn col_header_label(global_col: usize, main_cols: usize) -> String {
 }
 
 /// ODF `;` → Excel `,` in function call lists (TSV generic column).
-#[inline(always)]
 pub fn interop_excel_list_separators(s: &str) -> String {
     s.replace(';', ",")
 }
@@ -536,7 +515,6 @@ pub fn interop_excel_list_separators(s: &str) -> String {
 /// After rebase, the formula pretty-printer joins call arguments with `,`. ODF/Calc
 /// expects `;` between arguments; replace top-level-argument commas (inside parens) without
 /// touching commas inside string literals.
-#[inline(always)]
 fn interop_odf_function_commas_to_semicolons(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut depth = 0i32;
@@ -562,7 +540,6 @@ fn interop_odf_function_commas_to_semicolons(s: &str) -> String {
     out
 }
 
-#[inline(always)]
 fn finish_generic_interop(grid: &Grid, s: String, rebase: Option<(i32, i32)>) -> String {
     let Some((d_row, d_col)) = rebase else {
         return s;
@@ -579,7 +556,6 @@ fn finish_generic_interop(grid: &Grid, s: String, rebase: Option<(i32, i32)>) ->
 ///
 /// ODS re-import: apply the **inverse** shift (`-d_row, -d_col`) to `of:` bodies so they match
 /// Corro’s grid A1 again (see [`crate::ods::set_ods_cell_tsv_parity`]).
-#[inline(always)]
 fn delimited_generic_rebase(
     col_start: usize,
     col_end: usize,
@@ -606,7 +582,6 @@ fn delimited_generic_rebase(
 
 /// Re-export the same rebase the ODS/TSV `corro-ods-layout` block was built with, so the importer
 /// can run [`crate::formula::rebase_interop_formula_row_col`] with negated `(d_row, d_col)`.
-#[inline(always)]
 pub fn delimited_layout_generic_rebase(
     col_start: usize,
     col_end: usize,
@@ -623,7 +598,6 @@ pub fn delimited_layout_generic_rebase(
     )
 }
 
-#[inline(always)]
 fn selection_generic_rebase(
     cols: &[usize],
     include_header_row: bool,
@@ -644,7 +618,6 @@ fn selection_generic_rebase(
 }
 
 /// Same row/col semantics as delimited, matching [`export_ascii_table_with_options`]'s `writeln!` order.
-#[inline(always)]
 fn ascii_generic_rebase(
     col_start: usize,
     col_end: usize,
@@ -701,7 +674,6 @@ fn ascii_generic_rebase(
 ///
 /// The list-separator pass runs **after** [`finish_generic_interop`] (rebase), so
 /// `formula::rebase_interop_formula_row_col` always sees the same `;` tokenization as the grid.
-#[inline(always)]
 pub fn generic_interop_cell_text(
     grid: &Grid,
     logical_row: usize,
@@ -709,7 +681,6 @@ pub fn generic_interop_cell_text(
     rebase: Option<(i32, i32)>,
     excel_list_arg_comma: bool,
 ) -> Option<String> {
-#[inline(always)]
     fn after_rebase(s: &str, excel: bool) -> String {
         if excel {
             interop_excel_list_separators(s)
@@ -786,7 +757,6 @@ pub fn generic_interop_cell_text(
     None
 }
 
-#[inline(always)]
 fn aggregate_formula_name(raw: &str) -> Option<&'static str> {
     use crate::ops::AggFunc;
     match crate::ops::margin_key_agg_func(raw)? {
@@ -799,7 +769,6 @@ fn aggregate_formula_name(raw: &str) -> Option<&'static str> {
     }
 }
 
-#[inline(always)]
 fn right_margin_aggregate_formula_name(grid: &Grid, global_col: usize) -> Option<&'static str> {
     let main_cols = grid.main_cols();
     let mut labels: Vec<(u32, String)> = grid
@@ -815,7 +784,6 @@ fn right_margin_aggregate_formula_name(grid: &Grid, global_col: usize) -> Option
         .find_map(|(_, val)| aggregate_formula_name(&val))
 }
 
-#[inline(always)]
 fn main_row_aggregate_formula_name(grid: &Grid, main_row: usize) -> Option<&'static str> {
     let label = grid.text(&CellAddr::Left {
         col: MARGIN_COLS - 1,
@@ -824,7 +792,6 @@ fn main_row_aggregate_formula_name(grid: &Grid, main_row: usize) -> Option<&'sta
     aggregate_formula_name(&label)
 }
 
-#[inline(always)]
 fn raw_main_row_runs_before_aggregate(grid: &Grid, current_main_row: usize) -> Vec<(usize, usize)> {
     let mut start = 0usize;
     for candidate in (0..current_main_row).rev() {
@@ -840,7 +807,6 @@ fn raw_main_row_runs_before_aggregate(grid: &Grid, current_main_row: usize) -> V
     }
 }
 
-#[inline(always)]
 fn non_aggregate_main_row_runs(grid: &Grid) -> Vec<(usize, usize)> {
     let mut runs = Vec::new();
     let mut start: Option<usize> = None;
@@ -863,7 +829,6 @@ fn non_aggregate_main_row_runs(grid: &Grid) -> Vec<(usize, usize)> {
     runs
 }
 
-#[inline(always)]
 fn aggregate_formula_over_runs(
     func: &str,
     col: &str,
@@ -893,7 +858,6 @@ fn aggregate_formula_over_runs(
     }
 }
 
-#[inline(always)]
 fn left_margin_row_aggregate_formula(
     grid: &Grid,
     logical_row: usize,
@@ -920,7 +884,6 @@ fn left_margin_row_aggregate_formula(
     Some(format!("={body}"))
 }
 
-#[inline(always)]
 fn right_margin_row_aggregate_formula(
     grid: &Grid,
     logical_row: usize,
@@ -939,7 +902,6 @@ fn right_margin_row_aggregate_formula(
     Some(format!("={func}(A{row}:{last_col}{row})"))
 }
 
-#[inline(always)]
 fn footer_column_aggregate_formula(
     grid: &Grid,
     logical_row: usize,
@@ -965,7 +927,6 @@ fn footer_column_aggregate_formula(
     Some(format!("={body}"))
 }
 
-#[inline(always)]
 fn sheet_row_label(logical_row: usize, main_rows: usize) -> String {
     let hr = HEADER_ROWS;
     if logical_row < hr {
@@ -978,7 +939,6 @@ fn sheet_row_label(logical_row: usize, main_rows: usize) -> String {
     }
 }
 
-#[inline(always)]
 fn cell_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> String {
     let hr = HEADER_ROWS;
     let mr = grid.main_rows();
@@ -1023,7 +983,6 @@ fn cell_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> String {
     }
 }
 
-#[inline(always)]
 fn rendered_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> String {
     use crate::grid::SheetCursor;
     let cur = SheetCursor {
@@ -1035,7 +994,6 @@ fn rendered_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> Stri
     crate::ui::format_cell_display(grid, &addr, text)
 }
 
-#[inline(always)]
 fn rendered_value_at_ascii(grid: &Grid, logical_row: usize, global_col: usize) -> String {
     let hr = HEADER_ROWS;
     let mr = grid.main_rows();
@@ -1073,7 +1031,6 @@ fn rendered_value_at_ascii(grid: &Grid, logical_row: usize, global_col: usize) -
 /// For [`ExportContent::Generic`] only, `generic_excel_list_arg_comma` is passed to
 /// [`generic_interop_cell_text`]: `true` = Excel/TSV (`,` between function args), `false` = ODF /
 /// LibreOffice in `of:` (`;` between args). Ignored for other modes (pass `true`).
-#[inline(always)]
 pub fn export_cell_text(
     grid: &Grid,
     logical_row: usize,
@@ -1098,18 +1055,15 @@ pub fn export_cell_text(
     }
 }
 
-#[inline(always)]
 fn needs_csv_quoting(s: &str, delim: char) -> bool {
     s.contains(delim) || s.contains('"') || s.contains('\n') || s.contains('\r')
 }
 
-#[inline(always)]
 fn csv_quote(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
 /// Column span and row order for TSV/CSV; must match [`export_delimited`].
-#[inline(always)]
 fn delimited_table_col_span_and_rows(
     grid: &Grid,
     options: &DelimitedExportOptions,
@@ -1213,7 +1167,6 @@ fn delimited_table_col_span_and_rows(
 
 /// Rebase (Δrow, Δcol) for interop `=…` for the given delimited layout ([`delimited_export_matrix`]
 /// uses the same span and row list as this).
-#[inline(always)]
 pub fn delimited_options_generic_rebase(
     grid: &Grid,
     options: &DelimitedExportOptions,
@@ -1230,12 +1183,10 @@ pub fn delimited_options_generic_rebase(
 
 /// Rebase (Δrow, Δcol) for interop `=…` relative to a default TSV/CSV table (A1 = file top-left
 /// with header row, margins, and row key column; same layout as `DelimitedExportOptions::default`).
-#[inline(always)]
 pub fn delimited_default_generic_rebase(grid: &Grid) -> (i32, i32) {
     delimited_options_generic_rebase(grid, &DelimitedExportOptions::default())
 }
 
-#[inline(always)]
 fn export_delimited(
     grid: &Grid,
     out: &mut dyn Write,
@@ -1341,7 +1292,6 @@ fn export_delimited(
 /// Matrix of the same text [`export_tsv_with_options`] / [`export_delimited`] would write (one
 /// row per `Vec`, fields tab-separated in the original output). For ODS, this matches LibreOffice
 /// A1/row 1+ layout when a header row and row-key column are used.
-#[inline(always)]
 pub fn delimited_export_matrix(
     grid: &Grid,
     options: &DelimitedExportOptions,
@@ -1405,7 +1355,6 @@ pub fn delimited_export_matrix(
     (out, col_start, col_end, rows)
 }
 
-#[inline(always)]
 fn odt_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -1413,7 +1362,6 @@ fn odt_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-#[inline(always)]
 fn odt_content_xml(grid: &Grid) -> String {
     let mr = grid.main_rows();
     let tc = grid.total_cols();
@@ -1452,7 +1400,6 @@ fn odt_content_xml(grid: &Grid) -> String {
     s
 }
 
-#[inline(always)]
 fn ascii_row_bounds(grid: &Grid) -> (usize, usize) {
     let hr = HEADER_ROWS;
     let mr = grid.main_rows();
@@ -1464,7 +1411,6 @@ fn ascii_row_bounds(grid: &Grid) -> (usize, usize) {
     }
 }
 
-#[inline(always)]
 fn ascii_col_bounds(grid: &Grid) -> (usize, usize) {
     let tc = grid.total_cols();
     let mut start = 0;
@@ -1478,7 +1424,6 @@ fn ascii_col_bounds(grid: &Grid) -> (usize, usize) {
     (start, end.max(start + 1))
 }
 
-#[inline(always)]
 fn odt_manifest_xml() -> String {
     String::from(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1490,7 +1435,6 @@ fn odt_manifest_xml() -> String {
 }
 
 /// Min/max main **row** indices (0-based) with any main/margin content.
-#[inline(always)]
 fn main_row_index_bounds_for_export(grid: &Grid) -> Option<(usize, usize)> {
     let mut set = HashSet::new();
     for (addr, _) in grid.iter_nonempty() {
@@ -1513,7 +1457,6 @@ fn main_row_index_bounds_for_export(grid: &Grid) -> Option<(usize, usize)> {
     }
 }
 
-#[inline(always)]
 fn row_order(grid: &Grid, _total_rows: usize) -> Vec<usize> {
     let hr = HEADER_ROWS;
     let mr = grid.main_rows();
@@ -1550,7 +1493,6 @@ fn row_order(grid: &Grid, _total_rows: usize) -> Vec<usize> {
     rows
 }
 
-#[inline(always)]
 pub fn export_sorted_tsv(grid: &Grid, out: &mut dyn Write, sort_cols: &[usize]) {
     let mr = grid.main_rows();
     let mc = grid.main_cols();
@@ -1608,7 +1550,6 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
-#[inline(always)]
     fn load_fixture(path: &Path) -> crate::ops::WorkbookState {
         let data = std::fs::read_to_string(path).unwrap();
         let mut workbook = crate::ops::WorkbookState::new();
@@ -1630,7 +1571,6 @@ mod tests {
     /// `split_top_level_args` must treat `;` like `,` (ODF / aggregate multi-range) or rebase is a
     /// no-op and refs stay in grid-space (`A1` instead of the exported sheet’s `C3`).
     #[test]
-#[inline(always)]
     fn rebase_interop_shifts_max_with_semicolon_list_separator() {
         let out = crate::formula::rebase_interop_formula_row_col("=MAX(A1:A5;A7:A9)", 2, 2, 4);
         assert_eq!(out, "=MAX(C3:C7,C9:C11)");
@@ -1639,7 +1579,6 @@ mod tests {
     /// After a successful rebase, the pretty-printer joins args with `,`; ODF still
     /// needs `;` between function arguments.
     #[test]
-#[inline(always)]
     fn odf_interop_rewrites_commas_in_calls_to_semicolons() {
         assert_eq!(
             interop_odf_function_commas_to_semicolons("=MAX(C3:C7,C9:C11)"),
@@ -1647,14 +1586,12 @@ mod tests {
         );
     }
 
-#[inline(always)]
     fn parse_delimited(data: &str, delim: char) -> Vec<Vec<String>> {
         data.lines()
             .map(|line| parse_delimited_line(line, delim))
             .collect()
     }
 
-#[inline(always)]
     fn parse_delimited_line(line: &str, delim: char) -> Vec<String> {
         let mut fields = Vec::new();
         let mut current = String::new();
@@ -1692,7 +1629,6 @@ mod tests {
 
     /// Same field rules as [`export_delimited`], for comparing CSV vs TSV without evaluating
     /// volatile formulas twice (two full exports can shift `NOW()` between passes).
-#[inline(always)]
     fn matrix_render_same_as_export(rows: &[Vec<String>], delim: char) -> String {
         let mut out = String::new();
         for row in rows {
@@ -1714,7 +1650,6 @@ mod tests {
     }
 
     #[test]
-#[inline(always)]
     fn ascii_table_trims_empty_margin_columns() {
         let mut g = crate::grid::Grid::new(3, 1);
         g.set(&CellAddr::Main { row: 0, col: 0 }, "Aasdf".into());
@@ -1730,7 +1665,6 @@ mod tests {
     }
 
     #[test]
-#[inline(always)]
     fn ascii_headers_use_ui_margin_notation() {
         let mut g = crate::grid::Grid::new(1, 1);
         g.set(&CellAddr::Left { row: 0, col: 0 }, "L".into());
@@ -1744,7 +1678,6 @@ mod tests {
     }
 
     #[test]
-#[inline(always)]
     fn ascii_values_shows_total_label_for_stored_eq_total() {
         let mut g = crate::grid::Grid::new(3, 1);
         g.set(&CellAddr::Main { row: 0, col: 0 }, "1".into());
@@ -1761,7 +1694,6 @@ mod tests {
     }
 
     #[test]
-#[inline(always)]
     fn colwidth_fixture_keeps_column_a_narrow_and_b_wide() {
         use std::path::Path;
 
@@ -1787,7 +1719,6 @@ mod tests {
     }
 
     #[test]
-#[inline(always)]
     fn ascii_export_uses_rendered_widths() {
         use std::path::Path;
 
@@ -1822,7 +1753,6 @@ mod tests {
     /// directive uses interop `=SUBTOTAL(9,…)` while the TUI still shows `TOTAL`. True `=SUBTOTAL(4,…)`
     /// interop is a formula whose **Values** are numeric, never the label word `MAX`.
     #[test]
-#[inline(always)]
     fn subtotal_delimited_values_match_computed_display_and_generic_matches_non_formula() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("subtotal.corro");
         let workbook = load_fixture(&path);
@@ -1846,7 +1776,6 @@ mod tests {
         let h = if opts_v.include_header_row { 1 } else { 0 };
         let rk = if opts_v.include_row_label_column { 1 } else { 0 };
 
-#[inline(always)]
         fn is_subtotal_following_label_replaced_by_interop(s: &str) -> bool {
             matches!(
                 s.trim().to_ascii_uppercase().as_str(),
@@ -1942,7 +1871,6 @@ mod tests {
     /// and with no column header `=TOTAL`) must stay the literal `TOTAL` in Generic export, not
     /// `=SUBTOTAL(9,…)` over the main block.
     #[test]
-#[inline(always)]
     fn generic_bare_text_total_in_cell_stays_total_not_subtotal_range() {
         use crate::grid::HEADER_ROWS;
 
@@ -1987,7 +1915,6 @@ mod tests {
     /// the *word* `MAX` — a fact the delimited matrix test does not see when it `continue`s on
     /// `=…` Generic cells. This pins that semantic.
     #[test]
-#[inline(always)]
     fn subtotal4_eval_result_is_not_string_max() {
         use crate::grid::HEADER_ROWS;
 
@@ -2015,7 +1942,6 @@ mod tests {
     }
 
     #[test]
-#[inline(always)]
     fn tsv_export_keeps_left_margin_columns() {
         let mut grid = crate::grid::Grid::new(2, 2);
         grid.set(&CellAddr::Header { row: 0, col: crate::grid::ColumnAddr::Left(0) }, "HDR".into());
@@ -2036,7 +1962,6 @@ mod tests {
     }
 
     #[test]
-#[inline(always)]
     fn csv_and_tsv_exports_match_for_docs_fixtures() {
         let fixtures_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/tests");
         let mut fixtures: Vec<PathBuf> = std::fs::read_dir(&fixtures_dir)
@@ -2064,7 +1989,6 @@ mod tests {
     }
 
     #[test]
-#[inline(always)]
     fn delimited_omit_header_row_starts_with_data() {
         let mut grid = crate::grid::Grid::new(2, 2);
         grid.set(&CellAddr::Main { row: 0, col: 0 }, "V1".into());
@@ -2084,7 +2008,6 @@ mod tests {
     }
 
     #[test]
-#[inline(always)]
     fn delimited_main_only_can_keep_row_key_without_margins() {
         let mut grid = crate::grid::Grid::new(2, 2);
         grid.set(&CellAddr::Main { row: 0, col: 0 }, "V1".into());
@@ -2108,7 +2031,6 @@ mod tests {
     }
 
     #[test]
-#[inline(always)]
     fn generic_tsv_uses_tsv_header_and_interop_formula() {
         use crate::grid::HEADER_ROWS;
 
@@ -2158,7 +2080,6 @@ grid.set(
     /// A real `=SUBTOTAL(4;…)` (stored formula) should use `,` in function lists for Excel/TSV.
     /// Bare `MAX` labels no longer go through that path (see `subtotal_code_for_label`).
     #[test]
-#[inline(always)]
     fn generic_tsv_subtotal_formula_uses_excel_list_commas() {
         use crate::grid::HEADER_ROWS;
 
@@ -2196,9 +2117,7 @@ grid.set(
     /// Values must match the edited source for every exported main data cell (including formulas whose
     /// values changed because of the edit).
     #[test]
-#[inline(always)]
     fn generic_tsv_target_parallel_data_edit_values_match_source() {
-#[inline(always)]
         fn target_grid_from_matrix(m: &[Vec<String>]) -> crate::grid::GridBox {
             let rows = m.len().max(1);
             let cols = m.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
@@ -2319,9 +2238,7 @@ grid.set(
     /// where the right-margin `TOTAL` cell is a static value. If only the source data cell and the
     /// corresponding exported target field change, the target's total must still recompute.
     #[test]
-#[inline(always)]
     fn generic_tsv_target_right_margin_total_recomputes_after_parallel_data_edit() {
-#[inline(always)]
         fn target_grid_from_matrix(m: &[Vec<String>]) -> crate::grid::GridBox {
             let rows = m.len().max(1);
             let cols = m.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
@@ -2418,9 +2335,7 @@ grid.set(
     /// rendered Values in Generic export. If the exported target's source data changes, the footer
     /// must recompute from formulas over the target columns.
     #[test]
-#[inline(always)]
     fn generic_tsv_target_footer_total_recomputes_after_parallel_data_edit() {
-#[inline(always)]
         fn target_grid_from_matrix(m: &[Vec<String>]) -> crate::grid::GridBox {
             let rows = m.len().max(1);
             let cols = m.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
@@ -2543,7 +2458,6 @@ grid.set(
 
     /// TSV/ODS generic strings match after `,` / `;` in function-argument positions (Subtotal).
 #[test]
-#[inline(always)]
 fn generic_ods_reuses_tsv_interop_excel_list_swap() {
         use crate::grid::HEADER_ROWS;
 
@@ -2572,7 +2486,6 @@ fn generic_ods_reuses_tsv_interop_excel_list_swap() {
     /// reported Err:508 on `MAX(A1:B1,A2:B2)`-style commas; TSV still uses commas after
     /// [interop_excel_list_separators].
     #[test]
-#[inline(always)]
     fn generic_footer_max_multirange_ods_semicolon_tsv_comma() {
         use crate::grid::HEADER_ROWS;
 
@@ -2629,7 +2542,6 @@ fn generic_ods_reuses_tsv_interop_excel_list_swap() {
     }
 
     #[test]
-#[inline(always)]
     fn selection_omit_header_row_is_data_first() {
         use crate::grid::HEADER_ROWS;
 
@@ -2669,7 +2581,6 @@ fn generic_ods_reuses_tsv_interop_excel_list_swap() {
     }
 
     #[test]
-#[inline(always)]
     fn ascii_ems_space_in_cell_glue() {
         let mut g = crate::grid::Grid::new(3, 1);
         g.set(&CellAddr::Main { row: 0, col: 0 }, "x".into());
@@ -2686,7 +2597,6 @@ fn generic_ods_reuses_tsv_interop_excel_list_swap() {
     }
 
     #[test]
-#[inline(always)]
     fn ascii_omit_row_label_column_starts_with_column_not_row_numbers() {
         let mut g = crate::grid::Grid::new(3, 1);
         g.set(&CellAddr::Main { row: 0, col: 0 }, "x".into());
@@ -2708,7 +2618,6 @@ fn generic_ods_reuses_tsv_interop_excel_list_swap() {
     }
 
     #[test]
-#[inline(always)]
     fn ascii_omit_column_label_row_goes_straight_to_data() {
         let mut g = crate::grid::Grid::new(3, 1);
         g.set(&CellAddr::Main { row: 0, col: 0 }, "val".into());
@@ -2731,7 +2640,6 @@ fn generic_ods_reuses_tsv_interop_excel_list_swap() {
     }
 
     #[test]
-#[inline(always)]
     fn ascii_header_data_separator_none_drops_line_between_label_and_data() {
         let mut g = crate::grid::Grid::new(3, 1);
         g.set(&CellAddr::Main { row: 0, col: 0 }, "z".into());

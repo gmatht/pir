@@ -443,8 +443,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             }
 
             if !did_spill {
-                // Include the 1-char inter-column gap as available width
-                // (matching ratatui: trailing width is part of the cell's space)
+                // Include the inter-column gap in available width so that
+                // cell text can use the gap character as overflow room,
+                // matching ratatui's rendering.
                 let avail_width = if fw > cw { cw + gap_width } else { cw };
                 let display_text = if formatted.is_empty() {
                     String::new()
