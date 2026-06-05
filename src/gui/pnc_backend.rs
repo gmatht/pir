@@ -1,4 +1,5 @@
-use crate::grid::{CellAddr, HEADER_ROWS, MARGIN_COLS};
+use crate::formula::cell_effective_display;
+use crate::grid::{CellAddr, ColumnAddr, TextAlign, HEADER_ROWS, MARGIN_COLS};
 use crate::ui_core::{
     self, main_col_window, rendered_width_for_column, right_nonblank_end,
 };
@@ -55,7 +56,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     // ── Visible columns (matching ratatui's visible_col_indices) ──────
     let right_start = lm + mc;
-    let (main_lo, main_hi) = main_col_window(&sheet_rec, cursor);
+    let (_main_lo, main_hi) = main_col_window(&sheet_rec, cursor);
 
     let right_band: Vec<usize> = match right_nonblank_end(&sheet_rec) {
         Some(end) => (0..=end).map(|i| right_start + i).collect(),
@@ -103,50 +104,81 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     }
     spreadsheet.set_row_labels(row_labels);
 
-    // Cell data for main data rows
+    // ── Cell data for ALL visible rows and columns ────────────────────
     for (ri, &logical_row) in display_rows.iter().enumerate() {
-        if logical_row >= hr && logical_row < hr + mr {
-            let main_row = (logical_row - hr) as u32;
-            for &c in &col_ixs {
-                if c >= lm && c < lm + mc {
-                    let main_col = (c - lm) as u32;
-                    let addr = CellAddr::Main {
-                        row: main_row,
-                        col: main_col,
-                    };
-                    if let Some(val) = g.get(&addr) {
-                        let formatted =
-                            ui_core::format_cell_display(g, &addr, val);
-                        let cw = *col_widths.get(&c).unwrap_or(&4);
-                        let fw = formatted.width();
-                        let align =
-                            ui_core::effective_cell_align(g, &addr, &formatted);
-                        let inner = if fw > cw {
+        for &c in &col_ixs {
+            // Determine the CellAddr for this visible cell
+            let addr = if logical_row < hr {
+                let hdr_row = (hr - 1 - logical_row) as u32;
+                if c < lm {
+                    CellAddr::Header { row: hdr_row, col: ColumnAddr::Left(c) }
+                } else if c < lm + mc {
+                    CellAddr::Header { row: hdr_row, col: ColumnAddr::Main((c - lm) as u32) }
+                } else {
+                    CellAddr::Header { row: hdr_row, col: ColumnAddr::Right(c - lm - mc) }
+                }
+            } else if logical_row < hr + mr {
+                let main_row = (logical_row - hr) as u32;
+                if c < lm {
+                    CellAddr::Left { row: main_row, col: c }
+                } else if c < lm + mc {
+                    CellAddr::Main { row: main_row, col: (c - lm) as u32 }
+                } else {
+                    CellAddr::Right { row: main_row, col: c - lm - mc }
+                }
+            } else {
+                let ftr_row = (logical_row - hr - mr) as u32;
+                if c < lm {
+                    CellAddr::Footer { row: ftr_row, col: ColumnAddr::Left(c) }
+                } else if c < lm + mc {
+                    CellAddr::Footer { row: ftr_row, col: ColumnAddr::Main((c - lm) as u32) }
+                } else {
+                    CellAddr::Footer { row: ftr_row, col: ColumnAddr::Right(c - lm - mc) }
+                }
+            };
+
+            let cw = *col_widths.get(&c).unwrap_or(&4);
+
+            // Widget column index in the cells map:
+            // For main columns (c in [lm, lm+mc)): c - lm
+            // For right-margin columns: c - lm = mc + right_idx
+            // Left-margin columns are not stored (widget doesn't render them)
+            let widget_col = c.saturating_sub(lm);
+
+            let raw_opt = g.get(&addr);
+            if let Some(ref raw) = raw_opt {
+                // Only store cell content for main and right-margin columns
+                if c >= lm {
+                    // Store raw value in raw_cells for formula bar display
+                    spreadsheet.set_raw_cell(ri as u32, widget_col as u32, raw);
+
+                    // For display: use evaluated/formatted text
+                    let effective = cell_effective_display(g, &addr);
+                    let formatted = ui_core::format_cell_display(g, &addr, effective);
+                    let fw = formatted.width();
+                    let align = ui_core::effective_cell_align(g, &addr, &formatted);
+
+                    let display_text = if fw > cw {
+                        if align == Some(TextAlign::Right) || align == Some(TextAlign::Default) {
                             ui_core::shrink_numeric_display(&formatted, cw)
                                 .or_else(|| {
-                                    ui_core::exponential_numeric_display(
-                                        &formatted, cw,
-                                    )
+                                    ui_core::exponential_numeric_display(&formatted, cw)
                                 })
                                 .unwrap_or_else(|| {
-                                    ui_core::truncate_with_ellipsis(
-                                        &formatted, cw,
-                                    )
+                                    ui_core::truncate_with_ellipsis(&formatted, cw)
                                 })
                         } else {
-                            formatted
-                        };
-                        let disp =
-                            ui_core::align_cell_display(inner.clone(), cw, align);
-                        spreadsheet.set_cell(ri as u32, main_col, &disp);
-                        spreadsheet.set_raw_cell(ri as u32, main_col, &inner);
-                        // Set raw cell at (0, 0) for A1 so the formula bar
-                        // (cursor defaults to row 0) shows the correct value
-                        if main_row == 0 && main_col == 0 {
-                            spreadsheet.set_raw_cell(0, 0, &inner);
+                            formatted.to_string()
                         }
-                    }
+                    } else {
+                        formatted.to_string()
+                    };
+
+                    spreadsheet.set_cell(ri as u32, widget_col as u32, &display_text);
                 }
+            } else if c >= lm && c < lm + mc {
+                // Empty cell marker for main columns (stops overflow from previous column)
+                spreadsheet.set_cell(ri as u32, widget_col as u32, "");
             }
         }
     }
