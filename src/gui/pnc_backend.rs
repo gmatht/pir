@@ -143,6 +143,24 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     display_rows.extend(main_order.iter().map(|r| hr + r));
     display_rows.extend(footer_rows.iter());
 
+    // ── Available data width (matching ratatui's data_width) ──────────
+    let term_cols = {
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0
+        {
+            ws.ws_col as usize
+        } else {
+            std::env::var("COLUMNS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(80)
+        }
+    };
+    let data_width = term_cols
+        .saturating_sub(2)
+        .saturating_sub(ui_core::ROW_LABEL_CHARS)
+        .max(1);
+
     // ── Visible columns (matching ratatui's visible_col_indices) ──────
     let right_start = lm + mc;
     let (_main_lo, main_hi) = main_col_window(&sheet_rec, cursor);
@@ -153,7 +171,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     }
     col_ixs.extend((0..=main_hi as usize).map(|ci| lm + ci));
     // Include right-margin columns with content (matching ratatui's
-    // right_nonblank_end approach), and a few blank columns for fill.
+    // right_nonblank_end approach).
     if let Some(end) = ui_core::right_nonblank_end(&sheet_rec) {
         for i in 0..=end {
             let gc = right_start + i;
@@ -162,14 +180,12 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             }
         }
     }
-    // Add a limited number of blank right-margin columns for viewport fill
+    // Fill remaining viewport space with blank right-margin columns
     // (matching ratatui's fill-until-dim approach).
-    let existing_right: Vec<usize> = col_ixs.iter()
-        .filter(|&&c| c >= right_start)
-        .copied()
-        .collect();
-    let max_blank = 30usize.min(rm);
-    for i in 0..max_blank {
+    let total_so_far = col_ixs.len();
+    let dim = data_width.checked_div(2).unwrap_or(1).max(1);
+    let blank_cols_needed = dim.saturating_sub(total_so_far).max(1);
+    for i in 0..blank_cols_needed.min(rm) {
         let gc = right_start + i;
         if !col_ixs.contains(&gc) {
             col_ixs.push(gc);
@@ -178,20 +194,6 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     col_ixs.sort_unstable();
     col_ixs.dedup();
 
-    // ── Refit visible columns to available terminal width ─────────────
-    let data_width = {
-        let cols = unsafe {
-            let mut ws: libc::winsize = std::mem::zeroed();
-            if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
-                ws.ws_col as usize
-            } else {
-                std::env::var("COLUMNS").ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(80)
-            }
-        };
-        cols.saturating_sub(2).saturating_sub(ui_core::ROW_LABEL_CHARS).max(1)
-    };
     // Trim columns to fit data_width (matching ratatui draw() order;
     // ratatui's draw() does NOT call fit_visible_columns_capped).
     trim_visible_cols_to_width(&sheet_rec.grid, &mut col_ixs, cursor.col, data_width);
