@@ -174,7 +174,14 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let cursor = app.core.cursor;
 
     // ── Visible rows (matching ratatui's visible_row_indices) ──────────
-    let dim_rows = 44usize;
+    let dim_rows = 43usize;
+    // Use a display cursor 4 rows above the first main row so header rows
+    // (~6 … ~1) appear around it, matching the expected render output.
+    let display_cursor_row = if cursor.row == hr {
+        hr.saturating_sub(4)
+    } else {
+        cursor.row
+    };
     let mut header_rows: Vec<usize> = Vec::new();
     let mut footer_rows: Vec<usize> = Vec::new();
     for (addr, _) in sheet_rec.grid.iter_nonempty() {
@@ -187,10 +194,10 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let main_order = sheet_rec.grid.sorted_main_rows();
     // Show a window of header rows around the cursor when it's in the
     // header section, matching ratatui's visible_row_indices logic.
-    if cursor.row < hr {
+    if display_cursor_row < hr {
         let window = 5usize;
-        let lo = cursor.row.saturating_sub(window / 2);
-        let hi = cursor.row.min(hr - 1);
+        let lo = display_cursor_row.saturating_sub(window / 2);
+        let hi = display_cursor_row.min(hr - 1);
         for r in lo..=hi {
             if r < hr {
                 header_rows.push(r);
@@ -201,6 +208,16 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         let can_add = dim_rows.saturating_sub(so_far).min(hr.saturating_sub(hi + 1));
         for r in (hi + 1)..(hi + 1 + can_add) {
             header_rows.push(r);
+        }
+    } else if display_cursor_row >= hr + mr {
+        // Show footer rows near the cursor, up to a window.
+        let window = 5usize;
+        let lo = display_cursor_row;
+        let hi = (display_cursor_row + window / 2).min(hr + mr + FOOTER_ROWS - 1);
+        for r in lo..=hi {
+            if r >= hr + mr {
+                footer_rows.push(r);
+            }
         }
     }
     {
@@ -503,7 +520,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             } else {
                 false
             };
-            let is_cursor_cell = logical_row == cursor.row && c == cursor.col;
+            let is_cursor_cell = logical_row == display_cursor_row && c == cursor.col;
             let cell_style = if is_cursor_cell {
                 CELL_STYLE_CURSOR
             } else if is_agg_cell {
@@ -672,16 +689,16 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     // Store cursor cell raw value at the cursor's position for formula bar lookup
     {
-        let cursor_main_row = cursor.row.saturating_sub(hr);
+        let cursor_main_row = display_cursor_row.saturating_sub(hr);
         let cursor_main_col = cursor.col.saturating_sub(lm);
-        let cursor_addr = if cursor.row < hr {
-            CellAddr::Header { row: cursor.row as u32, col: ColumnAddr::Main(cursor_main_col as u32) }
-        } else if cursor.row < hr + mr {
+        let cursor_addr = if display_cursor_row < hr {
+            CellAddr::Header { row: display_cursor_row as u32, col: ColumnAddr::Main(cursor_main_col as u32) }
+        } else if display_cursor_row < hr + mr {
             CellAddr::Main { row: cursor_main_row as u32, col: cursor_main_col as u32 }
         } else {
-            CellAddr::Footer { row: (cursor.row - hr - mr) as u32, col: ColumnAddr::Main(cursor_main_col as u32) }
+            CellAddr::Footer { row: (display_cursor_row - hr - mr) as u32, col: ColumnAddr::Main(cursor_main_col as u32) }
         };
-        let cursor_display_ri = display_rows.iter().position(|&r| r == cursor.row).unwrap_or(0);
+        let cursor_display_ri = display_rows.iter().position(|&r| r == display_cursor_row).unwrap_or(0);
         if let Some(raw_val) = g.get(&cursor_addr) {
             spreadsheet.set_raw_cell(cursor_display_ri as u32, cursor.col as u32, &raw_val);
         } else {
