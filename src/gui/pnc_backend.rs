@@ -184,20 +184,17 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         }
     }
     let main_order = sheet_rec.grid.sorted_main_rows();
-    header_rows.sort_unstable();
-    header_rows.dedup();
-    footer_rows.sort_unstable();
-    footer_rows.dedup();
-    // Fill remaining viewport space with blank footer rows to fill the
-    // visible grid area (matching ratatui's visible_row_indices dim).
+    // Match ratatui's visible_row_indices order: compute content_count
+    // BEFORE sorting/dedup so that duplicate entries inflate the count
+    // and produce the same blank_needed value.
     let content_count = header_rows.len() + main_order.len() + footer_rows.len();
     let dim_rows = 44usize;
     let blank_needed = dim_rows.saturating_sub(content_count);
-    if blank_needed > 0 {
-        for i in 0..blank_needed {
-            footer_rows.push(hr + mr + i);
-        }
+    for i in 0..blank_needed {
+        footer_rows.push(hr + mr + i);
     }
+    header_rows.sort_unstable();
+    header_rows.dedup();
     footer_rows.sort_unstable();
     footer_rows.dedup();
 
