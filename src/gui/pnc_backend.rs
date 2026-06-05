@@ -621,19 +621,13 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         spreadsheet.set_cursor(cursor_display_ri as u32, cursor.col as u32);
     }
 
-    // Tab bar (match ratatui format: " Sheet1    Sheet2    Sheet3    Sheet1 Copy ")
+    // Tab bar (styled matching ratatui: inactive=white fg+gray bg, active=bold+black fg+yellow bg)
     if app.core.workbook.sheet_count() > 1 {
-        let tabs: String = app.core.workbook.sheets.iter().enumerate()
-            .flat_map(|(idx, sheet)| {
-                let mut parts = Vec::new();
-                if idx > 0 {
-                    parts.push("  ".to_string());
-                }
-                parts.push(format!(" {} ", sheet.title));
-                parts
-            })
+        let titles: Vec<String> = app.core.workbook.sheets.iter()
+            .map(|s| s.title.clone())
             .collect();
-        spreadsheet.set_tab_text(&tabs);
+        let active = app.core.workbook.active_sheet;
+        spreadsheet.set_tab_data(&titles, active);
     }
 
     // Border title
