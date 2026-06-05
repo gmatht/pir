@@ -6,7 +6,8 @@ use crate::grid::{CellAddr, ColumnAddr, GridBox, MainRange, NumberFormat, HEADER
 use crate::ops::{margin_key_agg_func, AggFunc, AggregateDef};
 use crate::ui_core::align_cell_display;
 use crate::ui_core::{
-    self, exponential_numeric_display_with_hint, main_col_window, would_ellipsis_hide_decimal_point,
+    self, exponential_numeric_display_with_hint, main_col_window, take_display_prefix,
+    truncate_with_ellipsis, would_ellipsis_hide_decimal_point,
 };
 use std::collections::HashMap;
 use rustxwidgets::backends_pancurses_adapter::*;
@@ -249,7 +250,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         };
         let row_agg = row_agg_func[ri];
 
-        for &c in &col_ixs {
+        let mut col_ix = 0usize;
+        while col_ix < col_ixs.len() {
+            let c = col_ixs[col_ix];
             // Determine the CellAddr for this visible cell
             let addr = if logical_row < hr {
                 let hdr_row = logical_row as u32;
@@ -364,49 +367,125 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             let allow_spill = fw > cw
                 && (align.is_none() || align == Some(crate::grid::TextAlign::Left))
                 && !is_agg_cell;
-            let display_text = if formatted.is_empty() {
-                String::new()
-            } else if allow_spill {
-                formatted.to_string()
-            } else if fw > cw {
-                let cell_fmt = g.format_for_addr(&addr);
-                let rational_hint = if matches!(cell_fmt.number, None | Some(NumberFormat::Rational | NumberFormat::DecimalGeneric))
-                    && would_ellipsis_hide_decimal_point(&formatted, cw)
-                {
-                    effective_numeric(g, &addr, &mut Vec::new(), &mut 10_000usize)
-                        .map(|n| n.to_f64())
-                        .filter(|v| v.is_finite())
-                } else {
-                    None
-                };
-                let exp_preferred = if would_ellipsis_hide_decimal_point(&formatted, cw) {
-                    exponential_numeric_display_with_hint(&formatted, cw, rational_hint)
-                } else {
-                    None
-                };
-                let inner = exp_preferred
-                    .or_else(|| ui_core::shrink_numeric_display(&formatted, cw))
-                    .or_else(|| ui_core::exponential_numeric_display(&formatted, cw))
-                    .unwrap_or_else(|| ui_core::truncate_with_ellipsis(&formatted, cw));
-                align_cell_display(inner, cw, align)
-            } else {
-                align_cell_display(formatted.to_string(), cw, align)
-            };
 
-            // Only store cells with content (or empty markers for main cols)
-            let store_text = if display_text.trim().is_empty() {
-                String::new()
-            } else {
-                display_text
-            };
-            if !store_text.is_empty() || (c >= lm && c < lm + mc) {
-                if c < lm {
-                    // Left-margin cells: store by global column index so the
-                    // widget can look them up separately from main cells.
-                    spreadsheet.set_cell(ri as u32, c as u32, &store_text);
-                } else {
-                    spreadsheet.set_cell(ri as u32, widget_col as u32, &store_text);
+            // ── Spill rendering (distribute wide text across adjacent empty columns) ──
+            let mut did_spill = false;
+            if allow_spill {
+                let mut next_ix = col_ix + 1;
+                let mut total_spill = cw;
+                while next_ix < col_ixs.len() {
+                    let c_next = col_ixs[next_ix];
+                    let next_addr = if logical_row < hr {
+                        let hdr_row = logical_row as u32;
+                        if c_next < lm {
+                            CellAddr::Header { row: hdr_row, col: ColumnAddr::Left(c_next) }
+                        } else if c_next < lm + mc {
+                            CellAddr::Header { row: hdr_row, col: ColumnAddr::Main((c_next - lm) as u32) }
+                        } else {
+                            CellAddr::Header { row: hdr_row, col: ColumnAddr::Right(c_next - lm - mc) }
+                        }
+                    } else if logical_row < hr + mr {
+                        let main_row = (logical_row - hr) as u32;
+                        if c_next < lm {
+                            CellAddr::Left { row: main_row, col: c_next }
+                        } else if c_next < lm + mc {
+                            CellAddr::Main { row: main_row, col: (c_next - lm) as u32 }
+                        } else {
+                            CellAddr::Right { row: main_row, col: c_next - lm - mc }
+                        }
+                    } else {
+                        let ftr_row = (logical_row - hr - mr) as u32;
+                        if c_next < lm {
+                            CellAddr::Footer { row: ftr_row, col: ColumnAddr::Left(c_next) }
+                        } else if c_next < lm + mc {
+                            CellAddr::Footer { row: ftr_row, col: ColumnAddr::Main((c_next - lm) as u32) }
+                        } else {
+                            CellAddr::Footer { row: ftr_row, col: ColumnAddr::Right(c_next - lm - mc) }
+                        }
+                    };
+                    if !cell_effective_display(g, &next_addr).trim().is_empty() {
+                        break;
+                    }
+                    let cw_next = *col_widths.get(&c_next).unwrap_or(&4);
+                    total_spill += cw_next;
+                    next_ix += 1;
                 }
+                if total_spill > cw && next_ix > col_ix + 1 {
+                    did_spill = true;
+                    let (pre_total, suf_total) = take_display_prefix(&formatted, total_spill);
+                    let mut rest = pre_total;
+                    for spill_ix in col_ix..next_ix {
+                        let c_col = col_ixs[spill_ix];
+                        let cw_col = *col_widths.get(&c_col).unwrap_or(&4);
+                        let (chunk, rem) = take_display_prefix(&rest, cw_col);
+                        rest = rem;
+                        let is_last = spill_ix == next_ix - 1;
+                        let cell_content = if is_last && !suf_total.is_empty() {
+                            truncate_with_ellipsis(&chunk, cw_col)
+                        } else {
+                            chunk
+                        };
+                        let store_text = if cell_content.trim().is_empty() {
+                            String::new()
+                        } else {
+                            align_cell_display(cell_content, cw_col, align)
+                        };
+                        if !store_text.is_empty() || (c_col >= lm && c_col < lm + mc) {
+                            if c_col < lm {
+                                spreadsheet.set_cell(ri as u32, c_col as u32, &store_text);
+                            } else {
+                                spreadsheet.set_cell(ri as u32, (c_col - lm) as u32, &store_text);
+                            }
+                        }
+                    }
+                    col_ix = next_ix;
+                }
+            }
+
+            if !did_spill {
+                let display_text = if formatted.is_empty() {
+                    String::new()
+                } else if fw > cw {
+                    let cell_fmt = g.format_for_addr(&addr);
+                    let rational_hint = if matches!(cell_fmt.number, None | Some(NumberFormat::Rational | NumberFormat::DecimalGeneric))
+                        && would_ellipsis_hide_decimal_point(&formatted, cw)
+                    {
+                        effective_numeric(g, &addr, &mut Vec::new(), &mut 10_000usize)
+                            .map(|n| n.to_f64())
+                            .filter(|v| v.is_finite())
+                    } else {
+                        None
+                    };
+                    let exp_preferred = if would_ellipsis_hide_decimal_point(&formatted, cw) {
+                        exponential_numeric_display_with_hint(&formatted, cw, rational_hint)
+                    } else {
+                        None
+                    };
+                    let inner = exp_preferred
+                        .or_else(|| ui_core::shrink_numeric_display(&formatted, cw))
+                        .or_else(|| ui_core::exponential_numeric_display(&formatted, cw))
+                        .unwrap_or_else(|| ui_core::truncate_with_ellipsis(&formatted, cw));
+                    align_cell_display(inner, cw, align)
+                } else {
+                    align_cell_display(formatted.to_string(), cw, align)
+                };
+
+                // Only store cells with content (or empty markers for main cols)
+                let store_text = if display_text.trim().is_empty() {
+                    String::new()
+                } else {
+                    display_text
+                };
+                if !store_text.is_empty() || (c >= lm && c < lm + mc) {
+                    if c < lm {
+                        // Left-margin cells: store by global column index so the
+                        // widget can look them up separately from main cells.
+                        spreadsheet.set_cell(ri as u32, c as u32, &store_text);
+                    } else {
+                        spreadsheet.set_cell(ri as u32, widget_col as u32, &store_text);
+                    }
+                }
+                col_ix += 1;
             }
         }
     }
