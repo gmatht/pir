@@ -422,7 +422,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     }
                     next_ix += 1;
                 }
-                if total_spill > cw && next_ix > col_ix + 1 {
+                if total_spill_gaps > cw && next_ix > col_ix {
                     did_spill = true;
                     let (pre_total, _suf_total) = take_display_prefix(&formatted, total_spill_gaps);
                     // Store the full overflowing text in the FIRST column of the
