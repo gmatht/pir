@@ -35,7 +35,7 @@ fn row_total_block_start(grid: &Grid, current_main_row: u32) -> u32 {
     0
 }
 
-fn parse_num(s: &str) -> Option<f64> {
+pub(crate) fn parse_num(s: &str) -> Option<f64> {
     let t = s.trim();
     if t.is_empty() {
         return None;
@@ -43,7 +43,7 @@ fn parse_num(s: &str) -> Option<f64> {
     t.parse::<f64>().ok()
 }
 
-fn fold_numbers(func: AggFunc, xs: &[f64]) -> String {
+pub(crate) fn fold_numbers(func: AggFunc, xs: &[f64]) -> String {
     if xs.is_empty() {
         return String::new();
     }
