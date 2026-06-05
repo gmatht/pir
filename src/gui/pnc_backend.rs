@@ -368,11 +368,18 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 && (align.is_none() || align == Some(crate::grid::TextAlign::Left))
                 && !is_agg_cell;
 
-            // ── Spill rendering (distribute wide text across adjacent empty columns) ──
+            // ── Spill rendering ──────────────────────────────────────────────
+            // Matching ratatui: include the inter-column gap (1 char) in the
+            // available width so text flows continuously without visible gaps
+            // between columns.  The pancurses layout always uses a 1-char gap
+            // between adjacent columns.
+            let gap_width = if col_ix + 1 < col_ixs.len() { 1 } else { 0 };
+
             let mut did_spill = false;
             if allow_spill {
                 let mut next_ix = col_ix + 1;
                 let mut total_spill = cw;
+                let mut total_spill_gaps = cw + gap_width;
                 while next_ix < col_ixs.len() {
                     let c_next = col_ixs[next_ix];
                     let next_addr = if logical_row < hr {
@@ -408,47 +415,43 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     }
                     let cw_next = *col_widths.get(&c_next).unwrap_or(&4);
                     total_spill += cw_next;
+                    total_spill_gaps += cw_next;
+                    // Add 1-char gap after this empty column
+                    if next_ix + 1 < col_ixs.len() {
+                        total_spill_gaps += 1;
+                    }
                     next_ix += 1;
                 }
                 if total_spill > cw && next_ix > col_ix + 1 {
                     did_spill = true;
-                    let (pre_total, suf_total) = take_display_prefix(&formatted, total_spill);
-                    let mut rest = pre_total;
-                    for spill_ix in col_ix..next_ix {
-                        let c_col = col_ixs[spill_ix];
-                        let cw_col = *col_widths.get(&c_col).unwrap_or(&4);
-                        let (chunk, rem) = take_display_prefix(&rest, cw_col);
-                        rest = rem;
-                        let is_last = spill_ix == next_ix - 1;
-                        let cell_content = if is_last && !suf_total.is_empty() {
-                            truncate_with_ellipsis(&chunk, cw_col)
-                        } else {
-                            chunk
-                        };
-                        let store_text = if cell_content.trim().is_empty() {
-                            String::new()
-                        } else {
-                            align_cell_display(cell_content, cw_col, align)
-                        };
-                        if !store_text.is_empty() || (c_col >= lm && c_col < lm + mc) {
-                            if c_col < lm {
-                                spreadsheet.set_cell(ri as u32, c_col as u32, &store_text);
-                            } else {
-                                spreadsheet.set_cell(ri as u32, (c_col - lm) as u32, &store_text);
-                            }
-                        }
+                    let (pre_total, _suf_total) = take_display_prefix(&formatted, total_spill_gaps);
+                    // Store the full overflowing text in the FIRST column of the
+                    // spill range.  Leave subsequent columns empty so the pancurses
+                    // renderer's overflow logic draws the text across columns.
+                    let store_text = if pre_total.trim().is_empty() {
+                        String::new()
+                    } else {
+                        align_cell_display(pre_total, total_spill_gaps, align)
+                    };
+                    if !store_text.is_empty() || (c >= lm && c < lm + mc) {
+                        // Store by global column index so margin and main cells
+                        // don't collide at (row, 0)/(row, 1).
+                        spreadsheet.set_cell(ri as u32, c as u32, &store_text);
                     }
                     col_ix = next_ix;
                 }
             }
 
             if !did_spill {
+                // Include the 1-char inter-column gap as available width
+                // (matching ratatui: trailing width is part of the cell's space)
+                let avail_width = if fw > cw { cw + gap_width } else { cw };
                 let display_text = if formatted.is_empty() {
                     String::new()
                 } else if fw > cw {
                     let cell_fmt = g.format_for_addr(&addr);
                     let rational_hint = if matches!(cell_fmt.number, None | Some(NumberFormat::Rational | NumberFormat::DecimalGeneric))
-                        && would_ellipsis_hide_decimal_point(&formatted, cw)
+                        && would_ellipsis_hide_decimal_point(&formatted, avail_width)
                     {
                         effective_numeric(g, &addr, &mut Vec::new(), &mut 10_000usize)
                             .map(|n| n.to_f64())
@@ -456,34 +459,33 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     } else {
                         None
                     };
-                    let exp_preferred = if would_ellipsis_hide_decimal_point(&formatted, cw) {
-                        exponential_numeric_display_with_hint(&formatted, cw, rational_hint)
+                    let exp_preferred = if would_ellipsis_hide_decimal_point(&formatted, avail_width) {
+                        exponential_numeric_display_with_hint(&formatted, avail_width, rational_hint)
                     } else {
                         None
                     };
-                    let inner = exp_preferred
-                        .or_else(|| ui_core::shrink_numeric_display(&formatted, cw))
-                        .or_else(|| ui_core::exponential_numeric_display(&formatted, cw))
-                        .unwrap_or_else(|| ui_core::truncate_with_ellipsis(&formatted, cw));
-                    align_cell_display(inner, cw, align)
+                    let inner = if fw <= avail_width {
+                        // Text fits within column + gap, no truncation needed
+                        formatted.to_string()
+                    } else {
+                        exp_preferred
+                            .or_else(|| ui_core::shrink_numeric_display(&formatted, avail_width))
+                            .or_else(|| ui_core::exponential_numeric_display(&formatted, avail_width))
+                            .unwrap_or_else(|| ui_core::truncate_with_ellipsis(&formatted, avail_width))
+                    };
+                    align_cell_display(inner, avail_width, align)
                 } else {
                     align_cell_display(formatted.to_string(), cw, align)
                 };
 
-                // Only store cells with content (or empty markers for main cols)
                 let store_text = if display_text.trim().is_empty() {
                     String::new()
                 } else {
                     display_text
                 };
                 if !store_text.is_empty() || (c >= lm && c < lm + mc) {
-                    if c < lm {
-                        // Left-margin cells: store by global column index so the
-                        // widget can look them up separately from main cells.
-                        spreadsheet.set_cell(ri as u32, c as u32, &store_text);
-                    } else {
-                        spreadsheet.set_cell(ri as u32, widget_col as u32, &store_text);
-                    }
+                    // Store by global column index to avoid margin/main collision.
+                    spreadsheet.set_cell(ri as u32, c as u32, &store_text);
                 }
                 col_ix += 1;
             }
