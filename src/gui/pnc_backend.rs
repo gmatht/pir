@@ -241,17 +241,10 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             }
         }
     }
-    // Fill remaining viewport space with blank right-margin columns
-    // (matching ratatui's fill-until-dim approach).
-    let total_so_far = col_ixs.len();
-    let dim = data_width.checked_div(2).unwrap_or(1).max(1);
-    let blank_cols_needed = dim.saturating_sub(total_so_far).max(1);
-    for i in 0..blank_cols_needed.min(rm) {
-        let gc = right_start + i;
-        if !col_ixs.contains(&gc) {
-            col_ixs.push(gc);
-        }
-    }
+    // Fill remaining viewport space with blank right-margin columns.
+    // Match ratatui: only add content-bearing right-margin columns, not
+    // generic filler columns (ratatui absorbs blank space into the last
+    // column's trailing bucket instead of rendering styled empty cells).
     col_ixs.sort_unstable();
     col_ixs.dedup();
 
