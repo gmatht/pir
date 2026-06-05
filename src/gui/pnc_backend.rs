@@ -462,7 +462,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             let fw = formatted.width();
             let align = ui_core::effective_cell_align(g, &addr, &formatted);
             let is_left_margin = c < lm;
-            let is_agg_cell = if is_left_margin {
+            let is_agg_cell = if logical_row < hr {
+                false
+            } else if is_left_margin {
                 false
             } else if c < lm + mc {
                 row_agg.is_some() || rca.is_some()
