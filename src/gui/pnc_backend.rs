@@ -1,11 +1,12 @@
 use crate::agg::compute_aggregate;
 use crate::agg::helpers::{data_main_col_count, left_margin_main_col_aggregate};
 use crate::formula::cell_effective_display;
-use crate::grid::{CellAddr, ColumnAddr, GridBox, MainRange, HEADER_ROWS, MARGIN_COLS};
+use crate::formula::effective_numeric;
+use crate::grid::{CellAddr, ColumnAddr, GridBox, MainRange, NumberFormat, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::{margin_key_agg_func, AggFunc, AggregateDef};
 use crate::ui_core::align_cell_display;
 use crate::ui_core::{
-    self, main_col_window,
+    self, exponential_numeric_display_with_hint, main_col_window, would_ellipsis_hide_decimal_point,
 };
 use std::collections::HashMap;
 use rustxwidgets::backends_pancurses_adapter::*;
@@ -190,14 +191,16 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         };
         cols.saturating_sub(2).saturating_sub(ui_core::ROW_LABEL_CHARS).max(1)
     };
+    // Trim columns to fit data_width FIRST (matching ratatui order)
+    trim_visible_cols_to_width(&sheet_rec.grid, &mut col_ixs, cursor.col, data_width);
+    // Then refit visible columns so budget is distributed among columns
+    // that actually fit in the viewport.
     ui_core::fit_visible_columns_capped(
         &mut sheet_rec.grid,
         &col_ixs,
         data_width,
         cursor.col,
     );
-    // Now trim columns that still don't fit within data_width.
-    trim_visible_cols_to_width(&sheet_rec.grid, &mut col_ixs, cursor.col, data_width);
 
     // ── Column layout with widths matching ratatui's grid.col_width() ──
     let g = &sheet_rec.grid;
@@ -363,15 +366,33 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             let formatted = ui_core::format_cell_display(g, &addr, effective);
             let fw = formatted.width();
             let align = ui_core::effective_cell_align(g, &addr, &formatted);
+            let is_agg_cell = row_agg.is_some() || rca.is_some();
 
             let allow_spill = fw > cw
-                && (align.is_none() || align == Some(crate::grid::TextAlign::Left));
+                && (align.is_none() || align == Some(crate::grid::TextAlign::Left))
+                && !is_agg_cell;
             let display_text = if formatted.is_empty() {
                 String::new()
             } else if allow_spill {
                 formatted.to_string()
             } else if fw > cw {
-                let inner = ui_core::shrink_numeric_display(&formatted, cw)
+                let cell_fmt = g.format_for_addr(&addr);
+                let rational_hint = if matches!(cell_fmt.number, None | Some(NumberFormat::Rational | NumberFormat::DecimalGeneric))
+                    && would_ellipsis_hide_decimal_point(&formatted, cw)
+                {
+                    effective_numeric(g, &addr, &mut Vec::new(), &mut 10_000usize)
+                        .map(|n| n.to_f64())
+                        .filter(|v| v.is_finite())
+                } else {
+                    None
+                };
+                let exp_preferred = if would_ellipsis_hide_decimal_point(&formatted, cw) {
+                    exponential_numeric_display_with_hint(&formatted, cw, rational_hint)
+                } else {
+                    None
+                };
+                let inner = exp_preferred
+                    .or_else(|| ui_core::shrink_numeric_display(&formatted, cw))
                     .or_else(|| ui_core::exponential_numeric_display(&formatted, cw))
                     .unwrap_or_else(|| ui_core::truncate_with_ellipsis(&formatted, cw));
                 align_cell_display(inner, cw, align)
