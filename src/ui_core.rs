@@ -7,8 +7,9 @@
 
 use crate::grid::{
     CellAddr, GridBox as Grid, NumberFormat, SheetCursor, TextAlign,
-    FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS,
+    MARGIN_COLS,
 };
+use crate::formula::cell_effective_display;
 use crate::ops::SheetState;
 
 // ---------------------------------------------------------------------------
@@ -457,6 +458,362 @@ pub fn align_cell_display(text: String, width: usize, align: Option<TextAlign>) 
         }
         Some(TextAlign::Default) => {
             format!("{}{}", text, " ".repeat(pad))
+        }
+    }
+}
+
+/// Compute the rendered width (in monospace columns) needed to display the
+/// widest non-empty cell in the given global column, including a one-character
+/// padding gap.  Returns `None` if the column has no content at all.
+///
+/// This mirrors `App::rendered_width_for_column` for use outside the ratatui
+/// backend (notably the pancurses backend).
+pub fn rendered_width_for_column(grid: &Grid, global_col: usize) -> Option<usize> {
+    use unicode_width::UnicodeWidthStr;
+
+    let mut maxw = 0usize;
+    let mut saw_content = false;
+    let main_cols = grid.main_cols();
+
+    for (addr, _) in grid.iter_nonempty() {
+        match &addr {
+            CellAddr::Header { col, .. } | CellAddr::Footer { col, .. }
+                if col.to_global(main_cols) == global_col =>
+            {
+                let mut measured = None;
+                if let Some(raw) = grid.get(&addr) {
+                    measured = measured_width_text_for_stored_literal(&raw);
+                }
+                let val = measured.unwrap_or_else(||
+                    normalize_inline_text(&cell_effective_display(grid, &addr)));
+                if !val.is_empty() {
+                    saw_content = true;
+                    maxw = maxw.max(val.width() + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for r in 0..grid.main_rows() {
+        if global_col < MARGIN_COLS {
+            let addr = CellAddr::Left { col: global_col, row: r as u32 };
+            let mut measured = None;
+            if let Some(raw) = grid.get(&addr) {
+                measured = measured_width_text_for_stored_literal(&raw);
+            }
+            let val = measured.unwrap_or_else(||
+                normalize_inline_text(&cell_effective_display(grid, &addr)));
+            if !val.is_empty() {
+                saw_content = true;
+                maxw = maxw.max(val.width() + 1);
+            }
+        } else if global_col < MARGIN_COLS + main_cols {
+            let addr = CellAddr::Main { row: r as u32, col: (global_col - MARGIN_COLS) as u32 };
+            let mut measured = None;
+            if let Some(raw) = grid.get(&addr) {
+                measured = measured_width_text_for_stored_literal(&raw);
+            }
+            let val = measured.unwrap_or_else(||
+                normalize_inline_text(&cell_effective_display(grid, &addr)));
+            if !val.is_empty() {
+                saw_content = true;
+                maxw = maxw.max(val.width() + 1);
+            }
+        } else {
+            let addr = CellAddr::Right { col: global_col - MARGIN_COLS - main_cols, row: r as u32 };
+            let mut measured = None;
+            if let Some(raw) = grid.get(&addr) {
+                measured = measured_width_text_for_stored_literal(&raw);
+            }
+            let val = measured.unwrap_or_else(||
+                normalize_inline_text(&cell_effective_display(grid, &addr)));
+            if !val.is_empty() {
+                saw_content = true;
+                maxw = maxw.max(val.width() + 1);
+            }
+        }
+    }
+
+    saw_content.then_some(maxw.max(4))
+}
+
+/// Adjust column widths for the visible columns so they fit within
+/// `data_width` characters.  Each column's width is capped by its rendered
+/// content width (computed via [`rendered_width_for_column`]) and by the
+/// grid's `max_col_width`.
+///
+/// When the total desired width exceeds the budget the function distributes
+/// space proportionally, giving priority to the column under the cursor.
+///
+/// This mirrors `App::fit_visible_columns_capped` for use outside the ratatui
+/// backend.
+pub fn fit_visible_columns_capped(
+    grid: &mut Grid,
+    col_ixs: &[usize],
+    data_width: usize,
+    cursor_col: usize,
+) {
+    if col_ixs.is_empty() {
+        return;
+    }
+    let n = col_ixs.len();
+    let gaps = n.saturating_sub(1);
+    let budget = data_width.saturating_sub(gaps);
+
+    let mut desired: Vec<(usize, usize)> = Vec::with_capacity(n);
+    for &c in col_ixs {
+        if let Some(maxw) = rendered_width_for_column(grid, c) {
+            let cap = maxw.min(grid.max_col_width());
+            desired.push((c, cap));
+        } else {
+            desired.push((c, 4));
+        }
+    }
+
+    let total_desired: usize = desired.iter().map(|(_, w)| *w).sum();
+    if total_desired <= budget {
+        for (c, w) in desired {
+            grid.set_col_width(c, Some(w));
+        }
+        return;
+    }
+
+    let pivot_ix = if let Some(p) = col_ixs.iter().position(|&c| c == cursor_col) {
+        p
+    } else {
+        let mut best = 0usize;
+        let mut best_dist = usize::MAX;
+        for (i, &c) in col_ixs.iter().enumerate() {
+            let dist = if c > cursor_col { c - cursor_col } else { cursor_col - c };
+            if dist < best_dist {
+                best_dist = dist;
+                best = i;
+            }
+        }
+        best
+    };
+
+    let mut left = pivot_ix;
+    let mut right = pivot_ix;
+    let mut window_sum = desired[pivot_ix].1;
+    let mut prefer_right = true;
+    loop {
+        let can_right = right + 1 < desired.len();
+        let can_left = left > 0;
+        if !can_right && !can_left {
+            break;
+        }
+        let mut expanded = false;
+        let sides = if prefer_right { [1isize, -1isize] } else { [-1isize, 1isize] };
+        for &side in &sides {
+            if side > 0 && can_right {
+                let cand_w = desired[right + 1].1;
+                let win_len = right.saturating_sub(left).saturating_add(1);
+                let new_win_len = win_len.saturating_add(1);
+                let outside = desired.len().saturating_sub(new_win_len);
+                if window_sum.saturating_add(cand_w).saturating_add(outside) <= budget {
+                    right += 1;
+                    window_sum = window_sum.saturating_add(cand_w);
+                    expanded = true;
+                    break;
+                }
+            } else if side < 0 && can_left {
+                let cand_w = desired[left - 1].1;
+                let win_len = right.saturating_sub(left).saturating_add(1);
+                let new_win_len = win_len.saturating_add(1);
+                let outside = desired.len().saturating_sub(new_win_len);
+                if window_sum.saturating_add(cand_w).saturating_add(outside) <= budget {
+                    left -= 1;
+                    window_sum = window_sum.saturating_add(cand_w);
+                    expanded = true;
+                    break;
+                }
+            }
+        }
+        if !expanded {
+            break;
+        }
+        prefer_right = !prefer_right;
+    }
+
+    let mut allocations: std::collections::HashMap<usize, usize> =
+        desired.iter().map(|(c, _)| (*c, 1usize)).collect();
+    let mut rem_budget = budget.saturating_sub(desired.len());
+
+    let main_cols = grid.main_cols();
+    let mut cols: Vec<(usize, usize, usize, usize)> = Vec::new();
+    for i in left..=right {
+        let (col, cap) = desired[i];
+        let mut looks_like_date = false;
+
+        for (addr, _) in grid.iter_nonempty() {
+            match &addr {
+                CellAddr::Header { col: hcol, .. } | CellAddr::Footer { col: hcol, .. }
+                    if hcol.to_global(grid.main_cols()) == col =>
+                {
+                    if let Some(raw) = grid.get(&addr) {
+                        let t = raw.trim();
+                        if !crate::formula::is_formula(t) {
+                            if crate::formula::parse_numeric_or_date_literal(t).is_some() {
+                                looks_like_date = true;
+                                break;
+                            }
+                        }
+                    }
+                    let val = normalize_inline_text(&cell_effective_display(grid, &addr));
+                    let t = val.trim();
+                    let bytes = t.as_bytes();
+                    if bytes.len() >= 10 {
+                        for i in 0..=bytes.len().saturating_sub(10) {
+                            if (bytes[i + 4] == b'-' || bytes[i + 4] == b'/' || bytes[i + 4] == b'\\')
+                                && (bytes[i + 7] == b'-' || bytes[i + 7] == b'/' || bytes[i + 7] == b'\\')
+                            {
+                                if bytes[i..i + 4].iter().all(|b| b.is_ascii_digit())
+                                    && bytes[i + 5..i + 7].iter().all(|b| b.is_ascii_digit())
+                                    && bytes[i + 8..i + 10].iter().all(|b| b.is_ascii_digit())
+                                {
+                                    looks_like_date = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if looks_like_date {
+                break;
+            }
+        }
+
+        if !looks_like_date {
+            for r in 0..grid.main_rows() {
+                let raw_val = if col < MARGIN_COLS {
+                    grid.get(&CellAddr::Left { col, row: r as u32 })
+                } else if col < MARGIN_COLS + main_cols {
+                    grid.get(&CellAddr::Main { row: r as u32, col: (col - MARGIN_COLS) as u32 })
+                } else {
+                    grid.get(&CellAddr::Right { col: col - MARGIN_COLS - main_cols, row: r as u32 })
+                };
+
+                if let Some(raw) = raw_val {
+                    let t = raw.trim();
+                    if !crate::formula::is_formula(t) {
+                        if crate::formula::parse_numeric_or_date_literal(t).is_some() {
+                            looks_like_date = true;
+                            break;
+                        }
+                    }
+                }
+
+                let cell_addr = if col < MARGIN_COLS {
+                    CellAddr::Left { col, row: r as u32 }
+                } else if col < MARGIN_COLS + main_cols {
+                    CellAddr::Main { row: r as u32, col: (col - MARGIN_COLS) as u32 }
+                } else {
+                    CellAddr::Right { col: col - MARGIN_COLS - main_cols, row: r as u32 }
+                };
+                let val = normalize_inline_text(&cell_effective_display(grid, &cell_addr));
+                let t = val.trim();
+                let bytes = t.as_bytes();
+                if bytes.len() >= 10 {
+                    for i in 0..=bytes.len().saturating_sub(10) {
+                        if (bytes[i + 4] == b'-' || bytes[i + 4] == b'/' || bytes[i + 4] == b'\\')
+                            && (bytes[i + 7] == b'-' || bytes[i + 7] == b'/' || bytes[i + 7] == b'\\')
+                        {
+                            if bytes[i..i + 4].iter().all(|b| b.is_ascii_digit())
+                                && bytes[i + 5..i + 7].iter().all(|b| b.is_ascii_digit())
+                                && bytes[i + 8..i + 10].iter().all(|b| b.is_ascii_digit())
+                            {
+                                looks_like_date = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if looks_like_date {
+                    break;
+                }
+            }
+        }
+
+        let cap_used = if looks_like_date { grid.max_col_width() } else { cap };
+        let need = cap_used.saturating_sub(1);
+        let weight = if looks_like_date { need.saturating_mul(8).max(1) } else { need.max(1) };
+        cols.push((col, cap_used, need, weight));
+    }
+
+    let pivot_col = desired[pivot_ix].0;
+    if rem_budget > 0 {
+        if let Some(pos) = cols.iter().position(|(col, ..)| *col == pivot_col) {
+            let need = cols[pos].2;
+            if need > 0 {
+                let give = rem_budget.min(need);
+                if give > 0 {
+                    allocations.insert(pivot_col, allocations[&pivot_col].saturating_add(give));
+                    rem_budget = rem_budget.saturating_sub(give);
+                    cols[pos].2 = need.saturating_sub(give);
+                }
+            }
+        }
+    }
+
+    while rem_budget > 0 {
+        let total_weight: usize = cols.iter()
+            .map(|(_, _, need, weight)| if *need > 0 { *weight } else { 0 })
+            .sum();
+        if total_weight == 0 {
+            break;
+        }
+
+        let mut given = 0usize;
+        let mut remainders: Vec<(usize, usize)> = Vec::new();
+        for (col, _cap, need, weight) in cols.iter_mut() {
+            if *need == 0 {
+                continue;
+            }
+            let numerator = rem_budget.saturating_mul(*weight);
+            let base = numerator / total_weight;
+            let rem = numerator % total_weight;
+            let give = base.min(*need);
+            if give > 0 {
+                let entry = allocations.entry(*col).or_insert(1);
+                *entry = entry.saturating_add(give);
+                *need = need.saturating_sub(give);
+                given = given.saturating_add(give);
+            }
+            if *need > 0 {
+                remainders.push((*col, rem));
+            }
+        }
+
+        rem_budget = rem_budget.saturating_sub(given);
+        if rem_budget == 0 {
+            break;
+        }
+
+        remainders.sort_by(|a, b| b.1.cmp(&a.1));
+        for (col, _rem) in remainders.iter() {
+            if rem_budget == 0 {
+                break;
+            }
+            if let Some((_c, _cap, need, _weight)) = cols.iter_mut().find(|(cc, _, _, _)| cc == col) {
+                if *need > 0 {
+                    let entry = allocations.entry(*col).or_insert(1);
+                    *entry = entry.saturating_add(1);
+                    *need = need.saturating_sub(1);
+                    rem_budget = rem_budget.saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    for &c in col_ixs {
+        if let Some(&w) = allocations.get(&c) {
+            grid.set_col_width(c, Some(w));
+        } else {
+            grid.set_col_width(c, Some(1));
         }
     }
 }

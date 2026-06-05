@@ -1,5 +1,7 @@
 use crate::grid::{CellAddr, HEADER_ROWS, MARGIN_COLS};
-use crate::ui_core::{self, main_col_window, right_nonblank_end};
+use crate::ui_core::{
+    self, main_col_window, rendered_width_for_column, right_nonblank_end,
+};
 use rustxwidgets::backends_pancurses_adapter::*;
 use unicode_width::UnicodeWidthStr;
 
@@ -75,12 +77,17 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     col_ixs.sort_unstable();
     col_ixs.dedup();
 
-    // ── Column layout with correct widths ──────────────────────────────
+    // ── Column layout with content-aware widths ────────────────────────
     let mut layout: Vec<(u32, u32, String)> = Vec::new();
+    let mut col_widths: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for &c in &col_ixs {
-        let w = g.col_width(c).max(1) as u32;
+        let w = rendered_width_for_column(g, c)
+            .map(|w| w.min(g.max_col_width()))
+            .unwrap_or(4)
+            .max(1);
+        col_widths.insert(c, w);
         let label = crate::addr::ui_column_fragment(c, mc);
-        layout.push((c as u32, w, label));
+        layout.push((c as u32, w as u32, label));
     }
 
     // ── Spreadsheet ────────────────────────────────────────────────────
@@ -110,7 +117,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     if let Some(val) = g.get(&addr) {
                         let formatted =
                             ui_core::format_cell_display(g, &addr, val);
-                        let cw = g.col_width(c).max(1) as usize;
+                        let cw = *col_widths.get(&c).unwrap_or(&4);
                         let fw = formatted.width();
                         let align =
                             ui_core::effective_cell_align(g, &addr, &formatted);
