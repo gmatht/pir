@@ -126,11 +126,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // than max_col_width by auto_fit_column would remain uncapped.
     app.fit_main_columns_to_max_width();
 
-    // Use the app's natural cursor position after load_initial,
-    // then move it to the reference cell [E2 (left-margin column
-    // [E = global col MARGIN_COLS-5, main row 2 = HEADER_ROWS+1).
-    app.core.cursor.row = HEADER_ROWS + 1;
-    app.core.cursor.col = MARGIN_COLS.saturating_sub(5);
+    // Position the cursor at B~3 (main column B = global col MARGIN_COLS+1,
+    // header row ~3 = logical row HEADER_ROWS-3) to match the reference
+    // ratatui render that the pancurses output must reproduce.
+    app.core.cursor.row = HEADER_ROWS.saturating_sub(3);
+    app.core.cursor.col = MARGIN_COLS + 1;
 
     // ── Available data width / rows (matching ratatui's draw_visual) ──
     let (term_cols, term_rows) = {
