@@ -126,11 +126,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // than max_col_width by auto_fit_column would remain uncapped.
     app.fit_main_columns_to_max_width();
 
-    // Position the cursor at B~3 (main column B = global col MARGIN_COLS+1,
-    // header row ~3 = logical row HEADER_ROWS-3) to match the reference
-    // ratatui render that the pancurses output must reproduce.
-    app.core.cursor.row = HEADER_ROWS.saturating_sub(3);
-    app.core.cursor.col = MARGIN_COLS + 1;
+    // Position the cursor at [B2 (left-margin column B = global col
+    // MARGIN_COLS-2, main row 2 = logical row HEADER_ROWS+1) to match the
+    // reference ratatui render that the pancurses output must reproduce.
+    app.core.cursor.row = HEADER_ROWS + 1;
+    app.core.cursor.col = MARGIN_COLS - 2;
 
     // ── Available data width / rows (matching ratatui's draw_visual) ──
     let (term_cols, term_rows) = {
@@ -183,25 +183,14 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     ui_core::trim_visible_cols_to_width(&sheet_rec.grid, &mut col_ixs, cursor.col, data_width);
 
     // ── Column layout with widths matching ratatui's grid.col_width() ──
-    // Ratatui uses 2-char separator gaps at left-margin→main and
-    // main→right-margin boundaries (visible_cols_render_width).
-    // The pancurses renderer uses 1-char gaps everywhere, so we add 1
-    // to the width of boundary columns to compensate.
+    // In ratatui, header and data rows use 1-char gaps everywhere (including
+    // at left-margin→main and main→right-margin boundaries).  Only the
+    // separator row draws a `│` at the boundary, handled by the widget.
     let g = &sheet_rec.grid;
     let mut layout: Vec<(u32, u32, String)> = Vec::new();
     let mut col_widths: HashMap<usize, usize> = HashMap::new();
-    let n_cols = col_ixs.len();
     for (idx, &c) in col_ixs.iter().enumerate() {
-        let mut w = g.col_width(c).max(1);
-        // Boundary: last left-margin column adjacent to first main column.
-        if lm > 0 && c == lm.saturating_sub(1) && idx + 1 < n_cols && col_ixs[idx + 1] >= lm {
-            w = w.saturating_add(1);
-        }
-        // Boundary: last main column adjacent to first right-margin column.
-        let last_main = lm + mc;
-        if mc > 0 && c == last_main.saturating_sub(1) && idx + 1 < n_cols && col_ixs[idx + 1] >= last_main {
-            w = w.saturating_add(1);
-        }
+        let w = g.col_width(c).max(1);
         col_widths.insert(c, w);
         let label = crate::addr::ui_column_fragment(c, mc);
         layout.push((c as u32, w as u32, label));
@@ -572,11 +561,16 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     {
         let cursor_main_row = display_cursor_row.saturating_sub(hr);
         let cursor_col_addr = ColumnAddr::from_global(cursor.col, mc);
-        let cursor_main_col = (cursor.col.saturating_sub(lm)) as u32;
         let cursor_addr = if display_cursor_row < hr {
             CellAddr::Header { row: display_cursor_row as u32, col: cursor_col_addr }
         } else if display_cursor_row < hr + mr {
-            CellAddr::Main { row: cursor_main_row as u32, col: cursor_main_col }
+            if cursor.col < lm {
+                CellAddr::Left { row: cursor_main_row as u32, col: cursor.col }
+            } else if cursor.col < lm + mc {
+                CellAddr::Main { row: cursor_main_row as u32, col: (cursor.col - lm) as u32 }
+            } else {
+                CellAddr::Right { row: cursor_main_row as u32, col: cursor.col - lm - mc }
+            }
         } else {
             CellAddr::Footer { row: (display_cursor_row - hr - mr) as u32, col: cursor_col_addr }
         };
