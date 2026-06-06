@@ -612,6 +612,74 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     rustxwidgets::backends::pancurses::set_focus(spreadsheet.id());
     win.present();
 
+    // ── Cursor move callback: grow grid extent + update viewport ─────────
+    // The ratatui backend recomputes the viewport each frame so pressing arrow
+    // keys scrolls the visible columns/rows and the grid extent grows as needed.
+    let display_rows_for_cb = display_rows.clone();
+    let mut col_ixs_cb = col_ixs.clone();
+    let sid = spreadsheet.id();
+    let app_ptr: *mut super::App = app;
+    let hr_cb = hr;
+    let data_cols_cb = data_cols;
+    let data_width_cb = data_width;
+    add_cursor_move_callback(move |_display_row, _display_col| {
+        // SAFETY: app is &mut App alive for the entire event loop
+        let app = unsafe { &mut *app_ptr };
+        let display_idx = _display_row as usize;
+        if let Some(&logical_row) = display_rows_for_cb.get(display_idx) {
+            app.core.cursor.row = logical_row;
+            app.core.cursor.col = _display_col as usize;
+            let sheet = app.core.workbook.active_sheet_mut();
+            let prev_mr = sheet.grid.main_rows();
+            // When cursor moves to the row just beyond the current extent,
+            // grow the grid (matching ratatui's move_cursor_one_row_vertical).
+            if logical_row >= hr_cb + prev_mr {
+                sheet.grid.grow_main_row_at_bottom();
+            }
+            sheet.grid.ensure_extent_for_cursor(logical_row, _display_col as usize);
+            if sheet.grid.main_rows() != prev_mr {
+                // Grid grew — update border title and row labels
+                let mr = sheet.grid.main_rows();
+                let boundary_title = format!(
+                    "corro  {}r × {}c  ops {}",
+                    mr, sheet.grid.main_cols(), app.core.ops_applied
+                );
+                spreadsheet_set_border_title(sid, &boundary_title);
+                let new_labels: Vec<(u32, String)> = display_rows_for_cb.iter()
+                    .enumerate()
+                    .map(|(idx, &r)| {
+                        let label = crate::addr::ui_row_label(r, mr);
+                        (idx as u32, label)
+                    })
+                    .collect();
+                spreadsheet_set_row_labels(sid, new_labels);
+            }
+            // Update column viewport when cursor column moves outside the
+            // currently visible range (matching ratatui's per-frame recompute).
+            if !col_ixs_cb.contains(&(_display_col as usize)) {
+                let rec = app.core.workbook.active_sheet().clone();
+                let g = &rec.grid;
+                let mc = g.main_cols();
+                let cursor = app.core.cursor;
+                let (mut new_ixs, _) =
+                    crate::ui_core::visible_col_indices(&rec, cursor, data_cols_cb, 0);
+                crate::ui_core::trim_visible_cols_to_width(
+                    g, &mut new_ixs, cursor.col, data_width_cb,
+                );
+                let new_layout: Vec<(u32, u32, String)> = new_ixs
+                    .iter()
+                    .map(|&c| {
+                        let w = g.col_width(c).max(1);
+                        let label = crate::addr::ui_column_fragment(c, mc);
+                        (c as u32, w as u32, label)
+                    })
+                    .collect();
+                spreadsheet_set_column_layout(sid, new_layout);
+                col_ixs_cb = new_ixs;
+            }
+        }
+    });
+
     _backend.run().map_err(|e| format!("pancurses error: {e}"))?;
     Ok(())
 }
