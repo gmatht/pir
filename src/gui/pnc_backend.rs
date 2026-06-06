@@ -166,11 +166,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     app.fit_main_columns_to_max_width();
 
     // ── Position cursor to match reference output ────────────────
-    // Reference (ratatui) shows cursor at [C~4 (left-margin column [C,
-    // header row ~4).  Left-margin labels are mirrored so [C is at
-    // global_col = MARGIN_COLS - 3 = 699, [B at 700, [A at 701.
-    app.core.cursor.row = HEADER_ROWS - 4;
-    app.core.cursor.col = MARGIN_COLS - 3;
+    // Reference (ratatui) shows cursor at B~6 (main column B,
+    // header row ~6).  Main column B is at global_col = MARGIN_COLS + 1.
+    // Header row ~6 = HEADER_ROWS - 6.
+    app.core.cursor.row = HEADER_ROWS - 6;
+    app.core.cursor.col = MARGIN_COLS + 1;
 
     let mut sheet_rec = app.core.workbook.active_sheet().clone();
     let hr = HEADER_ROWS;
