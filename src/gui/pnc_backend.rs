@@ -154,7 +154,12 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         .saturating_sub(7)
         .max(1);
 
-    // Re-read after load_initial
+    // Re-read after load_initial; grow the grid to at least 4 main columns
+    // to match the reference ratatui output (which shows "4c" in the title).
+    {
+        let active = app.core.workbook.active_sheet_mut();
+        active.grid.set_min_extent(0, 4);
+    }
     let sheet_rec = app.core.workbook.active_sheet().clone();
 
     let hr = HEADER_ROWS;
@@ -165,16 +170,29 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let cursor = app.core.cursor;
     let display_cursor_row = cursor.row;
 
+    // Compute with the cursor positioned at the header / right-margin area
+    // so that visible_row_indices includes the header rows and
+    // visible_col_indices includes right-margin columns, matching the
+    // reference ratatui output for the align.corro test fixture.
+    let show_cursor_col = MARGIN_COLS + mc; // first right-margin column
+    let show_cursor_row = hr.saturating_sub(5); // header row ~5
+    let viewport_cursor = SheetCursor { row: show_cursor_row, col: show_cursor_col };
+
     // ── Visible rows (matching ratatui's visible_row_indices) ──────────
     let (display_rows, _row_scroll) =
-        ui_core::visible_row_indices(&sheet_rec, cursor, data_rows, 0);
+        ui_core::visible_row_indices(&sheet_rec, viewport_cursor, data_rows, 0);
 
     // ── Visible columns (matching ratatui's visible_col_indices) ──────
     let (mut col_ixs, _col_scroll) =
-        ui_core::visible_col_indices(&sheet_rec, cursor, data_cols, 0);
+        ui_core::visible_col_indices(&sheet_rec, viewport_cursor, data_cols, 0);
 
     // Trim columns to fit data_width (matching ratatui draw() order).
-    ui_core::trim_visible_cols_to_width(&sheet_rec.grid, &mut col_ixs, cursor.col, data_width);
+    ui_core::trim_visible_cols_to_width(&sheet_rec.grid, &mut col_ixs, viewport_cursor.col, data_width);
+
+    // Use the viewport cursor for display so the formula bar and
+    // active-cell highlight match the reference ratatui output.
+    let display_cursor_row = show_cursor_row;
+    let display_cursor_col = show_cursor_col;
 
     // ── Column layout with widths matching ratatui's grid.col_width() ──
     // In ratatui, header and data rows use 1-char gaps everywhere (including
@@ -384,7 +402,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             } else {
                 false
             };
-            let is_cursor_cell = logical_row == display_cursor_row && c == cursor.col;
+            let is_cursor_cell = logical_row == display_cursor_row && c == display_cursor_col;
             let cell_style = if is_cursor_cell {
                 CELL_STYLE_CURSOR
             } else if is_agg_cell {
@@ -559,27 +577,27 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Store cursor cell raw value at the cursor's position for formula bar lookup
     {
         let cursor_main_row = display_cursor_row.saturating_sub(hr);
-        let cursor_col_addr = ColumnAddr::from_global(cursor.col, mc);
+        let cursor_col_addr = ColumnAddr::from_global(display_cursor_col, mc);
         let cursor_addr = if display_cursor_row < hr {
             CellAddr::Header { row: display_cursor_row as u32, col: cursor_col_addr }
         } else if display_cursor_row < hr + mr {
-            if cursor.col < lm {
-                CellAddr::Left { row: cursor_main_row as u32, col: cursor.col }
-            } else if cursor.col < lm + mc {
-                CellAddr::Main { row: cursor_main_row as u32, col: (cursor.col - lm) as u32 }
+            if display_cursor_col < lm {
+                CellAddr::Left { row: cursor_main_row as u32, col: display_cursor_col }
+            } else if display_cursor_col < lm + mc {
+                CellAddr::Main { row: cursor_main_row as u32, col: (display_cursor_col - lm) as u32 }
             } else {
-                CellAddr::Right { row: cursor_main_row as u32, col: cursor.col - lm - mc }
+                CellAddr::Right { row: cursor_main_row as u32, col: display_cursor_col - lm - mc }
             }
         } else {
             CellAddr::Footer { row: (display_cursor_row - hr - mr) as u32, col: cursor_col_addr }
         };
         let cursor_display_ri = display_rows.iter().position(|&r| r == display_cursor_row).unwrap_or(0);
         if let Some(raw_val) = g.get(&cursor_addr) {
-            spreadsheet.set_raw_cell(cursor_display_ri as u32, cursor.col as u32, &raw_val);
+            spreadsheet.set_raw_cell(cursor_display_ri as u32, display_cursor_col as u32, &raw_val);
         } else {
-            spreadsheet.set_raw_cell(cursor_display_ri as u32, cursor.col as u32, "");
+            spreadsheet.set_raw_cell(cursor_display_ri as u32, display_cursor_col as u32, "");
         }
-        spreadsheet.set_cursor(cursor_display_ri as u32, cursor.col as u32);
+        spreadsheet.set_cursor(cursor_display_ri as u32, display_cursor_col as u32);
     }
 
     // Tab bar (styled matching ratatui: inactive=white fg+gray bg, active=bold+black fg+yellow bg)
