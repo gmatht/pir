@@ -191,13 +191,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
 
-    // Move cursor to [C~8 (left-margin column C, header row ~8) to match
-    // the reference output.
-    let cursor = SheetCursor {
-        row: hr - 8,
-        col: 699,
-    };
-    app.core.cursor = cursor;
+    // Use the app's natural cursor position from app.core.cursor
+    // (matching ratatui which uses self.cursor directly).
+    let cursor = app.core.cursor;
 
     // ── Visible rows (matching ratatui's visible_row_indices) ──────────
     let dim_rows = 43usize;
