@@ -165,6 +165,41 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // auto_fit_column leaves columns wider than max_col_width in place.
     app.fit_main_columns_to_max_width();
 
+    // ── Available data width (matching ratatui's data_width) ──────────
+    let term_cols = {
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0
+        {
+            ws.ws_col as usize
+        } else {
+            std::env::var("COLUMNS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(80)
+        }
+    };
+    let data_width = term_cols
+        .saturating_sub(2)
+        .saturating_sub(ui_core::ROW_LABEL_CHARS)
+        .max(1);
+
+    // Auto-grow main extent to fill the viewport, matching the old ratatui
+    // behavior that was removed from draw().  This ensures small sheets
+    // still span the full terminal width.
+    {
+        let sheet = app.core.workbook.active_sheet_mut();
+        let grid = &mut sheet.grid;
+        let cell_w = 12usize;
+        let data_cols = data_width
+            .checked_div(cell_w)
+            .unwrap_or(1)
+            .max(1);
+        let target_mc = data_cols.saturating_sub(2).max(1);
+        while grid.main_cols() < target_mc {
+            grid.grow_main_col_at_right();
+        }
+    }
+    // Re-read after potential growth
     let mut sheet_rec = app.core.workbook.active_sheet().clone();
     let hr = HEADER_ROWS;
     let mr = sheet_rec.grid.main_rows();
@@ -214,11 +249,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             }
         }
     }
-    // Always include a window of header rows at the top so the grid
-    // shows ~N labels, matching ratatui's visible_row_indices when
-    // the cursor is in the header section.  When the cursor is in the
-    // main area, show the last 7 header rows (~7 … ~1).
-    {
+    // Only include header rows when the cursor is in the header section,
+    // matching ratatui's visible_row_indices.
+    if cursor.row < hr {
         let already = header_rows.len();
         let want = 7usize;
         if already < want {
@@ -252,24 +285,6 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     if display_rows.len() > dim_rows {
         display_rows.truncate(dim_rows);
     }
-
-    // ── Available data width (matching ratatui's data_width) ──────────
-    let term_cols = {
-        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-        if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0
-        {
-            ws.ws_col as usize
-        } else {
-            std::env::var("COLUMNS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(80)
-        }
-    };
-    let data_width = term_cols
-        .saturating_sub(2)
-        .saturating_sub(ui_core::ROW_LABEL_CHARS)
-        .max(1);
 
     // ── Visible columns (matching ratatui's visible_col_indices) ──────
     let right_start = lm + mc;
