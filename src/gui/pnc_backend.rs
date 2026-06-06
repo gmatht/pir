@@ -175,13 +175,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     // ── Visible rows (matching ratatui's visible_row_indices) ──────────
     let dim_rows = 43usize;
-    // Use a display cursor 4 rows above the first main row so header rows
-    // (~6 … ~1) appear around it, matching the expected render output.
-    let display_cursor_row = if cursor.row == hr {
-        hr.saturating_sub(4)
-    } else {
-        cursor.row
-    };
+    let display_cursor_row = cursor.row;
     let mut header_rows: Vec<usize> = Vec::new();
     let mut footer_rows: Vec<usize> = Vec::new();
     for (addr, _) in sheet_rec.grid.iter_nonempty() {
@@ -192,12 +186,12 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         }
     }
     let main_order = sheet_rec.grid.sorted_main_rows();
-    // Show a window of header rows around the cursor when it's in the
+    // Show a window of header rows near the cursor when it's in the
     // header section, matching ratatui's visible_row_indices logic.
-    if display_cursor_row < hr {
+    if cursor.row < hr {
         let window = 5usize;
-        let lo = display_cursor_row.saturating_sub(window / 2);
-        let hi = display_cursor_row.min(hr - 1);
+        let lo = cursor.row.saturating_sub(window / 2);
+        let hi = cursor.row.min(hr - 1);
         for r in lo..=hi {
             if r < hr {
                 header_rows.push(r);
@@ -209,11 +203,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         for r in (hi + 1)..(hi + 1 + can_add) {
             header_rows.push(r);
         }
-    } else if display_cursor_row >= hr + mr {
+    } else if cursor.row >= hr + mr {
         // Show footer rows near the cursor, up to a window.
         let window = 5usize;
-        let lo = display_cursor_row;
-        let hi = (display_cursor_row + window / 2).min(hr + mr + FOOTER_ROWS - 1);
+        let lo = cursor.row;
+        let hi = (cursor.row + window / 2).min(hr + mr + FOOTER_ROWS - 1);
         for r in lo..=hi {
             if r >= hr + mr {
                 footer_rows.push(r);
