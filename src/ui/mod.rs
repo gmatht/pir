@@ -1800,11 +1800,24 @@ fn visible_row_indices(
     if cursor.row >= hr + mr {
         // When cursor is in the footer, fill from just above the cursor
         // window upward so footer labels are sequential with no gap.
+        // Over-fill to dim so display_rows exceeds dim, allowing the
+        // scroll window to push main rows off the top.
         let lo = cursor.row;
-        for i in 0..blank_needed {
+        let hi = (lo + 2).min(hr + mr + FOOTER_ROWS - 1);
+        for i in 0..dim {
             let r = lo.saturating_sub(1 + i);
             if r >= hr + mr {
                 footer_rows.push(r);
+            }
+        }
+        let so_far = header_rows.len() + main_order.len() + footer_rows.len();
+        if so_far < dim {
+            let remaining = dim - so_far;
+            for i in 0..remaining {
+                let r = hi + 1 + i;
+                if r < hr + mr + FOOTER_ROWS {
+                    footer_rows.push(r);
+                }
             }
         }
     } else {

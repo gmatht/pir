@@ -595,9 +595,8 @@ pub fn visible_row_indices(
             header_rows.push(r);
         }
     } else if cursor.row >= hr + mr {
-        let window = 5usize;
         let lo = cursor.row;
-        let hi = (cursor.row + window / 2).min(hr + mr + FOOTER_ROWS - 1);
+        let hi = (lo + 2).min(hr + mr + FOOTER_ROWS - 1);
         for r in lo..=hi {
             if r >= hr + mr {
                 footer_rows.push(r);
@@ -606,8 +605,29 @@ pub fn visible_row_indices(
     }
     let content_count = header_rows.len() + main_order.len() + footer_rows.len();
     let blank_needed = dim.saturating_sub(content_count);
-    for i in 0..blank_needed {
-        footer_rows.push(hr + mr + i);
+    if cursor.row >= hr + mr {
+        let lo = cursor.row;
+        let hi = (lo + 2).min(hr + mr + FOOTER_ROWS - 1);
+        for i in 0..dim {
+            let r = lo.saturating_sub(1 + i);
+            if r >= hr + mr {
+                footer_rows.push(r);
+            }
+        }
+        let so_far = header_rows.len() + main_order.len() + footer_rows.len();
+        if so_far < dim {
+            let remaining = dim - so_far;
+            for i in 0..remaining {
+                let r = hi + 1 + i;
+                if r < hr + mr + FOOTER_ROWS {
+                    footer_rows.push(r);
+                }
+            }
+        }
+    } else {
+        for i in 0..blank_needed {
+            footer_rows.push(hr + mr + i);
+        }
     }
     header_rows.sort_unstable();
     header_rows.dedup();
@@ -692,7 +712,7 @@ pub fn visible_col_indices(
     let left_band: Vec<usize> = if cursor_in_left {
         let start = cursor.col;
         let end = lm.saturating_sub(1);
-        let window = 7usize;
+        let window = lm;
         if end.saturating_sub(start) <= window {
             (start..=end).collect()
         } else {
@@ -820,10 +840,29 @@ pub fn visible_cols_render_width(grid: &Grid, cols: &[usize]) -> usize {
 }
 
 pub fn trim_visible_cols_to_width(grid: &Grid, cols: &mut Vec<usize>, cursor_col: usize, width: usize) {
+    // The left-margin boundary column [A should never be removed when the
+    // cursor is in the left margin — it is the visual anchor to the main grid.
+    let boundary = MARGIN_COLS.saturating_sub(1);
+    let protect_boundary = cursor_col < MARGIN_COLS;
     while cols.len() > 1 && visible_cols_render_width(grid, cols) > width {
         let first = cols.first().copied().unwrap_or(cursor_col);
         let last = cols.last().copied().unwrap_or(cursor_col);
         if last > cursor_col {
+            if protect_boundary && last == boundary {
+                let mut removed = false;
+                for j in (0..cols.len().saturating_sub(1)).rev() {
+                    if cols[j] > cursor_col {
+                        cols.remove(j);
+                        removed = true;
+                        break;
+                    }
+                }
+                if removed {
+                    continue;
+                }
+                cols.remove(0);
+                continue;
+            }
             cols.pop();
         } else if first < cursor_col {
             cols.remove(0);

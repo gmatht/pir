@@ -162,10 +162,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
 
-    // Position cursor at [D4 (left margin col 698, main row 3) to match
+    // Position cursor at [I4 (left margin col 693, main row 3) to match
     // the ratatui reference output (corro_cols/).
-    app.core.cursor.col = lm.saturating_sub(4);
-    app.core.cursor.row = hr + 3;
+    let target_main_row = 3usize.min(mr.saturating_sub(1));
+    app.core.cursor.col = lm.saturating_sub(9);
+    app.core.cursor.row = hr + target_main_row;
     let cursor = app.core.cursor;
     let display_cursor_row = cursor.row;
 
