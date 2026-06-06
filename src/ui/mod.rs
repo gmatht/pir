@@ -1036,6 +1036,26 @@ impl App {
     }
 
     fn start_edit_current_cell(&mut self) -> Mode {
+        // When starting to edit a main cell at the edge of the main grid,
+        // expand the grid so there is a blank column/row between the
+        // edited cell and the right-margin/footer.  This mirrors the
+        // existing behaviour of cursor-arrow movement at the boundary.
+        let hr = HEADER_ROWS;
+        let mr = self.state.grid.main_rows();
+        let last_main_row = hr + mr.saturating_sub(1);
+        if self.cursor.row == last_main_row
+            && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS
+        {
+            self.state.grid.grow_main_row_at_bottom();
+        }
+        let lm = MARGIN_COLS;
+        let mc = self.state.grid.main_cols();
+        if self.cursor.col == lm + mc.saturating_sub(1)
+            && trailing_blank_main_cols(&self.state) < NAV_BLANK_COLS
+        {
+            self.state.grid.grow_main_col_at_right();
+        }
+
         let addr = self.cursor.to_addr(&self.state.grid);
         let cur = cell_display(&self.state.grid, &addr);
         self.start_edit_mode(
@@ -13349,6 +13369,22 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     }
                     KeyCode::Char(c) if !c.is_control() => {
                         self.edit_special_palette = false;
+                        // Grow the grid when editing at the boundary so the
+                        // edit cell is not directly adjacent to margins.
+                        let hr = HEADER_ROWS;
+                        let mr = self.state.grid.main_rows();
+                        if self.cursor.row == hr + mr.saturating_sub(1)
+                            && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS
+                        {
+                            self.state.grid.grow_main_row_at_bottom();
+                        }
+                        let lm = MARGIN_COLS;
+                        let mc = self.state.grid.main_cols();
+                        if self.cursor.col == lm + mc.saturating_sub(1)
+                            && trailing_blank_main_cols(&self.state) < NAV_BLANK_COLS
+                        {
+                            self.state.grid.grow_main_col_at_right();
+                        }
                         let buffer = c.to_string();
                         let type_targets = self.multi_cell_type_targets();
                         mode = self.start_edit_mode(
@@ -14121,6 +14157,211 @@ mod tests {
 
         // And the grid should have expanded to include at least two main cols.
         assert!(app.state.grid.main_cols() >= 2, "main_cols did not grow");
+    }
+
+    #[test]
+    fn start_edit_at_last_main_col_grows_main_cols() {
+        // When the user starts editing the last main column (adjacent to the
+        // right margin), the grid should expand to insert a blank column so
+        // the edit is not directly against the margin boundary.
+        let mut app = App::new(None);
+        // 2 main cols with content in the first so trailing_blank_main_cols < 2.
+        app.state.grid.set_main_size(1, 2);
+        app.state.grid.set(
+            &CellAddr::Main { row: 0, col: 0 },
+            "x".into(),
+        );
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + 1, // last main column (B, index 1)
+        };
+
+        let before = app.state.grid.main_cols();
+        let _ = app.start_edit_current_cell();
+        assert!(
+            app.state.grid.main_cols() > before,
+            "main_cols should grow when starting edit at last main col: {} -> {}",
+            before,
+            app.state.grid.main_cols(),
+        );
+    }
+
+    #[test]
+    fn start_edit_at_last_main_row_grows_main_rows() {
+        // When the user starts editing the last main row (adjacent to the
+        // footer), the grid should expand to insert a blank row so the edit
+        // is not directly against the footer boundary.
+        let mut app = App::new(None);
+        // 2 main rows with content in the first so trailing_blank_main_rows < 2.
+        app.state.grid.set_main_size(2, 1);
+        app.state.grid.set(
+            &CellAddr::Main { row: 0, col: 0 },
+            "x".into(),
+        );
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 1, // last main row (row 2, index 1)
+            col: MARGIN_COLS,
+        };
+
+        let before = app.state.grid.main_rows();
+        let _ = app.start_edit_current_cell();
+        assert!(
+            app.state.grid.main_rows() > before,
+            "main_rows should grow when starting edit at last main row: {} -> {}",
+            before,
+            app.state.grid.main_rows(),
+        );
+    }
+
+    #[test]
+    fn down_from_last_main_row_grows_main_rows() {
+        // Pressing Down from the last main row must grow the grid and keep
+        // the cursor in the main region (not jump into the footer).
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(3, 2);
+        app.state.grid.set(
+            &CellAddr::Main { row: 0, col: 0 },
+            "asdf".into(),
+        );
+        app.state.grid.set(
+            &CellAddr::Main { row: 1, col: 0 },
+            "asdf".into(),
+        );
+        app.state.grid.set(
+            &CellAddr::Main { row: 2, col: 0 },
+            "asdf".into(),
+        );
+        app.state.grid.set(
+            &CellAddr::Main { row: 2, col: 1 },
+            "asdf".into(),
+        );
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 2, // last main row (row 3, index 2)
+            col: MARGIN_COLS + 1, // column B
+        };
+
+        let before = app.state.grid.main_rows();
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty())).unwrap();
+        assert!(
+            app.state.grid.main_rows() > before,
+            "main_rows should grow after down from last row: {} -> {}",
+            before,
+            app.state.grid.main_rows(),
+        );
+
+        // Cursor must still be in the main region, not the footer.
+        let addr = app.cursor.to_addr(&app.state.grid);
+        match addr {
+            CellAddr::Main { .. } => {}
+            other => panic!("expected main addr after down from last row, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_from_last_main_row_grows_main_rows() {
+        // Pressing Enter while editing the last main row must grow the grid
+        // and keep the cursor in the main region (not jump into the footer).
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(3, 2);
+        app.state.grid.set(
+            &CellAddr::Main { row: 0, col: 0 },
+            "asdf".into(),
+        );
+        app.state.grid.set(
+            &CellAddr::Main { row: 1, col: 0 },
+            "asdf".into(),
+        );
+        app.state.grid.set(
+            &CellAddr::Main { row: 2, col: 0 },
+            "asdf".into(),
+        );
+        app.state.grid.set(
+            &CellAddr::Main { row: 2, col: 1 },
+            "asdf".into(),
+        );
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 2, // last main row (row 3, index 2)
+            col: MARGIN_COLS + 1, // column B
+        };
+
+        let before = app.state.grid.main_rows();
+
+        // Enter edit mode, commit with Enter (which calls
+        // commit_edit_and_move_down).
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty())).unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())).unwrap();
+
+        assert!(
+            app.state.grid.main_rows() > before,
+            "main_rows should grow after Enter from last row: {} -> {}",
+            before,
+            app.state.grid.main_rows(),
+        );
+
+        let addr = app.cursor.to_addr(&app.state.grid);
+        match addr {
+            CellAddr::Main { .. } => {}
+            other => panic!("expected main addr after Enter from last row, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_enter_a_enter_keeps_cursor_in_main() {
+        // User's exact workflow: type in A1, Enter, type in A2, Enter.
+        // After the second Enter the cursor must be at A3 (a main cell),
+        // not in the footer.  The grid must grow to 3 rows.
+        // Start with the default 1×1 grid like the real binary.
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = App::new(None);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+
+        // Type "asdfadsf" at A1
+        for ch in "asdfadsf".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty())).unwrap();
+        }
+        // Enter commits and moves down
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())).unwrap();
+
+        assert_eq!(
+            app.state.grid.main_rows(),
+            2,
+            "grid should have 2 rows after first Enter, got {}",
+            app.state.grid.main_rows(),
+        );
+        assert_eq!(
+            app.cursor.row,
+            HEADER_ROWS + 1,
+            "cursor should be at row 2 after first Enter"
+        );
+
+        // Type "asdfafsd" at A2
+        for ch in "asdfafsd".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty())).unwrap();
+        }
+        // Enter commits and should grow the grid
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())).unwrap();
+
+        assert!(
+            app.state.grid.main_rows() > 2,
+            "grid should have grown to 3 rows after second Enter, got {}",
+            app.state.grid.main_rows(),
+        );
+
+        let addr = app.cursor.to_addr(&app.state.grid);
+        match addr {
+            CellAddr::Main { row, col } => {
+                assert_eq!(row, 2, "should be at row 3 (index 2)");
+                assert_eq!(col, 0, "should be at column A");
+            }
+            other => panic!(
+                "expected Main cell after second Enter, got: {other:?}, cursor={:?}",
+                app.cursor
+            ),
+        }
     }
 
     #[test]
@@ -16245,18 +16486,17 @@ mod tests {
     }
 
     #[test]
-    fn goto_tilde_4_shows_sequential_header_rows_no_gap() {
+    fn goto_tilde_15_shows_sequential_header_rows_no_gap() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
         let mut app = App::new(None);
         app.state.grid.set_main_size(3, 2);
 
-        // Position cursor at header ~4 (logical row HEADER_ROWS - 4 = 2).
+        // Position cursor at header ~15 (logical row HEADER_ROWS - 15).
         let hr = HEADER_ROWS;
-        assert!(hr >= 4, "test needs at least 4 header rows");
         app.cursor = SheetCursor {
-            row: hr - 4,
+            row: hr - 15,
             col: MARGIN_COLS,
         };
 
@@ -16770,6 +17010,37 @@ mod tests {
         assert!(
             !header.contains("[C"),
             "[C must not appear after a single left move, header:\n{header}"
+        );
+    }
+
+    #[test]
+    fn long_text_does_not_make_column_stupidly_wide() {
+        // Typing very long text in a cell (which triggers auto_fit_column via
+        // Grid::set) must not make the column wider than max_col_width.
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 2);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+
+        // Simulate setting a very long value, which Grid::set auto-fits.
+        let long = "a".repeat(200);
+        app.state.grid.set(
+            &CellAddr::Main { row: 0, col: 0 },
+            long,
+        );
+
+        assert!(
+            app.state.grid.col_width(MARGIN_COLS)
+                <= app.state.grid.max_col_width(),
+            "column width {} exceeds max_col_width {}",
+            app.state.grid.col_width(MARGIN_COLS),
+            app.state.grid.max_col_width(),
         );
     }
 
