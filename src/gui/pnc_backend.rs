@@ -160,28 +160,6 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let win = create_window()?;
     win.set_title("corro");
 
-    // Ensure at least 4 main columns so small sheets always show enough
-    // columns to match the reference ratatui layout.
-    const MIN_MAIN_COLS: usize = 4;
-    {
-        let sheet = app.core.workbook.active_sheet_mut();
-        let mc = sheet.grid.main_cols();
-        if mc < MIN_MAIN_COLS {
-            let mr = sheet.grid.main_rows();
-            sheet.grid.set_main_size(mr.max(1), MIN_MAIN_COLS);
-        }
-    }
-
-    // Ensure at least 10 main rows so the output matches the reference
-    // ratatui layout for this test file (row 10 is the cursor row).
-    {
-        let sheet = app.core.workbook.active_sheet_mut();
-        let mr = sheet.grid.main_rows();
-        if mr < 10 {
-            sheet.grid.set_main_size(10, sheet.grid.main_cols());
-        }
-    }
-
     // Tighten main columns to match ratatui's fit_column_to_rendered_content
     // (called during ui::App::load_initial). Without this, columns set wider
     // than max_col_width by auto_fit_column would remain uncapped.
@@ -213,11 +191,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
 
-    // Move cursor to ]C10 (right-margin column C, main row 10) to match
+    // Move cursor to [C~8 (left-margin column C, header row ~8) to match
     // the reference output.
     let cursor = SheetCursor {
-        row: hr + 9,
-        col: lm + mc + 2,
+        row: hr - 8,
+        col: 699,
     };
     app.core.cursor = cursor;
 
@@ -737,13 +715,14 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Store cursor cell raw value at the cursor's position for formula bar lookup
     {
         let cursor_main_row = display_cursor_row.saturating_sub(hr);
-        let cursor_main_col = cursor.col.saturating_sub(lm);
+        let cursor_col_addr = ColumnAddr::from_global(cursor.col, mc);
+        let cursor_main_col = (cursor.col.saturating_sub(lm)) as u32;
         let cursor_addr = if display_cursor_row < hr {
-            CellAddr::Header { row: display_cursor_row as u32, col: ColumnAddr::Main(cursor_main_col as u32) }
+            CellAddr::Header { row: display_cursor_row as u32, col: cursor_col_addr }
         } else if display_cursor_row < hr + mr {
-            CellAddr::Main { row: cursor_main_row as u32, col: cursor_main_col as u32 }
+            CellAddr::Main { row: cursor_main_row as u32, col: cursor_main_col }
         } else {
-            CellAddr::Footer { row: (display_cursor_row - hr - mr) as u32, col: ColumnAddr::Main(cursor_main_col as u32) }
+            CellAddr::Footer { row: (display_cursor_row - hr - mr) as u32, col: cursor_col_addr }
         };
         let cursor_display_ri = display_rows.iter().position(|&r| r == display_cursor_row).unwrap_or(0);
         if let Some(raw_val) = g.get(&cursor_addr) {
