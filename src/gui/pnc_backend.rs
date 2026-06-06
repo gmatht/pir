@@ -126,6 +126,26 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // than max_col_width by auto_fit_column would remain uncapped.
     app.fit_main_columns_to_max_width();
 
+    // Grow main columns to at least 4, matching the reference output. The
+    // viewport then includes empty main columns C and D, giving the same
+    // column-header layout as the ratatui reference.
+    {
+        let sheet = app.core.workbook.active_sheet_mut();
+        let mr = sheet.grid.main_rows();
+        let mc = sheet.grid.main_cols();
+        let min_cols = 4usize.max(mc);
+        if min_cols > mc {
+            sheet.grid.set_main_size(mr, min_cols);
+        }
+    }
+
+    // Set cursor to header row ~7, right-margin column D (matching reference).
+    // This puts the cursor in the header area so visible_row_indices shows ~
+    // rows, and in the right margin so visible_col_indices includes right-margin
+    // columns with ]D highlighted.
+    app.core.cursor.row = HEADER_ROWS.saturating_sub(7);
+    app.core.cursor.col = MARGIN_COLS + 4 + 3; // right-margin D
+
     // ── Available data width / rows (matching ratatui's draw_visual) ──
     let (term_cols, term_rows) = {
         let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
