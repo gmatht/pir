@@ -195,19 +195,6 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         .saturating_sub(ui_core::ROW_LABEL_CHARS)
         .max(1);
 
-    // Position the cursor to show header context and left-margin context
-    {
-        let cursor = &mut app.core.cursor;
-        // Move cursor up 3 rows into the header area so header rows are visible
-        if cursor.row >= HEADER_ROWS && cursor.row < HEADER_ROWS + 3 {
-            cursor.row = HEADER_ROWS.saturating_sub(3);
-        }
-        // Move cursor left 7 columns into the left margin so left-margin cols are visible
-        if cursor.col >= MARGIN_COLS && cursor.col < MARGIN_COLS + 7 {
-            cursor.col = MARGIN_COLS.saturating_sub(7);
-        }
-    }
-
     // Re-read after possible column growth from file loading
     let sheet_rec = app.core.workbook.active_sheet().clone();
 
@@ -261,13 +248,6 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             if r >= hr + mr {
                 footer_rows.push(r);
             }
-        }
-    } else {
-        // Cursor is in or at the first main row.  Show the bottom 3
-        // header rows so the pancurses widget cursor (display-index-
-        // based) can navigate up into the header area via KeyUp.
-        for r in hr.saturating_sub(3)..hr {
-            header_rows.push(r);
         }
     }
     {
