@@ -144,7 +144,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         .saturating_sub(2)
         .saturating_sub(ui_core::ROW_LABEL_CHARS)
         .max(1);
-    let data_cols = data_width.checked_div(2).unwrap_or(1).max(1);
+    let data_cols = data_width.max(1);
 
     // ── Viewport rows (matching ratatui's draw_visual) ──────────────────
     // The widget layout is: menu(1) + formula(1) + border(1) + header(1) +
@@ -162,11 +162,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
 
-    // Position cursor at [I4 (left margin col 693, main row 3) to match
-    // the ratatui reference output (corro_cols/).
-    let target_main_row = 3usize.min(mr.saturating_sub(1));
-    app.core.cursor.col = lm.saturating_sub(9);
-    app.core.cursor.row = hr + target_main_row;
+    // Use default cursor position (A1 = first main cell), matching ratatui.
     let cursor = app.core.cursor;
     let display_cursor_row = cursor.row;
 

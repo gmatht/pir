@@ -9688,7 +9688,17 @@ impl App {
                 let p = name.unicode_pad(w, header_align, true).into_owned();
                 spans.push(Span::styled(p, style));
                 if i + 1 < col_ixs.len() {
-                    spans.push(Span::raw(" "));
+                    let tr = inter_column_trailing_after_data_cell(
+                        i, c, &col_ixs, lm, mc, show_right_divider,
+                    );
+                    match tr {
+                        InterColumnTrailing::PipeAndSpace => {
+                            spans.push(Span::raw("│ "));
+                        }
+                        _ => {
+                            spans.push(Span::raw(" "));
+                        }
+                    }
                 }
             }
             lines.push(Line::from(spans));
@@ -10083,7 +10093,11 @@ impl App {
                 spans_raw.push((disp.clone(), st));
                 match inter_column_trailing_after_data_cell(i, c, &col_ixs, lm, mc, show_right_divider) {
                     InterColumnTrailing::EndOfVisibleRow => {}
-                    InterColumnTrailing::PipeAndSpace | InterColumnTrailing::AsciiSpace => {
+                    InterColumnTrailing::PipeAndSpace => {
+                        spans_raw.push(("│".to_string(), boundary_separator_style(is_underlined_boundary_row)));
+                        spans_raw.push((" ".to_string(), boundary_gap_style(is_underlined_boundary_row)));
+                    }
+                    InterColumnTrailing::AsciiSpace => {
                         spans_raw.push((" ".to_string(), boundary_gap_style(is_underlined_boundary_row)));
                     }
                 }
