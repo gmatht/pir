@@ -126,24 +126,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // than max_col_width by auto_fit_column would remain uncapped.
     app.fit_main_columns_to_max_width();
 
-    // Expand the grid to 4 main columns to match the reference output
-    // (which shows "9r × 4c" in the border title).  The test file only
-    // stores data in columns A and B, so the initial extent is 2;
-    // the extra columns (C, D) let the header row and right-margin
-    // position align with the reference ratatui render.
-    {
-        let sheet = app.core.workbook.active_sheet_mut();
-        let mr = sheet.grid.main_rows();
-        if sheet.grid.main_cols() < 4 {
-            sheet.grid.set_main_size(mr, 4);
-        }
-    }
-
-    // Position the cursor at header row ~5 (logical row HEADER_ROWS - 5)
-    // and right-margin column ]C (global col MARGIN_COLS + 4 + 2) to
+    // Position the cursor at header row ~1 (logical row HEADER_ROWS - 1)
+    // and left-margin column [G (global col MARGIN_COLS - 1 - 6) to
     // match the reference ratatui render.
-    app.core.cursor.row = HEADER_ROWS - 5;
-    app.core.cursor.col = MARGIN_COLS + 4 + 2;
+    app.core.cursor.row = HEADER_ROWS - 1;
+    app.core.cursor.col = MARGIN_COLS - 1 - 6;
 
     // ── Available data width / rows (matching ratatui's draw_visual) ──
     let (term_cols, term_rows) = {
