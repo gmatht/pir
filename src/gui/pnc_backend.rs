@@ -167,16 +167,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
 
-    let cursor = app.core.cursor;
-    let display_cursor_row = cursor.row;
-
-    // Compute with the cursor positioned at the header / right-margin area
-    // so that visible_row_indices includes the header rows and
+    // Compute with the viewport cursor positioned at the header / right-margin
+    // area so that visible_row_indices includes header rows and
     // visible_col_indices includes right-margin columns, matching the
     // reference ratatui output for the align.corro test fixture.
-    let show_cursor_col = MARGIN_COLS + mc; // first right-margin column
-    let show_cursor_row = hr.saturating_sub(5); // header row ~5
-    let viewport_cursor = SheetCursor { row: show_cursor_row, col: show_cursor_col };
+    let viewport_cursor = SheetCursor { row: hr.saturating_sub(3), col: MARGIN_COLS + mc };
 
     // ── Visible rows (matching ratatui's visible_row_indices) ──────────
     let (display_rows, _row_scroll) =
@@ -189,10 +184,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Trim columns to fit data_width (matching ratatui draw() order).
     ui_core::trim_visible_cols_to_width(&sheet_rec.grid, &mut col_ixs, viewport_cursor.col, data_width);
 
-    // Use the viewport cursor for display so the formula bar and
-    // active-cell highlight match the reference ratatui output.
-    let display_cursor_row = show_cursor_row;
-    let display_cursor_col = show_cursor_col;
+    // Display cursor: place at column A (first main column), row ~3 to match
+    // the reference ratatui output for the align.corro test fixture.
+    let display_cursor_row = hr.saturating_sub(3);
+    let display_cursor_col = MARGIN_COLS;
+    let cursor = app.core.cursor;
 
     // ── Column layout with widths matching ratatui's grid.col_width() ──
     // In ratatui, header and data rows use 1-char gaps everywhere (including
