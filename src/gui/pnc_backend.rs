@@ -162,10 +162,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
 
-    let cursor = {
-        let c = app.core.cursor;
-        crate::grid::SheetCursor { row: c.row, col: lm.saturating_sub(1) }
-    };
+    let cursor = app.core.cursor;
     let display_cursor_row = cursor.row;
 
     // ── Visible rows (matching ratatui's visible_row_indices) ──────────
