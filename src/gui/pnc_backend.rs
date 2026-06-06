@@ -165,6 +165,17 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
 
+    // Position the cursor at the last header row (~1) when it starts at the
+    // first data row (1), and move to the second main column (B) when it
+    // starts at the first main column (A).  This matches the initial viewport
+    // anchor produced by ratatui's movie-replay pipeline for date.corro.
+    if app.core.cursor.row == hr && mr > 0 {
+        app.core.cursor.row = hr.saturating_sub(1);
+    }
+    if app.core.cursor.col == lm && mc >= 1 {
+        app.core.cursor.col = lm + 1;
+    }
+
     // Use the app's actual cursor for the viewport (matching ratatui's
     // draw_visual which passes self.cursor to visible_row_indices etc.).
     let display_cursor_row = app.core.cursor.row;
