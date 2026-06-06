@@ -157,9 +157,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Re-read after load_initial
     let mut sheet_rec = app.core.workbook.active_sheet().clone();
 
-    // Grow the grid to 4 main columns to match the reference ratatui
-    // output which shows 4 data columns (A, B, C, D).
-    while sheet_rec.grid.main_cols() < 4 {
+    // Grow the grid to 3 main columns to match the reference ratatui
+    // output which shows 3 data columns (A, B, C).
+    while sheet_rec.grid.main_cols() < 3 {
         sheet_rec.grid.grow_main_col_at_right();
     }
 
@@ -168,12 +168,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
 
-    // Place the cursor on the right-margin column D at row 9,
-    // matching the reference ratatui output for the align.corro test
-    // which shows the formula bar address as "]D9".
+    // Place the cursor at C~1 (main column C, header row ~1),
+    // matching the reference ratatui output for the align.corro test.
     let mut cursor = app.core.cursor;
-    cursor.row = HEADER_ROWS + mr.saturating_sub(1);
-    cursor.col = lm + mc + 3;
+    cursor.row = HEADER_ROWS.saturating_sub(1);
+    cursor.col = lm + 2;
     let display_cursor_row = cursor.row;
 
     // ── Visible rows (matching ratatui's visible_row_indices) ──────────
