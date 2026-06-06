@@ -9704,12 +9704,39 @@ impl App {
             lines.push(Line::from(spans));
         }
 
-        // ── Header separator (│──────────│) ──────────────────────
+        // ── Header separator (├──────┼──────┼──────┤) ──────────
         {
-            let sep_line = format!("│{}│", "─".repeat(inner_w));
-            let truncated: String = sep_line.chars().take(inner_w).collect();
+            let lm = MARGIN_COLS;
+            let mc = grid.main_cols();
+            let show_right_divider = col_ixs.contains(&(lm + mc));
+            let mut sep: Vec<char> = vec!['─'; inner_w];
+            if !sep.is_empty() {
+                sep[0] = '├';
+                *sep.last_mut().unwrap() = '┤';
+            }
+            let mut pos = ROW_LABEL_CHARS;
+            for (i, &c) in col_ixs.iter().enumerate() {
+                pos += grid.col_width(c).max(1);
+                if i + 1 < col_ixs.len() {
+                    let tr = inter_column_trailing_after_data_cell(
+                        i, c, &col_ixs, lm, mc, show_right_divider,
+                    );
+                    match tr {
+                        InterColumnTrailing::PipeAndSpace => {
+                            if pos < inner_w {
+                                sep[pos] = '┼';
+                            }
+                            pos += 2;
+                        }
+                        _ => {
+                            pos += 1;
+                        }
+                    }
+                }
+            }
+            let sep_line: String = sep.iter().collect();
             lines.push(Line::from(Span::styled(
-                truncated,
+                sep_line,
                 Style::default().fg(Color::DarkGray),
             )));
         }
