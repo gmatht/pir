@@ -187,16 +187,8 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let mut sheet_rec = app.core.workbook.active_sheet().clone();
     let hr = HEADER_ROWS;
     let mr = sheet_rec.grid.main_rows();
-    let mut mc = sheet_rec.grid.main_cols();
-    // Ensure at least 4 main columns so the stable column window
-    // (cursor_main_col + 4) is not truncated by main_col_window,
-    // matching the ratatui backend's column selection.
-    if mc < 4 {
-        sheet_rec.grid.set_main_size(mr, 4);
-        mc = 4;
-    }
+    let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
-    let rm = MARGIN_COLS;
     let cursor = app.core.cursor;
 
     // ── Visible rows (matching ratatui's visible_row_indices) ──────────
