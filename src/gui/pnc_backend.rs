@@ -642,22 +642,87 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // ── Cursor move callback: grow grid extent + update viewport ─────────
     // The ratatui backend recomputes the viewport each frame so pressing arrow
     // keys scrolls the visible columns/rows and the grid extent grows as needed.
-    let display_rows_for_cb = display_rows.clone();
+    let display_rows_for_cb = std::cell::RefCell::new(display_rows.clone());
     let mut col_ixs_cb = col_ixs.clone();
+    let sheet_cb = spreadsheet.clone();
     let sid = spreadsheet.id();
     let app_ptr: *mut super::App = app;
     let hr_cb = hr;
+    let mr_cb = mr;
+    let data_rows_cb = data_rows;
     let data_cols_cb = data_cols;
     let data_width_cb = data_width;
     let mut prev_cursor_col = cursor.col;
     let mut prev_cursor_row = cursor.row;
+    let sheet_rec = app.core.workbook.active_sheet().clone();
     add_cursor_move_callback(move |_display_row, _display_col| {
         // SAFETY: app is &mut App alive for the entire event loop
         let app = unsafe { &mut *app_ptr };
         let display_idx = _display_row as usize;
-        if let Some(&logical_row) = display_rows_for_cb.get(display_idx) {
+        let mut need_viewport_recompute = false;
+
+        // Handle sentinel values for scrolling past viewport boundaries
+        if _display_row == u32::MAX {
+            // Scroll up sentinel: user pressed Up at the first visible row
+            if app.core.cursor.row > 0 {
+                app.core.cursor.row -= 1;
+            }
+            need_viewport_recompute = true;
+        } else if _display_row == u32::MAX - 1 {
+            // Scroll down sentinel: user pressed Down at the last visible row
+            app.core.cursor.row += 1;
+            need_viewport_recompute = true;
+        } else if let Some(&logical_row) = display_rows_for_cb.borrow().get(display_idx) {
             app.core.cursor.row = logical_row;
-            app.core.cursor.col = _display_col as usize;
+            // Check if cursor moved into header or footer region; if so,
+            // recompute the viewport so those rows become visible.
+            if logical_row < hr_cb || logical_row >= hr_cb + mr_cb {
+                need_viewport_recompute = true;
+            }
+        }
+        app.core.cursor.col = _display_col as usize;
+
+        if need_viewport_recompute {
+            // Recompute display_rows with the new cursor position and
+            // update the widget's row labels so header/footer rows appear.
+            let rec = app.core.workbook.active_sheet().clone();
+            let cursor = app.core.cursor;
+            let (new_display_rows, _) =
+                crate::ui_core::visible_row_indices(&rec, cursor, data_rows_cb, 0);
+            let new_mr = rec.grid.main_rows();
+            let new_mc = rec.grid.main_cols();
+            let new_labels: Vec<(u32, String)> = new_display_rows.iter()
+                .enumerate()
+                .map(|(idx, &r)| {
+                    let label = crate::addr::ui_row_label(r, new_mr);
+                    (idx as u32, label)
+                })
+                .collect();
+            // Update the widget's row labels
+            spreadsheet_set_row_labels(sid, new_labels);
+            // Find the cursor's new display position in the recomputed rows
+            if let Some(new_display_ri) = new_display_rows.iter().position(|&r| r == cursor.row) {
+                // Set raw cell value for the cursor position so the formula bar
+                // can display it correctly (especially for header/footer cells).
+                let cursor_col_addr = ColumnAddr::from_global(cursor.col, new_mc);
+                let cursor_addr = crate::addr::sheet_cursor_to_addr(
+                    crate::addr::LogicalRow(cursor.row),
+                    crate::addr::GlobalCol(cursor.col),
+                    crate::addr::MainRows(new_mr),
+                    crate::addr::MainCols(new_mc),
+                );
+                if let Some(raw_val) = rec.grid.get(&cursor_addr) {
+                    sheet_cb.set_raw_cell(new_display_ri as u32, cursor.col as u32, &raw_val);
+                } else {
+                    sheet_cb.set_raw_cell(new_display_ri as u32, cursor.col as u32, "");
+                }
+                sheet_cb.set_cursor(new_display_ri as u32, cursor.col as u32);
+            }
+            *display_rows_for_cb.borrow_mut() = new_display_rows;
+            return;
+        }
+
+        if let Some(&logical_row) = display_rows_for_cb.borrow().get(display_idx) {
             let sheet = app.core.workbook.active_sheet_mut();
             let prev_mr = sheet.grid.main_rows();
             let prev_mc = sheet.grid.main_cols();
@@ -703,7 +768,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     mr, mc, app.core.ops_applied
                 );
                 spreadsheet_set_border_title(sid, &boundary_title);
-                let new_labels: Vec<(u32, String)> = display_rows_for_cb.iter()
+                let new_labels: Vec<(u32, String)> = display_rows_for_cb.borrow().iter()
                     .enumerate()
                     .map(|(idx, &r)| {
                         let label = crate::addr::ui_row_label(r, mr);
