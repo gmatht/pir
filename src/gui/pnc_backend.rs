@@ -114,45 +114,6 @@ fn row_total_block_start(g: &GridBox, current_main_row: u32) -> u32 {
     0
 }
 
-/// Compute the total render width (col widths + separators) for a list of
-/// visible column indices, matching ratatui's visible_cols_render_width.
-fn visible_cols_render_width(g: &GridBox, cols: &[usize]) -> usize {
-    let lm = MARGIN_COLS;
-    let mc = g.main_cols();
-    let show_right_divider = cols.contains(&(lm + mc));
-    cols.iter()
-        .enumerate()
-        .map(|(i, &c)| {
-            let sep = if i + 1 >= cols.len() {
-                0
-            } else if (c == lm - 1 && lm > 0 && cols.contains(&lm))
-                || (c == lm + mc - 1 && show_right_divider)
-            {
-                2
-            } else {
-                1
-            };
-            g.col_width(c).max(1) + sep
-        })
-        .sum()
-}
-
-/// Trim trailing columns from `cols` until the total render width fits
-/// within `width`, matching ratatui's trim_visible_cols_to_width.
-fn trim_visible_cols_to_width(g: &GridBox, cols: &mut Vec<usize>, cursor_col: usize, width: usize) {
-    while cols.len() > 1 && visible_cols_render_width(g, cols) > width {
-        let first = cols.first().copied().unwrap_or(cursor_col);
-        let last = cols.last().copied().unwrap_or(cursor_col);
-        if last > cursor_col {
-            cols.pop();
-        } else if first < cursor_col {
-            cols.remove(0);
-        } else {
-            break;
-        }
-    }
-}
-
 pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
     let _backend = rustxwidgets::backends::pancurses::init()
         .map_err(|e| format!("pancurses init failed: {e}"))?;
@@ -165,22 +126,30 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // than max_col_width by auto_fit_column would remain uncapped.
     app.fit_main_columns_to_max_width();
 
-    // ── Available data width (matching ratatui's data_width) ──────────
-    let term_cols = {
+    // ── Available data width / rows (matching ratatui's draw_visual) ──
+    let (term_cols, term_rows) = {
         let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
         if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0
         {
-            ws.ws_col as usize
+            (ws.ws_col as usize, ws.ws_row as usize)
         } else {
-            std::env::var("COLUMNS")
+            let cols = std::env::var("COLUMNS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(80)
+                .unwrap_or(80);
+            (cols, 50usize)
         }
     };
     let data_width = term_cols
         .saturating_sub(2)
         .saturating_sub(ui_core::ROW_LABEL_CHARS)
+        .max(1);
+    let data_cols = data_width.checked_div(2).unwrap_or(1).max(1);
+
+    // ── Viewport rows (matching ratatui's data_rows) ──────────────────
+    // data_rows = inner_h - 1 where inner_h = (term_rows - 3 - 2)
+    let data_rows = term_rows
+        .saturating_sub(6)
         .max(1);
 
     // Re-read after possible column/row growth
@@ -194,147 +163,18 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Use the app's natural cursor position from app.core.cursor
     // (matching ratatui which uses self.cursor directly).
     let cursor = app.core.cursor;
+    let display_cursor_row = cursor.row;
 
     // ── Visible rows (matching ratatui's visible_row_indices) ──────────
-    let dim_rows = 43usize;
-    let display_cursor_row = cursor.row;
-    let mut header_rows: Vec<usize> = Vec::new();
-    let mut footer_rows: Vec<usize> = Vec::new();
-    for (addr, _) in sheet_rec.grid.iter_nonempty() {
-        match addr {
-            CellAddr::Header { row, .. } => header_rows.push(row as usize),
-            CellAddr::Footer { row, .. } => footer_rows.push(hr + mr + row as usize),
-            _ => {}
-        }
-    }
-    let main_order = sheet_rec.grid.sorted_main_rows();
-    // Show a window of header rows near the cursor when it's in the
-    // header section, matching ratatui's visible_row_indices logic.
-    // Also include header rows when cursor is at or near the first main
-    // row so that Up-navigation into header territory works (the
-    // pancurses widget uses display-row indices: cursor_row > 0 is
-    // required for KeyUp, so placing header rows before the first main
-    // row gives the necessary room).
-    let show_header_context = cursor.row < hr;
-    if cursor.row < hr {
-        let window = 5usize;
-        let lo = cursor.row.saturating_sub(window / 2);
-        let hi = cursor.row.min(hr - 1);
-        for r in lo..=hi {
-            if r < hr {
-                header_rows.push(r);
-            }
-        }
-        // Fill gap from bottom of header window down to ~1
-        let so_far = header_rows.len() + main_order.len() + footer_rows.len();
-        let can_add = dim_rows.saturating_sub(so_far).min(hr.saturating_sub(hi + 1));
-        for r in (hi + 1)..(hi + 1 + can_add) {
-            header_rows.push(r);
-        }
-    } else if show_header_context {
-        // Show a window of header rows near the bottom of the header section
-        // so the user can see header labels when the cursor is on the first
-        // few main rows.
-        let window = 8usize;
-        let lo = (hr - window).max(0);
-        let hi = hr - 1;
-        for r in lo..=hi {
-            if r < hr {
-                header_rows.push(r);
-            }
-        }
-    } else if cursor.row >= hr + mr {
-        // Show footer rows near the cursor, up to a window.
-        let window = 5usize;
-        let lo = cursor.row;
-        let hi = (cursor.row + window / 2).min(hr + mr + FOOTER_ROWS - 1);
-        for r in lo..=hi {
-            if r >= hr + mr {
-                footer_rows.push(r);
-            }
-        }
-    }
-    {
-        let content_count = header_rows.len() + main_order.len() + footer_rows.len();
-        let blank_needed = dim_rows.saturating_sub(content_count);
-        for i in 0..blank_needed {
-            footer_rows.push(hr + mr + i);
-        }
-    }
-    header_rows.sort_unstable();
-    header_rows.dedup();
-    footer_rows.sort_unstable();
-    footer_rows.dedup();
-
-    let mut display_rows: Vec<usize> =
-        Vec::with_capacity(header_rows.len() + main_order.len() + footer_rows.len());
-    display_rows.extend(header_rows.iter());
-    display_rows.extend(main_order.iter().map(|r| hr + r));
-    display_rows.extend(footer_rows.iter());
-
-    // Trim display_rows to dim_rows to avoid exceeding the viewport.
-    if display_rows.len() > dim_rows {
-        display_rows.truncate(dim_rows);
-    }
+    let (display_rows, _row_scroll) =
+        ui_core::visible_row_indices(&sheet_rec, cursor, data_rows, 0);
 
     // ── Visible columns (matching ratatui's visible_col_indices) ──────
-    let right_start = lm + mc;
-    let (_main_lo, main_hi) = main_col_window(&sheet_rec, cursor);
+    let (mut col_ixs, _col_scroll) =
+        ui_core::visible_col_indices(&sheet_rec, cursor, data_cols, 0);
 
-    let mut col_ixs: Vec<usize> = Vec::new();
-    // Build left-margin band (matching ratatui's visible_col_indices).
-    if lm > 0 {
-        col_ixs.push(lm - 1);
-        if cursor.col < lm {
-            let start = cursor.col;
-            let end = lm.saturating_sub(1);
-            let window = 7usize;
-            if end.saturating_sub(start) <= window {
-                for c in start..=end {
-                    if !col_ixs.contains(&c) { col_ixs.push(c); }
-                }
-            } else {
-                let half = window / 2;
-                let lo = start.saturating_sub(half);
-                let hi = (lo + window).min(end);
-                for c in lo..=hi {
-                    if !col_ixs.contains(&c) { col_ixs.push(c); }
-                }
-            }
-        }
-    }
-    col_ixs.extend((0..=main_hi as usize).map(|ci| lm + ci));
-    // Fill remaining viewport space with blank right-margin columns
-    // so the grid always fills the screen, matching ratatui:
-    // fill FIRST, then add right_band.
-    {
-        let data_cols = data_width.checked_div(2).unwrap_or(1).max(1);
-        let total_so_far = col_ixs.len();
-        if total_so_far < data_cols {
-            let blank_cols_needed = data_cols - total_so_far;
-            for i in 0..blank_cols_needed.min(MARGIN_COLS) {
-                let gc = right_start + i;
-                if !col_ixs.contains(&gc) {
-                    col_ixs.push(gc);
-                }
-            }
-        }
-    }
-    // Then add right-margin columns with content (right_band).
-    if let Some(end) = ui_core::right_nonblank_end(&sheet_rec) {
-        for i in 0..=end {
-            let gc = right_start + i;
-            if !col_ixs.contains(&gc) {
-                col_ixs.push(gc);
-            }
-        }
-    }
-    col_ixs.sort_unstable();
-    col_ixs.dedup();
-
-    // Trim columns to fit data_width (matching ratatui draw() order;
-    // ratatui's draw() does NOT call fit_visible_columns_capped).
-    trim_visible_cols_to_width(&sheet_rec.grid, &mut col_ixs, cursor.col, data_width);
+    // Trim columns to fit data_width (matching ratatui draw() order).
+    ui_core::trim_visible_cols_to_width(&sheet_rec.grid, &mut col_ixs, cursor.col, data_width);
 
     // ── Column layout with widths matching ratatui's grid.col_width() ──
     let g = &sheet_rec.grid;

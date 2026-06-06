@@ -558,3 +558,277 @@ pub fn rendered_width_for_column(grid: &Grid, global_col: usize) -> Option<usize
 
     saw_content.then_some(maxw.max(4))
 }
+
+// ── Viewport functions (shared by ratatui and pancurses backends) ─────────
+
+pub fn visible_row_indices(
+    state: &SheetState,
+    cursor: SheetCursor,
+    dim: usize,
+    prev_start: usize,
+) -> (Vec<usize>, usize) {
+    let g = &state.grid;
+    let hr = HEADER_ROWS;
+    let mr = g.main_rows();
+    let main_order = g.sorted_main_rows();
+    let mut header_rows = Vec::new();
+    let mut footer_rows = Vec::new();
+    for (addr, _) in g.iter_nonempty() {
+        match addr {
+            CellAddr::Header { row, .. } => header_rows.push(row as usize),
+            CellAddr::Footer { row, .. } => footer_rows.push(hr + mr + row as usize),
+            _ => {}
+        }
+    }
+    if cursor.row < hr {
+        let window = 5usize;
+        let lo = cursor.row.saturating_sub(window / 2);
+        let hi = cursor.row.min(hr - 1);
+        for r in lo..=hi {
+            if r < hr {
+                header_rows.push(r);
+            }
+        }
+        let so_far = header_rows.len() + main_order.len() + footer_rows.len();
+        let can_add = dim.saturating_sub(so_far).min(hr.saturating_sub(hi + 1));
+        for r in (hi + 1)..(hi + 1 + can_add) {
+            header_rows.push(r);
+        }
+    } else if cursor.row >= hr + mr {
+        let window = 5usize;
+        let lo = cursor.row;
+        let hi = (cursor.row + window / 2).min(hr + mr + FOOTER_ROWS - 1);
+        for r in lo..=hi {
+            if r >= hr + mr {
+                footer_rows.push(r);
+            }
+        }
+    }
+    let content_count = header_rows.len() + main_order.len() + footer_rows.len();
+    let blank_needed = dim.saturating_sub(content_count);
+    for i in 0..blank_needed {
+        footer_rows.push(hr + mr + i);
+    }
+    header_rows.sort_unstable();
+    header_rows.dedup();
+    footer_rows.sort_unstable();
+    footer_rows.dedup();
+
+    let mut display_rows: Vec<usize> =
+        Vec::with_capacity(header_rows.len() + main_order.len() + footer_rows.len());
+    display_rows.extend(header_rows);
+    display_rows.extend(main_order.iter().copied().map(|r| hr + r));
+    display_rows.extend(footer_rows);
+
+    let dim = dim.max(1).min(display_rows.len().max(1));
+    if display_rows.len() <= dim {
+        return (display_rows, 0);
+    }
+
+    let cur_display = if cursor.row < hr {
+        cursor.row
+    } else if cursor.row < hr + mr {
+        hr + main_order
+            .iter()
+            .position(|&r| hr + r == cursor.row)
+            .unwrap_or(0)
+    } else {
+        cursor.row
+    };
+
+    let cur_pos = display_rows
+        .iter()
+        .position(|&r| r == cur_display)
+        .unwrap_or(0);
+    let max_start = display_rows.len().saturating_sub(dim);
+    let mut start = prev_start.min(max_start);
+    if cur_pos < start {
+        start = cur_pos;
+    } else if cur_pos >= start + dim {
+        start = cur_pos + 1 - dim;
+    }
+
+    (display_rows[start..start + dim].to_vec(), start)
+}
+
+pub fn visible_col_indices(
+    state: &SheetState,
+    cursor: SheetCursor,
+    dim: usize,
+    prev_start: usize,
+) -> (Vec<usize>, usize) {
+    let g = &state.grid;
+    let lm = MARGIN_COLS;
+    let mc = g.main_cols();
+    let rm = MARGIN_COLS;
+    let total = lm + mc + rm;
+    let dim = dim.max(1).min(total.max(1));
+    let cur = cursor.col.min(total.saturating_sub(1));
+    let cursor_in_left = cursor.col < lm;
+    let cursor_in_right = cursor.col >= lm + mc;
+
+    if total <= dim {
+        return ((0..total).collect(), 0);
+    }
+
+    let (_main_lo, main_hi) = main_col_window(state, cursor);
+    let right_start = lm + mc;
+    let mut right_band: Vec<usize> = match right_nonblank_end(state) {
+        Some(end) => (0..=end).map(|i| right_start + i).collect(),
+        None => Vec::new(),
+    };
+    let blank_right = right_nonblank_end(state)
+        .map(|end| end + 1)
+        .filter(|&i| i < rm)
+        .map(|i| right_start + i)
+        .unwrap_or(right_start);
+    if cursor_in_right {
+        let rcur = cur.saturating_sub(right_start);
+        for i in 0..=rcur {
+            right_band.push(right_start + i);
+        }
+        right_band.push(blank_right);
+    }
+    let left_band: Vec<usize> = if cursor_in_left {
+        let start = cursor.col;
+        let end = lm.saturating_sub(1);
+        let window = 7usize;
+        if end.saturating_sub(start) <= window {
+            (start..=end).collect()
+        } else {
+            let half = window / 2;
+            let lo = start.saturating_sub(half);
+            let hi = (lo + window).min(end);
+            (lo..=hi).collect()
+        }
+    } else {
+        Vec::new()
+    };
+    let main_span = (main_hi.saturating_sub(0) + 1) as usize;
+    let mut stable_band = Vec::with_capacity(
+        (if lm > 0 { 1 } else { 0 })
+            + left_band.len()
+            + main_span
+            + right_band.len(),
+    );
+    if lm > 0 {
+        stable_band.push(lm - 1);
+    }
+    stable_band.extend(left_band.iter().copied());
+    stable_band.extend((0..=main_hi).map(|ci| lm + ci as usize));
+    {
+        let total_so_far = stable_band.len();
+        if total_so_far < dim {
+            let blank_cols_needed = dim - total_so_far;
+            for i in 0..blank_cols_needed.min(rm) {
+                stable_band.push(right_start + i);
+            }
+        }
+    }
+    stable_band.extend(right_band.iter().copied());
+    stable_band.sort_unstable();
+    stable_band.dedup();
+    if stable_band.len() <= dim && stable_band.contains(&cur) {
+        return (stable_band, 0);
+    }
+
+    let mut reserved: Vec<usize> = left_band;
+    for ci in 0..=main_hi {
+        let gc = lm + ci as usize;
+        if !reserved.contains(&gc) {
+            reserved.push(gc);
+        }
+    }
+    if lm > 0 && !reserved.contains(&(lm - 1)) {
+        reserved.push(lm - 1);
+    }
+    if !cursor_in_right && rm > 0 && !reserved.iter().any(|&c| c == blank_right) {
+        let mut cand = reserved.clone();
+        cand.push(blank_right);
+        cand.sort_unstable();
+        cand.dedup();
+        if cand.len() < dim {
+            let available = dim.saturating_sub(cand.len()).max(1);
+            let filtered_len = (0..total).filter(|c| !cand.iter().any(|p| p == c)).count();
+            if filtered_len <= available {
+                reserved = cand;
+            }
+        }
+    }
+    reserved.sort_unstable();
+    reserved.dedup();
+
+    let available = dim.saturating_sub(reserved.len()).max(1);
+    let filtered: Vec<usize> = (0..total)
+        .filter(|c| !reserved.iter().any(|p| p == c))
+        .collect();
+    if filtered.is_empty() {
+        return (reserved, 0);
+    }
+
+    let cur_pos = match filtered.binary_search(&cur) {
+        Ok(i) => i,
+        Err(i) => i.min(filtered.len().saturating_sub(1)),
+    };
+    let max_start = filtered.len().saturating_sub(available);
+    let mut start = prev_start.min(max_start);
+    if cur_pos < start || cur_pos >= start + available {
+        start = cur_pos.saturating_sub(available / 2).min(max_start);
+    }
+    let end = (start + available).min(filtered.len());
+
+    let mut out: Vec<usize> = filtered[start..end].to_vec();
+
+    if end >= filtered.len() && out.last().copied().unwrap_or(0) <= right_start.saturating_sub(1) {
+        let right_start_col = right_start;
+        for i in 0..MARGIN_COLS {
+            let gc = right_start_col + i;
+            if reserved.contains(&gc) || out.contains(&gc) {
+                continue;
+            }
+            out.push(gc);
+            if out.len() + reserved.len() >= dim * 2 {
+                break;
+            }
+        }
+    }
+
+    out.extend(reserved);
+    out.sort_unstable();
+    (out, start)
+}
+
+pub fn visible_cols_render_width(grid: &Grid, cols: &[usize]) -> usize {
+    let lm = MARGIN_COLS;
+    let mc = grid.main_cols();
+    let show_right_divider = cols.contains(&(lm + mc));
+    cols.iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            let sep = if i + 1 >= cols.len() {
+                0
+            } else if (c == lm - 1 && lm > 0 && cols.contains(&lm))
+                || (c == lm + mc - 1 && show_right_divider)
+            {
+                2
+            } else {
+                1
+            };
+            grid.col_width(c).max(1) + sep
+        })
+        .sum()
+}
+
+pub fn trim_visible_cols_to_width(grid: &Grid, cols: &mut Vec<usize>, cursor_col: usize, width: usize) {
+    while cols.len() > 1 && visible_cols_render_width(grid, cols) > width {
+        let first = cols.first().copied().unwrap_or(cursor_col);
+        let last = cols.last().copied().unwrap_or(cursor_col);
+        if last > cursor_col {
+            cols.pop();
+        } else if first < cursor_col {
+            cols.remove(0);
+        } else {
+            break;
+        }
+    }
+}
