@@ -162,7 +162,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     // Ensure a minimum number of main columns so the grid always has at
     // least 4 column slots to display, matching the ratatui reference output.
-    const MIN_MAIN_COLS: usize = 4;
+    const MIN_MAIN_COLS: usize = 3;
     {
         let sheet = app.core.workbook.active_sheet_mut();
         let mc = sheet.grid.main_cols();
@@ -248,6 +248,13 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             if r >= hr + mr {
                 footer_rows.push(r);
             }
+        }
+    } else {
+        // Cursor is in or at the first main row.  Show the bottom 3
+        // header rows so the pancurses widget cursor (display-index-
+        // based) can navigate up into the header area via KeyUp.
+        for r in hr.saturating_sub(3)..hr {
+            header_rows.push(r);
         }
     }
     {
