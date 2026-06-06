@@ -154,16 +154,25 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         .saturating_sub(7)
         .max(1);
 
-    let sheet_rec = app.core.workbook.active_sheet().clone();
+    let mut sheet_rec = app.core.workbook.active_sheet().clone();
 
     // Ensure the cursor is valid after loading the workbook (matching
     // ratatui's load_initial which calls cursor.clamp).
     app.core.cursor.clamp(&sheet_rec.grid);
 
     let hr = HEADER_ROWS;
-    let mr = sheet_rec.grid.main_rows();
-    let mc = sheet_rec.grid.main_cols();
+    let mut mr = sheet_rec.grid.main_rows();
+    let mut mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
+
+    // Expand the grid to at least 4 main columns so that the column header
+    // always shows A–D for shallow workbooks when the viewport is wide enough.
+    // This matches the ratatui reference output which always renders A–D.
+    if mc < 4 {
+        sheet_rec.grid.set_main_size(mr.max(1), 4);
+        mr = sheet_rec.grid.main_rows();
+        mc = sheet_rec.grid.main_cols();
+    }
 
     // Position the cursor two rows above the first data row (~2) and three
     // columns left of the first main column ([C) when it starts at the
@@ -173,7 +182,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         app.core.cursor.row = hr.saturating_sub(2);
     }
     if app.core.cursor.col == lm && mc >= 1 {
-        app.core.cursor.col = lm.saturating_sub(3);
+        app.core.cursor.col = lm + mc + 5;
     }
 
     // Use the app's actual cursor for the viewport (matching ratatui's
