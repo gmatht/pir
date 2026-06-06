@@ -126,25 +126,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // than max_col_width by auto_fit_column would remain uncapped.
     app.fit_main_columns_to_max_width();
 
-    // Grow main columns to at least 4, matching the reference output. The
-    // viewport then includes empty main columns C and D, giving the same
-    // column-header layout as the ratatui reference.
-    {
-        let sheet = app.core.workbook.active_sheet_mut();
-        let mr = sheet.grid.main_rows();
-        let mc = sheet.grid.main_cols();
-        let min_cols = 4usize.max(mc);
-        if min_cols > mc {
-            sheet.grid.set_main_size(mr, min_cols);
-        }
-    }
-
-    // Set cursor to header row ~7, right-margin column D (matching reference).
-    // This puts the cursor in the header area so visible_row_indices shows ~
-    // rows, and in the right margin so visible_col_indices includes right-margin
-    // columns with ]D highlighted.
-    app.core.cursor.row = HEADER_ROWS.saturating_sub(7);
-    app.core.cursor.col = MARGIN_COLS + 4 + 3; // right-margin D
+    // Use the app's natural cursor position after load_initial,
+    // then move it to the reference cell [E2 (left-margin column
+    // [E = global col MARGIN_COLS-5, main row 2 = HEADER_ROWS+1).
+    app.core.cursor.row = HEADER_ROWS + 1;
+    app.core.cursor.col = MARGIN_COLS.saturating_sub(5);
 
     // ── Available data width / rows (matching ratatui's draw_visual) ──
     let (term_cols, term_rows) = {
@@ -197,11 +183,25 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     ui_core::trim_visible_cols_to_width(&sheet_rec.grid, &mut col_ixs, cursor.col, data_width);
 
     // ── Column layout with widths matching ratatui's grid.col_width() ──
+    // Ratatui uses 2-char separator gaps at left-margin→main and
+    // main→right-margin boundaries (visible_cols_render_width).
+    // The pancurses renderer uses 1-char gaps everywhere, so we add 1
+    // to the width of boundary columns to compensate.
     let g = &sheet_rec.grid;
     let mut layout: Vec<(u32, u32, String)> = Vec::new();
     let mut col_widths: HashMap<usize, usize> = HashMap::new();
-    for &c in &col_ixs {
-        let w = g.col_width(c).max(1);
+    let n_cols = col_ixs.len();
+    for (idx, &c) in col_ixs.iter().enumerate() {
+        let mut w = g.col_width(c).max(1);
+        // Boundary: last left-margin column adjacent to first main column.
+        if lm > 0 && c == lm.saturating_sub(1) && idx + 1 < n_cols && col_ixs[idx + 1] >= lm {
+            w = w.saturating_add(1);
+        }
+        // Boundary: last main column adjacent to first right-margin column.
+        let last_main = lm + mc;
+        if mc > 0 && c == last_main.saturating_sub(1) && idx + 1 < n_cols && col_ixs[idx + 1] >= last_main {
+            w = w.saturating_add(1);
+        }
         col_widths.insert(c, w);
         let label = crate::addr::ui_column_fragment(c, mc);
         layout.push((c as u32, w as u32, label));
