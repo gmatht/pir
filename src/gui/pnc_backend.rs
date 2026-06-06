@@ -183,18 +183,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         .saturating_sub(ui_core::ROW_LABEL_CHARS)
         .max(1);
 
-    // Grow main columns to a minimum of 3 so the viewport shows at least
-    // A, B, C (matching ratatui's auto-grow-on-Right-at-edge behavior).
-    // A larger sheet will keep its natural main_cols.
-    let needed_mc = 3usize;
-    {
-        let sheet = app.core.workbook.active_sheet_mut();
-        let grid = &mut sheet.grid;
-        while grid.main_cols() < needed_mc {
-            grid.grow_main_col_at_right();
-        }
-    }
-    // Re-read after potential growth
+    // Re-read after possible column growth from file loading
     let mut sheet_rec = app.core.workbook.active_sheet().clone();
     let hr = HEADER_ROWS;
     let mr = sheet_rec.grid.main_rows();
@@ -246,18 +235,6 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         for r in lo..=hi {
             if r >= hr + mr {
                 footer_rows.push(r);
-            }
-        }
-    }
-    // Always include at least 6 header rows for context and Up-navigation
-    // (matching the ratatui reference output for align.corro which shows
-    // rows ~6 … ~1 before the first main row).
-    {
-        let want = 6usize;
-        let start = hr.saturating_sub(want);
-        for r in start..hr {
-            if !header_rows.contains(&r) {
-                header_rows.push(r);
             }
         }
     }
