@@ -154,27 +154,22 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         .saturating_sub(7)
         .max(1);
 
-    // Re-read after load_initial; grow the grid to at least 4 main columns
-    // to match the reference ratatui output (which shows "4c" in the title).
-    {
-        let active = app.core.workbook.active_sheet_mut();
-        active.grid.set_min_extent(0, 4);
-    }
     let sheet_rec = app.core.workbook.active_sheet().clone();
+
+    // Ensure the cursor is valid after loading the workbook (matching
+    // ratatui's load_initial which calls cursor.clamp).
+    app.core.cursor.clamp(&sheet_rec.grid);
 
     let hr = HEADER_ROWS;
     let mr = sheet_rec.grid.main_rows();
     let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
 
-    // Position the cursor at header row ~2 / left-margin column G so the
-    // initial viewport (visible_row_indices with cursor in the header area)
-    // shows header rows ~4..~1, main rows 1..9, and footer rows _1.._30,
-    // matching the reference ratatui output for the align.corro test fixture.
-    let viewport_cursor = SheetCursor { row: hr.saturating_sub(2), col: MARGIN_COLS.saturating_sub(7) };
-    let display_cursor_row = viewport_cursor.row;
-    let display_cursor_col = viewport_cursor.col;
-    let cursor = viewport_cursor;
+    // Use the app's actual cursor for the viewport (matching ratatui's
+    // draw_visual which passes self.cursor to visible_row_indices etc.).
+    let display_cursor_row = app.core.cursor.row;
+    let display_cursor_col = app.core.cursor.col;
+    let cursor = app.core.cursor;
 
     // ── Visible rows (matching ratatui's visible_row_indices) ──────────
     let (display_rows, _row_scroll) =
