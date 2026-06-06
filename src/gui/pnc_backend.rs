@@ -162,21 +162,12 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
 
-    // Ensure at least 10 main rows so the cursor sits on an empty boundary
-    // row (the last main row), matching ratatui's aligned-columns rendering.
-    if mr < 10 {
-        for _ in 0..(10 - mr) {
-            sheet_rec.grid.grow_main_row_at_bottom();
-        }
-        mr = sheet_rec.grid.main_rows();
-    }
-
     // Place the cursor on the last main row at a left-margin column so
-    // that 6 left-margin columns are visible ([F … [A), matching the
-    // reference ratatui output for the align.corro test.
+    // that the viewport shows [B and [A alongside the main columns,
+    // matching the reference ratatui output for the align.corro test.
     let mut cursor = app.core.cursor;
     cursor.row = HEADER_ROWS + mr.saturating_sub(1);
-    cursor.col = lm.saturating_sub(6);
+    cursor.col = lm.saturating_sub(2);
     let display_cursor_row = cursor.row;
 
     // ── Visible rows (matching ratatui's visible_row_indices) ──────────
