@@ -224,6 +224,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // pancurses widget uses display-row indices: cursor_row > 0 is
     // required for KeyUp, so placing header rows before the first main
     // row gives the necessary room).
+    let show_header_context = cursor.row <= hr;
     if cursor.row < hr {
         let window = 5usize;
         let lo = cursor.row.saturating_sub(window / 2);
@@ -238,6 +239,18 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         let can_add = dim_rows.saturating_sub(so_far).min(hr.saturating_sub(hi + 1));
         for r in (hi + 1)..(hi + 1 + can_add) {
             header_rows.push(r);
+        }
+    } else if show_header_context {
+        // Show a window of header rows near the bottom of the header section
+        // so the user can see header labels when the cursor is on the first
+        // few main rows.
+        let window = 8usize;
+        let lo = (hr - window).max(0);
+        let hi = hr - 1;
+        for r in lo..=hi {
+            if r < hr {
+                header_rows.push(r);
+            }
         }
     } else if cursor.row >= hr + mr {
         // Show footer rows near the cursor, up to a window.
@@ -296,6 +309,15 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 for c in lo..=hi {
                     if !col_ixs.contains(&c) { col_ixs.push(c); }
                 }
+            }
+        } else if cursor.col == lm {
+            // Cursor at first main column: show a window of left-margin
+            // columns for context, matching ratatui behavior.
+            let window = 7usize;
+            let end = lm.saturating_sub(1);
+            let lo = end.saturating_sub(window);
+            for c in lo..=end {
+                if !col_ixs.contains(&c) { col_ixs.push(c); }
             }
         }
     }
