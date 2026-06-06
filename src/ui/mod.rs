@@ -1797,8 +1797,20 @@ fn visible_row_indices(
     // Fill remaining viewport space with blank footer rows.
     let content_count = header_rows.len() + main_order.len() + footer_rows.len();
     let blank_needed = dim.saturating_sub(content_count);
-    for i in 0..blank_needed {
-        footer_rows.push(hr + mr + i);
+    if cursor.row >= hr + mr {
+        // When cursor is in the footer, fill from just above the cursor
+        // window upward so footer labels are sequential with no gap.
+        let lo = cursor.row;
+        for i in 0..blank_needed {
+            let r = lo.saturating_sub(1 + i);
+            if r >= hr + mr {
+                footer_rows.push(r);
+            }
+        }
+    } else {
+        for i in 0..blank_needed {
+            footer_rows.push(hr + mr + i);
+        }
     }
     header_rows.sort_unstable();
     header_rows.dedup();
@@ -1888,11 +1900,12 @@ fn visible_col_indices(
         right_band.push(blank_right);
     }
     let left_band: Vec<usize> = if cursor_in_left {
-        // Show left-margin columns from cursor outward toward main,
-        // plus a few columns past cursor so adjacent labels are visible.
+        // Show left-margin columns from cursor outward toward the main
+        // boundary.  No artificial cap — the viewport grows leftward one
+        // column per left-arrow press.
         let start = cursor.col;
         let end = lm.saturating_sub(1);
-        let window = 7usize;
+        let window = lm;
         if end.saturating_sub(start) <= window {
             (start..=end).collect()
         } else {
@@ -2039,14 +2052,34 @@ fn visible_cols_render_width(grid: &Grid, cols: &[usize]) -> usize {
 }
 
 fn trim_visible_cols_to_width(grid: &Grid, cols: &mut Vec<usize>, cursor_col: usize, width: usize) {
+    // The left-margin boundary column [A should never be removed when the
+    // cursor is in the left margin — it is the visual anchor to the main grid.
+    let boundary = MARGIN_COLS.saturating_sub(1);
+    let protect_boundary = cursor_col < MARGIN_COLS;
     while cols.len() > 1 && visible_cols_render_width(grid, cols) > width {
         let first = cols.first().copied().unwrap_or(cursor_col);
         let last = cols.last().copied().unwrap_or(cursor_col);
-        // Remove columns to the *right* of the cursor first so we do not
-        // immediately drop a column to the left of the focus (e.g. hiding A
-        // when moving to B) when the overflow is from wide content on the right
-        // or in the right margin.
         if last > cursor_col {
+            if protect_boundary && last == boundary {
+                // Find the rightmost column before the boundary that is still
+                // to the right of cursor, and remove it instead.
+                let mut removed = false;
+                for j in (0..cols.len().saturating_sub(1)).rev() {
+                    if cols[j] > cursor_col {
+                        cols.remove(j);
+                        removed = true;
+                        break;
+                    }
+                }
+                if removed {
+                    continue;
+                }
+                // Nothing removable to the right except the boundary itself —
+                // remove from the left side (even if it is the cursor column
+                // — the cursor remains tracked independently).
+                cols.remove(0);
+                continue;
+            }
             cols.pop();
         } else if first < cursor_col {
             cols.remove(0);
@@ -15761,11 +15794,11 @@ mod tests {
     }
 
     #[test]
-    fn goto_a_20_shows_non_sequential_footer_rows() {
+    fn goto_a_20_shows_sequential_footer_rows() {
+        // Footer rows near the cursor should be sequential with no gap.
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        // Create a sheet with 3 main rows, 1 main column.
         let mut app = App::new(None);
         app.state.grid.set_main_size(3, 1);
         app.state
@@ -15787,7 +15820,6 @@ mod tests {
             "val_at_20".into(),
         );
 
-        // Position cursor at footer _20.
         let hr = HEADER_ROWS;
         let mr = app.state.grid.main_rows();
         app.cursor = SheetCursor {
@@ -15795,7 +15827,6 @@ mod tests {
             col: MARGIN_COLS,
         };
 
-        // Render the grid and capture the buffer.
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
@@ -15808,8 +15839,8 @@ mod tests {
             })
             .collect();
 
-        // Find all rendered footer row labels (lines containing `_N` with a digit).
-        let footer_labels: Vec<&str> = lines
+        // Find all rendered footer row labels (_N).
+        let footer_labels_vec: Vec<String> = lines
             .iter()
             .flat_map(|line| {
                 let mut labels = Vec::new();
@@ -15824,7 +15855,7 @@ mod tests {
                             .take_while(|&j| bytes[j].is_ascii_digit())
                             .last()
                             .unwrap_or(i + 1);
-                        labels.push(&line[i..=end]);
+                        labels.push(line[i..=end].to_string());
                         i = end + 1;
                     } else {
                         i += 1;
@@ -15833,28 +15864,18 @@ mod tests {
                 labels
             })
             .collect();
+        // Deduplicate: same label may appear on the formula bar and grid.
+        let mut footer_labels: Vec<&str> = footer_labels_vec.iter().map(|s| s.as_str()).collect();
+        footer_labels.sort_unstable();
+        footer_labels.dedup();
 
-        // The footer labels should include _1, _2, and _20 (where the
-        // cursor is), with a gap — this is the non-sequential footer
-        // behavior we are testing for.
-        // and _20 (where the cursor is), but NOT _3 through _19.
-        // This is the non-sequential gap we reproduce.
-        assert!(
-            footer_labels.contains(&"_1"),
-            "expected _1 in footer labels: {footer_labels:?}"
-        );
-        assert!(
-            footer_labels.contains(&"_2"),
-            "expected _2 in footer labels: {footer_labels:?}"
-        );
+        // _20 (cursor position) must be visible.
         assert!(
             footer_labels.contains(&"_20"),
             "expected _20 in footer labels: {footer_labels:?}"
         );
 
-        // Verify the gap: the labels should NOT be sequential.
-        // Sequential would be _1, _2, _3, ..., _23.
-        // Non-sequential means _1, _2, _20 with a jump.
+        // Footer rows near the cursor must be sequential (no gap).
         let footer_nums: Vec<u32> = footer_labels
             .iter()
             .filter_map(|l| l.strip_prefix('_'))
@@ -15864,12 +15885,12 @@ mod tests {
             let max = footer_nums.iter().copied().max().unwrap_or(0);
             let min = footer_nums.iter().copied().min().unwrap_or(0);
             let range_len = (max - min + 1) as usize;
-            // If sequential, count == range_len (no gaps).
-            // Non-sequential means count < range_len.
             assert!(
-                footer_nums.len() < range_len,
-                "expected NON-sequential footer rows (gap between _2 and _20), \
-                 got sequential range {min}..={max}: {footer_nums:?}\nlines:\n{}",
+                footer_nums.len() == range_len,
+                "expected SEQUENTIAL footer rows (no gap), \
+                 got {}/{} range {min}..={max}: {footer_nums:?}\nlines:\n{}",
+                footer_nums.len(),
+                range_len,
                 lines.join("\n")
             );
         }
@@ -16643,6 +16664,58 @@ mod tests {
             .unwrap_or_default();
 
         assert!(line.contains("[A"));
+    }
+
+    #[test]
+    fn left_from_a_shows_only_a_not_c() {
+        // On a blank 1x1 sheet, moving left once from column A should
+        // show [A in the viewport but NOT [C — the viewport should not
+        // jump more than one column per press.
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+
+        let backend = TestBackend::new(80, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+
+        // Move left once — cursor goes to [A.
+        app.cursor.col = MARGIN_COLS - 1;
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let lines: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+
+        // Find the grid border and take the line after it (column header).
+        let header = lines
+            .iter()
+            .position(|l| l.contains('┌'))
+            .and_then(|i| lines.get(i + 1))
+            .cloned()
+            .unwrap_or_default();
+
+        // [A should be visible (the column we just moved to).
+        assert!(
+            header.contains("[A"),
+            "[A should be visible after one left move, header:\n{header}"
+        );
+        // [C should NOT be visible — that would require two more left
+        // presses.
+        assert!(
+            !header.contains("[C"),
+            "[C must not appear after a single left move, header:\n{header}"
+        );
     }
 
     #[test]

@@ -154,22 +154,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         .saturating_sub(7)
         .max(1);
 
-    // Extend main columns to fill the available viewport width, matching
-    // ratatui's draw_visual which allocates data_cols columns.  This ensures
-    // empty main columns (C, D, …) are shown as data columns rather than
-    // right-margin columns, producing a consistent layout between backends.
-    {
-        let sheet = app.core.workbook.active_sheet_mut();
-        let mr = sheet.grid.main_rows();
-        let mc = sheet.grid.main_cols();
-        // Target at least 4 main columns (matching ratatui's default viewport).
-        let target_mc = data_cols.min(4.max(mc));
-        if target_mc > mc {
-            sheet.grid.set_main_size(mr, target_mc);
-        }
-    }
-
-    // Re-read after possible column/row growth
+    // Re-read after load_initial
     let sheet_rec = app.core.workbook.active_sheet().clone();
 
     let hr = HEADER_ROWS;
@@ -177,14 +162,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
 
-    // Set cursor to match the ratatui reference position: right-margin
-    // column for A (]A) at row 6, so the rendered output matches
-    // character-for-character.
-    let cursor = SheetCursor {
-        row: hr + 5,
-        col: lm + mc,
-    };
-    app.core.cursor = cursor;
+    // Position cursor at [D4 (left margin col 698, main row 3) to match
+    // the ratatui reference output (corro_cols/).
+    app.core.cursor.col = lm.saturating_sub(4);
+    app.core.cursor.row = hr + 3;
+    let cursor = app.core.cursor;
     let display_cursor_row = cursor.row;
 
     // ── Visible rows (matching ratatui's visible_row_indices) ──────────
@@ -524,9 +506,14 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 let display_text = if formatted.is_empty() {
                     String::new()
                 } else if fw > cw {
+                    // When content overflows the column width, include the
+                    // inter-column gap in the display width so text fills the
+                    // gap (matching ratatui's behavior where overflow text
+                    // consumes the gap space rather than leaving a gap char).
+                    let store_width = cw + gap_width;
                     let cell_fmt = g.format_for_addr(&addr);
                     let rational_hint = if matches!(cell_fmt.number, None | Some(NumberFormat::Rational | NumberFormat::DecimalGeneric))
-                        && would_ellipsis_hide_decimal_point(&formatted, cw)
+                        && would_ellipsis_hide_decimal_point(&formatted, store_width)
                     {
                         effective_numeric(g, &addr, &mut Vec::new(), &mut 10_000usize)
                             .map(|n| n.to_f64())
@@ -534,16 +521,16 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     } else {
                         None
                     };
-                    let exp_preferred = if would_ellipsis_hide_decimal_point(&formatted, cw) {
-                        exponential_numeric_display_with_hint(&formatted, cw, rational_hint)
+                    let exp_preferred = if would_ellipsis_hide_decimal_point(&formatted, store_width) {
+                        exponential_numeric_display_with_hint(&formatted, store_width, rational_hint)
                     } else {
                         None
                     };
                     let inner = exp_preferred
-                        .or_else(|| ui_core::shrink_numeric_display(&formatted, cw))
-                        .or_else(|| ui_core::exponential_numeric_display(&formatted, cw))
-                        .unwrap_or_else(|| ui_core::truncate_with_ellipsis(&formatted, cw));
-                    align_cell_display(inner, cw, align)
+                        .or_else(|| ui_core::shrink_numeric_display(&formatted, store_width))
+                        .or_else(|| ui_core::exponential_numeric_display(&formatted, store_width))
+                        .unwrap_or_else(|| ui_core::truncate_with_ellipsis(&formatted, store_width));
+                    align_cell_display(inner, store_width, align)
                 } else {
                     align_cell_display(formatted.to_string(), cw, align)
                 };
