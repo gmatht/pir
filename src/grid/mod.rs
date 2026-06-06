@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::formula::{parse_numeric_or_date_literal, Number};
 
-pub const HEADER_ROWS: usize = 999_999_999;
+pub const HEADER_ROWS: usize = 6;
 pub const FOOTER_ROWS: usize = 999_999_999;
 /// Number of margin columns on each side. Expanded to support multi-letter
 /// mirror names (e.g. A..ZZ). Use usize for indexes.

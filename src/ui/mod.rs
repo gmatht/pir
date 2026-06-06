@@ -16245,17 +16245,18 @@ mod tests {
     }
 
     #[test]
-    fn goto_tilde_15_shows_sequential_header_rows_no_gap() {
+    fn goto_tilde_4_shows_sequential_header_rows_no_gap() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
         let mut app = App::new(None);
         app.state.grid.set_main_size(3, 2);
 
-        // Position cursor at header ~15 (logical row HEADER_ROWS - 15).
+        // Position cursor at header ~4 (logical row HEADER_ROWS - 4 = 2).
         let hr = HEADER_ROWS;
+        assert!(hr >= 4, "test needs at least 4 header rows");
         app.cursor = SheetCursor {
-            row: hr - 15,
+            row: hr - 4,
             col: MARGIN_COLS,
         };
 

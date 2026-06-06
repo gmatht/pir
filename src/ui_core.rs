@@ -571,30 +571,9 @@ pub fn visible_row_indices(
     let hr = HEADER_ROWS;
     let mr = g.main_rows();
     let main_order = g.sorted_main_rows();
-    let mut header_rows = Vec::new();
+    let mut header_rows: Vec<usize> = (0..hr).collect();
     let mut footer_rows = Vec::new();
-    for (addr, _) in g.iter_nonempty() {
-        match addr {
-            CellAddr::Header { row, .. } => header_rows.push(row as usize),
-            CellAddr::Footer { row, .. } => footer_rows.push(hr + mr + row as usize),
-            _ => {}
-        }
-    }
-    if cursor.row < hr {
-        let window = 5usize;
-        let lo = cursor.row.saturating_sub(window / 2);
-        let hi = cursor.row.min(hr - 1);
-        for r in lo..=hi {
-            if r < hr {
-                header_rows.push(r);
-            }
-        }
-        let so_far = header_rows.len() + main_order.len() + footer_rows.len();
-        let can_add = dim.saturating_sub(so_far).min(hr.saturating_sub(hi + 1));
-        for r in (hi + 1)..(hi + 1 + can_add) {
-            header_rows.push(r);
-        }
-    } else if cursor.row >= hr + mr {
+    if cursor.row >= hr + mr {
         let lo = cursor.row;
         let hi = (lo + 2).min(hr + mr + FOOTER_ROWS - 1);
         for r in lo..=hi {
