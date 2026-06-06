@@ -155,24 +155,17 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         .max(1);
 
     // Re-read after load_initial
-    let mut sheet_rec = app.core.workbook.active_sheet().clone();
-
-    // Grow the grid to 3 main columns to match the reference ratatui
-    // output which shows 3 data columns (A, B, C).
-    while sheet_rec.grid.main_cols() < 3 {
-        sheet_rec.grid.grow_main_col_at_right();
-    }
+    let sheet_rec = app.core.workbook.active_sheet().clone();
 
     let hr = HEADER_ROWS;
-    let mut mr = sheet_rec.grid.main_rows();
+    let mr = sheet_rec.grid.main_rows();
     let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
 
-    // Place the cursor at C~1 (main column C, header row ~1),
-    // matching the reference ratatui output for the align.corro test.
-    let mut cursor = app.core.cursor;
-    cursor.row = HEADER_ROWS.saturating_sub(1);
-    cursor.col = lm + 2;
+    let cursor = {
+        let c = app.core.cursor;
+        crate::grid::SheetCursor { row: c.row, col: lm.saturating_sub(1) }
+    };
     let display_cursor_row = cursor.row;
 
     // ── Visible rows (matching ratatui's visible_row_indices) ──────────
