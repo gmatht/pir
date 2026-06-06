@@ -214,6 +214,22 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             }
         }
     }
+    // Always include a window of header rows at the top so the grid
+    // shows ~N labels, matching ratatui's visible_row_indices when
+    // the cursor is in the header section.  When the cursor is in the
+    // main area, show the last 7 header rows (~7 … ~1).
+    {
+        let already = header_rows.len();
+        let want = 7usize;
+        if already < want {
+            let start = hr.saturating_sub(want);
+            for r in start..hr {
+                if !header_rows.contains(&r) {
+                    header_rows.push(r);
+                }
+            }
+        }
+    }
     {
         let content_count = header_rows.len() + main_order.len() + footer_rows.len();
         let blank_needed = dim_rows.saturating_sub(content_count);
@@ -231,6 +247,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     display_rows.extend(header_rows.iter());
     display_rows.extend(main_order.iter().map(|r| hr + r));
     display_rows.extend(footer_rows.iter());
+
+    // Trim display_rows to dim_rows to avoid exceeding the viewport.
+    if display_rows.len() > dim_rows {
+        display_rows.truncate(dim_rows);
+    }
 
     // ── Available data width (matching ratatui's data_width) ──────────
     let term_cols = {
