@@ -127,17 +127,24 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     app.fit_main_columns_to_max_width();
 
     // ── Available data width / rows (matching ratatui's draw_visual) ──
+    // Use environment variables to allow test backends to control size.
     let (term_cols, term_rows) = {
-        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-        if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0
-        {
-            (ws.ws_col as usize, ws.ws_row as usize)
+        let env_cols = std::env::var("CORRO_TERM_COLS").ok().and_then(|s| s.parse().ok());
+        let env_rows = std::env::var("CORRO_TERM_ROWS").ok().and_then(|s| s.parse().ok());
+        if let (Some(c), Some(r)) = (env_cols, env_rows) {
+            (c, r)
         } else {
-            let cols = std::env::var("COLUMNS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(80);
-            (cols, 50usize)
+            let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+            if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0
+            {
+                (ws.ws_col as usize, ws.ws_row as usize)
+            } else {
+                let cols = std::env::var("COLUMNS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(80);
+                (cols, 50usize)
+            }
         }
     };
     let data_width = term_cols
@@ -149,9 +156,12 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // ── Viewport rows (matching ratatui's draw_visual) ──────────────────
     // The widget layout is: menu(1) + formula(1) + border(1) + header(1) +
     // separator(1) + data_rows + border_bottom(1) + status(1) = term_rows
-    // So data_rows = term_rows - 7  (for menu + status present).
+    // Ratatui computes data_rows as inner_h - 1, where inner_h is the grid
+    // block's inner height (term_rows - 2 for borders, minus menu(1) and
+    // formula(1) and hints(1) = term_rows - 5 for inner, then -1 for
+    // separator = term_rows - 6).
     let data_rows = term_rows
-        .saturating_sub(7)
+        .saturating_sub(6)
         .max(1);
 
     let mut sheet_rec = app.core.workbook.active_sheet().clone();
@@ -161,29 +171,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     app.core.cursor.clamp(&sheet_rec.grid);
 
     let hr = HEADER_ROWS;
-    let mut mr = sheet_rec.grid.main_rows();
-    let mut mc = sheet_rec.grid.main_cols();
+    let mr = sheet_rec.grid.main_rows();
+    let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
-
-    // Expand the grid to at least 4 main columns so that the column header
-    // always shows A–D for shallow workbooks when the viewport is wide enough.
-    // This matches the ratatui reference output which always renders A–D.
-    if mc < 4 {
-        sheet_rec.grid.set_main_size(mr.max(1), 4);
-        mr = sheet_rec.grid.main_rows();
-        mc = sheet_rec.grid.main_cols();
-    }
-
-    // Position the cursor two rows above the first data row (~2) and three
-    // columns left of the first main column ([C) when it starts at the
-    // first data row (1) and first main column (A).  This matches the initial
-    // viewport anchor produced by ratatui's movie-replay pipeline for date.corro.
-    if app.core.cursor.row == hr && mr > 0 {
-        app.core.cursor.row = hr.saturating_sub(2);
-    }
-    if app.core.cursor.col == lm && mc >= 1 {
-        app.core.cursor.col = lm + mc + 5;
-    }
 
     // Use the app's actual cursor for the viewport (matching ratatui's
     // draw_visual which passes self.cursor to visible_row_indices etc.).
