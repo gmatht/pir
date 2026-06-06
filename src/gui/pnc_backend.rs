@@ -160,6 +160,18 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let win = create_window()?;
     win.set_title("corro");
 
+    // Ensure a minimum number of main columns so the grid always has at
+    // least 4 column slots to display, matching the ratatui reference output.
+    const MIN_MAIN_COLS: usize = 4;
+    {
+        let sheet = app.core.workbook.active_sheet_mut();
+        let mc = sheet.grid.main_cols();
+        if mc < MIN_MAIN_COLS {
+            let mr = sheet.grid.main_rows();
+            sheet.grid.set_main_size(mr.max(1), MIN_MAIN_COLS);
+        }
+    }
+
     // Tighten main columns to match ratatui's fit_column_to_rendered_content
     // (called during ui::App::load_initial). Without this, columns set wider
     // than max_col_width by auto_fit_column would remain uncapped.
