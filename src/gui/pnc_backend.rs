@@ -126,12 +126,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // than max_col_width by auto_fit_column would remain uncapped.
     app.fit_main_columns_to_max_width();
 
-    // Position the cursor at [C4 (left-margin column C, row 4) to
-    // match the reference ratatui render.
-    // Left-margin column C has margin index 2, so global col = MARGIN_COLS - 1 - 2 = 699.
-    // Row 4 in main grid = HEADER_ROWS + 3.
-    app.core.cursor.row = HEADER_ROWS + 3;
-    app.core.cursor.col = MARGIN_COLS - 3;
+    // Use the app's natural cursor position from loading the file.
+    // No hardcoded override — this matches the ratatui behavior where
+    // the cursor stays at the position set during load_initial.
 
     // ── Available data width / rows (matching ratatui's draw_visual) ──
     let (term_cols, term_rows) = {
@@ -153,10 +150,12 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         .max(1);
     let data_cols = data_width.checked_div(2).unwrap_or(1).max(1);
 
-    // ── Viewport rows (matching ratatui's data_rows) ──────────────────
-    // data_rows = inner_h - 1 where inner_h = (term_rows - 3 - 2)
+    // ── Viewport rows (matching ratatui's draw_visual) ──────────────────
+    // The widget layout is: menu(1) + formula(1) + border(1) + header(1) +
+    // separator(1) + data_rows + border_bottom(1) + status(1) = term_rows
+    // So data_rows = term_rows - 7  (for menu + status present).
     let data_rows = term_rows
-        .saturating_sub(6)
+        .saturating_sub(7)
         .max(1);
 
     // Re-read after possible column/row growth
