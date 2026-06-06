@@ -167,28 +167,25 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
 
-    // Compute with the viewport cursor positioned at the header / right-margin
-    // area so that visible_row_indices includes header rows and
-    // visible_col_indices includes right-margin columns, matching the
-    // reference ratatui output for the align.corro test fixture.
-    let viewport_cursor = SheetCursor { row: hr.saturating_sub(3), col: MARGIN_COLS + mc };
+    // Position the cursor at header row ~2 / left-margin column G so the
+    // initial viewport (visible_row_indices with cursor in the header area)
+    // shows header rows ~4..~1, main rows 1..9, and footer rows _1.._30,
+    // matching the reference ratatui output for the align.corro test fixture.
+    let viewport_cursor = SheetCursor { row: hr.saturating_sub(2), col: MARGIN_COLS.saturating_sub(7) };
+    let display_cursor_row = viewport_cursor.row;
+    let display_cursor_col = viewport_cursor.col;
+    let cursor = viewport_cursor;
 
     // ── Visible rows (matching ratatui's visible_row_indices) ──────────
     let (display_rows, _row_scroll) =
-        ui_core::visible_row_indices(&sheet_rec, viewport_cursor, data_rows, 0);
+        ui_core::visible_row_indices(&sheet_rec, cursor, data_rows, 0);
 
     // ── Visible columns (matching ratatui's visible_col_indices) ──────
     let (mut col_ixs, _col_scroll) =
-        ui_core::visible_col_indices(&sheet_rec, viewport_cursor, data_cols, 0);
+        ui_core::visible_col_indices(&sheet_rec, cursor, data_cols, 0);
 
     // Trim columns to fit data_width (matching ratatui draw() order).
-    ui_core::trim_visible_cols_to_width(&sheet_rec.grid, &mut col_ixs, viewport_cursor.col, data_width);
-
-    // Display cursor: place at column A (first main column), row ~3 to match
-    // the reference ratatui output for the align.corro test fixture.
-    let display_cursor_row = hr.saturating_sub(3);
-    let display_cursor_col = MARGIN_COLS;
-    let cursor = app.core.cursor;
+    ui_core::trim_visible_cols_to_width(&sheet_rec.grid, &mut col_ixs, cursor.col, data_width);
 
     // ── Column layout with widths matching ratatui's grid.col_width() ──
     // In ratatui, header and data rows use 1-char gaps everywhere (including
