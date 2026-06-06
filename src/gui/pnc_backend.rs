@@ -595,7 +595,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Border title
     let total_ops = app.core.ops_applied;
     let border_title =
-        format!(" corro  {}r × {}c  ops {}", mr, mc, total_ops);
+        format!("corro  {}r × {}c  ops {}", mr, mc, total_ops);
     spreadsheet.set_border_title(&border_title);
 
     // Menu
@@ -636,6 +636,8 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let hr_cb = hr;
     let data_cols_cb = data_cols;
     let data_width_cb = data_width;
+    let mut prev_cursor_col = cursor.col;
+    let mut prev_cursor_row = cursor.row;
     add_cursor_move_callback(move |_display_row, _display_col| {
         // SAFETY: app is &mut App alive for the entire event loop
         let app = unsafe { &mut *app_ptr };
@@ -645,18 +647,47 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             app.core.cursor.col = _display_col as usize;
             let sheet = app.core.workbook.active_sheet_mut();
             let prev_mr = sheet.grid.main_rows();
+            let prev_mc = sheet.grid.main_cols();
+            let lm = MARGIN_COLS;
+
+            // Expand main columns when moving right past the last main column
+            // (matching ratatui's move_cursor_one_col_horizontal).
+            let new_col = _display_col as usize;
+            if new_col > prev_cursor_col {
+                if prev_cursor_col == lm + prev_mc.saturating_sub(1)
+                    && trailing_blank_main_cols(&sheet.grid) < crate::ui_core::NAV_BLANK_COLS
+                {
+                    sheet.grid.grow_main_col_at_right();
+                }
+            }
+
+            // Expand main rows when moving down from the last main row
+            // (matching ratatui's move_cursor_one_row_vertical).
+            if logical_row > prev_cursor_row {
+                if prev_cursor_row == hr_cb + prev_mr.saturating_sub(1)
+                    && trailing_blank_main_rows(&sheet.grid) < crate::ui_core::NAV_BLANK_ROWS
+                {
+                    sheet.grid.grow_main_row_at_bottom();
+                }
+            }
+
+            prev_cursor_col = new_col;
+            prev_cursor_row = logical_row;
+
             // When cursor moves to the row just beyond the current extent,
-            // grow the grid (matching ratatui's move_cursor_one_row_vertical).
+            // grow the grid (matching ratatui's move_cursor_one_row_vertical)
+            // for cases where the cursor jumps multiple rows at once.
             if logical_row >= hr_cb + prev_mr {
                 sheet.grid.grow_main_row_at_bottom();
             }
             sheet.grid.ensure_extent_for_cursor(logical_row, _display_col as usize);
-            if sheet.grid.main_rows() != prev_mr {
+            if sheet.grid.main_rows() != prev_mr || sheet.grid.main_cols() != prev_mc {
                 // Grid grew — update border title and row labels
                 let mr = sheet.grid.main_rows();
+                let mc = sheet.grid.main_cols();
                 let boundary_title = format!(
-                    " corro  {}r × {}c  ops {}",
-                    mr, sheet.grid.main_cols(), app.core.ops_applied
+                    "corro  {}r × {}c  ops {}",
+                    mr, mc, app.core.ops_applied
                 );
                 spreadsheet_set_border_title(sid, &boundary_title);
                 let new_labels: Vec<(u32, String)> = display_rows_for_cb.iter()
@@ -667,6 +698,27 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     })
                     .collect();
                 spreadsheet_set_row_labels(sid, new_labels);
+                // Also update column layout when main columns grew
+                let rec = app.core.workbook.active_sheet().clone();
+                let g = &rec.grid;
+                let cursor = app.core.cursor;
+                let (mut new_ixs, _) =
+                    crate::ui_core::visible_col_indices(&rec, cursor, data_cols_cb, 0);
+                crate::ui_core::trim_visible_cols_to_width(
+                    g, &mut new_ixs, cursor.col, data_width_cb,
+                );
+                let new_layout: Vec<(u32, u32, String)> = new_ixs
+                    .iter()
+                    .map(|&c| {
+                        let w = g.col_width(c).max(1);
+                        let label = crate::addr::ui_column_fragment(c, mc);
+                        (c as u32, w as u32, label)
+                    })
+                    .collect();
+                spreadsheet_set_column_layout(sid, new_layout);
+                col_ixs_cb = new_ixs;
+                // Keep the widget's margin_cols and main_cols in sync
+                spreadsheet_set_grid_config(sid, lm as u32, mc as u32);
             }
             // Update column viewport when cursor column moves outside the
             // currently visible range (matching ratatui's per-frame recompute).
@@ -696,4 +748,24 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     _backend.run().map_err(|e| format!("pancurses error: {e}"))?;
     Ok(())
+}
+
+/// Count trailing blank main columns (matching ratatui's trailing_blank_main_cols).
+fn trailing_blank_main_cols(grid: &crate::grid::GridBox) -> usize {
+    let lm = crate::grid::MARGIN_COLS;
+    let mc = grid.main_cols();
+    match (0..mc).rev().find(|&c| grid.logical_col_has_content(lm + c)) {
+        None => mc,
+        Some(last) => mc.saturating_sub(last + 1),
+    }
+}
+
+/// Count trailing blank main rows (matching ratatui's trailing_blank_main_rows).
+fn trailing_blank_main_rows(grid: &crate::grid::GridBox) -> usize {
+    let hr = crate::grid::HEADER_ROWS;
+    let mr = grid.main_rows();
+    match (0..mr).rev().find(|&r| grid.logical_row_has_content(hr + r)) {
+        None => mr,
+        Some(last) => mr.saturating_sub(last + 1),
+    }
 }
