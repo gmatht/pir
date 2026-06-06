@@ -4430,6 +4430,11 @@ impl App {
             }
 
             if should_tail {
+                // Save the in-memory extent so we can restore it after the
+                // reload — tail_apply rewinds the workbook to the log state,
+                // discarding any transient growth (e.g. grow_main_row_at_bottom).
+                let saved_rows = self.state.grid.main_rows();
+                let saved_cols = self.state.grid.main_cols();
                 match crate::io::tail_apply_workbook(
                     p,
                     self.offset,
@@ -4437,10 +4442,23 @@ impl App {
                     &mut self.view_sheet_id,
                 ) {
                     Ok(new_off) => {
-                        self.offset = new_off;
-                        self.sync_active_sheet_cache();
-                        self.status = "External change applied".into();
-                        changed = true;
+                        if new_off > self.offset {
+                            self.offset = new_off;
+                            self.sync_active_sheet_cache();
+                            // Restore transient extent that may have grown beyond
+                            // what the persisted log knows about.
+                            let cur_rows = self.state.grid.main_rows();
+                            let cur_cols = self.state.grid.main_cols();
+                            if saved_rows > cur_rows || saved_cols > cur_cols {
+                                self.state
+                                    .grid
+                                    .set_main_size(saved_rows.max(cur_rows), saved_cols.max(cur_cols));
+                            }
+                            self.status = "External change applied".into();
+                            changed = true;
+                        } else {
+                            self.offset = new_off;
+                        }
                     }
                     Err(_) => {
                         let data = std::fs::read_to_string(p).map_err(IoError::Io)?;
@@ -4460,6 +4478,14 @@ impl App {
                         self.workbook = workbook;
                         self.view_sheet_id = active_sheet;
                         self.sync_active_sheet_cache();
+                        // Restore transient extent.
+                        let cur_rows = self.state.grid.main_rows();
+                        let cur_cols = self.state.grid.main_cols();
+                        if saved_rows > cur_rows || saved_cols > cur_cols {
+                            self.state
+                                .grid
+                                .set_main_size(saved_rows.max(cur_rows), saved_cols.max(cur_cols));
+                        }
                         self.offset = data.len() as u64;
                         self.ops_applied =
                             data.lines().filter(|line| !line.trim().is_empty()).count();
