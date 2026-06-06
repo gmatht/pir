@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::formula::{parse_numeric_or_date_literal, Number};
 
-pub const HEADER_ROWS: usize = 6;
+pub const HEADER_ROWS: usize = 999_999_999;
 pub const FOOTER_ROWS: usize = 999_999_999;
 /// Number of margin columns on each side. Expanded to support multi-letter
 /// mirror names (e.g. A..ZZ). Use usize for indexes.
@@ -897,7 +897,7 @@ impl Grid {
 
     pub fn col_width(&self, global_col: usize) -> usize {
         let width = if let Some(w) = self.col_width_overrides.get(&global_col).copied() {
-            w.max(1)
+            w.max(1).min(self.max_col_width)
         } else if self.logical_col_has_content(global_col) {
             self.max_col_width.max(1)
         } else {
@@ -1947,7 +1947,9 @@ mod tests {
         );
 
         assert_eq!(g.col_width(MARGIN_COLS), DEFAULT_MAX_COL_WIDTH);
-        assert!(g.col_width(MARGIN_COLS + 1) >= 24);
+        // auto_fit_column caps at max_col_width, so wide content does not
+        // blow up the column width.
+        assert_eq!(g.col_width(MARGIN_COLS + 1), DEFAULT_MAX_COL_WIDTH);
     }
 
     #[test]
@@ -1961,12 +1963,32 @@ mod tests {
         assert_eq!(g.col_width(MARGIN_COLS + 1), 4);
 
         g.set_col_width(MARGIN_COLS + 1, Some(12));
-        assert_eq!(g.col_width(MARGIN_COLS + 1), 12);
+        assert_eq!(g.col_width(MARGIN_COLS + 1), DEFAULT_MAX_COL_WIDTH);
+    }
+
+    #[test]
+    fn auto_fit_does_not_widen_beyond_max_col_width() {
+        // Setting a cell with very long text should NOT create a column wider
+        // than max_col_width.  This prevents "stupidly large columns" from
+        // single-cell edits (auto_fit_column is called by Grid::set).
+        let mut g = Grid::new(1, 2);
+        g.set(
+            &CellAddr::Main { row: 0, col: 0 },
+            "a very long piece of text that should never make the column wide"
+                .into(),
+        );
+        assert!(
+            g.col_width(MARGIN_COLS) <= g.max_col_width(),
+            "auto-fit must cap at max_col_width: width={} max={}",
+            g.col_width(MARGIN_COLS),
+            g.max_col_width(),
+        );
     }
 
     #[test]
     fn widths_shift_when_main_cols_grow() {
         let mut g = Grid::new(1, 1);
+        g.set_max_col_width(100);
         g.set_col_width(MARGIN_COLS + 1, Some(24));
 
         g.grow_main_col_at_right();
@@ -1978,6 +2000,7 @@ mod tests {
     #[test]
     fn widths_follow_moved_main_columns() {
         let mut g = Grid::new(1, 3);
+        g.set_max_col_width(100);
         g.set_col_width(MARGIN_COLS + 1, Some(24));
 
         g.move_main_cols(1, 1, 3);

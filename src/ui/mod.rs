@@ -1854,6 +1854,11 @@ fn visible_row_indices(
         Vec::with_capacity(header_rows.len() + main_order.len() + footer_rows.len());
     display_rows.extend(header_rows);
     display_rows.extend(main_order.iter().copied().map(|r| hr + r));
+    // Include the cursor row if it is a main row that sorted_main_rows
+    // omitted (e.g. a blank row just added by grow_main_row_at_bottom).
+    if (hr..hr + mr).contains(&cursor.row) && !display_rows.contains(&cursor.row) {
+        display_rows.push(cursor.row);
+    }
     display_rows.extend(footer_rows);
 
     let dim = dim.max(1).min(display_rows.len().max(1));
