@@ -165,6 +165,18 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // auto_fit_column leaves columns wider than max_col_width in place.
     app.fit_main_columns_to_max_width();
 
+    // ── Pre-navigate cursor to ]F~3 with 4 main cols ──────────────
+    // The reference (ratatui) output was captured after navigating from
+    // A1: Right × 9, Up × 3, which grows mc from 2 to 4.
+    {
+        let sheet = app.core.workbook.active_sheet_mut();
+        while sheet.grid.main_cols() < 4 {
+            sheet.grid.grow_main_col_at_right();
+        }
+    }
+    app.core.cursor.row = HEADER_ROWS - 3;
+    app.core.cursor.col = MARGIN_COLS + 4 + 5;
+
     let mut sheet_rec = app.core.workbook.active_sheet().clone();
     let hr = HEADER_ROWS;
     let mr = sheet_rec.grid.main_rows();
