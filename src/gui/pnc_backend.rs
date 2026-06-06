@@ -508,11 +508,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 let display_text = if formatted.is_empty() {
                     String::new()
                 } else if fw > cw {
-                    // When content overflows the column width, include the
-                    // inter-column gap in the display width so text fills the
-                    // gap (matching ratatui's behavior where overflow text
-                    // consumes the gap space rather than leaving a gap char).
-                    let store_width = cw + gap_width;
+                    // Use exactly the column width (not including gaps) to
+                    // match ratatui's behavior in ui/mod.rs:10107-10112.
+                    let store_width = cw;
                     let cell_fmt = g.format_for_addr(&addr);
                     let rational_hint = if matches!(cell_fmt.number, None | Some(NumberFormat::Rational | NumberFormat::DecimalGeneric))
                         && would_ellipsis_hide_decimal_point(&formatted, store_width)
