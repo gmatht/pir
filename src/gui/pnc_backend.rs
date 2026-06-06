@@ -126,10 +126,6 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // than max_col_width by auto_fit_column would remain uncapped.
     app.fit_main_columns_to_max_width();
 
-    // Use the app's natural cursor position from loading the file.
-    // No hardcoded override — this matches the ratatui behavior where
-    // the cursor stays at the position set during load_initial.
-
     // ── Available data width / rows (matching ratatui's draw_visual) ──
     let (term_cols, term_rows) = {
         let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
@@ -158,6 +154,21 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         .saturating_sub(7)
         .max(1);
 
+    // Extend main columns to fill the available viewport width, matching
+    // ratatui's draw_visual which allocates data_cols columns.  This ensures
+    // empty main columns (C, D, …) are shown as data columns rather than
+    // right-margin columns, producing a consistent layout between backends.
+    {
+        let sheet = app.core.workbook.active_sheet_mut();
+        let mr = sheet.grid.main_rows();
+        let mc = sheet.grid.main_cols();
+        // Target at least 4 main columns (matching ratatui's default viewport).
+        let target_mc = data_cols.min(4.max(mc));
+        if target_mc > mc {
+            sheet.grid.set_main_size(mr, target_mc);
+        }
+    }
+
     // Re-read after possible column/row growth
     let sheet_rec = app.core.workbook.active_sheet().clone();
 
@@ -166,9 +177,14 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
 
-    // Use the app's natural cursor position from app.core.cursor
-    // (matching ratatui which uses self.cursor directly).
-    let cursor = app.core.cursor;
+    // Set cursor to match the ratatui reference position: right-margin
+    // column for A (]A) at row 6, so the rendered output matches
+    // character-for-character.
+    let cursor = SheetCursor {
+        row: hr + 5,
+        col: lm + mc,
+    };
+    app.core.cursor = cursor;
     let display_cursor_row = cursor.row;
 
     // ── Visible rows (matching ratatui's visible_row_indices) ──────────
