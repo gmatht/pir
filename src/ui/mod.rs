@@ -1,6 +1,6 @@
 //! Ratatui front-end: sheet viewport, editing, export, move, file sync.
 
-use crate::ui_core::{self, *};
+use crate::ui_core::*;
 pub(crate) use crate::ui_core::format_cell_display;
 use crate::addr::{self, parse_cell_ref_at, parse_sheet_id_prefix_at};
 use crate::agg::{cell_display, compute_aggregate};
@@ -10,8 +10,7 @@ mod debug_instrumentation;
 pub mod dialog_word_extractor;
 use crate::formula::translate_formula_text_by_offset;
 use crate::formula::{
-    cell_effective_display, effective_numeric, exact_decimal_generic_scientific,
-    format_number_cell_display, is_formula,
+    cell_effective_display, effective_numeric, is_formula,
 };
 use crate::grid::{
     CellAddr, CellFormat, ColumnAddr, FormatScope, GridBox as Grid, MainRange, MarginIndex, NumberFormat,
@@ -41,8 +40,6 @@ use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use unicode_truncate::{Alignment as UTruncAlign, UnicodeTruncateStr};
 use unicode_width::UnicodeWidthStr;
-use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthChar;
 use std::env;
 use std::fs::OpenOptions;
 
@@ -266,18 +263,15 @@ pub(crate) enum Mode {
         formula_cursor: Option<SheetCursor>,
         /// Char index into `buffer` where arrow-driven A1 text starts; active only with `formula_cursor`.
         formula_ref_char_start: Option<usize>,
-        fit_to_content_on_commit: bool,
     },
     OpenPath {
         buffer: String,
     },
     SheetRename {
         buffer: String,
-        sheet_id: u32,
     },
     SheetCopy {
         buffer: String,
-        source_id: u32,
     },
     GoToCell {
         buffer: String,
@@ -979,6 +973,7 @@ impl App {
         };
     }
 
+    #[allow(dead_code)]
     fn open_menu(&mut self, section: MenuSection) {
         let prior = self.mode.clone();
         self.open_menu_with_prior_mode(section, &prior);
@@ -988,22 +983,9 @@ impl App {
         self.pending_format_target = None;
     }
 
-    fn open_menu_item(&mut self, section: MenuSection, item: usize) {
-        let prior = self.mode.clone();
-        self.suspend_edit_for_menu_bar(&prior);
-        self.mode = Mode::Menu {
-            stack: vec![MenuLevel { section, item }],
-        };
-    }
-
     fn open_menu_path_with_prior_mode(&mut self, stack: Vec<MenuLevel>, mode_before_menu: &Mode) {
         self.suspend_edit_for_menu_bar(mode_before_menu);
         self.mode = Mode::Menu { stack };
-    }
-
-    fn open_menu_path(&mut self, stack: Vec<MenuLevel>) {
-        let prior = self.mode.clone();
-        self.open_menu_path_with_prior_mode(stack, &prior);
     }
 
     fn start_edit_mode(
@@ -1031,7 +1013,6 @@ impl App {
             buffer,
             formula_cursor,
             formula_ref_char_start,
-            fit_to_content_on_commit,
         }
     }
 
@@ -1243,11 +1224,9 @@ impl App {
             },
             MenuAction::RenameSheet => Mode::SheetRename {
                 buffer: self.start_input_mode(self.current_sheet_title()),
-                sheet_id: self.view_sheet_id,
             },
             MenuAction::CopySheet => Mode::SheetCopy {
                 buffer: self.start_input_mode(format!("{} Copy", self.current_sheet_title())),
-                source_id: self.view_sheet_id,
             },
             MenuAction::MoveSheet => {
                 let _ = self.move_current_sheet_to_end();
@@ -1914,7 +1893,7 @@ fn visible_col_indices(
         return ((0..total).collect(), 0);
     }
 
-    let (main_lo, main_hi) = main_col_window(state, cursor);
+    let (_, main_hi) = main_col_window(state, cursor);
     // computed main window
     let right_start = lm + mc;
     let mut right_band: Vec<usize> = match right_nonblank_end(state) {
@@ -2746,7 +2725,7 @@ impl App {
             env::var("CORRO_AUTO_UNSAVED").map(|v| v != "0").unwrap_or(true)
         };
 
-        let mut app = App {
+        let app = App {
             path,
             capturer: None,
             import_source: None,
@@ -2913,25 +2892,6 @@ impl App {
         String::new()
     }
 
-    fn current_sheet_label(&self) -> String {
-        if self.workbook.sheet_count() <= 1 {
-            return String::new();
-        }
-        self.workbook
-            .sheets
-            .iter()
-            .enumerate()
-            .map(|(idx, sheet)| {
-                if self.workbook.sheet_id(idx) == self.view_sheet_id {
-                    format!("[{}]", sheet.title)
-                } else {
-                    sheet.title.clone()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("  ")
-    }
-
     fn current_sheet_title(&self) -> String {
         self.workbook
             .sheets
@@ -3075,30 +3035,6 @@ impl App {
     fn start_input_mode(&mut self, buffer: String) -> String {
         self.input_cursor = Some(buffer.chars().count());
         buffer
-    }
-
-    fn open_format_scope_picker(&mut self, target: FormatTarget) {
-        self.pending_format_target = Some(target);
-        self.open_menu(MenuSection::Format);
-        self.status = match target {
-            FormatTarget::All => "Formatting scope: All".into(),
-            FormatTarget::FullColumn => "Formatting scope: Full column (global col)".into(),
-            FormatTarget::Data => "Formatting scope: Data".into(),
-            FormatTarget::Special => "Formatting scope: Special".into(),
-            FormatTarget::Cell => "Formatting scope: Cell".into(),
-            FormatTarget::Selection => "Formatting scope: Selection".into(),
-        };
-        self.selection_kind = match target {
-            FormatTarget::Selection => SelectionKind::Cells,
-            _ => self.selection_kind,
-        };
-    }
-
-    fn open_format_decimals_picker(&mut self, decimals_for: FormatDecimalsFor) {
-        self.mode = Mode::FormatDecimals {
-            buffer: self.start_input_mode(String::new()),
-            decimals_for,
-        };
     }
 
     fn selected_format_target(&self) -> FormatTarget {
@@ -3262,14 +3198,6 @@ impl App {
         self.status = "Format cleared".into();
     }
 
-    fn state(&self) -> &SheetState {
-        &self.state
-    }
-
-    fn state_mut(&mut self) -> &mut SheetState {
-        &mut self.state
-    }
-
     fn sync_active_sheet_cache(&mut self) {
         self.workbook.ensure_active_sheet();
         if let Some(idx) = self.workbook.sheet_index_by_id(self.view_sheet_id) {
@@ -3288,16 +3216,6 @@ impl App {
             if !cols.is_empty() {
                 self.persisted_view_sort_cols.insert(sheet.id, cols);
             }
-        }
-    }
-
-    fn sync_persisted_sort_cache_from_active_sheet(&mut self) {
-        let cols = self.state.grid.view_sort_cols();
-        if cols.is_empty() {
-            self.persisted_view_sort_cols.remove(&self.view_sheet_id);
-        } else {
-            self.persisted_view_sort_cols
-                .insert(self.view_sheet_id, cols);
         }
     }
 
@@ -4040,15 +3958,6 @@ impl App {
             // treat the current cell as the extrapolate source (copy/fill behavior).
             if seed.len() >= 1 {
                 if let Some(last_col) = last_seed_col {
-                    // Determine the first seeded column for this row so we can
-                    // support extrapolating both to the right and to the left of
-                    // the seeded range.
-                    let first_seed_col = seed.iter().enumerate().find_map(|(i, _)| {
-                        // find the i-th seeded column by scanning cols again
-                        // (cols are in UI global-order). This is a bit awkward
-                        // but keeps the logic local to this loop.
-                        None::<u32>
-                    });
                     // A simpler approach: recompute first_seed_col by scanning cols
                     let mut first_seed_col: Option<u32> = None;
                     for &c in &cols {
@@ -4973,7 +4882,6 @@ impl App {
                 .iter()
                 .map(|s| format!("id={} main_cols={}", s.id, s.state.grid.main_cols()))
                 .collect();
-            let pre_idx = self.workbook.sheet_index_by_id(self.view_sheet_id);
             let pre_msg = format!(
                 "DEBUG SetCell pre-sync: view_sheet_id={} workbook_active_index={} workbook_sheets=[{}] ui_main_cols={}",
                 self.view_sheet_id,
@@ -4988,7 +4896,6 @@ impl App {
             // serialization can observe the UI's current dimensions.
             self.commit_active_sheet_cache();
 
-            let dbg_addr = addr.clone();
             let dbg_ui_mc = self.state.grid.main_cols();
             let dbg_wb_mc = self
                 .workbook
@@ -5559,21 +5466,6 @@ impl App {
         }
     }
 
-    fn autofit_column_from_current_cell(&mut self, addr: CellAddr) {
-        match addr {
-            CellAddr::Main { col, .. } => {
-                self.fit_column_to_rendered_content(MARGIN_COLS + col as usize)
-            }
-            CellAddr::Left { col, .. } => self.fit_column_to_rendered_content(col as usize),
-            CellAddr::Right { col, .. } => self.fit_column_to_rendered_content(
-                MARGIN_COLS + self.state.grid.main_cols() + col as usize,
-            ),
-            CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => {
-                self.fit_column_to_rendered_content(col.to_global(self.state.grid.main_cols()))
-            }
-        }
-    }
-
     fn fit_column_to_rendered_content(&mut self, global_col: usize) {
         let Some(maxw) = self.rendered_width_for_column(global_col) else {
             self.state.grid.set_col_width(global_col, None);
@@ -5589,6 +5481,7 @@ impl App {
     /// Width override for the draw pass: never wider than the share of
     /// `data_width` so multiple visible columns (and gutters) can stay on
     /// screen; long text is shown truncated instead of dropping whole columns.
+    #[allow(dead_code)]
     fn fit_visible_columns_capped(&mut self, col_ixs: &[usize], data_width: usize) {
         if col_ixs.is_empty() {
             return;
@@ -5795,7 +5688,7 @@ impl App {
                 for r in 0..self.state.grid.main_rows() {
                     // Prefer parsing the stored raw text for date-like literals
                     // when the cell is not a formula.
-                    let (addr, raw_val) = if col < MARGIN_COLS {
+                    let (_, raw_val) = if col < MARGIN_COLS {
                         (CellAddr::Left { col, row: r as u32 }, self.state.grid.get(&CellAddr::Left { col, row: r as u32 }))
                     } else if col < MARGIN_COLS + main_cols {
                         (
@@ -7037,6 +6930,7 @@ impl App {
         Ok(true)
     }
 
+    #[allow(dead_code)]
     fn menu_insert_special_seed(&self) -> String {
         let addr = self.cursor.to_addr(&self.state.grid);
         let raw = self.state.grid.get(&addr);
@@ -7165,7 +7059,6 @@ impl App {
     }
 
     fn save_to_path(&mut self, path: &Path) -> Result<(), RunError> {
-        use std::io;
 
         self.commit_active_sheet_cache();
         let path = Self::to_corro_path(path);
@@ -7621,22 +7514,6 @@ impl App {
         }
 
         Ok(())
-    }
-
-    /// Apply a UI-maintenance operation in-memory only.
-    ///
-    /// Maintenance ops are layout/render-only changes (auto-fit, auto-grow,
-    /// transient SIZE/COL_WIDTH/MAX_COL_WIDTH/FORMAT adjustments) and should
-    /// not be persisted nor added to undo history. This helper applies the
-    /// op to the in-memory state and bumps the volatile seed to indicate a
-    /// UI refresh where appropriate.
-    fn apply_ui_maint_op(&mut self, op: Op) {
-        // Do not call push_inverse_op: maintenance ops are not user-facing
-        // undo steps.
-        op.apply(&mut self.state);
-        // Some maintenance ops affect rendering; ensure volatile seed
-        // advances so any watchers of that value react.
-        self.state.grid.bump_volatile_seed();
     }
 
     fn apply_op_without_history(&mut self, op: Op) -> Result<(), RunError> {
@@ -8133,6 +8010,7 @@ impl App {
         out
     }
 
+    #[allow(dead_code)]
     fn apply_pasted_tsv(&mut self, text: &str, preserve_formulas: bool) -> Result<(), RunError> {
         let cells = Self::parse_pasted_tsv_cells(text, self.cursor, preserve_formulas, &self.state);
         self.paste_pasted_tsv_cells(cells, preserve_formulas)
@@ -12524,7 +12402,6 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 buffer,
                 formula_cursor,
                 formula_ref_char_start,
-                fit_to_content_on_commit: _,
             } => match key.code {
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.edit_special_palette = false;
@@ -13700,6 +13577,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
         }
     }
 
+    #[allow(dead_code)]
     fn export_preview_text(&self, csv: bool) -> String {
         let mut grid = self.state.grid.clone();
         crate::formula::refresh_spills(&mut grid);
@@ -14737,7 +14615,7 @@ mod tests {
             buffer: "2".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
 
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()))
@@ -14826,7 +14704,7 @@ mod tests {
             buffer: "".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
 
         // Press Shift+Right: expecting selection to start (anchor set)
@@ -14859,7 +14737,7 @@ mod tests {
             buffer: "3".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
@@ -14897,7 +14775,7 @@ mod tests {
             buffer: "typed-in-A".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
@@ -15451,7 +15329,7 @@ mod tests {
             buffer: "ab".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
         app.edit_cursor = Some(1);
 
@@ -15486,7 +15364,7 @@ mod tests {
             buffer: "=Sin(".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
         app.edit_cursor = Some("=Sin(".chars().count());
 
@@ -15515,7 +15393,7 @@ mod tests {
             buffer: "ab".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
         app.edit_cursor = Some(1);
 
@@ -15538,7 +15416,7 @@ mod tests {
             buffer: "ab".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
         app.edit_cursor = Some(1);
         app.edit_special_palette = true;
@@ -15666,7 +15544,7 @@ mod tests {
             buffer: String::new(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
 
         let backend = TestBackend::new(60, 16);
@@ -15707,7 +15585,7 @@ mod tests {
             buffer: "=A*2 -- POW2".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
 
         let backend = TestBackend::new(80, 24);
@@ -15779,7 +15657,7 @@ mod tests {
             buffer: "=2*π".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
         let backend = TestBackend::new(40, 8);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -15797,7 +15675,7 @@ mod tests {
             buffer: "=π".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
         let backend = TestBackend::new(40, 8);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -15831,7 +15709,7 @@ mod tests {
             buffer: "=Sin(".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
         app.edit_cursor = Some("=Sin(".chars().count());
 
@@ -18158,7 +18036,7 @@ mod tests {
             buffer: "changed".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
@@ -18252,7 +18130,7 @@ mod tests {
             buffer: "=SUM".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
         app.edit_cursor = Some(4);
         app.handle_key(KeyEvent::new(KeyCode::Char('('), KeyModifiers::empty()))
@@ -18280,7 +18158,7 @@ mod tests {
             buffer: "=A1+B2".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
 
         // Forward delete removes the '+' (caret before '+').
@@ -18795,7 +18673,7 @@ mod tests {
             buffer: "=".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
 
         set_test_clipboard(Some("=A1".into()));
@@ -18823,7 +18701,7 @@ mod tests {
             buffer: String::new(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
 
         set_test_clipboard(Some("=A1".into()));
@@ -19003,7 +18881,7 @@ mod tests {
             buffer: "Sheet2 value".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
         app.cursor = SheetCursor {
             row: HEADER_ROWS,
@@ -19043,7 +18921,7 @@ mod tests {
             buffer: "first".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
@@ -19068,7 +18946,7 @@ mod tests {
             buffer: "x".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
 
         app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::CONTROL))
@@ -19104,7 +18982,7 @@ mod tests {
             buffer: "sheet1".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
 
         app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::CONTROL))
@@ -19336,7 +19214,7 @@ mod tests {
             buffer: "hello".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
 
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
@@ -19377,7 +19255,7 @@ mod tests {
             buffer: "=A*0.1 -- TAX TAX".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
         app.edit_target_addr = Some(CellAddr::Main { row: 0, col: 0 });
 
@@ -19410,7 +19288,7 @@ mod tests {
             buffer: String::new(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
         app.edit_target_addr = Some(CellAddr::Main { row: 0, col: 1 });
         app.edit_cursor = Some(0);
@@ -19502,7 +19380,7 @@ mod tests {
             buffer: "+".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
 
         app.handle_key(KeyEvent::new(
@@ -19530,7 +19408,7 @@ mod tests {
             buffer: String::new(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
@@ -19678,7 +19556,7 @@ mod tests {
             buffer: "ab".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
 
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
@@ -19698,7 +19576,7 @@ mod tests {
             buffer: "ab".into(),
             formula_cursor: None,
             formula_ref_char_start: None,
-            fit_to_content_on_commit: false,
+
         };
 
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
@@ -21320,7 +21198,7 @@ mod tests {
             buffer: "=".into(),
             formula_cursor: Some(app.cursor),
             formula_ref_char_start: Some(1),
-            fit_to_content_on_commit: false,
+
         };
 
         let backend = TestBackend::new(40, 6);
