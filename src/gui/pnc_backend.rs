@@ -755,7 +755,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             // When cursor moves to the row just beyond the current extent,
             // grow the grid (matching ratatui's move_cursor_one_row_vertical)
             // for cases where the cursor jumps multiple rows at once.
-            if logical_row >= hr_cb + prev_mr {
+            // Use the current main row count (after any growth above) to
+            // avoid redundant growth: prev_mr may be stale if the earlier
+            // row-growth condition at line ~753 already fired.
+            let cur_mr = sheet.grid.main_rows();
+            if logical_row >= hr_cb + cur_mr {
                 sheet.grid.grow_main_row_at_bottom();
             }
             sheet.grid.ensure_extent_for_cursor(logical_row, _display_col as usize);
