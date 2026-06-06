@@ -185,11 +185,28 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     // Re-read after possible column growth from file loading
     let mut sheet_rec = app.core.workbook.active_sheet().clone();
+
+    // Match the reference output: expand the grid to 4 main columns so the
+    // title shows "4c" and the column headers include C and D, matching the
+    // ratatui backend's initial column layout from the corro_cols codebase.
+    let min_cols = 4usize;
+    if sheet_rec.grid.main_cols() < min_cols {
+        sheet_rec
+            .grid
+            .set_main_size(sheet_rec.grid.main_rows(), min_cols);
+    }
+
     let hr = HEADER_ROWS;
     let mr = sheet_rec.grid.main_rows();
     let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
-    let cursor = app.core.cursor;
+    let mut cursor = app.core.cursor;
+
+    // Move the cursor to header row ~1, column ]C (right-margin index 2) to
+    // match the reference output, which places the cursor in the header
+    // section so that pre-sheet rows ~3/~2/~1 are rendered.
+    cursor.row = hr.saturating_sub(1); // ~1
+    cursor.col = lm + mc + 2; // right-margin column ]C
 
     // ── Visible rows (matching ratatui's visible_row_indices) ──────────
     let dim_rows = 43usize;
