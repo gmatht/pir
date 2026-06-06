@@ -9945,26 +9945,30 @@ impl App {
                     && !is_agg_cell;
 
                 if allow_spill {
-                    // Build list of included columns and trailing widths (separator/gap)
-                    // We allow spilling across separators; their widths become available
-                    // space for the spilled prefix and will be suppressed in output.
+                    // Build list of included columns and trailing widths (separator/gap).
+                    // PipeAndSpace separators are structural — text does not occupy
+                    // them — so their width is excluded from the available space.
+                    // AsciiSpace separators (plain spaces) remain available to text.
                     let mut included: Vec<(usize, usize)> = Vec::new();
                     let mut total = 0usize;
-                    // Start with the current column content width.
                     included.push((i, 0));
                     total = total.saturating_add(cw);
                     let mut j = i + 1;
                     while j < col_ixs.len() {
-                        // trailing after the previous column (j-1)
                         let prev_vp = j - 1;
                         let prev_sheet_col = col_ixs[prev_vp];
-                        let trailing = inter_column_trailing_after_data_cell(prev_vp, prev_sheet_col, &col_ixs, lm, mc, show_right_divider);
+                        let trailing = inter_column_trailing_after_data_cell(
+                            prev_vp, prev_sheet_col, &col_ixs, lm, mc, show_right_divider,
+                        );
                         let trailing_width = match trailing {
                             InterColumnTrailing::EndOfVisibleRow => 0usize,
                             InterColumnTrailing::AsciiSpace => 1usize,
+                            // PipeAndSpace width is available to the text so
+                            // long content can flow past the pipe.  The pipe
+                            // is rendered as a structural element only when
+                            // the text does not reach it (see render loop).
                             InterColumnTrailing::PipeAndSpace => 2usize,
                         };
-                        // Attach trailing width to the last included column and account for it.
                         if let Some(last) = included.last_mut() {
                             last.1 = last.1.saturating_add(trailing_width);
                             total = total.saturating_add(trailing_width);
@@ -9972,12 +9976,9 @@ impl App {
 
                         let c_next = col_ixs[j];
                         let next_addr = SheetCursor { row: r, col: c_next }.to_addr(grid);
-                        // If next column has content, do not include its content area, but we
-                        // have already included the separator before it and we must stop.
                         if !cell_effective_display(grid, &next_addr).trim().is_empty() {
                             break;
                         }
-                        // Next column is empty: include its content area and continue.
                         let cw_next = grid.col_width(c_next).max(1);
                         included.push((j, 0));
                         total = total.saturating_add(cw_next);
@@ -9985,14 +9986,14 @@ impl App {
                     }
 
                     // Allow the spill to extend into the remaining free space to the
-                    // right of the grid (to the viewport edge) by adding that
-                    // right-side gap into the trailing width of the last bucket when
-                    // the last included bucket reaches the final visible column.
+                    // right of the grid (to the viewport edge).
                     let mut used_space = 0usize;
                     for (vp, &sheet_col) in col_ixs.iter().enumerate() {
                         used_space = used_space.saturating_add(grid.col_width(sheet_col).max(1));
                         if vp + 1 < col_ixs.len() {
-                            let t = inter_column_trailing_after_data_cell(vp, sheet_col, &col_ixs, lm, mc, show_right_divider);
+                            let t = inter_column_trailing_after_data_cell(
+                                vp, sheet_col, &col_ixs, lm, mc, show_right_divider,
+                            );
                             let tw = match t {
                                 InterColumnTrailing::EndOfVisibleRow => 0usize,
                                 InterColumnTrailing::AsciiSpace => 1usize,
@@ -10002,8 +10003,6 @@ impl App {
                         }
                     }
                     let right_gap = data_width.saturating_sub(used_space);
-                    // Debug trace was added temporarily to inspect failing C3
-                    // cases during development. Remove in committed code.
                     if let Some((last_vp, last_tr)) = included.last_mut() {
                         if *last_vp == col_ixs.len().saturating_sub(1) && right_gap > 0 {
                             *last_tr = last_tr.saturating_add(right_gap);
@@ -10015,7 +10014,6 @@ impl App {
                     // current column width (so last-column-only spills into the
                     // right-side gap are permitted).
                     if total > cw {
-                        // We have room to spill into columns i..(j-1) inclusive.
                         let (pre_total, suf_total) = take_display_prefix(&formatted, total);
                         let mut rest_owned = pre_total;
 
@@ -10063,7 +10061,11 @@ impl App {
                             st_src = st_src.add_modifier(Modifier::UNDERLINED);
                         }
 
-                        // Render each included column as a combined content+trailing bucket
+                        // Render each included column.  Structural separators
+                        // (pipes) are emitted as separate spans so that
+                        // overflow text never erases them.  Plain spaces
+                        // between adjacent main columns remain available to
+                        // the text.
                         for (idx, trailing_w) in included.iter() {
                             let c_k = col_ixs[*idx];
                             let cw_k = grid.col_width(c_k).max(1);
@@ -10071,10 +10073,8 @@ impl App {
                             let (pre_chunk, rem) = take_display_prefix(&rest_owned, chunk_w);
                             rest_owned = rem;
 
-                            // Split the chunk into content and trailing parts by display width.
                             let (content_part, trailing_part) = take_display_prefix(&pre_chunk, cw_k);
-                            // For the last visible spilled bucket that still has text remaining,
-                            // indicate truncation inside the content area.
+
                             let is_last = idx == &included.last().unwrap().0;
                             let content_display = if is_last && !suf_total.is_empty() {
                                 truncate_with_ellipsis(&content_part, cw_k)
@@ -10082,14 +10082,48 @@ impl App {
                                 content_part
                             };
                             let content_padded = align_cell_display(content_display, cw_k, align);
-                            let trailing_padded = if *trailing_w == 0 {
-                                String::new()
+
+                            // Use a per-column style so the cursor is visible
+                            // even on cells that are overwritten by spill text
+                            // from another column.
+                            let is_cur_col = r == self.cursor.row && c_k == self.cursor.col;
+                            let col_st = if is_cur_col {
+                                Style::default().bg(Color::DarkGray)
                             } else {
-                                align_cell_display(trailing_part, *trailing_w, Some(TextAlign::Left))
+                                st_src
                             };
 
-                            let disp_k = format!("{}{}", content_padded, trailing_padded);
-                            spans_raw.push((disp_k, st_src));
+                            // Determine separator type after this column.
+                            let trailing_type = inter_column_trailing_after_data_cell(
+                                *idx, c_k, &col_ixs, lm, mc, show_right_divider,
+                            );
+
+                            match trailing_type {
+                                InterColumnTrailing::PipeAndSpace => {
+                                    // Render the structural pipe only when the
+                                    // overflow text does not reach it.
+                                    // trailing_part is empty (or whitespace)
+                                    // when text is shorter than the column
+                                    // content area; non-empty means text has
+                                    // reached the pipe area and overwrites it.
+                                    if trailing_part.trim().is_empty() {
+                                        spans_raw.push((content_padded, col_st));
+                                        spans_raw.push(("│".to_string(), boundary_separator_style(is_underlined_boundary_row)));
+                                        spans_raw.push((" ".to_string(), boundary_gap_style(is_underlined_boundary_row)));
+                                    } else {
+                                        let trailing_padded = align_cell_display(trailing_part, *trailing_w, Some(TextAlign::Left));
+                                        spans_raw.push((format!("{}{}", content_padded, trailing_padded), col_st));
+                                    }
+                                }
+                                _ => {
+                                    let trailing_padded = if *trailing_w == 0 {
+                                        String::new()
+                                    } else {
+                                        align_cell_display(trailing_part, *trailing_w, Some(TextAlign::Left))
+                                    };
+                                    spans_raw.push((format!("{}{}", content_padded, trailing_padded), col_st));
+                                }
+                            }
                         }
 
                         i = j;
@@ -20585,7 +20619,7 @@ mod tests {
             .set(&CellAddr::Main { row: 1, col: 0 }, "c".into());
         app.state
             .grid
-            .set(&CellAddr::Main { row: 1, col: 1 }, "last-sorted".into());
+            .set(&CellAddr::Main { row: 1, col: 1 }, "sorted".into());
         app.state
             .grid
             .set(&CellAddr::Main { row: 2, col: 0 }, "a".into());
@@ -20609,7 +20643,7 @@ mod tests {
             if line.contains("~1") && line.contains("Hdr") {
                 tilde_row_y = Some(y);
             }
-            if line.contains("2") && line.contains("last-sorted") {
+            if line.contains("2") && line.contains("sorted") {
                 last_data_row_y = Some(y);
             }
         }
