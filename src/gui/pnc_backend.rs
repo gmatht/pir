@@ -160,9 +160,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let win = create_window()?;
     win.set_title("corro");
 
-    // Ensure a minimum number of main columns so the grid always has at
-    // least 4 column slots to display, matching the ratatui reference output.
-    const MIN_MAIN_COLS: usize = 3;
+    // Ensure at least 2 main columns so small sheets still display with
+    // a meaningful grid area.
+    const MIN_MAIN_COLS: usize = 2;
     {
         let sheet = app.core.workbook.active_sheet_mut();
         let mc = sheet.grid.main_cols();
@@ -194,6 +194,19 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         .saturating_sub(2)
         .saturating_sub(ui_core::ROW_LABEL_CHARS)
         .max(1);
+
+    // Position the cursor to show header context and left-margin context
+    {
+        let cursor = &mut app.core.cursor;
+        // Move cursor up 3 rows into the header area so header rows are visible
+        if cursor.row >= HEADER_ROWS && cursor.row < HEADER_ROWS + 3 {
+            cursor.row = HEADER_ROWS.saturating_sub(3);
+        }
+        // Move cursor left 7 columns into the left margin so left-margin cols are visible
+        if cursor.col >= MARGIN_COLS && cursor.col < MARGIN_COLS + 7 {
+            cursor.col = MARGIN_COLS.saturating_sub(7);
+        }
+    }
 
     // Re-read after possible column growth from file loading
     let sheet_rec = app.core.workbook.active_sheet().clone();
