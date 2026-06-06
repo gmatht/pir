@@ -160,9 +160,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let win = create_window()?;
     win.set_title("corro");
 
-    // Tighten main columns against max_col_width (matching ratatui's
-    // fit_column_to_rendered_content during load_initial). Without this,
-    // auto_fit_column leaves columns wider than max_col_width in place.
+    // Tighten main columns to match ratatui's fit_column_to_rendered_content
+    // (called during ui::App::load_initial). Without this, columns set wider
+    // than max_col_width by auto_fit_column would remain uncapped.
     app.fit_main_columns_to_max_width();
 
     // ── Available data width (matching ratatui's data_width) ──────────
@@ -190,10 +190,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let mr = sheet_rec.grid.main_rows();
     let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
-    // Place cursor at [D (left-margin global index 698 for mirrored column D)
-    // ~7 (header row 7) so rendered output matches the reference (ratatui
-    // backend from corro_cols/ after navigating to [D~7).
-    let mut cursor = SheetCursor { row: hr.saturating_sub(7), col: MARGIN_COLS - 4_usize };
+    let cursor = app.core.cursor;
 
     // ── Visible rows (matching ratatui's visible_row_indices) ──────────
     let dim_rows = 43usize;

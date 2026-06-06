@@ -7,7 +7,7 @@ fn test_narrow2() {
     let data = std::fs::read_to_string(&path).unwrap();
     let mut workbook = corro::ops::WorkbookState::new();
     let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
-    let (_, _replay) = corro::ops::load_workbook_revisions_partial(
+    let (_, _replay) = corro::io::load_workbook_revisions_partial(
         &path,
         usize::MAX,
         &mut workbook,
