@@ -1,7 +1,7 @@
 #[test]
 fn test_narrow2() {
     let path = std::path::PathBuf::from("docs/tests/subtotal-tiny.corro");
-    let mut app = corro::ui::App::new(Some(path));
+    let mut app = corro::ui::App::new(Some(path.clone()));
     println!("before load");
     // Manually do what load_initial does
     let data = std::fs::read_to_string(&path).unwrap();
