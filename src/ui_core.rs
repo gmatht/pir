@@ -744,11 +744,21 @@ pub fn visible_col_indices(
     }
     stable_band.extend(left_band.iter().copied());
     stable_band.extend((0..=main_hi).map(|ci| lm + ci as usize));
+    // Fill remaining viewport space.  Prefer main columns so that
+    // non-blank data columns past the cursor window are never hidden
+    // behind right-margin filler columns.
     {
         let total_so_far = stable_band.len();
         if total_so_far < dim {
             let blank_cols_needed = dim - total_so_far;
-            for i in 0..blank_cols_needed.min(rm) {
+            let hi = main_hi as usize;
+            let extra_main = mc.saturating_sub(hi + 1);
+            let main_fill = blank_cols_needed.min(extra_main);
+            for ci in (hi + 1)..(hi + 1 + main_fill) {
+                stable_band.push(lm + ci);
+            }
+            let rm_fill = blank_cols_needed.saturating_sub(main_fill).min(rm);
+            for i in 0..rm_fill {
                 stable_band.push(right_start + i);
             }
         }
