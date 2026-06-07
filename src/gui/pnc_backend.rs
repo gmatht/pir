@@ -488,11 +488,51 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         .saturating_sub(6)
         .max(1);
 
-    let sheet_rec = app.core.workbook.active_sheet().clone();
+    let mut sheet_rec = app.core.workbook.active_sheet().clone();
 
     // Ensure the cursor is valid after loading the workbook (matching
     // ratatui's load_initial which calls cursor.clamp).
     app.core.cursor.clamp(&sheet_rec.grid);
+
+    // Grow the grid to cover the cursor position, matching ratatui's
+    // behavior when the cursor is moved (e.g. via Tab/Arrow navigation
+    // in the test harness before the first render).
+    let mut grid_grown = false;
+    {
+        let sheet = app.core.workbook.active_sheet_mut();
+        let g = &mut sheet.grid;
+        let hr = HEADER_ROWS;
+        let cr = app.core.cursor.row;
+        let cc = app.core.cursor.col;
+        let cur_mr = g.main_rows();
+        let cur_mc = g.main_cols();
+        let mut new_mr = cur_mr;
+        let mut new_mc = cur_mc;
+
+        // Grow main rows if cursor is at or beyond the current last main row
+        if cr >= hr && cr < hr + cur_mr.saturating_add(1) && cr >= hr.saturating_add(cur_mr.saturating_sub(1)) {
+            let target_rows = (cr - hr + 1) as usize;
+            if target_rows > cur_mr {
+                new_mr = target_rows;
+            }
+        }
+
+        // Grow main columns if cursor is in main area beyond current extent
+        if cc >= MARGIN_COLS && cc < MARGIN_COLS + cur_mc.saturating_add(1) && cc >= MARGIN_COLS.saturating_add(cur_mc.saturating_sub(1)) {
+            let target_cols = (cc - MARGIN_COLS + 1) as usize;
+            if target_cols > cur_mc {
+                new_mc = target_cols;
+            }
+        }
+
+        if new_mr != cur_mr || new_mc != cur_mc {
+            g.set_main_size(new_mr.max(1), new_mc.max(1));
+            grid_grown = true;
+        }
+    }
+    if grid_grown {
+        sheet_rec = app.core.workbook.active_sheet().clone();
+    }
 
     let hr = HEADER_ROWS;
     let mr = sheet_rec.grid.main_rows();
