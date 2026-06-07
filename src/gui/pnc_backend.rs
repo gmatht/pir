@@ -696,7 +696,38 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             app.core.cursor.row += 1;
             need_viewport_recompute = true;
         } else if let Some(&logical_row) = display_rows_for_cb.borrow().get(display_idx) {
+            // Grow grid before moving cursor, matching ratatui's
+            // move_cursor_one_row_vertical / move_cursor_one_col_horizontal.
+            {
+                let sheet = app.core.workbook.active_sheet_mut();
+                let g = &mut sheet.grid;
+                let hr = hr_cb;
+                let lm = MARGIN_COLS;
+                // Row growth: if cursor was at the last main row and
+                // trailing blank rows are below threshold, grow.
+                if logical_row > prev_cursor_row {
+                    if prev_cursor_row >= hr
+                        && prev_cursor_row == hr + g.main_rows().saturating_sub(1)
+                        && trailing_blank_main_rows(g) < crate::ui_core::NAV_BLANK_ROWS
+                    {
+                        g.grow_main_row_at_bottom();
+                    }
+                }
+                // Column growth: if cursor was at the last main column and
+                // trailing blank cols are below threshold, grow.
+                let new_col = _display_col as usize;
+                if new_col > prev_cursor_col {
+                    if prev_cursor_col >= lm
+                        && prev_cursor_col == lm + g.main_cols().saturating_sub(1)
+                        && trailing_blank_main_cols(g) < crate::ui_core::NAV_BLANK_COLS
+                    {
+                        g.grow_main_col_at_right();
+                    }
+                }
+            }
+
             app.core.cursor.row = logical_row;
+
             // Check if cursor moved into header or footer region; if so,
             // recompute the viewport so those rows become visible.
             if logical_row < hr_cb || logical_row >= hr_cb + mr_cb {
@@ -712,6 +743,12 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 crate::ui_core::visible_row_indices(&rec, cursor, data_rows_cb, 0);
             let new_mr = rec.grid.main_rows();
             let new_mc = rec.grid.main_cols();
+            // Update border title when grid grew (matching the non-recompute path)
+            let boundary_title = format!(
+                "corro  {}r × {}c  ops {}",
+                new_mr, new_mc, app.core.ops_applied
+            );
+            spreadsheet_set_border_title(sid, &boundary_title);
             let new_labels: Vec<(u32, String)> = new_display_rows.iter()
                 .enumerate()
                 .map(|(idx, &r)| {
@@ -720,6 +757,27 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 })
                 .collect();
             spreadsheet_set_row_labels(sid, new_labels);
+            // Update column layout when main columns grew
+            {
+                let g = &rec.grid;
+                let cur_cursor = app.core.cursor;
+                let (mut new_ixs, _) =
+                    crate::ui_core::visible_col_indices(&rec, cur_cursor, data_cols_cb, 0);
+                crate::ui_core::trim_visible_cols_to_width(
+                    g, &mut new_ixs, cur_cursor.col, data_width_cb,
+                );
+                let new_layout: Vec<(u32, u32, String)> = new_ixs
+                    .iter()
+                    .map(|&c| {
+                        let w = g.col_width(c).max(1);
+                        let label = crate::addr::ui_column_fragment(c, new_mc);
+                        (c as u32, w as u32, label)
+                    })
+                    .collect();
+                spreadsheet_set_column_layout(sid, new_layout);
+                col_ixs_cb = new_ixs;
+                spreadsheet_set_grid_config(sid, MARGIN_COLS as u32, new_mc as u32);
+            }
             // Repopulate all visible cells for the new viewport
             let new_col_widths: HashMap<usize, usize> = col_ixs_cb.iter()
                 .map(|&c| (c, rec.grid.col_width(c).max(1)))
@@ -745,6 +803,8 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 sheet_cb.set_cursor(new_display_ri as u32, cursor.col as u32);
             }
             *display_rows_for_cb.borrow_mut() = new_display_rows;
+            prev_cursor_row = app.core.cursor.row;
+            prev_cursor_col = app.core.cursor.col;
             return;
         }
 
