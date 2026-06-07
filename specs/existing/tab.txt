@@ -1,0 +1,24 @@
+To switch between sheets in Google Sheets, press Option + Down Arrow (Mac) or Alt + Down Arrow (Windows) to move to the next sheet, and Option + Up Arrow (Mac) or Alt + Up Arrow (Windows) to move to the previous sheet. 
+
+In Excel, the shortcuts depend on your operating system:
+
+Windows: Press Ctrl + Page Down to go to the next sheet and Ctrl + Page Up to go to the previous sheet. 
+Mac: Press Control + Page Down to go to the next sheet and Control + Page Up to go to the previous sheet. 
+Additional navigation and management shortcuts include:
+
+Google Sheets (Mac): Press Shift + Fn + F11 to insert a new sheet or Option + Shift + k to display a list of all sheets. 
+Google Sheets (Windows): Press Shift + F11 to insert a new sheet or Alt + Shift + k to display a list of all sheets. 
+Excel (Windows): Press Alt + Shift + F1 to insert a new worksheet immediately. 
+Excel (Mac): Press Ctrl + Shift + F1 to insert a new worksheet immediately. 
+
+LibreOffice Calc offers specific keyboard shortcuts to navigate and manage spreadsheet tabs (sheets), though Ctrl+Tab is not a default shortcut for switching between sheets in the current version.  To move between sheets, users can use Ctrl+Page Up to go to the previous sheet and Ctrl+Page Down to go to the next sheet. 
+
+For selecting multiple sheets simultaneously, the shortcuts are Shift+Ctrl+Page Up to add the previous sheet to the selection and Shift+Ctrl+Page Down to add the next sheet.  Additionally, Ctrl+Shift+Page Up and Ctrl+Shift+Page Down can be used to select the previous or next spreadsheet in the file along with the current one, depending on the specific configuration. 
+
+If you need to switch to the last used sheet or tab, the search context indicates that this functionality is not natively available via a standard shortcut key, and some users have requested Ctrl+Tab for this purpose in community forums.  To copy a sheet, you can hold Ctrl and drag the sheet tab, while Alt+Click on a sheet tab allows you to rename it directly. '
+
+LibreOffice Calc offers specific keyboard shortcuts to navigate and manage spreadsheet tabs (sheets), though Ctrl+Tab is not a default shortcut for switching between sheets in the current version.  To move between sheets, users can use Ctrl+Page Up to go to the previous sheet and Ctrl+Page Down to go to the next sheet. 
+
+For selecting multiple sheets simultaneously, the shortcuts are Shift+Ctrl+Page Up to add the previous sheet to the selection and Shift+Ctrl+Page Down to add the next sheet.  Additionally, Ctrl+Shift+Page Up and Ctrl+Shift+Page Down can be used to select the previous or next spreadsheet in the file along with the current one, depending on the specific configuration. 
+
+If you need to switch to the last used sheet or tab, the search context indicates that this functionality is not natively available via a standard shortcut key, and some users have requested Ctrl+Tab for this purpose in community forums.  To copy a sheet, you can hold Ctrl and drag the sheet tab, while Alt+Click on a sheet tab allows you to rename it directly. 
