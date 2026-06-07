@@ -1076,7 +1076,7 @@ fn delimited_table_col_span_and_rows(
     let fr = FOOTER_ROWS;
     let total_rows = hr + mr + fr;
 
-    let (col_start, mut col_end) = if include_margins {
+    let (col_start, col_end) = if include_margins {
         // Preserve ascii_col_bounds when including margins: allow left-margin,
         // main block, and any right-margin columns that contain content. The
         // ascii_col_bounds helper already trims leading/trailing empty margin

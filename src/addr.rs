@@ -251,7 +251,7 @@ pub struct A1RefLocks {
 /// Returns `(address, lock flags for main-style A1 translation, byte length consumed)`.
 ///
 /// `$` locking applies only to plain `A1`/`$A1`/`A$1`/`$A$1` forms (no `[` / `]` / `~` / `_`).
-pub fn parse_cell_ref_at(s: &str, main_cols: usize) -> Option<(CellAddr, A1RefLocks, usize)> {
+pub fn parse_cell_ref_at(s: &str, _main_cols: usize) -> Option<(CellAddr, A1RefLocks, usize)> {
     let bytes = s.as_bytes();
     if bytes.is_empty() {
         return None;
@@ -381,7 +381,7 @@ pub fn parse_cell_ref_at(s: &str, main_cols: usize) -> Option<(CellAddr, A1RefLo
     Some((addr, locks, i + row_digits))
 }
 
-pub fn cell_ref_text(addr: &CellAddr, main_cols: usize) -> String {
+pub fn cell_ref_text(addr: &CellAddr, _main_cols: usize) -> String {
     // Keep this function quiet in normal operation; debug traces should go
     // to the configured debug log via stderr redirection in main.
     match addr {

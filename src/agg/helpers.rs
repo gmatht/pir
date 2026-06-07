@@ -1,4 +1,4 @@
-use crate::grid::{CellAddr, ColumnAddr, GridBox as Grid, MainRange, HEADER_ROWS, MARGIN_COLS};
+use crate::grid::{CellAddr, GridBox as Grid, MainRange, MARGIN_COLS};
 use crate::ops::{AggFunc, AggregateDef};
 
 // Internal helpers kept private to this module

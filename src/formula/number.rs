@@ -254,15 +254,6 @@ impl Number {
     }
 }
 
-/// Same magnitude rule as evaluator float display: outside ~\\(10^{-4}..10^{10}\\) ⇒ scientific.
-pub(crate) fn prefer_scientific_for_number(n: &Number) -> bool {
-    match n {
-        Number::Exact(r) => prefer_scientific_exact(r),
-        Number::Approx(f) => prefer_scientific_f64_abs(f.abs()),
-        Number::Complex(c) => prefer_scientific_f64_abs(c.re) || prefer_scientific_f64_abs(c.im),
-    }
-}
-
 fn prefer_scientific_f64_abs(abs: f64) -> bool {
     if !abs.is_finite() {
         return true;
@@ -298,22 +289,6 @@ fn format_complex(c: Complex64, format_approx: &mut impl FnMut(f64) -> String) -
     }
 }
 
-/// Fixed-decimal display for complex values (each component uses `decimals` places).
-pub(crate) fn format_complex_fixed_decimal(c: Complex64, decimals: usize) -> String {
-    fn fmt_part(v: f64, decimals: usize) -> String {
-        if !v.is_finite() {
-            return v.to_string();
-        }
-        format!("{v:.decimals$}")
-    }
-    let re_s = fmt_part(c.re, decimals);
-    let im_abs_s = fmt_part(c.im.abs(), decimals);
-    if c.im < 0.0 {
-        format!("{re_s}-{im_abs_s}i")
-    } else {
-        format!("{re_s}+{im_abs_s}i")
-    }
-}
 
 /// Multiply by `10^exp` (`exp` clamped modestly): `exp >= 1` ⇒ integer power-of-ten scale;
 /// `exp <= -1` ⇒ division by matching power of ten (for `ROUND`, etc.).

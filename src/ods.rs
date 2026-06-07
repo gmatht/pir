@@ -2,7 +2,7 @@
 
 use crate::addr::excel_column_name;
 use crate::export::{self, DelimitedExportOptions, ExportContent};
-use crate::formula::{cell_effective_display, is_formula, rebase_interop_formula_row_col};
+use crate::formula::{cell_effective_display, is_formula};
 use crate::grid::{CellAddr, ColumnAddr, CellFormat, GridBox as Grid, NumberFormat, TextAlign, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::{SheetRecord, SheetState, WorkbookSnapshot, WorkbookState};
 use quick_xml::events::Event;

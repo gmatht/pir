@@ -9,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut wb = corro::ops::WorkbookState::new();
     let mut active = wb.sheet_id(wb.active_sheet);
 
-    for (i, line) in data.lines().enumerate() {
+    for (_i, line) in data.lines().enumerate() {
         let t = line.trim();
         if t.is_empty() {
             continue;

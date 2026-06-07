@@ -12,7 +12,6 @@ mod functions;
 pub mod number;
 
 pub use number::Number;
-pub(crate) use number::exact_decimal_generic_scientific;
 
 thread_local! {
     static EVAL_WORKBOOK: RefCell<Option<WorkbookState>> = const { RefCell::new(None) };
@@ -145,12 +144,6 @@ impl EvalResult {
         }
     }
 
-    fn as_text(&self) -> Option<&str> {
-        match self {
-            EvalResult::Text(s) => Some(s.as_str()),
-            _ => None,
-        }
-    }
 }
 
 pub(crate) fn parse_number_literal(s: &str) -> Option<Number> {
@@ -1846,7 +1839,7 @@ fn eval_expr_str(
 }
 
 #[derive(Clone, Debug)]
-enum Ast {
+pub(crate) enum Ast {
     Number(Number),
     Text(String),
     Name(String),
@@ -2715,12 +2708,6 @@ pub fn refresh_spills(grid: &mut Grid) {
 
 fn format_number(n: &Number) -> String {
     n.format_eval_display(format_significant_10)
-}
-
-/// Display for UI/export when a column uses [`crate::grid::NumberFormat::Rational`]: exact rationals
-/// as literals; approximate values use the same float rendering as evaluation.
-pub(crate) fn format_number_cell_display(n: &Number) -> String {
-    format_number(n)
 }
 
 fn eval_result_to_string(result: &EvalResult) -> String {

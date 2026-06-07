@@ -324,7 +324,7 @@ pub fn exponential_numeric_display(text: &str, width: usize) -> Option<String> {
     let significant: &str = if non_zero.is_empty() { "0" } else { non_zero };
 
     if trailing_zeros > 0 && !significant.is_empty() && significant != "0" {
-        let sign = if digits.starts_with('-') { "-" } else { "" };
+        let _sign = if digits.starts_with('-') { "-" } else { "" };
         // Format as: first digit + . + remaining significant digits + e + exponent
         let mut mantissa = String::with_capacity(significant.len() + 2);
         mantissa.push(significant.chars().next()?);
@@ -397,7 +397,7 @@ pub fn shrink_numeric_display(text: &str, width: usize) -> Option<String> {
         return Some(sci);
     }
 
-    if let Some(dot_pos) = t.find('.') {
+    if let Some(_dot_pos) = t.find('.') {
         let trimmed = t.trim_end_matches('0');
         if trimmed != t && trimmed.width() <= width {
             return Some(trimmed.to_string());

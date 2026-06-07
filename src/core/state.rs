@@ -1,7 +1,6 @@
-use crate::export;
-use crate::grid::{self, CellAddr, ColumnAddr, GridBox as Grid, HEADER_ROWS, MARGIN_COLS, MainRange, SheetCursor, SortSpec};
+use crate::grid::{CellAddr, MainRange, SheetCursor, SortSpec};
 use crate::io::LogWatcher;
-use crate::ops::{self, Op, SheetState, WorkbookState};
+use crate::ops::{Op, SheetState, WorkbookState};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::SystemTime;

@@ -73,7 +73,7 @@ fn main() {
     {
         let opts = export::DelimitedExportOptions::default();
         let include_headers = opts.include_header_row;
-        let include_margins = opts.include_margins;
+        let _include_margins = opts.include_margins;
         let row_key_col = opts.include_row_label_column;
         let mc = grid.main_cols();
         let mr = grid.main_rows();
