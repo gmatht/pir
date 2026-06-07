@@ -510,14 +510,15 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         ui_core::visible_row_indices(&sheet_rec, cursor, data_rows, 0);
 
     // ── Visible columns (matching ratatui's visible_col_indices) ──────
+    let g = &sheet_rec.grid;
     let (mut col_ixs, _col_scroll) =
         ui_core::visible_col_indices(&sheet_rec, cursor, data_cols, 0);
+    ui_core::trim_visible_cols_to_width(g, &mut col_ixs, cursor.col, data_width);
 
     // ── Column layout with widths matching ratatui's grid.col_width() ──
     // In ratatui, header and data rows use 1-char gaps everywhere (including
     // at left-margin→main and main→right-margin boundaries).  Only the
     // separator row draws a `│` at the boundary, handled by the widget.
-    let g = &sheet_rec.grid;
     let mut layout: Vec<(u32, u32, String)> = Vec::new();
     let mut col_widths: HashMap<usize, usize> = HashMap::new();
     for &c in col_ixs.iter() {
