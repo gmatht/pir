@@ -559,16 +559,6 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
 
-    // Position cursor at the last populated row of the last column
-    // so the viewport is scrolled to show the bottom-right data area,
-    // matching the ratatui reference output.
-    if mc > 0 && mr > 0 {
-        let last_data_col = MARGIN_COLS + (mc - 1);
-        let last_data_row = HEADER_ROWS + (mr - 1);
-        app.core.cursor.col = last_data_col;
-        app.core.cursor.row = last_data_row;
-    }
-
     let display_cursor_row = app.core.cursor.row;
     let display_cursor_col = app.core.cursor.col;
     let cursor = app.core.cursor;
