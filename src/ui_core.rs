@@ -70,6 +70,7 @@ pub fn main_col_window(state: &SheetState, cursor: SheetCursor) -> (u32, u32) {
     }
     let mc_u32 = mc as u32;
 
+    // Determine the column range from content columns and cursor position.
     let cursor_main_col = if cursor.col < lm {
         0u32
     } else if cursor.col < lm + mc {
@@ -78,14 +79,30 @@ pub fn main_col_window(state: &SheetState, cursor: SheetCursor) -> (u32, u32) {
         mc_u32.saturating_sub(1)
     };
 
-    // Always start from the first main column so that no main columns
-    // are skipped between the left-margin anchor and the cursor.
-    let lo = 0u32;
-    // Extend at least to the cursor, plus extra so the viewport shows
-    // context ahead.  Use a wider window so content columns just past
-    // the cursor (e.g. column F when the cursor is at A) are visible
-    // without requiring the user to scroll right.
-    let hi = (cursor_main_col + 8).min(mc_u32.saturating_sub(1));
+    let mut lo = mc_u32;
+    let mut hi = 0u32;
+
+    for c in 0..mc_u32 {
+        if g.logical_col_has_content(lm + c as usize) {
+            lo = lo.min(c);
+            hi = hi.max(c);
+        }
+    }
+    if lo <= hi {
+        lo = lo.saturating_sub(1);
+        hi = (hi + 1).min(mc_u32.saturating_sub(1));
+    } else {
+        lo = 0;
+        hi = 0;
+    }
+    // Ensure the cursor column is within the window
+    if cursor_main_col > hi {
+        hi = cursor_main_col;
+    }
+    if cursor_main_col < lo {
+        lo = 0;
+    }
+
     (lo, hi)
 }
 

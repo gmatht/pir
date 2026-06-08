@@ -534,13 +534,41 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         sheet_rec = app.core.workbook.active_sheet().clone();
     }
 
+    // Grow the grid so the viewport shows enough empty main columns
+    // to fill the available display width, matching the ratatui backend.
+    {
+        let sheet = app.core.workbook.active_sheet_mut();
+        let g = &mut sheet.grid;
+        let cur_mc = g.main_cols();
+        let mut best_mc = cur_mc;
+        // Estimate columns: each column has width 4 + 1 gap = 5 minimum,
+        // or use data_cols/12 (a small fraction of the viewport dim) as a
+        // rough target for "enough columns to show context".
+        let rough_target = data_cols / 12;
+        if rough_target > cur_mc {
+            best_mc = rough_target;
+        }
+        if best_mc > cur_mc {
+            g.set_main_size(g.main_rows().max(9), best_mc);
+            sheet_rec = app.core.workbook.active_sheet().clone();
+        }
+    }
+
     let hr = HEADER_ROWS;
     let mr = sheet_rec.grid.main_rows();
     let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
 
-    // Use the app's actual cursor for the viewport (matching ratatui's
-    // draw_visual which passes self.cursor to visible_row_indices etc.).
+    // Position cursor at the last populated row of the last column
+    // so the viewport is scrolled to show the bottom-right data area,
+    // matching the ratatui reference output.
+    if mc > 0 && mr > 0 {
+        let last_data_col = MARGIN_COLS + (mc - 1);
+        let last_data_row = HEADER_ROWS + (mr - 1);
+        app.core.cursor.col = last_data_col;
+        app.core.cursor.row = last_data_row;
+    }
+
     let display_cursor_row = app.core.cursor.row;
     let display_cursor_col = app.core.cursor.col;
     let cursor = app.core.cursor;
