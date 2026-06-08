@@ -232,6 +232,10 @@ fn fill_cells(
                     if !cell_effective_display(g, &next_addr).trim().is_empty() {
                         break;
                     }
+                    // Stop at section boundaries so │ separators are preserved
+                    if c_next == lm || c_next == lm + mc {
+                        break;
+                    }
                     let cw_next = *col_widths.get(&c_next).unwrap_or(&4);
                     total_spill_gaps += cw_next;
                     if next_ix + 1 < col_ixs.len() {
