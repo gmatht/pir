@@ -1006,9 +1006,8 @@ impl Grid {
 
     pub fn auto_fit_column(&mut self, global_col: usize) {
         if let Some(maxw) = self.content_width_for_column(global_col) {
-            if maxw > self.max_col_width {
-                self.col_width_overrides.insert(global_col, maxw);
-            }
+            self.col_width_overrides
+                .insert(global_col, maxw.min(self.max_col_width));
         }
     }
 
@@ -1922,7 +1921,9 @@ mod tests {
             "abcdefghijklmnopqrstuvwx".into(),
         );
 
-        assert_eq!(g.col_width(MARGIN_COLS), DEFAULT_MAX_COL_WIDTH);
+        // auto_fit_column now always sets an override, so "short" (5 chars)
+        // produces width 6, not max_col_width.
+        assert_eq!(g.col_width(MARGIN_COLS), 6);
         // auto_fit_column caps at max_col_width, so wide content does not
         // blow up the column width.
         assert_eq!(g.col_width(MARGIN_COLS + 1), DEFAULT_MAX_COL_WIDTH);
@@ -1935,7 +1936,9 @@ mod tests {
         assert_eq!(g.col_width(MARGIN_COLS), 4);
 
         g.set(&CellAddr::Main { row: 0, col: 0 }, "x".into());
-        assert_eq!(g.col_width(MARGIN_COLS), DEFAULT_MAX_COL_WIDTH);
+        // auto_fit_column now always sets an override, so "x" (1 char)
+        // produces width 4 (minimum content width), not max_col_width.
+        assert_eq!(g.col_width(MARGIN_COLS), 4);
         assert_eq!(g.col_width(MARGIN_COLS + 1), 4);
 
         g.set_col_width(MARGIN_COLS + 1, Some(12));
