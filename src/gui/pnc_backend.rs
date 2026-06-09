@@ -584,102 +584,10 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     let mut sheet_rec = app.core.workbook.active_sheet().clone();
 
-    // Ensure the cursor is valid after loading the workbook (matching
-    // ratatui's load_initial which calls cursor.clamp).
+    // Keep the cursor at its natural initial position (first main row,
+    // first main column = cell A1), matching the ratatui backend which
+    // does not grow the grid or reposition the cursor on initial load.
     app.core.cursor.clamp(&sheet_rec.grid);
-
-    // Grow the grid to match the reference grid state that the ratatui
-    // backend produces after interactive editing.  The ratatui backend's
-    // commit_edit_and_move_down grows the grid by one when pressing Enter
-    // at the last main row and trailing_blank_main_rows < NAV_BLANK_ROWS.
-    // For overflow.corro, each SET command triggers this growth at the
-    // boundary, resulting in 5 main rows instead of 3.
-    //
-    // Additionally, when a cell in the last main row has content that
-    // overflows (spills past its column width), phantom overflow rows are
-    // added so the visual boundary between main data and footer is pushed
-    // past the overflowed content.
-    let mut grid_grown = false;
-    {
-        let sheet = app.core.workbook.active_sheet_mut();
-        let g = &mut sheet.grid;
-        let hr = HEADER_ROWS;
-        let cr = app.core.cursor.row;
-        let cc = app.core.cursor.col;
-        let cur_mr = g.main_rows();
-        let cur_mc = g.main_cols();
-        let mut new_mr = cur_mr;
-        let mut new_mc = cur_mc;
-
-        // Grow main rows if cursor is at or beyond the current last main row
-        if cr >= hr && cr < hr + cur_mr.saturating_add(1) && cr >= hr.saturating_add(cur_mr.saturating_sub(1)) {
-            let target_rows = (cr - hr + 1) as usize;
-            if target_rows > cur_mr {
-                new_mr = target_rows;
-            }
-        }
-
-        // Grow main columns if cursor is in main area beyond current extent
-        if cc >= MARGIN_COLS && cc < MARGIN_COLS + cur_mc.saturating_add(1) && cc >= MARGIN_COLS.saturating_add(cur_mc.saturating_sub(1)) {
-            let target_cols = (cc - MARGIN_COLS + 1) as usize;
-            if target_cols > cur_mc {
-                new_mc = target_cols;
-            }
-        }
-
-        // Add phantom overflow rows when the last main row has cells that
-        // overflow (their rendered text is wider than the column).  The
-        // ratatui backend creates these phantom rows through grid growth
-        // in commit_edit_and_move_down; we replicate the result here by
-        // adding NAV_BLANK_ROWS extra rows below the current last content
-        // row so that overflow text has room to breathe.
-        if cur_mr > 0 {
-            let last_content_row = (0..cur_mr as u32)
-                .rev()
-                .find(|&r| {
-                    for c in 0..g.main_cols() as u32 {
-                        let addr = CellAddr::Main { row: r, col: c };
-                        if let Some(v) = g.get(&addr) {
-                            if !v.trim().is_empty() {
-                                let cw = g.col_width(MARGIN_COLS + c as usize).max(1);
-                                let fw = crate::ui_core::format_cell_display(g, &addr, v.clone()).width();
-                                if fw > cw {
-                                    return true;
-                                }
-                            }
-                        }
-                    }
-                    false
-                });
-            if let Some(_last_overflow_row) = last_content_row {
-                let target_rows = cur_mr + crate::ui_core::NAV_BLANK_ROWS;
-                if target_rows > cur_mr {
-                    new_mr = target_rows;
-                }
-            }
-        }
-
-        if new_mr != cur_mr || new_mc != cur_mc {
-            g.set_main_size(new_mr.max(1), new_mc.max(1));
-            grid_grown = true;
-        }
-    }
-    if grid_grown {
-        sheet_rec = app.core.workbook.active_sheet().clone();
-    }
-
-    // Set cursor position to match the reference grid state (footer row _1,
-    // left-margin column [G) that the ratatui backend produces after
-    // replaying the overflow test file via key-press interaction.
-    {
-        let mr = sheet_rec.grid.main_rows();
-        let first_footer_row = HEADER_ROWS + mr;
-        app.core.cursor.row = first_footer_row;
-        // [G is at margin index 695 = MARGIN_COLS - 7, the first visible
-        // left-margin column when the viewport shows 7 margin cols.
-        app.core.cursor.col = MARGIN_COLS.saturating_sub(7);
-        app.core.cursor.clamp(&sheet_rec.grid);
-    }
 
     let hr = HEADER_ROWS;
     let mr = sheet_rec.grid.main_rows();
