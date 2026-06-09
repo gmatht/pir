@@ -31,6 +31,14 @@ fn fill_cells(
     display_cursor_row: usize, display_cursor_col: usize,
     row_agg_func: &[Option<AggFunc>],
 ) {
+    // DEBUG: log row_agg_func
+    for (ri, &lr) in display_rows.iter().enumerate() {
+        if lr >= hr && lr < hr + mr {
+            let mri = (lr - hr) as u32;
+            let left_val = g.get(&CellAddr::Left { col: MARGIN_COLS - 1, row: mri });
+            eprintln!("DBG row ri={} lr={} mri={} left_val={:?} agg={:?}", ri, lr, mri, left_val, row_agg_func[ri]);
+        }
+    }
     for (ri, &logical_row) in display_rows.iter().enumerate() {
         let main_row = if logical_row >= hr && logical_row < hr + mr {
             Some((logical_row - hr) as u32)
@@ -533,6 +541,8 @@ fn row_total_block_start(g: &GridBox, current_main_row: u32) -> u32 {
 }
 
 pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = std::fs::write("/tmp/pnc_debug_run.txt", "DEBUG run_pancurses entered\n");
+    eprintln!("DEBUG run_pancurses entered");
     let _backend = rustxwidgets::backends::pancurses::init()
         .map_err(|e| format!("pancurses init failed: {e}"))?;
 
