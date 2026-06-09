@@ -234,6 +234,11 @@ fn fill_cells(
                     }
                     // Stop at section boundaries so │ separators are preserved
                     if c_next == lm || c_next == lm + mc {
+                        // Include remaining viewport space (right gap) so
+                        // text can flow into the filler area, matching ratatui.
+                        let render_w: usize = ui_core::visible_cols_render_width(g, col_ixs);
+                        let right_gap = data_width.saturating_sub(render_w);
+                        total_spill_gaps = total_spill_gaps.saturating_add(right_gap);
                         break;
                     }
                     let cw_next = *col_widths.get(&c_next).unwrap_or(&4);
@@ -244,11 +249,8 @@ fn fill_cells(
                     next_ix += 1;
                 }
                 if next_ix >= col_ixs.len() {
-                    let actual_total: usize = col_ixs.iter()
-                        .map(|&c| (*col_widths.get(&c).unwrap_or(&4)).max(1))
-                        .sum::<usize>()
-                        + col_ixs.len().saturating_sub(1);
-                    let right_gap = data_width.saturating_sub(actual_total).saturating_sub(1);
+                    let render_w: usize = ui_core::visible_cols_render_width(g, col_ixs);
+                    let right_gap = data_width.saturating_sub(render_w);
                     total_spill_gaps = total_spill_gaps.saturating_add(right_gap);
                 }
                 if total_spill_gaps > cw && next_ix > col_ix {
