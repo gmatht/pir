@@ -193,12 +193,15 @@ fn fill_cells(
                 && (align.is_none() || align == Some(crate::grid::TextAlign::Left))
                 && !is_agg_cell;
 
-            let gap_width = if col_ix + 1 < col_ixs.len() { 1 } else { 0 };
-
             let mut did_spill = false;
             if allow_spill {
                 let mut next_ix = col_ix + 1;
-                let mut total_spill_gaps = cw + gap_width;
+                let mut total_spill_gaps = cw;
+                // Compute two widths:
+                //   narrow – up to and including the PipeAndSpace at main→right boundary
+                //   wide   – all visible columns + right_gap
+                let mut narrow_spill = cw;
+                let mut beyond_boundary = false;
                 while next_ix < col_ixs.len() {
                     let c_next = col_ixs[next_ix];
                     let next_addr = if logical_row < hr {
@@ -229,37 +232,95 @@ fn fill_cells(
                             CellAddr::Footer { row: ftr_row, col: ColumnAddr::Right(c_next - lm - mc) }
                         }
                     };
+                    // Add trailing separator AFTER the previous column (matching ratatui)
+                    let prev_vp = next_ix - 1;
+                    let prev_col = col_ixs[prev_vp];
+                    let trailing = ui_core::inter_column_trailing_after_data_cell(
+                        prev_vp, prev_col, col_ixs, lm, mc, col_ixs.contains(&(lm + mc)),
+                    );
+                    match trailing {
+                        ui_core::InterColumnTrailing::AsciiSpace => {
+                            total_spill_gaps += 1;
+                            if !beyond_boundary {
+                                narrow_spill += 1;
+                            }
+                        }
+                        ui_core::InterColumnTrailing::PipeAndSpace => {
+                            total_spill_gaps += 2;
+                            if !beyond_boundary {
+                                narrow_spill += 2;
+                            }
+                        }
+                        _ => {}
+                    }
                     if !cell_effective_display(g, &next_addr).trim().is_empty() {
                         break;
                     }
-                    // Stop at section boundaries so │ separators are preserved
-                    if c_next == lm || c_next == lm + mc {
-                        // Include remaining viewport space (right gap) so
-                        // text can flow into the filler area, matching ratatui.
-                        let render_w: usize = ui_core::visible_cols_render_width(g, col_ixs);
+                    // Left-margin boundary: stop, add remaining space.
+                    if c_next == lm {
+                        let render_w = ui_core::visible_cols_render_width(g, col_ixs);
+                        let right_gap = data_width.saturating_sub(render_w);
+                        total_spill_gaps = total_spill_gaps.saturating_add(right_gap);
+                        narrow_spill = narrow_spill.saturating_add(right_gap);
+                        break;
+                    }
+                    // Right-margin boundary: if text fits within main+pipe, stop here;
+                    // otherwise continue into right-margin columns.
+                    if c_next == lm + mc {
+                        beyond_boundary = true;
+                        // Add this boundary column's width too
+                        let cw_rm = *col_widths.get(&c_next).unwrap_or(&4);
+                        total_spill_gaps += cw_rm;
+                        // Continue wide calculation for remaining right-margin cols.
+                        let mut wide_ix = next_ix + 1;
+                        while wide_ix < col_ixs.len() {
+                            let cw_more = *col_widths.get(&col_ixs[wide_ix]).unwrap_or(&4);
+                            total_spill_gaps += cw_more;
+                            if wide_ix + 1 < col_ixs.len() {
+                                let t = ui_core::inter_column_trailing_after_data_cell(
+                                    wide_ix, col_ixs[wide_ix], col_ixs,
+                                    lm, mc, col_ixs.contains(&(lm + mc)),
+                                );
+                                match t {
+                                    ui_core::InterColumnTrailing::AsciiSpace => total_spill_gaps += 1,
+                                    ui_core::InterColumnTrailing::PipeAndSpace => total_spill_gaps += 2,
+                                    _ => {}
+                                }
+                            }
+                            wide_ix += 1;
+                        }
+                        let render_w = ui_core::visible_cols_render_width(g, col_ixs);
                         let right_gap = data_width.saturating_sub(render_w);
                         total_spill_gaps = total_spill_gaps.saturating_add(right_gap);
                         break;
                     }
                     let cw_next = *col_widths.get(&c_next).unwrap_or(&4);
                     total_spill_gaps += cw_next;
-                    if next_ix + 1 < col_ixs.len() {
-                        total_spill_gaps += 1;
+                    if !beyond_boundary {
+                        narrow_spill += cw_next;
                     }
                     next_ix += 1;
                 }
-                if next_ix >= col_ixs.len() {
-                    let render_w: usize = ui_core::visible_cols_render_width(g, col_ixs);
+                if !beyond_boundary && next_ix >= col_ixs.len() {
+                    let render_w = ui_core::visible_cols_render_width(g, col_ixs);
                     let right_gap = data_width.saturating_sub(render_w);
-                    total_spill_gaps = total_spill_gaps.saturating_add(right_gap);
+                    narrow_spill = narrow_spill.saturating_add(right_gap);
+                    total_spill_gaps = narrow_spill;
                 }
-                if total_spill_gaps > cw && next_ix > col_ix {
+                // Use narrow_spill when text fits within it (preserves structural pipe).
+                // Use total_spill_gaps (wide) when text overflows the boundary.
+                // For narrow text the PipeAndSpace at the boundary is drawn by the
+                // widget as a structural element, so exclude it from the text padding.
+                let use_wide = fw > narrow_spill;
+                let pipe_gap = if !use_wide && beyond_boundary { 2 } else { 0 };
+                let pad_spill = if use_wide { total_spill_gaps } else { narrow_spill.saturating_sub(pipe_gap) };
+                if pad_spill > cw {
                     did_spill = true;
-                    let (pre_total, _suf_total) = take_display_prefix(&formatted, total_spill_gaps);
+                    let (pre_total, _suf_total) = take_display_prefix(&formatted, pad_spill);
                     let store_text = if pre_total.trim().is_empty() {
                         String::new()
                     } else {
-                        align_cell_display(pre_total, total_spill_gaps, align)
+                        align_cell_display(pre_total, pad_spill, align)
                     };
                 let should_store = !store_text.is_empty()
                     || (c >= lm && c < lm + mc)
@@ -271,14 +332,23 @@ fn fill_cells(
                         spreadsheet.set_raw_cell(ri as u32, c as u32, &raw_val);
                     }
                     }
-                    // Clear overflowed columns so stale data doesn't block
-                    // render-time overflow detection.
-                    for skip in (col_ix + 1)..next_ix {
+                    // Determine how far to advance.  For wide text past the boundary,
+                    // consume all right-margin columns.
+                    let advance_to = if use_wide && beyond_boundary {
+                        let mut adv = next_ix + 1;
+                        while adv < col_ixs.len() {
+                            adv += 1;
+                        }
+                        adv
+                    } else {
+                        next_ix
+                    };
+                    for skip in (col_ix + 1)..advance_to {
                         let skip_col = col_ixs[skip];
                         spreadsheet.set_cell(ri as u32, skip_col as u32, "");
                         spreadsheet.set_cell_style(ri as u32, skip_col as u32, CELL_STYLE_DEFAULT);
                     }
-                    col_ix = next_ix;
+                    col_ix = advance_to;
                 }
             }
 
