@@ -965,6 +965,17 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 col_ixs_cb = new_ixs;
                 // Keep the widget's margin_cols and main_cols in sync
                 spreadsheet_set_grid_config(sid, lm as u32, mc as u32);
+                // Repopulate cells with updated column layout after growth
+                let dr: Vec<usize> = display_rows_for_cb.borrow().clone();
+                let new_col_widths: HashMap<usize, usize> = col_ixs_cb.iter()
+                    .map(|&c| (c, g.col_width(c).max(1)))
+                    .collect();
+                let new_row_agg = compute_row_agg_func(g, &dr, hr_cb, mr);
+                fill_cells(
+                    &sheet_cb, &dr, &col_ixs_cb, &new_col_widths,
+                    g, hr_cb, mr, mc, MARGIN_COLS, data_width_cb,
+                    cursor.row, cursor.col, &new_row_agg,
+                );
             }
             // Update column viewport when cursor column moves outside the
             // currently visible range (matching ratatui's per-frame recompute).
@@ -988,6 +999,17 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     .collect();
                 spreadsheet_set_column_layout(sid, new_layout);
                 col_ixs_cb = new_ixs;
+                // Repopulate cells with updated column viewport
+                let dr: Vec<usize> = display_rows_for_cb.borrow().clone();
+                let new_col_widths: HashMap<usize, usize> = col_ixs_cb.iter()
+                    .map(|&c| (c, g.col_width(c).max(1)))
+                    .collect();
+                let new_row_agg = compute_row_agg_func(g, &dr, hr_cb, mc);
+                fill_cells(
+                    &sheet_cb, &dr, &col_ixs_cb, &new_col_widths,
+                    g, hr_cb, g.main_rows(), mc, MARGIN_COLS, data_width_cb,
+                    cursor.row, cursor.col, &new_row_agg,
+                );
             }
         }
     });
