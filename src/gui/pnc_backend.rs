@@ -337,11 +337,14 @@ fn fill_cells(
                 let pad_spill = if use_wide { total_spill_gaps } else { narrow_spill.saturating_sub(pipe_gap) };
                 if pad_spill > cw {
                     did_spill = true;
-                    let (pre_total, _suf_total) = take_display_prefix(&formatted, pad_spill);
-                    let store_text = if pre_total.trim().is_empty() {
+                    // Store the full formatted text; the widget will handle
+                    // overflow/truncation during rendering.  Truncating here
+                    // with pad_spill can lose characters when the visible
+                    // columns barely fit the render width.
+                    let store_text = if formatted.trim().is_empty() {
                         String::new()
                     } else {
-                        align_cell_display(pre_total, pad_spill, align)
+                        formatted.clone()
                     };
                 let should_store = !store_text.is_empty()
                     || (c >= lm && c < lm + mc)
