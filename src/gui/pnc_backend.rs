@@ -744,11 +744,35 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             }
             need_viewport_recompute = true;
         } else if _display_row == u32::MAX - 1 {
-            // Scroll down sentinel: user pressed Down at the last visible row
+            // Scroll down sentinel: user pressed Down at the last visible row.
+            // Grow the grid if the cursor is at the last main row with few
+            // trailing blanks (matching ratatui's move_cursor_one_row_vertical).
+            let cursor_row = app.core.cursor.row;
+            {
+                let sheet = app.core.workbook.active_sheet_mut();
+                let mr = sheet.grid.main_rows();
+                if cursor_row == hr_cb + mr.saturating_sub(1)
+                    && trailing_blank_main_rows(&sheet.grid) < crate::ui_core::NAV_BLANK_ROWS
+                {
+                    sheet.grid.grow_main_row_at_bottom();
+                }
+            }
             app.core.cursor.row += 1;
             need_viewport_recompute = true;
         } else if let Some(&logical_row) = display_rows_for_cb.borrow().get(display_idx) {
             app.core.cursor.row = logical_row;
+
+            // Grow the grid if cursor moves from the last main row with few
+            // trailing blanks (matching ratatui's move_cursor_one_row_vertical).
+            if logical_row >= hr_cb + mr_cb {
+                let sheet = app.core.workbook.active_sheet_mut();
+                let cur_mr = sheet.grid.main_rows();
+                if prev_cursor_row == hr_cb + cur_mr.saturating_sub(1)
+                    && trailing_blank_main_rows(&sheet.grid) < crate::ui_core::NAV_BLANK_ROWS
+                {
+                    sheet.grid.grow_main_row_at_bottom();
+                }
+            }
 
             // Check if cursor moved into header or footer region; if so,
             // recompute the viewport so those rows become visible.
