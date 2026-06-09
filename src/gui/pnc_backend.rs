@@ -269,6 +269,13 @@ fn fill_cells(
                         spreadsheet.set_raw_cell(ri as u32, c as u32, &raw_val);
                     }
                     }
+                    // Clear overflowed columns so stale data doesn't block
+                    // render-time overflow detection.
+                    for skip in (col_ix + 1)..next_ix {
+                        let skip_col = col_ixs[skip];
+                        spreadsheet.set_cell(ri as u32, skip_col as u32, "");
+                        spreadsheet.set_cell_style(ri as u32, skip_col as u32, CELL_STYLE_DEFAULT);
+                    }
                     col_ix = next_ix;
                 }
             }
@@ -307,9 +314,7 @@ fn fill_cells(
                 } else {
                     display_text
                 };
-                let should_store = !store_text.is_empty()
-                    || (c >= lm && c < lm + mc)
-                    || (c >= lm + mc);
+                let should_store = true;
                 if should_store {
                     spreadsheet.set_cell(ri as u32, c as u32, &store_text);
                     spreadsheet.set_cell_style(ri as u32, c as u32, cell_style);
