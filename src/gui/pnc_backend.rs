@@ -755,7 +755,6 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let data_width_cb = data_width;
     let mut prev_cursor_col = cursor.col;
     let mut prev_cursor_row = cursor.row;
-    let sheet_rec = app.core.workbook.active_sheet().clone();
     add_cursor_move_callback(move |_display_row, _display_col| {
         // SAFETY: app is &mut App alive for the entire event loop
         let app = unsafe { &mut *app_ptr };
@@ -774,36 +773,6 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             app.core.cursor.row += 1;
             need_viewport_recompute = true;
         } else if let Some(&logical_row) = display_rows_for_cb.borrow().get(display_idx) {
-            // Grow grid before moving cursor, matching ratatui's
-            // move_cursor_one_row_vertical / move_cursor_one_col_horizontal.
-            {
-                let sheet = app.core.workbook.active_sheet_mut();
-                let g = &mut sheet.grid;
-                let hr = hr_cb;
-                let lm = MARGIN_COLS;
-                // Row growth: if cursor was at the last main row and
-                // trailing blank rows are below threshold, grow.
-                if logical_row > prev_cursor_row {
-                    if prev_cursor_row >= hr
-                        && prev_cursor_row == hr + g.main_rows().saturating_sub(1)
-                        && trailing_blank_main_rows(g) < crate::ui_core::NAV_BLANK_ROWS
-                    {
-                        g.grow_main_row_at_bottom();
-                    }
-                }
-                // Column growth: if cursor was at the last main column and
-                // trailing blank cols are below threshold, grow.
-                let new_col = _display_col as usize;
-                if new_col > prev_cursor_col {
-                    if prev_cursor_col >= lm
-                        && prev_cursor_col == lm + g.main_cols().saturating_sub(1)
-                        && trailing_blank_main_cols(g) < crate::ui_core::NAV_BLANK_COLS
-                    {
-                        g.grow_main_col_at_right();
-                    }
-                }
-            }
-
             app.core.cursor.row = logical_row;
 
             // Check if cursor moved into header or footer region; if so,
