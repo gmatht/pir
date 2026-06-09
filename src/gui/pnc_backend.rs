@@ -271,6 +271,19 @@ fn fill_cells(
                         // Add this boundary column's width too
                         let cw_rm = *col_widths.get(&c_next).unwrap_or(&4);
                         total_spill_gaps += cw_rm;
+                        // Add trailing between boundary column and first right-margin col
+                        // (matching ratatui, which adds this in the next loop iteration)
+                        if next_ix + 1 < col_ixs.len() {
+                            let t = ui_core::inter_column_trailing_after_data_cell(
+                                next_ix, c_next, col_ixs,
+                                lm, mc, col_ixs.contains(&(lm + mc)),
+                            );
+                            match t {
+                                ui_core::InterColumnTrailing::AsciiSpace => total_spill_gaps += 1,
+                                ui_core::InterColumnTrailing::PipeAndSpace => total_spill_gaps += 2,
+                                _ => {}
+                            }
+                        }
                         // Continue wide calculation for remaining right-margin cols.
                         let mut wide_ix = next_ix + 1;
                         while wide_ix < col_ixs.len() {
