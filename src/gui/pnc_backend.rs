@@ -619,11 +619,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
 
-    // Use the next logical row for the initial cursor display position
-    // to match the ratatui reference output (which shows cursor at A2
-    // during replay comparison). At load time the cursor starts at A1;
-    // during replay the first keystroke moves it to A2.
-    let display_cursor_row = app.core.cursor.row + 1;
+    let display_cursor_row = app.core.cursor.row;
     let display_cursor_col = app.core.cursor.col;
     let cursor = SheetCursor {
         row: display_cursor_row,
