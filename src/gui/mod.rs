@@ -43,7 +43,7 @@ impl App {
                 offset: 0,
                 state: Default::default(),
                 workbook: WorkbookState::new(),
-                cursor: SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS },
+                cursor: SheetCursor { row: HEADER_ROWS + 1, col: MARGIN_COLS },
                 anchor: None,
                 watcher: None,
                 status: String::new(),
