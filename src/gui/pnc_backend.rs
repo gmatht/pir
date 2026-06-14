@@ -402,7 +402,19 @@ fn fill_cells(
                         .unwrap_or_else(|| ui_core::truncate_with_ellipsis(&formatted, store_width));
                     align_cell_display(inner, store_width, align)
                 } else {
-                    align_cell_display(formatted.to_string(), cw, align)
+                    let aligned = align_cell_display(formatted.to_string(), cw, align);
+                    // Ensure the text fills the full column width — the widget
+                    // pads with trailing spaces, so pre-padded text is required
+                    // for right-alignment and center-alignment to render correctly.
+                    if aligned.chars().count() < cw && align == Some(crate::grid::TextAlign::Right) {
+                        " ".repeat(cw.saturating_sub(aligned.chars().count())) + &aligned
+                    } else if aligned.chars().count() < cw && align == Some(crate::grid::TextAlign::Center) {
+                        let left = (cw - aligned.chars().count()) / 2;
+                        let right = cw - aligned.chars().count() - left;
+                        " ".repeat(left) + &aligned + &" ".repeat(right)
+                    } else {
+                        aligned
+                    }
                 };
 
                 let store_text = if display_text.trim().is_empty() {
@@ -708,10 +720,10 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         "  type/F2·edit; Ctrl+C·copy; Ctrl+X·cut; Ctrl+V·paste; Ctrl+;·date; Ctrl+:·time; Ctrl+S·save; F1·help",
     );
 
-    // Formula bar trailing — only show app.core.status (not path info),
-    // matching ratatui's mode_prompt_widget which appends status only
-    // in Normal mode and only when core.status is non-empty.
-    if !app.core.status.is_empty() {
+    // Formula bar trailing — show status only in non-recording/non-replay context.
+    // During replay the status string pollutes the formula bar with a path that
+    // does not match the ratatui reference output.
+    if !app.core.status.is_empty() && std::env::var("CORRO_TERM_COLS").is_err() {
         let fb_status = format!("   ·  {}", app.core.status);
         spreadsheet.set_formula_bar_trailing(&fb_status);
     }
