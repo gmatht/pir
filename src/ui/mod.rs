@@ -12145,9 +12145,15 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 // like it does in Normal mode. Handle Shift+Arrow here before the
                 // text-editing Left/Right branch so Shift doesn't get consumed as a
                 // plain text navigation key.
+                // Commit the pending buffer before moving the cursor, so the pending
+                // edit targets the original cell — not the cell the cursor moves to
+                // (which `maybe_sync_edit_target_with_highlighted_cell` would pick up).
                 KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
                     if key.modifiers.contains(KeyModifiers::SHIFT) =>
                 {
+                    self.edit_cursor = None;
+                    let raw = buffer.clone();
+                    self.commit_edit_buffer(&raw)?;
                     let ctrl_or_cmd = key.modifiers.contains(KeyModifiers::CONTROL)
                         || key.modifiers.contains(KeyModifiers::SUPER);
                     match key.code {
@@ -12217,6 +12223,10 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                         }
                         _ => {}
                     }
+                    // After committing the buffer, exit to Normal mode with the
+                    // selection active so subsequent keys (arrows, ESC, type)
+                    // behave as they would in Normal mode.
+                    mode = Mode::Normal;
                 }
 
                 KeyCode::Left | KeyCode::Right => {
