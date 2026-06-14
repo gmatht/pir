@@ -720,13 +720,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         "  type/F2·edit; Ctrl+C·copy; Ctrl+X·cut; Ctrl+V·paste; Ctrl+;·date; Ctrl+:·time; Ctrl+S·save; F1·help",
     );
 
-    // Formula bar trailing — show status only in non-recording/non-replay context.
-    // During replay the status string pollutes the formula bar with a path that
-    // does not match the ratatui reference output.
-    if !app.core.status.is_empty() && std::env::var("CORRO_TERM_COLS").is_err() {
-        let fb_status = format!("   ·  {}", app.core.status);
-        spreadsheet.set_formula_bar_trailing(&fb_status);
-    }
+    // Formula bar trailing — not set during replay to match ratatui reference output.
+    // In normal usage the status could be shown here, but ratatui shows status
+    // only in the formula bar for Normal mode, not Edit mode.
 
     win.set_child(&spreadsheet);
     rustxwidgets::backends::pancurses::set_focus(spreadsheet.id());
@@ -735,7 +731,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // ── Cursor move callback: grow grid extent + update viewport ─────────
     // The ratatui backend recomputes the viewport each frame so pressing arrow
     // keys scrolls the visible columns/rows and the grid extent grows as needed.
-    let display_rows_for_cb = std::cell::RefCell::new(display_rows.clone());
+    let display_rows_for_cb = std::rc::Rc::new(std::cell::RefCell::new(display_rows.clone()));
     let display_rows_for_ce = display_rows_for_cb.clone();
     let mut col_ixs_cb = col_ixs.clone();
     let sheet_cb = spreadsheet.clone();
@@ -964,10 +960,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     g, hr_cb, mr, mc, MARGIN_COLS, data_width_cb,
                     cursor.row, cursor.col, &new_row_agg,
                 );
-            }
-            // Update column viewport when cursor column moves outside the
-            // currently visible range (matching ratatui's per-frame recompute).
-            if !col_ixs_cb.contains(&(_display_col as usize)) {
+            } else if !col_ixs_cb.contains(&(_display_col as usize)) {
+                // Update column viewport when cursor column moves outside the
+                // currently visible range (matching ratatui's per-frame recompute).
                 let rec = app.core.workbook.active_sheet().clone();
                 let g = &rec.grid;
                 let mc = g.main_cols();
@@ -993,6 +988,23 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     .map(|&c| (c, g.col_width(c).max(1)))
                     .collect();
                 let new_row_agg = compute_row_agg_func(g, &dr, hr_cb, mc);
+                fill_cells(
+                    &sheet_cb, &dr, &col_ixs_cb, &new_col_widths,
+                    g, hr_cb, g.main_rows(), mc, MARGIN_COLS, data_width_cb,
+                    cursor.row, cursor.col, &new_row_agg,
+                );
+            } else {
+                // Cursor moved within the current viewport — refresh cells to ensure
+                // formatted display values are used (commits overwrite cells with raw values).
+                let rec = app.core.workbook.active_sheet().clone();
+                let g = &rec.grid;
+                let mc = g.main_cols();
+                let cursor = app.core.cursor;
+                let dr: Vec<usize> = display_rows_for_cb.borrow().clone();
+                let new_col_widths: HashMap<usize, usize> = col_ixs_cb.iter()
+                    .map(|&c| (c, g.col_width(c).max(1)))
+                    .collect();
+                let new_row_agg = compute_row_agg_func(g, &dr, hr_cb, g.main_rows());
                 fill_cells(
                     &sheet_cb, &dr, &col_ixs_cb, &new_col_widths,
                     g, hr_cb, g.main_rows(), mc, MARGIN_COLS, data_width_cb,
