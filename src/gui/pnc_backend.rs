@@ -720,9 +720,10 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         "  type/F2·edit; Ctrl+C·copy; Ctrl+X·cut; Ctrl+V·paste; Ctrl+;·date; Ctrl+:·time; Ctrl+S·save; F1·help",
     );
 
-    // Formula bar trailing — not set during replay to match ratatui reference output.
-    // In normal usage the status could be shown here, but ratatui shows status
-    // only in the formula bar for Normal mode, not Edit mode.
+    // Formula bar trailing with status message (matching ratatui mode_prompt_widget)
+    if !app.core.status.is_empty() {
+        spreadsheet.set_formula_bar_trailing(&format!("   ·  {}", app.core.status));
+    }
 
     win.set_child(&spreadsheet);
     rustxwidgets::backends::pancurses::set_focus(spreadsheet.id());
