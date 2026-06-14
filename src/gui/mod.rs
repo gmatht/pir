@@ -85,34 +85,46 @@ impl App {
     pub fn load_initial(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let path = self.core.path.clone();
         if let Some(p) = &path {
-            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-            match ext.as_str() {
-                "corro" => {
-                    let mut active_sheet = self.core.workbook.sheet_id(self.core.workbook.active_sheet);
-                    let (_, replay) = load_workbook_revisions_partial(
-                        p, self.rev_limit.unwrap_or(usize::MAX),
-                        &mut self.core.workbook, &mut active_sheet,
-                    ).map_err(|e| format!("failed to load: {e}"))?;
-                    self.core.ops_applied = replay.op_count;
-                    self.core.status = Self::replay_status("Loaded workbook", p, &replay);
-                    if let Some(i) = self.core.workbook.sheets.iter().position(|s| s.id == active_sheet) {
-                        self.core.workbook.active_sheet = i;
+            if p.exists() {
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+                match ext.as_str() {
+                    "corro" => {
+                        let mut active_sheet = self.core.workbook.sheet_id(self.core.workbook.active_sheet);
+                        let (offset, replay) = load_workbook_revisions_partial(
+                            p, self.rev_limit.unwrap_or(usize::MAX),
+                            &mut self.core.workbook, &mut active_sheet,
+                        ).map_err(|e| format!("failed to load: {e}"))?;
+                        self.core.offset = offset;
+                        self.core.ops_applied = replay.op_count;
+                        self.core.status = Self::replay_status("Loaded workbook", p, &replay);
+                        if let Some(i) = self.core.workbook.sheets.iter().position(|s| s.id == active_sheet) {
+                            self.core.workbook.active_sheet = i;
+                        }
                     }
+                    "ods" => {
+                        let wb = crate::ods::import_ods_workbook(p).map_err(|e| format!("failed to import ODS: {e}"))?;
+                        self.core.workbook = wb;
+                    }
+                    "tsv" => {
+                        let data = std::fs::read_to_string(p).map_err(|e| format!("failed to read TSV: {e}"))?;
+                        crate::io::import_tsv(&data, self.core.workbook.active_sheet_mut());
+                    }
+                    "csv" => {
+                        let data = std::fs::read_to_string(p).map_err(|e| format!("failed to read CSV: {e}"))?;
+                        crate::io::import_csv(&data, self.core.workbook.active_sheet_mut());
+                    }
+                    _ => return Err(format!("unsupported file type: {ext}").into()),
                 }
-                "ods" => {
-                    let wb = crate::ods::import_ods_workbook(p).map_err(|e| format!("failed to import ODS: {e}"))?;
-                    self.core.workbook = wb;
-                }
-                "tsv" => {
-                    let data = std::fs::read_to_string(p).map_err(|e| format!("failed to read TSV: {e}"))?;
-                    crate::io::import_tsv(&data, self.core.workbook.active_sheet_mut());
-                }
-                "csv" => {
-                    let data = std::fs::read_to_string(p).map_err(|e| format!("failed to read CSV: {e}"))?;
-                    crate::io::import_csv(&data, self.core.workbook.active_sheet_mut());
-                }
-                _ => return Err(format!("unsupported file type: {ext}").into()),
             }
+        }
+        if self.core.workbook.sheets.is_empty() {
+            self.core.workbook.sheets.push(crate::ops::SheetRecord {
+                id: 1,
+                title: "Sheet1".to_string(),
+                state: crate::ops::SheetState::new(1, 1),
+                linked_source: None,
+            });
+            self.core.workbook.active_sheet = 0;
         }
         Ok(())
     }

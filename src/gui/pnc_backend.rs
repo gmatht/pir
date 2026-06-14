@@ -6,7 +6,7 @@ use crate::agg::helpers::{
 use crate::formula::cell_effective_display;
 use crate::formula::effective_numeric;
 use crate::grid::{CellAddr, ColumnAddr, GridBox, MainRange, NumberFormat, HEADER_ROWS, MARGIN_COLS};
-use crate::ops::{margin_key_agg_func, AggFunc, AggregateDef};
+use crate::ops::{margin_key_agg_func, AggFunc, AggregateDef, Op, WorkbookOp};
 use crate::ui_core::align_cell_display;
 use crate::ui_core::{
     self, exponential_numeric_display_with_hint, take_display_prefix,
@@ -732,12 +732,15 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // The ratatui backend recomputes the viewport each frame so pressing arrow
     // keys scrolls the visible columns/rows and the grid extent grows as needed.
     let display_rows_for_cb = std::cell::RefCell::new(display_rows.clone());
+    let display_rows_for_ce = display_rows_for_cb.clone();
     let mut col_ixs_cb = col_ixs.clone();
     let sheet_cb = spreadsheet.clone();
     let sid = spreadsheet.id();
     let app_ptr: *mut super::App = app;
     let hr_cb = hr;
+    let hr_ce = hr;
     let mr_cb = mr;
+    let lm_ce = lm;
     let data_rows_cb = data_rows;
     let data_cols_cb = data_cols;
     let data_width_cb = data_width;
@@ -992,6 +995,31 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     cursor.row, cursor.col, &new_row_agg,
                 );
             }
+        }
+    });
+
+    // ── Commit edit callback: persist cell edits to workbook ──────────
+    let app_ptr_ce = app_ptr;
+    add_commit_edit_callback(move |display_row, col, value| {
+        let app = unsafe { &mut *app_ptr_ce };
+        let dr = display_rows_for_ce.borrow();
+        let logical_row = dr.get(display_row as usize).copied().unwrap_or(0);
+        let main_row = logical_row.saturating_sub(hr_ce);
+        let main_col = col.saturating_sub(lm_ce as u32);
+        let addr = CellAddr::Main { row: main_row as u32, col: main_col as u32 };
+        let sheet_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
+        let op = Op::SetCell { addr, value };
+        let wbo = WorkbookOp::SheetOp { sheet_id, op };
+        if let Some(ref p) = app.core.path.clone() {
+            let mut active_sheet = sheet_id;
+            let _ = crate::io::commit_workbook_op(
+                p,
+                &mut app.core.offset,
+                &mut app.core.workbook,
+                &mut active_sheet,
+                &wbo,
+            );
+            app.core.ops_applied = app.core.ops_applied.saturating_add(1);
         }
     });
 
