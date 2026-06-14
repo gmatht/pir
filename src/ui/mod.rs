@@ -10170,7 +10170,7 @@ impl App {
         self.draw_visual(f);
     }
 
-    fn hints_line(&self) -> String {
+    pub fn hints_line(&self) -> String {
         match &self.mode {
             Mode::Normal => {
                 if self.anchor.is_some() {
