@@ -708,19 +708,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         "  type/F2·edit; Ctrl+C·copy; Ctrl+X·cut; Ctrl+V·paste; Ctrl+;·date; Ctrl+:·time; Ctrl+S·save; F1·help",
     );
 
-    // Formula bar trailing
-    let fb_status = if !app.core.status.is_empty() {
-        format!("   ·  {}", app.core.status)
-    } else if let Some(ref path) = app.core.path {
-        format!(
-            "   ·  Loaded workbook {} @ revision {}",
-            path.display(),
-            app.core.ops_applied
-        )
-    } else {
-        String::new()
-    };
-    if !fb_status.is_empty() {
+    // Formula bar trailing — only show app.core.status (not path info),
+    // matching ratatui's mode_prompt_widget which appends status only
+    // in Normal mode and only when core.status is non-empty.
+    if !app.core.status.is_empty() {
+        let fb_status = format!("   ·  {}", app.core.status);
         spreadsheet.set_formula_bar_trailing(&fb_status);
     }
 
