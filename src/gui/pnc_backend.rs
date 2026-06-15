@@ -395,19 +395,7 @@ fn fill_cells(
                         .unwrap_or_else(|| ui_core::truncate_with_ellipsis(&formatted, store_width));
                     align_cell_display(inner, store_width, align)
                 } else {
-                    let aligned = align_cell_display(formatted.to_string(), cw, align);
-                    // Ensure the text fills the full column width — the widget
-                    // pads with trailing spaces, so pre-padded text is required
-                    // for right-alignment and center-alignment to render correctly.
-                    if aligned.chars().count() < cw && align == Some(crate::grid::TextAlign::Right) {
-                        " ".repeat(cw.saturating_sub(aligned.chars().count())) + &aligned
-                    } else if aligned.chars().count() < cw && align == Some(crate::grid::TextAlign::Center) {
-                        let left = (cw - aligned.chars().count()) / 2;
-                        let right = cw - aligned.chars().count() - left;
-                        " ".repeat(left) + &aligned + &" ".repeat(right)
-                    } else {
-                        aligned
-                    }
+                    align_cell_display(formatted.to_string(), cw, align)
                 };
 
                 let store_text = if display_text.trim().is_empty() {
@@ -600,22 +588,15 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     let sheet_rec = app.core.workbook.active_sheet().clone();
 
-    // Keep the cursor at its natural initial position (first main row,
-    // first main column = cell A1), matching the ratatui backend which
-    // does not grow the grid or reposition the cursor on initial load.
+    // Keep the cursor at its natural initial position as set by the
+    // recording, matching the ratatui backend which does not grow the
+    // grid or reposition the cursor on initial load.
     app.core.cursor.clamp(&sheet_rec.grid);
 
     let hr = HEADER_ROWS;
     let mr = sheet_rec.grid.main_rows();
     let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
-
-    // Position cursor at A1 (first main row, first main column) matching the
-    // normal-mode reference output from the ratatui backend.
-    if mr >= 1 {
-        app.core.cursor.row = hr;
-        app.core.cursor.col = MARGIN_COLS;
-    }
 
     let display_cursor_row = app.core.cursor.row;
     let display_cursor_col = app.core.cursor.col;
