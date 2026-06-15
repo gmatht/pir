@@ -718,17 +718,6 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Menu
     spreadsheet.set_menu_text(" [File]   Edit    Insert    Format    Sheet    Help");
 
-    spreadsheet.set_status_text(
-        "  type/F2·edit; Ctrl+C·copy; Ctrl+X·cut; Ctrl+V·paste; Ctrl+;·date; Ctrl+:·time; Ctrl+S·save; F1·help",
-    );
-
-    // Formula bar trailing with status message (matching ratatui mode_prompt_widget).
-    // The trailing is only rendered when NOT editing — when editing the edit buffer
-    // is shown instead (no trailing), matching the ratatui behavior.
-    if !app.core.status.is_empty() {
-        spreadsheet.set_formula_bar_trailing(&format!("   ·  {}", app.core.status));
-    }
-
     win.set_child(&spreadsheet);
     rustxwidgets::backends::pancurses::set_focus(spreadsheet.id());
     win.present();
