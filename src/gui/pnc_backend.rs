@@ -718,6 +718,31 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Menu
     spreadsheet.set_menu_text(" [File]   Edit    Insert    Format    Sheet    Help");
 
+    // Formula bar trailing status (matching ratatui's mode_prompt_widget)
+    if !app.core.status.is_empty() {
+        spreadsheet.set_formula_bar_trailing(&format!("   ·  {}", app.core.status));
+    }
+
+    // Bottom status bar hints (matching ratatui's hints_line for Normal mode)
+    {
+        let mut hints = vec!["type/F2·edit", "Ctrl+C·copy", "Ctrl+X·cut", "Ctrl+V·paste"];
+        if !app.core.op_history.is_empty() {
+            hints.push("Ctrl+Z·undo");
+        }
+        if !app.core.redo_history.is_empty() {
+            hints.push("Ctrl+Y·redo");
+        }
+        hints.push("Ctrl+;·date");
+        hints.push("Ctrl+:·time");
+        hints.push(if app.core.path.is_some() {
+            "Ctrl+S·save"
+        } else {
+            "Ctrl+S·save as"
+        });
+        hints.push("F1·help");
+        spreadsheet.set_status_text(&format!("  {}", hints.join("; ")));
+    }
+
     win.set_child(&spreadsheet);
     rustxwidgets::backends::pancurses::set_focus(spreadsheet.id());
     win.present();
