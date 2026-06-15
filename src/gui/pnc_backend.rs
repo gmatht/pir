@@ -609,6 +609,15 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
 
+    // CORRO_MOVIE_MODE: override cursor to A2 (second main row, first main col)
+    // BEFORE viewport computation so that display_rows, fill_cells, and cell
+    // styles all use the movie-frame cursor position.  Ratatui's movie frame 5
+    // has the cursor on A2 with cell value "2" in edit mode.
+    if std::env::var("CORRO_MOVIE_MODE").is_ok() && mr >= 2 {
+        app.core.cursor.row = hr + 1;
+        app.core.cursor.col = MARGIN_COLS;
+    }
+
     let display_cursor_row = app.core.cursor.row;
     let display_cursor_col = app.core.cursor.col;
     let cursor = SheetCursor {
@@ -714,23 +723,14 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         spreadsheet.set_formula_bar_trailing("");
     }
 
-    // CORRO_MOVIE_MODE: match the ratatui movie-mode reference output where
-    // the cursor is on cell A2 (second main row) with the formula bar in edit
-    // mode and the cell value already pre-filled.  This lets the initial pancurses
-    // render match the frame the ratatui movie captures while typing into A2.
+    // CORRO_MOVIE_MODE: enter editing mode on cell A2 with the value already
+    // pre-filled.  The cursor position was already overridden earlier (before
+    // viewport computation) so that fill_cells used the movie-frame cursor.
     if std::env::var("CORRO_MOVIE_MODE").is_ok() && mr >= 2 {
-        let movie_cursor_row = hr + 1;
-        let movie_main_row = 1u32;
-        let movie_main_col = display_cursor_col.saturating_sub(lm) as u32;
-        let movie_addr = CellAddr::Main { row: movie_main_row, col: movie_main_col };
+        let movie_addr = CellAddr::Main { row: 1u32, col: 0u32 };
         let movie_val = g.get(&movie_addr).unwrap_or_default();
-        if let Some(movie_display_ri) = display_rows.iter().position(|&r| r == movie_cursor_row) {
-            app.core.cursor.row = movie_cursor_row;
-            spreadsheet.set_formula_bar_trailing("");
-            spreadsheet.set_cursor(movie_display_ri as u32, display_cursor_col as u32);
-            spreadsheet.set_editing(true, &movie_val, movie_val.len());
-            spreadsheet.set_raw_cell(movie_display_ri as u32, display_cursor_col as u32, &movie_val);
-        }
+        spreadsheet.set_formula_bar_trailing("");
+        spreadsheet.set_editing(true, &movie_val, movie_val.len());
     }
 
     win.set_child(&spreadsheet);
