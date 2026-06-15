@@ -685,14 +685,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         let cursor_raw_val = g.get(&cursor_addr).unwrap_or_default();
         spreadsheet.set_raw_cell(cursor_display_ri as u32, display_cursor_col as u32, &cursor_raw_val);
         spreadsheet.set_cursor(cursor_display_ri as u32, display_cursor_col as u32);
-        // Enter edit mode with the cursor cell's value so the formula bar
-        // renders in prompt+caret style (matching ratatui's Mode::Edit).
-        // The replay captures the rendered output after all key events have
-        // been processed; those events include typing the cell value, which
-        // enters edit mode with that value as the edit buffer.
-        if !cursor_raw_val.is_empty() {
-            spreadsheet.set_editing(true, &cursor_raw_val, cursor_raw_val.len());
-        }
+        // Show the cursor cell's raw value in the formula bar (normal mode),
+        // matching ratatui's formula bar which displays the cell value without
+        // entering edit mode until the user explicitly types.
+        // No set_editing call here — the widget remains in normal mode and
+        // reads the cell value from the raw_cells store for the formula bar.
     }
 
     // Tab bar (styled matching ratatui: inactive=white fg+gray bg, active=bold+black fg+yellow bg)
@@ -713,9 +710,13 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Menu
     spreadsheet.set_menu_text(" [File]   Edit    Insert    Format    Sheet    Help");
 
-    // Formula bar trailing is not used — status text is shown via
-    // set_status_text instead, matching ratatui's hints_line() behavior.
-    spreadsheet.set_formula_bar_trailing("");
+    // Formula bar trailing: show app status text (matches ratatui's
+    // mode_prompt_widget which appends "   ·  {status}" after the cell value).
+    if !app.core.status.is_empty() {
+        spreadsheet.set_formula_bar_trailing(&format!("   ·  {}", app.core.status));
+    } else {
+        spreadsheet.set_formula_bar_trailing("");
+    }
 
     win.set_child(&spreadsheet);
     rustxwidgets::backends::pancurses::set_focus(spreadsheet.id());
