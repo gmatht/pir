@@ -607,7 +607,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         .saturating_sub(6)
         .max(1);
 
-    let mut sheet_rec = app.core.workbook.active_sheet().clone();
+    let sheet_rec = app.core.workbook.active_sheet().clone();
 
     // Keep the cursor at its natural initial position (first main row,
     // first main column = cell A1), matching the ratatui backend which
@@ -727,20 +727,6 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // is shown instead (no trailing), matching the ratatui behavior.
     if !app.core.status.is_empty() {
         spreadsheet.set_formula_bar_trailing(&format!("   ·  {}", app.core.status));
-    }
-
-    // Enter edit mode on the current cell with its raw value loaded,
-    // matching ratatui's behavior where pressing Enter enters edit mode
-    // with the cell value as the buffer.
-    let cursor_main_row = display_cursor_row.saturating_sub(hr);
-    let cursor_display_ri = display_rows.iter().position(|&r| r == display_cursor_row).unwrap_or(0);
-    if cursor_main_row < mr && display_cursor_col >= lm && display_cursor_col < lm + mc {
-        let main_col = (display_cursor_col - lm) as u32;
-        let edit_addr = CellAddr::Main { row: cursor_main_row as u32, col: main_col };
-        let raw_val = g.get(&edit_addr).unwrap_or_default();
-        spreadsheet.set_raw_cell(cursor_display_ri as u32, display_cursor_col as u32, &raw_val);
-        let pos = raw_val.chars().count();
-        spreadsheet.set_editing(true, &raw_val, pos);
     }
 
     win.set_child(&spreadsheet);
