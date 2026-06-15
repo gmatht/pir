@@ -685,11 +685,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         let cursor_raw_val = g.get(&cursor_addr).unwrap_or_default();
         spreadsheet.set_raw_cell(cursor_display_ri as u32, display_cursor_col as u32, &cursor_raw_val);
         spreadsheet.set_cursor(cursor_display_ri as u32, display_cursor_col as u32);
-        // Show the cursor cell's raw value in the formula bar (normal mode),
-        // matching ratatui's formula bar which displays the cell value without
-        // entering edit mode until the user explicitly types.
-        // No set_editing call here — the widget remains in normal mode and
-        // reads the cell value from the raw_cells store for the formula bar.
+        if !cursor_raw_val.is_empty() {
+            spreadsheet.set_editing(true, &cursor_raw_val, cursor_raw_val.chars().count());
+        }
     }
 
     // Tab bar (styled matching ratatui: inactive=white fg+gray bg, active=bold+black fg+yellow bg)
