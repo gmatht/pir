@@ -76,7 +76,7 @@ fn fill_cells(
                 }
             };
 
-            let cw = *col_widths.get(&c).unwrap_or(&4);
+            let cw = g.col_width(c).max(1);
 
             let rca = right_col_agg(g, c);
 
