@@ -727,12 +727,15 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Menu
     spreadsheet.set_menu_text(" [File]   Edit    Insert    Format    Sheet    Help");
 
-    // Status bar
+    // Status bar (shown when not editing; when editing, the rendering code
+    // shows the editing hint matching ratatui's "type to edit..." text).
     spreadsheet.set_status_text(
-        "  type/F2·edit; Ctrl+C·copy; Ctrl+X·cut; Ctrl+V·paste; Ctrl+;·date; Ctrl+:·time; Ctrl+S·save; F1·help",
+        "  type to edit (or addr: val)   Enter·confirm   Esc·discard",
     );
 
-    // Formula bar trailing with status message (matching ratatui mode_prompt_widget)
+    // Formula bar trailing with status message (matching ratatui mode_prompt_widget).
+    // The trailing is only rendered when NOT editing — when editing the edit buffer
+    // is shown instead (no trailing), matching the ratatui behavior.
     if !app.core.status.is_empty() {
         spreadsheet.set_formula_bar_trailing(&format!("   ·  {}", app.core.status));
     }
