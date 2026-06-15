@@ -169,6 +169,7 @@ fn fill_cells(
             let formatted = ui_core::format_cell_display(g, &addr, effective);
             let fw = formatted.width();
             let align = ui_core::effective_cell_align(g, &addr, &formatted);
+
             let is_agg_cell = if row_agg.is_some() {
                 rca.is_some() || (c >= lm && c < lm + mc)
             } else if let Some(_) = main_row {

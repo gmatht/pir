@@ -459,7 +459,7 @@ pub fn align_cell_display(text: String, width: usize, align: Option<TextAlign>) 
         return String::new();
     }
     let w = text.width();
-    if w >= width {
+    if w > width {
         return truncate_with_ellipsis(&text, width);
     }
     let pad = width.saturating_sub(w);
