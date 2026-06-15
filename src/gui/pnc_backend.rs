@@ -747,6 +747,14 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     add_cursor_move_callback(move |_display_row, _display_col| {
         // SAFETY: app is &mut App alive for the entire event loop
         let app = unsafe { &mut *app_ptr };
+
+        // Sync formula bar trailing with app status (ratatui shows status in formula bar)
+        if !app.core.status.is_empty() {
+            sheet_cb.set_formula_bar_trailing(&format!("   ·  {}", app.core.status));
+        } else {
+            sheet_cb.set_formula_bar_trailing("");
+        }
+
         let display_idx = _display_row as usize;
         let mut need_viewport_recompute = false;
 
