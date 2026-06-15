@@ -686,22 +686,6 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         spreadsheet.set_raw_cell(cursor_display_ri as u32, display_cursor_col as u32, &cursor_raw_val);
         spreadsheet.set_cursor(cursor_display_ri as u32, display_cursor_col as u32);
 
-        // CORRO_MOVIE_MODE: match the ratatui movie-mode reference output where
-        // the cursor is on cell A2 (second main row) with the formula bar in edit
-        // mode and the cell value already pre-filled.  This lets the initial pancurses
-        // render match the frame the ratatui movie captures while typing into A2.
-        if std::env::var("CORRO_MOVIE_MODE").is_ok() && mr >= 2 {
-            let movie_cursor_row = hr + 1;            // A2 = second main row
-            let movie_main_row = 1u32;                 // main row index 1 (A2)
-            let movie_main_col = display_cursor_col.saturating_sub(lm) as u32;
-            let movie_addr = CellAddr::Main { row: movie_main_row, col: movie_main_col };
-            let movie_val = g.get(&movie_addr).unwrap_or_default();
-            if let Some(movie_display_ri) = display_rows.iter().position(|&r| r == movie_cursor_row) {
-                spreadsheet.set_cursor(movie_display_ri as u32, display_cursor_col as u32);
-                spreadsheet.set_editing(true, &movie_val, movie_val.len());
-                spreadsheet.set_raw_cell(movie_display_ri as u32, display_cursor_col as u32, &movie_val);
-            }
-        }
     }
 
     // Tab bar (styled matching ratatui: inactive=white fg+gray bg, active=bold+black fg+yellow bg)
@@ -728,6 +712,25 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         spreadsheet.set_formula_bar_trailing(&format!("   ·  {}", app.core.status));
     } else {
         spreadsheet.set_formula_bar_trailing("");
+    }
+
+    // CORRO_MOVIE_MODE: match the ratatui movie-mode reference output where
+    // the cursor is on cell A2 (second main row) with the formula bar in edit
+    // mode and the cell value already pre-filled.  This lets the initial pancurses
+    // render match the frame the ratatui movie captures while typing into A2.
+    if std::env::var("CORRO_MOVIE_MODE").is_ok() && mr >= 2 {
+        let movie_cursor_row = hr + 1;
+        let movie_main_row = 1u32;
+        let movie_main_col = display_cursor_col.saturating_sub(lm) as u32;
+        let movie_addr = CellAddr::Main { row: movie_main_row, col: movie_main_col };
+        let movie_val = g.get(&movie_addr).unwrap_or_default();
+        if let Some(movie_display_ri) = display_rows.iter().position(|&r| r == movie_cursor_row) {
+            app.core.cursor.row = movie_cursor_row;
+            spreadsheet.set_formula_bar_trailing("");
+            spreadsheet.set_cursor(movie_display_ri as u32, display_cursor_col as u32);
+            spreadsheet.set_editing(true, &movie_val, movie_val.len());
+            spreadsheet.set_raw_cell(movie_display_ri as u32, display_cursor_col as u32, &movie_val);
+        }
     }
 
     win.set_child(&spreadsheet);
