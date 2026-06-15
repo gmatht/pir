@@ -692,12 +692,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             CellAddr::Footer { row: (display_cursor_row - hr - mr) as u32, col: cursor_col_addr }
         };
         let cursor_display_ri = display_rows.iter().position(|&r| r == display_cursor_row).unwrap_or(0);
-        if let Some(raw_val) = g.get(&cursor_addr) {
-            spreadsheet.set_raw_cell(cursor_display_ri as u32, display_cursor_col as u32, &raw_val);
-        } else {
-            spreadsheet.set_raw_cell(cursor_display_ri as u32, display_cursor_col as u32, "");
-        }
+        let cursor_raw_val = g.get(&cursor_addr).unwrap_or_default();
+        spreadsheet.set_raw_cell(cursor_display_ri as u32, display_cursor_col as u32, &cursor_raw_val);
         spreadsheet.set_cursor(cursor_display_ri as u32, display_cursor_col as u32);
+        // Put formula bar in edit mode showing the cursor cell value (matching ratatui behavior).
+        spreadsheet.set_editing(true, &cursor_raw_val, cursor_raw_val.len());
     }
 
     // Tab bar (styled matching ratatui: inactive=white fg+gray bg, active=bold+black fg+yellow bg)
