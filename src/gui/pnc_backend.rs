@@ -695,9 +695,11 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         let cursor_raw_val = g.get(&cursor_addr).unwrap_or_default();
         spreadsheet.set_raw_cell(cursor_display_ri as u32, display_cursor_col as u32, &cursor_raw_val);
         spreadsheet.set_cursor(cursor_display_ri as u32, display_cursor_col as u32);
-        // Do NOT start in edit mode (matching ratatui behavior — editing only on F2/typing).
-        // The raw cell value is already stored via set_raw_cell above for normal-mode display.
-        spreadsheet.set_editing(false, "", 0);
+        // Start in edit mode with the cursor cell's value in the buffer,
+        // matching ratatui's behavior where the formula bar shows the cell
+        // value with prompt-style rendering and an active cursor.
+        let edit_cursor = cursor_raw_val.chars().count();
+        spreadsheet.set_editing(true, &cursor_raw_val, edit_cursor);
     }
 
     // Tab bar (styled matching ratatui: inactive=white fg+gray bg, active=bold+black fg+yellow bg)
@@ -717,11 +719,6 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     // Menu
     spreadsheet.set_menu_text(" [File]   Edit    Insert    Format    Sheet    Help");
-
-    // Formula bar trailing status (matching ratatui's mode_prompt_widget)
-    if !app.core.status.is_empty() {
-        spreadsheet.set_formula_bar_trailing(&format!("   ·  {}", app.core.status));
-    }
 
     // Bottom status bar hints (matching ratatui's hints_line for Normal mode)
     {
