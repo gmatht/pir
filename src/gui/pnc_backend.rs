@@ -692,21 +692,12 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             CellAddr::Footer { row: (display_cursor_row - hr - mr) as u32, col: cursor_col_addr }
         };
         let cursor_display_ri = display_rows.iter().position(|&r| r == display_cursor_row).unwrap_or(0);
-        let cursor_raw_val: String = if let Some(raw_val) = g.get(&cursor_addr) {
+        if let Some(raw_val) = g.get(&cursor_addr) {
             spreadsheet.set_raw_cell(cursor_display_ri as u32, display_cursor_col as u32, &raw_val);
-            raw_val
         } else {
             spreadsheet.set_raw_cell(cursor_display_ri as u32, display_cursor_col as u32, "");
-            String::new()
-        };
-        spreadsheet.set_cursor(cursor_display_ri as u32, display_cursor_col as u32);
-        // During replay (--revision N) enter edit mode with the cursor cell's
-        // value so the formula bar and status-bar hint match the ratatui
-        // backend's movie-replay output (which renders mid-typing).
-        if app.core.revision_limit.is_some() && !cursor_raw_val.is_empty() {
-            let edit_len = cursor_raw_val.chars().count();
-            spreadsheet.set_editing(true, &cursor_raw_val, edit_len);
         }
+        spreadsheet.set_cursor(cursor_display_ri as u32, display_cursor_col as u32);
     }
 
     // Tab bar (styled matching ratatui: inactive=white fg+gray bg, active=bold+black fg+yellow bg)
@@ -727,10 +718,8 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Menu
     spreadsheet.set_menu_text(" [File]   Edit    Insert    Format    Sheet    Help");
 
-    // Status bar (shown when not editing; when editing, the rendering code
-    // shows the editing hint matching ratatui's "type to edit..." text).
     spreadsheet.set_status_text(
-        "  type to edit (or addr: val)   Enter·confirm   Esc·discard",
+        "  type/F2·edit; Ctrl+C·copy; Ctrl+X·cut; Ctrl+V·paste; Ctrl+;·date; Ctrl+:·time; Ctrl+S·save; F1·help",
     );
 
     // Formula bar trailing with status message (matching ratatui mode_prompt_widget).
