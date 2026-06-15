@@ -705,6 +705,16 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Menu
     spreadsheet.set_menu_text(" [File]   Edit    Insert    Format    Sheet    Help");
 
+    // Formula bar trailing (status text matching ratatui's draw_visual)
+    {
+        let formula_trailing = if !app.core.status.is_empty() {
+            format!("   ·  {}", app.core.status)
+        } else {
+            String::new()
+        };
+        spreadsheet.set_formula_bar_trailing(&formula_trailing);
+    }
+
     win.set_child(&spreadsheet);
     rustxwidgets::backends::pancurses::set_focus(spreadsheet.id());
     win.present();
