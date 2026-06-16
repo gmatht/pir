@@ -1050,3 +1050,5 @@ fn trailing_blank_main_rows(grid: &crate::grid::GridBox) -> usize {
         Some(last) => mr.saturating_sub(last + 1),
     }
 }
+
+
