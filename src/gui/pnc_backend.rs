@@ -581,20 +581,20 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // ── Viewport rows (matching ratatui's draw_visual) ──────────────────
     // The widget layout is: menu(1) + formula(1) + border(1) + header(1) +
     // separator(1) + data_rows + border_bottom(1) + status(1) = term_rows
-    // Ratatui computes data_rows as inner_h - 1, where inner_h is the grid
-    // block's inner height (term_rows - 2 for borders, minus menu(1) and
-    // formula(1) and hints(1) = term_rows - 5 for inner, then -1 for
-    // separator = term_rows - 6).
+    // Ratatui uses the same layout: menu(1) + formula(1) + grid(h) + hints(1)
+    // where grid area height = term_rows - 3, inner_h = h - 2 (borders),
+    // and data_rows = inner_h - 1 = term_rows - 6.
     let data_rows = term_rows
         .saturating_sub(6)
         .max(1);
 
     let sheet_rec = app.core.workbook.active_sheet().clone();
 
-    // Keep the cursor at its natural initial position as set by the
-    // recording, matching the ratatui backend which does not grow the
-    // grid or reposition the cursor on initial load.
-    app.core.cursor.clamp(&sheet_rec.grid);
+    // Set the cursor to the first main row, matching ratatui's draw_visual
+    // which sets cursor.row = HEADER_ROWS + 1 before each render.
+    app.core.cursor.row = HEADER_ROWS + 1;
+    app.core.cursor.col = MARGIN_COLS;
+    app.core.anchor = Some(SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS });
 
     let hr = HEADER_ROWS;
     let mr = sheet_rec.grid.main_rows();
