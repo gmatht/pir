@@ -601,12 +601,6 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let mc = sheet_rec.grid.main_cols();
     let lm = MARGIN_COLS;
 
-    // Position the cursor at A2 (second main row) so the initial render matches
-    // the reference output.
-    if mr >= 2 {
-        app.core.cursor.row = hr + 1;
-        app.core.cursor.col = MARGIN_COLS;
-    }
     let display_cursor_row = app.core.cursor.row;
     let display_cursor_col = app.core.cursor.col;
     let cursor = SheetCursor {
@@ -729,15 +723,6 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         spreadsheet.set_formula_bar_trailing("");
     }
 
-    // Enter editing mode on cell A2 with the value already
-    // pre-filled.  The cursor position was already overridden earlier (before
-    // viewport computation) so that fill_cells used the movie-frame cursor.
-    if mr >= 2 {
-        let movie_addr = CellAddr::Main { row: 1u32, col: 0u32 };
-        let movie_val = g.get(&movie_addr).unwrap_or_default();
-        spreadsheet.set_formula_bar_trailing("");
-        spreadsheet.set_editing(true, &movie_val, movie_val.len());
-    }
     win.set_child(&spreadsheet);
     rustxwidgets::backends::pancurses::set_focus(spreadsheet.id());
     win.present();
