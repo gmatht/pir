@@ -590,9 +590,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     let sheet_rec = app.core.workbook.active_sheet().clone();
 
-    // Set the cursor to the first main row, matching ratatui's draw_visual
-    // which sets cursor.row = HEADER_ROWS + 1 before each render.
-    app.core.cursor.row = HEADER_ROWS + 1;
+    // Set the cursor to the first main row, matching ratatui's cursor
+    // initialization which sets cursor.row = HEADER_ROWS (see ui/mod.rs:2693).
+    app.core.cursor.row = HEADER_ROWS;
     app.core.cursor.col = MARGIN_COLS;
     app.core.anchor = Some(SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS });
 
