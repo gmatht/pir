@@ -676,6 +676,23 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         let cursor_display_ri = display_rows.iter().position(|&r| r == display_cursor_row).unwrap_or(0);
         let cursor_raw_val = g.get(&cursor_addr).unwrap_or_default();
         spreadsheet.set_raw_cell(cursor_display_ri as u32, display_cursor_col as u32, &cursor_raw_val);
+        // Also re-store the formatted display text for the cursor cell, so the
+        // cells map always has correctly-aligned text regardless of any prior
+        // fill_cells state.  Compute the effective display and align it to the
+        // column width, matching fill_cells logic.
+        {
+            let cw_cursor = g.col_width(display_cursor_col).max(1);
+            let effective_cursor = crate::formula::cell_effective_display(g, &cursor_addr);
+            let formatted_cursor = crate::ui_core::format_cell_display(g, &cursor_addr, effective_cursor);
+            let align_cursor = crate::ui_core::effective_cell_align(g, &cursor_addr, &formatted_cursor);
+            let cursor_display_text = crate::ui_core::align_cell_display(
+                formatted_cursor, cw_cursor, align_cursor,
+            );
+            if !cursor_display_text.trim().is_empty() {
+                spreadsheet.set_cell(cursor_display_ri as u32, display_cursor_col as u32, &cursor_display_text);
+                spreadsheet.set_cell_style(cursor_display_ri as u32, display_cursor_col as u32, CELL_STYLE_CURSOR);
+            }
+        }
         spreadsheet.set_cursor(cursor_display_ri as u32, display_cursor_col as u32);
 
     }
