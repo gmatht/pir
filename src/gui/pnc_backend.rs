@@ -398,6 +398,7 @@ fn fill_cells(
                     align_cell_display(formatted.to_string(), cw, align)
                 };
 
+
                 let store_text = if display_text.trim().is_empty() {
                     String::new()
                 } else {
