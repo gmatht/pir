@@ -588,35 +588,49 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         .saturating_sub(6)
         .max(1);
 
-    let sheet_rec = app.core.workbook.active_sheet().clone();
+    // ── Visible columns (matching ratatui's visible_col_indices) ──────
+    // Determine the viewport extent BEFORE cloning so we can adjust column
+    // widths on the live grid (matching ratatui's fit_visible_columns_capped).
+    let hr = HEADER_ROWS;
+    let mr = app.core.workbook.active_sheet().grid.main_rows();
+    let mc = app.core.workbook.active_sheet().grid.main_cols();
 
-    // Set the cursor to the first main row, matching ratatui's cursor
-    // initialization which sets cursor.row = HEADER_ROWS (see ui/mod.rs:2693).
-    app.core.cursor.row = HEADER_ROWS;
-    app.core.cursor.col = MARGIN_COLS;
+    let display_cursor_row = HEADER_ROWS;
+    let display_cursor_col = MARGIN_COLS;
+    app.core.cursor.row = display_cursor_row;
+    app.core.cursor.col = display_cursor_col;
     app.core.anchor = Some(SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS });
 
-    let hr = HEADER_ROWS;
-    let mr = sheet_rec.grid.main_rows();
-    let mc = sheet_rec.grid.main_cols();
-    let lm = MARGIN_COLS;
-
-    let display_cursor_row = app.core.cursor.row;
-    let display_cursor_col = app.core.cursor.col;
     let cursor = SheetCursor {
         row: display_cursor_row,
         col: display_cursor_col,
     };
 
     // ── Visible rows (matching ratatui's visible_row_indices) ──────────
+    let sheet_rec = app.core.workbook.active_sheet().clone();
     let (display_rows, _row_scroll) =
         ui_core::visible_row_indices(&sheet_rec, cursor, data_rows, 0);
 
-    // ── Visible columns (matching ratatui's visible_col_indices) ──────
-    let g = &sheet_rec.grid;
+    // Use the live (pre-clone) grid for column width fitting, then clone
+    // so the resulting overrides are present in the snapshot.
     let (mut col_ixs, _col_scroll) =
         ui_core::visible_col_indices(&sheet_rec, cursor, data_cols, 0);
-    ui_core::trim_visible_cols_to_width(g, &mut col_ixs, cursor.col, data_width);
+    ui_core::trim_visible_cols_to_width(&sheet_rec.grid, &mut col_ixs, cursor.col, data_width);
+
+    // Adjust column widths to fit the viewport (matching ratatui).
+    crate::ui_core::fit_visible_columns_capped(
+        &mut app.core.workbook.active_sheet_mut().grid,
+        &col_ixs,
+        cursor.col,
+        data_width,
+    );
+
+    // Re-read the sheet after width adjustments.
+    let sheet_rec = app.core.workbook.active_sheet().clone();
+    let g = &sheet_rec.grid;
+    let mr = g.main_rows();
+    let mc = g.main_cols();
+    let lm = MARGIN_COLS;
 
     // ── Column layout with widths matching ratatui's grid.col_width() ──
     // In ratatui, header and data rows use 1-char gaps everywhere (including
@@ -814,12 +828,31 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         app.core.cursor.col = _display_col as usize;
 
         if need_viewport_recompute {
-            let rec = app.core.workbook.active_sheet().clone();
             let cursor = app.core.cursor;
-            let (new_display_rows, _) =
-                crate::ui_core::visible_row_indices(&rec, cursor, data_rows_cb, 0);
-            let new_mr = rec.grid.main_rows();
-            let new_mc = rec.grid.main_cols();
+            // Determine viewport and fit columns BEFORE cloning so the
+            // resulting width overrides are reflected in the snapshot.
+            let (new_display_rows, new_mr, new_mc, new_ixs) = {
+                let rec = app.core.workbook.active_sheet().clone();
+                let (new_display_rows, _) =
+                    crate::ui_core::visible_row_indices(&rec, cursor, data_rows_cb, 0);
+                let new_mr = rec.grid.main_rows();
+                let new_mc = rec.grid.main_cols();
+                let (mut new_ixs, _) =
+                    crate::ui_core::visible_col_indices(&rec, cursor, data_cols_cb, 0);
+                crate::ui_core::trim_visible_cols_to_width(
+                    &rec.grid, &mut new_ixs, cursor.col, data_width_cb,
+                );
+                (new_display_rows, new_mr, new_mc, new_ixs)
+            };
+            // Fit visible columns to viewport on the live grid (matching ratatui).
+            crate::ui_core::fit_visible_columns_capped(
+                &mut app.core.workbook.active_sheet_mut().grid,
+                &new_ixs,
+                cursor.col,
+                data_width_cb,
+            );
+            // Re-read the sheet after width adjustments.
+            let rec = app.core.workbook.active_sheet().clone();
             // Update border title when grid grew (matching the non-recompute path)
             let boundary_title = format!(
                 "corro  {}r × {}c  ops {}",
@@ -834,15 +867,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 })
                 .collect();
             spreadsheet_set_row_labels(sid, new_labels);
-            // Update column layout when main columns grew
+            // Update column layout with fitted widths
             {
                 let g = &rec.grid;
-                let cur_cursor = app.core.cursor;
-                let (mut new_ixs, _) =
-                    crate::ui_core::visible_col_indices(&rec, cur_cursor, data_cols_cb, 0);
-                crate::ui_core::trim_visible_cols_to_width(
-                    g, &mut new_ixs, cur_cursor.col, data_width_cb,
-                );
                 let new_layout: Vec<(u32, u32, String)> = new_ixs
                     .iter()
                     .map(|&c| {
@@ -852,7 +879,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     })
                     .collect();
                 spreadsheet_set_column_layout(sid, new_layout);
-                col_ixs_cb = new_ixs;
+                col_ixs_cb = new_ixs.clone();
                 spreadsheet_set_grid_config(sid, MARGIN_COLS as u32, new_mc as u32);
             }
             // Repopulate all visible cells for the new viewport
@@ -945,13 +972,23 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 spreadsheet_set_row_labels(sid, new_labels);
                 // Also update column layout when main columns grew
                 let rec = app.core.workbook.active_sheet().clone();
-                let g = &rec.grid;
                 let cursor = app.core.cursor;
                 let (mut new_ixs, _) =
                     crate::ui_core::visible_col_indices(&rec, cursor, data_cols_cb, 0);
                 crate::ui_core::trim_visible_cols_to_width(
-                    g, &mut new_ixs, cursor.col, data_width_cb,
+                    &rec.grid, &mut new_ixs, cursor.col, data_width_cb,
                 );
+                // Fit visible columns to viewport (matching ratatui).
+                drop(rec);
+                crate::ui_core::fit_visible_columns_capped(
+                    &mut app.core.workbook.active_sheet_mut().grid,
+                    &new_ixs,
+                    cursor.col,
+                    data_width_cb,
+                );
+                let rec = app.core.workbook.active_sheet().clone();
+                let g = &rec.grid;
+                let mc = g.main_cols();
                 let new_layout: Vec<(u32, u32, String)> = new_ixs
                     .iter()
                     .map(|&c| {
@@ -979,14 +1016,23 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 // Update column viewport when cursor column moves outside the
                 // currently visible range (matching ratatui's per-frame recompute).
                 let rec = app.core.workbook.active_sheet().clone();
-                let g = &rec.grid;
-                let mc = g.main_cols();
                 let cursor = app.core.cursor;
                 let (mut new_ixs, _) =
                     crate::ui_core::visible_col_indices(&rec, cursor, data_cols_cb, 0);
                 crate::ui_core::trim_visible_cols_to_width(
-                    g, &mut new_ixs, cursor.col, data_width_cb,
+                    &rec.grid, &mut new_ixs, cursor.col, data_width_cb,
                 );
+                // Fit visible columns to viewport (matching ratatui).
+                drop(rec);
+                crate::ui_core::fit_visible_columns_capped(
+                    &mut app.core.workbook.active_sheet_mut().grid,
+                    &new_ixs,
+                    cursor.col,
+                    data_width_cb,
+                );
+                let rec = app.core.workbook.active_sheet().clone();
+                let g = &rec.grid;
+                let mc = g.main_cols();
                 let new_layout: Vec<(u32, u32, String)> = new_ixs
                     .iter()
                     .map(|&c| {
