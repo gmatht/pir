@@ -79,8 +79,11 @@ fn fill_cells(
             let cw = g.col_width(c).max(1);
 
             let rca = right_col_agg(g, c);
+            let is_cursor_cell = logical_row == display_cursor_row && c == display_cursor_col;
 
-            let effective = if let Some(func) = row_agg {
+            let effective = if is_cursor_cell {
+                cell_effective_display(g, &addr)
+            } else if let Some(func) = row_agg {
                 if let Some(_ftr_row) = footer_row_idx {
                     if rca.is_some() {
                         footer_special_col_aggregate(g, func, c, mr, mc)
@@ -177,7 +180,6 @@ fn fill_cells(
             } else {
                 false
             };
-            let is_cursor_cell = logical_row == display_cursor_row && c == display_cursor_col;
             let cell_style = if is_cursor_cell {
                 CELL_STYLE_CURSOR
             } else if is_agg_cell {
