@@ -1022,6 +1022,10 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     });
 
     // ── Commit edit callback: persist cell edits to workbook ──────────
+    // After the commit, re-align the committed cell so the grid shows
+    // the correctly-aligned display text (spreadsheet_commit_edit stores
+    // the RAW value in the cells HashMap, but display text must be aligned).
+    let commit_sheet = spreadsheet.clone();
     let app_ptr_ce = app_ptr;
     add_commit_edit_callback(move |display_row, col, value| {
         let app = unsafe { &mut *app_ptr_ce };
@@ -1043,6 +1047,19 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 &wbo,
             );
             app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+        }
+        // Re-align the committed cell's display text (spreadsheet_commit_edit
+        // stored the raw value, but we need the aligned version).
+        let rec = app.core.workbook.active_sheet().clone();
+        let g = &rec.grid;
+        if let Some(effective) = logical_row.checked_sub(hr_ce).and_then(|mr| {
+            g.get(&CellAddr::Main { row: mr as u32, col: main_col as u32 })
+        }) {
+            let formatted = crate::ui_core::format_cell_display(g, &addr, effective);
+            let cw = g.col_width(col as usize).max(1);
+            let align = crate::ui_core::effective_cell_align(g, &addr, &formatted);
+            let aligned = crate::ui_core::align_cell_display(formatted, cw, align);
+            commit_sheet.set_cell(display_row, col, &aligned);
         }
     });
 
