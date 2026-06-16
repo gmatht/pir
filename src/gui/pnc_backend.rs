@@ -9,7 +9,7 @@ use crate::grid::{CellAddr, ColumnAddr, GridBox, MainRange, NumberFormat, SheetC
 use crate::ops::{margin_key_agg_func, AggFunc, AggregateDef, Op, WorkbookOp};
 use crate::ui_core::align_cell_display;
 use crate::ui_core::{
-    self, exponential_numeric_display_with_hint, take_display_prefix,
+    self, exponential_numeric_display_with_hint,
     truncate_with_ellipsis, would_ellipsis_hide_decimal_point,
 };
 use std::collections::HashMap;
