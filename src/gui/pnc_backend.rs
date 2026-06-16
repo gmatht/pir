@@ -684,10 +684,18 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             let cw_cursor = g.col_width(display_cursor_col).max(1);
             let effective_cursor = crate::formula::cell_effective_display(g, &cursor_addr);
             let formatted_cursor = crate::ui_core::format_cell_display(g, &cursor_addr, effective_cursor);
+            let fw = formatted_cursor.width();
             let align_cursor = crate::ui_core::effective_cell_align(g, &cursor_addr, &formatted_cursor);
-            let cursor_display_text = crate::ui_core::align_cell_display(
-                formatted_cursor, cw_cursor, align_cursor,
-            );
+            let cursor_display_text = if fw > cw_cursor
+                && (align_cursor.is_none() || align_cursor == Some(crate::grid::TextAlign::Left))
+            {
+                // Text would spill into adjacent columns — keep the full text
+                // (matching fill_cells spill logic) so the widget renders
+                // the overflow correctly instead of truncating it.
+                formatted_cursor
+            } else {
+                crate::ui_core::align_cell_display(formatted_cursor, cw_cursor, align_cursor)
+            };
             if !cursor_display_text.trim().is_empty() {
                 spreadsheet.set_cell(cursor_display_ri as u32, display_cursor_col as u32, &cursor_display_text);
                 spreadsheet.set_cell_style(cursor_display_ri as u32, display_cursor_col as u32, CELL_STYLE_CURSOR);
@@ -1056,9 +1064,18 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             g.get(&CellAddr::Main { row: mr as u32, col: main_col as u32 })
         }) {
             let formatted = crate::ui_core::format_cell_display(g, &addr, effective);
+            let fw = formatted.width();
             let cw = g.col_width(col as usize).max(1);
             let align = crate::ui_core::effective_cell_align(g, &addr, &formatted);
-            let aligned = crate::ui_core::align_cell_display(formatted, cw, align);
+            let aligned = if fw > cw
+                && (align.is_none() || align == Some(crate::grid::TextAlign::Left))
+            {
+                // Text would spill into adjacent columns — keep the full text
+                // (matching fill_cells spill logic).
+                formatted
+            } else {
+                crate::ui_core::align_cell_display(formatted, cw, align)
+            };
             commit_sheet.set_cell(display_row, col, &aligned);
         }
     });
@@ -1067,11 +1084,27 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+/// Check if the header at `HEADER_ROWS - 1` for the given main column has content
+/// (matching ratatui's `header_template_applies`).
+fn header_template_applies(grid: &GridBox, main_col: usize) -> bool {
+    use crate::grid::HEADER_ROWS;
+    grid.get(&CellAddr::Header {
+        row: (HEADER_ROWS - 1) as u32,
+        col: crate::grid::ColumnAddr::Main(main_col as u32),
+    })
+    .as_deref()
+    .is_some()
+}
+
 /// Count trailing blank main columns (matching ratatui's trailing_blank_main_cols).
 fn trailing_blank_main_cols(grid: &crate::grid::GridBox) -> usize {
     let lm = crate::grid::MARGIN_COLS;
     let mc = grid.main_cols();
-    match (0..mc).rev().find(|&c| grid.logical_col_has_content(lm + c)) {
+    match (0..mc).rev().find(|&c| {
+        grid.logical_col_has_content(lm + c)
+            || header_template_applies(grid, c)
+            || right_col_agg(grid, lm + c).is_some()
+    }) {
         None => mc,
         Some(last) => mc.saturating_sub(last + 1),
     }
