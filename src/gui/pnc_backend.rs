@@ -133,12 +133,17 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     {
         let sht = app.core.workbook.active_sheet_mut();
         let grd = &mut sht.grid;
-        // Distribute the data_width budget across visible columns proportionally,
-        // matching ratatui's fit_visible_columns_capped.  This sets col_width
-        // overrides on the live grid so the clone below inherits them.
-        ui_core::fit_visible_columns_capped(grd, &col_ixs, cursor.col, data_width);
-        // Trim columns that still don't fit (must happen after fit_visible_columns_capped
-        // since trim_visible_cols_to_width uses the updated widths).
+        // Set column widths based on rendered content (matching ratatui's
+        // fit_column_to_rendered_content used during draw_visual).  This runs
+        // on the live grid so the clone below inherits the overrides.
+        for &c in col_ixs.iter() {
+            let rw = crate::ui_core::rendered_width_for_column(grd, c);
+            match rw {
+                Some(w) => grd.set_col_width(c, Some(w.min(grd.max_col_width()))),
+                None => grd.set_col_width(c, None),
+            }
+        }
+        // Trim columns that don't fit (uses the newly-set widths).
         crate::ui_core::trim_visible_cols_to_width(grd, &mut col_ixs, cursor.col, data_width);
     }
 
@@ -359,9 +364,17 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 // Fit and trim columns on the live grid so the clone inherits the widths.
                 {
                     let sht = app.core.workbook.active_sheet_mut();
-                    crate::ui_core::fit_visible_columns_capped(
-                        &mut sht.grid, &new_ixs, cursor.col, data_width_cb,
-                    );
+                    for &c in new_ixs.iter() {
+                        let rw = crate::ui_core::rendered_width_for_column(
+                            &sht.grid, c,
+                        );
+                        match rw {
+                            Some(w) => sht.grid.set_col_width(
+                                c, Some(w.min(sht.grid.max_col_width())),
+                            ),
+                            None => sht.grid.set_col_width(c, None),
+                        }
+                    }
                     crate::ui_core::trim_visible_cols_to_width(
                         &mut sht.grid, &mut new_ixs, cursor.col, data_width_cb,
                     );
@@ -495,9 +508,17 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 // Fit and trim columns on the live grid so the clone inherits the widths.
                 {
                     let sht = app.core.workbook.active_sheet_mut();
-                    crate::ui_core::fit_visible_columns_capped(
-                        &mut sht.grid, &new_ixs, cursor.col, data_width_cb,
-                    );
+                    for &c in new_ixs.iter() {
+                        let rw = crate::ui_core::rendered_width_for_column(
+                            &sht.grid, c,
+                        );
+                        match rw {
+                            Some(w) => sht.grid.set_col_width(
+                                c, Some(w.min(sht.grid.max_col_width())),
+                            ),
+                            None => sht.grid.set_col_width(c, None),
+                        }
+                    }
                     crate::ui_core::trim_visible_cols_to_width(
                         &mut sht.grid, &mut new_ixs, cursor.col, data_width_cb,
                     );
@@ -538,9 +559,17 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 // Fit and trim columns on the live grid so the clone inherits the widths.
                 {
                     let sht = app.core.workbook.active_sheet_mut();
-                    crate::ui_core::fit_visible_columns_capped(
-                        &mut sht.grid, &new_ixs, cursor.col, data_width_cb,
-                    );
+                    for &c in new_ixs.iter() {
+                        let rw = crate::ui_core::rendered_width_for_column(
+                            &sht.grid, c,
+                        );
+                        match rw {
+                            Some(w) => sht.grid.set_col_width(
+                                c, Some(w.min(sht.grid.max_col_width())),
+                            ),
+                            None => sht.grid.set_col_width(c, None),
+                        }
+                    }
                     crate::ui_core::trim_visible_cols_to_width(
                         &mut sht.grid, &mut new_ixs, cursor.col, data_width_cb,
                     );
