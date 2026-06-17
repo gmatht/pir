@@ -615,6 +615,21 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         ui_core::visible_col_indices(&sheet_rec, cursor, data_cols, 0);
     ui_core::trim_visible_cols_to_width(&sheet_rec.grid, &mut col_ixs, cursor.col, data_width);
 
+    // Ensure all visible columns have correct widths via rendered_width_for_column,
+    // matching ratatui's per-column fit_column_to_rendered_content.  This runs on
+    // the live grid so the clone below inherits the overrides.
+    {
+        let sht = app.core.workbook.active_sheet_mut();
+        let grd = &mut sht.grid;
+        for &c in col_ixs.iter() {
+            let rw = crate::ui_core::rendered_width_for_column(grd, c);
+            match rw {
+                Some(w) => grd.set_col_width(c, Some(w.min(grd.max_col_width()))),
+                None => grd.set_col_width(c, None),
+            }
+        }
+    }
+
     // Re-read the sheet after width adjustments.
     let sheet_rec = app.core.workbook.active_sheet().clone();
     let g = &sheet_rec.grid;
