@@ -7,10 +7,12 @@ use crate::ops::WorkbookState;
 use std::path::PathBuf;
 
 pub mod clipboard;
+pub mod compute;
 pub mod dialogs;
 pub mod edit;
 pub mod keymap;
 pub mod menu;
+pub mod render;
 pub mod sheet;
 
 #[cfg(feature = "gui")]

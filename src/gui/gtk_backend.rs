@@ -1,29 +1,36 @@
 #![allow(non_upper_case_globals)]
 
-use crate::grid::CellAddr;
 use rustxwidgets::backends_gtk_adapter::*;
 use rustxwidgets::core::DrawContext;
+
+use crate::grid::{CellAddr, ColumnAddr, HEADER_ROWS, MARGIN_COLS};
+use crate::ui_core;
+
+use super::compute;
+use super::edit::{KEY_BACKSPACE, KEY_DELETE, KEY_DOWN, KEY_END, KEY_ENTER, KEY_ESC,
+    KEY_F2, KEY_HOME, KEY_LEFT, KEY_PAGE_DOWN, KEY_PAGE_UP, KEY_RETURN,
+    KEY_RIGHT, KEY_TAB, KEY_UP};
 
 const CELL_W: f64 = 100.0;
 const CELL_H: f64 = 28.0;
 const HEADER_W: f64 = 50.0;
 const HEADER_H: f64 = 28.0;
+const VISIBLE_ROWS: u32 = 30;
+const VISIBLE_COLS: u32 = 12;
 
-const GDK_KEY_Return: u32 = 0xFF0D;
-const GDK_KEY_KP_Enter: u32 = 0xFF8D;
-const GDK_KEY_Escape: u32 = 0xFF1B;
-const GDK_KEY_Tab: u32 = 0xFF09;
-const GDK_KEY_BackSpace: u32 = 0xFF08;
-const GDK_KEY_Delete: u32 = 0xFFFF;
-const GDK_KEY_Left: u32 = 0xFF51;
-const GDK_KEY_Up: u32 = 0xFF52;
-const GDK_KEY_Right: u32 = 0xFF53;
-const GDK_KEY_Down: u32 = 0xFF54;
-const GDK_KEY_Home: u32 = 0xFF50;
-const GDK_KEY_End: u32 = 0xFF57;
-const GDK_KEY_Page_Up: u32 = 0xFF55;
-const GDK_KEY_Page_Down: u32 = 0xFF56;
-const GDK_KEY_F2: u32 = 0xFFBF;
+struct GtkCanvasState {
+    app: *mut super::App,
+    formula_entry: Entry,
+    addr_label: Label,
+    status_label: Label,
+    canvas: Canvas,
+    scroll_row: std::cell::Cell<u32>,
+    scroll_col: std::cell::Cell<u32>,
+    edit_buf: std::cell::RefCell<String>,
+    editing: std::cell::Cell<bool>,
+    last_row: std::cell::Cell<usize>,
+    last_col: std::cell::Cell<usize>,
+}
 
 pub fn run_gtk(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
     let _backend = rustxwidgets::backends::gtk::init()
@@ -33,16 +40,15 @@ pub fn run_gtk(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
     win.set_title(&format!("corro {}", env!("CARGO_PKG_VERSION")));
     win.set_default_size(1200, 800);
 
-    // Create application (action group host for menus)
     let gtk_app = create_application()?;
     gtk_app.register()?;
 
-    // Build menu bar
     let menubar = crate::gui::menu::build_menu_bar(&gtk_app, &win)?;
 
     let vbox = create_box(Orientation::Vertical, 0)?;
     vbox.append(&menubar);
 
+    // Formula bar
     let formula_bar = create_box(Orientation::Horizontal, 2)?;
     let addr_label = create_label("A1")?;
     addr_label.set_xalign(0.0);
@@ -55,133 +61,70 @@ pub fn run_gtk(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
     formula_bar.append(&formula_entry);
     vbox.append(&formula_bar);
 
-    let sheet = app.core.workbook.active_sheet().clone();
-    let total_rows = sheet.grid.main_rows().max(50) as usize;
-    let total_cols = sheet.grid.main_cols().max(10) as usize;
+    let spreadsheet = create_spreadsheet(200, 50)?;
 
-    let spreadsheet = create_spreadsheet(total_rows, total_cols)?;
+    // Fit column widths to rendered content (matching ratatui)
+    app.fit_main_columns_to_max_width();
 
-    let data: std::collections::HashMap<(u32, u32), String> = {
-        let mut map = std::collections::HashMap::new();
-        for r in 0..total_rows.min(200) as u32 {
-            for c in 0..total_cols.min(50) as u32 {
-                let addr = CellAddr::Main { row: r, col: c };
-                if let Some(val) = sheet.grid.get(&addr) {
-                    map.insert((r, c), val.clone());
-                }
-            }
-        }
-        map
-    };
+    let hr = HEADER_ROWS;
+    let lm = MARGIN_COLS;
 
-    let shared = std::rc::Rc::new(super::sheet::SharedState {
-        cursor_row: std::cell::Cell::new(0),
-        cursor_col: std::cell::Cell::new(0),
+    let cursor_row = hr;
+    let cursor_col = lm;
+    app.core.cursor.row = cursor_row;
+    app.core.cursor.col = cursor_col;
+    app.core.anchor = Some(crate::grid::SheetCursor { row: hr, col: lm });
+
+    let state = GtkCanvasState {
+        app,
+        formula_entry: formula_entry.clone(),
+        addr_label: addr_label.clone(),
+        status_label: create_label("Ready")?,
+        canvas: spreadsheet.canvas().clone(),
         scroll_row: std::cell::Cell::new(0),
         scroll_col: std::cell::Cell::new(0),
         edit_buf: std::cell::RefCell::new(String::new()),
         editing: std::cell::Cell::new(false),
-        data: std::cell::RefCell::new(data),
-    });
+        last_row: std::cell::Cell::new(cursor_row),
+        last_col: std::cell::Cell::new(cursor_col),
+    };
 
-    let visible_rows = 25u32;
-    let visible_cols = 10u32;
+    let state = std::rc::Rc::new(state);
+
+    update_formula_bar(&state, cursor_row, cursor_col);
 
     spreadsheet.set_draw_callback(Box::new({
-        let s = shared.clone();
-        let tr = total_rows as u32;
-        let tc = total_cols as u32;
+        let state = state.clone();
+        let sheet_state = app.core.workbook.active_sheet().clone();
         move |dc: &mut dyn DrawContext, _w: i32, _h: i32| {
-            dc.clear(1.0, 1.0, 1.0, 1.0);
-            let top_r = s.scroll_row.get() as usize;
-            let left_c = s.scroll_col.get() as usize;
-            let max_r = (tr as usize).min(top_r + visible_rows as usize + 2);
-            let max_c = (tc as usize).min(left_c + visible_cols as usize + 2);
-
-            dc.save();
-
-            for c in left_c..max_c {
-                let x = HEADER_W + (c - left_c) as f64 * CELL_W;
-                let label = column_label(c as u32);
-                dc.fill_rect(x, 0.0, CELL_W, HEADER_H, 0.92, 0.92, 0.92, 1.0);
-                let te = dc.text_extents(&label, "monospace", 12.0);
-                dc.draw_text_styled(x + (CELL_W - te.2) / 2.0, HEADER_H - 8.0,
-                    &label, "monospace", 12.0, 0.2, 0.2, 0.2, 1.0, 0, 1);
-            }
-
-            for r in top_r..max_r {
-                let y = HEADER_H + (r - top_r) as f64 * CELL_H;
-                let label = format!("{}", r + 1);
-                dc.fill_rect(0.0, y, HEADER_W, CELL_H, 0.92, 0.92, 0.92, 1.0);
-                let te = dc.text_extents(&label, "monospace", 12.0);
-                dc.draw_text(HEADER_W - te.2 - 5.0, y + CELL_H - 8.0, &label, "monospace", 12.0, 0.2, 0.2, 0.2, 1.0);
-            }
-
-            let grid_w = (max_c - left_c) as f64 * CELL_W;
-            let grid_h = (max_r - top_r) as f64 * CELL_H;
-            dc.stroke_rect(HEADER_W, 0.0, grid_w, grid_h, 0.85, 0.85, 0.85, 1.0, 0.5);
-
-            let is_editing = s.editing.get();
-            let eb_str = s.edit_buf.borrow().clone();
-            let data_borrow = s.data.borrow();
-
-            for r in top_r..max_r {
-                for c in left_c..max_c {
-                    let is_cursor = r as u32 == s.cursor_row.get() && c as u32 == s.cursor_col.get();
-                    let x = HEADER_W + (c - left_c) as f64 * CELL_W;
-                    let y = HEADER_H + (r - top_r) as f64 * CELL_H;
-
-                    if is_editing && is_cursor {
-                        dc.fill_rect(x, y, CELL_W, CELL_H, 0.8, 1.0, 0.8, 0.3);
-                        dc.stroke_rect(x, y, CELL_W, CELL_H, 0.0, 0.7, 0.0, 1.0, 2.0);
-                        dc.draw_text(x + 3.0, y + CELL_H - 8.0, &eb_str, "monospace", 12.0, 0.0, 0.0, 0.0, 1.0);
-                    } else if is_cursor {
-                        dc.fill_rect(x, y, CELL_W, CELL_H, 0.2, 0.5, 1.0, 0.15);
-                        dc.stroke_rect(x, y, CELL_W, CELL_H, 0.2, 0.5, 1.0, 1.0, 1.5);
-                        if let Some(text) = data_borrow.get(&(r as u32, c as u32)) {
-                            dc.draw_text(x + 3.0, y + CELL_H - 8.0, text, "monospace", 12.0, 0.0, 0.0, 0.0, 1.0);
-                        }
-                    } else if let Some(text) = data_borrow.get(&(r as u32, c as u32)) {
-                        dc.draw_text(x + 3.0, y + CELL_H - 8.0, text, "monospace", 12.0, 0.0, 0.0, 0.0, 1.0);
-                    }
-                }
-            }
-            dc.restore();
+            render_grid(dc, &state, &sheet_state);
         }
     }));
 
     spreadsheet.on_key(Box::new({
-        let s = shared.clone();
-        let f_entry = formula_entry.clone();
-        let a_label = addr_label.clone();
-        let ss = spreadsheet.clone();
-        let tr = total_rows as u32;
-        let tc = total_cols as u32;
+        let state = state.clone();
         move |keyval: u32, _state: u32| -> bool {
-            handle_key(keyval, &s, &f_entry, &a_label, tr, tc, visible_rows, visible_cols, ss.canvas())
+            handle_key(keyval, &state)
         }
     }));
 
     spreadsheet.on_click(Box::new({
-        let s = shared.clone();
-        let ss = spreadsheet.clone();
+        let state = state.clone();
         move |x: f64, y: f64| {
-            let col = ((x - HEADER_W) / CELL_W) as i32 + s.scroll_col.get() as i32;
-            let row = ((y - HEADER_H) / CELL_H) as i32 + s.scroll_row.get() as i32;
+            let col = ((x - HEADER_W) / CELL_W) as i32 + state.scroll_col.get() as i32;
+            let row = ((y - HEADER_H) / CELL_H) as i32 + state.scroll_row.get() as i32;
             if col >= 0 && row >= 0 {
-                s.cursor_col.set(col as u32);
-                s.cursor_row.set(row as u32);
-                ss.queue_redraw();
+                state.last_col.set(col as usize);
+                state.last_row.set(row as usize);
+                update_state_cursor(&state, row as usize, col as usize);
+                state.canvas.queue_redraw();
             }
         }
     }));
 
+    let status_bar = state.status_label.clone();
     vbox.append(&spreadsheet);
-
-    let status_bar = create_label("Ready")?;
-    status_bar.set_xalign(0.0);
     vbox.append(&status_bar);
-
     win.set_child(&vbox);
     win.present();
 
@@ -189,146 +132,395 @@ pub fn run_gtk(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn handle_key(
-    keyval: u32,
-    shared: &super::sheet::SharedState,
-    formula_entry: &Entry,
-    addr_label: &Label,
-    total_rows: u32, total_cols: u32,
-    visible_rows: u32, visible_cols: u32,
-    canvas: &Canvas,
-) -> bool {
-    macro_rules! redraw { () => { canvas.queue_redraw(); } }
+fn render_grid(dc: &mut dyn DrawContext, state: &GtkCanvasState, sheet_state: &crate::ops::SheetState) {
+    dc.clear(1.0, 1.0, 1.0, 1.0);
 
-    if shared.editing.get() {
-    #[allow(non_upper_case_globals)]
-    match keyval {
-            GDK_KEY_Return | GDK_KEY_KP_Enter => {
-                commit_edit(shared, formula_entry);
-                let next = (shared.cursor_row.get() + 1).min(total_rows - 1);
-                shared.cursor_row.set(next);
-                if next >= shared.scroll_row.get() + visible_rows {
-                    shared.scroll_row.set(shared.scroll_row.get() + 1);
+    let g = &sheet_state.grid;
+    let hr = HEADER_ROWS;
+    let mr = g.main_rows();
+    let mc = g.main_cols();
+    let lm = MARGIN_COLS;
+    let top_r = state.scroll_row.get() as usize;
+    let left_c = state.scroll_col.get() as usize;
+
+    // Determine visible rows/cols from the workbook model
+    let data_width = 200usize; // approximate
+    let cursor = crate::grid::SheetCursor {
+        row: state.last_row.get(),
+        col: state.last_col.get(),
+    };
+    let (visible_rows, _) = ui_core::visible_row_indices(
+        sheet_state, cursor, VISIBLE_ROWS as usize, top_r,
+    );
+    let (mut col_ixs, _) = ui_core::visible_col_indices(
+        sheet_state, cursor, VISIBLE_COLS as usize, left_c,
+    );
+    ui_core::trim_visible_cols_to_width(g, &mut col_ixs, cursor.col, data_width);
+
+    // Ensure column widths are fitted
+    // Note: rendered_width_for_column needs a &GridBox, but set_col_width needs &mut.
+    // Canvas backends refresh the viewport on each redraw so widths are recalculated.
+    // Use col_widths which were already fitted during the cursor-move callback.
+
+    let col_widths: std::collections::HashMap<usize, usize> = col_ixs.iter()
+        .map(|&c| (c, g.col_width(c).max(1)))
+        .collect();
+
+    let row_agg_func = compute::compute_row_agg_func(g, &visible_rows, hr, mr);
+
+    dc.save();
+
+    // Draw column headers
+    for (ci, &c) in col_ixs.iter().enumerate() {
+        let x = HEADER_W + ci as f64 * CELL_W;
+        let label = crate::addr::ui_column_fragment(c, mc);
+        dc.fill_rect(x, 0.0, CELL_W, HEADER_H, 0.92, 0.92, 0.92, 1.0);
+        let te = dc.text_extents(&label, "monospace", 12.0);
+        dc.draw_text(x + (CELL_W - te.2) / 2.0, HEADER_H - 8.0,
+            &label, "monospace", 12.0, 0.2, 0.2, 0.2, 1.0);
+    }
+
+    // Draw row headers
+    for (ri, &r) in visible_rows.iter().enumerate() {
+        let y = HEADER_H + ri as f64 * CELL_H;
+        let label = crate::addr::ui_row_label(r, mr);
+        dc.fill_rect(0.0, y, HEADER_W, CELL_H, 0.92, 0.92, 0.92, 1.0);
+        let te = dc.text_extents(&label, "monospace", 12.0);
+        dc.draw_text(HEADER_W - te.2 - 5.0, y + CELL_H - 8.0,
+            &label, "monospace", 12.0, 0.2, 0.2, 0.2, 1.0);
+    }
+
+    // Grid outline
+    let grid_w = col_ixs.len() as f64 * CELL_W;
+    let grid_h = visible_rows.len() as f64 * CELL_H;
+    dc.stroke_rect(HEADER_W, 0.0, grid_w, grid_h, 0.85, 0.85, 0.85, 1.0, 0.5);
+
+    // Draw cells
+    for (ri, &logical_row) in visible_rows.iter().enumerate() {
+        for (ci, &c) in col_ixs.iter().enumerate() {
+            let addr = cell_addr_for(logical_row, hr, mr, c, lm, mc);
+            let is_cursor = logical_row == state.last_row.get() && c == state.last_col.get();
+            let is_editing = state.editing.get() && is_cursor;
+            let x = HEADER_W + ci as f64 * CELL_W;
+            let y = HEADER_H + ri as f64 * CELL_H;
+
+            let cell_info = compute::compute_cell_info(
+                g, &addr, is_cursor && !is_editing,
+                row_agg_func.get(ri).copied().flatten(),
+                if logical_row >= hr && logical_row < hr + mr { Some((logical_row - hr) as u32) } else { None },
+                if logical_row >= hr + mr { Some((logical_row - hr - mr) as u32) } else { None },
+                compute::right_col_agg(g, c),
+                c, lm, mc, mr,
+            );
+
+            if is_editing {
+                dc.fill_rect(x, y, CELL_W, CELL_H, 0.8, 1.0, 0.8, 0.3);
+                dc.stroke_rect(x, y, CELL_W, CELL_H, 0.0, 0.7, 0.0, 1.0, 2.0);
+                let buf = state.edit_buf.borrow();
+                dc.draw_text(x + 3.0, y + CELL_H - 8.0, &buf, "monospace", 12.0, 0.0, 0.0, 0.0, 1.0);
+            } else if is_cursor {
+                dc.fill_rect(x, y, CELL_W, CELL_H, 0.2, 0.5, 1.0, 0.15);
+                dc.stroke_rect(x, y, CELL_W, CELL_H, 0.2, 0.5, 1.0, 1.0, 1.5);
+                if !cell_info.formatted.is_empty() {
+                    dc.draw_text(x + 3.0, y + CELL_H - 8.0, &cell_info.formatted, "monospace", 12.0, 0.0, 0.0, 0.0, 1.0);
                 }
-                redraw!(); return true;
+            } else if matches!(cell_info.style, compute::CellDisplayStyle::Aggregate | compute::CellDisplayStyle::FooterAggregate) {
+                dc.fill_rect(x, y, CELL_W, CELL_H, 0.95, 0.95, 0.99, 1.0);
+                if !cell_info.formatted.is_empty() {
+                    dc.draw_text(x + 3.0, y + CELL_H - 8.0, &cell_info.formatted, "monospace", 12.0, 0.0, 0.0, 0.5, 1.0);
+                }
+            } else if !cell_info.formatted.is_empty() {
+                dc.draw_text(x + 3.0, y + CELL_H - 8.0, &cell_info.formatted, "monospace", 12.0, 0.0, 0.0, 0.0, 1.0);
             }
-            GDK_KEY_Escape => {
-                shared.editing.set(false);
-                shared.edit_buf.borrow_mut().clear();
-                update_formula_bar(shared, formula_entry, addr_label);
-                redraw!(); return true;
+
+            // Draw cell grid lines
+            dc.stroke_rect(x, y, CELL_W, CELL_H, 0.9, 0.9, 0.9, 1.0, 0.5);
+        }
+    }
+
+    dc.restore();
+}
+
+fn handle_key(keyval: u32, state: &GtkCanvasState) -> bool {
+    let app = unsafe { &mut *state.app };
+
+    if state.editing.get() {
+        match keyval {
+            KEY_RETURN | KEY_ENTER => {
+                commit_edit(state);
+                move_cursor(state, 1, 0);
+                return true;
             }
-            GDK_KEY_Tab => {
-                commit_edit(shared, formula_entry);
-                let next = (shared.cursor_col.get() + 1).min(total_cols - 1);
-                shared.cursor_col.set(next);
-                if next >= shared.scroll_col.get() + visible_cols { shared.scroll_col.set(shared.scroll_col.get() + 1); }
-                update_formula_bar(shared, formula_entry, addr_label);
-                redraw!(); return true;
+            KEY_ESC => {
+                state.editing.set(false);
+                state.edit_buf.borrow_mut().clear();
+                update_formula_bar(state, state.last_row.get(), state.last_col.get());
+                state.canvas.queue_redraw();
+                return true;
             }
-            GDK_KEY_BackSpace => { shared.edit_buf.borrow_mut().pop(); redraw!(); return true; }
-            GDK_KEY_Delete => { shared.edit_buf.borrow_mut().clear(); redraw!(); return true; }
-            GDK_KEY_Left  => { commit_and_move(shared, |s| if s.cursor_col.get() > 0 { s.cursor_col.set(s.cursor_col.get() - 1) }); redraw!(); return true; }
-            GDK_KEY_Right => { commit_and_move(shared, |s| s.cursor_col.set((s.cursor_col.get() + 1).min(total_cols - 1))); redraw!(); return true; }
-            GDK_KEY_Up    => { commit_and_move(shared, |s| if s.cursor_row.get() > 0 { s.cursor_row.set(s.cursor_row.get() - 1) }); redraw!(); return true; }
-            GDK_KEY_Down  => { commit_and_move(shared, |s| s.cursor_row.set((s.cursor_row.get() + 1).min(total_rows - 1))); redraw!(); return true; }
+            KEY_TAB => {
+                commit_edit(state);
+                move_cursor(state, 0, 1);
+                return true;
+            }
+            KEY_BACKSPACE => {
+                state.edit_buf.borrow_mut().pop();
+                state.canvas.queue_redraw();
+                return true;
+            }
+            KEY_DELETE => {
+                state.edit_buf.borrow_mut().clear();
+                state.canvas.queue_redraw();
+                return true;
+            }
+            KEY_LEFT => {
+                commit_and_move(state, |_s| {
+                    let c = state.last_col.get();
+                    if c > 0 { state.last_col.set(c - 1); }
+                });
+                return true;
+            }
+            KEY_RIGHT => {
+                commit_and_move(state, |_s| {
+                    state.last_col.set(state.last_col.get() + 1);
+                });
+                return true;
+            }
+            KEY_UP => {
+                commit_and_move(state, |_s| {
+                    let r = state.last_row.get();
+                    if r > HEADER_ROWS { state.last_row.set(r - 1); }
+                });
+                return true;
+            }
+            KEY_DOWN => {
+                commit_and_move(state, |_s| {
+                    state.last_row.set(state.last_row.get() + 1);
+                });
+                return true;
+            }
             _ => {
                 if keyval >= 32 && keyval <= 126 {
-                    shared.edit_buf.borrow_mut().push(char::from_u32(keyval).unwrap_or('?'));
-                    formula_entry.set_text(&shared.edit_buf.borrow());
-                    redraw!(); return true;
+                    state.edit_buf.borrow_mut().push(char::from_u32(keyval).unwrap_or('?'));
+                    state.formula_entry.set_text(&state.edit_buf.borrow());
+                    state.canvas.queue_redraw();
+                    return true;
                 }
             }
         }
         return false;
     }
 
-    #[allow(non_upper_case_globals)]
+    // Non-editing key handling
     match keyval {
-        GDK_KEY_Left  => { nav(shared, formula_entry, addr_label, |s| if s.cursor_col.get() > 0 { s.cursor_col.set(s.cursor_col.get() - 1); if s.cursor_col.get() < s.scroll_col.get() { s.scroll_col.set(s.cursor_col.get()); } }); }
-        GDK_KEY_Right => { nav(shared, formula_entry, addr_label, |s| { let n = (s.cursor_col.get() + 1).min(total_cols - 1); s.cursor_col.set(n); if n >= s.scroll_col.get() + visible_cols { s.scroll_col.set(s.scroll_col.get() + 1); } }); }
-        GDK_KEY_Up    => { nav(shared, formula_entry, addr_label, |s| if s.cursor_row.get() > 0 { s.cursor_row.set(s.cursor_row.get() - 1); if s.cursor_row.get() < s.scroll_row.get() { s.scroll_row.set(s.cursor_row.get()); } }); }
-        GDK_KEY_Down  => { nav(shared, formula_entry, addr_label, |s| { let n = (s.cursor_row.get() + 1).min(total_rows - 1); s.cursor_row.set(n); if n >= s.scroll_row.get() + visible_rows { s.scroll_row.set(s.scroll_row.get() + 1); } }); }
-        GDK_KEY_Return | GDK_KEY_KP_Enter => { start_edit(shared, formula_entry); }
-        GDK_KEY_Tab   => { nav(shared, formula_entry, addr_label, |s| { let n = (s.cursor_col.get() + 1).min(total_cols - 1); s.cursor_col.set(n); if n >= s.scroll_col.get() + visible_cols { s.scroll_col.set(s.scroll_col.get() + 1); } }); }
-        GDK_KEY_Home  => { nav(shared, formula_entry, addr_label, |s| { s.cursor_col.set(0); s.scroll_col.set(0); }); }
-        GDK_KEY_End   => { nav(shared, formula_entry, addr_label, |s| s.cursor_col.set(total_cols - 1)); }
-        GDK_KEY_Page_Up   => { pg(shared, visible_rows, |s, p| { if s.cursor_row.get() >= p { s.cursor_row.set(s.cursor_row.get() - p); } else { s.cursor_row.set(0); } if s.cursor_row.get() < s.scroll_row.get() { s.scroll_row.set(s.cursor_row.get()); } }); }
-        GDK_KEY_Page_Down => { pg(shared, visible_rows, |s, p| { let n = (s.cursor_row.get() + p).min(total_rows - 1); s.cursor_row.set(n); if n >= s.scroll_row.get() + visible_rows { s.scroll_row.set(s.scroll_row.get() + p); } }); }
-        GDK_KEY_Delete => { shared.data.borrow_mut().remove(&(shared.cursor_row.get(), shared.cursor_col.get())); formula_entry.set_text(""); redraw!(); }
-        GDK_KEY_F2 => { start_edit(shared, formula_entry); }
+        KEY_LEFT => {
+            let c = state.last_col.get();
+            if c > 0 {
+                state.last_col.set(c - 1);
+                update_state_cursor(state, state.last_row.get(), state.last_col.get());
+            }
+        }
+        KEY_RIGHT => {
+            state.last_col.set(state.last_col.get() + 1);
+            update_state_cursor(state, state.last_row.get(), state.last_col.get());
+        }
+        KEY_UP => {
+            let r = state.last_row.get();
+            if r > HEADER_ROWS {
+                state.last_row.set(r - 1);
+                update_state_cursor(state, state.last_row.get(), state.last_col.get());
+            }
+        }
+        KEY_DOWN => {
+            state.last_row.set(state.last_row.get() + 1);
+            update_state_cursor(state, state.last_row.get(), state.last_col.get());
+        }
+        KEY_RETURN | KEY_ENTER => start_edit(state),
+        KEY_TAB => {
+            state.last_col.set(state.last_col.get() + 1);
+            update_state_cursor(state, state.last_row.get(), state.last_col.get());
+        }
+        KEY_HOME => {
+            state.last_col.set(MARGIN_COLS);
+            update_state_cursor(state, state.last_row.get(), state.last_col.get());
+        }
+        KEY_END => {
+            let mc = app.core.workbook.active_sheet().grid.main_cols();
+            state.last_col.set(MARGIN_COLS + mc - 1);
+            update_state_cursor(state, state.last_row.get(), state.last_col.get());
+        }
+        KEY_PAGE_UP => {
+            let p = VISIBLE_ROWS as usize;
+            if state.last_row.get() >= p {
+                state.last_row.set(state.last_row.get() - p);
+            } else {
+                state.last_row.set(HEADER_ROWS);
+            }
+            update_state_cursor(state, state.last_row.get(), state.last_col.get());
+        }
+        KEY_PAGE_DOWN => {
+            let mr = app.core.workbook.active_sheet().grid.main_rows();
+            let p = VISIBLE_ROWS as usize;
+            let n = (state.last_row.get() + p).min(HEADER_ROWS + mr - 1);
+            state.last_row.set(n);
+            update_state_cursor(state, n, state.last_col.get());
+        }
+        KEY_DELETE => {
+            let sheet = app.core.workbook.active_sheet_mut();
+            let main_row = state.last_row.get().saturating_sub(HEADER_ROWS);
+            let main_col = state.last_col.get().saturating_sub(MARGIN_COLS);
+            let addr = CellAddr::Main { row: main_row as u32, col: main_col as u32 };
+            sheet.grid.set(&addr, String::new());
+            state.formula_entry.set_text("");
+            state.canvas.queue_redraw();
+        }
+        KEY_F2 => start_edit(state),
         _ => {
             if keyval >= 32 && keyval <= 126 {
-                start_edit_with(shared, formula_entry, char::from_u32(keyval).unwrap_or('?'));
-            } else { return false; }
+                start_edit_with(state, char::from_u32(keyval).unwrap_or('?'));
+            } else {
+                return false;
+            }
         }
     }
-    redraw!();
+    update_formula_bar(state, state.last_row.get(), state.last_col.get());
+    state.canvas.queue_redraw();
     true
 }
 
-fn commit_edit(shared: &super::sheet::SharedState, formula_entry: &Entry) {
-    let text = shared.edit_buf.borrow().clone();
-    shared.data.borrow_mut().insert((shared.cursor_row.get(), shared.cursor_col.get()), text.clone());
-    shared.editing.set(false);
-    shared.edit_buf.borrow_mut().clear();
-    formula_entry.set_text(&text);
+fn commit_edit(state: &GtkCanvasState) {
+    let app = unsafe { &mut *state.app };
+    let text = state.edit_buf.borrow().clone();
+    let main_row = state.last_row.get().saturating_sub(HEADER_ROWS);
+    let main_col = state.last_col.get().saturating_sub(MARGIN_COLS);
+    let addr = CellAddr::Main { row: main_row as u32, col: main_col as u32 };
+    {
+        let sheet = app.core.workbook.active_sheet_mut();
+        sheet.grid.set(&addr, text.clone());
+    }
+    let sheet_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
+    let op = crate::ops::Op::SetCell { addr, value: text };
+    let wbo = crate::ops::WorkbookOp::SheetOp { sheet_id, op };
+    if let Some(ref p) = app.core.path.clone() {
+        let mut active_sheet = sheet_id;
+        let _ = crate::io::commit_workbook_op(
+            p, &mut app.core.offset, &mut app.core.workbook,
+            &mut active_sheet, &wbo,
+        );
+        app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+    }
+    state.editing.set(false);
+    state.edit_buf.borrow_mut().clear();
 }
 
-fn commit_and_move(shared: &super::sheet::SharedState, f: impl FnOnce(&super::sheet::SharedState)) {
-    let text = shared.edit_buf.borrow().clone();
-    shared.data.borrow_mut().insert((shared.cursor_row.get(), shared.cursor_col.get()), text);
-    shared.editing.set(false);
-    shared.edit_buf.borrow_mut().clear();
-    f(shared);
+fn commit_and_move(state: &GtkCanvasState, f: impl FnOnce(&GtkCanvasState)) {
+    commit_edit(state);
+    f(state);
+    update_state_cursor(state, state.last_row.get(), state.last_col.get());
 }
 
-fn start_edit(shared: &super::sheet::SharedState, formula_entry: &Entry) {
-    let (r, c) = (shared.cursor_row.get(), shared.cursor_col.get());
-    if let Some(val) = shared.data.borrow().get(&(r, c)) {
-        shared.edit_buf.borrow_mut().clone_from(val);
-    } else { shared.edit_buf.borrow_mut().clear(); }
-    shared.editing.set(true);
-    formula_entry.set_text("");
-}
-
-fn start_edit_with(shared: &super::sheet::SharedState, formula_entry: &Entry, ch: char) {
-    let (r, c) = (shared.cursor_row.get(), shared.cursor_col.get());
-    if let Some(val) = shared.data.borrow().get(&(r, c)) {
-        shared.edit_buf.borrow_mut().clone_from(val);
-    } else { shared.edit_buf.borrow_mut().clear(); }
-    shared.edit_buf.borrow_mut().push(ch);
-    shared.editing.set(true);
-    formula_entry.set_text("");
-}
-
-fn pg(shared: &super::sheet::SharedState, _page: u32, f: impl FnOnce(&super::sheet::SharedState, u32)) {
-    f(shared, _page);
-}
-
-fn nav(shared: &super::sheet::SharedState, formula_entry: &Entry, addr_label: &Label, f: impl FnOnce(&super::sheet::SharedState)) {
-    f(shared);
-    update_formula_bar(shared, formula_entry, addr_label);
-}
-
-fn update_formula_bar(shared: &super::sheet::SharedState, formula_entry: &Entry, addr_label: &Label) {
-    let (r, c) = (shared.cursor_row.get(), shared.cursor_col.get());
-    let val = shared.data.borrow().get(&(r, c)).cloned().unwrap_or_default();
-    formula_entry.set_text(&val);
-    addr_label.set_text(&addr_col_row(r, c));
-}
-
-fn column_label(idx: u32) -> String {
-    if idx < 26 {
-        let c = (b'A' + idx as u8) as char;
-        c.to_string()
+fn start_edit(state: &GtkCanvasState) {
+    let app = unsafe { &mut *state.app };
+    let main_row = state.last_row.get().saturating_sub(HEADER_ROWS);
+    let main_col = state.last_col.get().saturating_sub(MARGIN_COLS);
+    let addr = CellAddr::Main { row: main_row as u32, col: main_col as u32 };
+    let sheet = app.core.workbook.active_sheet();
+    if let Some(val) = sheet.grid.get(&addr) {
+        *state.edit_buf.borrow_mut() = val;
     } else {
-        let prefix = (idx / 26 - 1) as u8;
-        let suffix = (idx % 26) as u8;
-        format!("{}{}", (b'A' + prefix) as char, (b'A' + suffix) as char)
+        state.edit_buf.borrow_mut().clear();
+    }
+    state.editing.set(true);
+    state.formula_entry.set_text("");
+    state.canvas.queue_redraw();
+}
+
+fn start_edit_with(state: &GtkCanvasState, ch: char) {
+    start_edit(state);
+    state.edit_buf.borrow_mut().push(ch);
+    state.canvas.queue_redraw();
+}
+
+fn move_cursor(state: &GtkCanvasState, dr: usize, dc: usize) {
+    let new_row = state.last_row.get() + dr;
+    let new_col = state.last_col.get() + dc;
+    state.last_row.set(new_row);
+    state.last_col.set(new_col);
+    update_state_cursor(state, new_row, new_col);
+}
+
+fn update_state_cursor(state: &GtkCanvasState, row: usize, col: usize) {
+    let app = unsafe { &mut *state.app };
+    app.core.cursor.row = row;
+    app.core.cursor.col = col;
+    // Grow grid if needed
+    let sheet = app.core.workbook.active_sheet_mut();
+    let mr = sheet.grid.main_rows();
+    let mc = sheet.grid.main_cols();
+    let main_row = row.saturating_sub(HEADER_ROWS);
+    let main_col = col.saturating_sub(MARGIN_COLS);
+    if main_col >= mc && compute::trailing_blank_main_cols(&sheet.grid) < crate::ui_core::NAV_BLANK_COLS {
+        sheet.grid.grow_main_col_at_right();
+    }
+    if main_row >= mr && compute::trailing_blank_main_rows(&sheet.grid) < crate::ui_core::NAV_BLANK_ROWS {
+        sheet.grid.grow_main_row_at_bottom();
+    }
+    sheet.grid.ensure_extent_for_cursor(row, col);
+    update_formula_bar(state, row, col);
+    state.canvas.queue_redraw();
+}
+
+fn update_formula_bar(state: &GtkCanvasState, row: usize, col: usize) {
+    let app = unsafe { &mut *state.app };
+    let sheet = app.core.workbook.active_sheet();
+    let main_row = row.saturating_sub(HEADER_ROWS);
+    let main_col = col.saturating_sub(MARGIN_COLS);
+    let addr = CellAddr::Main { row: main_row as u32, col: main_col as u32 };
+    let val = sheet.grid.get(&addr).unwrap_or_default();
+    state.formula_entry.set_text(&val);
+    let addr_str = format!("{}",
+        crate::addr::sheet_cursor_to_addr(
+            crate::addr::LogicalRow(row),
+            crate::addr::GlobalCol(col),
+            crate::addr::MainRows(sheet.grid.main_rows()),
+            crate::addr::MainCols(sheet.grid.main_cols()),
+        )
+    );
+    state.addr_label.set_text(&addr_str);
+    if !app.core.status.is_empty() {
+        state.status_label.set_text(&app.core.status);
+    } else {
+        state.status_label.set_text("Ready");
     }
 }
 
-fn addr_col_row(row: u32, col: u32) -> String {
-    format!("{}{}", column_label(col), row + 1)
+fn cell_addr_for(logical_row: usize, hr: usize, mr: usize, c: usize, lm: usize, mc: usize) -> CellAddr {
+    if logical_row < hr {
+        let hdr_row = logical_row as u32;
+        if c < lm {
+            CellAddr::Header { row: hdr_row, col: ColumnAddr::Left(c) }
+        } else if c < lm + mc {
+            CellAddr::Header { row: hdr_row, col: ColumnAddr::Main((c - lm) as u32) }
+        } else {
+            CellAddr::Header { row: hdr_row, col: ColumnAddr::Right(c - lm - mc) }
+        }
+    } else if logical_row < hr + mr {
+        let main_row = (logical_row - hr) as u32;
+        if c < lm {
+            CellAddr::Left { row: main_row, col: c }
+        } else if c < lm + mc {
+            CellAddr::Main { row: main_row, col: (c - lm) as u32 }
+        } else {
+            CellAddr::Right { row: main_row, col: c - lm - mc }
+        }
+    } else {
+        let ftr_row = (logical_row - hr - mr) as u32;
+        if c < lm {
+            CellAddr::Footer { row: ftr_row, col: ColumnAddr::Left(c) }
+        } else if c < lm + mc {
+            CellAddr::Footer { row: ftr_row, col: ColumnAddr::Main((c - lm) as u32) }
+        } else {
+            CellAddr::Footer { row: ftr_row, col: ColumnAddr::Right(c - lm - mc) }
+        }
+    }
 }
