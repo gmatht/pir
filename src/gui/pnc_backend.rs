@@ -134,7 +134,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         let sht = app.core.workbook.active_sheet_mut();
         let grd = &mut sht.grid;
         // Set column widths based on rendered content (matching ratatui's
-        // fit_column_to_rendered_content used during draw_visual).  This runs
+        // fit_column_to_rendered_content used during load_initial).  This runs
         // on the live grid so the clone below inherits the overrides.
         for &c in col_ixs.iter() {
             let rw = crate::ui_core::rendered_width_for_column(grd, c);
