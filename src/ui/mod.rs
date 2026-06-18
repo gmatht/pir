@@ -9034,6 +9034,15 @@ impl App {
                 self.cursor.clamp(&self.state.grid);
                 return Ok(true);
             }
+            crate::ops::WorkbookOp::DeleteSheet { .. } => {
+                crate::ops::apply_workbook_op(&mut self.workbook, active_sheet, op)
+                    .map_err(IoError::from)?;
+                self.view_sheet_id = *active_sheet;
+                self.sync_active_sheet_cache();
+                self.ops_applied += 1;
+                self.cursor.clamp(&self.state.grid);
+                return Ok(true);
+            }
         }
         Ok(false)
     }

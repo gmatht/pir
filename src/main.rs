@@ -377,6 +377,7 @@ fn try_main() -> (Result<(), Box<dyn std::error::Error>>, Option<String>) {
             let exit_msg = app.take_final_exit_hint();
             (res, exit_msg)
         }
+        #[allow(unreachable_patterns)]
         _ => {
             let msg = format!("{:?} UI backend not compiled in", args.ui);
             (Err(msg.into()), None)

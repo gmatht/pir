@@ -5,11 +5,9 @@ use rustxwidgets::core::DrawContext;
 
 use std::collections::HashMap;
 use std::cell::{Cell, RefCell};
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 
-use unicode_width::UnicodeWidthStr;
-
-use crate::grid::{CellAddr, ColumnAddr, GridBox, SheetCursor, HEADER_ROWS, MARGIN_COLS};
+use crate::grid::{CellAddr, SheetCursor, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::{AggFunc, Op, WorkbookOp};
 use crate::ui_core;
 
@@ -55,8 +53,8 @@ impl GtkCanvasSink {
         col_ixs: &[usize],
         col_widths: &HashMap<usize, usize>,
         display_rows: &[usize],
-        mr: usize,
-        mc: usize,
+        _mr: usize,
+        _mc: usize,
         cursor_row: usize,
         cursor_col: usize,
         is_editing: bool,
@@ -71,8 +69,8 @@ impl GtkCanvasSink {
             let is_sel_row = selection_anchor.map_or(false, |(ar, ac)| {
                 let r1 = ar.min(cursor_row);
                 let r2 = ar.max(cursor_row);
-                let c1 = ac.min(cursor_col);
-                let c2 = ac.max(cursor_col);
+                let _c1 = ac.min(cursor_col);
+                let _c2 = ac.max(cursor_col);
                 logical_row >= r1 && logical_row <= r2
             });
 
@@ -187,8 +185,6 @@ enum GtkMode {
 }
 
 struct GtkCanvasState {
-    rc_self: RefCell<Weak<GtkCanvasState>>,
-    window: Rc<Window>,
     app: *mut super::App,
     formula_entry: Entry,
     addr_label: Label,
@@ -209,8 +205,6 @@ struct GtkCanvasState {
     data_cols: Cell<usize>,
     row_agg_func: RefCell<Vec<Option<AggFunc>>>,
     sink: GtkCanvasSink,
-    sheet_tabs_box: BoxWidget,
-    sheet_tab_buttons: RefCell<Vec<Button>>,
 }
 
 pub fn run_gtk(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
@@ -220,12 +214,11 @@ pub fn run_gtk(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
     let win = create_window()?;
     win.set_title(&format!("corro {}", env!("CARGO_PKG_VERSION")));
     win.set_default_size(1200, 800);
-    let win = Rc::new(win);
 
     let gtk_app = create_application()?;
     gtk_app.register()?;
 
-    let menubar = crate::gui::menu::build_menu_bar(&gtk_app, &*win)?;
+    let menubar = crate::gui::menu::build_menu_bar(&gtk_app, &win)?;
 
     let vbox = create_box(Orientation::Vertical, 0)?;
     vbox.append(&menubar);
@@ -274,13 +267,8 @@ pub fn run_gtk(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
         &sheet_rec.grid, &display_rows, hr, sheet_rec.grid.main_rows(),
     );
 
-    // Sheet tabs box (created before state since state needs it)
-    let sheet_tabs_box = create_box(Orientation::Horizontal, 0)?;
-
     let state = GtkCanvasState {
-        rc_self: RefCell::new(Weak::new()),
         app,
-        window: win.clone(),
         formula_entry: formula_entry.clone(),
         addr_label: addr_label.clone(),
         status_label: create_label("Ready")?,
@@ -300,12 +288,9 @@ pub fn run_gtk(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
         data_cols: Cell::new(data_cols),
         row_agg_func: RefCell::new(row_agg_func),
         sink: GtkCanvasSink::new(),
-        sheet_tabs_box,
-        sheet_tab_buttons: RefCell::new(Vec::new()),
     };
 
     let state = Rc::new(state);
-    *state.rc_self.borrow_mut() = Rc::downgrade(&state);
     update_formula_bar(&state, cursor_row, cursor_col);
 
     // Draw callback
@@ -328,13 +313,9 @@ pub fn run_gtk(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
 
     let status_bar = state.status_label.clone();
     vbox.append(&spreadsheet);
-    vbox.append(&state.sheet_tabs_box);
     vbox.append(&status_bar);
     win.set_child(&vbox);
     win.present();
-
-    rebuild_sheet_tabs(&state);
-    update_title(&state);
 
     _backend.run().map_err(|e| format!("GUI error: {e}"))?;
     Ok(())
@@ -471,15 +452,12 @@ fn recompute_viewport(state: &GtkCanvasState) {
         col: state.last_col.get(),
     };
 
-    let sheet = app.core.workbook.active_sheet_mut();
-    let mr = sheet.grid.main_rows();
-    let mc = sheet.grid.main_cols();
+    let _sheet = app.core.workbook.active_sheet_mut();
 
     let data_rows = state.data_rows.get();
     let data_cols = state.data_cols.get();
     let data_width = state.data_width.get();
     let hr = HEADER_ROWS;
-    let lm = MARGIN_COLS;
 
     // Recompute visible rows and columns
     let rec = app.core.workbook.active_sheet().clone();
@@ -593,7 +571,6 @@ fn start_edit_with(state: &GtkCanvasState, ch: char) {
 }
 
 fn move_cursor(state: &GtkCanvasState, dr: isize, dc: isize) {
-    let app = unsafe { &mut *state.app };
     let cur_row = state.last_row.get() as isize;
     let cur_col = state.last_col.get() as isize;
     let new_row = (cur_row + dr).max(HEADER_ROWS as isize) as usize;
@@ -1060,7 +1037,7 @@ fn handle_save(state: &GtkCanvasState) {
 
 // ── Find / Replace ───────────────────────────────────────────────────────────
 
-fn handle_find(state: &GtkCanvasState) {
+fn handle_find(_state: &GtkCanvasState) {
     crate::gui::dialogs::find_dialog(|result| {
         if let Some(text) = result {
             // TODO: implement find logic
@@ -1069,7 +1046,7 @@ fn handle_find(state: &GtkCanvasState) {
     });
 }
 
-fn handle_replace(state: &GtkCanvasState) {
+fn handle_replace(_state: &GtkCanvasState) {
     crate::gui::dialogs::replace_dialog(|result| {
         if let Some((find, replace)) = result {
             // TODO: implement replace logic
@@ -1150,49 +1127,6 @@ fn handle_edit_key(keyval: u32, state: &GtkCanvasState) -> bool {
 
 // ── Sheet Management ─────────────────────────────────────────────────────────
 
-fn update_title(state: &GtkCanvasState) {
-    let app = unsafe { &*state.app };
-    let idx = app.core.workbook.active_sheet;
-    let title = app.core.workbook.sheet_title(idx);
-    state.window.set_title(&format!("corro {} — {}", env!("CARGO_PKG_VERSION"), title));
-}
-
-fn rebuild_sheet_tabs(state: &Rc<GtkCanvasState>) {
-    // Remove old buttons from box
-    if let Some(loader) = rustxwidgets::backends::gtk::loader() {
-        let old_buttons = state.sheet_tab_buttons.replace(vec![]);
-        for btn in &old_buttons {
-            unsafe {
-                gtk_dynamic_loader::remove_from_parent(&loader, *btn.as_ref());
-            }
-        }
-    }
-
-    let app = unsafe { &mut *state.app };
-    let wb = &app.core.workbook;
-    let active_idx = wb.active_sheet;
-    let mut new_buttons = Vec::new();
-    for (i, sheet) in wb.sheets.iter().enumerate() {
-        let btn = create_button(&sheet.title).unwrap();
-        btn.set_size_request(80, 24);
-        if i == active_idx {
-            btn.add_class("active-tab");
-        }
-        let state_clone = state.clone();
-        let sid = sheet.id;
-        let _ = btn.on_click(move || {
-            let app = unsafe { &mut *state_clone.app };
-            let cur_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
-            if sid != cur_id {
-                handle_activate_sheet_id(&state_clone, sid);
-            }
-        });
-        state.sheet_tabs_box.append(&btn);
-        new_buttons.push(btn);
-    }
-    *state.sheet_tab_buttons.borrow_mut() = new_buttons;
-}
-
 fn clamp_cursor_to_sheet(state: &GtkCanvasState) {
     let app = unsafe { &mut *state.app };
     let sheet = app.core.workbook.active_sheet();
@@ -1202,15 +1136,17 @@ fn clamp_cursor_to_sheet(state: &GtkCanvasState) {
     let max_col = MARGIN_COLS + mc.saturating_sub(1);
     let cur_row = state.last_row.get();
     let cur_col = state.last_col.get();
-    let new_row = cur_row.min(max_row).max(HEADER_ROWS);
-    let new_col = cur_col.min(max_col).max(MARGIN_COLS);
-    state.last_row.set(new_row);
-    state.last_col.set(new_col);
-    app.core.cursor.row = new_row;
-    app.core.cursor.col = new_col;
+    if cur_row > max_row || cur_col > max_col || cur_row < HEADER_ROWS || cur_col < MARGIN_COLS {
+        let new_row = cur_row.min(max_row).max(HEADER_ROWS);
+        let new_col = cur_col.min(max_col).max(MARGIN_COLS);
+        state.last_row.set(new_row);
+        state.last_col.set(new_col);
+        app.core.cursor.row = new_row;
+        app.core.cursor.col = new_col;
+    }
 }
 
-fn handle_activate_sheet_id(state: &Rc<GtkCanvasState>, sheet_id: u32) {
+fn handle_activate_sheet_id(state: &GtkCanvasState, sheet_id: u32) {
     let app = unsafe { &mut *state.app };
     let op = WorkbookOp::ActivateSheet { id: sheet_id };
     if let Err(e) = crate::ops::apply_workbook_op(
@@ -1228,13 +1164,12 @@ fn handle_activate_sheet_id(state: &Rc<GtkCanvasState>, sheet_id: u32) {
     }
     clamp_cursor_to_sheet(state);
     recompute_viewport(state);
-    rebuild_sheet_tabs(state);
-    update_title(state);
     update_formula_bar(state, state.last_row.get(), state.last_col.get());
+    app.core.status = format!("Sheet: {}", app.core.workbook.sheet_title(app.core.workbook.active_sheet));
     state.canvas.queue_redraw();
 }
 
-fn handle_new_sheet(state: &Rc<GtkCanvasState>) {
+fn handle_new_sheet(state: &GtkCanvasState) {
     let app = unsafe { &mut *state.app };
     let new_id = app.core.workbook.next_sheet_id;
     let title = format!("Sheet{}", new_id);
@@ -1275,14 +1210,12 @@ fn handle_new_sheet(state: &Rc<GtkCanvasState>) {
     app.core.cursor.col = MARGIN_COLS;
     app.core.anchor = Some(SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS });
     recompute_viewport(state);
-    rebuild_sheet_tabs(state);
-    update_title(state);
     update_formula_bar(state, state.last_row.get(), state.last_col.get());
     app.core.status = format!("New sheet: {}", title);
     state.canvas.queue_redraw();
 }
 
-fn handle_delete_sheet(state: &Rc<GtkCanvasState>) {
+fn handle_delete_sheet(state: &GtkCanvasState) {
     let app = unsafe { &mut *state.app };
     let wb = &mut app.core.workbook;
     if wb.sheet_count() <= 1 {
@@ -1290,39 +1223,45 @@ fn handle_delete_sheet(state: &Rc<GtkCanvasState>) {
         return;
     }
     let idx = wb.active_sheet;
+    let id = wb.sheet_id(idx);
     let title = wb.sheet_title(idx).to_string();
-    wb.sheets.remove(idx);
-    if wb.active_sheet >= wb.sheets.len() {
-        wb.active_sheet = wb.sheets.len().saturating_sub(1);
+    let op = WorkbookOp::DeleteSheet { id };
+    if let Err(e) = crate::ops::apply_workbook_op(wb, &mut 0, op.clone()) {
+        app.core.status = format!("Delete sheet error: {e}");
+        return;
     }
-    wb.ensure_active_sheet();
+    if let Some(ref p) = app.core.path.clone() {
+        let mut _active = 0;
+        let _ = crate::io::commit_workbook_op(
+            p, &mut app.core.offset, &mut app.core.workbook,
+            &mut _active, &op,
+        );
+    }
     clamp_cursor_to_sheet(state);
     recompute_viewport(state);
-    rebuild_sheet_tabs(state);
-    update_title(state);
     update_formula_bar(state, state.last_row.get(), state.last_col.get());
     app.core.status = format!("Deleted sheet: {}", title);
     state.canvas.queue_redraw();
 }
 
-fn handle_next_sheet(state: &Rc<GtkCanvasState>) {
+fn handle_next_sheet(state: &GtkCanvasState) {
     let app = unsafe { &mut *state.app };
     let wb = &app.core.workbook;
     let count = wb.sheet_count();
     if count <= 1 { return; }
     let next = (wb.active_sheet + 1) % count;
     let id = wb.sheet_id(next);
-    drop(wb);
+    let _ = wb;
     handle_activate_sheet_id(state, id);
 }
 
-fn handle_prev_sheet(state: &Rc<GtkCanvasState>) {
+fn handle_prev_sheet(state: &GtkCanvasState) {
     let app = unsafe { &mut *state.app };
     let wb = &app.core.workbook;
     let count = wb.sheet_count();
     if count <= 1 { return; }
     let prev = (wb.active_sheet + count - 1) % count;
     let id = wb.sheet_id(prev);
-    drop(wb);
+    let _ = wb;
     handle_activate_sheet_id(state, id);
 }

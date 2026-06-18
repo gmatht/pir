@@ -341,7 +341,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             let cursor = app.core.cursor;
             // Determine viewport and fit columns BEFORE cloning so the
             // resulting width overrides are reflected in the snapshot.
-            let (new_display_rows, new_mr, new_mc, mut new_ixs) = {
+            let (new_display_rows, new_mr, new_mc, new_ixs) = {
                 let rec = app.core.workbook.active_sheet().clone();
                 let (new_display_rows, _) =
                     crate::ui_core::visible_row_indices(&rec, cursor, data_rows_cb, 0);

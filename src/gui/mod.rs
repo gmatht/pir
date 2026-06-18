@@ -1,5 +1,5 @@
 use crate::core::state::CoreApp;
-use crate::grid::{CellAddr, SheetCursor, HEADER_ROWS, MARGIN_COLS};
+use crate::grid::{SheetCursor, HEADER_ROWS, MARGIN_COLS};
 use crate::io::load_workbook_revisions_partial;
 use crate::io::PartialReplay;
 use std::path::Path;
