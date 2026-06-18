@@ -1,6 +1,7 @@
 #![allow(non_upper_case_globals)]
 
 use rustxwidgets::backends_gtk_adapter::*;
+use rustxwidgets::backends::gtk;
 use rustxwidgets::core::DrawContext;
 
 use std::collections::HashMap;
@@ -21,6 +22,8 @@ const FONT_SIZE: f64 = 12.0;
 const ROW_H: f64 = 20.0;
 const HEADER_H: f64 = 24.0;
 const ROW_LABEL_W: f64 = 50.0;
+const MAX_RENDER_ROWS: usize = 500;
+const MAX_RENDER_COLS: usize = 50;
 const CHAR_W: f64 = 7.2;
 
 struct GtkCanvasSink {
@@ -64,7 +67,7 @@ impl GtkCanvasSink {
         let cells = self.cells.borrow();
         let styles = self.styles.borrow();
 
-        for (ri, &logical_row) in display_rows.iter().enumerate() {
+        for (ri, &logical_row) in display_rows.iter().enumerate().take(MAX_RENDER_ROWS) {
             let ry = HEADER_H + ri as f64 * ROW_H;
             let is_sel_row = selection_anchor.map_or(false, |(ar, ac)| {
                 let r1 = ar.min(cursor_row);
@@ -74,7 +77,7 @@ impl GtkCanvasSink {
                 logical_row >= r1 && logical_row <= r2
             });
 
-            for (ci, &c) in col_ixs.iter().enumerate() {
+for (ci, &c) in col_ixs.iter().enumerate().take(MAX_RENDER_COLS) {
                 let cw = *col_widths.get(&c).unwrap_or(&8) as f64 * CHAR_W;
                 let rx = col_x(ci, col_ixs, col_widths);
                 let is_cursor = logical_row == cursor_row && c == cursor_col;
@@ -140,8 +143,6 @@ impl GtkCanvasSink {
                     }
                 }
 
-                // Grid line
-                dc.stroke_rect(rx, ry, cw, ROW_H, 0.9, 0.9, 0.9, 1.0, 0.5);
             }
         }
     }
@@ -234,9 +235,20 @@ pub fn run_gtk(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
     formula_bar.append(&addr_label);
     formula_bar.append(&f_label);
     formula_bar.append(&formula_entry);
+    // Make formula entry read-only so clicking it doesn't steal keyboard focus
+    if let Some(loader) = gtk::loader() {
+        if let Some(set_editable) = loader.symbols.gtk_entry_set_editable {
+            unsafe { set_editable(*formula_entry.0.as_ref(), 0); }
+        }
+    }
     vbox.append(&formula_bar);
 
-    let spreadsheet = create_spreadsheet(200, 50)?;
+    // Compute viewport dimensions (before create_spreadsheet, which uses them for size_request)
+    let data_width = 200usize;
+    let data_rows = 30usize;
+    let data_cols = 12usize;
+
+    let spreadsheet = create_spreadsheet(data_rows, data_cols)?;
 
     // Fit column widths to rendered content
     app.fit_main_columns_to_max_width();
@@ -248,11 +260,6 @@ pub fn run_gtk(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
     app.core.cursor.row = cursor_row;
     app.core.cursor.col = cursor_col;
     app.core.anchor = Some(SheetCursor { row: hr, col: lm });
-
-    // Compute viewport dimensions
-    let data_width = 200usize;
-    let data_rows = 30usize;
-    let data_cols = 12usize;
 
     let sheet_rec = app.core.workbook.active_sheet().clone();
     let cursor = SheetCursor { row: cursor_row, col: cursor_col };
@@ -299,11 +306,48 @@ pub fn run_gtk(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
         render_grid(dc, &state_draw, w, h);
     }));
 
-    // Key handler
+    // Key handler — attach to the canvas DrawingArea (the adapter stores the
+    // controller to keep it alive).  For GTK4 the DrawingArea is NOT focusable,
+    // so we also attach an EventControllerKey to the formula entry (which does
+    // accept focus) so keyboard events are always captured.
     let state_key = state.clone();
     spreadsheet.on_key(Box::new(move |keyval: u32, key_state: u32| -> bool {
         handle_key(keyval, key_state, &state_key)
     }));
+    // Capture keys from the formula entry too (it can still receive focus even
+    // when read-only, and in GTK4 the DrawingArea is not focusable).
+    let state_key2 = state.clone();
+    let entry_controllers: Rc<RefCell<Vec<Box<dyn std::any::Any>>>> = Rc::new(RefCell::new(Vec::new()));
+    if let Some(loader) = gtk::loader() {
+        if loader.symbols.gtk_gesture_click_new.is_some() {
+            // GTK4: use EventControllerKey
+            if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(loader.clone()) {
+                let state_k = state_key2.clone();
+                let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32, key_state: u32| -> i32 {
+                    if handle_key(keyval, key_state, &state_k) { 1 } else { 0 }
+                }));
+                ctrl.add_to_widget(&formula_entry);
+                entry_controllers.borrow_mut().push(Box::new(ctrl));
+            }
+        } else {
+            // GTK3: connect key-press-event signal directly
+            let entry_ptr = *formula_entry.0.as_ref();
+            let l2 = loader.clone();
+            let l3 = l2.clone();
+            let mut cb = Box::new(move |keyval: u32, key_state: u32| -> bool {
+                handle_key(keyval, key_state, &state_key2)
+            });
+            unsafe {
+                let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                    &l2, entry_ptr, "key-press-event",
+                    Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
+                        let keyval = gtk_dynamic_loader::EventControllerKey::get_keyval_static(&l3, ev);
+                        if cb(keyval, 0) { 1 } else { 0 }
+                    }),
+                );
+            }
+        }
+    }
 
     // Click handler
     let state_click = state.clone();
@@ -428,10 +472,24 @@ fn render_grid(dc: &mut dyn DrawContext, state: &GtkCanvasState, w: i32, h: i32)
             cursor_row, cursor_col, is_editing, &edit_text, anchor);
     }
 
-    // Border / separator lines
+    // Grid lines (batched, replaces per-cell stroke_rect)
     let total_w: f64 = col_ixs.iter().map(|&c| col_pixel_width(c, &col_widths)).sum();
     let total_h = display_rows.len() as f64 * ROW_H;
-    dc.stroke_rect(ROW_LABEL_W, 0.0, total_w, total_h, 0.85, 0.85, 0.85, 1.0, 0.5);
+    // Horizontal lines between rows
+    let mut y = HEADER_H;
+    for _ in 0..=display_rows.len() {
+        dc.fill_rect(ROW_LABEL_W, y, total_w, 0.5, 0.9, 0.9, 0.9, 1.0);
+        y += ROW_H;
+    }
+    // Vertical lines between columns
+    let mut x = ROW_LABEL_W;
+    for &c in col_ixs.iter() {
+        let cw = col_pixel_width(c, &col_widths);
+        dc.fill_rect(x, HEADER_H, 0.5, total_h, 0.9, 0.9, 0.9, 1.0);
+        x += cw;
+    }
+    // Rightmost vertical line
+    dc.fill_rect(x, HEADER_H, 0.5, total_h, 0.9, 0.9, 0.9, 1.0);
 
     // Border title
     let border_title = format!("corro  {}r × {}c  ops {}", mr, mc, app.core.ops_applied);
@@ -483,20 +541,22 @@ fn recompute_viewport(state: &GtkCanvasState) {
 // ── Click handling ───────────────────────────────────────────────────────────
 
 fn handle_click(x: f64, y: f64, state: &GtkCanvasState) {
-    let col_ixs = state.col_ixs.borrow();
-    let col_widths = state.col_widths.borrow();
-
-    // Find which column was clicked
-    let mut click_col_ix = None;
-    let mut accumulated = ROW_LABEL_W;
-    for (ci, &c) in col_ixs.iter().enumerate() {
-        let cw = col_pixel_width(c, &col_widths);
-        if x >= accumulated && x < accumulated + cw {
-            click_col_ix = Some((ci, c));
-            break;
+    // Find which column was clicked (borrows col_ixs/col_widths, dropped before update_state_cursor)
+    let click_col_ix = {
+        let col_ixs = state.col_ixs.borrow();
+        let col_widths = state.col_widths.borrow();
+        let mut click_col_ix = None;
+        let mut accumulated = ROW_LABEL_W;
+        for (ci, &c) in col_ixs.iter().enumerate() {
+            let cw = col_pixel_width(c, &col_widths);
+            if x >= accumulated && x < accumulated + cw {
+                click_col_ix = Some((ci, c));
+                break;
+            }
+            accumulated += cw;
         }
-        accumulated += cw;
-    }
+        click_col_ix
+    };
 
     let click_row_ix = if y >= HEADER_H && y < HEADER_H + display_rows_len(state) as f64 * ROW_H {
         Some(((y - HEADER_H) / ROW_H) as usize)
@@ -505,7 +565,8 @@ fn handle_click(x: f64, y: f64, state: &GtkCanvasState) {
     };
 
     if let (Some((_ci, c)), Some(ri)) = (click_col_ix, click_row_ix) {
-        if let Some(&logical_row) = state.display_rows.borrow().get(ri) {
+        let logical_row = state.display_rows.borrow().get(ri).copied();
+        if let Some(logical_row) = logical_row {
             state.last_col.set(c);
             state.last_row.set(logical_row);
             update_state_cursor(state, logical_row, c);

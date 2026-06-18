@@ -186,7 +186,7 @@ func ansiResetAndClear(w io.Writer) {
 
 func typeText(ctx context.Context, w io.Writer, text string, cps float64) error {
 	if cps <= 0 {
-		cps = 12
+		cps = 20 
 	}
 	perChar := time.Duration(float64(time.Second) / cps)
 	if perChar < 5*time.Millisecond {
@@ -259,7 +259,7 @@ func runCastMovie(ctx context.Context, filePath string, forceWSL bool) error {
 	}
 
 	if commandExists("asciinema") {
-		return runCommandStreaming(ctx, "asciinema", "play", filePath)
+		return runCommandStreaming(ctx, "asciinema", "play", "-s", "2", filePath)
 	}
 
 	if commandExists("wsl") {

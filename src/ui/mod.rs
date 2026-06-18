@@ -328,7 +328,14 @@ pub(crate) enum Mode {
     },
     QuitPrompt,
     /// Interactive extrapolation: arrow keys extend the selection, Enter extrapolates, Esc cancels.
-    Extrapolate,
+    Extrapolate {
+        /// The selection anchor/cursor at the moment Extrapolate mode was entered.
+        /// These define the seed range — only cells within this rectangle are used
+        /// as sources for inference. Cells outside this rectangle (added by arrow
+        /// extension) are targets and will be overwritten.
+        seed_anchor: SheetCursor,
+        seed_cursor: SheetCursor,
+    },
     /// Interactive duplicate: arrow keys extend the selection, Enter duplicates, Esc cancels.
     Duplicate,
 }
@@ -1339,8 +1346,13 @@ impl App {
                 }
                 // Enter extrapolate mode even when there is only a single
                 // selected cell (or when there was no prior selection).
+                // Save the current anchor/cursor as the seed range so that
+                // only these cells are used as inference sources; any cells
+                // added by arrow-key extension become targets.
+                let seed_anchor = self.anchor.unwrap();
+                let seed_cursor = self.cursor;
                 self.status = "Use arrows to extend selection, Enter to extrapolate, Esc to cancel".into();
-                Mode::Extrapolate
+                Mode::Extrapolate { seed_anchor, seed_cursor }
             }
             MenuAction::SortView => Mode::SortView {
                 buffer: self.start_input_mode(String::new()),
@@ -3874,185 +3886,137 @@ impl App {
             return None;
         }
         let (rows, cols) = self.current_selection_range()?;
+
+        let (seed_anchor, seed_cursor) = match &self.mode {
+            Mode::Extrapolate { seed_anchor, seed_cursor } => (*seed_anchor, *seed_cursor),
+            _ => return None,
+        };
+        let seed_r0 = seed_anchor.row.min(seed_cursor.row);
+        let seed_r1 = seed_anchor.row.max(seed_cursor.row);
+        let seed_c0 = seed_anchor.col.min(seed_cursor.col);
+        let seed_c1 = seed_anchor.col.max(seed_cursor.col);
+
+        let seed_main_r0 = (seed_r0 - HEADER_ROWS) as u32;
+        let seed_main_r1 = (seed_r1 - HEADER_ROWS) as u32;
+        let seed_main_c0 = (seed_c0 - MARGIN_COLS) as u32;
+        let seed_main_c1 = (seed_c1 - MARGIN_COLS) as u32;
+
         let mut cells = Vec::new();
         let mut filled: HashSet<(u32, u32)> = HashSet::new();
         let main_cols = self.state.grid.main_cols() as u32;
         let main_rows = self.state.grid.main_rows() as u32;
 
+        // ── Row-wise (horizontal) extrapolation ──
+        // Only rows within the saved seed range contribute seeds.
         for &r in &rows {
             if r < HEADER_ROWS {
+                continue;
+            }
+            if r < seed_r0 || r > seed_r1 {
                 continue;
             }
             let main_row = (r - HEADER_ROWS) as u32;
             if main_row >= main_rows {
                 continue;
             }
+            // Collect seeds from cells within the seed column range.
             let mut seed = Vec::new();
-            let mut last_seed_col: Option<u32> = None;
-            for &c in &cols {
-                if c < MARGIN_COLS {
-                    continue;
+            for mc in seed_main_c0..=seed_main_c1 {
+                if mc >= main_cols {
+                    break;
                 }
-                let main_col = (c - MARGIN_COLS) as u32;
-                if main_col >= main_cols {
-                    continue;
-                }
-                let addr = CellAddr::Main {
-                    row: main_row,
-                    col: main_col,
-                };
+                let addr = CellAddr::Main { row: main_row, col: mc };
                 if let Some(v) = self.state.grid.get(&addr) {
                     if !v.is_empty() {
                         seed.push(v.to_string());
-                        last_seed_col = Some(main_col);
                     }
                 }
             }
-            // Allow a single-cell seed: when there is no multi-cell selection
-            // treat the current cell as the extrapolate source (copy/fill behavior).
-            if seed.len() >= 1 {
-                if let Some(last_col) = last_seed_col {
-                    // A simpler approach: recompute first_seed_col by scanning cols
-                    let mut first_seed_col: Option<u32> = None;
-                    for &c in &cols {
-                        if c < MARGIN_COLS {
-                            continue;
-                        }
-                        let main_col = (c - MARGIN_COLS) as u32;
-                        if main_col >= main_cols {
-                            continue;
-                        }
-                        let addr = CellAddr::Main { row: main_row, col: main_col };
-                        if let Some(v) = self.state.grid.get(&addr) {
-                            if !v.is_empty() {
-                                first_seed_col = Some(main_col);
-                                break;
-                            }
-                        }
+            let last_col = seed_main_c1.min(main_cols.saturating_sub(1));
+            if !seed.is_empty() {
+                for &c in &cols {
+                    if c < MARGIN_COLS {
+                        continue;
                     }
-                    let first_col = first_seed_col.unwrap_or(last_col);
-
-                    for &c in &cols {
-                        if c < MARGIN_COLS {
-                            continue;
-                        }
-                        let main_col = (c - MARGIN_COLS) as u32;
-                        if main_col >= main_cols {
-                            continue;
-                        }
-                        // Skip columns that are inside the seeded range.
-                        if main_col >= first_col && main_col <= last_col {
-                            continue;
-                        }
-                        let addr = CellAddr::Main {
-                            row: main_row,
-                            col: main_col,
-                        };
-                        if filled.contains(&(main_row, main_col)) {
-                            continue;
-                        }
-                        if self.state.grid.get(&addr).map_or(true, |v| v.is_empty()) {
-                            let offset = main_col as i32 - last_col as i32;
-                            if let Some(value) = crate::extrapolate::infer_fill_value(
-                                &seed,
-                                offset,
-                                crate::extrapolate::FillDirection::Right,
-                                main_cols as usize,
-                            ) {
-                                filled.insert((main_row, main_col));
-                                cells.push((addr, value));
-                            }
-                        }
+                    let main_col = (c - MARGIN_COLS) as u32;
+                    if main_col >= main_cols {
+                        continue;
+                    }
+                    // Skip columns inside the seed column range.
+                    if main_col >= seed_main_c0 && main_col <= seed_main_c1 {
+                        continue;
+                    }
+                    let addr = CellAddr::Main { row: main_row, col: main_col };
+                    if filled.contains(&(main_row, main_col)) {
+                        continue;
+                    }
+                    let offset = main_col as i32 - last_col as i32;
+                    if let Some(value) = crate::extrapolate::infer_fill_value(
+                        &seed,
+                        offset,
+                        crate::extrapolate::FillDirection::Right,
+                        main_cols as usize,
+                    ) {
+                        filled.insert((main_row, main_col));
+                        cells.push((addr, value));
                     }
                 }
             }
         }
 
+        // ── Column-wise (vertical) extrapolation ──
+        // Only columns within the saved seed range contribute seeds.
         for &c in &cols {
             if c < MARGIN_COLS {
+                continue;
+            }
+            if c < seed_c0 || c > seed_c1 {
                 continue;
             }
             let main_col = (c - MARGIN_COLS) as u32;
             if main_col >= main_cols {
                 continue;
             }
+            // Collect seeds from cells within the seed row range.
             let mut seed = Vec::new();
-            let mut last_seed_row: Option<u32> = None;
-            for &r in &rows {
-                if r < HEADER_ROWS {
-                    continue;
+            for mr in seed_main_r0..=seed_main_r1 {
+                if mr >= main_rows {
+                    break;
                 }
-                let main_row = (r - HEADER_ROWS) as u32;
-                if main_row >= main_rows {
-                    continue;
-                }
-                let addr = CellAddr::Main {
-                    row: main_row,
-                    col: main_col,
-                };
+                let addr = CellAddr::Main { row: mr, col: main_col };
                 if let Some(v) = self.state.grid.get(&addr) {
                     if !v.is_empty() {
                         seed.push(v.to_string());
-                        last_seed_row = Some(main_row);
                     }
                 }
             }
-            // Allow a single-cell seed: when there is no multi-cell selection
-            // treat the current cell as the extrapolate source (copy/fill behavior).
-            if seed.len() >= 1 {
-                if let Some(last_row) = last_seed_row {
-                    // Determine first seeded row for this column to allow
-                    // backward extrapolation above the seeded range.
-                    let mut first_seed_row: Option<u32> = None;
-                    for &r in &rows {
-                        if r < HEADER_ROWS {
-                            continue;
-                        }
-                        let main_row = (r - HEADER_ROWS) as u32;
-                        if main_row >= main_rows {
-                            continue;
-                        }
-                        let addr = CellAddr::Main { row: main_row, col: main_col };
-                        if let Some(v) = self.state.grid.get(&addr) {
-                            if !v.is_empty() {
-                                first_seed_row = Some(main_row);
-                                break;
-                            }
-                        }
+            let last_row = seed_main_r1.min(main_rows.saturating_sub(1));
+            if !seed.is_empty() {
+                for &r in &rows {
+                    if r < HEADER_ROWS {
+                        continue;
                     }
-                    let first_row = first_seed_row.unwrap_or(last_row);
-
-                    for &r in &rows {
-                        if r < HEADER_ROWS {
-                            continue;
-                        }
-                        let main_row = (r - HEADER_ROWS) as u32;
-                        if main_row >= main_rows {
-                            continue;
-                        }
-                        // Skip rows inside the seeded span
-                        if main_row >= first_row && main_row <= last_row {
-                            continue;
-                        }
-                        let addr = CellAddr::Main {
-                            row: main_row,
-                            col: main_col,
-                        };
-                        if filled.contains(&(main_row, main_col)) {
-                            continue;
-                        }
-                        if self.state.grid.get(&addr).map_or(true, |v| v.is_empty()) {
-                            let offset = main_row as i32 - last_row as i32;
-                            if let Some(value) = crate::extrapolate::infer_fill_value(
-                                &seed,
-                                offset,
-                                crate::extrapolate::FillDirection::Down,
-                                main_cols as usize,
-                            ) {
-                                filled.insert((main_row, main_col));
-                                cells.push((addr, value));
-                            }
-                        }
+                    let main_row = (r - HEADER_ROWS) as u32;
+                    if main_row >= main_rows {
+                        continue;
+                    }
+                    // Skip rows inside the seed row range.
+                    if main_row >= seed_main_r0 && main_row <= seed_main_r1 {
+                        continue;
+                    }
+                    let addr = CellAddr::Main { row: main_row, col: main_col };
+                    if filled.contains(&(main_row, main_col)) {
+                        continue;
+                    }
+                    let offset = main_row as i32 - last_row as i32;
+                    if let Some(value) = crate::extrapolate::infer_fill_value(
+                        &seed,
+                        offset,
+                        crate::extrapolate::FillDirection::Down,
+                        main_cols as usize,
+                    ) {
+                        filled.insert((main_row, main_col));
+                        cells.push((addr, value));
                     }
                 }
             }
@@ -9395,7 +9359,7 @@ impl App {
                 g.set(&addr, buffer.clone());
             }
             preview_grid = Some(g);
-        } else if matches!(self.mode, Mode::Extrapolate) {
+        } else if matches!(self.mode, Mode::Extrapolate { .. }) {
             // Show extrapolation preview: compute candidate fills and overlay
             // them into a cloned grid so the user can see predicted values.
             // Also record the addresses we wrote so rendering can highlight
@@ -9876,7 +9840,7 @@ impl App {
                         let mut st_src = if is_cur_src {
                             Style::default().bg(Color::DarkGray)
                         } else if sel_src {
-                            if matches!(self.mode, Mode::Extrapolate) && formatted.trim().is_empty() {
+                            if matches!(self.mode, Mode::Extrapolate { .. }) && formatted.trim().is_empty() {
                                 Style::default().add_modifier(Modifier::REVERSED)
                             } else {
                                 Style::default().bg(Color::Blue)
@@ -9884,7 +9848,7 @@ impl App {
                         } else {
                             Style::default()
                         };
-                        if matches!(self.mode, Mode::Extrapolate) {
+                        if matches!(self.mode, Mode::Extrapolate { .. }) {
                             if let Some(ref s) = previewed_addrs {
                                 let src_addr = SheetCursor { row: r, col: c }.to_addr(grid);
                                 if s.contains(&src_addr) {
@@ -10021,7 +9985,7 @@ impl App {
                 let mut st = if is_cur {
                     Style::default().bg(Color::DarkGray)
                 } else if sel {
-                    if matches!(self.mode, Mode::Extrapolate) && formatted.trim().is_empty() {
+                    if matches!(self.mode, Mode::Extrapolate { .. }) && formatted.trim().is_empty() {
                         Style::default().add_modifier(Modifier::REVERSED)
                     } else {
                         Style::default().bg(Color::Blue)
@@ -10031,7 +9995,7 @@ impl App {
                 } else {
                     Style::default()
                 };
-                if matches!(self.mode, Mode::Extrapolate) {
+                if matches!(self.mode, Mode::Extrapolate { .. }) {
                     if let Some(ref s) = previewed_addrs {
                         let cur_addr = SheetCursor { row: r, col: c }.to_addr(grid);
                         if s.contains(&cur_addr) {
@@ -10315,7 +10279,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 "  Tab/Shift+Tab·move focus   Enter/Space·select   Esc·cancel".into()
             }
             Mode::FormatDecimals { .. } => "  type decimals   Enter·apply   Esc·cancel".into(),
-            Mode::Extrapolate => {
+            Mode::Extrapolate { .. } => {
                 "  arrows·extend selection   Enter·extrapolate   Esc·cancel".into()
             }
             Mode::Duplicate => {
@@ -11796,7 +11760,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 }
                 _ => {}
             },
-            Mode::Extrapolate => match key.code {
+            Mode::Extrapolate { .. } => match key.code {
                 KeyCode::Enter => {
                     if let Some(op) = self.extrapolate_selection() {
                         let _ = self.apply_single_op(op);
@@ -13104,7 +13068,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 .style(Style::default().fg(Color::White).bg(Color::Blue)),
             Mode::About => Paragraph::new(" About - Up/Down scroll, Esc closes ")
                 .style(Style::default().fg(Color::White).bg(Color::Blue)),
-            Mode::Extrapolate | Mode::Duplicate | Mode::Menu { .. } | Mode::Normal | Mode::RevisionBrowse => {
+            Mode::Extrapolate { .. } | Mode::Duplicate | Mode::Menu { .. } | Mode::Normal | Mode::RevisionBrowse => {
                 let prompt_cyan = Style::default().fg(Color::Cyan);
                 let prompt_cyan_bold = prompt_cyan.add_modifier(Modifier::BOLD);
                 let formula = if matches!(&self.mode, Mode::Menu { .. }) {
@@ -17659,7 +17623,10 @@ mod tests {
         };
         // Enter extrapolate mode (menu action would set anchor if none)
         app.anchor = Some(app.cursor);
-        app.mode = Mode::Extrapolate;
+        app.mode = Mode::Extrapolate {
+            seed_anchor: app.anchor.unwrap(),
+            seed_cursor: app.cursor,
+        };
 
         // Simulate Right key press
         let key = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
@@ -17678,7 +17645,10 @@ mod tests {
             col: MARGIN_COLS,
         };
         app.anchor = Some(app.cursor);
-        app.mode = Mode::Extrapolate;
+        app.mode = Mode::Extrapolate {
+            seed_anchor: app.anchor.unwrap(),
+            seed_cursor: app.cursor,
+        };
 
         let key = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
         let _ = app.handle_key(key).unwrap();

@@ -1,22 +1,31 @@
-FILE: subtotal.corro
+FILE: docs/corrocorro.cast
+TITLE: Two corros at once
+DESC: Demonstrating two corro instances editing the same file.
+
+FILE: docs/watch.cast
+TITLE: Live Data
+DESC: Demonstrating that corro can reload a tsv when it changes, essentially allowing corro to edit live data.
+
+FILE: docs/tests/subtotal.corro
 TITLE: Subtotals and Summary Labels
 DESC: Demonstrates subtotal markers, summary formulas. With a single entry in the left margin you can create a subtotal or grand total column. No need to worry about the grand total double counting the data by summing the subtotals AND the original data. It is all automatic.
 
-FILE: bal2.corro
+
+FILE: docs/tests/bal2.corro
 TITLE: Automated Balance Report
 DESC: Demonstrates BALANCE_REPORT generation and sign-based grouping for reconciliation-style outputs. This is useful for matching up each reimbursement with the corresponsing set of expense(s).
 
-FILE: docs/tests/main.corro
-TITLE: Formula Feature Tour
-DESC: Provides a broad sweep of math, text, date, lookup, logic, and dynamic-array style formula usage.
+#FILE: docs/tests/main.corro
+#TITLE: Formula Feature Tour
+#DESC: Provides a broad sweep of math, text, date, lookup, logic, and dynamic-array style formula usage.
 
 # Optional cast playback demo (asciinema required):
-FILE: docs/corro.cast
-TITLE: Recorded Corro Walkthrough
-DESC: Plays back an asciinema recording to demonstrate scripted terminal playback support alongside .corro movies.
+# FILE: docs/corro.cast
+# TITLE: Recorded Corro Walkthrough
+# DESC: Plays back an asciinema recording to demonstrate scripted terminal playback support alongside .corro movies.
 
 # Overflow:
-FILE: docs/test/overflow.corro
+FILE: docs/tests/overflow_short.corro
 TITLE: Text Overlow
 DESC: Text can overflow to the next cell if it is empty
 

@@ -166,7 +166,10 @@ pub fn all_dialog_specs() -> Vec<DialogSpec> {
             }
             app.status =
                 "Use arrows to extend selection, Enter to extrapolate, Esc to cancel".into();
-            app.mode = Mode::Extrapolate;
+            app.mode = Mode::Extrapolate {
+                seed_anchor: app.anchor.unwrap(),
+                seed_cursor: app.cursor,
+            };
         }),
     });
 
