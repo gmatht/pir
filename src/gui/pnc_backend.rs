@@ -107,8 +107,6 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     // ── Visible columns (matching ratatui's visible_col_indices) ──────
     let hr = HEADER_ROWS;
-    let mr = app.core.workbook.active_sheet().grid.main_rows();
-    let mc = app.core.workbook.active_sheet().grid.main_cols();
 
     let display_cursor_row = HEADER_ROWS;
     let display_cursor_col = MARGIN_COLS;
@@ -133,9 +131,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     {
         let sht = app.core.workbook.active_sheet_mut();
         let grd = &mut sht.grid;
-        // Match ratatui's fit_visible_columns_capped (proportional allocation)
-        // then trim columns that don't fit.
-        crate::ui_core::fit_visible_columns_capped(grd, &col_ixs, cursor.col, data_width);
+        // Match ratatui: trim columns that don't fit (no proportional refit).
         crate::ui_core::trim_visible_cols_to_width(grd, &mut col_ixs, cursor.col, data_width);
     }
 
@@ -353,12 +349,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 let new_mc = rec.grid.main_cols();
                 let (mut new_ixs, _) =
                     crate::ui_core::visible_col_indices(&rec, cursor, data_cols_cb, 0);
-                // Fit and trim columns on the live grid so the clone inherits the widths.
+                // Trim columns to fit (matching ratatui: no proportional refit).
                 {
                     let sht = app.core.workbook.active_sheet_mut();
-                    crate::ui_core::fit_visible_columns_capped(
-                        &mut sht.grid, &new_ixs, cursor.col, data_width_cb,
-                    );
                     crate::ui_core::trim_visible_cols_to_width(
                         &mut sht.grid, &mut new_ixs, cursor.col, data_width_cb,
                     );
@@ -489,12 +482,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 let cursor = app.core.cursor;
                 let (mut new_ixs, _) =
                     crate::ui_core::visible_col_indices(&rec, cursor, data_cols_cb, 0);
-                // Fit and trim columns on the live grid so the clone inherits the widths.
+                // Trim columns to fit (matching ratatui: no proportional refit).
                 {
                     let sht = app.core.workbook.active_sheet_mut();
-                    crate::ui_core::fit_visible_columns_capped(
-                        &mut sht.grid, &new_ixs, cursor.col, data_width_cb,
-                    );
                     crate::ui_core::trim_visible_cols_to_width(
                         &mut sht.grid, &mut new_ixs, cursor.col, data_width_cb,
                     );
@@ -532,12 +522,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 let cursor = app.core.cursor;
                 let (mut new_ixs, _) =
                     crate::ui_core::visible_col_indices(&rec, cursor, data_cols_cb, 0);
-                // Fit and trim columns on the live grid so the clone inherits the widths.
+                // Trim columns to fit (matching ratatui: no proportional refit).
                 {
                     let sht = app.core.workbook.active_sheet_mut();
-                    crate::ui_core::fit_visible_columns_capped(
-                        &mut sht.grid, &new_ixs, cursor.col, data_width_cb,
-                    );
                     crate::ui_core::trim_visible_cols_to_width(
                         &mut sht.grid, &mut new_ixs, cursor.col, data_width_cb,
                     );
