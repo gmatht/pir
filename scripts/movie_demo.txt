@@ -14,3 +14,10 @@ DESC: Provides a broad sweep of math, text, date, lookup, logic, and dynamic-arr
 FILE: docs/corro.cast
 TITLE: Recorded Corro Walkthrough
 DESC: Plays back an asciinema recording to demonstrate scripted terminal playback support alongside .corro movies.
+
+# Overflow:
+FILE: docs/test/overflow.corro
+TITLE: Text Overlow
+DESC: Text can overflow to the next cell if it is empty
+
+

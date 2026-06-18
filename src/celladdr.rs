@@ -161,7 +161,7 @@ impl CellRef {
     }
 
     /// Build a CellRef from an existing grid::CellAddr (useful for serializing).
-    pub fn from_grid(addr: &CellAddr, main_cols: usize) -> CellRef {
+    pub fn from_grid(addr: &CellAddr, _main_cols: usize) -> CellRef {
         match addr {
             CellAddr::Header { row, col } => match col {
                 ColumnAddr::Left(idx) => CellRef {

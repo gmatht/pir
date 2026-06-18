@@ -14,6 +14,7 @@ pub const KEY_HOME: u32 = 0xFF50;
 pub const KEY_END: u32 = 0xFF57;
 pub const KEY_PAGE_UP: u32 = 0xFF55;
 pub const KEY_PAGE_DOWN: u32 = 0xFF56;
+pub const KEY_F1: u32 = 0xFFBE;
 pub const KEY_F2: u32 = 0xFFBF;
 
 pub enum EditAction {

@@ -111,17 +111,17 @@ fn render_has_menu_and_cell_text() {
 }
 
 #[test]
-fn arrow_down_shows_a2() {
+fn arrow_down_shows_a3() {
     let pane = run_in_tmux("--pancurses docs/tests/overflow.corro", &["Down"], 1200);
-    assert!(pane.contains("A2"),
-        "formula bar should show A2 after Down\n---\n{}\n---", &pane[..pane.len().min(5000)]);
+    assert!(pane.contains("A3"),
+        "formula bar should show A3 after Down from A2\n---\n{}\n---", &pane[..pane.len().min(5000)]);
 }
 
 #[test]
-fn right_arrow_shows_b1() {
+fn right_arrow_shows_b2() {
     let pane = run_in_tmux("--pancurses docs/tests/overflow.corro", &["Right"], 1200);
-    assert!(pane.contains("B1"),
-        "formula bar should show B1 after Right\n---\n{}\n---", &pane[..pane.len().min(5000)]);
+    assert!(pane.contains("B2"),
+        "formula bar should show B2 after Right from A2\n---\n{}\n---", &pane[..pane.len().min(5000)]);
 }
 
 #[test]

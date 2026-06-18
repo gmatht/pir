@@ -1380,60 +1380,14 @@ impl App {
                 self.help_scroll = 0;
                 Mode::Help
             }
-            MenuAction::FormatApplyAll => {
-                self.pending_format_target = Some(FormatTarget::All);
-                Mode::Menu {
-                    stack: vec![MenuLevel {
-                        section: MenuSection::Format,
-                        item: 0,
-                    }],
-                }
-            }
+            MenuAction::FormatApplyAll => self.apply_format_target(FormatTarget::All),
             MenuAction::FormatApplyFullColumn => {
-                self.pending_format_target = Some(FormatTarget::FullColumn);
-                Mode::Menu {
-                    stack: vec![MenuLevel {
-                        section: MenuSection::Format,
-                        item: 0,
-                    }],
-                }
+                self.apply_format_target(FormatTarget::FullColumn)
             }
-            MenuAction::FormatApplyData => {
-                self.pending_format_target = Some(FormatTarget::Data);
-                Mode::Menu {
-                    stack: vec![MenuLevel {
-                        section: MenuSection::Format,
-                        item: 0,
-                    }],
-                }
-            }
-            MenuAction::FormatApplySpecial => {
-                self.pending_format_target = Some(FormatTarget::Special);
-                Mode::Menu {
-                    stack: vec![MenuLevel {
-                        section: MenuSection::Format,
-                        item: 0,
-                    }],
-                }
-            }
-            MenuAction::FormatApplyCell => {
-                self.pending_format_target = Some(FormatTarget::Cell);
-                Mode::Menu {
-                    stack: vec![MenuLevel {
-                        section: MenuSection::Format,
-                        item: 0,
-                    }],
-                }
-            }
-            MenuAction::FormatApplySelection => {
-                self.pending_format_target = Some(FormatTarget::Selection);
-                Mode::Menu {
-                    stack: vec![MenuLevel {
-                        section: MenuSection::Format,
-                        item: 0,
-                    }],
-                }
-            }
+            MenuAction::FormatApplyData => self.apply_format_target(FormatTarget::Data),
+            MenuAction::FormatApplySpecial => self.apply_format_target(FormatTarget::Special),
+            MenuAction::FormatApplyCell => self.apply_format_target(FormatTarget::Cell),
+            MenuAction::FormatApplySelection => self.apply_format_target(FormatTarget::Selection),
             MenuAction::FormatCurrency => Mode::FormatDecimals {
                 buffer: self.start_input_mode(String::new()),
                 decimals_for: FormatDecimalsFor::Currency,
@@ -8030,10 +7984,7 @@ impl App {
         let data = self.do_export(csv);
         let ext = if csv { "csv" } else { "tsv" };
         if filename.trim().is_empty() {
-            match copy_to_clipboard(&data) {
-                Ok(()) => self.status = format!("{} copied to clipboard", ext.to_uppercase()),
-                Err(e) => self.status = format!("Clipboard error: {e}"),
-            }
+            self.copy_with_status(&data, &format!("{} copied to clipboard", ext.to_uppercase()));
         } else {
             match std::fs::write(filename.trim(), &data) {
                 Ok(()) => self.status = format!("Exported {} to {filename}", ext.to_uppercase()),
@@ -9083,6 +9034,15 @@ impl App {
                 self.cursor.clamp(&self.state.grid);
                 return Ok(true);
             }
+            crate::ops::WorkbookOp::DeleteSheet { .. } => {
+                crate::ops::apply_workbook_op(&mut self.workbook, active_sheet, op)
+                    .map_err(IoError::from)?;
+                self.view_sheet_id = *active_sheet;
+                self.sync_active_sheet_cache();
+                self.ops_applied += 1;
+                self.cursor.clamp(&self.state.grid);
+                return Ok(true);
+            }
         }
         Ok(false)
     }
@@ -9500,12 +9460,9 @@ impl App {
         // ── Formula bar ───────────────────────────────────────────────────────
         let addr = self.cursor.to_addr(grid);
         let edit_addr = self.edit_target_addr.clone().unwrap_or(addr.clone());
-        let prompt_style = Style::default().fg(Color::White).bg(Color::DarkGray);
+        let prompt_style = Self::prompt_style();
         let prompt_style_bold = prompt_style.add_modifier(Modifier::BOLD);
-        let caret_style = Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
-            .add_modifier(Modifier::BOLD);
+        let caret_style = Self::caret_style();
         let formula_widget = self.mode_prompt_widget(
             grid,
             &addr,
@@ -9517,7 +9474,7 @@ impl App {
         f.render_widget(formula_widget, formula_area);
 
         if has_tabs {
-            let tab_style = Style::default().fg(Color::White).bg(Color::DarkGray);
+            let tab_style = Self::tab_style();
             let active_style = Style::default()
                 .fg(Color::Black)
                 .bg(Color::Yellow)
@@ -10222,7 +10179,7 @@ impl App {
         self.draw_visual(f);
     }
 
-    fn hints_line(&self) -> String {
+    pub fn hints_line(&self) -> String {
         match &self.mode {
             Mode::Normal => {
                 if self.anchor.is_some() {
@@ -11188,7 +11145,6 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             Mode::Menu { .. } => {}
             Mode::Replace { buffer } => match key.code {
                 KeyCode::Enter => {
-                    self.input_cursor = None;
                     if let Some((find, repl)) = Self::parse_replace_spec(buffer) {
                         if find.is_empty() {
                             self.status = "Replace: text before | is required (example: old|new)".into();
@@ -11204,7 +11160,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                         self.status =
                             "Replace: use old|new (example: search|replace)".into();
                     }
-                    mode = Mode::Normal;
+                    mode = self.exit_to_normal();
                 }
                 KeyCode::Esc => mode = Mode::Normal,
                 _ if Self::handle_plain_text_input_key(
@@ -11216,9 +11172,8 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             },
             Mode::SheetRename { buffer, .. } => match key.code {
                 KeyCode::Enter => {
-                    self.input_cursor = None;
                     self.rename_current_sheet(buffer.clone())?;
-                    mode = Mode::Normal;
+                    mode = self.exit_to_normal();
                 }
                 KeyCode::Esc => mode = Mode::Normal,
                 _ if Self::handle_plain_text_input_key(
@@ -11230,9 +11185,8 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             },
             Mode::SheetCopy { buffer, .. } => match key.code {
                 KeyCode::Enter => {
-                    self.input_cursor = None;
                     self.copy_current_sheet(buffer.clone())?;
-                    mode = Mode::Normal;
+                    mode = self.exit_to_normal();
                 }
                 KeyCode::Esc => mode = Mode::Normal,
                 _ if Self::handle_plain_text_input_key(
@@ -11244,9 +11198,8 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             },
             Mode::GoToCell { buffer } => match key.code {
                 KeyCode::Enter => {
-                    self.input_cursor = None;
                     self.go_to_cell(buffer);
-                    mode = Mode::Normal;
+                    mode = self.exit_to_normal();
                 }
                 KeyCode::Esc => mode = Mode::Normal,
                 _ if Self::handle_plain_text_input_key(
@@ -11259,82 +11212,20 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             Mode::ExportTsv { buffer } => {
                 if key.modifiers.contains(KeyModifiers::ALT) {
                     if let KeyCode::Char(ch) = key.code {
-                        match ch {
-                            'h' | 'H' => {
-                                self.export_delimited_options.include_header_row =
-                                    !self.export_delimited_options.include_header_row;
-                                self.status = if self.export_delimited_options.include_header_row {
-                                    "Column header row: on".into()
-                                } else {
-                                    "Column header row: off".into()
-                                };
-                            }
-                            'm' | 'M' => {
-                                self.export_delimited_options.include_margins =
-                                    !self.export_delimited_options.include_margins;
-                                self.status = if self.export_delimited_options.include_margins {
-                                    "Row/column margin labels: on".into()
-                                } else {
-                                    "Row/column margin labels: off".into()
-                                };
-                            }
-                            'r' | 'R' => {
-                                self.export_delimited_options.include_row_label_column =
-                                    !self.export_delimited_options.include_row_label_column;
-                                self.status = if self.export_delimited_options
-                                    .include_row_label_column
-                                {
-                                    "Left row# column: on".into()
-                                } else {
-                                    "Left row# column: off".into()
-                                };
-                            }
-                            'f' | 'F' => {
-                                self.export_delimited_options.content = export::ExportContent::Formulas;
-                                self.status = "Export: formulas (stored text)".into();
-                            }
-                            'v' | 'V' => {
-                                self.export_delimited_options.content = export::ExportContent::Values;
-                                self.status = "Export: values (calculated)".into();
-                            }
-                            'g' | 'G' => {
-                                self.export_delimited_options.content = export::ExportContent::Generic;
-                                self.status = "Export: generic (labels + =interop)".into();
-                            }
-                            'x' | 'X' => {
-                                match copy_to_clipboard(&self.do_export(false)) {
-                                    Ok(()) => {
-                                        self.status = "TSV export copied to clipboard".into();
-                                    }
-                                    Err(e) => {
-                                        self.status = format!("Clipboard error: {e}");
-                                    }
-                                }
-                                self.input_cursor = None;
-                                mode = Mode::Normal;
-                            }
-                            _ => {}
+                        self.handle_export_delimited_alt(ch);
+                        if let 'x' | 'X' = ch {
+                            let data = self.do_export(false);
+                            self.copy_with_status(&data, "TSV export copied to clipboard");
+                            mode = self.exit_to_normal();
                         }
                     }
                 } else {
                     match key.code {
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            self.export_preview_scroll = self.export_preview_scroll.saturating_sub(1);
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            self.export_preview_scroll = self.export_preview_scroll.saturating_add(1);
-                        }
-                        KeyCode::PageUp => {
-                            self.export_preview_scroll = self.export_preview_scroll.saturating_sub(20);
-                        }
-                        KeyCode::PageDown => {
-                            self.export_preview_scroll = self.export_preview_scroll.saturating_add(20);
-                        }
+                        _ if self.handle_export_scroll(key.code) => {}
                         KeyCode::Enter => {
                             let fname = buffer.clone();
                             self.finish_export(false, &fname);
-                            self.input_cursor = None;
-                            mode = Mode::Normal;
+                            mode = self.exit_to_normal();
                         }
                         KeyCode::Esc => mode = Mode::Normal,
                         _ if Self::handle_plain_text_input_key(
@@ -11349,82 +11240,20 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             Mode::ExportCsv { buffer } => {
                 if key.modifiers.contains(KeyModifiers::ALT) {
                     if let KeyCode::Char(ch) = key.code {
-                        match ch {
-                            'h' | 'H' => {
-                                self.export_delimited_options.include_header_row =
-                                    !self.export_delimited_options.include_header_row;
-                                self.status = if self.export_delimited_options.include_header_row {
-                                    "Column header row: on".into()
-                                } else {
-                                    "Column header row: off".into()
-                                };
-                            }
-                            'm' | 'M' => {
-                                self.export_delimited_options.include_margins =
-                                    !self.export_delimited_options.include_margins;
-                                self.status = if self.export_delimited_options.include_margins {
-                                    "Row/column margin labels: on".into()
-                                } else {
-                                    "Row/column margin labels: off".into()
-                                };
-                            }
-                            'r' | 'R' => {
-                                self.export_delimited_options.include_row_label_column =
-                                    !self.export_delimited_options.include_row_label_column;
-                                self.status = if self.export_delimited_options
-                                    .include_row_label_column
-                                {
-                                    "Left row# column: on".into()
-                                } else {
-                                    "Left row# column: off".into()
-                                };
-                            }
-                            'f' | 'F' => {
-                                self.export_delimited_options.content = export::ExportContent::Formulas;
-                                self.status = "Export: formulas (stored text)".into();
-                            }
-                            'v' | 'V' => {
-                                self.export_delimited_options.content = export::ExportContent::Values;
-                                self.status = "Export: values (calculated)".into();
-                            }
-                            'g' | 'G' => {
-                                self.export_delimited_options.content = export::ExportContent::Generic;
-                                self.status = "Export: generic (labels + =interop)".into();
-                            }
-                            'x' | 'X' => {
-                                match copy_to_clipboard(&self.do_export(true)) {
-                                    Ok(()) => {
-                                        self.status = "CSV export copied to clipboard".into();
-                                    }
-                                    Err(e) => {
-                                        self.status = format!("Clipboard error: {e}");
-                                    }
-                                }
-                                self.input_cursor = None;
-                                mode = Mode::Normal;
-                            }
-                            _ => {}
+                        self.handle_export_delimited_alt(ch);
+                        if let 'x' | 'X' = ch {
+                            let data = self.do_export(true);
+                            self.copy_with_status(&data, "CSV export copied to clipboard");
+                            mode = self.exit_to_normal();
                         }
                     }
                 } else {
                     match key.code {
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            self.export_preview_scroll = self.export_preview_scroll.saturating_sub(1);
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            self.export_preview_scroll = self.export_preview_scroll.saturating_add(1);
-                        }
-                        KeyCode::PageUp => {
-                            self.export_preview_scroll = self.export_preview_scroll.saturating_sub(20);
-                        }
-                        KeyCode::PageDown => {
-                            self.export_preview_scroll = self.export_preview_scroll.saturating_add(20);
-                        }
+                        _ if self.handle_export_scroll(key.code) => {}
                         KeyCode::Enter => {
                             let fname = buffer.clone();
                             self.finish_export(true, &fname);
-                            self.input_cursor = None;
-                            mode = Mode::Normal;
+                            mode = self.exit_to_normal();
                         }
                         KeyCode::Esc => mode = Mode::Normal,
                         _ if Self::handle_plain_text_input_key(
@@ -11531,41 +11360,21 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                                 self.status = "Export: generic (labels + =interop)".into();
                             }
                             'x' | 'X' => {
-                                match copy_to_clipboard(&self.do_export_ascii()) {
-                                    Ok(()) => {
-                                        self.status = "ASCII table copied to clipboard".into();
-                                    }
-                                    Err(e) => {
-                                        self.status = format!("Clipboard error: {e}");
-                                    }
-                                }
-                                self.input_cursor = None;
-                                mode = Mode::Normal;
+                                let data = self.do_export_ascii();
+                                self.copy_with_status(&data, "ASCII table copied to clipboard");
+                                mode = self.exit_to_normal();
                             }
                             _ => {}
                         }
                     }
                 } else {
                     match key.code {
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            self.export_preview_scroll = self.export_preview_scroll.saturating_sub(1);
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            self.export_preview_scroll = self.export_preview_scroll.saturating_add(1);
-                        }
-                        KeyCode::PageUp => {
-                            self.export_preview_scroll = self.export_preview_scroll.saturating_sub(20);
-                        }
-                        KeyCode::PageDown => {
-                            self.export_preview_scroll = self.export_preview_scroll.saturating_add(20);
-                        }
+                        _ if self.handle_export_scroll(key.code) => {}
                         KeyCode::Enter => {
                             let fname = buffer.clone();
                             if fname.trim().is_empty() {
-                                match copy_to_clipboard(&self.do_export_ascii()) {
-                                    Ok(()) => self.status = "ASCII table copied to clipboard".into(),
-                                    Err(e) => self.status = format!("Clipboard error: {e}"),
-                                }
+                                let data = self.do_export_ascii();
+                                self.copy_with_status(&data, "ASCII table copied to clipboard");
                             } else {
                                 match std::fs::write(fname.trim(), self.do_export_ascii()) {
                                     Ok(()) => {
@@ -11609,18 +11418,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     }
                 } else {
                     match key.code {
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            self.export_preview_scroll = self.export_preview_scroll.saturating_sub(1);
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            self.export_preview_scroll = self.export_preview_scroll.saturating_add(1);
-                        }
-                        KeyCode::PageUp => {
-                            self.export_preview_scroll = self.export_preview_scroll.saturating_sub(20);
-                        }
-                        KeyCode::PageDown => {
-                            self.export_preview_scroll = self.export_preview_scroll.saturating_add(20);
-                        }
+                        _ if self.handle_export_scroll(key.code) => {}
                         KeyCode::Enter => {
                             let fname = buffer.clone();
                             if fname.trim().is_empty() {
@@ -11647,86 +11445,27 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             Mode::ExportAll { buffer } => {
                 if key.modifiers.contains(KeyModifiers::ALT) {
                     if let KeyCode::Char(ch) = key.code {
-                        match ch {
-                            'h' | 'H' => {
-                                self.export_delimited_options.include_header_row =
-                                    !self.export_delimited_options.include_header_row;
-                                self.status = if self.export_delimited_options.include_header_row {
-                                    "Column header row: on".into()
+                        self.handle_export_delimited_alt(ch);
+                        if let 'x' | 'X' = ch {
+                            let data = if self.anchor.is_some() {
+                                self.do_export_selection()
+                            } else {
+                                self.do_export_all()
+                            };
+                            self.copy_with_status(
+                                &data,
+                                if self.anchor.is_some() {
+                                    "Selection copied to clipboard"
                                 } else {
-                                    "Column header row: off".into()
-                                };
-                            }
-                            'm' | 'M' => {
-                                self.export_delimited_options.include_margins =
-                                    !self.export_delimited_options.include_margins;
-                                self.status = if self.export_delimited_options.include_margins {
-                                    "Row/column margin labels: on".into()
-                                } else {
-                                    "Row/column margin labels: off".into()
-                                };
-                            }
-                            'r' | 'R' => {
-                                self.export_delimited_options.include_row_label_column =
-                                    !self.export_delimited_options.include_row_label_column;
-                                self.status = if self.export_delimited_options
-                                    .include_row_label_column
-                                {
-                                    "Left row# column: on".into()
-                                } else {
-                                    "Left row# column: off".into()
-                                };
-                            }
-                            'f' | 'F' => {
-                                self.export_delimited_options.content = export::ExportContent::Formulas;
-                                self.status = "Export: formulas (stored text)".into();
-                            }
-                            'v' | 'V' => {
-                                self.export_delimited_options.content = export::ExportContent::Values;
-                                self.status = "Export: values (calculated)".into();
-                            }
-                            'g' | 'G' => {
-                                self.export_delimited_options.content = export::ExportContent::Generic;
-                                self.status = "Export: generic (labels + =interop)".into();
-                            }
-                            'x' | 'X' => {
-                                let data = if self.anchor.is_some() {
-                                    self.do_export_selection()
-                                } else {
-                                    self.do_export_all()
-                                };
-                                match copy_to_clipboard(&data) {
-                                    Ok(()) => {
-                                        self.status = if self.anchor.is_some() {
-                                            "Selection copied to clipboard".into()
-                                        } else {
-                                            "Full export copied to clipboard".into()
-                                        }
-                                    }
-                                    Err(e) => {
-                                        self.status = format!("Clipboard error: {e}");
-                                    }
-                                }
-                                self.input_cursor = None;
-                                mode = Mode::Normal;
-                            }
-                            _ => {}
+                                    "Full export copied to clipboard"
+                                },
+                            );
+                            mode = self.exit_to_normal();
                         }
                     }
                 } else {
                     match key.code {
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            self.export_preview_scroll = self.export_preview_scroll.saturating_sub(1);
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            self.export_preview_scroll = self.export_preview_scroll.saturating_add(1);
-                        }
-                        KeyCode::PageUp => {
-                            self.export_preview_scroll = self.export_preview_scroll.saturating_sub(20);
-                        }
-                        KeyCode::PageDown => {
-                            self.export_preview_scroll = self.export_preview_scroll.saturating_add(20);
-                        }
+                        _ if self.handle_export_scroll(key.code) => {}
                         KeyCode::Enter => {
                             let fname = buffer.clone();
                             if fname.trim().is_empty() {
@@ -11735,16 +11474,14 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                                 } else {
                                     self.do_export_all()
                                 };
-                                match copy_to_clipboard(&data) {
-                                    Ok(()) => {
-                                        self.status = if self.anchor.is_some() {
-                                            "Selection copied to clipboard".into()
-                                        } else {
-                                            "Full export copied to clipboard".into()
-                                        }
-                                    }
-                                    Err(e) => self.status = format!("Clipboard error: {e}"),
-                                }
+                                self.copy_with_status(
+                                    &data,
+                                    if self.anchor.is_some() {
+                                        "Selection copied to clipboard"
+                                    } else {
+                                        "Full export copied to clipboard"
+                                    },
+                                );
                             } else {
                                 let data = if self.anchor.is_some() {
                                     self.do_export_selection()
@@ -11762,8 +11499,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                                     Err(e) => self.status = format!("Write error: {e}"),
                                 }
                             }
-                            self.input_cursor = None;
-                            mode = Mode::Normal;
+                            mode = self.exit_to_normal();
                         }
                         KeyCode::Esc => mode = Mode::Normal,
                         _ if Self::handle_plain_text_input_key(
@@ -11798,8 +11534,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                         }
                         self.status = format!("Default column width set to {width}");
                     }
-                    self.input_cursor = None;
-                    mode = Mode::Normal;
+                    mode = self.exit_to_normal();
                 }
                 KeyCode::Esc => mode = Mode::Normal,
                 _ if Self::handle_plain_text_input_key(
@@ -11865,8 +11600,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                         }
                         self.status = format!("Column {col} width override cleared");
                     }
-                    self.input_cursor = None;
-                    mode = Mode::Normal;
+                    mode = self.exit_to_normal();
                 }
                 KeyCode::Esc => mode = Mode::Normal,
                 _ if Self::handle_plain_text_input_key(
@@ -11926,8 +11660,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     } else {
                         "View sort updated".into()
                     };
-                    self.input_cursor = None;
-                    mode = Mode::Normal;
+                    mode = self.exit_to_normal();
                 }
                 KeyCode::Esc => mode = Mode::Normal,
                 _ if Self::handle_plain_text_input_key(
@@ -12066,8 +11799,6 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             Mode::Extrapolate => match key.code {
                 KeyCode::Enter => {
                     if let Some(op) = self.extrapolate_selection() {
-                        // Use centralized helper to record inverse op and persist
-                        // when `self.path` is present.
                         let _ = self.apply_single_op(op);
                         self.status = "Extrapolated selection".into();
                     } else {
@@ -12080,67 +11811,17 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     self.anchor = None;
                     mode = Mode::Normal;
                 }
-                KeyCode::Left => {
-                    if self.anchor.is_none() {
-                        self.anchor = Some(self.cursor);
-                    }
-                    self.move_cursor_one_col_horizontal(false);
-                }
-                KeyCode::Right => {
-                    if self.anchor.is_none() {
-                        self.anchor = Some(self.cursor);
-                    }
-                    // If at the rightmost main column, grow the main area so the
-                    // extrapolation target becomes visible instead of being
-                    // clamped to the existing NAV_BLANK_COLS policy.
-                    let lm = MARGIN_COLS;
-                    let mc = self.state.grid.main_cols();
-                    let right_limit = lm + mc.saturating_sub(1);
-                    if self.cursor.col < right_limit {
-                        self.cursor.col = self.cursor.col.saturating_add(1);
-                    } else {
-                        self.state.grid.grow_main_col_at_right();
-                        self.cursor.col = self.cursor.col.saturating_add(1);
-                    }
-                    self.cursor.clamp(&self.state.grid);
-                    self.state
-                        .grid
-                        .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
-                }
-                KeyCode::Up => {
-                    if self.anchor.is_none() {
-                        self.anchor = Some(self.cursor);
-                    }
-                    self.move_cursor_one_row_vertical(false);
-                }
-                KeyCode::Down => {
-                    if self.anchor.is_none() {
-                        self.anchor = Some(self.cursor);
-                    }
-                    // If at the bottom main row, grow the main area so the
-                    // extrapolation target becomes visible instead of being
-                    // clamped to the existing NAV_BLANK_ROWS policy.
-                    let hr = HEADER_ROWS;
-                    let mr = self.state.grid.main_rows();
-                    let bottom_main = hr + mr.saturating_sub(1);
-                    if self.cursor.row < bottom_main {
-                        self.cursor.row = self.cursor.row.saturating_add(1);
-                    } else {
-                        self.state.grid.grow_main_row_at_bottom();
-                        self.cursor.row = self.cursor.row.saturating_add(1);
-                    }
-                    self.cursor.clamp(&self.state.grid);
-                    self.state
-                        .grid
-                        .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                _ if matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+                ) =>
+                {
+                    self.handle_selection_arrow(key.code);
                 }
                 _ => {}
             },
             Mode::Duplicate => match key.code {
                 KeyCode::Enter => {
-                    // Apply duplicate semantics: duplicate selected rows or
-                    // cols if the selection mode indicates, otherwise attempt
-                    // a mitosis for the current cursor.
                     if self.selection_kind == SelectionKind::Rows {
                         if let Ok(_) = self.insert_mitosis_row_after_cursor() {
                             self.status = "Duplicated selection".into();
@@ -12154,7 +11835,6 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                             self.status = "Nothing to duplicate".into();
                         }
                     } else {
-                        // Fallback: try duplicating the current cursor row/col
                         if let Ok(true) = self.insert_mitosis_row_after_cursor() {
                             self.status = "Duplicated row".into();
                         } else if let Ok(true) = self.insert_mitosis_col_after_cursor() {
@@ -12170,59 +11850,12 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     self.anchor = None;
                     mode = Mode::Normal;
                 }
-                KeyCode::Left => {
-                    if self.anchor.is_none() {
-                        self.anchor = Some(self.cursor);
-                    }
-                    self.move_cursor_one_col_horizontal(false);
-                }
-                KeyCode::Right => {
-                    if self.anchor.is_none() {
-                        self.anchor = Some(self.cursor);
-                    }
-                    // If at the rightmost main column, grow the main area so the
-                    // duplicate target becomes visible instead of being
-                    // clamped to the existing NAV_BLANK_COLS policy.
-                    let lm = MARGIN_COLS;
-                    let mc = self.state.grid.main_cols();
-                    let right_limit = lm + mc.saturating_sub(1);
-                    if self.cursor.col < right_limit {
-                        self.cursor.col = self.cursor.col.saturating_add(1);
-                    } else {
-                        self.state.grid.grow_main_col_at_right();
-                        self.cursor.col = self.cursor.col.saturating_add(1);
-                    }
-                    self.cursor.clamp(&self.state.grid);
-                    self.state
-                        .grid
-                        .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
-                }
-                KeyCode::Up => {
-                    if self.anchor.is_none() {
-                        self.anchor = Some(self.cursor);
-                    }
-                    self.move_cursor_one_row_vertical(false);
-                }
-                KeyCode::Down => {
-                    if self.anchor.is_none() {
-                        self.anchor = Some(self.cursor);
-                    }
-                    // If at the bottom main row, grow the main area so the
-                    // duplicate target becomes visible instead of being
-                    // clamped to the existing NAV_BLANK_ROWS policy.
-                    let hr = HEADER_ROWS;
-                    let mr = self.state.grid.main_rows();
-                    let bottom_main = hr + mr.saturating_sub(1);
-                    if self.cursor.row < bottom_main {
-                        self.cursor.row = self.cursor.row.saturating_add(1);
-                    } else {
-                        self.state.grid.grow_main_row_at_bottom();
-                        self.cursor.row = self.cursor.row.saturating_add(1);
-                    }
-                    self.cursor.clamp(&self.state.grid);
-                    self.state
-                        .grid
-                        .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                _ if matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+                ) =>
+                {
+                    self.handle_selection_arrow(key.code);
                 }
                 _ => {}
             },
@@ -12371,8 +12004,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                         self.status = "Save path required".into();
                     } else {
                         self.save_to_path(&path)?;
-                        self.input_cursor = None;
-                        mode = Mode::Normal;
+                        mode = self.exit_to_normal();
                     }
                 }
                 KeyCode::Esc => mode = Mode::Normal,
@@ -12387,10 +12019,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 KeyCode::Enter => {
                     self.find_next_substring(buffer);
                 }
-                KeyCode::Esc => {
-                    self.input_cursor = None;
-                    mode = Mode::Normal;
-                }
+                KeyCode::Esc => mode = self.exit_to_normal(),
                 _ if Self::handle_plain_text_input_key(
                     buffer,
                     &mut self.input_cursor,
@@ -12525,9 +12154,15 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 // like it does in Normal mode. Handle Shift+Arrow here before the
                 // text-editing Left/Right branch so Shift doesn't get consumed as a
                 // plain text navigation key.
+                // Commit the pending buffer before moving the cursor, so the pending
+                // edit targets the original cell — not the cell the cursor moves to
+                // (which `maybe_sync_edit_target_with_highlighted_cell` would pick up).
                 KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
                     if key.modifiers.contains(KeyModifiers::SHIFT) =>
                 {
+                    self.edit_cursor = None;
+                    let raw = buffer.clone();
+                    self.commit_edit_buffer(&raw)?;
                     let ctrl_or_cmd = key.modifiers.contains(KeyModifiers::CONTROL)
                         || key.modifiers.contains(KeyModifiers::SUPER);
                     match key.code {
@@ -12597,6 +12232,10 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                         }
                         _ => {}
                     }
+                    // After committing the buffer, exit to Normal mode with the
+                    // selection active so subsequent keys (arrows, ESC, type)
+                    // behave as they would in Normal mode.
+                    mode = Mode::Normal;
                 }
 
                 KeyCode::Left | KeyCode::Right => {
@@ -13366,7 +13005,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
     #[cold]
     #[inline(never)]
     fn mode_prompt_widget<'a>(
-        &self,
+        &'a self,
         grid: &'a Grid,
         addr: &CellAddr,
         edit_addr: &CellAddr,
@@ -13387,118 +13026,51 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 formula_edit_preview(grid, edit_addr, buffer),
             ))
             .style(prompt_style),
-            Mode::OpenPath { buffer } => Paragraph::new(input_line(
-                " open: ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::SheetRename { buffer, .. } => Paragraph::new(input_line(
-                " rename sheet: ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::SheetCopy { buffer, .. } => Paragraph::new(input_line(
-                " copy sheet as: ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::GoToCell { buffer } => Paragraph::new(input_line(
-                " go to: ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::SavePath { buffer } => Paragraph::new(input_line(
-                " save as: ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::ExportTsv { buffer } => Paragraph::new(input_line(
-                " export TSV (blank=clipboard): ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::ExportCsv { buffer } => Paragraph::new(input_line(
-                " export CSV (blank=clipboard): ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::ExportAscii { buffer } => Paragraph::new(input_line(
-                " export ASCII table (blank=clipboard): ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::ExportAll { buffer } => Paragraph::new(input_line(
+            Mode::OpenPath { buffer } => self.make_input_line(" open: ".to_string(), buffer),
+            Mode::SheetRename { buffer, .. } => {
+                self.make_input_line(" rename sheet: ".to_string(), buffer)
+            }
+            Mode::SheetCopy { buffer, .. } => {
+                self.make_input_line(" copy sheet as: ".to_string(), buffer)
+            }
+            Mode::GoToCell { buffer } => self.make_input_line(" go to: ".to_string(), buffer),
+            Mode::SavePath { buffer } => self.make_input_line(" save as: ".to_string(), buffer),
+            Mode::ExportTsv { buffer } => {
+                self.make_input_line(" export TSV (blank=clipboard): ".to_string(), buffer)
+            }
+            Mode::ExportCsv { buffer } => {
+                self.make_input_line(" export CSV (blank=clipboard): ".to_string(), buffer)
+            }
+            Mode::ExportAscii { buffer } => {
+                self.make_input_line(" export ASCII table (blank=clipboard): ".to_string(), buffer)
+            }
+            Mode::ExportAll { buffer } => self.make_input_line(
                 " export full (incl headers/margins): ".to_string(),
                 buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::ExportOdt { buffer } => Paragraph::new(input_line(
-                " export ODS: ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::Find { buffer } => Paragraph::new(input_line(
-                " find text: ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::Replace { buffer } => Paragraph::new(input_line(
-                " replace (old|new): ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
+            ),
+            Mode::ExportOdt { buffer } => {
+                self.make_input_line(" export ODS: ".to_string(), buffer)
+            }
+            Mode::Find { buffer } => self.make_input_line(" find text: ".to_string(), buffer),
+            Mode::Replace { buffer } => {
+                self.make_input_line(" replace (old|new): ".to_string(), buffer)
+            }
             Mode::SetMaxColWidth { buffer } => Paragraph::new(input_line(
                 format!(" max col width (default={}: ", DEFAULT_MAX_COL_WIDTH),
                 buffer,
                 self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
+                Self::prompt_style(),
+                Self::caret_style(),
             ))
-            .style(prompt_style),
+            .style(Self::prompt_style()),
             Mode::SetColWidth { buffer } => Paragraph::new(input_line(
                 " col width [col=width|col]: ".to_string(),
                 buffer,
                 self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
+                Self::prompt_style(),
+                Self::caret_style(),
             ))
-            .style(prompt_style),
+            .style(Self::prompt_style()),
             Mode::SortView { buffer, persist } => Paragraph::new(input_line(
                 format!(
                     " sort cols [A,B,C]{}: ",
@@ -13506,10 +13078,10 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 ),
                 buffer,
                 self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
+                Self::prompt_style(),
+                Self::caret_style(),
             ))
-            .style(prompt_style),
+            .style(Self::prompt_style()),
             Mode::BalanceBooks { .. } => Paragraph::new(" ").style(prompt_style),
             Mode::FormatDecimals {
                 buffer,
@@ -13522,10 +13094,10 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 .to_string(),
                 buffer,
                 self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
+                Self::prompt_style(),
+                Self::caret_style(),
             ))
-            .style(prompt_style),
+            .style(Self::prompt_style()),
             Mode::QuitPrompt => Paragraph::new(" Quit Corro? (Q)uit, (B)ack ")
                 .style(Style::default().fg(Color::White).bg(Color::Red)),
             Mode::Help => Paragraph::new(" Help - Up/Down scroll, Esc closes ")
@@ -13676,6 +13248,176 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             _ => None,
         }
     }
+
+    // ── Shared Helper Constants / Style constructors ───────────────────────
+    fn prompt_style() -> Style {
+        Style::default().fg(Color::White).bg(Color::DarkGray)
+    }
+    fn caret_style() -> Style {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    }
+    fn tab_style() -> Style {
+        Style::default().fg(Color::White).bg(Color::DarkGray)
+    }
+
+    // ── Shared Helper Methods ────────────────────────────────────────────
+
+    fn exit_to_normal(&mut self) -> Mode {
+        self.input_cursor = None;
+        Mode::Normal
+    }
+
+    fn copy_with_status(&mut self, data: &str, success_msg: &str) {
+        match copy_to_clipboard(data) {
+            Ok(()) => self.status = success_msg.into(),
+            Err(e) => self.status = format!("Clipboard error: {e}"),
+        }
+    }
+
+    fn apply_format_target(&mut self, target: FormatTarget) -> Mode {
+        self.pending_format_target = Some(target);
+        Mode::Menu {
+            stack: vec![MenuLevel {
+                section: MenuSection::Format,
+                item: 0,
+            }],
+        }
+    }
+
+    fn start_export_mode(&mut self, extension: &str) -> Mode {
+        self.export_preview_scroll = 0;
+        self.start_export_mode_with_saved_path(extension)
+    }
+
+    fn start_export_mode_with_saved_path(&mut self, extension: &str) -> Mode {
+        Mode::ExportTsv {
+            buffer: self.start_input_mode(self.suggested_export_save_path(extension)),
+        }
+    }
+
+    fn make_input_line(&self, prefix: String, buffer: &str) -> Paragraph<'static> {
+        Paragraph::new(input_line(
+            prefix,
+            buffer,
+            self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+            Self::prompt_style(),
+            Self::caret_style(),
+        ))
+        .style(Self::prompt_style())
+    }
+
+    fn handle_export_scroll(&mut self, key: KeyCode) -> bool {
+        match key {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.export_preview_scroll = self.export_preview_scroll.saturating_sub(1);
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.export_preview_scroll = self.export_preview_scroll.saturating_add(1);
+                true
+            }
+            KeyCode::PageUp => {
+                self.export_preview_scroll = self.export_preview_scroll.saturating_sub(20);
+                true
+            }
+            KeyCode::PageDown => {
+                self.export_preview_scroll = self.export_preview_scroll.saturating_add(20);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_export_delimited_alt(&mut self, ch: char) {
+        match ch {
+            'h' | 'H' => {
+                self.export_delimited_options.include_header_row =
+                    !self.export_delimited_options.include_header_row;
+                self.status = if self.export_delimited_options.include_header_row {
+                    "Column header row: on".into()
+                } else {
+                    "Column header row: off".into()
+                };
+            }
+            'm' | 'M' => {
+                self.export_delimited_options.include_margins =
+                    !self.export_delimited_options.include_margins;
+                self.status = if self.export_delimited_options.include_margins {
+                    "Row/column margin labels: on".into()
+                } else {
+                    "Row/column margin labels: off".into()
+                };
+            }
+            'r' | 'R' => {
+                self.export_delimited_options.include_row_label_column =
+                    !self.export_delimited_options.include_row_label_column;
+                self.status = if self.export_delimited_options.include_row_label_column {
+                    "Left row# column: on".into()
+                } else {
+                    "Left row# column: off".into()
+                };
+            }
+            'f' | 'F' => {
+                self.export_delimited_options.content = export::ExportContent::Formulas;
+                self.status = "Export: formulas (stored text)".into();
+            }
+            'v' | 'V' => {
+                self.export_delimited_options.content = export::ExportContent::Values;
+                self.status = "Export: values (calculated)".into();
+            }
+            'g' | 'G' => {
+                self.export_delimited_options.content = export::ExportContent::Generic;
+                self.status = "Export: generic (labels + =interop)".into();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_selection_arrow(&mut self, key: KeyCode) {
+        if self.anchor.is_none() {
+            self.anchor = Some(self.cursor);
+        }
+        match key {
+            KeyCode::Left => self.move_cursor_one_col_horizontal(false),
+            KeyCode::Right => {
+                let lm = MARGIN_COLS;
+                let mc = self.state.grid.main_cols();
+                let right_limit = lm + mc.saturating_sub(1);
+                if self.cursor.col < right_limit {
+                    self.cursor.col = self.cursor.col.saturating_add(1);
+                } else {
+                    self.state.grid.grow_main_col_at_right();
+                    self.cursor.col = self.cursor.col.saturating_add(1);
+                }
+                self.cursor.clamp(&self.state.grid);
+                self.state
+                    .grid
+                    .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+            }
+            KeyCode::Up => self.move_cursor_one_row_vertical(false),
+            KeyCode::Down => {
+                let hr = HEADER_ROWS;
+                let mr = self.state.grid.main_rows();
+                let bottom_main = hr + mr.saturating_sub(1);
+                if self.cursor.row < bottom_main {
+                    self.cursor.row = self.cursor.row.saturating_add(1);
+                } else {
+                    self.state.grid.grow_main_row_at_bottom();
+                    self.cursor.row = self.cursor.row.saturating_add(1);
+                }
+                self.cursor.clamp(&self.state.grid);
+                self.state
+                    .grid
+                    .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+            }
+            _ => {}
+        }
+    }
+
+    // ── Overlay renderers ─────────────────────────────────────────────────
 
     #[cold]
     #[inline(never)]

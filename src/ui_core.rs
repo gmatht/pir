@@ -70,6 +70,7 @@ pub fn main_col_window(state: &SheetState, cursor: SheetCursor) -> (u32, u32) {
     }
     let mc_u32 = mc as u32;
 
+    // Determine the column range from content columns and cursor position.
     let cursor_main_col = if cursor.col < lm {
         0u32
     } else if cursor.col < lm + mc {
@@ -78,14 +79,30 @@ pub fn main_col_window(state: &SheetState, cursor: SheetCursor) -> (u32, u32) {
         mc_u32.saturating_sub(1)
     };
 
-    // Always start from the first main column so that no main columns
-    // are skipped between the left-margin anchor and the cursor.
-    let lo = 0u32;
-    // Extend at least to the cursor, plus extra so the viewport shows
-    // context ahead.  Use a wider window so content columns just past
-    // the cursor (e.g. column F when the cursor is at A) are visible
-    // without requiring the user to scroll right.
-    let hi = (cursor_main_col + 8).min(mc_u32.saturating_sub(1));
+    let mut lo = mc_u32;
+    let mut hi = 0u32;
+
+    for c in 0..mc_u32 {
+        if g.logical_col_has_content(lm + c as usize) {
+            lo = lo.min(c);
+            hi = hi.max(c);
+        }
+    }
+    if lo <= hi {
+        lo = lo.saturating_sub(1);
+        hi = (hi + 1).min(mc_u32.saturating_sub(1));
+    } else {
+        lo = 0;
+        hi = 0;
+    }
+    // Ensure the cursor column is within the window
+    if cursor_main_col > hi {
+        hi = cursor_main_col;
+    }
+    if cursor_main_col < lo {
+        lo = 0;
+    }
+
     (lo, hi)
 }
 
@@ -324,7 +341,7 @@ pub fn exponential_numeric_display(text: &str, width: usize) -> Option<String> {
     let significant: &str = if non_zero.is_empty() { "0" } else { non_zero };
 
     if trailing_zeros > 0 && !significant.is_empty() && significant != "0" {
-        let sign = if digits.starts_with('-') { "-" } else { "" };
+        let _sign = if digits.starts_with('-') { "-" } else { "" };
         // Format as: first digit + . + remaining significant digits + e + exponent
         let mut mantissa = String::with_capacity(significant.len() + 2);
         mantissa.push(significant.chars().next()?);
@@ -397,7 +414,7 @@ pub fn shrink_numeric_display(text: &str, width: usize) -> Option<String> {
         return Some(sci);
     }
 
-    if let Some(dot_pos) = t.find('.') {
+    if let Some(_dot_pos) = t.find('.') {
         let trimmed = t.trim_end_matches('0');
         if trimmed != t && trimmed.width() <= width {
             return Some(trimmed.to_string());
@@ -442,7 +459,7 @@ pub fn align_cell_display(text: String, width: usize, align: Option<TextAlign>) 
         return String::new();
     }
     let w = text.width();
-    if w >= width {
+    if w > width {
         return truncate_with_ellipsis(&text, width);
     }
     let pad = width.saturating_sub(w);
@@ -744,11 +761,21 @@ pub fn visible_col_indices(
     }
     stable_band.extend(left_band.iter().copied());
     stable_band.extend((0..=main_hi).map(|ci| lm + ci as usize));
+    // Fill remaining viewport space.  Prefer main columns so that
+    // non-blank data columns past the cursor window are never hidden
+    // behind right-margin filler columns.
     {
         let total_so_far = stable_band.len();
         if total_so_far < dim {
             let blank_cols_needed = dim - total_so_far;
-            for i in 0..blank_cols_needed.min(rm) {
+            let hi = main_hi as usize;
+            let extra_main = mc.saturating_sub(hi + 1);
+            let main_fill = blank_cols_needed.min(extra_main);
+            for ci in (hi + 1)..(hi + 1 + main_fill) {
+                stable_band.push(lm + ci);
+            }
+            let rm_fill = blank_cols_needed.saturating_sub(main_fill).min(rm);
+            for i in 0..rm_fill {
                 stable_band.push(right_start + i);
             }
         }
@@ -824,6 +851,186 @@ pub fn visible_col_indices(
     out.extend(reserved);
     out.sort_unstable();
     (out, start)
+}
+
+/// Adjust all visible column widths to fit within `data_width`, mirroring
+/// ratatui's `fit_visible_columns_capped` logic so that the pancurses backend
+/// produces identical column widths for the same data.
+///
+/// Each column starts with a minimum width of 1.  Remaining space is
+/// distributed proportionally based on content-desired widths (capped by
+/// `max_col_width`), with the cursor column given priority.
+pub fn fit_visible_columns_capped(
+    grid: &mut Grid,
+    col_ixs: &[usize],
+    cursor_col: usize,
+    data_width: usize,
+) {
+    if col_ixs.is_empty() {
+        return;
+    }
+    let n = col_ixs.len();
+    let gaps = n.saturating_sub(1);
+    let budget = data_width.saturating_sub(gaps);
+
+    let mut desired: Vec<(usize, usize)> = Vec::with_capacity(n);
+    for &c in col_ixs {
+        if let Some(maxw) = rendered_width_for_column(grid, c) {
+            let cap = maxw.min(grid.max_col_width());
+            desired.push((c, cap));
+        } else {
+            desired.push((c, 4));
+        }
+    }
+
+    let total_desired: usize = desired.iter().map(|(_, w)| *w).sum();
+    if total_desired <= budget {
+        for (c, w) in &desired {
+            grid.set_col_width(*c, Some(*w));
+        }
+        return;
+    }
+
+    let pivot_ix = if let Some(p) = col_ixs.iter().position(|&c| c == cursor_col) {
+        p
+    } else {
+        let mut best = 0usize;
+        let mut best_dist = usize::MAX;
+        for (i, &c) in col_ixs.iter().enumerate() {
+            let dist = if c > cursor_col { c - cursor_col } else { cursor_col - c };
+            if dist < best_dist {
+                best_dist = dist;
+                best = i;
+            }
+        }
+        best
+    };
+
+    let mut left = pivot_ix;
+    let mut right = pivot_ix;
+    let mut window_sum = desired[pivot_ix].1;
+    let mut prefer_right = true;
+    loop {
+        let can_right = right + 1 < desired.len();
+        let can_left = left > 0;
+        if !can_right && !can_left {
+            break;
+        }
+        let mut expanded = false;
+        let sides = if prefer_right { [1isize, -1isize] } else { [-1isize, 1isize] };
+        for &side in &sides {
+            if side > 0 && can_right {
+                let cand_w = desired[right + 1].1;
+                let win_len = right.saturating_sub(left).saturating_add(1);
+                let new_win_len = win_len.saturating_add(1);
+                let outside = desired.len().saturating_sub(new_win_len);
+                if window_sum.saturating_add(cand_w).saturating_add(outside) <= budget {
+                    right += 1;
+                    window_sum = window_sum.saturating_add(cand_w);
+                    expanded = true;
+                    break;
+                }
+            } else if side < 0 && can_left {
+                let cand_w = desired[left - 1].1;
+                let win_len = right.saturating_sub(left).saturating_add(1);
+                let new_win_len = win_len.saturating_add(1);
+                let outside = desired.len().saturating_sub(new_win_len);
+                if window_sum.saturating_add(cand_w).saturating_add(outside) <= budget {
+                    left -= 1;
+                    window_sum = window_sum.saturating_add(cand_w);
+                    expanded = true;
+                    break;
+                }
+            }
+        }
+        if !expanded {
+            break;
+        }
+        prefer_right = !prefer_right;
+    }
+
+    let mut allocations: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (c, _cap) in &desired {
+        allocations.insert(*c, 1);
+    }
+    let mut rem_budget = budget.saturating_sub(desired.len());
+
+    let mut cols: Vec<(usize, usize, usize, usize)> = Vec::new();
+    for i in left..=right {
+        let (col, cap) = desired[i];
+        let need = cap.saturating_sub(1);
+        let weight = need.max(1);
+        cols.push((col, cap, need, weight));
+    }
+
+    let pivot_col = desired[pivot_ix].0;
+    if rem_budget > 0 {
+        if let Some(pos) = cols.iter().position(|(c, _cap, _need, _weight)| *c == pivot_col) {
+            let need = cols[pos].2;
+            if need > 0 {
+                let give = rem_budget.min(need);
+                if give > 0 {
+                    *allocations.entry(pivot_col).or_insert(1) += give;
+                    rem_budget = rem_budget.saturating_sub(give);
+                    cols[pos].2 = need.saturating_sub(give);
+                }
+            }
+        }
+    }
+
+    while rem_budget > 0 {
+        let total_weight: usize = cols.iter().map(|(_, _, need, weight)| if *need > 0 { *weight } else { 0 }).sum();
+        if total_weight == 0 {
+            break;
+        }
+
+        let mut given = 0usize;
+        let mut remainders: Vec<(usize, usize)> = Vec::new();
+        for (col, _cap, need, weight) in cols.iter_mut() {
+            if *need == 0 {
+                continue;
+            }
+            let numerator = rem_budget.saturating_mul(*weight);
+            let base = numerator / total_weight;
+            let rem = numerator % total_weight;
+            let give = base.min(*need);
+            if give > 0 {
+                *allocations.entry(*col).or_insert(1) += give;
+                *need = need.saturating_sub(give);
+                given = given.saturating_add(give);
+            }
+            if *need > 0 {
+                remainders.push((*col, rem));
+            }
+        }
+
+        rem_budget = rem_budget.saturating_sub(given);
+        if rem_budget == 0 {
+            break;
+        }
+
+        remainders.sort_by(|a, b| b.1.cmp(&a.1));
+        for (col, _rem) in remainders.iter() {
+            if rem_budget == 0 {
+                break;
+            }
+            if let Some((_c, _cap, need, _weight)) = cols.iter_mut().find(|(cc, _, _, _)| cc == col) {
+                if *need > 0 {
+                    *allocations.entry(*col).or_insert(1) += 1;
+                    *need = need.saturating_sub(1);
+                    rem_budget = rem_budget.saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    for &c in col_ixs {
+        if let Some(&w) = allocations.get(&c) {
+            grid.set_col_width(c, Some(w));
+        } else {
+            grid.set_col_width(c, Some(1));
+        }
+    }
 }
 
 pub fn visible_cols_render_width(grid: &Grid, cols: &[usize]) -> usize {

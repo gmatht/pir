@@ -9,7 +9,9 @@ use std::path::PathBuf;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UiKind {
     Ratatui,
+    #[allow(dead_code)]
     Gui,
+    #[allow(dead_code)]
     Pancurses,
 }
 
@@ -34,6 +36,7 @@ enum RevisionMode {
     Limit(usize),
 }
 
+#[allow(dead_code)]
 fn cli_option_suggestion(arg: &str) -> Option<&'static str> {
     match arg {
         "--movie-cps" => Some("--movie-typing-cps"),
@@ -56,12 +59,12 @@ fn parse_args() -> Result<Args, String> {
     let mut revision = None;
     let mut export = None;
     let mut movie = false;
-    let mut movie_typing_cps = 22.0f64;
-    let mut movie_confirm_ms = 120u64;
-    let mut movie_menu_hold_ms = 1200u64;
+    let movie_typing_cps = 22.0f64;
+    let movie_confirm_ms = 120u64;
+    let movie_menu_hold_ms = 1200u64;
     let mut show_help = false;
     let mut show_version = false;
-    let mut debug_no_number = false;
+    let debug_no_number = false;
     let mut ui = determine_default_ui();
     let mut capture_html = None;
     let mut convert_ansi = None;
@@ -374,6 +377,7 @@ fn try_main() -> (Result<(), Box<dyn std::error::Error>>, Option<String>) {
             let exit_msg = app.take_final_exit_hint();
             (res, exit_msg)
         }
+        #[allow(unreachable_patterns)]
         _ => {
             let msg = format!("{:?} UI backend not compiled in", args.ui);
             (Err(msg.into()), None)

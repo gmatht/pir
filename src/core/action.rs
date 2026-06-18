@@ -2,8 +2,7 @@
 //! input mechanism (keyboard, mouse, script). The UI maps input events to
 //! Actions, and the core dispatches them.
 
-use crate::grid::{CellAddr, CellFormat, FormatScope, MainRange, SortSpec};
-use crate::ops::Op;
+use crate::grid::{CellAddr, CellFormat, FormatScope, MainRange};
 use std::path::PathBuf;
 
 /// Every user-triggerable operation in the application.

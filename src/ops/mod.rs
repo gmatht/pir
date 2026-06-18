@@ -381,6 +381,9 @@ pub enum WorkbookOp {
     MoveSheet {
         id: u32,
     },
+    DeleteSheet {
+        id: u32,
+    },
     BalanceReport {
         id: u32,
         title: String,
@@ -1702,6 +1705,7 @@ impl WorkbookOp {
             WorkbookOp::ActivateSheet { id } => format!("${id}:ACTIVATE_SHEET"),
             WorkbookOp::RenameSheet { id, title } => format!("${id}:RENAME_SHEET {title}"),
             WorkbookOp::MoveSheet { id } => format!("${id}:MOVE_SHEET"),
+            WorkbookOp::DeleteSheet { id } => format!("${id}:DELETE_SHEET"),
             WorkbookOp::BalanceReport {
                 id,
                 title,
@@ -1968,6 +1972,7 @@ pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
             })
         }
         "MOVE_SHEET" => Ok(WorkbookOp::MoveSheet { id: sheet_id }),
+        "DELETE_SHEET" => Ok(WorkbookOp::DeleteSheet { id: sheet_id }),
         "BALANCE_REPORT" => {
             let title = parts
                 .next()
@@ -2153,6 +2158,22 @@ pub fn apply_workbook_op(
                 .sheet_index_by_id(id)
                 .unwrap_or(workbook.active_sheet);
             *active_sheet = id;
+            Ok(())
+        }
+        WorkbookOp::DeleteSheet { id } => {
+            let idx = workbook
+                .sheet_index_by_id(id)
+                .ok_or_else(|| bad("unknown sheet id"))?;
+            workbook.sheets.remove(idx);
+            if workbook.active_sheet >= workbook.sheets.len() {
+                workbook.active_sheet = workbook.sheets.len().saturating_sub(1);
+            }
+            workbook.ensure_active_sheet();
+            *active_sheet = workbook
+                .sheets
+                .get(workbook.active_sheet)
+                .map(|s| s.id)
+                .unwrap_or(1);
             Ok(())
         }
         WorkbookOp::BalanceReport {

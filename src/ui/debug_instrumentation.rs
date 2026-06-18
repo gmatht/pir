@@ -1,6 +1,6 @@
 use crate::grid::CellAddr;
 
-pub fn trace_setcell_construction(addr: &CellAddr, ui_main_cols: usize, workbook_main_cols: usize) {
+pub fn trace_setcell_construction(addr: &CellAddr, _ui_main_cols: usize, _workbook_main_cols: usize) {
     #[cfg(debug_assertions)]
     {
         crate::debug_log::log(&format!(

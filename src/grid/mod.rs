@@ -88,7 +88,7 @@ impl fmt::Display for CellAddr {
             CellAddr::Header { row, col } => {
                 write!(f, "~{}(col {})", HEADER_ROWS as u32 - row, col)
             }
-            CellAddr::Footer { row, col } => write!(f, "_(row {})", row + 1),
+            CellAddr::Footer { row, col: _ } => write!(f, "_(row {})", row + 1),
             CellAddr::Main { row, col } => write!(f, "({}, {})", row, col),
             CellAddr::Left { col, row } => write!(f, "<{}>({})", col, row),
             CellAddr::Right { col, row } => write!(f, ">{}>({})", col, row),
@@ -167,7 +167,7 @@ impl CellAddr {
     }
 
     /// Return the objective [`ColumnAddr`] for this address, given current `main_cols`.
-    pub fn to_column_addr(&self, main_cols: usize) -> ColumnAddr {
+    pub fn to_column_addr(&self, _main_cols: usize) -> ColumnAddr {
         match self {
             CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => *col,
             CellAddr::Main { col, .. } => ColumnAddr::Main(*col),
@@ -1006,9 +1006,8 @@ impl Grid {
 
     pub fn auto_fit_column(&mut self, global_col: usize) {
         if let Some(maxw) = self.content_width_for_column(global_col) {
-            if maxw > self.max_col_width {
-                self.col_width_overrides.insert(global_col, maxw);
-            }
+            self.col_width_overrides
+                .insert(global_col, maxw.min(self.max_col_width));
         }
     }
 
@@ -1448,30 +1447,6 @@ impl Grid {
             }
         }
         self.main_cells = new_main;
-
-        fn remap_sparse_main_cols(
-            cells: &mut HashMap<(u32, u32), String>,
-            order: &[u32],
-            old_main_cols: usize,
-        ) {
-            let mut old_to_new = vec![0usize; old_main_cols];
-            for (new_pos, &old_pos) in order.iter().enumerate() {
-                old_to_new[old_pos as usize] = new_pos;
-            }
-
-            let mut remapped = HashMap::new();
-            for ((row, col), value) in cells.drain() {
-                let col_usize = col as usize;
-                let new_col = if col_usize < MARGIN_COLS || col_usize >= MARGIN_COLS + old_main_cols
-                {
-                    col_usize
-                } else {
-                    MARGIN_COLS + old_to_new[col_usize - MARGIN_COLS]
-                };
-                remapped.insert((row, new_col as u32), value);
-            }
-            *cells = remapped;
-        }
 
         fn remap_sparse_main_cols_addr(
             cells: &mut HashMap<(u32, ColumnAddr), String>,
@@ -1946,7 +1921,9 @@ mod tests {
             "abcdefghijklmnopqrstuvwx".into(),
         );
 
-        assert_eq!(g.col_width(MARGIN_COLS), DEFAULT_MAX_COL_WIDTH);
+        // auto_fit_column now always sets an override, so "short" (5 chars)
+        // produces width 6, not max_col_width.
+        assert_eq!(g.col_width(MARGIN_COLS), 6);
         // auto_fit_column caps at max_col_width, so wide content does not
         // blow up the column width.
         assert_eq!(g.col_width(MARGIN_COLS + 1), DEFAULT_MAX_COL_WIDTH);
@@ -1959,7 +1936,9 @@ mod tests {
         assert_eq!(g.col_width(MARGIN_COLS), 4);
 
         g.set(&CellAddr::Main { row: 0, col: 0 }, "x".into());
-        assert_eq!(g.col_width(MARGIN_COLS), DEFAULT_MAX_COL_WIDTH);
+        // auto_fit_column now always sets an override, so "x" (1 char)
+        // produces width 4 (minimum content width), not max_col_width.
+        assert_eq!(g.col_width(MARGIN_COLS), 4);
         assert_eq!(g.col_width(MARGIN_COLS + 1), 4);
 
         g.set_col_width(MARGIN_COLS + 1, Some(12));

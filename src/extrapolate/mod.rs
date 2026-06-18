@@ -2,7 +2,7 @@
 //! operations. This module intentionally provides a small, well-documented API so
 //! the UI can call into it for drag-preview and commit.
 
-use crate::grid::{CellAddr, ColumnAddr, GridBox, MainRange};
+use crate::grid::{CellAddr, GridBox, MainRange};
 use crate::formula::{translate_formula_text_by_offset, is_formula};
 
 /// Direction for a 1-D extrapolation (used by the UI when inferring values).
@@ -249,7 +249,7 @@ fn infer_named_sequence_fill(seed: &[String], offset_from_last: i32) -> Option<S
             return token.to_ascii_lowercase();
         }
         // Title-case: first uppercase, rest lowercase
-        let mut chars: Vec<char> = original.chars().collect();
+        let chars: Vec<char> = original.chars().collect();
         if !chars.is_empty()
             && chars[0].is_uppercase()
             && chars.iter().skip(1).all(|c| !c.is_alphabetic() || c.is_lowercase())
