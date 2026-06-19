@@ -5,6 +5,7 @@ use rustxwidgets::backends::gtk;
 use rustxwidgets::core::DrawContext;
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
