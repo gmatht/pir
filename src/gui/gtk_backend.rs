@@ -235,12 +235,6 @@ pub fn run_gtk(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
     formula_bar.append(&addr_label);
     formula_bar.append(&f_label);
     formula_bar.append(&formula_entry);
-    // Make formula entry read-only so clicking it doesn't steal keyboard focus
-    if let Some(loader) = gtk::loader() {
-        if let Some(set_editable) = loader.symbols.gtk_entry_set_editable {
-            unsafe { set_editable(*formula_entry.0.as_ref(), 0); }
-        }
-    }
     vbox.append(&formula_bar);
 
     // Compute viewport dimensions (before create_spreadsheet, which uses them for size_request)
@@ -319,6 +313,8 @@ pub fn run_gtk(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
     let state_key2 = state.clone();
     let entry_controllers: Rc<RefCell<Vec<Box<dyn std::any::Any>>>> = Rc::new(RefCell::new(Vec::new()));
     if let Some(loader) = gtk::loader() {
+        let _ = std::io::Write::write(&mut std::io::stderr(), format!("DEBUG loader gtk_gesture_click_new={}\n", loader.symbols.gtk_gesture_click_new.is_some()).as_bytes());
+        let _ = std::io::stderr().flush();
         if loader.symbols.gtk_gesture_click_new.is_some() {
             // GTK4: use EventControllerKey
             if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(loader.clone()) {
@@ -334,17 +330,25 @@ pub fn run_gtk(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
             let entry_ptr = *formula_entry.0.as_ref();
             let l2 = loader.clone();
             let l3 = l2.clone();
+            eprintln!("DEBUG GTK3 using key-press-event signal");
             let mut cb = Box::new(move |keyval: u32, key_state: u32| -> bool {
-                handle_key(keyval, key_state, &state_key2)
+                eprintln!("DEBUG GTK3 key-press-event cb keyval={} char={:?}", keyval, char::from_u32(keyval));
+                let r = handle_key(keyval, key_state, &state_key2);
+                eprintln!("DEBUG GTK3 key-press-event cb result={}", r);
+                r
             });
             unsafe {
-                let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                let res = gtk_dynamic_loader::widget_connect_signal_bool(
                     &l2, entry_ptr, "key-press-event",
                     Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
                         let keyval = gtk_dynamic_loader::EventControllerKey::get_keyval_static(&l3, ev);
-                        if cb(keyval, 0) { 1 } else { 0 }
+                        eprintln!("DEBUG GTK3 trampoline keyval={}", keyval);
+                        let r = cb(keyval, 0);
+                        eprintln!("DEBUG GTK3 trampoline result={}", r);
+                        if r { 1 } else { 0 }
                     }),
                 );
+                eprintln!("DEBUG GTK3 signal_connect result={:?}", res);
             }
         }
     }
@@ -383,6 +387,7 @@ fn update_viewport_dims(state: &GtkCanvasState, w: i32, h: i32) -> bool {
 }
 
 fn render_grid(dc: &mut dyn DrawContext, state: &GtkCanvasState, w: i32, h: i32) {
+    eprintln!("DEBUG render_grid w={} h={} editing={}", w, h, state.editing.get());
     dc.clear(1.0, 1.0, 1.0, 1.0);
 
     let app = unsafe { &*state.app };
@@ -567,8 +572,15 @@ fn handle_click(x: f64, y: f64, state: &GtkCanvasState) {
     if let (Some((_ci, c)), Some(ri)) = (click_col_ix, click_row_ix) {
         let logical_row = state.display_rows.borrow().get(ri).copied();
         if let Some(logical_row) = logical_row {
+            // Commit any ongoing edit before moving cursor
+            if state.editing.get() {
+                commit_edit(state);
+            }
             state.last_col.set(c);
             state.last_row.set(logical_row);
+            // Reset selection anchor to the clicked cell
+            let app = unsafe { &mut *state.app };
+            app.core.anchor = Some(SheetCursor { row: logical_row, col: c });
             update_state_cursor(state, logical_row, c);
             state.canvas.queue_redraw();
         }
@@ -793,7 +805,7 @@ fn handle_key(keyval: u32, key_state: u32, state_rc: &Rc<GtkCanvasState>) -> boo
             }
         }
         KEY_DOWN => move_cursor(state, 1, 0),
-        KEY_RETURN | KEY_ENTER => start_edit(state),
+        KEY_RETURN | KEY_ENTER => move_cursor(state, 1, 0),
         KEY_TAB => move_cursor(state, 0, 1),
         KEY_HOME => {
             state.last_col.set(MARGIN_COLS);
@@ -835,7 +847,9 @@ fn handle_key(keyval: u32, key_state: u32, state_rc: &Rc<GtkCanvasState>) -> boo
         KEY_F2 => start_edit(state),
         // Printable chars start editing (skip Ctrl chars 0-31)
         _ if (32..=126).contains(&keyval) => {
-            start_edit_with(state, char::from_u32(keyval).unwrap_or('?'));
+            let ch = char::from_u32(keyval).unwrap_or('?');
+            eprintln!("DEBUG handle_key printable: ch={:?} editing={:?}", ch, state.editing.get());
+            start_edit_with(state, ch);
         }
         _ => return false,
     }

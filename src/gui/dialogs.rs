@@ -23,17 +23,18 @@ pub fn show_about_dialog() {
     #[cfg(feature = "gui")]
     {
         use rustxwidgets::backends_gtk_adapter::*;
-        let dialog = create_dialog();
-        let label = create_label(&format!(
+        if let (Ok(dialog), Ok(label)) = (create_dialog(), create_label(&format!(
             "corro {}\n\nAppend-only collaborative spreadsheet\n\nBuilt with Rust + GTK",
             env!("CARGO_PKG_VERSION"),
-        ));
-        if let (Ok(dialog), Ok(label)) = (&dialog, &label) {
+        ))) {
             dialog.set_title("About corro");
-            dialog.append_content_area(label);
+            dialog.append_content_area(&label);
             dialog.add_button("Close", 0);
             dialog.connect_response(|_| {}).ok();
             dialog.present();
+            // Keep alive: leak so GTK manages the lifecycle
+            let _ = Box::into_raw(Box::new(dialog));
+            let _ = Box::into_raw(Box::new(label));
         }
     }
     #[cfg(not(feature = "gui"))]
@@ -44,9 +45,7 @@ pub fn show_keybinds_help() {
     #[cfg(feature = "gui")]
     {
         use rustxwidgets::backends_gtk_adapter::*;
-        let dialog = create_dialog();
-        let tv = create_textview();
-        if let (Ok(dialog), Ok(tv)) = (&dialog, &tv) {
+        if let (Ok(dialog), Ok(tv)) = (create_dialog(), create_textview()) {
             dialog.set_title("Keybindings");
             tv.set_text(
                 "Navigation:    Arrow keys / Page Up/Down / Home / End\n\
@@ -58,15 +57,18 @@ pub fn show_keybinds_help() {
                  \n\
                  File menu:     Ctrl+O (open), Ctrl+S (save)\n\
                  Edit menu:     Ctrl+Z (undo), Ctrl+Y (redo)\n\
-                                Ctrl+X (cut), Ctrl+C (copy), Ctrl+V (paste)\n\
-                                Ctrl+F (find), Ctrl+H (replace)"
+                                 Ctrl+X (cut), Ctrl+C (copy), Ctrl+V (paste)\n\
+                                 Ctrl+F (find), Ctrl+H (replace)"
             );
             tv.set_wrap_mode(0);
             tv.set_size_request(400, 300);
-            dialog.append_content_area(tv);
+            dialog.append_content_area(&tv);
             dialog.add_button("Close", 0);
             dialog.connect_response(|_| {}).ok();
             dialog.present();
+            // Keep alive: leak so GTK manages the lifecycle
+            let _ = Box::into_raw(Box::new(dialog));
+            let _ = Box::into_raw(Box::new(tv));
         }
     }
     #[cfg(not(feature = "gui"))]
@@ -83,9 +85,11 @@ pub fn find_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
             dialog.append_content_area(&entry);
             dialog.add_button("Cancel", 0);
             dialog.add_button("Find", 1);
+            let entry_ptr = &entry as *const Entry as usize;
             let mut on_result = Some(on_result);
             dialog.connect_response(move |response_id| {
                 if let Some(f) = on_result.take() {
+                    let entry: &Entry = unsafe { &*(entry_ptr as *const Entry) };
                     if response_id == 1 {
                         f(entry.get_text());
                     } else {
@@ -94,6 +98,9 @@ pub fn find_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
                 }
             }).ok();
             dialog.present();
+            // Keep alive: leak so GTK manages the lifecycle
+            let _ = Box::into_raw(Box::new(dialog));
+            let _ = Box::into_raw(Box::new(entry));
             return;
         }
     }
@@ -122,9 +129,13 @@ pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: 
             dialog.append_content_area(&vbox);
             dialog.add_button("Cancel", 0);
             dialog.add_button("Replace", 1);
+            let find_ptr = &find_entry as *const Entry as usize;
+            let replace_ptr = &replace_entry as *const Entry as usize;
             let mut on_result = Some(on_result);
             dialog.connect_response(move |response_id| {
                 if let Some(f) = on_result.take() {
+                    let find_entry: &Entry = unsafe { &*(find_ptr as *const Entry) };
+                    let replace_entry: &Entry = unsafe { &*(replace_ptr as *const Entry) };
                     if response_id == 1 {
                         f(Some((
                             find_entry.get_text().unwrap_or_default(),
@@ -136,6 +147,11 @@ pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: 
                 }
             }).ok();
             dialog.present();
+            // Keep alive: leak so GTK manages the lifecycle
+            let _ = Box::into_raw(Box::new(dialog));
+            let _ = Box::into_raw(Box::new(find_entry));
+            let _ = Box::into_raw(Box::new(replace_entry));
+            let _ = Box::into_raw(Box::new(vbox));
             return;
         }
     }
@@ -163,9 +179,13 @@ pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &Workb
             dialog.append_content_area(&vbox);
             dialog.add_button("Cancel", 0);
             dialog.add_button("Sort", 1);
+            let sort_col_ptr = &sort_col as *const DropDown as usize;
+            let ascending_ptr = &ascending as *const CheckButton as usize;
             let mut on_result = Some(on_result);
             dialog.connect_response(move |response_id| {
                 if let Some(f) = on_result.take() {
+                    let sort_col: &DropDown = unsafe { &*(sort_col_ptr as *const DropDown) };
+                    let ascending: &CheckButton = unsafe { &*(ascending_ptr as *const CheckButton) };
                     if response_id == 1 {
                         let col = sort_col.get_active().max(0) as usize;
                         let asc = ascending.is_active();
@@ -176,6 +196,11 @@ pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &Workb
                 }
             }).ok();
             dialog.present();
+            // Keep alive: leak so GTK manages the lifecycle
+            let _ = Box::into_raw(Box::new(dialog));
+            let _ = Box::into_raw(Box::new(sort_col));
+            let _ = Box::into_raw(Box::new(ascending));
+            let _ = Box::into_raw(Box::new(vbox));
             return;
         }
     }
@@ -196,9 +221,11 @@ pub fn balance_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
             dialog.append_content_area(&entry);
             dialog.add_button("Cancel", 0);
             dialog.add_button("Balance", 1);
+            let entry_ptr = &entry as *const Entry as usize;
             let mut on_result = Some(on_result);
             dialog.connect_response(move |response_id| {
                 if let Some(f) = on_result.take() {
+                    let entry: &Entry = unsafe { &*(entry_ptr as *const Entry) };
                     if response_id == 1 {
                         f(entry.get_text());
                     } else {
@@ -207,6 +234,9 @@ pub fn balance_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
                 }
             }).ok();
             dialog.present();
+            // Keep alive: leak so GTK manages the lifecycle
+            let _ = Box::into_raw(Box::new(dialog));
+            let _ = Box::into_raw(Box::new(entry));
             return;
         }
     }
