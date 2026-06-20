@@ -85,7 +85,7 @@ pub fn find_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
             dialog.append_content_area(&entry);
             dialog.add_button("Cancel", 0);
             dialog.add_button("Find", 1);
-            let entry_ptr = &entry as *const Entry as usize;
+            let entry_ptr = Box::into_raw(Box::new(entry)) as usize;
             let mut on_result = Some(on_result);
             dialog.connect_response(move |response_id| {
                 if let Some(f) = on_result.take() {
@@ -100,7 +100,6 @@ pub fn find_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
             dialog.present();
             // Keep alive: leak so GTK manages the lifecycle
             let _ = Box::into_raw(Box::new(dialog));
-            let _ = Box::into_raw(Box::new(entry));
             return;
         }
     }
@@ -118,19 +117,21 @@ pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: 
             dialog.set_default_size(350, 150);
             if let Ok(find_label) = create_label("Find:") {
                 vbox.append(&find_label);
+                let _ = Box::into_raw(Box::new(find_label));
             }
             find_entry.set_hexpand(true);
             vbox.append(&find_entry);
             if let Ok(replace_label) = create_label("Replace with:") {
                 vbox.append(&replace_label);
+                let _ = Box::into_raw(Box::new(replace_label));
             }
             replace_entry.set_hexpand(true);
             vbox.append(&replace_entry);
             dialog.append_content_area(&vbox);
             dialog.add_button("Cancel", 0);
             dialog.add_button("Replace", 1);
-            let find_ptr = &find_entry as *const Entry as usize;
-            let replace_ptr = &replace_entry as *const Entry as usize;
+            let find_ptr = Box::into_raw(Box::new(find_entry)) as usize;
+            let replace_ptr = Box::into_raw(Box::new(replace_entry)) as usize;
             let mut on_result = Some(on_result);
             dialog.connect_response(move |response_id| {
                 if let Some(f) = on_result.take() {
@@ -149,8 +150,6 @@ pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: 
             dialog.present();
             // Keep alive: leak so GTK manages the lifecycle
             let _ = Box::into_raw(Box::new(dialog));
-            let _ = Box::into_raw(Box::new(find_entry));
-            let _ = Box::into_raw(Box::new(replace_entry));
             let _ = Box::into_raw(Box::new(vbox));
             return;
         }
@@ -171,6 +170,7 @@ pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &Workb
             dialog.set_default_size(300, 150);
             if let Ok(label) = create_label("Sort column:") {
                 vbox.append(&label);
+                let _ = Box::into_raw(Box::new(label));
             }
             sort_col.set_hexpand(true);
             vbox.append(&sort_col);
@@ -179,8 +179,8 @@ pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &Workb
             dialog.append_content_area(&vbox);
             dialog.add_button("Cancel", 0);
             dialog.add_button("Sort", 1);
-            let sort_col_ptr = &sort_col as *const DropDown as usize;
-            let ascending_ptr = &ascending as *const CheckButton as usize;
+            let sort_col_ptr = Box::into_raw(Box::new(sort_col)) as usize;
+            let ascending_ptr = Box::into_raw(Box::new(ascending)) as usize;
             let mut on_result = Some(on_result);
             dialog.connect_response(move |response_id| {
                 if let Some(f) = on_result.take() {
@@ -198,8 +198,6 @@ pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &Workb
             dialog.present();
             // Keep alive: leak so GTK manages the lifecycle
             let _ = Box::into_raw(Box::new(dialog));
-            let _ = Box::into_raw(Box::new(sort_col));
-            let _ = Box::into_raw(Box::new(ascending));
             let _ = Box::into_raw(Box::new(vbox));
             return;
         }
@@ -215,13 +213,14 @@ pub fn balance_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
             dialog.set_title("Balance Books");
             if let Ok(label) = create_label("Column to balance:") {
                 dialog.append_content_area(&label);
+                let _ = Box::into_raw(Box::new(label));
             }
             entry.set_text("A");
             entry.set_hexpand(true);
             dialog.append_content_area(&entry);
             dialog.add_button("Cancel", 0);
             dialog.add_button("Balance", 1);
-            let entry_ptr = &entry as *const Entry as usize;
+            let entry_ptr = Box::into_raw(Box::new(entry)) as usize;
             let mut on_result = Some(on_result);
             dialog.connect_response(move |response_id| {
                 if let Some(f) = on_result.take() {
@@ -236,7 +235,6 @@ pub fn balance_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
             dialog.present();
             // Keep alive: leak so GTK manages the lifecycle
             let _ = Box::into_raw(Box::new(dialog));
-            let _ = Box::into_raw(Box::new(entry));
             return;
         }
     }

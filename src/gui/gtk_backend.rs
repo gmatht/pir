@@ -314,11 +314,12 @@ pub fn run_gtk(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
     let state_key2 = state.clone();
     let entry_controllers: Rc<RefCell<Vec<Box<dyn std::any::Any>>>> = Rc::new(RefCell::new(Vec::new()));
     if let Some(loader) = gtk::loader() {
-        let _ = std::io::Write::write(&mut std::io::stderr(), format!("DEBUG loader gtk_gesture_click_new={}\n", loader.symbols.gtk_gesture_click_new.is_some()).as_bytes());
-        let _ = std::io::stderr().flush();
-        if loader.symbols.gtk_gesture_click_new.is_some() {
+        // Use gtk_drawing_area_set_draw_func to detect GTK4 (it is GTK4-only).
+        // gtk_gesture_click_new exists in GTK3 >= 3.24 and cannot distinguish versions.
+        if loader.symbols.gtk_drawing_area_set_draw_func.is_some() {
             // GTK4: use EventControllerKey
             if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(loader.clone()) {
+                ctrl.set_propagation_phase_capture();
                 let state_k = state_key2.clone();
                 let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32, key_state: u32| -> i32 {
                     if handle_key(keyval, key_state, &state_k) { 1 } else { 0 }
@@ -331,25 +332,21 @@ pub fn run_gtk(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
             let entry_ptr = *formula_entry.0.as_ref();
             let l2 = loader.clone();
             let l3 = l2.clone();
-            eprintln!("DEBUG GTK3 using key-press-event signal");
-            let mut cb = Box::new(move |keyval: u32, key_state: u32| -> bool {
-                eprintln!("DEBUG GTK3 key-press-event cb keyval={} char={:?}", keyval, char::from_u32(keyval));
-                let r = handle_key(keyval, key_state, &state_key2);
-                eprintln!("DEBUG GTK3 key-press-event cb result={}", r);
-                r
+            let cb = Box::new(move |keyval: u32, key_state: u32| -> bool {
+                handle_key(keyval, key_state, &state_key2)
             });
             unsafe {
-                let res = gtk_dynamic_loader::widget_connect_signal_bool(
+                let gdk_get_keyval = l3.symbols.gdk_event_get_keyval;
+                let _res = gtk_dynamic_loader::widget_connect_signal_bool(
                     &l2, entry_ptr, "key-press-event",
                     Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
-                        let keyval = gtk_dynamic_loader::EventControllerKey::get_keyval_static(&l3, ev);
-                        eprintln!("DEBUG GTK3 trampoline keyval={}", keyval);
-                        let r = cb(keyval, 0);
-                        eprintln!("DEBUG GTK3 trampoline result={}", r);
-                        if r { 1 } else { 0 }
+                        let mut keyval: u32 = 0;
+                        if let Some(f) = gdk_get_keyval {
+                            f(ev, &mut keyval);
+                        }
+                        if cb(keyval, 0) { 1 } else { 0 }
                     }),
                 );
-                eprintln!("DEBUG GTK3 signal_connect result={:?}", res);
             }
         }
     }
@@ -364,6 +361,8 @@ pub fn run_gtk(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
     vbox.append(&spreadsheet);
     vbox.append(&status_bar);
     win.set_child(&vbox);
+    // Ensure formula entry receives keyboard focus so key‑press‑event fires (GTK3)
+    formula_entry.grab_focus();
     win.present();
 
     _backend.run().map_err(|e| format!("GUI error: {e}"))?;
@@ -388,7 +387,6 @@ fn update_viewport_dims(state: &GtkCanvasState, w: i32, h: i32) -> bool {
 }
 
 fn render_grid(dc: &mut dyn DrawContext, state: &GtkCanvasState, w: i32, h: i32) {
-    eprintln!("DEBUG render_grid w={} h={} editing={}", w, h, state.editing.get());
     dc.clear(1.0, 1.0, 1.0, 1.0);
 
     let app = unsafe { &*state.app };
@@ -400,6 +398,7 @@ fn render_grid(dc: &mut dyn DrawContext, state: &GtkCanvasState, w: i32, h: i32)
     let lm = MARGIN_COLS;
     let cursor_row = state.last_row.get();
     let cursor_col = state.last_col.get();
+
 
     // Update viewport dimensions from canvas size
     if update_viewport_dims(state, w, h) {
@@ -586,6 +585,8 @@ fn handle_click(x: f64, y: f64, state: &GtkCanvasState) {
             state.canvas.queue_redraw();
         }
     }
+    // Refocus formula entry so key‑press‑event keeps firing (GTK3)
+    state.formula_entry.grab_focus();
 }
 
 fn display_rows_len(state: &GtkCanvasState) -> usize {
@@ -849,7 +850,6 @@ fn handle_key(keyval: u32, key_state: u32, state_rc: &Rc<GtkCanvasState>) -> boo
         // Printable chars start editing (skip Ctrl chars 0-31)
         _ if (32..=126).contains(&keyval) => {
             let ch = char::from_u32(keyval).unwrap_or('?');
-            eprintln!("DEBUG handle_key printable: ch={:?} editing={:?}", ch, state.editing.get());
             start_edit_with(state, ch);
         }
         _ => return false,
