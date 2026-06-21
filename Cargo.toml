@@ -14,7 +14,7 @@ default-run = "corro"
 default = ["ratatui"]
 nightly = []
 ratatui = ["dep:ratatui", "dep:crossterm", "dep:unicode-truncate", "dep:unicode-segmentation"]
-gui = ["dep:rustxwidgets"]
+gui = ["dep:rustxwidgets", "rustxwidgets/gtk", "dep:gtk_dynamic_loader"]
 pancurses = ["rustxwidgets/pancurses"]
 
 [dependencies]
@@ -36,6 +36,8 @@ num-rational = { version = "0.4", default-features = false, features = ["std", "
 num-traits = "0.2"
 num-complex = "0.4"
 libc = "0.2"
+[target.'cfg(unix)'.dependencies]
+gtk_dynamic_loader = { path = "rustxWidgets/gtk_dynamic_loader", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

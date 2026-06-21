@@ -8,7 +8,7 @@
 use crate::agg::helpers::{
     data_main_col_count, footer_row_agg_func, footer_special_col_aggregate,
     left_margin_agg_func, left_margin_main_col_aggregate, left_margin_special_col_aggregate,
-    parse_num, previous_raw_block, right_col_agg_func, row_total_block_start,
+    previous_raw_block, right_col_agg_func, row_total_block_start,
 };
 use crate::formula::cell_effective_display;
 use crate::grid::{

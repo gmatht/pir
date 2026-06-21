@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::grid::{CellAddr, SheetCursor, HEADER_ROWS, MARGIN_COLS};
-use crate::ops::{AggFunc, Op, WorkbookOp};
+use crate::ops::{Op, WorkbookOp};
 use crate::ui_core;
 
 use super::compute::{self, CellDisplayStyle};
@@ -17,7 +17,7 @@ use super::render::{self, CellSink};
 // Platform key constants
 // ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "gtk", unix))]
+#[cfg(unix)]
 mod key {
     pub const RETURN: u32 = 0xFF0D;
     pub const ESCAPE: u32 = 0xFF1B;
@@ -77,7 +77,6 @@ const CHAR_W: f64 = 7.2;
 enum GuiMode {
     Normal,
     Help,
-    About,
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +129,7 @@ impl CellSink for GuiCanvasSink {
 
 struct GuiState {
     app: *mut super::App,
+    #[allow(dead_code)]
     rxapp: rustxwidgets::App,
     canvas: Canvas,
     formula_entry: Entry,
@@ -142,11 +142,6 @@ struct GuiState {
     last_col: Cell<usize>,
     data_rows: Cell<usize>,
     data_cols: Cell<usize>,
-    // drawing data
-    cells: RefCell<HashMap<(u32, u32), String>>,
-    styles: RefCell<HashMap<(u32, u32), CellDisplayStyle>>,
-    raw_values: RefCell<HashMap<(u32, u32), String>>,
-    cursor_pos: Cell<Option<(u32, u32)>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -184,9 +179,10 @@ fn render_to(
             let cw = *col_widths.get(&c).unwrap_or(&8) as f64 * CHAR_W;
             let cx = ROW_LABEL_W + col_ixs.iter().take(ci).map(|&pc| *col_widths.get(&pc).unwrap_or(&8) as f64 * CHAR_W).sum::<f64>();
 
-            let key = (logical_row as u32, c as u32);
+            let key = (ri as u32, c as u32);
             let raw_text = cells.get(&key).map(|s| s.as_str()).unwrap_or("");
-            let style = styles.get(&key).copied().unwrap_or(CellDisplayStyle::Default);
+            let style_key = (ri as u32, c as u32);
+            let style = styles.get(&style_key).copied().unwrap_or(CellDisplayStyle::Default);
             let is_current = logical_row == cursor_row && c == cursor_col;
 
             let bg = if is_current {
@@ -250,33 +246,35 @@ fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
     let cursor_row = state.last_row.get();
     let cursor_col = state.last_col.get();
 
-    // Row headers
-    for (ri, logical_row) in (0..app.core.workbook.active_sheet().grid.main_rows()).enumerate().take(MAX_RENDER_ROWS) {
-        let ry = HEADER_H + ri as f64 * ROW_H;
-        let (tw, _, _, _) = dc.text_extents(&logical_row.to_string(), "monospace", FONT_SIZE);
-        dc.fill_rect(0.0, ry, ROW_LABEL_W, ROW_H, 0.9, 0.9, 0.9, 1.0);
-        dc.draw_text(ROW_LABEL_W - tw - 4.0, ry + 2.0, &logical_row.to_string(), "monospace", FONT_SIZE, 0.3, 0.3, 0.3, 1.0);
-    }
-
-    // Column headers
-    let col_ixs: Vec<usize> = {
-        let sheet = app.core.workbook.active_sheet();
-        ui_core::visible_col_indices(sheet, app.core.cursor, state.data_cols.get(), 0).0
-    };
-
-    for (ci, &c) in col_ixs.iter().enumerate().take(MAX_RENDER_COLS) {
-        let cw = sheet_rec_col_width(&app.core.workbook.active_sheet(), c) as f64 * CHAR_W;
-        let cx = ROW_LABEL_W + col_ixs.iter().take(ci).map(|&pc| sheet_rec_col_width(&app.core.workbook.active_sheet(), pc) as f64 * CHAR_W).sum::<f64>();
-        let col_name = crate::addr::excel_column_name(c.saturating_sub(MARGIN_COLS));
-        dc.fill_rect(cx, 0.0, cw, HEADER_H, 0.9, 0.9, 0.9, 1.0);
-        dc.draw_text(cx + 4.0, 2.0, &col_name, "monospace", FONT_SIZE, 0.3, 0.3, 0.3, 1.0);
-    }
-
-    // Data rows
     let display_rows: Vec<usize> = {
         let sheet = app.core.workbook.active_sheet();
         ui_core::visible_row_indices(sheet, app.core.cursor, state.data_rows.get(), 0).0
     };
+    let col_ixs: Vec<usize> = {
+        let sheet = app.core.workbook.active_sheet();
+        ui_core::visible_col_indices(sheet, app.core.cursor, state.data_cols.get(), 0).0
+    };
+    let mr = app.core.workbook.active_sheet().grid.main_rows();
+    let mc = app.core.workbook.active_sheet().grid.main_cols();
+
+    // Row headers
+    for (ri, &logical_row) in display_rows.iter().enumerate().take(MAX_RENDER_ROWS) {
+        let ry = HEADER_H + ri as f64 * ROW_H;
+        let label = crate::addr::ui_row_label(logical_row, mr);
+        let (_, _, tw, _) = dc.text_extents(&label, "monospace", FONT_SIZE);
+        dc.fill_rect(0.0, ry, ROW_LABEL_W, ROW_H, 0.9, 0.9, 0.9, 1.0);
+        dc.draw_text(ROW_LABEL_W - tw - 4.0, ry + 2.0, &label, "monospace", FONT_SIZE, 0.3, 0.3, 0.3, 1.0);
+    }
+
+    // Column headers
+    for (ci, &c) in col_ixs.iter().enumerate().take(MAX_RENDER_COLS) {
+        let cw = sheet_rec_col_width(&app.core.workbook.active_sheet(), c) as f64 * CHAR_W;
+        let cx = ROW_LABEL_W + col_ixs.iter().take(ci).map(|&pc| sheet_rec_col_width(&app.core.workbook.active_sheet(), pc) as f64 * CHAR_W).sum::<f64>();
+        let col_name = crate::addr::ui_column_fragment(c, mc);
+        dc.fill_rect(cx, 0.0, cw, HEADER_H, 0.9, 0.9, 0.9, 1.0);
+        let (_, _, tw, _) = dc.text_extents(&col_name, "monospace", FONT_SIZE);
+        dc.draw_text(cx + (cw - tw) / 2.0, (HEADER_H - FONT_SIZE * 1.2) / 2.0, &col_name, "monospace", FONT_SIZE, 0.3, 0.3, 0.3, 1.0);
+    }
 
     let col_widths: HashMap<usize, usize> = col_ixs.iter()
         .map(|&c| (c, sheet_rec_col_width(&app.core.workbook.active_sheet(), c)))
@@ -284,7 +282,7 @@ fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
 
     let row_agg_func = compute::compute_row_agg_func(
         &app.core.workbook.active_sheet().grid,
-        &display_rows, hr, app.core.workbook.active_sheet().grid.main_rows(),
+        &display_rows, hr, mr,
     );
 
     // Fill cells via the shared render pipeline
@@ -293,16 +291,14 @@ fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
         render::fill_cells(
             &mut sink, &display_rows, &col_ixs, &col_widths,
             &app.core.workbook.active_sheet().grid,
-            hr, app.core.workbook.active_sheet().grid.main_rows(),
-            app.core.workbook.active_sheet().grid.main_cols(),
+            hr, mr, mc,
             lm, state.data_cols.get(),
             cursor_row, cursor_col,
             &row_agg_func,
         );
         render_to(
             &sink, dc, &col_ixs, &col_widths, &display_rows,
-            app.core.workbook.active_sheet().grid.main_rows(),
-            app.core.workbook.active_sheet().grid.main_cols(),
+            mr, mc,
             cursor_row, cursor_col,
             state.editing.get(),
             &state.edit_buf.borrow(),
@@ -335,7 +331,7 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>) -> bool {
     };
 
     match state.mode.get() {
-        GuiMode::Help | GuiMode::About => {
+        GuiMode::Help => {
             if key == ESCAPE {
                 state.mode.set(GuiMode::Normal);
                 state.canvas.queue_redraw();
@@ -795,7 +791,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     corro_app.core.cursor.col = cursor_col;
     corro_app.core.anchor = Some(SheetCursor { row: hr, col: lm });
 
-    let data_width = 200usize;
+    let _data_width = 200usize;
     let data_rows = 30usize;
     let data_cols = 12usize;
 
@@ -831,10 +827,6 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         last_col: Cell::new(cursor_col),
         data_rows: Cell::new(data_rows),
         data_cols: Cell::new(data_cols),
-        cells: RefCell::new(HashMap::new()),
-        styles: RefCell::new(HashMap::new()),
-        raw_values: RefCell::new(HashMap::new()),
-        cursor_pos: Cell::new(None),
     });
 
     // Build menu
@@ -865,8 +857,8 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         on_formula_entry_changed(&shared_entry);
     })?;
 
-    // GTK: capture keyboard on the formula entry for Enter/Escape during editing
-    #[cfg(all(feature = "gtk", unix))]
+    // Intercept Enter/Escape from formula entry during editing
+    #[cfg(unix)]
     {
         use gtk_dynamic_loader::prelude::*;
         let entry_hwnd = formula_entry.raw_handle() as *mut gtk_dynamic_loader::GtkWidget;
@@ -879,6 +871,19 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             });
             ctrl.add_to_widget(unsafe { &*entry_hwnd });
         }
+    }
+    #[cfg(windows)]
+    {
+        let shared_k = shared.clone();
+        formula_entry.on_key(Box::new(move |keyval: u32| -> bool {
+            let masked = keyval & 0xFF;
+            if masked == RETURN || masked == ESCAPE {
+                handle_key(keyval, &shared_k);
+                true
+            } else {
+                false
+            }
+        }));
     }
 
     // Assemble layout
