@@ -1,0 +1,13 @@
+# Minimal 2-sheet workbook: corro to ODS (Generic) to corro round-trip. Covers multi-arg
+# MAX/MIN, SUM, and a simple TAX line; same ODF rebase/offset path as a full subtotal sheet.
+SET $1:A1 1
+SET $1:B1 10
+SET $1:A2 2
+SET $1:B2 20
+SET $1:C1 =B1*0.1
+SET $1:C2 =B2*0.1
+SET $1:D1 =MAX(B1:B1,B2:B2)
+SET $1:D2 =MIN(B1:B1,B2:B2)
+SET $1:E1 =SUM(B1:B2)
+$2:NEW_SHEET Notes
+SET $2:A1 x

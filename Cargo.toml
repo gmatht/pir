@@ -1,6 +1,9 @@
 [workspace]
 members = ["balance-core", "rustxWidgets/gtk_dynamic_loader", "rustxWidgets/rustxwidgets"]
 
+[toolchain]
+channel = "nightly"
+
 [package]
 name = "corro"
 version = "0.6.0"
