@@ -18,8 +18,7 @@ pub mod sheet;
 #[cfg(all(feature = "gui", unix))]
 mod gtk_backend;
 #[cfg(all(feature = "gui", windows))]
-// TODO: Implement NWG backend
-// mod nwg_backend;
+mod nwg_backend;
 #[cfg(all(feature = "gui", target_os = "android"))]
 mod android_backend;
 #[cfg(feature = "pancurses")]
@@ -210,7 +209,7 @@ impl App {
 
     #[cfg(all(feature = "gui", windows))]
     fn run_nwg_inner(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        Err("NWG backend not implemented yet".into())
+        nwg_backend::run_nwg(self)
     }
 
     #[cfg(not(feature = "gui"))]
