@@ -352,6 +352,9 @@ fn try_main() -> (Result<(), Box<dyn std::error::Error>>, Option<String>) {
                     GuiApp::new_with_revision_limit(args.files.first().cloned(), Some(revision))
                 }
             };
+            #[cfg(windows)]
+            app.set_backend(corro::gui::Backend::Nwg);
+            #[cfg(unix)]
             app.set_backend(corro::gui::Backend::Gtk);
             let res = match app.load_initial() {
                 Ok(()) => app.run(),
@@ -369,6 +372,7 @@ fn try_main() -> (Result<(), Box<dyn std::error::Error>>, Option<String>) {
                     GuiApp::new_with_revision_limit(args.files.first().cloned(), Some(revision))
                 }
             };
+            #[cfg(feature = "pancurses")]
             app.set_backend(corro::gui::Backend::Pancurses);
             let res = match app.load_initial() {
                 Ok(()) => app.run(),

@@ -15,13 +15,21 @@ pub mod menu;
 pub mod render;
 pub mod sheet;
 
-#[cfg(feature = "gui")]
+#[cfg(all(feature = "gui", unix))]
 mod gtk_backend;
+#[cfg(all(feature = "gui", windows))]
+// TODO: Implement NWG backend
+// mod nwg_backend;
+#[cfg(all(feature = "gui", target_os = "android"))]
+mod android_backend;
 #[cfg(feature = "pancurses")]
 mod pnc_backend;
 
 pub enum Backend {
+    #[cfg(unix)]
     Gtk,
+    #[cfg(windows)]
+    Nwg,
     Pancurses,
 }
 
@@ -168,15 +176,41 @@ impl App {
     }
 
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        match self.backend.as_ref().unwrap_or(&Backend::Gtk) {
-            Backend::Gtk => self.run_gtk_inner(),
-            Backend::Pancurses => self.run_pnc_inner(),
+        #[cfg(unix)]
+        if let Some(Backend::Gtk) = self.backend {
+            return self.run_gtk_inner();
         }
+        #[cfg(windows)]
+        if let Some(Backend::Nwg) = self.backend {
+            return self.run_nwg_inner();
+        }
+        #[cfg(not(any(unix, windows)))]
+        if let Some(Backend::Pancurses) = self.backend {
+            return self.run_pnc_inner();
+        }
+        #[cfg(all(unix))]
+        if self.backend.is_none() {
+            return self.run_gtk_inner();
+        }
+        #[cfg(all(windows))]
+        if self.backend.is_none() {
+            return self.run_nwg_inner();
+        }
+        #[cfg(not(any(unix, windows)))]
+        if self.backend.is_none() {
+            return self.run_pnc_inner();
+        }
+        Err("Unknown backend".into())
     }
 
-    #[cfg(feature = "gui")]
+    #[cfg(all(feature = "gui", unix))]
     fn run_gtk_inner(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         gtk_backend::run_gtk(self)
+    }
+
+    #[cfg(all(feature = "gui", windows))]
+    fn run_nwg_inner(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        Err("NWG backend not implemented yet".into())
     }
 
     #[cfg(not(feature = "gui"))]
