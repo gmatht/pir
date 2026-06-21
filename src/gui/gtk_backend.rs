@@ -361,7 +361,7 @@ pub fn run_gtk(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
     vbox.append(&spreadsheet);
     vbox.append(&status_bar);
     win.set_child(&vbox);
-    // Ensure formula entry receives keyboard focus so key‑press‑event fires (GTK3)
+    // Ensure formula entry receives keyboard focus so key‑press‑event keeps firing (GTK3)
     formula_entry.grab_focus();
     win.present();
 

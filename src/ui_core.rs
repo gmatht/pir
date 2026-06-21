@@ -5,12 +5,17 @@
 //! (`format_cell_display`, `normalize_inline_text`, …). It is imported
 //! into `crate::ui` via `use crate::ui_core::*`.
 
+use crate::agg::helpers::{
+    data_main_col_count, footer_row_agg_func, footer_special_col_aggregate,
+    left_margin_agg_func, left_margin_main_col_aggregate, left_margin_special_col_aggregate,
+    parse_num, previous_raw_block, right_col_agg_func, row_total_block_start,
+};
 use crate::formula::cell_effective_display;
 use crate::grid::{
     CellAddr, GridBox as Grid, NumberFormat, SheetCursor, TextAlign,
     FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS,
 };
-use crate::ops::SheetState;
+use crate::ops::{AggFunc, AggregateDef, MainRange, SheetState};
 
 // ---------------------------------------------------------------------------
 // Re-exports from addr.rs (convenience aliases)
@@ -1084,5 +1089,171 @@ pub fn trim_visible_cols_to_width(grid: &Grid, cols: &mut Vec<usize>, cursor_col
         } else {
             break;
         }
+    }
+}
+
+/// For **Values** TSV, bare aggregate labels in the key left margin still resolve to the computed
+/// aggregate for the row, not the word `TOTAL` (etc.). (Generic text export keeps bare `TOTAL` /
+/// `SUM` as on-sheet text; other labels such as `MAX` can still use `=SUBTOTAL(…)` interop.)
+pub(crate) fn tsv_left_key_subtotal_computed(
+    grid: &Grid,
+    cell_addr: &CellAddr,
+    func: AggFunc,
+    main_row: u32,
+) -> Option<String> {
+    let CellAddr::Left { col, row } = cell_addr else {
+        return None;
+    };
+    if *row != main_row || *col != MARGIN_COLS - 1 {
+        return None;
+    }
+    let raw = grid.get(cell_addr).unwrap_or_default();
+    if crate::ods::subtotal_code_for_label(&raw).is_none() {
+        return None;
+    }
+    Some(left_margin_main_col_aggregate(grid, func, main_row, 0))
+}
+
+/// Footers: key column (`MARGIN_COLS - 1`) may hold a bare `TOTAL` while [`crate::ods::cell_export_value_string`]
+/// emits `=SUBTOTAL(…)` over the full main block — Values must be that aggregate, not the label.
+pub(crate) fn tsv_footer_key_subtotal_computed(
+    grid: &Grid,
+    cell_addr: &CellAddr,
+    func: AggFunc,
+) -> Option<String> {
+    let CellAddr::Footer { col, .. } = cell_addr else {
+        return None;
+    };
+    if col.to_global(grid.main_cols()) != MARGIN_COLS - 1 {
+        return None;
+    }
+    let raw = grid.get(cell_addr).unwrap_or_default();
+    if crate::ods::subtotal_code_for_label(&raw).is_none() {
+        return None;
+    }
+    let mr = grid.main_rows();
+    let mc = grid.main_cols() as u32;
+    Some(crate::agg::compute_aggregate(
+        grid,
+        &AggregateDef {
+            func,
+            source: MainRange {
+                row_start: 0,
+                row_end: mr as u32,
+                col_start: 0,
+                col_end: mc,
+            },
+        },
+    ))
+}
+
+/// Same unformatted value as the main grid's data cells, used by TSV/CSV export to match
+/// on-screen subtotal/aggregate columns (not just stored formula text).
+pub(crate) fn tsv_effective_unformatted_string(grid: &Grid, r: usize, c: usize) -> String {
+    let cur = SheetCursor { row: r, col: c };
+    let cell_addr = cur.to_addr(grid);
+    let hr = HEADER_ROWS;
+    let mr = grid.main_rows();
+    let lm = MARGIN_COLS;
+    let mc = grid.main_cols();
+    let right_col_agg = right_col_agg_func(grid, c);
+    let footer_agg = if r >= hr + mr {
+        footer_row_agg_func(grid, r - hr - mr)
+    } else {
+        None
+    };
+    let main_row_idx = if r >= hr && r < hr + mr {
+        Some((r - hr) as u32)
+    } else {
+        None
+    };
+    let left_margin_agg = main_row_idx.and_then(|mri| left_margin_agg_func(grid, mri));
+    let left_margin_block_start = main_row_idx.map(|mri| row_total_block_start(grid, mri));
+
+    if let Some(func) = footer_agg {
+        if right_col_agg.is_some() {
+            footer_special_col_aggregate(grid, func, c, mr, mc)
+                .unwrap_or_else(|| {
+                    tsv_footer_key_subtotal_computed(grid, &cell_addr, func)
+                        .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
+                })
+        } else if c >= lm && c < lm + mc {
+            let main_col = (c - lm) as u32;
+            crate::agg::compute_aggregate(
+                grid,
+                &AggregateDef {
+                    func,
+                    source: MainRange {
+                        row_start: 0,
+                        row_end: mr as u32,
+                        col_start: main_col,
+                        col_end: main_col + 1,
+                    },
+                },
+            )
+        } else {
+            tsv_footer_key_subtotal_computed(grid, &cell_addr, func)
+                .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
+        }
+    } else if let (Some(func), Some(block_start), Some(main_row)) =
+        (left_margin_agg, left_margin_block_start, main_row_idx)
+    {
+        if c >= lm && c < lm + mc {
+            if right_col_agg.is_some() {
+                let data_cols = data_main_col_count(grid);
+                let (row_start, row_end) = if block_start < main_row {
+                    (block_start, main_row)
+                } else {
+                    previous_raw_block(grid, main_row).unwrap_or((0, main_row))
+                };
+                left_margin_special_col_aggregate(
+                    grid, func, c, row_start, row_end, data_cols,
+                )
+                .unwrap_or_else(|| {
+                    tsv_left_key_subtotal_computed(grid, &cell_addr, func, main_row)
+                        .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
+                })
+            } else {
+                let main_col = (c - lm) as u32;
+                left_margin_main_col_aggregate(grid, func, main_row, main_col)
+            }
+        } else if right_col_agg.is_some() {
+            left_margin_special_col_aggregate(
+                grid,
+                func,
+                c,
+                block_start,
+                main_row,
+                data_main_col_count(grid),
+            )
+            .unwrap_or_else(|| {
+                tsv_left_key_subtotal_computed(grid, &cell_addr, func, main_row)
+                    .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
+            })
+        } else {
+            tsv_left_key_subtotal_computed(grid, &cell_addr, func, main_row)
+                .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
+        }
+    } else if r >= hr && r < hr + mr {
+        if let Some(func) = right_col_agg {
+            let main_row = (r - hr) as u32;
+            let data_cols = data_main_col_count(grid);
+            crate::agg::compute_aggregate(
+                grid,
+                &AggregateDef {
+                    func,
+                    source: MainRange {
+                        row_start: main_row,
+                        row_end: main_row + 1,
+                        col_start: 0,
+                        col_end: data_cols as u32,
+                    },
+                },
+            )
+        } else {
+            cell_effective_display(grid, &cell_addr)
+        }
+    } else {
+        cell_effective_display(grid, &cell_addr)
     }
 }

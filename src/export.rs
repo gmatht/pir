@@ -990,8 +990,8 @@ fn rendered_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> Stri
         col: global_col,
     };
     let addr = cur.to_addr(grid);
-    let text = crate::ui::tsv_effective_unformatted_string(grid, logical_row, global_col);
-    crate::ui::format_cell_display(grid, &addr, text)
+    let text = crate::ui_core::tsv_effective_unformatted_string(grid, logical_row, global_col);
+    crate::ui_core::format_cell_display(grid, &addr, text)
 }
 
 fn rendered_value_at_ascii(grid: &Grid, logical_row: usize, global_col: usize) -> String {

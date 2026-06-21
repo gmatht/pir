@@ -2,7 +2,7 @@ use crate::grid::{CellAddr, GridBox as Grid, MainRange, MARGIN_COLS};
 use crate::ops::{AggFunc, AggregateDef};
 
 // Internal helpers kept private to this module
-fn right_col_agg_func(grid: &Grid, global_col: usize) -> Option<AggFunc> {
+pub(crate) fn right_col_agg_func(grid: &Grid, global_col: usize) -> Option<AggFunc> {
     let main_cols = grid.main_cols();
     let mut labels: Vec<(u32, String)> = grid
         .iter_nonempty()
@@ -20,13 +20,13 @@ fn right_col_agg_func(grid: &Grid, global_col: usize) -> Option<AggFunc> {
     None
 }
 
-fn left_margin_agg_func(grid: &Grid, main_row: u32) -> Option<AggFunc> {
+pub(crate) fn left_margin_agg_func(grid: &Grid, main_row: u32) -> Option<AggFunc> {
     let key_col = MARGIN_COLS - 1;
     let val = grid.get(&CellAddr::Left { col: key_col, row: main_row })?;
     crate::ops::margin_key_agg_func(&val)
 }
 
-fn row_total_block_start(grid: &Grid, current_main_row: u32) -> u32 {
+pub(crate) fn row_total_block_start(grid: &Grid, current_main_row: u32) -> u32 {
     for candidate in (0..current_main_row).rev() {
         if left_margin_agg_func(grid, candidate).is_some() {
             return candidate + 1;
