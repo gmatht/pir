@@ -38,6 +38,7 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
+gtk_dynamic_loader = { path = "rustxWidgets/gtk_dynamic_loader" }
 
 [profile.release]
 opt-level = "z"

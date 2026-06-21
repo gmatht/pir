@@ -30,7 +30,8 @@ pub fn show_about_dialog() {
             dialog.set_title("About corro");
             dialog.append_content_area(&label);
             dialog.add_button("Close", 0);
-            dialog.connect_response(|_| {}).ok();
+            let d = dialog.clone();
+            dialog.connect_response(move |_| d.close()).ok();
             dialog.present();
             // Keep alive: leak so GTK manages the lifecycle
             let _ = Box::into_raw(Box::new(dialog));
@@ -64,7 +65,8 @@ pub fn show_keybinds_help() {
             tv.set_size_request(400, 300);
             dialog.append_content_area(&tv);
             dialog.add_button("Close", 0);
-            dialog.connect_response(|_| {}).ok();
+            let d = dialog.clone();
+            dialog.connect_response(move |_| d.close()).ok();
             dialog.present();
             // Keep alive: leak so GTK manages the lifecycle
             let _ = Box::into_raw(Box::new(dialog));
@@ -87,6 +89,7 @@ pub fn find_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
             dialog.add_button("Find", 1);
             let entry_ptr = Box::into_raw(Box::new(entry)) as usize;
             let mut on_result = Some(on_result);
+            let d = dialog.clone();
             dialog.connect_response(move |response_id| {
                 if let Some(f) = on_result.take() {
                     let entry: &Entry = unsafe { &*(entry_ptr as *const Entry) };
@@ -96,6 +99,7 @@ pub fn find_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
                         f(None);
                     }
                 }
+                d.close();
             }).ok();
             dialog.present();
             // Keep alive: leak so GTK manages the lifecycle
@@ -133,6 +137,7 @@ pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: 
             let find_ptr = Box::into_raw(Box::new(find_entry)) as usize;
             let replace_ptr = Box::into_raw(Box::new(replace_entry)) as usize;
             let mut on_result = Some(on_result);
+            let d = dialog.clone();
             dialog.connect_response(move |response_id| {
                 if let Some(f) = on_result.take() {
                     let find_entry: &Entry = unsafe { &*(find_ptr as *const Entry) };
@@ -146,6 +151,7 @@ pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: 
                         f(None);
                     }
                 }
+                d.close();
             }).ok();
             dialog.present();
             // Keep alive: leak so GTK manages the lifecycle
@@ -182,6 +188,7 @@ pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &Workb
             let sort_col_ptr = Box::into_raw(Box::new(sort_col)) as usize;
             let ascending_ptr = Box::into_raw(Box::new(ascending)) as usize;
             let mut on_result = Some(on_result);
+            let d = dialog.clone();
             dialog.connect_response(move |response_id| {
                 if let Some(f) = on_result.take() {
                     let sort_col: &DropDown = unsafe { &*(sort_col_ptr as *const DropDown) };
@@ -194,6 +201,7 @@ pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &Workb
                         f(None);
                     }
                 }
+                d.close();
             }).ok();
             dialog.present();
             // Keep alive: leak so GTK manages the lifecycle
@@ -222,6 +230,7 @@ pub fn balance_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
             dialog.add_button("Balance", 1);
             let entry_ptr = Box::into_raw(Box::new(entry)) as usize;
             let mut on_result = Some(on_result);
+            let d = dialog.clone();
             dialog.connect_response(move |response_id| {
                 if let Some(f) = on_result.take() {
                     let entry: &Entry = unsafe { &*(entry_ptr as *const Entry) };
@@ -231,6 +240,7 @@ pub fn balance_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
                         f(None);
                     }
                 }
+                d.close();
             }).ok();
             dialog.present();
             // Keep alive: leak so GTK manages the lifecycle
