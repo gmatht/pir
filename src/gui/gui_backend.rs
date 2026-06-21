@@ -11,6 +11,7 @@ use crate::ops::{Op, WorkbookOp};
 use crate::ui_core;
 
 use super::compute::{self, CellDisplayStyle};
+use super::dialogs;
 use super::render::{self, CellSink};
 
 // ---------------------------------------------------------------------------
@@ -310,6 +311,20 @@ fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
     if h as f64 > HEADER_H + 20.0 {
         dc.fill_rect(0.0, h as f64 - 20.0, w as f64, 20.0, 0.9, 0.9, 0.9, 1.0);
     }
+
+    // Diagnostic: read first data cell from grid directly
+    let first_row = hr;
+    let first_col = lm;
+    let main_row = first_row.saturating_sub(hr);
+    let main_col = first_col.saturating_sub(lm);
+    let addr = crate::grid::CellAddr::Main { row: main_row as u32, col: main_col as u32 };
+    let cell_val = app.core.workbook.active_sheet().grid.get(&addr).unwrap_or_default();
+    let editing = state.editing.get();
+    let eb = state.edit_buf.borrow().clone();
+    let is_editing = if state.editing.get() { "EDIT" } else { "NORM" };
+    let buf_display = if eb.is_empty() { "(empty)" } else { &eb };
+    dc.draw_text(100.0, h as f64 - 80.0, &format!("Mode:{is_editing}  Buf:'{buf_display}'"), "monospace", 14.0, 0.5, 0.0, 0.5, 1.0);
+    dc.draw_text(100.0, h as f64 - 60.0, &format!("Cell({main_row},{main_col}): '{cell_val}'"), "monospace", 14.0, 0.0, 0.0, 1.0, 1.0);
 }
 
 fn sheet_rec_col_width(sheet: &crate::ops::SheetState, col: usize) -> usize {
@@ -487,6 +502,12 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
             commit_edit(state);
             state.last_row.set(state.last_row.get() + 1);
             update_state_cursor(state, state.last_row.get(), state.last_col.get());
+            true
+        }
+        _ if (32..=126).contains(&key) => {
+            let ch = char::from_u32(key).unwrap_or('?');
+            state.edit_buf.borrow_mut().push(ch);
+            state.canvas.queue_redraw();
             true
         }
         _ => true,
@@ -705,6 +726,7 @@ fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
                     app.core.anchor = Some(SheetCursor { row: logical_row, col: c });
                 }
                 update_formula_bar(state, logical_row, c);
+                start_edit(state);
                 state.canvas.queue_redraw();
             }
             return;
@@ -717,7 +739,7 @@ fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
 // Menu building
 // ---------------------------------------------------------------------------
 
-fn build_menu(rxapp: &rustxwidgets::App, win: &Window, _state: &Rc<GuiState>) -> Result<MenuBar, Box<dyn std::error::Error>> {
+fn build_menu(rxapp: &rustxwidgets::App, win: &Window, state: &Rc<GuiState>) -> Result<MenuBar, Box<dyn std::error::Error>> {
     use crate::gui::menu;
 
     let action_group = rxapp.ensure_action_group()?;
@@ -737,12 +759,14 @@ fn build_menu(rxapp: &rustxwidgets::App, win: &Window, _state: &Rc<GuiState>) ->
     menubar_model.append_submenu("Data", &data_menu);
     menubar_model.append_submenu("Help", &help_menu);
 
-    // Register action callbacks
+    // Register action callbacks with state access
+    let s = state.clone();
     for &items in &[menu::FILE_MENU, menu::EDIT_MENU, menu::VIEW_MENU, menu::SHEET_MENU, menu::DATA_MENU, menu::HELP_MENU] {
         for item in items {
             let name = menu::action_kind_to_name(item.action);
             let name_owned = name.to_string();
-            menu::register_action(rxapp, name, move || menu::handle_action(&name_owned))?;
+            let state_cb = s.clone();
+            menu::register_action(rxapp, name, move || handle_menu_action(&name_owned, &state_cb))?;
         }
     }
 
@@ -750,6 +774,150 @@ fn build_menu(rxapp: &rustxwidgets::App, win: &Window, _state: &Rc<GuiState>) ->
     win.insert_action_group("app", action_group);
 
     Ok(menubar)
+}
+
+fn handle_menu_action(name: &str, state: &GuiState) {
+    let app = unsafe { &mut *state.app };
+    match name {
+        "open" => {
+            if let Some(path) = dialogs::file_open_dialog() {
+                match crate::io::load_workbook_snapshot(&path) {
+                    Ok(snapshot) => {
+                        app.core.workbook = crate::ops::WorkbookState::from_snapshot(&snapshot);
+                        app.core.offset = 0;
+                        app.core.ops_applied = 0;
+                        app.core.path = Some(path);
+                        app.core.status = "Opened file".into();
+                        recompute_viewport(state);
+                        state.canvas.queue_redraw();
+                    }
+                    Err(e) => app.core.status = format!("Open error: {e}"),
+                }
+            }
+        }
+        "save" => {
+            if let Some(ref p) = app.core.path.clone() {
+                let snapshot = crate::ops::WorkbookSnapshot::from_workbook(&app.core.workbook);
+                match crate::io::save_workbook(p, &snapshot) {
+                    Ok(()) => app.core.status = "Saved".into(),
+                    Err(e) => app.core.status = format!("Save error: {e}"),
+                }
+            }
+        }
+        "save_as" => {
+            if let Some(path) = dialogs::file_save_dialog() {
+                app.core.path = Some(path.clone());
+                let snapshot = crate::ops::WorkbookSnapshot::from_workbook(&app.core.workbook);
+                match crate::io::save_workbook(&path, &snapshot) {
+                    Ok(()) => app.core.status = format!("Saved to {}", path.display()),
+                    Err(e) => app.core.status = format!("Save error: {e}"),
+                }
+            }
+        }
+        "quit" => {
+            #[cfg(unix)]
+            let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
+        }
+        "find" => dialogs::find_dialog(|result| {
+            if let Some(text) = result {
+                app.core.status = format!("Find: {text}");
+            }
+        }),
+        "replace" => dialogs::replace_dialog(|result| {
+            if let Some((find, replace)) = result {
+                app.core.status = format!("Replace: '{find}' with '{replace}'");
+            }
+        }),
+        "sort_asc" => {
+            let wb = crate::ops::WorkbookState::default();
+            dialogs::sort_dialog(&wb, |result| {
+                if let Some((col, asc)) = result {
+                    app.core.status = format!("Sort col {col} asc: {asc}");
+                }
+            });
+        }
+        "sort_desc" => {
+            let wb = crate::ops::WorkbookState::default();
+            dialogs::sort_dialog(&wb, |result| {
+                if let Some((col, asc)) = result {
+                    app.core.status = format!("Sort col {col} desc: {}", !asc);
+                }
+            });
+        }
+        "balance_books" => dialogs::balance_dialog(|result| {
+            if let Some(col) = result {
+                app.core.status = format!("Balance col: {col}");
+            }
+        }),
+        "about" => dialogs::show_about_dialog(),
+        "help_keybinds" => dialogs::show_keybinds_help(),
+        "rename_sheet" => dialogs::find_dialog(|result| {
+            if let Some(name) = result {
+                app.core.status = format!("Rename sheet to: {name}");
+            }
+        }),
+        "undo" => {
+            app.core.status = "Undo not yet implemented".into();
+            state.canvas.queue_redraw();
+        }
+        "redo" => {
+            app.core.status = "Redo not yet implemented".into();
+            state.canvas.queue_redraw();
+        }
+        "cut" => {
+            app.core.status = "Cut not yet implemented".into();
+        }
+        "copy" => {
+            app.core.status = "Copy not yet implemented".into();
+        }
+        "paste" => {
+            app.core.status = "Paste not yet implemented".into();
+        }
+        "delete_cell" => {
+            handle_delete(state);
+        }
+        "select_all" => {
+            app.core.status = "Select All".into();
+            app.core.anchor = None;
+            state.canvas.queue_redraw();
+        }
+        "toggle_headers" => {
+            app.core.status = "Toggle headers not yet implemented".into();
+        }
+        "toggle_margins" => {
+            app.core.status = "Toggle margins not yet implemented".into();
+        }
+        "new_sheet" => {
+            app.core.status = "New sheet not yet implemented".into();
+        }
+        "delete_sheet" => {
+            app.core.status = "Delete sheet not yet implemented".into();
+        }
+        "export_tsv" => {
+            if let Some(path) = dialogs::file_save_dialog() {
+                app.core.status = format!("Exporting TSV to {}", path.display());
+            }
+        }
+        "export_csv" => {
+            if let Some(path) = dialogs::file_save_dialog() {
+                app.core.status = format!("Exporting CSV to {}", path.display());
+            }
+        }
+        "export_ods" => {
+            if let Some(path) = dialogs::file_save_dialog() {
+                app.core.status = format!("Exporting ODS to {}", path.display());
+            }
+        }
+        "export_ascii" => {
+            if let Some(path) = dialogs::file_save_dialog() {
+                app.core.status = format!("Exporting ASCII to {}", path.display());
+            }
+        }
+        _ => {
+            app.core.status = format!("Menu action: {name}");
+        }
+    }
+    update_formula_bar(state, state.last_row.get(), state.last_col.get());
 }
 
 // ---------------------------------------------------------------------------
