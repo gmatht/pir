@@ -1,5 +1,7 @@
 use crate::ops::WorkbookState;
 use std::path::PathBuf;
+#[cfg(feature = "gui")]
+use rustxwidgets::*;
 
 pub fn file_open_dialog() -> Option<PathBuf> {
     #[cfg(feature = "gui")]
@@ -22,9 +24,8 @@ pub fn file_save_dialog() -> Option<PathBuf> {
 pub fn show_about_dialog() {
     #[cfg(feature = "gui")]
     {
-        use rustxwidgets::App;
         #[cfg(unix)]
-        if let Ok(app) = App::init() {
+        if let Ok(app) = rustxwidgets::App::init() {
             if let Ok(dialog) = app.create_dialog() {
                 if let Ok(label) = app.create_label(&format!(
                     "corro {}\n\nAppend-only collaborative spreadsheet",
@@ -53,9 +54,8 @@ pub fn show_about_dialog() {
 pub fn show_keybinds_help() {
     #[cfg(feature = "gui")]
     {
-        use rustxwidgets::App;
         #[cfg(unix)]
-        if let Ok(app) = App::init() {
+        if let Ok(app) = rustxwidgets::App::init() {
             if let Ok(dialog) = app.create_dialog() {
                 if let Ok(tv) = app.create_textview() {
                     dialog.set_title("Keybindings");
@@ -95,9 +95,8 @@ pub fn show_keybinds_help() {
 pub fn find_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
     #[cfg(feature = "gui")]
     {
-        use rustxwidgets::App;
         #[cfg(unix)]
-        if let Ok(app) = App::init() {
+        if let Ok(app) = rustxwidgets::App::init() {
             if let Ok(dialog) = app.create_dialog() {
                 if let Ok(entry) = app.create_entry() {
                     dialog.set_title("Find");
@@ -133,9 +132,8 @@ pub fn find_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
 pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: F) {
     #[cfg(feature = "gui")]
     {
-        use rustxwidgets::App;
         #[cfg(unix)]
-        if let Ok(app) = App::init() {
+        if let Ok(app) = rustxwidgets::App::init() {
             if let (Ok(dialog), Ok(find_entry), Ok(replace_entry), Ok(vbox)) =
                 (app.create_dialog(), app.create_entry(), app.create_entry(), app.create_box(Orientation::Vertical, 4))
             {
@@ -189,9 +187,8 @@ pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: 
 pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &WorkbookState, on_result: F) {
     #[cfg(feature = "gui")]
     {
-        use rustxwidgets::App;
         #[cfg(unix)]
-        if let Ok(app) = App::init() {
+        if let Ok(app) = rustxwidgets::App::init() {
             let cols: &[&str] = &["Column A", "Column B", "Column C", "Column D", "Column E"];
             if let (Ok(dialog), Ok(sort_col), Ok(ascending), Ok(vbox)) =
                 (app.create_dialog(), app.create_dropdown(cols), app.create_checkbutton("Ascending"),
@@ -242,9 +239,8 @@ pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &Workb
 pub fn balance_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
     #[cfg(feature = "gui")]
     {
-        use rustxwidgets::App;
         #[cfg(unix)]
-        if let Ok(app) = App::init() {
+        if let Ok(app) = rustxwidgets::App::init() {
             if let (Ok(dialog), Ok(entry)) = (app.create_dialog(), app.create_entry()) {
                 dialog.set_title("Balance Books");
                 if let Ok(label) = app.create_label("Column to balance:") {

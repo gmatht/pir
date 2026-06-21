@@ -15,7 +15,8 @@ use crate::grid::{
     CellAddr, GridBox as Grid, NumberFormat, SheetCursor, TextAlign,
     FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS,
 };
-use crate::ops::{AggFunc, AggregateDef, MainRange, SheetState};
+use crate::grid::MainRange;
+use crate::ops::{AggFunc, AggregateDef, SheetState};
 
 // ---------------------------------------------------------------------------
 // Re-exports from addr.rs (convenience aliases)
