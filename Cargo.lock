@@ -184,7 +184,6 @@ dependencies = [
  "balance-core",
  "chrono",
  "crossterm",
- "gtk_dynamic_loader",
  "libc",
  "notify",
  "num-bigint",

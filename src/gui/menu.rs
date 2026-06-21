@@ -1,13 +1,13 @@
-#[cfg(feature = "gui")]
+#[cfg(all(feature = "gui", not(feature = "pancurses")))]
 use crate::gui::dialogs;
-#[cfg(feature = "gui")]
+#[cfg(all(feature = "gui", unix))]
 use rustxwidgets::backends_gtk_adapter::{
     self, Application, Menu, MenuBar, Window,
 };
 
 /// Build the GTK menu bar, create and register actions, and return the MenuBar widget.
 /// The caller should pack the returned MenuBar into the window's layout before other content.
-#[cfg(feature = "gui")]
+#[cfg(all(feature = "gui", unix))]
 pub fn build_menu_bar(
     app: &Application,
     window: &Window,
@@ -37,6 +37,7 @@ pub fn build_menu_bar(
         }
     })?;
     register_action(app, "quit", || {
+        #[cfg(unix)]
         let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
     })?;
     register_action(app, "undo", || eprintln!("Undo"))?;
@@ -106,6 +107,7 @@ pub fn build_menu_bar(
     })?;
 
     // ── Assemble menubar model ──────────────────────────────────────────
+    #[cfg(unix)]
     let mut menubar_model = backends_gtk_adapter::create_menu()?;
     menubar_model.append_submenu("File", &file_menu);
     menubar_model.append_submenu("Edit", &edit_menu);
@@ -115,6 +117,7 @@ pub fn build_menu_bar(
     menubar_model.append_submenu("Help", &help_menu);
 
     // ── Insert action group into window and create MenuBar ──────────────
+    #[cfg(unix)]
     unsafe {
         window.insert_action_group("app", app.as_ptr());
         let menubar = backends_gtk_adapter::create_menubar(&menubar_model, app.as_ptr())?;
@@ -123,7 +126,7 @@ pub fn build_menu_bar(
 }
 
 /// Create a `Menu` from a slice of `MenuAction` items.
-#[cfg(feature = "gui")]
+#[cfg(all(feature = "gui", unix))]
 fn build_submenu(items: &[MenuAction], prefix: &str) -> Result<Menu, Box<dyn std::error::Error>> {
     let mut menu = backends_gtk_adapter::create_menu()?;
     for item in items {
@@ -134,7 +137,7 @@ fn build_submenu(items: &[MenuAction], prefix: &str) -> Result<Menu, Box<dyn std
 }
 
 /// Create a `SimpleAction`, connect its activate closure, and register it with the application.
-#[cfg(feature = "gui")]
+#[cfg(all(feature = "gui", unix))]
 fn register_action<F: FnMut() + 'static>(
     app: &Application,
     name: &str,
