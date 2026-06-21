@@ -4,6 +4,11 @@ use crate::ui_core::*;
 pub(crate) use crate::ui_core::format_cell_display;
 use crate::addr::{self, parse_cell_ref_at, parse_sheet_id_prefix_at};
 use crate::agg::{cell_display, compute_aggregate};
+use crate::agg::helpers::{
+    data_main_col_count, footer_row_agg_func, footer_special_col_aggregate,
+    left_margin_agg_func, left_margin_main_col_aggregate, left_margin_special_col_aggregate,
+    previous_raw_block, right_col_agg_func, row_total_block_start,
+};
 use crate::balance::{self, BalanceDirection};
 use crate::export;
 mod debug_instrumentation;
@@ -2121,201 +2126,12 @@ fn header_template_applies(grid: &Grid, main_col: usize) -> bool {
     raw.as_deref().is_some()
 }
 
-fn data_main_col_count(grid: &Grid) -> usize {
-    crate::agg::helpers::data_main_col_count(grid)
-}
-
-fn row_total_block_start(grid: &Grid, current_main_row: u32) -> u32 {
-    for candidate in (0..current_main_row).rev() {
-        if left_margin_agg_func(grid, candidate).is_some() {
-            return candidate + 1;
-        }
-    }
-    0
-}
-
-fn previous_raw_block(grid: &Grid, current_main_row: u32) -> Option<(u32, u32)> {
-    crate::agg::helpers::previous_raw_block(grid, current_main_row)
-}
-
-fn left_margin_main_col_aggregate(
-    grid: &Grid,
-    func: AggFunc,
-    current_main_row: u32,
-    main_col: u32,
-) -> String {
-    crate::agg::helpers::left_margin_main_col_aggregate(grid, func, current_main_row, main_col)
-}
-
-fn left_margin_special_col_aggregate(
-    grid: &Grid,
-    subtotal_func: AggFunc,
-    global_col: usize,
-    row_start: u32,
-    row_end: u32,
-    data_cols: usize,
-) -> Option<String> {
-    crate::agg::helpers::left_margin_special_col_aggregate(
-        grid,
-        subtotal_func,
-        global_col,
-        row_start,
-        row_end,
-        data_cols,
-    )
-}
-
 fn left_margin_template_applies(grid: &Grid, main_row: usize) -> bool {
     let raw = grid.get(&CellAddr::Left {
         col: (MARGIN_COLS - 1),
         row: main_row as u32,
     });
     raw.as_deref().is_some_and(is_formula)
-}
-
-// ── Display-time aggregate helpers ───────────────────────────────────────────
-
-fn footer_row_agg_func(grid: &Grid, footer_row_idx: usize) -> Option<AggFunc> {
-    let val = grid.get(&CellAddr::Footer {
-        row: footer_row_idx as u32,
-        col: ColumnAddr::Left(MARGIN_COLS - 1),
-    })?;
-    crate::ops::margin_key_agg_func(&val)
-}
-
-fn right_col_agg_func(grid: &Grid, global_col: usize) -> Option<AggFunc> {
-    let mut labels: Vec<(u32, String)> = grid
-        .iter_nonempty()
-        .filter_map(|(addr, val)| match addr {
-            CellAddr::Header { row, col } if col.to_global(grid.main_cols()) == global_col => Some((row, val)),
-            _ => None,
-        })
-        .collect();
-    labels.sort_unstable_by_key(|(row, _)| *row);
-    for (_, val) in labels {
-        if let Some(f) = crate::ops::margin_key_agg_func(&val) {
-            return Some(f);
-        }
-    }
-    None
-}
-
-fn parse_num(s: &str) -> Option<f64> {
-    let t = s.trim();
-    if t.is_empty() {
-        return None;
-    }
-    t.parse::<f64>().ok()
-}
-
-fn boundary_gap_style(underlined: bool) -> Style {
-    if underlined {
-        Style::default().add_modifier(Modifier::UNDERLINED)
-    } else {
-        Style::default()
-    }
-}
-
-fn boundary_separator_style(underlined: bool) -> Style {
-    let style = Style::default().fg(Color::DarkGray);
-    if underlined {
-        style.add_modifier(Modifier::UNDERLINED)
-    } else {
-        style
-    }
-}
-
-fn left_margin_agg_func(grid: &Grid, main_row: u32) -> Option<AggFunc> {
-    let key_col: MarginIndex = MARGIN_COLS - 1;
-    let val = grid.get(&CellAddr::Left {
-        col: key_col,
-        row: main_row,
-    })?;
-    crate::ops::margin_key_agg_func(&val)
-}
-
-fn fold_numbers(func: AggFunc, xs: &[f64]) -> String {
-    if xs.is_empty() {
-        return String::new();
-    }
-    match func {
-        AggFunc::Sum => format!("{}", xs.iter().sum::<f64>()),
-        AggFunc::Mean => format!("{}", xs.iter().sum::<f64>() / xs.len() as f64),
-        AggFunc::Median => {
-            let mut ys = xs.to_vec();
-            ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let n = ys.len();
-            let m = if n % 2 == 1 {
-                ys[n / 2]
-            } else {
-                (ys[n / 2 - 1] + ys[n / 2]) / 2.0
-            };
-            format!("{m}")
-        }
-        AggFunc::Min => xs
-            .iter()
-            .copied()
-            .min_by(|a, b| a.partial_cmp(b).unwrap())
-            .map(|v| format!("{v}"))
-            .unwrap_or_default(),
-        AggFunc::Max => xs
-            .iter()
-            .copied()
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
-            .map(|v| format!("{v}"))
-            .unwrap_or_default(),
-        AggFunc::Count => format!("{}", xs.len()),
-    }
-}
-
-fn footer_special_col_aggregate(
-    grid: &Grid,
-    footer_func: AggFunc,
-    global_col: usize,
-    main_rows: usize,
-    main_cols: usize,
-) -> Option<String> {
-    let row_func = right_col_agg_func(grid, global_col);
-    let data_cols = data_main_col_count(grid);
-    let mut samples: Vec<f64> = Vec::new();
-    for r in 0..main_rows {
-        let row_val = if let Some(func) = row_func {
-            compute_aggregate(
-                grid,
-                &AggregateDef {
-                    func,
-                    source: MainRange {
-                        row_start: r as u32,
-                        row_end: r as u32 + 1,
-                        col_start: 0,
-                        col_end: data_cols as u32,
-                    },
-                },
-            )
-        } else if global_col < MARGIN_COLS {
-            String::new()
-        } else if global_col < MARGIN_COLS + main_cols {
-            cell_effective_display(
-                grid,
-                &CellAddr::Main {
-                    row: r as u32,
-                    col: (global_col - MARGIN_COLS) as u32,
-                },
-            )
-        } else {
-            cell_effective_display(
-                grid,
-                &CellAddr::Right {
-                    col: (global_col - MARGIN_COLS - main_cols),
-                    row: r as u32,
-                },
-            )
-        };
-        if let Some(n) = parse_num(&row_val) {
-            samples.push(n);
-        }
-    }
-    Some(fold_numbers(footer_func, &samples))
 }
 
 // ── Cell-address shorthand ───────────────────────────────────────────────────
@@ -2390,6 +2206,23 @@ fn cycle_special_value(current: &str, choices: &[&'static str]) -> Option<String
         None => choices[0],
     };
     Some(next.to_string())
+}
+
+fn boundary_gap_style(underlined: bool) -> Style {
+    if underlined {
+        Style::default().add_modifier(Modifier::UNDERLINED)
+    } else {
+        Style::default()
+    }
+}
+
+fn boundary_separator_style(underlined: bool) -> Style {
+    let style = Style::default().fg(Color::DarkGray);
+    if underlined {
+        style.add_modifier(Modifier::UNDERLINED)
+    } else {
+        style
+    }
 }
 
 // ── Clipboard helper ─────────────────────────────────────────────────────────
@@ -21755,172 +21588,6 @@ fn formula_bar_value(grid: &Grid, addr: &CellAddr) -> String {
         return raw;
     }
     raw
-}
-
-/// For **Values** TSV, bare aggregate labels in the key left margin still resolve to the computed
-/// aggregate for the row, not the word `TOTAL` (etc.). (Generic text export keeps bare `TOTAL` /
-/// `SUM` as on-sheet text; other labels such as `MAX` can still use `=SUBTOTAL(…)` interop.)
-fn tsv_left_key_subtotal_computed(
-    grid: &Grid,
-    cell_addr: &CellAddr,
-    func: AggFunc,
-    main_row: u32,
-) -> Option<String> {
-    let CellAddr::Left { col, row } = cell_addr else {
-        return None;
-    };
-    if *row != main_row || *col != MARGIN_COLS - 1 {
-        return None;
-    }
-    let raw = grid.get(cell_addr).unwrap_or_default();
-    if crate::ods::subtotal_code_for_label(&raw).is_none() {
-        return None;
-    }
-    Some(left_margin_main_col_aggregate(grid, func, main_row, 0))
-}
-
-/// Footers: key column (`MARGIN_COLS - 1`) may hold a bare `TOTAL` while [`crate::ods::cell_export_value_string`]
-/// emits `=SUBTOTAL(…)` over the full main block — Values must be that aggregate, not the label.
-fn tsv_footer_key_subtotal_computed(
-    grid: &Grid,
-    cell_addr: &CellAddr,
-    func: AggFunc,
-) -> Option<String> {
-    let CellAddr::Footer { col, .. } = cell_addr else {
-        return None;
-    };
-    if col.to_global(grid.main_cols()) != MARGIN_COLS - 1 {
-        return None;
-    }
-    let raw = grid.get(cell_addr).unwrap_or_default();
-    if crate::ods::subtotal_code_for_label(&raw).is_none() {
-        return None;
-    }
-    let mr = grid.main_rows();
-    let mc = grid.main_cols() as u32;
-    Some(compute_aggregate(
-        grid,
-        &AggregateDef {
-            func,
-            source: MainRange {
-                row_start: 0,
-                row_end: mr as u32,
-                col_start: 0,
-                col_end: mc,
-            },
-        },
-    ))
-}
-
-/// Same unformatted value as the main grid’s data cells, used by TSV/CSV export to match
-/// on-screen subtotal/aggregate columns (not just stored formula text).
-pub(crate) fn tsv_effective_unformatted_string(grid: &Grid, r: usize, c: usize) -> String {
-    let cur = SheetCursor { row: r, col: c };
-    let cell_addr = cur.to_addr(grid);
-    let hr = HEADER_ROWS;
-    let mr = grid.main_rows();
-    let lm = MARGIN_COLS;
-    let mc = grid.main_cols();
-    let right_col_agg = right_col_agg_func(grid, c);
-    let footer_agg = if r >= hr + mr {
-        footer_row_agg_func(grid, r - hr - mr)
-    } else {
-        None
-    };
-    let main_row_idx = if r >= hr && r < hr + mr {
-        Some((r - hr) as u32)
-    } else {
-        None
-    };
-    let left_margin_agg = main_row_idx.and_then(|mri| left_margin_agg_func(grid, mri));
-    let left_margin_block_start = main_row_idx.map(|mri| row_total_block_start(grid, mri));
-
-    if let Some(func) = footer_agg {
-        if right_col_agg.is_some() {
-            footer_special_col_aggregate(grid, func, c, mr, mc)
-                .unwrap_or_else(|| {
-                    tsv_footer_key_subtotal_computed(grid, &cell_addr, func)
-                        .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
-                })
-        } else if c >= lm && c < lm + mc {
-            let main_col = (c - lm) as u32;
-            compute_aggregate(
-                grid,
-                &AggregateDef {
-                    func,
-                    source: MainRange {
-                        row_start: 0,
-                        row_end: mr as u32,
-                        col_start: main_col,
-                        col_end: main_col + 1,
-                    },
-                },
-            )
-        } else {
-            tsv_footer_key_subtotal_computed(grid, &cell_addr, func)
-                .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
-        }
-    } else if let (Some(func), Some(block_start), Some(main_row)) =
-        (left_margin_agg, left_margin_block_start, main_row_idx)
-    {
-        if c >= lm && c < lm + mc {
-            if right_col_agg.is_some() {
-                let data_cols = data_main_col_count(grid);
-                let (row_start, row_end) = if block_start < main_row {
-                    (block_start, main_row)
-                } else {
-                    previous_raw_block(grid, main_row).unwrap_or((0, main_row))
-                };
-                left_margin_special_col_aggregate(
-                    grid, func, c, row_start, row_end, data_cols,
-                )
-                .unwrap_or_else(|| {
-                    tsv_left_key_subtotal_computed(grid, &cell_addr, func, main_row)
-                        .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
-                })
-            } else {
-                let main_col = (c - lm) as u32;
-                left_margin_main_col_aggregate(grid, func, main_row, main_col)
-            }
-        } else if right_col_agg.is_some() {
-            left_margin_special_col_aggregate(
-                grid,
-                func,
-                c,
-                block_start,
-                main_row,
-                data_main_col_count(grid),
-            )
-            .unwrap_or_else(|| {
-                tsv_left_key_subtotal_computed(grid, &cell_addr, func, main_row)
-                    .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
-            })
-        } else {
-            tsv_left_key_subtotal_computed(grid, &cell_addr, func, main_row)
-                .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
-        }
-    } else if r >= hr && r < hr + mr {
-        if let Some(func) = right_col_agg {
-            let main_row = (r - hr) as u32;
-            let data_cols = data_main_col_count(grid);
-            compute_aggregate(
-                grid,
-                &AggregateDef {
-                    func,
-                    source: MainRange {
-                        row_start: main_row,
-                        row_end: main_row + 1,
-                        col_start: 0,
-                        col_end: data_cols as u32,
-                    },
-                },
-            )
-        } else {
-            cell_effective_display(grid, &cell_addr)
-        }
-    } else {
-        cell_effective_display(grid, &cell_addr)
-    }
 }
 
 // Formatting functions (normalize_inline_text, measured_width_text_for_stored_literal,
