@@ -15,20 +15,15 @@ pub mod menu;
 pub mod render;
 pub mod sheet;
 
-#[cfg(all(feature = "gui", unix))]
-mod gtk_backend;
-#[cfg(all(feature = "gui", windows))]
-mod nwg_backend;
+#[cfg(all(feature = "gui", not(feature = "pancurses")))]
+mod gui_backend;
 #[cfg(all(feature = "gui", target_os = "android"))]
 mod android_backend;
 #[cfg(feature = "pancurses")]
 mod pnc_backend;
 
 pub enum Backend {
-    #[cfg(unix)]
-    Gtk,
-    #[cfg(windows)]
-    Nwg,
+    Gui,
     Pancurses,
 }
 
@@ -154,10 +149,6 @@ impl App {
     /// Fit all main columns to their rendered content (matching ratatui's
     /// fit_column_to_rendered_content called during load_initial).
     pub fn fit_main_columns_to_max_width(&mut self) {
-        // Use rendered_width_for_column (which evaluates formulas and uses
-        // Unicode width) to match ratatui's fit_column_to_rendered_content.
-        // The Grid's fit_column_to_content only measures raw cell text, which
-        // undercounts formula results that render wider (e.g. =e^i → "0.5403023…").
         let sheet = self.core.workbook.active_sheet_mut();
         let grid = &mut sheet.grid;
         let mc = grid.main_cols();
@@ -175,56 +166,15 @@ impl App {
     }
 
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        #[cfg(unix)]
-        if let Some(Backend::Gtk) = self.backend {
-            return self.run_gtk_inner();
+        #[cfg(all(feature = "gui", not(feature = "pancurses")))]
+        if self.backend.as_ref().map_or(true, |b| matches!(b, Backend::Gui)) {
+            return gui_backend::run_gui(self);
         }
-        #[cfg(windows)]
-        if let Some(Backend::Nwg) = self.backend {
-            return self.run_nwg_inner();
-        }
-        #[cfg(not(any(unix, windows)))]
-        if let Some(Backend::Pancurses) = self.backend {
-            return self.run_pnc_inner();
-        }
-        #[cfg(all(unix))]
-        if self.backend.is_none() {
-            return self.run_gtk_inner();
-        }
-        #[cfg(all(windows))]
-        if self.backend.is_none() {
-            return self.run_nwg_inner();
-        }
-        #[cfg(not(any(unix, windows)))]
-        if self.backend.is_none() {
-            return self.run_pnc_inner();
+        #[cfg(feature = "pancurses")]
+        if self.backend.as_ref().map_or(true, |b| matches!(b, Backend::Pancurses)) {
+            return pnc_backend::run_pancurses(self);
         }
         Err("Unknown backend".into())
-    }
-
-    #[cfg(all(feature = "gui", unix))]
-    fn run_gtk_inner(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        gtk_backend::run_gtk(self)
-    }
-
-    #[cfg(all(feature = "gui", windows))]
-    fn run_nwg_inner(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        nwg_backend::run_nwg(self)
-    }
-
-    #[cfg(not(feature = "gui"))]
-    fn run_gtk_inner(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        Err("GTK backend not compiled in (pancurses active); rebuild with --features gui".into())
-    }
-
-    #[cfg(feature = "pancurses")]
-    fn run_pnc_inner(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        pnc_backend::run_pancurses(self)
-    }
-
-    #[cfg(not(feature = "pancurses"))]
-    fn run_pnc_inner(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        Err("pancurses backend not compiled in; rebuild with --features pancurses".into())
     }
 
     pub fn take_final_exit_hint(&mut self) -> Option<String> {

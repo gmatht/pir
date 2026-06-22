@@ -111,6 +111,62 @@ pub(crate) fn previous_raw_block(grid: &Grid, current_main_row: u32) -> Option<(
     Some((0, current_main_row))
 }
 
+pub(crate) fn footer_row_agg_func(grid: &Grid, footer_row_idx: usize) -> Option<crate::ops::AggFunc> {
+    let key_col = crate::grid::ColumnAddr::Left(crate::grid::MARGIN_COLS - 1);
+    let val = grid.get(&CellAddr::Footer {
+        row: footer_row_idx as u32,
+        col: key_col,
+    })?;
+    crate::ops::margin_key_agg_func(&val)
+}
+
+pub(crate) fn footer_special_col_aggregate(
+    grid: &Grid,
+    footer_func: crate::ops::AggFunc,
+    global_col: usize,
+    main_rows: usize,
+    main_cols: usize,
+) -> Option<String> {
+    let row_func = right_col_agg_func(grid, global_col);
+    let data_cols = data_main_col_count(grid);
+    let mut samples: Vec<f64> = Vec::new();
+    for r in 0..main_rows {
+        let row_val = if let Some(func) = row_func {
+            crate::agg::compute_aggregate(
+                grid,
+                &crate::ops::AggregateDef {
+                    func,
+                    source: crate::grid::MainRange {
+                        row_start: r as u32,
+                        row_end: r as u32 + 1,
+                        col_start: 0,
+                        col_end: data_cols as u32,
+                    },
+                },
+            )
+        } else if global_col < crate::grid::MARGIN_COLS {
+            String::new()
+        } else if global_col < crate::grid::MARGIN_COLS + main_cols {
+            let mc = global_col - crate::grid::MARGIN_COLS;
+            crate::formula::cell_effective_display(
+                grid,
+                &CellAddr::Main {
+                    row: r as u32,
+                    col: mc as u32,
+                },
+            )
+        } else {
+            String::new()
+        };
+        if !row_val.is_empty() {
+            if let Some(n) = parse_num(&row_val) {
+                samples.push(n);
+            }
+        }
+    }
+    Some(fold_numbers(footer_func, &samples))
+}
+
 pub(crate) fn left_margin_main_col_aggregate(
     grid: &Grid,
     subtotal_func: AggFunc,

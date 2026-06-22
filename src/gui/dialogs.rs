@@ -24,9 +24,8 @@ pub fn file_save_dialog() -> Option<PathBuf> {
 pub fn show_about_dialog() {
     #[cfg(feature = "gui")]
     {
-        use rustxwidgets::App;
         #[cfg(unix)]
-        if let Ok(app) = App::init() {
+        if let Ok(app) = rustxwidgets::App::init() {
             if let Ok(dialog) = app.create_dialog() {
                 if let Ok(label) = app.create_label(&format!(
                     "corro {}\n\nAppend-only collaborative spreadsheet",
@@ -55,9 +54,8 @@ pub fn show_about_dialog() {
 pub fn show_keybinds_help() {
     #[cfg(feature = "gui")]
     {
-        use rustxwidgets::App;
         #[cfg(unix)]
-        if let Ok(app) = App::init() {
+        if let Ok(app) = rustxwidgets::App::init() {
             if let Ok(dialog) = app.create_dialog() {
                 if let Ok(tv) = app.create_textview() {
                     dialog.set_title("Keybindings");
@@ -199,8 +197,8 @@ pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: 
 
 pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &WorkbookState, on_result: F) {
     #[cfg(feature = "gui")]
-    {
-        use rustxwidgets::{App, DropDown, CheckButton};
+{
+        use rustxwidgets::{App, Entry};
         #[cfg(unix)]
         if let Ok(app) = App::init() {
             let cols: &[&str] = &["Column A", "Column B", "Column C", "Column D", "Column E"];
