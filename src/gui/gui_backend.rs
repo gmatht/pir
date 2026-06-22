@@ -1,6 +1,5 @@
 use rustxwidgets::common::*;
 use rustxwidgets::core::DrawContext;
-use rustxwidgets::Widget;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;

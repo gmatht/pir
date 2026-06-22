@@ -12,10 +12,9 @@ use crate::agg::helpers::{
 };
 use crate::formula::cell_effective_display;
 use crate::grid::{
-    CellAddr, GridBox as Grid, NumberFormat, SheetCursor, TextAlign,
+    CellAddr, GridBox as Grid, MainRange, NumberFormat, SheetCursor, TextAlign,
     FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS,
 };
-use crate::grid::MainRange;
 use crate::ops::{AggFunc, AggregateDef, SheetState};
 
 // ---------------------------------------------------------------------------

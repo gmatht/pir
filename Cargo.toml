@@ -1,5 +1,5 @@
 [workspace]
-members = ["balance-core", "rustxWidgets/gtk_dynamic_loader", "rustxWidgets/rustxwidgets"]
+members = ["balance-core", "rustxWidgets/rustxwidgets"]
 
 [toolchain]
 channel = "nightly"
@@ -14,7 +14,7 @@ default-run = "corro"
 default = ["ratatui"]
 nightly = []
 ratatui = ["dep:ratatui", "dep:crossterm", "dep:unicode-truncate", "dep:unicode-segmentation"]
-gui = ["dep:rustxwidgets", "rustxwidgets/gtk", "dep:gtk_dynamic_loader"]
+gui = ["dep:rustxwidgets", "rustxwidgets/gtk"]
 pancurses = ["rustxwidgets/pancurses"]
 
 [dependencies]

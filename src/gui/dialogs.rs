@@ -1,5 +1,7 @@
 use crate::ops::WorkbookState;
 use std::path::PathBuf;
+#[cfg(feature = "gui")]
+use rustxwidgets::prelude::Orientation;
 
 pub fn file_open_dialog() -> Option<PathBuf> {
     #[cfg(feature = "gui")]
@@ -81,28 +83,36 @@ pub fn show_keybinds_help() {
 pub fn find_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
     #[cfg(feature = "gui")]
     {
-        if let Ok(app) = rustxwidgets::App::init() {
+        use rustxwidgets::{App, Entry};
+        if let Ok(app) = App::init() {
             if let Ok(dialog) = app.create_dialog() {
                 if let Ok(entry) = app.create_entry() {
                     dialog.set_title("Find");
                     dialog.append_content_area(&entry);
                     dialog.add_button("Cancel", 0);
                     dialog.add_button("Find", 1);
-                    let entry_ptr = Box::into_raw(Box::new(entry)) as usize;
+                    let entry_ptr = Box::into_raw(Box::new(entry.clone())) as usize;
                     let mut on_result = Some(on_result);
                     let d = dialog.clone();
+                    let callback_called = std::cell::RefCell::new(false);
                     dialog.connect_response(move |response_id| {
-                        if let Some(f) = on_result.take() {
-                            let entry: &rustxwidgets::Entry = unsafe { &*(entry_ptr as *const rustxwidgets::Entry) };
-                            if response_id == 1 {
-                                f(entry.get_text());
-                            } else {
-                                f(None);
+                        let mut called = callback_called.borrow_mut();
+                        if !*called {
+                            *called = true;
+                            if let Some(f) = on_result.take() {
+                                let entry: &Entry = unsafe { &*(entry_ptr as *const Entry) };
+                                if response_id == 1 {
+                                    f(entry.get_text());
+                                } else {
+                                    f(None);
+                                }
                             }
                         }
                         d.close();
                     }).ok();
                     dialog.present();
+                    // Keep alive: leak so GTK manages the lifecycle
+                    let _ = Box::into_raw(Box::new(dialog));
                     return;
                 }
             }
@@ -114,9 +124,10 @@ pub fn find_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
 pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: F) {
     #[cfg(feature = "gui")]
     {
-        if let Ok(app) = rustxwidgets::App::init() {
+        use rustxwidgets::{App, Entry};
+        if let Ok(app) = App::init() {
             if let (Ok(dialog), Ok(find_entry), Ok(replace_entry), Ok(mut vbox)) =
-                (app.create_dialog(), app.create_entry(), app.create_entry(), app.create_box(rustxwidgets::Orientation::Vertical, 4))
+                (app.create_dialog(), app.create_entry(), app.create_entry(), app.create_box(Orientation::Vertical, 4))
             {
                 dialog.set_title("Replace");
                 dialog.set_default_size(350, 150);
@@ -131,26 +142,33 @@ pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: 
                 dialog.append_content_area(&vbox);
                 dialog.add_button("Cancel", 0);
                 dialog.add_button("Replace", 1);
-                let find_ptr = Box::into_raw(Box::new(find_entry)) as usize;
-                let replace_ptr = Box::into_raw(Box::new(replace_entry)) as usize;
+                let find_ptr = Box::into_raw(Box::new(find_entry.clone())) as usize;
+                let replace_ptr = Box::into_raw(Box::new(replace_entry.clone())) as usize;
                 let mut on_result = Some(on_result);
                 let d = dialog.clone();
+                let callback_called = std::cell::RefCell::new(false);
                 dialog.connect_response(move |response_id| {
-                    if let Some(f) = on_result.take() {
-                        let find_entry: &rustxwidgets::Entry = unsafe { &*(find_ptr as *const rustxwidgets::Entry) };
-                        let replace_entry: &rustxwidgets::Entry = unsafe { &*(replace_ptr as *const rustxwidgets::Entry) };
-                        if response_id == 1 {
-                            f(Some((
-                                find_entry.get_text().unwrap_or_default(),
-                                replace_entry.get_text().unwrap_or_default(),
-                            )));
-                        } else {
-                            f(None);
+                    let mut called = callback_called.borrow_mut();
+                    if !*called {
+                        *called = true;
+                        if let Some(f) = on_result.take() {
+                            let find_entry: &Entry = unsafe { &*(find_ptr as *const Entry) };
+                            let replace_entry: &Entry = unsafe { &*(replace_ptr as *const Entry) };
+                            if response_id == 1 {
+                                f(Some((
+                                    find_entry.get_text().unwrap_or_default(),
+                                    replace_entry.get_text().unwrap_or_default(),
+                                )));
+                            } else {
+                                f(None);
+                            }
                         }
                     }
                     d.close();
                 }).ok();
                 dialog.present();
+                // Keep alive: leak so GTK manages the lifecycle
+                let _ = Box::into_raw(Box::new(dialog));
                 return;
             }
         }
@@ -160,11 +178,11 @@ pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: 
 
 pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &WorkbookState, on_result: F) {
     #[cfg(feature = "gui")]
-    {
-        #[cfg(unix)]
-        if let Ok(app) = rustxwidgets::App::init() {
+{
+        use rustxwidgets::{App, CheckButton, DropDown};
+        if let Ok(app) = App::init() {
             let cols: &[&str] = &["Column A", "Column B", "Column C", "Column D", "Column E"];
-            if let (Ok(dialog), Ok(sort_col), Ok(ascending), Ok(vbox)) =
+            if let (Ok(dialog), Ok(sort_col), Ok(ascending), Ok(mut vbox)) =
                 (app.create_dialog(), app.create_dropdown(cols), app.create_checkbutton("Ascending"),
                  app.create_box(Orientation::Vertical, 4))
             {
@@ -181,20 +199,25 @@ pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &Workb
                 dialog.append_content_area(&vbox);
                 dialog.add_button("Cancel", 0);
                 dialog.add_button("Sort", 1);
-                let sort_col_ptr = Box::into_raw(Box::new(sort_col)) as usize;
-                let ascending_ptr = Box::into_raw(Box::new(ascending)) as usize;
+                let sort_col_ptr = Box::into_raw(Box::new(sort_col.clone())) as usize;
+                let ascending_ptr = Box::into_raw(Box::new(ascending.clone())) as usize;
                 let mut on_result = Some(on_result);
                 let d = dialog.clone();
+                let callback_called = std::cell::RefCell::new(false);
                 dialog.connect_response(move |response_id| {
-                    if let Some(f) = on_result.take() {
-                        let sort_col: &DropDown = unsafe { &*(sort_col_ptr as *const DropDown) };
-                        let ascending: &CheckButton = unsafe { &*(ascending_ptr as *const CheckButton) };
-                        if response_id == 1 {
-                            let col = sort_col.get_active().max(0) as usize;
-                            let asc = ascending.is_active();
-                            f(Some((col, asc)));
-                        } else {
-                            f(None);
+                    let mut called = callback_called.borrow_mut();
+                    if !*called {
+                        *called = true;
+                        if let Some(f) = on_result.take() {
+                            let sort_col: &DropDown = unsafe { &*(sort_col_ptr as *const DropDown) };
+                            let ascending: &CheckButton = unsafe { &*(ascending_ptr as *const CheckButton) };
+                            if response_id == 1 {
+                                let col = sort_col.get_active().max(0) as usize;
+                                let asc = ascending.is_active();
+                                f(Some((col, asc)));
+                            } else {
+                                f(None);
+                            }
                         }
                     }
                     d.close();
@@ -202,7 +225,6 @@ pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &Workb
                 dialog.present();
                 // Keep alive: leak so GTK manages the lifecycle
                 let _ = Box::into_raw(Box::new(dialog));
-                let _ = Box::into_raw(Box::new(vbox));
                 return;
             }
         }
@@ -213,8 +235,8 @@ pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &Workb
 pub fn balance_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
     #[cfg(feature = "gui")]
     {
-        #[cfg(unix)]
-        if let Ok(app) = rustxwidgets::App::init() {
+        use rustxwidgets::{App, Entry};
+        if let Ok(app) = App::init() {
             if let (Ok(dialog), Ok(entry)) = (app.create_dialog(), app.create_entry()) {
                 dialog.set_title("Balance Books");
                 if let Ok(label) = app.create_label("Column to balance:") {
@@ -226,7 +248,7 @@ pub fn balance_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
                 dialog.append_content_area(&entry);
                 dialog.add_button("Cancel", 0);
                 dialog.add_button("Balance", 1);
-                let entry_ptr = Box::into_raw(Box::new(entry)) as usize;
+                let entry_ptr = Box::into_raw(Box::new(entry.clone())) as usize;
                 let mut on_result = Some(on_result);
                 let d = dialog.clone();
                 dialog.connect_response(move |response_id| {
@@ -243,7 +265,6 @@ pub fn balance_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
                 dialog.present();
                 // Keep alive: leak so GTK manages the lifecycle
                 let _ = Box::into_raw(Box::new(dialog));
-                let _ = Box::into_raw(Box::new(entry));
                 return;
             }
         }
