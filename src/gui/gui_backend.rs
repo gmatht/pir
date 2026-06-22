@@ -143,6 +143,8 @@ struct GuiState {
     last_col: Cell<usize>,
     data_rows: Cell<usize>,
     data_cols: Cell<usize>,
+    last_key: Cell<u32>,
+    key_counter: Cell<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -287,6 +289,7 @@ fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
     );
 
     // Fill cells via the shared render pipeline
+    let sink_snapshot: HashMap<(u32, u32), String>;
     {
         let mut sink = GuiCanvasSink::new();
         render::fill_cells(
@@ -297,6 +300,7 @@ fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
             cursor_row, cursor_col,
             &row_agg_func,
         );
+        sink_snapshot = sink.cells.borrow().clone();
         render_to(
             &sink, dc, &col_ixs, &col_widths, &display_rows,
             mr, mc,
@@ -312,19 +316,24 @@ fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
         dc.fill_rect(0.0, h as f64 - 20.0, w as f64, 20.0, 0.9, 0.9, 0.9, 1.0);
     }
 
-    // Diagnostic: read first data cell from grid directly
+    // Diagnostic: read first data cell from grid + sink
     let first_row = hr;
     let first_col = lm;
     let main_row = first_row.saturating_sub(hr);
     let main_col = first_col.saturating_sub(lm);
     let addr = crate::grid::CellAddr::Main { row: main_row as u32, col: main_col as u32 };
     let cell_val = app.core.workbook.active_sheet().grid.get(&addr).unwrap_or_default();
-    let editing = state.editing.get();
-    let eb = state.edit_buf.borrow().clone();
     let is_editing = if state.editing.get() { "EDIT" } else { "NORM" };
+    let eb = state.edit_buf.borrow().clone();
     let buf_display = if eb.is_empty() { "(empty)" } else { &eb };
-    dc.draw_text(100.0, h as f64 - 80.0, &format!("Mode:{is_editing}  Buf:'{buf_display}'"), "monospace", 14.0, 0.5, 0.0, 0.5, 1.0);
-    dc.draw_text(100.0, h as f64 - 60.0, &format!("Cell({main_row},{main_col}): '{cell_val}'"), "monospace", 14.0, 0.0, 0.0, 1.0, 1.0);
+    let sink_key_col = MARGIN_COLS as u32;
+    let sink_first = sink_snapshot.get(&(0u32, sink_key_col)).cloned().unwrap_or_default();
+    let cur = (state.last_row.get(), state.last_col.get());
+    let lk = state.last_key.get();
+    let kc = state.key_counter.get();
+    dc.draw_text(100.0, h as f64 - 140.0, &format!("Grid(0,0)='{cell_val}' Sink(0,{sink_key_col})='{sink_first}' Cur=({},{})", cur.0, cur.1), "monospace", 12.0, 0.0, 0.5, 0.0, 1.0);
+    dc.draw_text(100.0, h as f64 - 120.0, &format!("lastKey=0x{lk:04x} cnt={kc}", ), "monospace", 12.0, 1.0, 0.0, 0.0, 1.0);
+    dc.draw_text(100.0, h as f64 - 100.0, &format!("Mode:{is_editing} Buf:'{buf_display}'"), "monospace", 14.0, 0.5, 0.0, 0.5, 1.0);
 }
 
 fn sheet_rec_col_width(sheet: &crate::ops::SheetState, col: usize) -> usize {
@@ -337,6 +346,7 @@ fn sheet_rec_col_width(sheet: &crate::ops::SheetState, col: usize) -> usize {
 
 fn handle_key(keyval: u32, state_rc: &Rc<GuiState>) -> bool {
     let state: &GuiState = &**state_rc;
+    state.last_key.set(keyval);
     let app = unsafe { &mut *state.app };
     let key = {
         #[cfg(windows)]
@@ -995,6 +1005,8 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         last_col: Cell::new(cursor_col),
         data_rows: Cell::new(data_rows),
         data_cols: Cell::new(data_cols),
+        last_key: Cell::new(0),
+        key_counter: Cell::new(0),
     });
 
     // Build menu
@@ -1043,7 +1055,10 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     #[cfg(windows)]
     {
         let shared_k = shared.clone();
+        let shared_k2 = shared.clone();
         formula_entry.on_key(Box::new(move |keyval: u32| -> bool {
+            shared_k2.key_counter.set(shared_k2.key_counter.get() + 1);
+            shared_k2.last_key.set(keyval);
             let masked = keyval & 0xFF;
             if masked == RETURN || masked == ESCAPE {
                 handle_key(keyval, &shared_k);
@@ -1052,6 +1067,10 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 false
             }
         }));
+
+        // WM_CHAR for Enter/Escape is consumed in the NWG adapter's _key_handler
+        // to prevent the Edit control from beeping. The on_key callback above handles
+        // WM_KEYDOWN for Enter/Escape by calling handle_key and returning true (consumed).
     }
 
     // Assemble layout
@@ -1062,6 +1081,9 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     win.set_child_box(&vbox);
     win.present();
+
+    // Start editing at A1 immediately so typing goes into the cell
+    start_edit(&shared);
 
     rxapp.run()?;
     Ok(())
