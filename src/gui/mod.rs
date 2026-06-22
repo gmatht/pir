@@ -15,7 +15,7 @@ pub mod menu;
 pub mod render;
 pub mod sheet;
 
-#[cfg(all(feature = "gui", not(feature = "pancurses")))]
+#[cfg(feature = "gui")]
 mod gui_backend;
 #[cfg(all(feature = "gui", target_os = "android"))]
 mod android_backend;
@@ -166,7 +166,7 @@ impl App {
     }
 
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        #[cfg(all(feature = "gui", not(feature = "pancurses")))]
+        #[cfg(feature = "gui")]
         if self.backend.as_ref().map_or(true, |b| matches!(b, Backend::Gui)) {
             return gui_backend::run_gui(self);
         }
