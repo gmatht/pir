@@ -114,6 +114,8 @@ pub fn handle_action(name: &str) {
         "quit" => {
             #[cfg(unix)]
             let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
+            #[cfg(windows)]
+            rustxwidgets::backends_nwg_adapter::quit_main_loop();
         }
         "find" => dialogs::find_dialog(|result| {
             if let Some(text) = result {
