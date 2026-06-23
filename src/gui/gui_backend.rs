@@ -1,23 +1,23 @@
 use rustxwidgets::prelude::*;
 use rustxwidgets::core::DrawContext;
-use rustxwidgets::Widget;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::grid::{CellAddr, SheetCursor, HEADER_ROWS, MARGIN_COLS};
-use crate::ops::{AggFunc, Op, WorkbookOp};
+use crate::ops::{Op, WorkbookOp};
 use crate::ui_core;
 
 use super::compute::{self, CellDisplayStyle};
+use super::dialogs;
 use super::render::{self, CellSink};
 
 // ---------------------------------------------------------------------------
 // Platform key constants
 // ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "gui", target_family = "unix"))]
+#[cfg(unix)]
 mod key {
     pub const RETURN: u32 = 0xFF0D;
     pub const ESCAPE: u32 = 0xFF1B;
@@ -81,7 +81,6 @@ const CHAR_W: f64 = 7.2;
 enum GuiMode {
     Normal,
     Help,
-    About,
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +133,7 @@ impl CellSink for GuiCanvasSink {
 
 struct GuiState {
     app: *mut super::App,
+    #[allow(dead_code)]
     rxapp: rustxwidgets::App,
     canvas: Canvas,
     formula_entry: Entry,
@@ -146,11 +146,8 @@ struct GuiState {
     last_col: Cell<usize>,
     data_rows: Cell<usize>,
     data_cols: Cell<usize>,
-    // drawing data
-    cells: RefCell<HashMap<(u32, u32), String>>,
-    styles: RefCell<HashMap<(u32, u32), CellDisplayStyle>>,
-    raw_values: RefCell<HashMap<(u32, u32), String>>,
-    cursor_pos: Cell<Option<(u32, u32)>>,
+    last_key: Cell<u32>,
+    key_counter: Cell<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -188,9 +185,10 @@ fn render_to(
             let cw = *col_widths.get(&c).unwrap_or(&8) as f64 * CHAR_W;
             let cx = ROW_LABEL_W + col_ixs.iter().take(ci).map(|&pc| *col_widths.get(&pc).unwrap_or(&8) as f64 * CHAR_W).sum::<f64>();
 
-            let key = (logical_row as u32, c as u32);
+            let key = (ri as u32, c as u32);
             let raw_text = cells.get(&key).map(|s| s.as_str()).unwrap_or("");
-            let style = styles.get(&key).copied().unwrap_or(CellDisplayStyle::Default);
+            let style_key = (ri as u32, c as u32);
+            let style = styles.get(&style_key).copied().unwrap_or(CellDisplayStyle::Default);
             let is_current = logical_row == cursor_row && c == cursor_col;
 
             let bg = if is_current {
@@ -254,33 +252,35 @@ fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
     let cursor_row = state.last_row.get();
     let cursor_col = state.last_col.get();
 
-    // Row headers
-    for (ri, logical_row) in (0..app.core.workbook.active_sheet().grid.main_rows()).enumerate().take(MAX_RENDER_ROWS) {
-        let ry = HEADER_H + ri as f64 * ROW_H;
-        let (tw, _, _, _) = dc.text_extents(&logical_row.to_string(), "monospace", FONT_SIZE);
-        dc.fill_rect(0.0, ry, ROW_LABEL_W, ROW_H, 0.9, 0.9, 0.9, 1.0);
-        dc.draw_text(ROW_LABEL_W - tw - 4.0, ry + 2.0, &logical_row.to_string(), "monospace", FONT_SIZE, 0.3, 0.3, 0.3, 1.0);
-    }
-
-    // Column headers
-    let col_ixs: Vec<usize> = {
-        let sheet = app.core.workbook.active_sheet();
-        ui_core::visible_col_indices(sheet, app.core.cursor, state.data_cols.get(), 0).0
-    };
-
-    for (ci, &c) in col_ixs.iter().enumerate().take(MAX_RENDER_COLS) {
-        let cw = sheet_rec_col_width(&app.core.workbook.active_sheet(), c) as f64 * CHAR_W;
-        let cx = ROW_LABEL_W + col_ixs.iter().take(ci).map(|&pc| sheet_rec_col_width(&app.core.workbook.active_sheet(), pc) as f64 * CHAR_W).sum::<f64>();
-        let col_name = crate::addr::excel_column_name(c.saturating_sub(MARGIN_COLS));
-        dc.fill_rect(cx, 0.0, cw, HEADER_H, 0.9, 0.9, 0.9, 1.0);
-        dc.draw_text(cx + 4.0, 2.0, &col_name, "monospace", FONT_SIZE, 0.3, 0.3, 0.3, 1.0);
-    }
-
-    // Data rows
     let display_rows: Vec<usize> = {
         let sheet = app.core.workbook.active_sheet();
         ui_core::visible_row_indices(sheet, app.core.cursor, state.data_rows.get(), 0).0
     };
+    let col_ixs: Vec<usize> = {
+        let sheet = app.core.workbook.active_sheet();
+        ui_core::visible_col_indices(sheet, app.core.cursor, state.data_cols.get(), 0).0
+    };
+    let mr = app.core.workbook.active_sheet().grid.main_rows();
+    let mc = app.core.workbook.active_sheet().grid.main_cols();
+
+    // Row headers
+    for (ri, &logical_row) in display_rows.iter().enumerate().take(MAX_RENDER_ROWS) {
+        let ry = HEADER_H + ri as f64 * ROW_H;
+        let label = crate::addr::ui_row_label(logical_row, mr);
+        let (_, _, tw, _) = dc.text_extents(&label, "monospace", FONT_SIZE);
+        dc.fill_rect(0.0, ry, ROW_LABEL_W, ROW_H, 0.9, 0.9, 0.9, 1.0);
+        dc.draw_text(ROW_LABEL_W - tw - 4.0, ry + 2.0, &label, "monospace", FONT_SIZE, 0.3, 0.3, 0.3, 1.0);
+    }
+
+    // Column headers
+    for (ci, &c) in col_ixs.iter().enumerate().take(MAX_RENDER_COLS) {
+        let cw = sheet_rec_col_width(&app.core.workbook.active_sheet(), c) as f64 * CHAR_W;
+        let cx = ROW_LABEL_W + col_ixs.iter().take(ci).map(|&pc| sheet_rec_col_width(&app.core.workbook.active_sheet(), pc) as f64 * CHAR_W).sum::<f64>();
+        let col_name = crate::addr::ui_column_fragment(c, mc);
+        dc.fill_rect(cx, 0.0, cw, HEADER_H, 0.9, 0.9, 0.9, 1.0);
+        let (_, _, tw, _) = dc.text_extents(&col_name, "monospace", FONT_SIZE);
+        dc.draw_text(cx + (cw - tw) / 2.0, (HEADER_H - FONT_SIZE * 1.2) / 2.0, &col_name, "monospace", FONT_SIZE, 0.3, 0.3, 0.3, 1.0);
+    }
 
     let col_widths: HashMap<usize, usize> = col_ixs.iter()
         .map(|&c| (c, sheet_rec_col_width(&app.core.workbook.active_sheet(), c)))
@@ -288,25 +288,25 @@ fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
 
     let row_agg_func = compute::compute_row_agg_func(
         &app.core.workbook.active_sheet().grid,
-        &display_rows, hr, app.core.workbook.active_sheet().grid.main_rows(),
+        &display_rows, hr, mr,
     );
 
     // Fill cells via the shared render pipeline
+    let sink_snapshot: HashMap<(u32, u32), String>;
     {
         let mut sink = GuiCanvasSink::new();
         render::fill_cells(
             &mut sink, &display_rows, &col_ixs, &col_widths,
             &app.core.workbook.active_sheet().grid,
-            hr, app.core.workbook.active_sheet().grid.main_rows(),
-            app.core.workbook.active_sheet().grid.main_cols(),
+            hr, mr, mc,
             lm, state.data_cols.get(),
             cursor_row, cursor_col,
             &row_agg_func,
         );
+        sink_snapshot = sink.cells.borrow().clone();
         render_to(
             &sink, dc, &col_ixs, &col_widths, &display_rows,
-            app.core.workbook.active_sheet().grid.main_rows(),
-            app.core.workbook.active_sheet().grid.main_cols(),
+            mr, mc,
             cursor_row, cursor_col,
             state.editing.get(),
             &state.edit_buf.borrow(),
@@ -318,6 +318,25 @@ fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
     if h as f64 > HEADER_H + 20.0 {
         dc.fill_rect(0.0, h as f64 - 20.0, w as f64, 20.0, 0.9, 0.9, 0.9, 1.0);
     }
+
+    // Diagnostic: read first data cell from grid + sink
+    let first_row = hr;
+    let first_col = lm;
+    let main_row = first_row.saturating_sub(hr);
+    let main_col = first_col.saturating_sub(lm);
+    let addr = crate::grid::CellAddr::Main { row: main_row as u32, col: main_col as u32 };
+    let cell_val = app.core.workbook.active_sheet().grid.get(&addr).unwrap_or_default();
+    let is_editing = if state.editing.get() { "EDIT" } else { "NORM" };
+    let eb = state.edit_buf.borrow().clone();
+    let buf_display = if eb.is_empty() { "(empty)" } else { &eb };
+    let sink_key_col = MARGIN_COLS as u32;
+    let sink_first = sink_snapshot.get(&(0u32, sink_key_col)).cloned().unwrap_or_default();
+    let cur = (state.last_row.get(), state.last_col.get());
+    let lk = state.last_key.get();
+    let kc = state.key_counter.get();
+    dc.draw_text(100.0, h as f64 - 140.0, &format!("Grid(0,0)='{cell_val}' Sink(0,{sink_key_col})='{sink_first}' Cur=({},{})", cur.0, cur.1), "monospace", 12.0, 0.0, 0.5, 0.0, 1.0);
+    dc.draw_text(100.0, h as f64 - 120.0, &format!("lastKey=0x{lk:04x} cnt={kc}", ), "monospace", 12.0, 1.0, 0.0, 0.0, 1.0);
+    dc.draw_text(100.0, h as f64 - 100.0, &format!("Mode:{is_editing} Buf:'{buf_display}'"), "monospace", 14.0, 0.5, 0.0, 0.5, 1.0);
 }
 
 fn sheet_rec_col_width(sheet: &crate::ops::SheetState, col: usize) -> usize {
@@ -330,6 +349,7 @@ fn sheet_rec_col_width(sheet: &crate::ops::SheetState, col: usize) -> usize {
 
 fn handle_key(keyval: u32, state_rc: &Rc<GuiState>) -> bool {
     let state: &GuiState = &**state_rc;
+    state.last_key.set(keyval);
     let app = unsafe { &mut *state.app };
     let key = {
         #[cfg(windows)]
@@ -339,7 +359,7 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>) -> bool {
     };
 
     match state.mode.get() {
-        GuiMode::Help | GuiMode::About => {
+        GuiMode::Help => {
             if key == ESCAPE {
                 state.mode.set(GuiMode::Normal);
                 state.canvas.queue_redraw();
@@ -495,6 +515,12 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
             commit_edit(state);
             state.last_row.set(state.last_row.get() + 1);
             update_state_cursor(state, state.last_row.get(), state.last_col.get());
+            true
+        }
+        _ if (32..=126).contains(&key) => {
+            let ch = char::from_u32(key).unwrap_or('?');
+            state.edit_buf.borrow_mut().push(ch);
+            state.canvas.queue_redraw();
             true
         }
         _ => true,
@@ -713,6 +739,7 @@ fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
                     app.core.anchor = Some(SheetCursor { row: logical_row, col: c });
                 }
                 update_formula_bar(state, logical_row, c);
+                start_edit(state);
                 state.canvas.queue_redraw();
             }
             return;
@@ -725,7 +752,7 @@ fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
 // Menu building
 // ---------------------------------------------------------------------------
 
-fn build_menu(rxapp: &rustxwidgets::App, win: &Window, _state: &Rc<GuiState>) -> Result<MenuBar, Box<dyn std::error::Error>> {
+fn build_menu(rxapp: &rustxwidgets::App, win: &Window, state: &Rc<GuiState>) -> Result<MenuBar, Box<dyn std::error::Error>> {
     use crate::gui::menu;
 
     let action_group = rxapp.ensure_action_group()?;
@@ -745,12 +772,14 @@ fn build_menu(rxapp: &rustxwidgets::App, win: &Window, _state: &Rc<GuiState>) ->
     menubar_model.append_submenu("Data", &data_menu);
     menubar_model.append_submenu("Help", &help_menu);
 
-    // Register action callbacks
+    // Register action callbacks with state access
+    let s = state.clone();
     for &items in &[menu::FILE_MENU, menu::EDIT_MENU, menu::VIEW_MENU, menu::SHEET_MENU, menu::DATA_MENU, menu::HELP_MENU] {
         for item in items {
             let name = menu::action_kind_to_name(item.action);
             let name_owned = name.to_string();
-            menu::register_action(rxapp, name, move || menu::handle_action(&name_owned))?;
+            let state_cb = s.clone();
+            menu::register_action(rxapp, name, move || handle_menu_action(&name_owned, &state_cb))?;
         }
     }
 
@@ -758,6 +787,152 @@ fn build_menu(rxapp: &rustxwidgets::App, win: &Window, _state: &Rc<GuiState>) ->
     win.insert_action_group("app", action_group);
 
     Ok(menubar)
+}
+
+fn handle_menu_action(name: &str, state: &GuiState) {
+    let app = unsafe { &mut *state.app };
+    match name {
+        "open" => {
+            if let Some(path) = dialogs::file_open_dialog() {
+                match crate::io::load_workbook_snapshot(&path) {
+                    Ok(snapshot) => {
+                        app.core.workbook = crate::ops::WorkbookState::from_snapshot(&snapshot);
+                        app.core.offset = 0;
+                        app.core.ops_applied = 0;
+                        app.core.path = Some(path);
+                        app.core.status = "Opened file".into();
+                        recompute_viewport(state);
+                        state.canvas.queue_redraw();
+                    }
+                    Err(e) => app.core.status = format!("Open error: {e}"),
+                }
+            }
+        }
+        "save" => {
+            if let Some(ref p) = app.core.path.clone() {
+                let snapshot = crate::ops::WorkbookSnapshot::from_workbook(&app.core.workbook);
+                match crate::io::save_workbook(p, &snapshot) {
+                    Ok(()) => app.core.status = "Saved".into(),
+                    Err(e) => app.core.status = format!("Save error: {e}"),
+                }
+            }
+        }
+        "save_as" => {
+            if let Some(path) = dialogs::file_save_dialog() {
+                app.core.path = Some(path.clone());
+                let snapshot = crate::ops::WorkbookSnapshot::from_workbook(&app.core.workbook);
+                match crate::io::save_workbook(&path, &snapshot) {
+                    Ok(()) => app.core.status = format!("Saved to {}", path.display()),
+                    Err(e) => app.core.status = format!("Save error: {e}"),
+                }
+            }
+        }
+        "quit" => {
+            #[cfg(unix)]
+            let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
+            #[cfg(windows)]
+            rustxwidgets::backends_nwg_adapter::quit_main_loop();
+        }
+        "find" => dialogs::find_dialog(|result| {
+            if let Some(text) = result {
+                app.core.status = format!("Find: {text}");
+            }
+        }),
+        "replace" => dialogs::replace_dialog(|result| {
+            if let Some((find, replace)) = result {
+                app.core.status = format!("Replace: '{find}' with '{replace}'");
+            }
+        }),
+        "sort_asc" => {
+            let wb = crate::ops::WorkbookState::default();
+            dialogs::sort_dialog(&wb, |result| {
+                if let Some((col, asc)) = result {
+                    app.core.status = format!("Sort col {col} asc: {asc}");
+                }
+            });
+        }
+        "sort_desc" => {
+            let wb = crate::ops::WorkbookState::default();
+            dialogs::sort_dialog(&wb, |result| {
+                if let Some((col, asc)) = result {
+                    app.core.status = format!("Sort col {col} desc: {}", !asc);
+                }
+            });
+        }
+        "balance_books" => dialogs::balance_dialog(|result| {
+            if let Some(col) = result {
+                app.core.status = format!("Balance col: {col}");
+            }
+        }),
+        "about" => dialogs::show_about_dialog(),
+        "help_keybinds" => dialogs::show_keybinds_help(),
+        "rename_sheet" => dialogs::find_dialog(|result| {
+            if let Some(name) = result {
+                app.core.status = format!("Rename sheet to: {name}");
+            }
+        }),
+        "undo" => {
+            app.core.status = "Undo not yet implemented".into();
+            state.canvas.queue_redraw();
+        }
+        "redo" => {
+            app.core.status = "Redo not yet implemented".into();
+            state.canvas.queue_redraw();
+        }
+        "cut" => {
+            app.core.status = "Cut not yet implemented".into();
+        }
+        "copy" => {
+            app.core.status = "Copy not yet implemented".into();
+        }
+        "paste" => {
+            app.core.status = "Paste not yet implemented".into();
+        }
+        "delete_cell" => {
+            handle_delete(state);
+        }
+        "select_all" => {
+            app.core.status = "Select All".into();
+            app.core.anchor = None;
+            state.canvas.queue_redraw();
+        }
+        "toggle_headers" => {
+            app.core.status = "Toggle headers not yet implemented".into();
+        }
+        "toggle_margins" => {
+            app.core.status = "Toggle margins not yet implemented".into();
+        }
+        "new_sheet" => {
+            app.core.status = "New sheet not yet implemented".into();
+        }
+        "delete_sheet" => {
+            app.core.status = "Delete sheet not yet implemented".into();
+        }
+        "export_tsv" => {
+            if let Some(path) = dialogs::file_save_dialog() {
+                app.core.status = format!("Exporting TSV to {}", path.display());
+            }
+        }
+        "export_csv" => {
+            if let Some(path) = dialogs::file_save_dialog() {
+                app.core.status = format!("Exporting CSV to {}", path.display());
+            }
+        }
+        "export_ods" => {
+            if let Some(path) = dialogs::file_save_dialog() {
+                app.core.status = format!("Exporting ODS to {}", path.display());
+            }
+        }
+        "export_ascii" => {
+            if let Some(path) = dialogs::file_save_dialog() {
+                app.core.status = format!("Exporting ASCII to {}", path.display());
+            }
+        }
+        _ => {
+            app.core.status = format!("Menu action: {name}");
+        }
+    }
+    update_formula_bar(state, state.last_row.get(), state.last_col.get());
 }
 
 // ---------------------------------------------------------------------------
@@ -799,7 +974,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     corro_app.core.cursor.col = cursor_col;
     corro_app.core.anchor = Some(SheetCursor { row: hr, col: lm });
 
-    let data_width = 200usize;
+    let _data_width = 200usize;
     let data_rows = 30usize;
     let data_cols = 12usize;
 
@@ -835,10 +1010,8 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         last_col: Cell::new(cursor_col),
         data_rows: Cell::new(data_rows),
         data_cols: Cell::new(data_cols),
-        cells: RefCell::new(HashMap::new()),
-        styles: RefCell::new(HashMap::new()),
-        raw_values: RefCell::new(HashMap::new()),
-        cursor_pos: Cell::new(None),
+        last_key: Cell::new(0),
+        key_counter: Cell::new(0),
     });
 
     // Build menu
@@ -869,8 +1042,8 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         on_formula_entry_changed(&shared_entry);
     })?;
 
-    // GTK: capture keyboard on the formula entry for Enter/Escape during editing
-    #[cfg(all(feature = "gtk", unix))]
+    // Intercept Enter/Escape from formula entry during editing
+    #[cfg(unix)]
     {
         use gtk_dynamic_loader::prelude::*;
         let entry_hwnd = formula_entry.raw_handle() as *mut gtk_dynamic_loader::GtkWidget;
@@ -884,6 +1057,26 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             ctrl.add_to_widget(unsafe { &*entry_hwnd });
         }
     }
+    #[cfg(windows)]
+    {
+        let shared_k = shared.clone();
+        let shared_k2 = shared.clone();
+        formula_entry.on_key(Box::new(move |keyval: u32| -> bool {
+            shared_k2.key_counter.set(shared_k2.key_counter.get() + 1);
+            shared_k2.last_key.set(keyval);
+            let masked = keyval & 0xFF;
+            if masked == RETURN || masked == ESCAPE {
+                handle_key(keyval, &shared_k);
+                true
+            } else {
+                false
+            }
+        }));
+
+        // WM_CHAR for Enter/Escape is consumed in the NWG adapter's _key_handler
+        // to prevent the Edit control from beeping. The on_key callback above handles
+        // WM_KEYDOWN for Enter/Escape by calling handle_key and returning true (consumed).
+    }
 
     // Assemble layout
     vbox.append(&formula_bar);
@@ -893,6 +1086,9 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     win.set_child_box(&vbox);
     win.present();
+
+    // Start editing at A1 immediately so typing goes into the cell
+    start_edit(&shared);
 
     rxapp.run()?;
     Ok(())

@@ -71,22 +71,24 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // ── Available data width / rows (matching ratatui's draw_visual) ──
     // Use environment variables to allow test backends to control size.
     let (term_cols, term_rows) = {
-        let env_cols = std::env::var("CORRO_TERM_COLS").ok().and_then(|s| s.parse().ok());
-        let env_rows = std::env::var("CORRO_TERM_ROWS").ok().and_then(|s| s.parse().ok());
+        let env_cols: Option<usize> = std::env::var("CORRO_TERM_COLS").ok().and_then(|s| s.parse().ok());
+        let env_rows: Option<usize> = std::env::var("CORRO_TERM_ROWS").ok().and_then(|s| s.parse().ok());
         if let (Some(c), Some(r)) = (env_cols, env_rows) {
             (c, r)
         } else {
-            let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-            if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0
+            #[cfg(unix)]
             {
-                (ws.ws_col as usize, ws.ws_row as usize)
-            } else {
-                let cols = std::env::var("COLUMNS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(80);
-                (cols, 50usize)
+                let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+                if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0
+                {
+                    return (ws.ws_col as usize, ws.ws_row as usize);
+                }
             }
+            let cols: usize = std::env::var("COLUMNS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(80);
+            (cols, 50usize)
         }
     };
     let data_width = term_cols

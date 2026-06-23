@@ -24,7 +24,6 @@ pub fn file_save_dialog() -> Option<PathBuf> {
 pub fn show_about_dialog() {
     #[cfg(feature = "gui")]
     {
-        #[cfg(unix)]
         if let Ok(app) = rustxwidgets::App::init() {
             if let Ok(dialog) = app.create_dialog() {
                 if let Ok(label) = app.create_label(&format!(
@@ -38,14 +37,9 @@ pub fn show_about_dialog() {
                     let d = dialog.clone();
                     dialog.connect_response(move |_| d.close()).ok();
                     dialog.present();
-                    // Keep alive: leak so GTK manages the lifecycle
-                    let _ = Box::into_raw(Box::new(dialog));
-                    let _ = Box::into_raw(Box::new(label));
                 }
             }
         }
-        #[cfg(windows)]
-        eprintln!("About: corro {}", env!("CARGO_PKG_VERSION"));
     }
     #[cfg(not(feature = "gui"))]
     eprintln!("corro {} - append-only collaborative spreadsheet", env!("CARGO_PKG_VERSION"));
@@ -54,7 +48,6 @@ pub fn show_about_dialog() {
 pub fn show_keybinds_help() {
     #[cfg(feature = "gui")]
     {
-        #[cfg(unix)]
         if let Ok(app) = rustxwidgets::App::init() {
             if let Ok(dialog) = app.create_dialog() {
                 if let Ok(tv) = app.create_textview() {
@@ -69,8 +62,8 @@ pub fn show_keybinds_help() {
                          \n\
                          File menu:     Ctrl+O (open), Ctrl+S (save)\n\
                          Edit menu:     Ctrl+Z (undo), Ctrl+Y (redo)\n\
-                                         Ctrl+X (cut), Ctrl+C (copy), Ctrl+V (paste)\n\
-                                         Ctrl+F (find), Ctrl+H (replace)"
+                                          Ctrl+X (cut), Ctrl+C (copy), Ctrl+V (paste)\n\
+                                          Ctrl+F (find), Ctrl+H (replace)"
                     );
                     tv.set_wrap_mode(0);
                     tv.set_size_request(400, 300);
@@ -79,14 +72,9 @@ pub fn show_keybinds_help() {
                     let d = dialog.clone();
                     dialog.connect_response(move |_| d.close()).ok();
                     dialog.present();
-                    // Keep alive: leak so GTK manages the lifecycle
-                    let _ = Box::into_raw(Box::new(dialog));
-                    let _ = Box::into_raw(Box::new(tv));
                 }
             }
         }
-        #[cfg(windows)]
-        eprintln!("Keybindings: arrows=navigate, Enter=edit, Esc=cancel, F1=help, Ctrl+Q=quit");
     }
     #[cfg(not(feature = "gui"))]
     eprintln!("Keybindings: arrows=navigate, Enter=edit, Esc=cancel, F1=help, Ctrl+Q=quit");
@@ -96,12 +84,10 @@ pub fn find_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
     #[cfg(feature = "gui")]
     {
         use rustxwidgets::{App, Entry};
-        #[cfg(unix)]
         if let Ok(app) = App::init() {
             if let Ok(dialog) = app.create_dialog() {
                 if let Ok(entry) = app.create_entry() {
                     dialog.set_title("Find");
-                    entry.set_hexpand(true);
                     dialog.append_content_area(&entry);
                     dialog.add_button("Cancel", 0);
                     dialog.add_button("Find", 1);
@@ -139,24 +125,19 @@ pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: 
     #[cfg(feature = "gui")]
     {
         use rustxwidgets::{App, Entry};
-        #[cfg(unix)]
         if let Ok(app) = App::init() {
-            if let (Ok(dialog), Ok(find_entry), Ok(replace_entry), Ok(vbox)) =
+            if let (Ok(dialog), Ok(find_entry), Ok(replace_entry), Ok(mut vbox)) =
                 (app.create_dialog(), app.create_entry(), app.create_entry(), app.create_box(Orientation::Vertical, 4))
             {
                 dialog.set_title("Replace");
                 dialog.set_default_size(350, 150);
                 if let Ok(find_label) = app.create_label("Find:") {
                     vbox.append(&find_label);
-                    let _ = Box::into_raw(Box::new(find_label));
                 }
-                find_entry.set_hexpand(true);
                 vbox.append(&find_entry);
                 if let Ok(replace_label) = app.create_label("Replace with:") {
                     vbox.append(&replace_label);
-                    let _ = Box::into_raw(Box::new(replace_label));
                 }
-                replace_entry.set_hexpand(true);
                 vbox.append(&replace_entry);
                 dialog.append_content_area(&vbox);
                 dialog.add_button("Cancel", 0);
@@ -198,11 +179,10 @@ pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: 
 pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &WorkbookState, on_result: F) {
     #[cfg(feature = "gui")]
 {
-        use rustxwidgets::{App, Entry};
-        #[cfg(unix)]
+        use rustxwidgets::{App, CheckButton, DropDown};
         if let Ok(app) = App::init() {
             let cols: &[&str] = &["Column A", "Column B", "Column C", "Column D", "Column E"];
-            if let (Ok(dialog), Ok(sort_col), Ok(ascending), Ok(vbox)) =
+            if let (Ok(dialog), Ok(sort_col), Ok(ascending), Ok(mut vbox)) =
                 (app.create_dialog(), app.create_dropdown(cols), app.create_checkbutton("Ascending"),
                  app.create_box(Orientation::Vertical, 4))
             {
@@ -256,7 +236,6 @@ pub fn balance_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
     #[cfg(feature = "gui")]
     {
         use rustxwidgets::{App, Entry};
-        #[cfg(unix)]
         if let Ok(app) = App::init() {
             if let (Ok(dialog), Ok(entry)) = (app.create_dialog(), app.create_entry()) {
                 dialog.set_title("Balance Books");
