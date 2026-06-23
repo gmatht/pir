@@ -1,4 +1,4 @@
-use rustxwidgets::common::*;
+use rustxwidgets::prelude::*;
 use rustxwidgets::core::DrawContext;
 use rustxwidgets::Widget;
 
@@ -17,7 +17,7 @@ use super::render::{self, CellSink};
 // Platform key constants
 // ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "gtk", unix))]
+#[cfg(all(feature = "gui", target_family = "unix"))]
 mod key {
     pub const RETURN: u32 = 0xFF0D;
     pub const ESCAPE: u32 = 0xFF1B;
@@ -36,7 +36,7 @@ mod key {
     pub const F2: u32 = 0xFFBF;
 }
 
-#[cfg(windows)]
+#[cfg(all(feature = "gui", windows))]
 mod key {
     pub const RETURN: u32 = 0x0D;
     pub const ESCAPE: u32 = 0x1B;
@@ -55,6 +55,10 @@ mod key {
     pub const F2: u32 = 0x71;
 }
 
+#[cfg(all(feature = "gui", target_family = "unix"))]
+use key::*;
+
+#[cfg(all(feature = "gui", windows))]
 use key::*;
 
 // ---------------------------------------------------------------------------
