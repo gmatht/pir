@@ -706,6 +706,11 @@ fn start_edit_with(state: &GuiState, ch: char) {
 fn commit_edit(state: &GuiState) {
     state.editing.set(false);
     state.mode.set(GuiMode::Normal);
+    if let Some(text) = state.formula_entry.get_text() {
+        if !text.is_empty() {
+            *state.edit_buf.borrow_mut() = text;
+        }
+    }
     let val = state.edit_buf.borrow().clone();
     if !val.is_empty() {
         let app = unsafe { &mut *state.app };
@@ -936,6 +941,8 @@ fn build_menu(rxapp: &rustxwidgets::App, win: &Window, state: &Rc<GuiState>) -> 
     let file_menu = menu::build_submenu(rxapp, menu::FILE_MENU, "app")?;
     let edit_menu = menu::build_submenu(rxapp, menu::EDIT_MENU, "app")?;
     let view_menu = menu::build_submenu(rxapp, menu::VIEW_MENU, "app")?;
+    let insert_menu = menu::build_submenu(rxapp, menu::INSERT_MENU, "app")?;
+    let format_menu = menu::build_submenu(rxapp, menu::FORMAT_MENU, "app")?;
     let sheet_menu = menu::build_submenu(rxapp, menu::SHEET_MENU, "app")?;
     let data_menu = menu::build_submenu(rxapp, menu::DATA_MENU, "app")?;
     let help_menu = menu::build_submenu(rxapp, menu::HELP_MENU, "app")?;
@@ -947,13 +954,15 @@ fn build_menu(rxapp: &rustxwidgets::App, win: &Window, state: &Rc<GuiState>) -> 
     menubar_model.append_submenu("\u{3164}File", &file_menu);
     menubar_model.append_submenu("\u{3164}Edit", &edit_menu);
     menubar_model.append_submenu("\u{3164}View", &view_menu);
+    menubar_model.append_submenu("\u{3164}Insert", &insert_menu);
+    menubar_model.append_submenu("\u{3164}Format", &format_menu);
     menubar_model.append_submenu("\u{3164}Sheet", &sheet_menu);
     menubar_model.append_submenu("\u{3164}Data", &data_menu);
     menubar_model.append_submenu("\u{3164}Help", &help_menu);
 
     // Register action callbacks with state access
     let s = state.clone();
-    for &items in &[menu::FILE_MENU, menu::EDIT_MENU, menu::VIEW_MENU, menu::SHEET_MENU, menu::DATA_MENU, menu::HELP_MENU] {
+    for &items in &[menu::FILE_MENU, menu::EDIT_MENU, menu::VIEW_MENU, menu::INSERT_MENU, menu::FORMAT_MENU, menu::SHEET_MENU, menu::DATA_MENU, menu::HELP_MENU] {
         for item in items {
             let name = menu::action_kind_to_name(item.action);
             let name_owned = name.to_string();
@@ -1108,6 +1117,45 @@ fn handle_menu_action(name: &str, state: &GuiState) {
             if let Some(path) = dialogs::file_save_dialog() {
                 app.core.status = format!("Exporting ASCII to {}", path.display());
             }
+        }
+        "insert_rows" => {
+            app.core.status = "Insert rows not yet implemented".into();
+        }
+        "insert_mitosis_row" => {
+            app.core.status = "Insert mitosis row not yet implemented".into();
+        }
+        "insert_mitosis_col" => {
+            app.core.status = "Insert mitosis col not yet implemented".into();
+        }
+        "insert_cols" => {
+            app.core.status = "Insert cols not yet implemented".into();
+        }
+        "insert_special_chars" => {
+            app.core.status = "Insert special chars not yet implemented".into();
+        }
+        "insert_date" => {
+            app.core.status = "Insert date not yet implemented".into();
+        }
+        "insert_time" => {
+            app.core.status = "Insert time not yet implemented".into();
+        }
+        "insert_hyperlink" => {
+            app.core.status = "Insert hyperlink not yet implemented".into();
+        }
+        "format_apply_all" | "format_apply_full_column" | "format_apply_data"
+        | "format_apply_special" | "format_apply_cell" | "format_apply_selection" => {
+            app.core.status = format!("Format scope: {name}");
+        }
+        "format_decimal_generic" | "format_currency" | "format_rational"
+        | "format_fixed_0" | "format_fixed_1" | "format_fixed_2" | "format_fixed_custom" => {
+            app.core.status = format!("Format number: {name}");
+        }
+        "format_align_left" | "format_align_center" | "format_align_right"
+        | "format_align_default" => {
+            app.core.status = format!("Format align: {name}");
+        }
+        "format_reset" => {
+            app.core.status = "Format reset".into();
         }
         _ => {
             app.core.status = format!("Menu action: {name}");
@@ -1340,6 +1388,16 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 }
             }
         }
+    }
+
+    // Register save-before-quit on window close (WM_CLOSE on NWG).
+    // This ensures the replayer tests that use WM_CLOSE (instead of
+    // Alt+F+Q) still commit pending edits to the output file.
+    {
+        let state_c = shared.clone();
+        win.on_close(Box::new(move || {
+            save_before_quit(&*state_c);
+        }));
     }
 
     // Intercept Enter/Escape from formula entry during editing
