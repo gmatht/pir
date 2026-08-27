@@ -27,7 +27,17 @@ fn main() {
     entries.sort();
 
     let mut body = String::new();
-    for name in &entries {
+    // Registration order matters: the first backend whose `specs()` contain a
+    // tool name wins dispatch. We push `prep` first so its enhanced `bash`
+    // shadows the builtin `bash`; everything else falls through to `builtin`.
+    let mut ordered: Vec<String> = entries.clone();
+    ordered.retain(|n| n != "prep");
+    let mut final_order = vec!["prep".to_string()];
+    final_order.extend(ordered);
+    for name in &final_order {
+        if !entries.contains(name) {
+            continue; // prep not present in this build -> skip
+        }
         let mod_ident = sanitize(name);
         let abs = ext_dir.join(name).join("src").join("lib.rs");
         let abs = abs.to_string_lossy().into_owned();
