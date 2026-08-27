@@ -45,6 +45,16 @@ pub struct Agent {
     /// visible during "thinking" instead of being clobbered by competing stdout
     /// writers. The REPL owns the only other reference; it only ever writes.
     typeahead: Arc<Mutex<String>>,
+    /// Optional cumulative token budget (in/out combined). When set, a turn
+    /// stops *before* the next model call once the budget is exceeded, printing
+    /// a banner. Off by default (None) — opt in via `--budget N` or
+    /// `PIR_TOKEN_BUDGET`.
+    token_budget: Option<u64>,
+    /// Per-session undo stack of (target, backup) pairs. Before `write_file` /
+    /// `edit_file` run, the previous file contents are snapshotted to a sidecar
+    /// under `.pir/undo/`; `/undo` restores the most recent snapshot. Only file
+    /// edits are checkpointed (bash is out of scope — the user can `git` it).
+    undo_stack: Vec<(PathBuf, PathBuf)>,
 }
 
 impl Agent {
@@ -123,6 +133,8 @@ impl Agent {
             typeahead,
             last_prompt: String::new(),
             continuations: Vec::new(),
+            token_budget: None,
+            undo_stack: Vec::new(),
         })
     }
 
@@ -196,11 +208,52 @@ impl Agent {
         self.client = make_client(&provider, self.cancel.clone())?;
         self.provider = provider;
         self.model = model;
+        // Remember the active model next to the session log so a resumed
+        // session starts on the same model instead of the global default.
+        self.persist_model();
         Ok(())
+    }
+
+    /// Persist the active provider/model to a sidecar (`<log>.model`) so the
+    /// choice survives a resume. Silent if there's no log (one-shot).
+    fn persist_model(&self) {
+        if let Some(p) = &self.log_path {
+            let path = p.with_extension("model");
+            let _ = std::fs::write(&path, format!("{}/{}", self.provider.pid(), self.model.id));
+        }
+    }
+
+    /// Load a previously persisted model choice (from `<log>.model`) for a
+    /// resumed session. Returns the `provider/model` label, or None.
+    pub fn persisted_model_label(&self) -> Option<String> {
+        let p = self.log_path.as_ref()?;
+        let s = std::fs::read_to_string(p.with_extension("model")).ok()?;
+        let s = s.trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    }
+
+    /// If a model was persisted for this session (via `/model`), restore it on
+    /// resume. Falls back to the existing provider/model when the persisted one
+    /// no longer resolves. Returns true if it switched.
+    pub fn apply_persisted_model(&mut self) -> bool {
+        let Some(label) = self.persisted_model_label() else { return false };
+        match crate::config::select(&crate::config::load_providers().unwrap_or_default(), &label) {
+            Ok((p, m)) => {
+                let _ = self.switch(p.clone(), m.clone());
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     pub fn clear(&mut self) {
         self.history.clear();
+    }
+
+    /// Set the cumulative token budget (in+out, in tokens). Off by default;
+    /// opt in via `--budget N` or `PIR_TOKEN_BUDGET`. Pass None to disable.
+    pub fn set_token_budget(&mut self, budget: Option<u64>) {
+        self.token_budget = budget;
     }
 
     /// Begin a new goal for this session, persisting it next to the log.
@@ -533,6 +586,32 @@ impl Agent {
                 self.notify.publish(self.turn_done_event(), false);
                 return Ok(());
             }
+            // Optional cumulative token budget (off by default). Stop *before*
+            // the next model call once in+out exceeds it, so a runaway turn can't
+            // burn unbounded usage. Surfaced as a banner, not an error.
+            if let Some(budget) = self.token_budget {
+                let used = self.usage.input + self.usage.output;
+                if used >= budget {
+                    if !self.quiet {
+                        if let Some(s) = spinner.as_mut() {
+                            s.stop();
+                        }
+                        spinner = None;
+                        term::out(&format!(
+                            "\r\x1b[K{}\n",
+                            term::yellow(&format!(
+                                "✗ token budget reached ({} used / {} limit) — stopping turn",
+                                used, budget
+                            ))
+                        ));
+                    }
+                    self.notify.publish(self.turn_done_event(), false);
+                    if !self.quiet {
+                        self.continuations.extend(self.registry.on_turn_end(user));
+                    }
+                    return Ok(());
+                }
+            }
             self.trim();
 
             // While we wait for the model's first token, show a spinner so it's
@@ -583,7 +662,13 @@ impl Agent {
             let (assistant, usage) = match result {
                 Ok(r) => r,
                 Err(e) => {
+                    // Surface the failure visibly in the main stream (red banner)
+                    // as well as stderr, so a mid-turn provider error isn't lost
+                    // below already-printed tokens. The on-screen notification
+                    // feed also gets an Error event.
                     if !self.quiet {
+                        term::out(&format!("\r\x1b[K{}\n", term::red(&format!("✗ turn error: {e}"))));
+                    } else {
                         eprintln!("{} {e}", term::red("error:"));
                     }
                     self.notify.publish(
@@ -621,6 +706,13 @@ impl Agent {
             for (id, name, input) in &calls {
                 if !self.quiet {
                     term::out(&format!("{} {}", term::cyan("»"), describe_call(name, input)));
+                }
+                // Snapshot the target file before a destructive edit so `/undo`
+                // can revert it. `write_file`/`edit_file` take `path`.
+                if name == "write_file" || name == "edit_file" {
+                    if let Some(p) = input.get("path").and_then(Value::as_str) {
+                        self.checkpoint_file(Path::new(p));
+                    }
                 }
                 let outcome = match self.run_goal_tool(name, input) {
                     Some(o) => o,
@@ -670,6 +762,78 @@ impl Agent {
     /// once and resets it.
     pub fn take_continuations(&mut self) -> Vec<String> {
         std::mem::take(&mut self.continuations)
+    }
+
+    /// Snapshot `path` before a destructive file edit so it can be reverted
+    /// with `/undo`. Copies the current contents (if any) to a sidecar under
+    /// `.pir/undo/` keyed by a content hash + timestamp; pushes (target, backup)
+    /// onto the undo stack. Best-effort: any failure is silently ignored so a
+    /// read-only or missing file never breaks the edit.
+    pub fn checkpoint_file(&mut self, path: &Path) {
+        let Ok(src) = std::fs::read(path) else { return };
+        let dir = self.undo_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        src.hash(&mut h);
+        let name = format!(
+            "{:016x}-{}.bak",
+            h.finish(),
+            term::timestamp_compact()
+        );
+        let backup = dir.join(name);
+        if std::fs::write(&backup, &src).is_ok() {
+            self.undo_stack.push((path.to_path_buf(), backup));
+        }
+    }
+
+    fn undo_dir(&self) -> PathBuf {
+        // Store undo sidecars next to the session logs so they're scoped to the
+        // project and cleaned up with it. Prefer the project-local `.pir/undo`
+        // when writable, else the global sessions dir.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let local = cwd.join(".pir").join("undo");
+        if std::fs::create_dir_all(&local).is_ok() {
+            return local;
+        }
+        config::pi_dir().join("agent").join("sessions").join("undo")
+    }
+
+    /// Restore the most recent file checkpoint (`/undo`). Returns a status line.
+    /// If `all` is true, restores every checkpoint on the stack (oldest→newest
+    /// would re-introduce edits, so we restore newest-first, i.e. replay in
+    /// reverse — but for simplicity `/undo` restores one; `/undo all` restores
+    /// each target to its latest snapshot).
+    pub fn undo(&mut self, all: bool) -> String {
+        if self.undo_stack.is_empty() {
+            return "nothing to undo".to_string();
+        }
+        if all {
+            // Re-apply each target from its newest snapshot, deduplicating by
+            // target so each file ends at its most-recent pre-edit state.
+            let mut by_target: std::collections::HashMap<PathBuf, PathBuf> = std::collections::HashMap::new();
+            for (target, backup) in self.undo_stack.iter().rev() {
+                by_target.insert(target.clone(), backup.clone());
+            }
+            let mut n = 0;
+            for (target, backup) in by_target {
+                if std::fs::copy(&backup, &target).is_ok() {
+                    n += 1;
+                }
+            }
+            self.undo_stack.clear();
+            return format!("restored {n} file(s) to their pre-edit state");
+        }
+        let (target, backup) = self.undo_stack.pop().expect("non-empty");
+        match std::fs::copy(&backup, &target) {
+            Ok(_) => format!("restored {}", target.display()),
+            Err(e) => format!("undo failed for {}: {e}", target.display()),
+        }
+    }
+
+    pub fn undo_available(&self) -> usize {
+        self.undo_stack.len()
     }
 
     /// Publish an exit notification to the shared bus (called from one-shot /

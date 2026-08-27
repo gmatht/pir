@@ -38,19 +38,22 @@ pub fn is_terminal() -> bool {
     io::stdout().is_terminal()
 }
 
-/// Write `s` to stdout **without ever panicking**. `print!`/`write!` to a
-/// non-blocking or full stdout (piped output, a logging wrapper, or a TTY that
-/// would block) return `EAGAIN` ("Resource temporarily unavailable"), and
-/// Rust's std macros *panic* on any write error — which previously killed the
-/// whole process mid-turn. This helper retries on `EAGAIN` and silently
-/// ignores any other error (e.g. a closed/broken pipe), so the REPL can never
-/// be taken down by a transient write failure.
+/// Write `s` to stdout, never panicking and never busy-spinning on a slow or
+/// full pipe. `print!`/`write!` to a non-blocking or full stdout return
+/// `EAGAIN` ("Resource temporarily unavailable"), and Rust's std macros *panic*
+/// on any write error — which previously killed the whole process mid-turn.
+///
+/// We drain the bytes with a bounded retry, and when the fd would block we
+/// wait for it to become writable via the smol reactor (the same event-driven
+/// mechanism the input path uses) instead of sleeping-and-retrying in a hot
+/// loop. A genuinely broken pipe is ignored silently.
 pub fn out(s: &str) {
-    let mut stdout = io::stdout();
-    let mut written = 0;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
     let bytes = s.as_bytes();
-    // Bound the retries so a persistently unwriteable fd can't spin forever.
-    for _ in 0..16 {
+    let mut written = 0usize;
+    // Bound the total work so a persistent stall can't spin forever.
+    for _ in 0..1024 {
+        let mut stdout = io::stdout();
         match stdout.write_all(&bytes[written..]) {
             Ok(()) => {
                 let _ = stdout.flush();
@@ -58,8 +61,22 @@ pub fn out(s: &str) {
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // EAGAIN: yield and retry. A short sleep avoids a hot spin.
-                std::thread::sleep(std::time::Duration::from_millis(5));
+                // EAGAIN: make stdout non-blocking (idempotent) and then block
+                // until it is writable, event-driven via the smol reactor
+                // (~0% CPU), instead of polling. We keep the fd non-blocking
+                // afterward (harmless for stdout) so the wait is always correct.
+                let fd = io::stdout().as_raw_fd();
+                unsafe {
+                    let flags = libc::fcntl(fd, libc::F_GETFL);
+                    libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+                let block = async {
+                    if let Ok(a) = smol::Async::new(unsafe { std::fs::File::from_raw_fd(fd) }) {
+                        let _ = a.writable().await;
+                        std::mem::forget(a); // we only borrowed fd 1; never close it
+                    }
+                };
+                smol::block_on(block);
                 continue;
             }
             Err(_) => return, // broken/closed pipe: give up silently
@@ -360,6 +377,22 @@ fn plain_read_line(prompt: &str) -> Option<String> {
     }
 }
 
+/// Append a line to the per-session history so prompts typed *while a turn was
+/// running* (raw mode, recorded into `typeahead` and queued) show up in the
+/// rustyline prompt's arrow-up history once we return to idle. Best-effort.
+pub fn push_history(line: &str) {
+    if line.trim().is_empty() {
+        return;
+    }
+    EDITOR.with(|e| {
+        let mut g = e.borrow_mut();
+        if let Some(rl) = g.as_mut() {
+            let _ = rl.add_history_entry(line);
+            save_history(rl);
+        }
+    });
+}
+
 
 /// A small terminal spinner shown while we're waiting for the model to produce
 /// its first token (the request is in flight but the stream hasn't started). It
@@ -490,7 +523,7 @@ impl Drop for Spinner {
 /// readable or the worker signals turn-completion, so the REPL thread sleeps
 /// (0% CPU) instead of polling.
 pub mod raw {
-    use std::io::{self, Write};
+    use std::io::{self};
     use std::os::unix::io::AsRawFd;
     use std::sync::{Arc, Mutex};
 
@@ -509,9 +542,21 @@ pub mod raw {
         active: false,
     });
 
+    /// Master switch for raw mode. When disabled (`--no-raw`), `enable_raw` /
+    /// `disable_raw` become no-ops and the REPL falls back to line-buffered
+    /// stdin. Default on. Safe to toggle before the first `enable_raw` call.
+    static ENABLED: Mutex<bool> = Mutex::new(true);
+    pub fn set_enabled(on: bool) {
+        *ENABLED.lock().unwrap() = on;
+    }
+
     /// Put stdin into raw, non-blocking mode (no canonical line editing, no
-    /// echo, reads return immediately). Idempotent.
+    /// echo, reads return immediately). Idempotent. No-op when raw mode is
+    /// disabled (`--no-raw`).
     pub fn enable_raw() {
+        if !*ENABLED.lock().unwrap() {
+            return;
+        }
         let mut st = STATE.lock().unwrap();
         if st.active {
             return;
@@ -536,6 +581,9 @@ pub mod raw {
 
     /// Restore the previous terminal attributes and blocking mode. Idempotent.
     pub fn disable_raw() {
+        if !*ENABLED.lock().unwrap() {
+            return;
+        }
         let mut st = STATE.lock().unwrap();
         if !st.active {
             return;

@@ -121,6 +121,12 @@ impl Client {
         // request aborts the whole loop immediately (no retry) via `self.cancel`.
         let cancel = self.cancel.clone();
         let mut emitted_text = false;
+        // True once the stream has delivered at least one tool_use block. A
+        // mid-stream crash after partial tool output is *not* safe to transparently
+        // retry: re-sending the whole request would lose the tool results already
+        // produced and can duplicate work. Treat partial tool progress like
+        // partial text — surface the error rather than replaying.
+        let mut saw_tool_calls = false;
         for attempt in 0..=MAX_RETRIES {
             if cancel.load(Ordering::SeqCst) {
                 return Err("request cancelled".to_string());
@@ -152,12 +158,14 @@ impl Client {
                         resp.into_reader(),
                         on_text,
                         &mut emitted_text,
+                        &mut saw_tool_calls,
                         &cancel,
                     ),
                     ApiKind::OpenAi => stream_openai(
                         resp.into_reader(),
                         on_text,
                         &mut emitted_text,
+                        &mut saw_tool_calls,
                         &cancel,
                     ),
                 });
@@ -176,7 +184,7 @@ impl Client {
                     if e.contains("stalled") {
                         return Err(e);
                     }
-                    if attempt >= MAX_RETRIES || !is_retryable(&e) || emitted_text {
+                    if attempt >= MAX_RETRIES || !is_retryable(&e) || emitted_text || saw_tool_calls {
                         return Err(e);
                     }
                     let backoff = (RETRY_BASE_BACKOFF * 2u32.pow(attempt as u32)).min(RETRY_MAX_BACKOFF);
@@ -390,6 +398,7 @@ fn stream_anthropic<R: Read>(
     r: R,
     on_text: &mut dyn FnMut(&str),
     emitted_text: &mut bool,
+    saw_tool_calls: &mut bool,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(Message, Usage), String> {
     let mut reader = BufReader::new(r);
@@ -474,6 +483,7 @@ fn stream_anthropic<R: Read>(
                 if let Some((id, name, buf)) = tool.take() {
                     let input: Value = serde_json::from_str(&buf).unwrap_or_else(|_| json!({}));
                     blocks.push(Block::ToolUse { id, name, input });
+                    *saw_tool_calls = true;
                 } else if !text.trim().is_empty() {
                     blocks.push(Block::Text(std::mem::take(&mut text)));
                 } else {
@@ -511,6 +521,7 @@ fn stream_openai<R: Read>(
     r: R,
     on_text: &mut dyn FnMut(&str),
     emitted_text: &mut bool,
+    saw_tool_calls: &mut bool,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(Message, Usage), String> {
     let mut reader = BufReader::new(r);
@@ -588,6 +599,7 @@ fn stream_openai<R: Read>(
         let name = if name.is_empty() { "unknown_tool".to_string() } else { name };
         let input: Value = serde_json::from_str(&args).unwrap_or_else(|_| json!({}));
         blocks.push(Block::ToolUse { id, name, input });
+        *saw_tool_calls = true;
     }
     if blocks.is_empty() {
         blocks.push(Block::Text("(empty response)".into()));
@@ -638,7 +650,7 @@ mod tests {
             data: b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
         };
         let started = std::time::Instant::now();
-        let res = stream_openai(&mut reader, &mut |_s: &str| {}, &mut false, &cancel);
+        let res = stream_openai(&mut reader, &mut |_s: &str| {}, &mut false, &mut false, &cancel);
         let elapsed = started.elapsed();
         assert!(res.is_err(), "expected an error after cancel");
         assert_eq!(res.unwrap_err(), "request cancelled");
@@ -657,7 +669,7 @@ mod tests {
             data: b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
         };
         let started = std::time::Instant::now();
-        let res = stream_openai(&mut reader, &mut |_s: &str| {}, &mut false, &cancel);
+        let res = stream_openai(&mut reader, &mut |_s: &str| {}, &mut false, &mut false, &cancel);
         let elapsed = started.elapsed();
         std::env::remove_var("PIR_STALL_TIMEOUT_SECS");
         assert!(res.is_err(), "expected a stall error");

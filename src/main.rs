@@ -17,6 +17,7 @@ use crate::config::Provider;
 use crate::notify::SharedBus;
 use std::io::BufRead;
 use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,6 +41,11 @@ OPTIONS
   -u, --as <user>            run project commands as this user (default ai_<project>)
   -h, --help  -V, --version
 
+  --no-raw             use line-buffered stdin (no raw mode) — for constrained
+                       terminals / screen where raw input misbehaves
+  --budget <tokens>    optional cumulative in+out token cap; turn stops (with a
+                       banner) once exceeded. Off by default. Env: PIR_TOKEN_BUDGET
+
 CONFIG (reused from pi, never modified)
   ~/.pi/models.json          providers, models, api keys ("{env:VAR}" supported)
   ~/.pi/agent/settings.json  optional default model ("model" key)
@@ -60,10 +66,12 @@ AGENT USERS RUN UNATTENDED
 COMMANDS
   /help  /model <sel>  /models  /sessions  /goal [objective]  /continue
   /bg <text>  /jobs  /fg <id>  /clear  /usage  /exit
+  /undo [all]             revert the last file edit (or all) to its pre-edit state
   /project init            create the ai_<project> user and chown the cwd (root)
   /fix                     make the .git setup sane for LLM use (install commit
                           guard hook + .gitattributes; jj-aware). Run it if you see
                           the "no commit guard hook" startup warning on an existing repo
+  /rebuild                cargo build + exec the fresh binary (unix)
   /create [name]           scaffold a new project (seeds from clipboard .md spec)
 
   Lines ending in & run in the background: "fix the parser &"  => /bg fix the parser
@@ -201,6 +209,8 @@ fn main() {
     let mut as_user: Option<String> = None;
     let mut project_name: Option<String> = None;
     let mut bg_prompt: Option<String> = None;
+    let mut no_raw = false;
+    let mut budget: Option<u64> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -254,6 +264,14 @@ fn main() {
                 match args.get(i) {
                     Some(v) => bg_prompt = Some(v.clone()),
                     None => die("-bg needs a prompt"),
+                }
+            }
+            "--no-raw" => no_raw = true,
+            "--budget" => {
+                i += 1;
+                match args.get(i).and_then(|v| v.parse::<u64>().ok()) {
+                    Some(n) => budget = Some(n),
+                    None => die("--budget needs a positive integer (tokens)"),
                 }
             }
             "-h" | "--help" => {
@@ -376,7 +394,22 @@ fn main() {
     // Resume prior history if `-r`/`-c` was given.
     if let Some(session) = &resume {
         agent.load_session(session);
+        // Restore the model that was active when this session last ran, so a
+        // resumed session doesn't silently drop back to the global default.
+        if agent.apply_persisted_model() {
+            // (model restored silently; the startup banner below shows it)
+        }
     }
+
+    // Resolve the token budget (off by default). `--budget N` wins; else the
+    // PIR_TOKEN_BUDGET env var; else None (unbounded).
+    let budget = budget.or_else(|| {
+        std::env::var("PIR_TOKEN_BUDGET")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    agent.set_token_budget(budget);
+    term::raw::set_enabled(!no_raw);
 
     // Continuation mode: attach the goal that lives next to the resumed
     // session and drive it to the next step. The goal file is itself
@@ -525,6 +558,9 @@ fn main() {
                 }
                 if let Some(next) = pending.drain(..).next() {
                     if let Ok(mut g) = typeahead.lock() { g.clear(); }
+                    // A prompt the user typed *mid-turn* (raw mode) won't be in
+                    // rustyline's history; record it so arrow-up recalls it later.
+                    term::push_history(&next);
                     fg_handle = Some(run_foreground_turn(
                         &agent_slot,
                         &fg_cancel,
@@ -546,6 +582,7 @@ fn main() {
                     };
                     if let Some(next) = follow.into_iter().next() {
                         if let Ok(mut g) = typeahead.lock() { g.clear(); }
+                        term::push_history(&next);
                         fg_handle = Some(run_foreground_turn(
                             &agent_slot,
                             &fg_cancel,
@@ -585,6 +622,7 @@ fn main() {
                             full_auto,
                             &bus,
                             &fg_cancel,
+                            true,
                         );
                     } else {
                         pending.push(s.to_string());
@@ -640,7 +678,7 @@ fn main() {
         let bg = input.ends_with('&') && !input.trim_end_matches('&').is_empty();
         let input = input.trim_end_matches('&').trim();
         if let Some(cmd) = input.strip_prefix('/') {
-            handle_command(cmd, &agent_slot, &providers, &mut jobs, full_auto, &bus, &fg_cancel);
+            handle_command(cmd, &agent_slot, &providers, &mut jobs, full_auto, &bus, &fg_cancel, false);
         } else if bg {
             // Run this prompt as a fresh background job that keeps its own
             // session log (the foreground session is unaffected).
@@ -712,9 +750,10 @@ type AgentSlot = Arc<Mutex<Option<Agent>>>;
 /// Handle a slash command. `agent_slot` holds the interactive agent behind an
 /// `Option` so a running foreground turn can own it on its worker thread;
 /// commands that need the agent take it only briefly. `jobs` surfaces
-/// background work and shows whether the foreground turn is running; `/cancel`
-/// asks the running turn to stop (the REPL owns the cancel flag, set on ctrl-c,
-/// so `/cancel` is advisory — prefer ctrl-c).
+/// background work and shows whether the foreground turn is running. `fg_running`
+/// is the truthful state (the REPL owns it via `fg_handle.is_some()`), so
+/// mid-turn `/cancel`/`/jobs` work even though the agent is *taken* out of the
+/// slot by the running worker.
 fn handle_command(
     cmd: &str,
     agent_slot: &AgentSlot,
@@ -723,6 +762,7 @@ fn handle_command(
     full_auto: bool,
     bus: &SharedBus,
     cancel: &Arc<AtomicBool>,
+    fg_running: bool,
 ) {
     let mut parts = cmd.split_whitespace();
     let cmd = parts.next().unwrap_or("");
@@ -732,7 +772,10 @@ fn handle_command(
             // Advisory stop: set the same cooperative cancel flag ctrl-c sets
             // (the REPL owns it). The running worker turn observes it at its
             // next safe boundary and stops after the current step completes.
-            if agent_slot.lock().unwrap().is_some() {
+            // `fg_running` (passed by the REPL) is the source of truth — the
+            // worker *takes* the agent out of `agent_slot` while running, so
+            // inspecting the slot would always report "no turn".
+            if !fg_running {
                 eprintln!("pir: no turn running to cancel (idle)");
             } else {
                 cancel.store(true, Ordering::SeqCst);
@@ -747,11 +790,30 @@ fn handle_command(
                 return;
             };
             if rest.is_empty() {
-                println!("current model: {}", agent.label());
+                // No argument: show current model and explain how to make a
+                // choice the *default* for future sessions (the first time a
+                // user picks a model, nothing is persisted globally).
+                let label = agent.label();
+                println!("current model: {}", label);
+                println!(
+                    "{}",
+                    term::dim(&format!(
+                        "to use this by default in new sessions, add to {}:\n  {}",
+                        config::pi_dir().join("agent").join("settings.json").display(),
+                        format!("{{ \"defaultModel\": \"{}\" }}", label)
+                    ))
+                );
+                println!(
+                    "{}",
+                    term::dim("(or just run `/model <sel>` again later — it's saved per-session and restored on resume)")
+                );
             } else {
                 match config::select(providers, &rest.join(" ")) {
                     Ok((p, m)) => match agent.switch(p.clone(), m.clone()) {
-                        Ok(()) => println!("→ {}", agent.label()),
+                        Ok(()) => {
+                            println!("→ {}", agent.label());
+                            println!("{} (saved for this session; restored on resume)", term::dim("·"));
+                        }
                         Err(e) => eprintln!("{e}"),
                     },
                     Err(e) => eprintln!("{e}"),
@@ -780,7 +842,9 @@ fn handle_command(
             }
         }
         "jobs" | "background" | "running" => {
-            jobs.set_fg_running(agent_slot.lock().unwrap().is_some() == false);
+            // `fg_running` is the real state: the worker *takes* the agent out of
+            // the slot while a turn runs, so the slot alone can't tell us.
+            jobs.set_fg_running(fg_running);
             print!("{}", jobs.list());
         }
         "fg" | "foreground" => {
@@ -862,6 +926,13 @@ fn handle_command(
             }
             println!("{}", crate::project::fix_git_setup(&repo));
         }
+        "rebuild" => {
+            // Recompile from source and, on success, replace this process with the
+            // freshly built binary (so you pick up the new code without leaving a
+            // stale agent running). Build failures print the tail and leave the
+            // current session intact.
+            rebuild_and_exec();
+        }
         "usage" => {
             let g = agent_slot.lock().unwrap();
             match g.as_ref() {
@@ -872,6 +943,15 @@ fn handle_command(
                 ),
                 None => eprintln!("pir: agent busy (turn running) — try again when idle"),
             }
+        }
+        "undo" => {
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                eprintln!("pir: agent busy (turn running) — try again when idle");
+                return;
+            };
+            let all = rest.first().map(|s| *s == "all").unwrap_or(false);
+            println!("{}", agent.undo(all));
         }
         "q" | "quit" | "exit" => std::process::exit(0),
         other => eprintln!("unknown command /{other} — try /help"),
@@ -1090,6 +1170,42 @@ fn run_project_subcommand(rest: &[String]) {
 #[cfg(not(unix))]
 fn run_project_subcommand(_rest: &[String]) {
     die("per-project users are only supported on unix");
+}
+
+/// `/rebuild` — `cargo build` (debug, honoring the lockfile) and, if it
+/// succeeds, replace this process with the freshly built binary via `exec`. On
+/// a build failure we print the tail of the output and stay in the running
+/// session. Unix-only: `exec` replaces the process image in place, so the new
+/// `pir` inherits the same stdio/terminal and keeps the user's place.
+fn rebuild_and_exec() {
+    eprintln!("{} rebuilding…", term::dim("·"));
+    let output = std::process::Command::new(env!("CARGO"))
+        .args(["build"])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            let bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("./target/debug/pir"));
+            eprintln!("\x1b[32m✓\x1b[0m built {}; restarting…", bin.display());
+            // Re-exec the new binary with the same args the user originally gave.
+            // `exec` does not return on success.
+            let err = std::process::Command::new(&bin).args(std::env::args().skip(1)).exec();
+            // Only reached if exec fails.
+            die(&format!("rebuild: failed to restart {}: {}", bin.display(), err));
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let tail: String = stderr.lines().rev().take(25).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+            eprintln!("{} build failed:\n{}", term::red("error:"), tail);
+        }
+        Err(e) => {
+            eprintln!("{} could not run cargo build: {}", term::red("error:"), e);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn rebuild_and_exec() {
+    eprintln!("pir: /rebuild (exec) is only supported on unix");
 }
 
 /// `/create [name]` — scaffold a new project directory under `PIR_PROJECTS_DIR`
