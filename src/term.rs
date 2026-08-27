@@ -360,6 +360,9 @@ impl Drop for Spinner {
 ///
 /// `enable_raw`/`disable_raw` manage the terminal attributes and the
 /// non-blocking flag on stdin; the REPL toggles them around the running turn.
+/// `wait_input` blocks event-driven (via the smol reactor) until stdin is
+/// readable or the worker signals turn-completion, so the REPL thread sleeps
+/// (0% CPU) instead of polling.
 pub mod raw {
     use std::io::{self, Write};
     use std::os::unix::io::AsRawFd;
@@ -441,28 +444,47 @@ pub mod raw {
         Eof,
     }
 
-    /// Consume any available input, echoing printable chars and managing a
-    /// backspace. Returns `RawInput::Line` only when Enter is pressed; callers
-    /// pass the *same* `buf` each iteration so partial typing persists.
-    pub fn poll_input(buf: &mut String) -> RawInput {
-        let fd = io::stdin().as_raw_fd();
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
+    /// Wait for input (or turn completion) and consume any available bytes,
+    /// echoing printable chars and managing a backspace. Returns `RawInput::Line`
+    /// only when Enter is pressed. `done` is a oneshot channel the worker thread
+    /// closes when the foreground turn finishes; the call returns (with `None`
+    /// if there's no pending input) as soon as *either* stdin becomes readable
+    /// *or* the turn completes.
+    ///
+    /// This is fully event-driven: `smol::Async<stdin>` registers the terminal
+    /// fd with the smol reactor so `readable()` wakes only when bytes actually
+    /// arrive, and `block_on` puts the main thread to sleep until a wakeup
+    /// fires — there is no `poll()` loop and no timer, so the REPL uses ~0% CPU
+    /// while a worker turn is just waiting on the network (the agent
+    /// "thinking"). Typing stays responsive because the reactor wakes
+    /// immediately on a keypress.
+    pub fn wait_input(buf: &mut String, done: &smol::channel::Receiver<()>) -> RawInput {
+        // Build an async wrapper around stdin for this wait. `enable_raw` already
+        // put fd 0 into non-blocking mode; `Async::new` registers it with the
+        // smol reactor (and deregisters on drop) so we can await readiness.
+        let stdin = match smol::Async::new(io::stdin()) {
+            Ok(s) => s,
+            Err(_) => return read_chunk(buf),
         };
-        // Poll with a short timeout so the REPL thread sleeps between checks
-        // instead of spinning at 100% CPU while a worker turn is just waiting
-        // on the network. 30ms keeps typing responsive without a busy loop.
-        const POLL_MS: libc::c_int = 30;
-        if unsafe { libc::poll(&mut pfd, 1, POLL_MS) } <= 0 {
-            return RawInput::None;
-        }
+        // Race "stdin became readable" against "the turn finished". Both arms
+        // yield `()` so `or` can select between them.
+        let readable = async { let _ = stdin.readable().await; };
+        let finished = async { let _ = done.recv().await; };
+        smol::block_on(smol::future::or(readable, finished));
+        // Either side fired (or stdin closed): drain whatever is buffered.
+        read_chunk(buf)
+    }
+
+    /// Drain any currently-available stdin bytes into `buf`, echoing and
+    /// translating control chars. `stdin` is non-blocking (see `enable_raw`),
+    /// so this returns as soon as no more bytes are readable.
+    fn read_chunk(buf: &mut String) -> RawInput {
+        let fd = io::stdin().as_raw_fd();
         let mut tmp = [0u8; 256];
         let mut nread = 0usize;
         // stdin is non-blocking (see enable_raw), so read may return a partial
         // chunk; keep draining until it would block (r <= 0) or the buffer is
-        // full. Without the loop a single poll could leave bytes unconsumed.
+        // full. Without the loop a single read could leave bytes unconsumed.
         loop {
             let r = unsafe {
                 libc::read(
@@ -480,11 +502,6 @@ pub mod raw {
             }
         }
         if nread == 0 {
-            // No bytes ready yet (poll timed out): tell the caller so it can
-            // loop. Crucially this returns *without* busy-spinning — the poll
-            // below sleeps for `POLL_MS` between checks, so the main thread idles
-            // while a worker turn is just waiting on the network instead of
-            // pegging a CPU core at 100%.
             return RawInput::None;
         }
         let mut stdout = io::stdout();

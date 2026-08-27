@@ -461,6 +461,9 @@ fn main() {
     let mut pending: Vec<String> = Vec::new();
     // Partial line buffer for the raw-mode input while a turn runs.
     let mut input_buf = String::new();
+    // Oneshot signal from the foreground worker: closed when the turn ends, so
+    // the REPL's event-driven wait can wake without polling.
+    let (done_tx, done_rx) = smol::channel::bounded(1);
 
     let mut line = String::new();
     loop {
@@ -502,6 +505,7 @@ fn main() {
                         &agent_slot,
                         &fg_cancel,
                         next,
+                        done_tx.clone(),
                     ));
                     term::raw::enable_raw();
                 }
@@ -509,10 +513,12 @@ fn main() {
         }
 
         if fg_handle.is_some() {
-            // A turn is running on a worker thread: stay responsive. Poll
-            // non-blocking input; Enter queues the next prompt, ctrl-c requests
-            // cancellation, ctrl-d stops the session.
-            match term::raw::poll_input(&mut input_buf) {
+            // A turn is running on a worker thread: stay responsive. Block
+            // (event-driven, ~0% CPU) until stdin is readable OR the worker
+            // signals completion via `done_rx`; then drain any typed input.
+            // Enter queues the next prompt, ctrl-c requests cancellation,
+            // ctrl-d stops the session.
+            match term::raw::wait_input(&mut input_buf, &done_rx) {
                 term::raw::RawInput::Line(s) => {
                     let s = s.trim();
                     if s.is_empty() {
@@ -545,7 +551,7 @@ fn main() {
                     term::raw::disable_raw();
                     return;
                 }
-                term::raw::RawInput::None => { /* nothing pending; loop */ }
+                term::raw::RawInput::None => { /* turn finished / no input; re-check loop */ }
             }
             continue;
         }
@@ -587,6 +593,7 @@ fn main() {
                 &agent_slot,
                 &fg_cancel,
                 input.to_string(),
+                done_tx.clone(),
             ));
             term::raw::enable_raw();
         }
@@ -596,11 +603,13 @@ fn main() {
 /// Spawn the given prompt as a foreground turn on a worker thread, *moving* the
 /// agent out of `agent_slot` for the duration (so the lock is never held during
 /// the turn), then returning it when the turn completes. Resets the cancel flag
-/// at the start and publishes an Idle/Error event when done.
+/// at the start and publishes an Idle/Error event when done. `done` is a oneshot
+/// the REPL awaits, so it can wake the moment the turn ends instead of polling.
 fn run_foreground_turn(
     agent_slot: &Arc<Mutex<Option<Agent>>>,
     cancel: &Arc<AtomicBool>,
     prompt: String,
+    done: smol::channel::Sender<()>,
 ) -> JoinHandle<()> {
     let slot = agent_slot.clone();
     let cancel = cancel.clone();
@@ -613,6 +622,8 @@ fn run_foreground_turn(
         };
         a.notify_on_exit(ev);
         *slot.lock().unwrap() = Some(a);
+        // Wake the REPL's event-driven wait so it joins this handle immediately.
+        let _ = done.try_send(());
     })
 }
 
