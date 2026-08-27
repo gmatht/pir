@@ -1,8 +1,9 @@
 use std::cell::RefCell;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
-use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc, OnceLock};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustyline::completion::Completer;
 use rustyline::highlight::Highlighter;
@@ -292,6 +293,61 @@ fn plain_read_line(prompt: &str) -> Option<String> {
     }
 }
 
+
+/// A small terminal spinner shown while we're waiting for the model to produce
+/// its first token (the request is in flight but the stream hasn't started). It
+/// animates on a background thread and overwrites its own line; call `stop()`
+/// the moment real output arrives. When stdout isn't a tty the spinner is a
+/// silent no-op so logs / pipes stay clean.
+pub struct Spinner {
+    handle: Option<JoinHandle<()>>,
+    alive: Arc<AtomicBool>,
+}
+
+impl Spinner {
+    /// Start spinning with the given leading label (e.g. "thinking"). Returns a
+    /// `Spinner` whose `stop()` clears the line. Pass `false` for `enabled` to
+    /// get a no-op spinner (used for quiet / non-tty contexts).
+    pub fn start(label: &str, enabled: bool) -> Spinner {
+        if !enabled {
+            return Spinner { handle: None, alive: Arc::new(AtomicBool::new(false)) };
+        }
+        let alive = Arc::new(AtomicBool::new(true));
+        let a = alive.clone();
+        let label = label.to_string();
+        let handle = thread::spawn(move || {
+            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let mut i = 0usize;
+            let mut out = io::stdout();
+            while a.load(Ordering::SeqCst) {
+                let frame = if color() { format!("\x1b[36m{}\x1b[0m", frames[i % frames.len()]) } else { frames[i % frames.len()].to_string() };
+                let _ = write!(out, "\r{} {}…", frame, label);
+                let _ = out.flush();
+                thread::sleep(Duration::from_millis(80));
+                i = i.wrapping_add(1);
+            }
+            // Clear the spinner line so subsequent output starts clean.
+            let _ = write!(out, "\r\x1b[K");
+            let _ = out.flush();
+        });
+        Spinner { handle: Some(handle), alive }
+    }
+
+    /// Stop the spinner and erase its line. Safe to call multiple times.
+    pub fn stop(&mut self) {
+        if self.alive.swap(false, Ordering::SeqCst) {
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
 
 /// Non-blocking, raw-mode terminal input used while a foreground agent turn is
 /// running on a worker thread. Lets the REPL stay responsive: the user can type

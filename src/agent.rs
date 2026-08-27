@@ -496,7 +496,23 @@ impl Agent {
             }
             self.trim();
 
+            // While we wait for the model's first token, show a spinner so it's
+            // obvious the agent is "thinking". It stops the instant the stream
+            // starts emitting text (and is skipped entirely when quiet / not a
+            // tty).
+            let mut spinner = if self.quiet {
+                term::Spinner::start("", false)
+            } else {
+                term::Spinner::start("thinking", crate::term::is_terminal())
+            };
+            let got_text = std::cell::Cell::new(false);
             let mut on_text = |t: &str| {
+                if !got_text.get() {
+                    got_text.set(true);
+                    if !self.quiet {
+                        spinner.stop();
+                    }
+                }
                 if !self.quiet {
                     print!("{t}");
                     let _ = std::io::stdout().flush();
@@ -511,6 +527,7 @@ impl Agent {
                 &mut on_text,
             );
             if !self.quiet {
+                spinner.stop();
                 println!();
             }
             let (assistant, usage) = match result {
