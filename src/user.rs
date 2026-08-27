@@ -133,7 +133,10 @@ pub fn provision(
         return Err("`pir project init` must run as root".into());
     }
 
-    // 1. Create the system user (non-login) if missing.
+    // 1. Create the system user (non-login) if missing. `-M` skips creating a
+    //    home dir (we create it explicitly below so we can chown it), which is
+    //    intentional: a fixed, owned home is what makes the per-project sandbox
+    //    self-contained (see `toolchain_env_for` / `become_user`).
     if lookup_user(user).is_err() {
         let status = Command::new("useradd")
             .args(["-r", "-s", "/usr/sbin/nologin", "-M", user])
@@ -145,6 +148,45 @@ pub fn provision(
         println!("created user {user}");
     } else {
         println!("user {user} already exists");
+    }
+
+    // 1b. Ensure the user's home directory exists and is owned by them. Some
+    //     distros (useradd -M) leave it absent, which would make `HOME` point
+    //     at a missing path once `become_user` fixes HOME to the real home.
+    let home = {
+        let cuser = std::ffi::CString::new(user).map_err(|_| format!("invalid user '{user}'"))?;
+        let mut buf = vec![0u8; 4096];
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        unsafe {
+            if libc::getpwnam_r(
+                cuser.as_ptr(),
+                &mut pwd,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result,
+            ) != 0
+                || result.is_null()
+                || pwd.pw_dir.is_null()
+            {
+                return Err(format!("cannot resolve home for user '{user}'"));
+            }
+            std::ffi::CStr::from_ptr(pwd.pw_dir).to_str().map(|s| s.to_string()).unwrap_or_default()
+        }
+    };
+    if !home.is_empty() {
+        let _ = std::fs::create_dir_all(&home);
+        let status = Command::new("chown")
+            .args(["-R", &format!("{user}:{user}"), &home])
+            .status()
+            .map_err(|e| format!("chown: {e}"))?;
+        if !status.success() {
+            return Err(format!("chown failed for {home} (exit {})", status.code().unwrap_or(-1)));
+        }
+        // Reset permissions to a sane 0700 so the sandbox user owns its home
+        // privately (the dir may have been created by root with 0755).
+        let _ = Command::new("chmod").args(["700", &home]).status();
+        println!("ensured home {home} owned by {user}");
     }
 
     // 2. Chown the project directory (and a .pir metadata dir) to the user.
@@ -289,6 +331,12 @@ pub fn toolchain_env_for(user: &str) -> Vec<(String, String)> {
     let cargo_home = std::path::Path::new(&home).join(".cargo");
     let gh_config = std::path::Path::new(&home).join(".config").join("gh");
     let mut out = Vec::new();
+    // Always point HOME at the agent user's real home directory. Without this,
+    // a launch that inherits a foreign HOME (e.g. root's) would make every tool
+    // (bash, cargo, gh, git) write into the invoking user's home instead of the
+    // sandbox user's own — defeating the per-project sandbox. The home is
+    // resolved from getpwnam, never from the inherited `$HOME`.
+    out.push(("HOME".into(), home.clone()));
     if cargo_home.is_dir() {
         out.push(("CARGO_HOME".into(), cargo_home.to_string_lossy().into_owned()));
     }
