@@ -61,6 +61,9 @@ COMMANDS
   /help  /model <sel>  /models  /sessions  /goal [objective]  /continue
   /bg <text>  /jobs  /fg <id>  /clear  /usage  /exit
   /project init            create the ai_<project> user and chown the cwd (root)
+  /fix                     make the .git setup sane for LLM use (install commit
+                          guard hook + .gitattributes; jj-aware). Run it if you see
+                          the "no commit guard hook" startup warning on an existing repo
   /create [name]           scaffold a new project (seeds from clipboard .md spec)
 
   Lines ending in & run in the background: "fix the parser &"  => /bg fix the parser
@@ -453,6 +456,17 @@ fn main() {
     }
     println!("{}", term::dim("/help for commands · ctrl-d to quit · type while a turn runs; ctrl-c cancels it"));
 
+    // Warn on existing git projects that lack the LLM-safety guard hook, and
+    // point at /fix. Skipped under jj (git hooks don't apply there).
+    if crate::project::missing_git_guard(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))) {
+        eprintln!(
+            "{}",
+            term::yellow(&format!(
+                "[pir] this git repo has no commit guard hook — agents could commit large/binary files. Run /fix to make the .git setup sane for LLM use."
+            ))
+        );
+    }
+
     let mut jobs = BackgroundJobs::new();
 
     // The interactive agent lives behind an Option so a running turn can *take*
@@ -839,6 +853,14 @@ fn handle_command(
             };
             agent.clear();
             println!("history cleared");
+        }
+        "fix" => {
+            let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            if !crate::project::is_git_repo(&repo) && crate::project::detect_vcs(&repo) != crate::project::Vcs::Jj {
+                eprintln!("pir: not inside a git/jj repo");
+                return;
+            }
+            println!("{}", crate::project::fix_git_setup(&repo));
         }
         "usage" => {
             let g = agent_slot.lock().unwrap();

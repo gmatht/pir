@@ -176,6 +176,18 @@ pub fn provision(
     //    up.
     setup_agent_toolchain(user)?;
 
+    // 5. Make the `.git` setup sane for LLM use on a fresh project: install the
+    //    pre-commit guard hook (refuses huge/binary files) so agents can't
+    //    accidentally bloat the repo. Under jj (git hooks don't run) this is a
+    //    no-op and `/fix` handles jj separately.
+    if crate::project::is_git_repo(&path) && crate::project::detect_vcs(&path) == crate::project::Vcs::Git {
+        match crate::project::install_git_guard_hook(&path) {
+            Ok(true) => println!("installed .git/hooks/pre-commit guard (refuses large/binary files)"),
+            Ok(false) => println!("a pre-commit hook already exists; left it in place"),
+            Err(e) => eprintln!("warning: could not install git guard hook: {e}"),
+        }
+    }
+
     Ok(format!(
         "project '{project}' -> user '{user}' (run as root, or `sudo -u {user} pir ...`)\n\
          agent toolchain (self-owned): CARGO_HOME=~{user}/.cargo GH_CONFIG_DIR=~{user}/.config/gh"
