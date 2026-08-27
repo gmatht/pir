@@ -24,8 +24,9 @@
 #        match; fail if it would need to change).
 #      * Unit tests: `cargo test --release --locked` (e.g. goal.rs parsing,
 #        next-step selection, goal persistence).
-#      * Lint gate (warning-only): `cargo clippy --locked` — surfaces lints
-#        but does not hard-fail the deploy.
+#      * Lint gate (errors fail, warnings warn): `cargo clippy --locked` —
+#        correctness/deny lints (e.g. `never_loop`, panic-in-const) block the
+#        deploy; plain warnings are surfaced but non-fatal.
 #      * Binary smoke tests against the freshly built artifact:
 #          - `--version` prints `pir <semver>`;
 #          - `--help` exits 0;
@@ -104,8 +105,15 @@ cargo test --release --locked >/dev/null || die "unit tests failed"
 
 if [ "$CLIPPY" -eq 1 ]; then
   if command -v cargo-clippy >/dev/null 2>&1 || cargo clippy --version >/dev/null 2>&1; then
-    say "clippy (warning-only gate)"
-    cargo clippy --release --locked 2>&1 | grep -E '^error|^warning: unused|panic' || true
+    say "clippy (deny-level errors fail the deploy; warnings are non-fatal)"
+    # Capture full output; fail only if clippy emitted a hard error (deny lint
+    # or compile failure), not on ordinary warnings.
+    CLIPPY_OUT="$(cargo clippy --release --locked 2>&1)"
+    echo "$CLIPPY_OUT" | grep -E '^(warning|warning:|note:|  -->|[0-9]+ \|)' || true
+    if echo "$CLIPPY_OUT" | grep -qE '^error(\[|:)'; then
+      die "clippy reported one or more errors (deny-level lint or compile failure)"
+    fi
+    say "  clippy clean (no errors)"
   else
     warn "cargo-clippy not installed; skipping lint gate"
   fi
