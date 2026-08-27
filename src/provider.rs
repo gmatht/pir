@@ -1,5 +1,5 @@
 use crate::config::ApiKind;
-use crate::tools::ToolSpec;
+use crate::plugin::ToolSpec;
 use crate::types::{Block, Message, Role, Usage};
 use serde_json::{json, Map, Value};
 use std::io::{BufRead, BufReader, Read};

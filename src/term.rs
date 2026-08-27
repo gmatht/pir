@@ -1,8 +1,26 @@
+use std::cell::RefCell;
 use std::io::{self, IsTerminal, Write};
+use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rustyline::completion::Completer;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::Validator;
+use rustyline::{CompletionType, Config, Context, Editor};
+
 static COLOR: OnceLock<bool> = OnceLock::new();
+
+/// Providers, set once at startup, so the line-editor helper can offer
+/// `/model` tab-completion.
+static MODEL_PROVIDERS: OnceLock<Vec<crate::config::Provider>> = OnceLock::new();
+
+/// Register the providers for `/model` tab-completion. Call once after
+/// models.json has been loaded.
+pub fn set_model_providers(providers: &[crate::config::Provider]) {
+    let _ = MODEL_PROVIDERS.set(providers.to_vec());
+}
 
 pub fn set_color(on: bool) {
     let _ = COLOR.set(on);
@@ -10,6 +28,12 @@ pub fn set_color(on: bool) {
 
 fn color() -> bool {
     *COLOR.get_or_init(|| io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none())
+}
+
+/// Whether stdout is attached to an interactive terminal (used by the
+/// notification policy to decide whether the user is "watching").
+pub fn is_terminal() -> bool {
+    io::stdout().is_terminal()
 }
 
 fn paint(code: &str, s: &str) -> String {
@@ -32,6 +56,38 @@ pub fn read_answer(prompt: &str) -> String {
 
 pub fn epoch() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// PID of the shell (bash) that launched pir, taken from the `PIR_PARENT_PID`
+/// env var if present, else the real parent process id. Used to tag sessions
+/// so `pir -r` can group/resume sessions from the same shell.
+pub fn parent_shell_pid() -> u32 {
+    if let Ok(v) = std::env::var("PIR_PARENT_PID") {
+        if let Ok(n) = v.parse::<u32>() {
+            if n != 0 {
+                return n;
+            }
+        }
+    }
+    parent_pid()
+}
+
+#[cfg(target_os = "linux")]
+fn parent_pid() -> u32 {
+    // /proc/self/stat: pid (1) (ppid 4) ...
+    if let Ok(s) = std::fs::read_to_string("/proc/self/stat") {
+        if let Some(ppid) = s.split_whitespace().nth(3) {
+            if let Ok(n) = ppid.parse() {
+                return n;
+            }
+        }
+    }
+    std::process::id()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn parent_pid() -> u32 {
+    std::process::id()
 }
 
 pub fn date_string() -> String {
@@ -63,4 +119,177 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (y + i64::from(m <= 2), m, d)
+}
+
+/// rustyline helper: offers `/model` tab-completion plus a live preview
+/// (up to ten matching `provider/model` labels) of the typed prefix.
+struct PirHelper;
+
+impl rustyline::Helper for PirHelper {}
+
+impl Completer for PirHelper {
+    type Candidate = String;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<String>)> {
+        let providers = MODEL_PROVIDERS.get().map(|v| v.as_slice()).unwrap_or(&[]);
+        let left = &line[..pos];
+        let start_idx = left.find(|c: char| !c.is_whitespace()).unwrap_or(0);
+        let rest = &left[start_idx..];
+        let cmd_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let cmd = &rest[..cmd_end];
+        if cmd != "/model" && cmd != "/m" {
+            return Ok((0, Vec::new()));
+        }
+        let after = &rest[cmd_end..];
+        if after.is_empty() {
+            // command typed but no trailing space yet — nothing to complete
+            return Ok((0, Vec::new()));
+        }
+        let arg_lead = after.find(|c: char| !c.is_whitespace()).unwrap_or(after.len());
+        let arg_start = start_idx + cmd_end + arg_lead;
+        let prefix = &left[arg_start..];
+        let matches = crate::config::match_models(providers, prefix, 10);
+        Ok((arg_start, matches))
+    }
+}
+
+impl Hinter for PirHelper {
+    type Hint = String;
+    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        // Show the first matching model as an inline preview while typing a
+        // `/model` argument, so the user sees a suggestion to the right.
+        let providers = MODEL_PROVIDERS.get().map(|v| v.as_slice()).unwrap_or(&[]);
+        if providers.is_empty() {
+            return None;
+        }
+        let left = &line[..pos];
+        let start_idx = left.find(|c: char| !c.is_whitespace()).unwrap_or(0);
+        let rest = &left[start_idx..];
+        let cmd_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let cmd = &rest[..cmd_end];
+        if cmd != "/model" && cmd != "/m" {
+            return None;
+        }
+        let after = &rest[cmd_end..];
+        if after.is_empty() {
+            return None;
+        }
+        let arg_lead = after.find(|c: char| !c.is_whitespace()).unwrap_or(after.len());
+        let arg_start = start_idx + cmd_end + arg_lead;
+        let prefix = &left[arg_start..];
+        let candidates = crate::config::match_models(providers, prefix, 10);
+        let hint = candidates
+            .into_iter()
+            .find_map(|m| crate::config::hint_remainder(&m, prefix));
+        hint.filter(|h| !h.is_empty())
+    }
+}
+
+impl Highlighter for PirHelper {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
+        if color() {
+            std::borrow::Cow::Owned(format!("\x1b[2m{hint}\x1b[0m"))
+        } else {
+            std::borrow::Cow::Borrowed(hint)
+        }
+    }
+}
+impl Validator for PirHelper {}
+
+thread_local! {
+    // One editor per thread, reused across calls so history (arrow up/down)
+    // and cursor bindings persist for the whole session.
+    static EDITOR: RefCell<Option<Editor<PirHelper, rustyline::history::DefaultHistory>>> =
+        const { RefCell::new(None) };
+    // Persisted history store (a .history file next to the session log).
+    static HISTORY_FILE: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
+}
+
+/// Point the line editor at a history file that should be loaded on first
+/// use and appended to on every line read. Call once after choosing a
+/// session log path.
+pub fn set_history_file(path: &Path) {
+    HISTORY_FILE.with(|f| *f.borrow_mut() = Some(path.to_path_buf()));
+    // Eagerly create the editor so the file is loaded before the first prompt.
+    EDITOR.with(|e| {
+        if e.borrow().is_none() {
+            let _ = new_editor().map(|rl| *e.borrow_mut() = Some(rl));
+        }
+    });
+    load_history();
+}
+
+/// Build a line editor with `/model` completion enabled.
+fn new_editor() -> Option<Editor<PirHelper, rustyline::history::DefaultHistory>> {
+    let config = Config::builder()
+        .completion_type(CompletionType::List)
+        .build();
+    let mut rl = Editor::<PirHelper, rustyline::history::DefaultHistory>::with_config(config).ok()?;
+    rl.set_helper(Some(PirHelper));
+    Some(rl)
+}
+
+fn load_history() {
+    EDITOR.with(|e| {
+        let mut g = e.borrow_mut();
+        let Some(rl) = g.as_mut() else { return };
+        if let Some(path) = HISTORY_FILE.with(|f| f.borrow().clone()) {
+            let _ = rl.load_history(&path);
+        }
+    });
+}
+
+fn save_history(rl: &mut Editor<PirHelper, rustyline::history::DefaultHistory>) {
+    if let Some(path) = HISTORY_FILE.with(|f| f.borrow().clone()) {
+        let _ = rl.save_history(&path);
+    }
+}
+
+/// Read a line with full line editing: arrow-up/down history, left/right
+/// cursor movement, home/end, word motion, etc. (provided by rustyline).
+///
+/// Returns `None` on EOF (e.g. ctrl-d) so the caller can quit cleanly.
+pub fn read_line(prompt: &str) -> Option<String> {
+    use rustyline::error::ReadlineError;
+
+    // Initialization is best-effort; fall back to plain stdin if needed.
+    EDITOR.with(|e| {
+        if e.borrow().is_none() {
+            *e.borrow_mut() = new_editor();
+        }
+        let mut guard = e.borrow_mut();
+        let rl = match guard.as_mut() {
+            Some(rl) => rl,
+            None => return plain_read_line(prompt),
+        };
+        loop {
+            match rl.readline(prompt) {
+                Ok(line) => {
+                    let _ = rl.add_history_entry(line.as_str());
+                    save_history(rl);
+                    return Some(line);
+                }
+                // Ctrl-C: stay in the REPL instead of dying.
+                Err(ReadlineError::Interrupted) => return Some(String::new()),
+                Err(ReadlineError::Eof) => return None,
+                Err(_) => return None,
+            }
+        }
+    })
+}
+
+fn plain_read_line(prompt: &str) -> Option<String> {
+    eprint!("{prompt} ");
+    let _ = io::stderr().flush();
+    let mut s = String::new();
+    match io::stdin().read_line(&mut s) {
+        Ok(0) => None,
+        Ok(_) => Some(s),
+        Err(_) => None,
+    }
 }

@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# perm-enforcer — privileged (root) enforcer for AI permission requests.
+#
+# Reads queued requests from the spool, VALIDATES each against an allowlist,
+# and applies the minimal grant:
+#   - target file: chgrp <group> + add group-read (g+r)
+#   - ancestor dirs: add world-execute (o+x) ONLY (lets the AI traverse to the
+#     file without revealing directory listings or contents)
+# Grants are recorded in a state dir so they can be reverted (explicit revoke
+# or TTL expiry). Any secret's contents stay protected: only the file's group
+# is changed to the AI group; mode bits for "other" are never given read.
+#
+# MUST be run as root. Intended to be wired to `sh-gate` / sudo:
+#   sudo perm-enforcer
+set -euo pipefail
+
+# ----------------------------- config ----------------------------------------
+GROUP="${AI_PERM_GROUP:-ai_rpi}"
+REQUEST_DIR="${AI_PERM_REQUEST_DIR:-/tmp/ai-perm-requests}"
+STATE_DIR="${AI_PERM_STATE_DIR:-/var/lib/ai-permctl}"
+GRANTS_DIR="$STATE_DIR/grants"
+ANCESTOR_DB="$STATE_DIR/ancestor-orig.json"
+AUDIT_LOG="${AI_PERM_AUDIT_LOG:-/var/log/ai-permctl.log}"
+
+# Allowlist of path prefixes the AI may request. Operator overrides via conf.
+ALLOW_PREFIXES=("/root/.config/gh")
+if [ -r /etc/ai-permctl.conf ]; then
+  # shellcheck disable=SC1091
+  . /etc/ai-permctl.conf
+fi
+if [ -n "${AI_PERM_ALLOW:-}" ]; then
+  IFS=':' read -ra ALLOW_PREFIXES <<< "$AI_PERM_ALLOW"
+fi
+
+# ----------------------------- helpers ---------------------------------------
+log() {
+  local ts; ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "$ts $*" >> "$AUDIT_LOG" 2>/dev/null || true
+  echo "$*" >&2
+}
+
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "perm-enforcer: must run as root (try: sudo perm-enforcer)" >&2
+    exit 1
+  fi
+}
+
+# parse a TTL like 30m/2h/1d/90s into seconds; default 1h
+ttl_to_secs() {
+  local t="$1"
+  case "$t" in
+    *s) echo $(( ${t%s} )) ;;
+    *m) echo $(( ${t%m} * 60 )) ;;
+    *h) echo $(( ${t%h} * 3600 )) ;;
+    *d) echo $(( ${t%d} * 86400 )) ;;
+    '') echo 3600 ;;
+    *)  echo "$t" ;;   # already seconds
+  esac
+}
+
+in_allowlist() {
+  local p="$1" pre
+  for pre in "${ALLOW_PREFIXES[@]}"; do
+    case "$p" in
+      "$pre"|"$pre"/*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Add o+x to a dir, recording its original mode the first time we touch it.
+ensure_traverse() {
+  local dir="$1" cur orig
+  [ -d "$dir" ] || return 0
+  cur="$(stat -c '%a' "$dir")"
+  # record original mode once (only if not already recorded)
+  if ! python3 - "$ANCESTOR_DB" "$dir" "$cur" <<'PY' 2>/dev/null; then :; fi
+import json,sys
+dbp,dirp,cur=sys.argv[1],sys.argv[2],sys.argv[3]
+try:
+    db=json.load(open(dbp)) if __import__('os').path.exists(dbp) else {}
+except Exception:
+    db={}
+if dirp not in db:
+    db[dirp]=cur
+    json.dump(db,open(dbp,"w"),indent=2)
+PY
+  # idempotent, ignore failure
+  chmod o+x "$dir" 2>/dev/null || true
+}
+
+# Remove o+x from a dir if no longer needed by any active grant; restore orig mode.
+reconcile_ancestors() {
+  [ -f "$ANCESTOR_DB" ] || return 0
+  # dirs currently needed by active grants
+  local needed; needed="$(jq -r '.path' "$GRANTS_DIR"/*.json 2>/dev/null | xargs -r -n1 dirname 2>/dev/null | sort -u)"
+  python3 - "$ANCESTOR_DB" "$GRANTS_DIR" <<PY
+import json,os,sys,subprocess
+dbp,grants=sys.argv[1],sys.argv[2]
+try:
+    db=json.load(open(dbp))
+except Exception:
+    db={}
+# collect needed dirs from active grants
+needed=set()
+import glob
+for g in glob.glob(os.path.join(grants,"*.json")):
+    try: p=json.load(open(g))["path"]
+    except Exception: continue
+    p=os.path.dirname(p)
+    while True:
+        needed.add(p)
+        np=os.path.dirname(p)
+        if np==p: break
+        p=np
+for d,orig in db.items():
+    if not os.path.isdir(d): 
+        continue
+    if d in needed:
+        # ensure o+x present
+        cur=int(oct(os.stat(d).st_mode)[-3:],8) if False else None
+    else:
+        # restore original mode (drops our o+x)
+        try:
+            os.chmod(d, int(str(orig),8))
+        except Exception as e:
+            sys.stderr.write("reconcile %s: %s\n"%(d,e))
+PY
+}
+
+apply_grant() {
+  local id="$1" path="$2" ttl="$3" reason="$4" by="$5"
+  if [ ! -e "$path" ]; then log "DENY $id: path does not exist: $path"; return 1; fi
+  if [ -d "$path" ]; then log "DENY $id: refusing directory grant (request the specific file): $path"; return 1; fi
+  if ! in_allowlist "$path"; then log "DENY $id: outside allowlist: $path (allowed: ${ALLOW_PREFIXES[*]})"; return 1; fi
+
+  # record original ownership/mode of the file
+  local orig_mode orig_grp
+  orig_mode="$(stat -c '%a' "$path")"
+  orig_grp="$(stat -c '%G' "$path")"
+  local expires_at
+  expires_at="$(date -u -d "+$(ttl_to_secs "$ttl") seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  # make every ancestor from the allow-root to the file's parent traversable
+  local p; p="$(dirname "$path")"
+  while [ "$p" != "/" ]; do
+    ensure_traverse "$p"
+    p="$(dirname "$p")"
+  done
+
+  # grant the file to the AI group with read
+  chgrp "$GROUP" "$path"
+  chmod g+r "$path"
+
+  cat > "$GRANTS_DIR/$id.json" <<JSON
+{
+  "id": "$id",
+  "path": "$path",
+  "original_mode": "$orig_mode",
+  "original_group": "$orig_grp",
+  "ttl": "$ttl",
+  "expires_at": "$expires_at",
+  "reason": "$reason",
+  "requested_by": "$by"
+}
+JSON
+  log "GRANT $id group=$GROUP path=$path ttl=$ttl expires=$expires_at reason='$reason'"
+}
+
+revoke_grant() {
+  local id="$1" rec="$GRANTS_DIR/$id.json"
+  [ -f "$rec" ] || { log "REVOKE $id: no such active grant"; return 0; }
+  local path; path="$(jq -r .path "$rec")"
+  # restore original group + mode
+  chgrp "$(jq -r .original_group "$rec")" "$path" 2>/dev/null || true
+  chmod "$(jq -r .original_mode "$rec")" "$path" 2>/dev/null || true
+  rm -f "$rec"
+  log "REVOKE $id path=$path"
+}
+
+# ----------------------------- main ------------------------------------------
+require_root
+mkdir -p "$GRANTS_DIR"
+chmod 700 "$STATE_DIR" "$GRANTS_DIR"
+touch "$AUDIT_LOG" 2>/dev/null || true
+
+processed=0
+shopt -s nullglob
+for req in "$REQUEST_DIR"/*.json; do
+  op="$(jq -r .op "$req" 2>/dev/null)"
+  case "$op" in
+    grant-read)
+      apply_grant "$(jq -r .id "$req")" "$(jq -r .path "$req")" \
+                  "$(jq -r .ttl "$req")" "$(jq -r .reason "$req")" "$(jq -r .requested_by "$req")" \
+        && processed=$((processed+1))
+      rm -f "$req"
+      ;;
+    revoke)
+      revoke_grant "$(jq -r .grant_id "$req")"
+      rm -f "$req"
+      processed=$((processed+1))
+      ;;
+    *)
+      log "SKIP unknown request op='$op' file=$req"
+      ;;
+  esac
+done
+
+# revoke anything past its expiry
+for rec in "$GRANTS_DIR"/*.json; do
+  exp="$(jq -r .expires_at "$rec" 2>/dev/null)"
+  if [ "$exp" != "null" ] && [ -n "$exp" ]; then
+    if [ "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$exp" ]; then
+      revoke_grant "$(jq -r .id "$rec")"
+    fi
+  fi
+done
+
+# fix ancestor dirs (drop o+x no longer needed)
+reconcile_ancestors
+
+echo "perm-enforcer: processed $processed request(s); active grants: $(ls -1 "$GRANTS_DIR"/*.json 2>/dev/null | wc -l)"
