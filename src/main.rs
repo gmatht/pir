@@ -570,6 +570,7 @@ fn main() {
                             &mut jobs,
                             full_auto,
                             &bus,
+                            &fg_cancel,
                         );
                     } else {
                         pending.push(s.to_string());
@@ -589,6 +590,20 @@ fn main() {
                     let _ = fg_handle.take().unwrap().join();
                     term::raw::disable_raw();
                     return;
+                }
+                term::raw::RawInput::Suspend => {
+                    // Pause the whole process (foreground turn + spinner thread
+                    // all stop with it) and hand control back to the parent
+                    // shell. Drop raw mode + the non-blocking flag first so the
+                    // shell is usable while suspended, then suspend; re-enable
+                    // raw mode on resume so the next `wait_input` works. The
+                    // partial input line is left intact in `input_buf`/`buf`.
+                    if let Ok(mut g) = typeahead.lock() { g.clear(); }
+                    term::raw::disable_raw();
+                    unsafe {
+                        libc::raise(libc::SIGTSTP);
+                    }
+                    term::raw::enable_raw();
                 }
                 term::raw::RawInput::None => { /* turn finished / no input; re-check loop */ }
             }
@@ -611,7 +626,7 @@ fn main() {
         let bg = input.ends_with('&') && !input.trim_end_matches('&').is_empty();
         let input = input.trim_end_matches('&').trim();
         if let Some(cmd) = input.strip_prefix('/') {
-            handle_command(cmd, &agent_slot, &providers, &mut jobs, full_auto, &bus);
+            handle_command(cmd, &agent_slot, &providers, &mut jobs, full_auto, &bus, &fg_cancel);
         } else if bg {
             // Run this prompt as a fresh background job that keeps its own
             // session log (the foreground session is unaffected).
@@ -693,11 +708,23 @@ fn handle_command(
     jobs: &mut BackgroundJobs,
     full_auto: bool,
     bus: &SharedBus,
+    cancel: &Arc<AtomicBool>,
 ) {
     let mut parts = cmd.split_whitespace();
     let cmd = parts.next().unwrap_or("");
     let rest: Vec<&str> = parts.collect();
     match cmd {
+        "cancel" | "c" => {
+            // Advisory stop: set the same cooperative cancel flag ctrl-c sets
+            // (the REPL owns it). The running worker turn observes it at its
+            // next safe boundary and stops after the current step completes.
+            if agent_slot.lock().unwrap().is_some() {
+                eprintln!("pir: no turn running to cancel (idle)");
+            } else {
+                cancel.store(true, Ordering::SeqCst);
+                println!("{} requesting cancel (turn will stop after its current step)", term::dim("·"));
+            }
+        }
         "h" | "help" => print!("{HELP}"),
         "m" | "model" => {
             let mut g = agent_slot.lock().unwrap();

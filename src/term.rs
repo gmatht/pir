@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,6 +36,40 @@ fn color() -> bool {
 /// notification policy to decide whether the user is "watching").
 pub fn is_terminal() -> bool {
     io::stdout().is_terminal()
+}
+
+/// Write `s` to stdout **without ever panicking**. `print!`/`write!` to a
+/// non-blocking or full stdout (piped output, a logging wrapper, or a TTY that
+/// would block) return `EAGAIN` ("Resource temporarily unavailable"), and
+/// Rust's std macros *panic* on any write error — which previously killed the
+/// whole process mid-turn. This helper retries on `EAGAIN` and silently
+/// ignores any other error (e.g. a closed/broken pipe), so the REPL can never
+/// be taken down by a transient write failure.
+pub fn out(s: &str) {
+    let mut stdout = io::stdout();
+    let mut written = 0;
+    let bytes = s.as_bytes();
+    // Bound the retries so a persistently unwriteable fd can't spin forever.
+    for _ in 0..16 {
+        match stdout.write_all(&bytes[written..]) {
+            Ok(()) => {
+                let _ = stdout.flush();
+                return;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // EAGAIN: yield and retry. A short sleep avoids a hot spin.
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
+            Err(_) => return, // broken/closed pipe: give up silently
+        }
+    }
+}
+
+/// Flush stdout, ignoring any error (so a flush failure can't panic either).
+pub fn out_flush() {
+    let _ = io::stdout().flush();
 }
 
 fn paint(code: &str, s: &str) -> String {
@@ -308,7 +343,17 @@ impl Spinner {
     /// Start spinning with the given leading label (e.g. "thinking"). Returns a
     /// `Spinner` whose `stop()` clears the line. Pass `false` for `enabled` to
     /// get a no-op spinner (used for quiet / non-tty contexts).
-    pub fn start(label: &str, enabled: bool) -> Spinner {
+    ///
+    /// `typeahead` is a buffer the REPL thread fills with any keystrokes the
+    /// user types *while* the turn is running (the REPL runs in raw mode and is
+    /// blocked waiting on the network). The spinner thread is the **only** thing
+    /// that writes to stdout while it's alive, so it owns the "thinking" line
+    /// and renders both the animation and the user's type-ahead there. This
+    /// avoids two threads racing on stdout — the previous design had the main
+    /// REPL thread echo keystrokes directly *and* the spinner rewrite the same
+    /// line, which clobbered the user's input mid-thought (the "REPL doesn't
+    /// display during thinking" bug).
+    pub fn start(label: &str, typeahead: Arc<Mutex<String>>, enabled: bool) -> Spinner {
         if !enabled {
             return Spinner { handle: None, alive: Arc::new(AtomicBool::new(false)) };
         }
@@ -321,13 +366,22 @@ impl Spinner {
             let mut out = io::stdout();
             while a.load(Ordering::SeqCst) {
                 let frame = if color() { format!("\x1b[36m{}\x1b[0m", frames[i % frames.len()]) } else { frames[i % frames.len()].to_string() };
-                let _ = write!(out, "\r{} {}…", frame, label);
+                // Read the user's in-progress line (recorded by the REPL thread)
+                // and show it on the spinner line so typing "displays" while the
+                // model thinks. `\x1b[K` clears any stale tail after a backspace.
+                let typed = typeahead.lock().map(|g| g.clone()).unwrap_or_default();
+                let tail = if typed.is_empty() {
+                    String::new()
+                } else {
+                    format!("  ⌨ {}", typed)
+                };
+                let _ = out.write_all(format!("\r{} {}…{}{}", frame, label, tail, "\x1b[K").as_bytes());
                 let _ = out.flush();
                 thread::sleep(Duration::from_millis(80));
                 i = i.wrapping_add(1);
             }
             // Clear the spinner line so subsequent output starts clean.
-            let _ = write!(out, "\r\x1b[K");
+            let _ = out.write_all(b"\r\x1b[K");
             let _ = out.flush();
         });
         Spinner { handle: Some(handle), alive }
@@ -366,7 +420,7 @@ impl Drop for Spinner {
 pub mod raw {
     use std::io::{self, Write};
     use std::os::unix::io::AsRawFd;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     /// Terminal state captured around a raw-mode session. Guarded by a Mutex so
     /// access is never via a raw `&mut` to a static (sound under the 2024
@@ -442,14 +496,24 @@ pub mod raw {
         Interrupt,
         /// ctrl-d: caller should stop the session.
         Eof,
+        /// ctrl-z: caller should pause (suspend) the whole process and return to
+        /// the parent shell. The REPL implements this by raising `SIGTSTP`
+        /// (after dropping raw mode so the shell is usable) and re-enabling raw
+        /// on resume. The partial input line is preserved across the suspend —
+        /// unlike `Interrupt`/`Eof`, which clear it.
+        Suspend,
     }
 
     /// Wait for input (or turn completion) and consume any available bytes,
-    /// echoing printable chars and managing a backspace. Returns `RawInput::Line`
-    /// only when Enter is pressed. `done` is a oneshot channel the worker thread
-    /// closes when the foreground turn finishes; the call returns (with `None`
-    /// if there's no pending input) as soon as *either* stdin becomes readable
-    /// *or* the turn completes.
+    /// recording them into `typeahead` (the live "what the user is typing" line
+    /// shown by the spinner thread — see [`Spinner::start`]). This REPL thread
+    /// must **not** write to stdout itself while the spinner is alive: the
+    /// spinner thread is the sole stdout writer during a turn, so echoing here
+    /// would race with its carriage-return rewrites and clobber the display.
+    /// Returns `RawInput::Line` only when Enter is pressed. `done` is a oneshot
+    /// channel the worker thread closes when the foreground turn finishes; the
+    /// call returns (with `None` if there's no pending input) as soon as *either*
+    /// stdin becomes readable *or* the turn completes.
     ///
     /// This is fully event-driven: `smol::Async<stdin>` registers the terminal
     /// fd with the smol reactor so `readable()` wakes only when bytes actually
@@ -458,13 +522,17 @@ pub mod raw {
     /// while a worker turn is just waiting on the network (the agent
     /// "thinking"). Typing stays responsive because the reactor wakes
     /// immediately on a keypress.
-    pub fn wait_input(buf: &mut String, done: &smol::channel::Receiver<()>) -> RawInput {
+    pub fn wait_input(
+        buf: &mut String,
+        typeahead: &Arc<Mutex<String>>,
+        done: &smol::channel::Receiver<()>,
+    ) -> RawInput {
         // Build an async wrapper around stdin for this wait. `enable_raw` already
         // put fd 0 into non-blocking mode; `Async::new` registers it with the
         // smol reactor (and deregisters on drop) so we can await readiness.
         let stdin = match smol::Async::new(io::stdin()) {
             Ok(s) => s,
-            Err(_) => return read_chunk(buf),
+            Err(_) => return read_chunk(buf, typeahead),
         };
         // Race "stdin became readable" against "the turn finished". Both arms
         // yield `()` so `or` can select between them.
@@ -472,13 +540,15 @@ pub mod raw {
         let finished = async { let _ = done.recv().await; };
         smol::block_on(smol::future::or(readable, finished));
         // Either side fired (or stdin closed): drain whatever is buffered.
-        read_chunk(buf)
+        read_chunk(buf, typeahead)
     }
 
-    /// Drain any currently-available stdin bytes into `buf`, echoing and
-    /// translating control chars. `stdin` is non-blocking (see `enable_raw`),
-    /// so this returns as soon as no more bytes are readable.
-    fn read_chunk(buf: &mut String) -> RawInput {
+    /// Drain any currently-available stdin bytes, translating control chars and
+    /// recording printable text into `typeahead` (for the spinner to render).
+    /// `stdin` is non-blocking (see `enable_raw`), so this returns as soon as no
+    /// more bytes are readable. Backspace pops the buffer; ctrl-c/ctrl-d/Enter
+    /// are surfaced to the caller. This thread never writes to stdout.
+    fn read_chunk(buf: &mut String, typeahead: &Arc<Mutex<String>>) -> RawInput {
         let fd = io::stdin().as_raw_fd();
         let mut tmp = [0u8; 256];
         let mut nread = 0usize;
@@ -504,7 +574,6 @@ pub mod raw {
         if nread == 0 {
             return RawInput::None;
         }
-        let mut stdout = io::stdout();
         for &b in &tmp[..nread] {
             match b {
                 0x0a | 0x0d => {
@@ -514,20 +583,44 @@ pub mod raw {
                 0x7f | 0x08 => {
                     if !buf.is_empty() {
                         buf.pop();
-                        let _ = stdout.write_all(b"\x08 \x08");
-                        let _ = stdout.flush();
+                        // Update the shared typeahead so the spinner drops the
+                        // removed character (it owns the only stdout writer).
+                        if let Ok(mut g) = typeahead.lock() {
+                            // Keep `g` only as long as needed; drop before any
+                            // other stdout writer could race.
+                            g.clear();
+                            g.push_str(buf);
+                        }
                     }
                 }
                 0x03 => {
                     buf.clear();
+                    if let Ok(mut g) = typeahead.lock() {
+                        g.clear();
+                    }
                     return RawInput::Interrupt;
                 }
-                0x04 => return RawInput::Eof,
+                0x04 => {
+                    buf.clear();
+                    if let Ok(mut g) = typeahead.lock() {
+                        g.clear();
+                    }
+                    return RawInput::Eof;
+                }
+                0x1a => {
+                    // ctrl-z: suspend. Do NOT clear `buf` — the partial line
+                    // must survive the pause (the REPL raises SIGTSTP and the
+                    // spinner/worker threads all stop with the process), so we
+                    // return immediately and let the caller handle it.
+                    return RawInput::Suspend;
+                }
                 0x1b => { /* ignore ESC sequences (arrows, etc.) */ }
                 c if c >= 0x20 && c < 0x7f => {
                     buf.push(c as char);
-                    let _ = stdout.write_all(&[c]);
-                    let _ = stdout.flush();
+                    if let Ok(mut g) = typeahead.lock() {
+                        g.clear();
+                        g.push_str(buf);
+                    }
                 }
                 _ => { /* ignore other control bytes */ }
             }

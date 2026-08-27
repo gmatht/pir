@@ -16,3 +16,5 @@
 # Local env overrides
 .env
 .env.local
+fuzz/fuzz_parser
+fuzz/corpus/
