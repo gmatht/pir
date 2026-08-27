@@ -24,6 +24,9 @@ pub struct Agent {
     pub log_path: Option<PathBuf>,
     goal_store: Option<GoalStore>,
     notify: SharedBus,
+    /// The most recent user prompt this agent is/was working on. Recorded so
+    /// notifications can show *what* finished, not just "turn done".
+    last_prompt: String,
     /// When true, the agent runs silently (no token streaming or per-tool
     /// prints to the terminal). Used for backgrounded sessions, which still
     /// persist everything to the session log and emit notifications.
@@ -104,6 +107,7 @@ impl Agent {
             notify: bus,
             quiet,
             cancel,
+            last_prompt: String::new(),
         })
     }
 
@@ -142,6 +146,16 @@ impl Agent {
 
     pub fn label(&self) -> String {
         format!("{}/{}", self.provider.pid(), self.model.id)
+    }
+
+    /// Short project/cwd label for notifications (e.g. the basename of the cwd,
+    /// "rpi"), so a pop-up can say which project finished. Empty if it can't be
+    /// determined.
+    pub fn project_label(&self) -> String {
+        std::env::current_dir()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .unwrap_or_default()
     }
 
     /// Whether this agent is currently running in the background.
@@ -477,6 +491,7 @@ impl Agent {
     /// background fire `TurnDone`/`Error`) so there is a single notification
     /// decision point per context.
     pub fn turn(&mut self, user: &str) -> Result<(), String> {
+        self.last_prompt = user.to_string();
         let msg = Message::user(user);
         log_line(&mut self.log, &msg);
         self.history.push(msg);
@@ -489,7 +504,7 @@ impl Agent {
             if self.cancel.load(Ordering::SeqCst) {
                 self.cancel.store(false, Ordering::SeqCst);
                 if !self.quiet {
-                    println!("{}", term::dim("· turn cancelled"));
+                    term::out(&term::dim("· turn cancelled"));
                 }
                 self.notify.publish(self.turn_done_event(), false);
                 return Ok(());
@@ -514,8 +529,11 @@ impl Agent {
                     }
                 }
                 if !self.quiet {
-                    print!("{t}");
-                    let _ = std::io::stdout().flush();
+                    // `term::out` never panics on a transient write error
+                    // (e.g. EAGAIN on a non-blocking/full stdout), which a bare
+                    // `print!` would — that previously crashed the whole process
+                    // mid-turn.
+                    term::out(t);
                 }
             };
             let result = self.client.chat(
@@ -536,7 +554,10 @@ impl Agent {
                     if !self.quiet {
                         eprintln!("{} {e}", term::red("error:"));
                     }
-                    self.notify.publish(AgentEvent::Error { message: e.clone() }, false);
+                    self.notify.publish(
+                        AgentEvent::error(e.clone(), self.project_label(), self.last_prompt.clone()),
+                        false,
+                    );
                     if !self.quiet {
                         self.registry.on_turn_end(user);
                     }
@@ -567,14 +588,14 @@ impl Agent {
             let mut results = Message { role: Role::User, blocks: Vec::new() };
             for (id, name, input) in &calls {
                 if !self.quiet {
-                    println!("{} {}", term::cyan("»"), describe_call(name, input));
+                    term::out(&format!("{} {}", term::cyan("»"), describe_call(name, input)));
                 }
                 let outcome = match self.run_goal_tool(name, input) {
                     Some(o) => o,
                     None => self.registry.execute(name, input),
                 };
                 if !self.quiet {
-                    println!("{}", term::dim(&format!("  {}", first_line(&outcome.content))));
+                    term::out(&term::dim(&format!("  {}", first_line(&outcome.content))));
                 }
                 results.blocks.push(Block::ToolResult {
                     tool_use_id: id.clone(),
@@ -590,7 +611,7 @@ impl Agent {
             if self.cancel.load(Ordering::SeqCst) {
                 self.cancel.store(false, Ordering::SeqCst);
                 if !self.quiet {
-                    println!("{}", term::dim("· turn cancelled"));
+                    term::out(&term::dim("· turn cancelled"));
                 }
                 self.notify.publish(self.turn_done_event(), false);
                 return Ok(());
@@ -608,11 +629,24 @@ impl Agent {
     /// Used by the one-shot / background exit paths, which have no meaningful
     /// per-turn duration.
     pub fn turn_done_event(&self) -> AgentEvent {
-        AgentEvent::TurnDone {
-            duration: std::time::Duration::ZERO,
-            in_tokens: self.usage.input,
-            out_tokens: self.usage.output,
-        }
+        AgentEvent::turn_done(
+            std::time::Duration::ZERO,
+            self.usage.input,
+            self.usage.output,
+            self.project_label(),
+            self.last_prompt.clone(),
+        )
+    }
+
+    /// Build the `Idle` event (returned to the REPL prompt). Carries the same
+    /// project / last-prompt context so on-screen feed lines identify it.
+    pub fn idle_event(&self) -> AgentEvent {
+        AgentEvent::idle(self.project_label(), self.last_prompt.clone())
+    }
+
+    /// Build an `Error` event from a turn's error message.
+    pub fn error_event(&self, message: String) -> AgentEvent {
+        AgentEvent::error(message, self.project_label(), self.last_prompt.clone())
     }
 
     /// Crude context management: past ~budget tokens, keep the first user
@@ -656,7 +690,7 @@ impl Agent {
             )));
         }
         self.history = history;
-        println!("{}", term::dim("[pir: context trimmed]"));
+        term::out(&term::dim("[pir: context trimmed]"));
     }
 }
 

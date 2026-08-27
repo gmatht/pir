@@ -24,38 +24,126 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-#[derive(Clone, Debug)]
-pub enum AgentEvent {
-    /// A user turn finished with the model returning plain text.
-    TurnDone { duration: Duration, in_tokens: u64, out_tokens: u64 },
-    /// The provider/tool loop hit an error and the turn aborted.
-    Error { message: String },
-    /// Returned to the REPL prompt and is waiting for input (REPL only).
+/// Discriminator for the kind of event, kept separate from the (shared)
+/// descriptive fields so events can carry notification context (project /
+/// prompt) without exploding every variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventKind {
+    TurnDone,
+    Error,
     Idle,
 }
 
+#[derive(Clone, Debug)]
+pub struct AgentEvent {
+    pub kind: EventKind,
+    pub duration: Duration,
+    pub in_tokens: u64,
+    pub out_tokens: u64,
+    pub message: String,
+    /// Short project/cwd label (e.g. "rpi"), shown in notification titles so a
+    /// pop-up identifies *which* project finished rather than just "pir".
+    pub project: String,
+    /// The last user prompt that produced this turn (truncated; may be empty),
+    /// shown in the notification body so the user knows *what* finished.
+    pub prompt: String,
+}
+
 impl AgentEvent {
+    pub fn turn_done(
+        duration: Duration,
+        in_tokens: u64,
+        out_tokens: u64,
+        project: String,
+        prompt: String,
+    ) -> Self {
+        AgentEvent {
+            kind: EventKind::TurnDone,
+            duration,
+            in_tokens,
+            out_tokens,
+            message: String::new(),
+            project,
+            prompt,
+        }
+    }
+
+    pub fn error(message: String, project: String, prompt: String) -> Self {
+        AgentEvent {
+            kind: EventKind::Error,
+            duration: Duration::ZERO,
+            in_tokens: 0,
+            out_tokens: 0,
+            message,
+            project,
+            prompt,
+        }
+    }
+
+    pub fn idle(project: String, prompt: String) -> Self {
+        AgentEvent {
+            kind: EventKind::Idle,
+            duration: Duration::ZERO,
+            in_tokens: 0,
+            out_tokens: 0,
+            message: String::new(),
+            project,
+            prompt,
+        }
+    }
+
     /// Short human-readable line, used by most notifiers and the on-screen feed.
     pub fn summary(&self) -> String {
-        match self {
-            AgentEvent::TurnDone { duration, in_tokens, out_tokens } => format!(
+        match self.kind {
+            EventKind::TurnDone => format!(
                 "turn done in {:.1}s ({} in / {} out tokens)",
-                duration.as_secs_f64(),
-                in_tokens,
-                out_tokens
+                self.duration.as_secs_f64(),
+                self.in_tokens,
+                self.out_tokens
             ),
-            AgentEvent::Error { message } => format!("error: {message}"),
-            AgentEvent::Idle => "idle".into(),
+            EventKind::Error => format!("error: {}", self.message),
+            EventKind::Idle => "idle".into(),
         }
     }
 
     /// Stable machine name, used in file/JSON/webhook payloads.
     pub fn kind(&self) -> &'static str {
-        match self {
-            AgentEvent::TurnDone { .. } => "turn-done",
-            AgentEvent::Error { .. } => "error",
-            AgentEvent::Idle => "idle",
+        match self.kind {
+            EventKind::TurnDone => "turn-done",
+            EventKind::Error => "error",
+            EventKind::Idle => "idle",
         }
+    }
+
+    /// Title for desktop pop-ups, e.g. "pir · rpi". Falls back to "pir" when the
+    /// project label is unavailable.
+    pub fn desktop_title(&self) -> String {
+        if self.project.is_empty() {
+            "pir".to_string()
+        } else {
+            format!("pir · {}", self.project)
+        }
+    }
+
+    /// Body for desktop pop-ups: the summary, plus the last prompt when we have
+    /// one, so the user knows which task finished.
+    pub fn desktop_body(&self) -> String {
+        let summary = self.summary();
+        if self.prompt.is_empty() {
+            summary
+        } else {
+            format!("{}\n{}", summary, self.prompt)
+        }
+    }
+}
+
+/// Clip a string to `n` chars, appending an ellipsis if truncated.
+fn clip(s: &str, n: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(n).collect::<String>())
     }
 }
 
@@ -185,13 +273,13 @@ impl NotifyPolicy {
         if for_screen {
             // The on-screen feed always shows everything the user asked for
             // (idle is suppressed — it's just "back at the prompt").
-            return !matches!(e, AgentEvent::Idle);
+            return !matches!(e.kind, EventKind::Idle);
         }
         // Event-type gate.
         let ok_type = match self.on.as_str() {
-            "turn-done" => matches!(e, AgentEvent::TurnDone { .. }),
-            "error" => matches!(e, AgentEvent::Error { .. }),
-            "idle" => matches!(e, AgentEvent::Idle),
+            "turn-done" => matches!(e.kind, EventKind::TurnDone),
+            "error" => matches!(e.kind, EventKind::Error),
+            "idle" => matches!(e.kind, EventKind::Idle),
             _ => true, // "all" and anything unknown
         };
         if !ok_type {
@@ -199,8 +287,8 @@ impl NotifyPolicy {
         }
 
         // Timing gate for turn-done.
-        if let AgentEvent::TurnDone { duration, .. } = e {
-            if duration.as_secs() < self.min_seconds {
+        if let EventKind::TurnDone = e.kind {
+            if e.duration.as_secs() < self.min_seconds {
                 return false;
             }
         }
@@ -216,8 +304,8 @@ impl NotifyPolicy {
                 // In an interactive REPL the user is watching; only ping if the
                 // turn took a while or output is not attached to a terminal
                 // (e.g. piped / backgrounded).
-                let long = matches!(e, AgentEvent::TurnDone { duration, .. }
-                    if duration.as_secs() >= self.min_seconds);
+                let long = matches!(e.kind, EventKind::TurnDone
+                    if e.duration.as_secs() >= self.min_seconds);
                 if !oneshot && term::is_terminal() && !long {
                     return false;
                 }
@@ -315,31 +403,145 @@ impl Notifier for Bell {
             return;
         }
         let _ = std::io::stderr().write_all(b"\x07");
-        let _ = std::io::stderr().write_all(format!("\x1b]0;pir: {}\x07", e.summary()).as_bytes());
+        let _ = std::io::stderr().write_all(
+            format!("\x1b]0;{}: {}\x07", e.desktop_title(), e.summary()).as_bytes(),
+        );
         let _ = std::io::stderr().flush();
     }
 }
 
 /// Desktop pop-up via the platform notifier. Best-effort; silently skips
 /// unsupported platforms.
+///
+/// The notifier subprocess runs with fully detached stdio (redirected to
+/// `/dev/null`), so a missing backend or an absent bus (the common case on a
+/// headless server or inside WSL2 without a bridge) can never leak error text
+/// onto the user's terminal — that was the source of the spurious
+/// "Could not connect: No such file or directory" lines.
 pub struct Desktop;
 impl Notifier for Desktop {
     fn name(&self) -> &'static str {
         "desktop"
     }
     fn notify(&self, e: &AgentEvent) {
-        let msg = e.summary();
-        let spawn = if cfg!(target_os = "macos") {
-            Command::new("osascript")
-                .args(["-e", &format!("display notification {msg:?} with title \"pir\"")])
-                .spawn()
-        } else if cfg!(target_os = "linux") {
-            Command::new("notify-send").args(["pir", &msg]).spawn()
-        } else {
-            return; // Windows: leave a no-op (BurntToast/msg are non-portable)
-        };
-        let _ = spawn;
+        let title = e.desktop_title();
+        let body = e.desktop_body();
+
+        // On macOS, use the native AppleScript notification.
+        #[cfg(target_os = "macos")]
+        {
+            let _ = Command::new("osascript")
+                .args(["-e", &format!("display notification {body:?} with title {title:?}")])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            return;
+        }
+
+        // On Linux (incl. WSL2), there is no desktop notification if there's no
+        // usable D-Bus session bus (headless / SSH / container). Probe it once
+        // and skip the spawn entirely so we neither error nor spam the
+        // terminal. Under WSL2 we additionally try to reach the *Windows*
+        // notification center, since the Linux D-Bus bus is not bridged to it.
+        #[cfg(target_os = "linux")]
+        {
+            if running_under_wsl() {
+                if notify_via_windows(&title, &body) {
+                    return;
+                }
+                // Only fall through to notify-send if a Linux bus actually
+                // exists; otherwise we'd spawn a subprocess that prints
+                // "Could not connect: No such file or directory" onto the
+                // terminal (the source of the spurious leak).
+            }
+            if !has_session_bus() {
+                return;
+            }
+            let _ = Command::new("notify-send")
+                .args([&title, &body])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
     }
+}
+
+/// True when running inside Windows Subsystem for Linux (WSL1 or WSL2), where
+/// the host is Windows and `/proc/version` mentions Microsoft. Cheap and
+/// best-effort (returns false if it can't be determined).
+#[cfg(target_os = "linux")]
+fn running_under_wsl() -> bool {
+    if let Ok(v) = std::fs::read_to_string("/proc/version") {
+        let l = v.to_ascii_lowercase();
+        return l.contains("microsoft") || l.contains("wsl");
+    }
+    false
+}
+
+/// Try to raise a Windows toast from inside WSL2, either via the `wsl-notify-
+/// send` libnotify bridge (if installed) or via `powershell.exe` + BurntToast.
+/// Returns true if we launched a backend (best-effort; we don't verify success
+/// — all subprocess stdio is detached so any failure is silent). Returns false
+/// if no Windows-side backend is reachable.
+#[cfg(target_os = "linux")]
+fn notify_via_windows(title: &str, body: &str) -> bool {
+    // Preferred: wsl-notify-send — a drop-in libnotify that forwards to the
+    // Windows Action Center. If present, just use it.
+    if Command::new("wsl-notify-send")
+        .args([title, body])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+    {
+        return true;
+    }
+    // Fallback: drive the Windows-side PowerShell host. BurntToast must be
+    // installed once on Windows (`Install-Module BurntToast -Force`). Escape
+    // double quotes / backticks so the message can't break out of the string.
+    let safe = body.replace('`', "``").replace('"', "`\"");
+    let script = format!(
+        "Import-Module BurntToast -ErrorAction SilentlyContinue; \
+         New-BurntToastNotification -AppLogo None -Text '{title}',\"{safe}\" \
+         -ErrorAction SilentlyContinue"
+    );
+    if Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+    {
+        return true;
+    }
+    false
+}
+
+/// True when a D-Bus session bus is actually reachable (DBUS_SESSION_BUS_ADDRESS
+/// is set *and* the socket file/abstract path exists). Best-effort: if the
+/// address is just inherited from root and the socket isn't there for this
+/// user, we skip the spawn rather than letting `notify-send` print an error.
+#[cfg(target_os = "linux")]
+fn has_session_bus() -> bool {
+    let addr = match std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+        Ok(a) if !a.is_empty() => a,
+        _ => return false,
+    };
+    // `unix:path=/run/user/1000/bus` — a real socket file.
+    if let Some(path) = addr.strip_prefix("unix:path=") {
+        return std::path::Path::new(path).exists();
+    }
+    // `unix:abstract=/tmp/dbus-XXXX` — abstract socket; can't easily probe, so
+    // permit it (notify-send will simply no-op if absent).
+    if addr.starts_with("unix:abstract=") {
+        return true;
+    }
+    // `autolaunch:` or anything else — be conservative and skip.
+    false
 }
 
 /// Write a small JSON stamp for scripting/CI. Stamps go under
@@ -363,6 +565,8 @@ impl Notifier for FileStamp {
             "ts": ts,
             "event": e.kind(),
             "summary": e.summary(),
+            "project": e.project,
+            "prompt": e.prompt,
         });
         let _ = serde_json::to_string_pretty(&body)
             .ok()
@@ -381,22 +585,30 @@ fn notify_dir() -> PathBuf {
     PathBuf::from(format!("/tmp/pir-notify-{}", std::process::id()))
 }
 
-/// Play a short system sound (opt-in).
+/// Play a short system sound (opt-in). Subprocess stdio is detached so a
+/// missing sound file / audio backend can't leak output onto the terminal.
 pub struct Sound;
 impl Notifier for Sound {
     fn name(&self) -> &'static str {
         "sound"
     }
     fn notify(&self, _e: &AgentEvent) {
-        if cfg!(target_os = "macos") {
-            let _ = Command::new("afplay")
-                .arg("/System/Library/Sounds/Glass.aiff")
-                .spawn();
+        let mut cmd = if cfg!(target_os = "macos") {
+            let mut c = Command::new("afplay");
+            c.arg("/System/Library/Sounds/Glass.aiff");
+            c
         } else if cfg!(target_os = "linux") {
-            let _ = Command::new("paplay")
-                .arg("/usr/share/sounds/freedesktop/stereo/complete.oga")
-                .spawn();
-        }
+            let mut c = Command::new("paplay");
+            c.arg("/usr/share/sounds/freedesktop/stereo/complete.oga");
+            c
+        } else {
+            return;
+        };
+        let _ = cmd
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
     }
 }
 
@@ -434,11 +646,28 @@ pub fn render_feed(events: &[AgentEvent]) -> String {
     }
     let mut out = String::new();
     for e in events {
-        let tag = match e {
-            AgentEvent::Error { .. } => term::red("✗"),
+        let tag = match e.kind {
+            EventKind::Error => term::red("✗"),
             _ => term::cyan("●"),
         };
-        out.push_str(&format!("{} {} {}\n", term::dim("notify"), tag, term::dim(&e.summary())));
+        let proj = if e.project.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", term::bold(&e.project))
+        };
+        let prompt = if e.prompt.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", term::dim(&clip(&e.prompt, 80)))
+        };
+        out.push_str(&format!(
+            "{} {} {}{}{}\n",
+            term::dim("notify"),
+            tag,
+            term::dim(&e.summary()),
+            proj,
+            prompt,
+        ));
     }
     out
 }

@@ -14,7 +14,7 @@ include!(concat!(env!("OUT_DIR"), "/gen_registry.rs"));
 
 use crate::agent::Agent;
 use crate::config::Provider;
-use crate::notify::{AgentEvent, SharedBus};
+use crate::notify::SharedBus;
 use std::io::BufRead;
 use std::io::Write;
 use std::path::PathBuf;
@@ -113,7 +113,7 @@ impl BackgroundJobs {
             let mut agent = builder();
             match agent.turn(&prompt_for_thread) {
                 Ok(()) => agent.notify_on_exit(agent.turn_done_event()),
-                Err(e) => agent.notify_on_exit(AgentEvent::Error { message: e }),
+                Err(e) => agent.notify_on_exit(agent.error_event(e)),
             }
         });
         self.jobs.push(BgSession {
@@ -401,7 +401,7 @@ fn main() {
                     .expect("agent build in background thread")
             }
         });
-        agent.notify_on_exit(AgentEvent::Idle);
+        agent.notify_on_exit(agent.idle_event());
         return;
     }
     if let Some(p) = &agent.log_path {
@@ -412,7 +412,7 @@ fn main() {
     if !prompt.is_empty() {
         match agent.turn(&prompt.join(" ")) {
             Ok(()) => agent.notify_on_exit(agent.turn_done_event()),
-            Err(e) => agent.notify_on_exit(AgentEvent::Error { message: e }),
+            Err(e) => agent.notify_on_exit(agent.error_event(e)),
         }
         return;
     }
@@ -476,8 +476,7 @@ fn main() {
         let feed = bus.drain_feed();
         let rendered = crate::notify::render_feed(&feed);
         if !rendered.is_empty() {
-            print!("{rendered}");
-            let _ = std::io::stdout().flush();
+            term::out(&rendered);
         }
         // Reap any finished background jobs so their handles don't leak.
         jobs.reap();
@@ -491,14 +490,11 @@ fn main() {
                 term::raw::disable_raw();
                 // Report token usage from the (now-returned) agent.
                 if let Some(a) = agent_slot.lock().unwrap().as_ref() {
-                    println!(
-                        "{}",
-                        term::dim(&format!(
-                            "· {} in / {} out tokens",
-                            fmt_tok(a.usage.input),
-                            fmt_tok(a.usage.output)
-                        ))
-                    );
+                    term::out(&term::dim(&format!(
+                        "· {} in / {} out tokens",
+                        fmt_tok(a.usage.input),
+                        fmt_tok(a.usage.output)
+                    )));
                 }
                 if let Some(next) = pending.drain(..).next() {
                     fg_handle = Some(run_foreground_turn(
@@ -537,12 +533,12 @@ fn main() {
                     } else {
                         pending.push(s.to_string());
                         input_buf.clear();
-                        println!("{}", term::dim("· queued; will run when current turn ends"));
+                        term::out(&term::dim("· queued; will run when current turn ends"));
                     }
                 }
                 term::raw::RawInput::Interrupt => {
                     fg_cancel.store(true, Ordering::SeqCst);
-                    println!("{}", term::dim("· cancelling turn (after current step)…"));
+                    term::out(&term::dim("· cancelling turn (after current step)…"));
                 }
                 term::raw::RawInput::Eof => {
                     fg_cancel.store(true, Ordering::SeqCst);
@@ -617,8 +613,8 @@ fn run_foreground_turn(
         cancel.store(false, Ordering::SeqCst);
         let mut a = slot.lock().unwrap().take().expect("agent present");
         let ev = match a.turn(&prompt) {
-            Ok(()) => AgentEvent::Idle,
-            Err(e) => AgentEvent::Error { message: e },
+            Ok(()) => a.idle_event(),
+            Err(e) => a.error_event(e),
         };
         a.notify_on_exit(ev);
         *slot.lock().unwrap() = Some(a);
