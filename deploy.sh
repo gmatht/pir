@@ -37,6 +37,14 @@
 #      * (Optional, root) `pir project init` creates `ai_<project>` and records
 #        the mapping; verified via `id ai_<project>` + `pir --version` as that
 #        user.
+#
+# Publishing to GitHub is OPT-IN and never happens by default. Use:
+#      * `--push [--push-remote origin] [--push-branch main]` — git push ref/tag
+#      * `--tag vX.Y.Z` — create + push an annotated tag
+#      * `--release` — implies --push + tag (from Cargo.toml version) + upload the
+#        built binary to a GitHub Release via `gh` (requires `gh auth login`).
+#    Without any of these, deploy.sh only builds, tests, and installs locally —
+#    it will NOT touch a remote.
 
 set -euo pipefail
 
@@ -46,6 +54,13 @@ REF=""
 WITH_PROJECT_INIT=0
 TEST_ONLY=0
 CLIPPY=1
+
+# publish (all opt-in; nothing is pushed to GitHub unless explicitly requested)
+PUSH=0
+PUSH_REMOTE="${PIR_DEPLOY_REMOTE:-origin}"
+PUSH_BRANCH=""
+TAG=""
+RELEASE=0
 
 usage() { sed -n '2,40p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 while [ $# -gt 0 ]; do
@@ -57,6 +72,14 @@ while [ $# -gt 0 ]; do
     --with-project-init) WITH_PROJECT_INIT=1; shift ;;
     --test-only)     TEST_ONLY=1; shift ;;
     --no-clippy)     CLIPPY=0; shift ;;
+    --push)          PUSH=1; shift ;;
+    --push-remote)   PUSH_REMOTE="$2"; shift 2 ;;
+    --push-remote=*) PUSH_REMOTE="${1#*=}"; shift ;;
+    --push-branch)   PUSH_BRANCH="$2"; shift 2 ;;
+    --push-branch=*) PUSH_BRANCH="${1#*=}"; shift ;;
+    --tag)           TAG="$2"; shift 2 ;;
+    --tag=*)         TAG="${1#*=}"; shift ;;
+    --release)       RELEASE=1; PUSH=1; shift ;;
     -h|--help)       usage 0 ;;
     *) echo "deploy.sh: unknown arg '$1'" >&2; usage 1 ;;
   esac
@@ -145,7 +168,20 @@ if dmesg 2>/dev/null | tail -1 | grep -qi 'pir.*core dumped'; then
 fi
 say "  graceful no-key failure ok (exit=$rc)"
 
-[ "$TEST_ONLY" -eq 1 ] && { say "test-only mode; skipping install."; exit 0; }
+[ "$TEST_ONLY" -eq 1 ] && { say "test-only mode; skipping install and publish."; exit 0; }
+
+# --------------------------------------------------------------- publish guard
+if [ "$RELEASE" -eq 1 ]; then
+  need gh || die "--release requires the 'gh' CLI"
+  [ -n "$TAG" ] || TAG="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([0-9.]+)".*/v\1/')"
+  [ -n "$TAG" ] || die "--release: could not derive tag from Cargo.toml; use --tag"
+  command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1 \
+    || die "--release: gh is not authenticated (run: gh auth login)"
+fi
+if [ "$PUSH" -eq 1 ] || [ -n "$TAG" ]; then
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "deploy.sh must run inside the git repo to publish"
+  git remote get-url "$PUSH_REMOTE" >/dev/null 2>&1 || die "push remote '$PUSH_REMOTE' not configured"
+fi
 
 # --------------------------------------------------------------- install
 say "installing to $PREFIX"
@@ -175,6 +211,53 @@ if [ "$WITH_PROJECT_INIT" -eq 1 ]; then
   sudo -u "ai_$PROJ" "$INSTALLED" --version >/dev/null 2>&1 \
     || warn "could not verify --version as ai_$PROJ (may lack ~/.pi config)"
   say "  ai_$PROJ provisioned"
+fi
+
+# --------------------------------------------------------------- publish to GitHub (opt-in)
+if [ "$PUSH" -eq 1 ] || [ -n "$TAG" ] || [ "$RELEASE" -eq 1 ]; then
+  say "publishing to GitHub"
+
+  # Default the ref to push: an explicit --push-branch, else HEAD, else REF.
+  PUSH_REF="${PUSH_BRANCH:-${REF:-HEAD}}"
+
+  # 1) Create + push an annotated tag if requested (or implied by --release).
+  if [ -n "$TAG" ]; then
+    if git rev-parse "$TAG" >/dev/null 2>&1; then
+      warn "tag $TAG already exists locally; reusing it"
+    else
+      say "  creating tag $TAG -> $PUSH_REF"
+      git tag -a "$TAG" -m "Release $TAG" "$PUSH_REF" \
+        || die "could not create tag $TAG"
+    fi
+    say "  pushing tag $TAG to $PUSH_REMOTE"
+    git push --follow-tags "$PUSH_REMOTE" "refs/tags/$TAG" \
+      || die "could not push tag $TAG to $PUSH_REMOTE"
+  fi
+
+  # 2) Push the commit/branch unless this run only meant to publish a tag.
+  if [ "$PUSH" -eq 1 ]; then
+    if [ -n "$PUSH_BRANCH" ]; then
+      say "  pushing $PUSH_REF -> $PUSH_REMOTE/$PUSH_BRANCH"
+      git push "$PUSH_REMOTE" "$PUSH_REF:refs/heads/$PUSH_BRANCH" \
+        || die "could not push $PUSH_REF to $PUSH_REMOTE/$PUSH_BRANCH"
+    else
+      say "  pushing $PUSH_REF to $PUSH_REMOTE"
+      git push "$PUSH_REMOTE" "$PUSH_REF" \
+        || die "could not push $PUSH_REF to $PUSH_REMOTE"
+    fi
+  fi
+
+  # 3) GitHub Release with the built binary (--release).
+  if [ "$RELEASE" -eq 1 ]; then
+    need gh || die "--release requires the 'gh' CLI"
+    ASSET="$BIN"
+    say "  creating GitHub release $TAG ($ASSET)"
+    gh release create "$TAG" "$ASSET" \
+      --title "pir $TAG" \
+      --notes "Automated release from deploy.sh (built from $PUSH_REF)." \
+      || die "gh release create failed for $TAG"
+    say "  released $TAG on GitHub"
+  fi
 fi
 
 say "deploy complete: $INSTALLED  ($V)"
