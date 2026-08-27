@@ -72,6 +72,21 @@ sudo ./target/release/pir project init      # creates ai_<project>, chowns cwd
 sudo -u ai_<project> ./target/release/pir    # ...then run as that user
 ```
 
+`pir project init` (run as **root**) also gives the new `ai_<project>` user its
+own, self-owned **network-capable toolchain directories**, so the agent can do
+its job without touching root's files:
+
+- `~ai_<project>/.cargo` — a writable `CARGO_HOME` (the default `/root/.cargo`
+  is `0700` root, so an unprivileged agent can't write its registry cache).
+- `~ai_<project>/.config/gh` — a writable `GH_CONFIG_DIR` (preferred over
+  widening traversal on root's `~/.config/gh`; see `ai-permctl`).
+
+When `pir` drops privileges to `ai_<project>` (via `become_user`), it exports
+`CARGO_HOME` / `GH_CONFIG_DIR` pointing at those dirs (resolved by
+`user::toolchain_env_for`). Net effect: **`ai_*` agents have outbound network
+access** (fetch crates, call APIs, push to GitHub) but own none of root's
+files. The `ai-permctl` read grant remains the only path to root's `gh` config.
+
 ---
 
 ## Usage
