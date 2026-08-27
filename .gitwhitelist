@@ -5,7 +5,11 @@
 # these patterns (it overrides .gitignore). Kept intentionally small: only the
 # kinds of files this project is meant to ship.
 
-# Rust source + build glue
+# Rust source + build glue — the project-defining files for a Rust crate.
+# `src/**/*.rs` matches every .rs anywhere under src/ (incl. extensions/*/src/),
+# in addition to the repo-root *.rs files (e.g. build.rs at the top level is
+# covered by the explicit build.rs entry below).
+src/**/*.rs
 *.rs
 Cargo.toml
 Cargo.lock
