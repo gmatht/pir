@@ -267,18 +267,16 @@ pub fn read_line(prompt: &str) -> Option<String> {
             Some(rl) => rl,
             None => return plain_read_line(prompt),
         };
-        loop {
-            match rl.readline(prompt) {
-                Ok(line) => {
-                    let _ = rl.add_history_entry(line.as_str());
-                    save_history(rl);
-                    return Some(line);
-                }
-                // Ctrl-C: stay in the REPL instead of dying.
-                Err(ReadlineError::Interrupted) => return Some(String::new()),
-                Err(ReadlineError::Eof) => return None,
-                Err(_) => return None,
+        match rl.readline(prompt) {
+            Ok(line) => {
+                let _ = rl.add_history_entry(line.as_str());
+                save_history(rl);
+                Some(line)
             }
+            // Ctrl-C: stay in the REPL instead of dying.
+            Err(ReadlineError::Interrupted) => Some(String::new()),
+            Err(ReadlineError::Eof) => None,
+            Err(_) => None,
         }
     })
 }
@@ -401,20 +399,25 @@ pub mod raw {
             return RawInput::None;
         }
         let mut tmp = [0u8; 256];
-        let mut nread = 0;
+        let mut nread = 0usize;
+        // stdin is non-blocking (see enable_raw), so read may return a partial
+        // chunk; keep draining until it would block (r <= 0) or the buffer is
+        // full. Without the loop a single poll could leave bytes unconsumed.
         loop {
             let r = unsafe {
                 libc::read(
                     fd,
-                    tmp.as_mut_ptr() as *mut libc::c_void,
-                    tmp.len(),
+                    tmp.as_mut_ptr().add(nread) as *mut libc::c_void,
+                    tmp.len() - nread,
                 )
             };
             if r <= 0 {
                 break;
             }
-            nread = r as usize;
-            break;
+            nread += r as usize;
+            if nread >= tmp.len() {
+                break;
+            }
         }
         if nread == 0 {
             return RawInput::None;
