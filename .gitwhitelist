@@ -1,0 +1,26 @@
+# .gitwhitelist — patterns that should ALWAYS be tracked, even if .gitignore
+# would normally exclude them. Source, docs, and scripts for this Rust agent.
+#
+# Run `scripts/git-wl-add` to force-add any untracked file matching one of
+# these patterns (it overrides .gitignore). Kept intentionally small: only the
+# kinds of files this project is meant to ship.
+
+# Rust source + build glue
+*.rs
+Cargo.toml
+Cargo.lock
+build.rs
+
+# Documentation
+*.md
+LICENSE.GPL3
+
+# Shell tooling / installers
+*.sh
+deploy.sh
+install-skynet-ai.sh
+
+# Misc project files that must be version-controlled
+.gitignore
+.gitwhitelist
+*.json

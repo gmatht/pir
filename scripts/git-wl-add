@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# git-wl-add — force-add any untracked file that matches .gitwhitelist, even if
+# .gitignore would normally exclude it. Idempotent: already-tracked files (or
+# those already staged) are skipped. The whitelist is the project's guarantee
+# that source/docs/scripts are never accidentally left out of version control.
+#
+# Usage:
+#   scripts/git-wl-add            # add matching untracked files
+#   scripts/git-wl-add --dry-run  # show what *would* be added, change nothing
+#
+# Safety: only `git add` (force-add) is performed — nothing is committed or
+# pushed. The operation never touches ignored build artifacts unless they
+# happen to match a whitelist pattern (they don't: *.o, target/, etc.).
+
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+WL="$ROOT/.gitwhitelist"
+DRY=0
+[ "${1:-}" = "--dry-run" ] && DRY=1
+
+[ -f "$WL" ] || { echo "git-wl-add: no .gitwhitelist at $WL" >&2; exit 1; }
+
+mapfile -t PATTERNS < <(grep -vE '^\s*#|^\s*$' "$WL")
+
+# untracked, not-yet-tracked files (ignores already-tracked + those excluded by
+# .gitignore). `--others --exclude-standard` already honors .gitignore.
+mapfile -t CANDIDATES < <(git -C "$ROOT" ls-files --others --exclude-standard)
+
+shopt -s globstar nullglob dotglob
+added=0
+for f in "${CANDIDATES[@]:-}"; do
+  [ -e "$ROOT/$f" ] || continue          # skip if somehow gone
+  match=0
+  for p in "${PATTERNS[@]:-}"; do
+    # Match against the path (so `*.rs` matches src/agent.rs) and the basename
+    # (so `deploy.sh` matches anywhere).
+    if [[ "$f" == $p ]] || [[ "$(basename "$f")" == $p ]]; then
+      match=1; break
+    fi
+  done
+  if [ "$match" -eq 1 ]; then
+    if [ "$DRY" -eq 1 ]; then
+      echo "would add: $f"
+    else
+      git -C "$ROOT" add -f -- "$f"
+      echo "added: $f"
+    fi
+    added=$((added+1))
+  fi
+done
+
+if [ "$added" -eq 0 ]; then
+  echo "git-wl-add: no untracked files match .gitwhitelist (nothing to do)."
+fi

@@ -1,2 +1,18 @@
+# Rust build output
 /target
+
+# Local project metadata / session logs written next to the cwd
 /.pir
+
+# Editor / OS noise
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+*.iml
+
+# Local env overrides
+.env
+.env.local
