@@ -5,7 +5,7 @@ use serde_json::{json, Map, Value};
 use std::io::{BufRead, BufReader, Error, ErrorKind, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,12 +27,14 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// "Error encountered in the status line: timed out reading response" if the
 /// status line isn't received in time. A too-short read timeout made every
 /// retry fail identically (all 4 attempts timing out at 2s), which is exactly
-/// the failure we saw. It doubles on each retry (see `READ_TIMEOUT_GROWTH`).
+/// the failure we saw. It doubles on each retry (see `READ_TIMEOUT_GROWTH`)
+/// with **no upper bound** — a slow/"thinking" provider keeps getting more
+/// time on each attempt rather than hitting a hard ceiling and failing forever.
 const READ_TIMEOUT_INIT: Duration = Duration::from_secs(30);
-/// Each retry gets this multiple of the previous attempt's read timeout. Capped
-/// at `READ_TIMEOUT_MAX` so a long run of retries can't blow up to minutes.
+/// Each retry gets this multiple of the previous attempt's read timeout. There
+/// is deliberately no cap: the timeout is *unlimited*, simply doubling each
+/// retry so the most stubborn slow provider eventually has room to respond.
 const READ_TIMEOUT_GROWTH: u32 = 2;
-const READ_TIMEOUT_MAX: Duration = Duration::from_secs(240);
 /// Hard backstop for the *streaming* phase: if no bytes arrive for this long
 /// the connection is treated as stalled and the request fails (rather than the
 /// parser polling forever). This guards the gap *between* SSE events once
@@ -59,9 +61,14 @@ fn stall_timeout() -> Duration {
 }
 
 /// Initial backoff between retries; it doubles each attempt (capped), giving
-/// 1s, 2s, 4s, 8s for the four retries above.
-const RETRY_BASE_BACKOFF: Duration = Duration::from_secs(1);
-const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(10);
+/// 60s, 120s, 240s, 240s for the four retries above. Starting at a full minute
+/// avoids hammering a slow / "thinking" provider (e.g. opencode.ai's zen
+/// endpoint) that can take many seconds before it produces its first token — a
+/// 1s backoff would retry repeatedly against a peer that simply hasn't started
+/// streaming yet. Cancellation is still honoured promptly during the backoff
+/// because the sleep loop re-checks `cancel` every 100ms.
+const RETRY_BASE_BACKOFF: Duration = Duration::from_secs(60);
+const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(240);
 
 pub struct Client {
     kind: ApiKind,
@@ -134,14 +141,12 @@ impl Client {
                 return Err("request cancelled".to_string());
             }
             // Read timeout for this attempt: start generous and double each
-            // retry (capped). The *first* attempt already waits up to
-            // READ_TIMEOUT_INIT for the status line, so a slow/"thinking"
+            // retry, with no upper bound. The *first* attempt already waits up
+            // to READ_TIMEOUT_INIT for the status line, so a slow/"thinking"
             // provider has room to respond instead of failing instantly; later
             // attempts get proportionally more time. Rebuild the ureq agent so
             // the new timeout takes effect (it's baked in at build time).
-            let read_timeout = (READ_TIMEOUT_INIT
-                * READ_TIMEOUT_GROWTH.saturating_pow(attempt as u32))
-                .min(READ_TIMEOUT_MAX);
+            let read_timeout = READ_TIMEOUT_INIT * READ_TIMEOUT_GROWTH.saturating_pow(attempt as u32);
             let http = Self::http_agent(read_timeout);
             let mut req = http.post(&url);
             req = match self.kind {
@@ -302,50 +307,78 @@ impl Client {
 /// instead of waiting for the next network byte — so a turn is honoured within
 /// tens of milliseconds (well under the 50ms target), every time, regardless of
 /// how long the peer is stalled. The pump thread is torn down on drop.
-struct CancelableReader<R: Read + Send + 'static> {
+///
+/// `R` is only used at construction time (the pump closure owns the source);
+/// the reader itself holds no `R`-typed field, so the struct is not generic.
+struct CancelableReader {
     rx: mpsc::Receiver<u8>,
     cancel: Arc<AtomicBool>,
+    /// Set by the pump if the underlying `Read` fails with a *fatal* (non-timeout)
+    /// error. Lets `read()` distinguish "connection closed / broken" from a
+    /// cooperative cancel or a clean EOF once the channel disconnects.
+    errored: Arc<Mutex<Option<String>>>,
+    /// Set on `Drop` so the pump (which is blocked in the underlying `read` and
+    /// cannot be joined without stalling the turn) knows to stop polling once
+    /// its current read times out. Bounds a cancelled/errored turn's pump thread
+    /// to at most one read-timeout of lingering, instead of spinning forever.
+    done: Arc<AtomicBool>,
     pump: Option<thread::JoinHandle<()>>,
 }
 
-impl<R: Read + Send + 'static> CancelableReader<R> {
-    fn new(mut src: R, cancel: Arc<AtomicBool>) -> Self {
+impl CancelableReader {
+    fn new<R: Read + Send + 'static>(mut src: R, cancel: Arc<AtomicBool>) -> Self {
         let (tx, rx) = mpsc::sync_channel::<u8>(256);
+        let errored: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let errored_pump = errored.clone();
+        let done: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let done_pump = done.clone();
         let pump = thread::spawn(move || {
             let mut buf = [0u8; 256];
             loop {
                 match src.read(&mut buf) {
                     Ok(0) => {
-                        // EOF: nothing more to read. The receiver will see
-                        // `Disconnected` once `tx` drops at the end of this
-                        // closure. No further bytes needed.
+                        // Genuine EOF: the response body is complete. The channel
+                        // `tx` drops when this closure returns, so the parser's
+                        // `recv` sees `Disconnected` and treats it as a clean EOF.
                         break;
                     }
                     Ok(n) => {
                         for &b in &buf[..n] {
-                            // Block only if the channel is full (the parser is
-                            // behind). On disconnect (reader dropped) stop.
+                            // Block only while the channel is full (the parser is
+                            // behind); if the reader was dropped, stop.
                             if tx.send(b).is_err() {
                                 return;
                             }
                         }
                     }
-                    Err(_) => {
-                        // Any read error (including a real timeout): stop the
-                        // pump. If it was a stall/timeout, the parser's own
-                        // watchdog (keyed off `last_byte`) will trip shortly;
-                        // if it was cancellation, `read()` will surface that
-                        // first. Either way we don't busy-spin on errors.
+                    Err(e) if is_read_timeout(&e) => {
+                        // A read timeout (SO_RCVTIMEO) is *not* a failure — the
+                        // provider is just slow / between SSE events. Keep waiting
+                        // rather than ending the stream: the parser's own stall
+                        // watchdog still trips if no byte ever arrives, and cancel
+                        // is still honoured on the next poll. Breaking here would
+                        // falsely truncate the response and defeat the watchdog.
+                        // Once the reader is dropped (`done`), stop so the pump
+                        // thread doesn't spin forever on recurring timeouts.
+                        if done_pump.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        // A genuine read failure (e.g. ECONNRESET): poison the
+                        // reader so the parser reports it instead of a clean EOF.
+                        *errored_pump.lock().unwrap() = Some(e.to_string());
                         break;
                     }
                 }
             }
         });
-        CancelableReader { rx, cancel, pump: Some(pump) }
+        CancelableReader { rx, cancel, errored, done, pump: Some(pump) }
     }
 }
 
-impl<R: Read + Send + 'static> Read for CancelableReader<R> {
+impl Read for CancelableReader {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         if self.cancel.load(Ordering::SeqCst) {
             return Err(Error::new(ErrorKind::Interrupted, "request cancelled"));
@@ -380,26 +413,32 @@ impl<R: Read + Send + 'static> Read for CancelableReader<R> {
                 Err(Error::new(ErrorKind::WouldBlock, "no data within poll window"))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // Pump has ended (EOF or its own error). Surface cancellation if
-                // it was requested, else report EOF via a clean 0-byte read.
+                // Pump has ended (EOF, a fatal error, or the reader was dropped).
                 if self.cancel.load(Ordering::SeqCst) {
                     return Err(Error::new(ErrorKind::Interrupted, "request cancelled"));
                 }
+                if let Some(msg) = self.errored.lock().unwrap().take() {
+                    return Err(Error::new(ErrorKind::Other, format!("stream: {msg}")));
+                }
+                // Clean EOF.
                 Ok(0)
             }
         }
     }
 }
 
-impl<R: Read + Send + 'static> Drop for CancelableReader<R> {
+impl Drop for CancelableReader {
     fn drop(&mut self) {
-        // Signal cancellation so the pump stops even if the parser never set it
-        // (e.g. the stream ended first). This also unblocks `tx.send` (the
-        // receiver is gone), letting the pump thread exit promptly.
-        self.cancel.store(true, Ordering::SeqCst);
-        if let Some(h) = self.pump.take() {
-            let _ = h.join();
-        }
+        // Signal the pump to stop once its next read times out (it's blocked in
+        // the underlying `read`, which we deliberately do NOT join — joining
+        // would stall this destructor for up to the read timeout and thus the
+        // whole `chat` call, reintroducing the latency we're removing). The pump
+        // self-terminates on its next timeout/EOF and is then detached. We do NOT
+        // flip `cancel` here: that flag is owned by the REPL/agent and must stay
+        // the source of truth (flipping it on drop could wrongly turn a
+        // retryable mid-stream error into a "cancelled").
+        self.done.store(true, Ordering::SeqCst);
+        self.pump.take(); // detach; the pump self-terminates
     }
 }
 
@@ -853,10 +892,10 @@ mod tests {
     fn backoff_grows_and_caps() {
         let base = RETRY_BASE_BACKOFF;
         let capped = RETRY_MAX_BACKOFF;
-        assert_eq!((base * 2u32.pow(0)).min(capped), Duration::from_secs(1));
-        assert_eq!((base * 2u32.pow(1)).min(capped), Duration::from_secs(2));
-        assert_eq!((base * 2u32.pow(2)).min(capped), Duration::from_secs(4));
-        assert_eq!((base * 2u32.pow(3)).min(capped), Duration::from_secs(8));
+        assert_eq!((base * 2u32.pow(0)).min(capped), Duration::from_secs(60));
+        assert_eq!((base * 2u32.pow(1)).min(capped), Duration::from_secs(120));
+        assert_eq!((base * 2u32.pow(2)).min(capped), Duration::from_secs(240)); // hits cap
+        assert_eq!((base * 2u32.pow(3)).min(capped), Duration::from_secs(240));
         assert_eq!((base * 2u32.pow(10)).min(capped), capped);
     }
 
@@ -866,10 +905,10 @@ mod tests {
         // The streaming *status-line* read timeout is now generous, so a slow
         // / "thinking" provider has time to send its first byte before we
         // retry. The stall watchdog (between SSE events once streaming) stays
-        // short so a Ctrl-C/Ctrl-D is honoured promptly.
+        // short so a Ctrl-C/Ctrl-D is honoured promptly. Read timeouts double
+        // with NO cap — a slow provider is given ever more time per attempt.
         assert!(READ_TIMEOUT_INIT.as_secs() >= 15);
         assert!(READ_TIMEOUT_GROWTH >= 2);
-        assert!(READ_TIMEOUT_MAX.as_secs() >= READ_TIMEOUT_INIT.as_secs());
         assert!(STALL_TIMEOUT.as_secs() >= 30);
         assert_eq!(MAX_RETRIES, 4);
     }
@@ -877,16 +916,142 @@ mod tests {
     #[test]
     fn read_timeout_doubles_each_retry() {
         // Mirrors the chat() loop's computation: generous initial timeout that
-        // doubles per attempt and caps at READ_TIMEOUT_MAX. This is what stops
-        // every attempt from timing out identically at 2s (the old bug).
-        let compute = |attempt: u32| {
-            (READ_TIMEOUT_INIT * READ_TIMEOUT_GROWTH.saturating_pow(attempt)).min(READ_TIMEOUT_MAX)
-        };
+        // doubles per attempt with NO upper bound — so the most stubborn slow
+        // provider keeps getting more time instead of hitting a ceiling.
+        let compute = |attempt: u32| READ_TIMEOUT_INIT * READ_TIMEOUT_GROWTH.saturating_pow(attempt);
         assert_eq!(compute(0), Duration::from_secs(30));
         assert_eq!(compute(1), Duration::from_secs(60));
         assert_eq!(compute(2), Duration::from_secs(120));
-        assert_eq!(compute(3), Duration::from_secs(240)); // hits cap
-        assert_eq!(compute(4), Duration::from_secs(240));
+        assert_eq!(compute(3), Duration::from_secs(240));
+        assert_eq!(compute(4), Duration::from_secs(480));
+        assert_eq!(compute(10), Duration::from_secs(30720));
         assert!(compute(1) > compute(0));
+    }
+
+    /// A `Read` that blocks forever (never returns) until a `cancel` flag is
+    /// set — modelling a provider that is connected but silent ("thinking"),
+    /// with `ureq` parked in a blocking `recv`. We cannot actually block a
+    /// thread's `read` indefinitely in a test, so we simulate the *parser's*
+    /// experience: the wrapped `CancelableReader` sees no bytes and must react
+    /// to the flag. To make the inner `read` return without data, we use a
+    /// short-lived pump source that goes quiet (WouldBlock) — exactly the
+    /// `CancelableReader`'s polling contract — then assert the reader surfaces
+    /// cancellation within the 50ms budget after the flag flips.
+    struct SilentAfter {
+        sent: bool,
+        data: &'static [u8],
+    }
+    impl std::io::Read for SilentAfter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.sent {
+                self.sent = true;
+                let n = self.data.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.data[..n]);
+                return Ok(n);
+            }
+            // After the preamble, report "would block" forever, so the pump
+            // thread keeps polling but never yields bytes — i.e. a stalled
+            // connection. The CancelableReader must still honour `cancel`.
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "simulated silent connection",
+            ))
+        }
+    }
+
+    /// A `Read` that simulates a *real* ureq socket read: it yields the
+    /// preamble, then returns **timeout** errors (WouldBlock) for a while
+    /// before resuming — exactly what happens between SSE events when the
+    /// provider is "thinking". The old pump treated any `Err` as EOF and broke,
+    /// which truncated the stream and masked the stall watchdog. The pump must
+    /// keep waiting through the timeouts and deliver the late bytes.
+    struct PausesThenResumes {
+        state: usize,
+        data: &'static [u8],
+    }
+    impl std::io::Read for PausesThenResumes {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.state < self.data.len() {
+                let b = self.data[self.state];
+                self.state += 1;
+                buf[0] = b;
+                return Ok(1);
+            }
+            // After the data is exhausted, alternate: a few timeouts, then EOF.
+            // We emulate "the peer went silent for a bit then closed".
+            if self.state < self.data.len() + 3 {
+                self.state += 1;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "simulated socket read timeout",
+                ));
+            }
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn pump_survives_midstream_timeouts() {
+        // The pump must NOT treat a mid-stream read timeout as EOF — it should
+        // keep waiting and deliver the rest of the body (and the parser must
+        // see a clean end, not a truncated stream).
+        let cancel = Arc::new(AtomicBool::new(false));
+        let inner = PausesThenResumes {
+            state: 0,
+            data: b"data: hello\n\n",
+        };
+        let mut reader = CancelableReader::new(inner, cancel.clone());
+        let mut got = String::new();
+        let mut buf = [0u8; 64];
+        // Read until EOF (the pump's WouldBlock phases must not truncate it).
+        loop {
+            match std::io::Read::read(&mut reader, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => got.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Err(e) => {
+                    // WouldBlock is expected while the pump waits out a timeout;
+                    // keep reading. Any other error is a real failure.
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        continue;
+                    }
+                    panic!("unexpected error: {e}");
+                }
+            }
+        }
+        assert!(
+            got.contains("data: hello"),
+            "pump truncated the stream across timeouts: {got:?}"
+        );
+    }
+
+    #[test]
+    fn cancelable_reader_obeys_within_50ms() {
+        // The whole point of the cancelable reader: Ctrl-C sets `cancel` while
+        // `ureq` is blocked in its network `recv`; the parser must stop within
+        // tens of milliseconds, every time — not after the read timeout.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let inner = SilentAfter {
+            sent: false,
+            data: b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
+        };
+        let mut reader = CancelableReader::new(inner, cancel.clone());
+
+        // Drain the preamble the pump already forwarded, then the reader is
+        // waiting on the silent connection.
+        let mut scratch = [0u8; 64];
+        let _ = std::io::Read::read(&mut reader, &mut scratch);
+
+        // Flip the flag as if Ctrl-C just arrived, and time how long the next
+        // read takes to honour it.
+        cancel.store(true, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let res = std::io::Read::read(&mut reader, &mut scratch);
+        let elapsed = started.elapsed();
+        assert!(res.is_err(), "expected cancellation error, got {res:?}");
+        assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        assert!(
+            elapsed <= Duration::from_millis(50),
+            "cancel took {elapsed:?}, must be <= 50ms"
+        );
     }
 }
