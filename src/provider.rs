@@ -3,6 +3,26 @@ use crate::plugin::ToolSpec;
 use crate::types::{Block, Message, Role, Usage};
 use serde_json::{json, Map, Value};
 use std::io::{BufRead, BufReader, Read};
+use std::time::Duration;
+
+/// How many times to retry a failed request (the first attempt is not a retry,
+/// so this is the number of *additional* attempts). Network blips, DNS hiccups,
+/// and transient 5xx / 429 responses from the provider are retried; hard errors
+/// (e.g. 401/unauthorized, malformed URL) are not.
+const MAX_RETRIES: usize = 4;
+
+/// Per-attempt network timeouts (applied to every request via the ureq agent).
+/// `timeout_read` is the max gap allowed between successive bytes on the
+/// streaming socket, so a stalled model connection is detected and retried
+/// instead of hanging the agent forever.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const READ_TIMEOUT: Duration = Duration::from_secs(180);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Initial backoff between retries; it doubles each attempt (capped), giving
+/// 1s, 2s, 4s, 8s for the four retries above.
+const RETRY_BASE_BACKOFF: Duration = Duration::from_secs(1);
+const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(10);
 
 pub struct Client {
     kind: ApiKind,
@@ -13,11 +33,16 @@ pub struct Client {
 
 impl Client {
     pub fn new(kind: ApiKind, base_url: &str, api_key: String) -> Self {
+        let http = ureq::AgentBuilder::new()
+            .timeout_connect(CONNECT_TIMEOUT)
+            .timeout_read(READ_TIMEOUT)
+            .timeout_write(WRITE_TIMEOUT)
+            .build();
         Client {
             kind,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
-            http: ureq::Agent::new(),
+            http,
         }
     }
 
@@ -34,18 +59,49 @@ impl Client {
             ApiKind::Anthropic => self.anthropic_request(model, max_tokens, system, history, tools),
             ApiKind::OpenAi => self.openai_request(model, max_tokens, system, history, tools),
         };
-        let mut req = self.http.post(&url);
-        req = match self.kind {
-            ApiKind::Anthropic => req
-                .set("x-api-key", &self.api_key)
-                .set("anthropic-version", "2023-06-01"),
-            ApiKind::OpenAi => req.set("Authorization", &format!("Bearer {}", self.api_key)),
-        };
-        let resp = req.send_json(&body).map_err(http_error)?;
-        match self.kind {
-            ApiKind::Anthropic => stream_anthropic(resp.into_reader(), on_text),
-            ApiKind::OpenAi => stream_openai(resp.into_reader(), on_text),
+        // Retry the whole request (connect + stream parse) on transient errors.
+        // `emitted_text` is set by the stream parsers the moment any token is
+        // delivered, so that — once the user is seeing streaming output — we
+        // NEVER re-run the attempt (and risk duplicating already-printed text);
+        // a mid-stream failure is surfaced as a hard error instead.
+        let mut emitted_text = false;
+        for attempt in 0..=MAX_RETRIES {
+            let mut req = self.http.post(&url);
+            req = match self.kind {
+                ApiKind::Anthropic => req
+                    .set("x-api-key", &self.api_key)
+                    .set("anthropic-version", "2023-06-01"),
+                ApiKind::OpenAi => req.set("Authorization", &format!("Bearer {}", self.api_key)),
+            };
+            // `send_json` returns a `ureq::Error`; map it to our `String` error
+            // before streaming so the two parsers share one error type.
+            let result: Result<(Message, Usage), String> = req
+                .send_json(&body)
+                .map_err(http_error)
+                .and_then(|resp| match self.kind {
+                    ApiKind::Anthropic => {
+                        stream_anthropic(resp.into_reader(), on_text, &mut emitted_text)
+                    }
+                    ApiKind::OpenAi => {
+                        stream_openai(resp.into_reader(), on_text, &mut emitted_text)
+                    }
+                });
+            match result {
+                Ok(r) => return Ok(r),
+                Err(e) => {
+                    if attempt >= MAX_RETRIES || !is_retryable(&e) || emitted_text {
+                        return Err(e);
+                    }
+                    let backoff = (RETRY_BASE_BACKOFF * 2u32.pow(attempt as u32)).min(RETRY_MAX_BACKOFF);
+                    let _ = on_text(&format!(
+                        "\n\u{26a0} request failed (attempt {}), retrying in {:.0?}: {}\n",
+                        attempt + 1, backoff, e
+                    ));
+                    std::thread::sleep(backoff);
+                }
+            }
         }
+        unreachable!()
     }
 
     fn anthropic_request(
@@ -110,6 +166,28 @@ impl Client {
         );
         (format!("{}/chat/completions", self.base_url), Value::Object(body))
     }
+}
+
+/// Decide whether an error is worth retrying. Retry on transport-level
+/// failures (DNS, connection refused, TLS, timeouts, I/O) and on transient
+/// HTTP status codes (429 rate-limit, 500/502/503/504 server errors). Do
+/// NOT retry on 4xx client errors other than 429 (e.g. 401 unauthorized,
+/// 400 bad request) — those won't succeed on replay.
+fn is_retryable(error: &str) -> bool {
+    if error.starts_with("HTTP 429")
+        || error.starts_with("HTTP 500")
+        || error.starts_with("HTTP 502")
+        || error.starts_with("HTTP 503")
+        || error.starts_with("HTTP 504")
+    {
+        return true;
+    }
+    // Transport-layer (non-HTTP) failures: ureq reports these as bare
+    // messages; they are retryable connection/timeout/IO problems.
+    if error.starts_with("HTTP ") {
+        return false; // a 4xx/other 5xx we didn't explicitly allow
+    }
+    true
 }
 
 fn http_error(e: ureq::Error) -> String {
@@ -200,6 +278,7 @@ fn openai_message(m: &Message) -> Vec<Value> {
 fn stream_anthropic<R: Read>(
     r: R,
     on_text: &mut dyn FnMut(&str),
+    emitted_text: &mut bool,
 ) -> Result<(Message, Usage), String> {
     let mut reader = BufReader::new(r);
     let mut blocks: Vec<Block> = Vec::new();
@@ -236,6 +315,9 @@ fn stream_anthropic<R: Read>(
                 match d["type"].as_str().unwrap_or("") {
                     "text_delta" => {
                         let t = d["text"].as_str().unwrap_or("");
+                        if !t.is_empty() {
+                            *emitted_text = true;
+                        }
                         on_text(t);
                         text.push_str(t);
                     }
@@ -287,6 +369,7 @@ fn stream_anthropic<R: Read>(
 fn stream_openai<R: Read>(
     r: R,
     on_text: &mut dyn FnMut(&str),
+    emitted_text: &mut bool,
 ) -> Result<(Message, Usage), String> {
     let mut reader = BufReader::new(r);
     let mut usage = Usage::default();
@@ -313,6 +396,7 @@ fn stream_openai<R: Read>(
         let delta = &choice["delta"];
         if let Some(t) = delta["content"].as_str() {
             if !t.is_empty() {
+                *emitted_text = true;
                 on_text(t);
                 text.push_str(t);
             }
@@ -350,4 +434,54 @@ fn stream_openai<R: Read>(
         blocks.push(Block::Text("(empty response)".into()));
     }
     Ok((Message { role: Role::Assistant, blocks }, usage))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryable_http_codes() {
+        assert!(is_retryable("HTTP 429: rate limited"));
+        assert!(is_retryable("HTTP 500: internal error"));
+        assert!(is_retryable("HTTP 502: bad gateway"));
+        assert!(is_retryable("HTTP 503: unavailable"));
+        assert!(is_retryable("HTTP 504: gateway timeout"));
+    }
+
+    #[test]
+    fn non_retryable_http_codes() {
+        assert!(!is_retryable("HTTP 400: bad request"));
+        assert!(!is_retryable("HTTP 401: unauthorized"));
+        assert!(!is_retryable("HTTP 403: forbidden"));
+        assert!(!is_retryable("HTTP 404: not found"));
+        assert!(!is_retryable("HTTP 501: not implemented"));
+    }
+
+    #[test]
+    fn retryable_transport_errors() {
+        assert!(is_retryable("connection failed: Connection refused"));
+        assert!(is_retryable("DNS lookup failed"));
+        assert!(is_retryable("TLS handshake timed out"));
+        assert!(is_retryable("stream: timed out"));
+    }
+
+    #[test]
+    fn backoff_grows_and_caps() {
+        let base = RETRY_BASE_BACKOFF;
+        let capped = RETRY_MAX_BACKOFF;
+        assert_eq!((base * 2u32.pow(0)).min(capped), Duration::from_secs(1));
+        assert_eq!((base * 2u32.pow(1)).min(capped), Duration::from_secs(2));
+        assert_eq!((base * 2u32.pow(2)).min(capped), Duration::from_secs(4));
+        assert_eq!((base * 2u32.pow(3)).min(capped), Duration::from_secs(8));
+        assert_eq!((base * 2u32.pow(10)).min(capped), capped);
+    }
+
+    #[test]
+    fn timeout_constants_sane() {
+        assert!(CONNECT_TIMEOUT.as_secs() >= 5);
+        assert!(READ_TIMEOUT.as_secs() >= 30);
+        assert_eq!(MAX_RETRIES, 4);
+    }
 }
