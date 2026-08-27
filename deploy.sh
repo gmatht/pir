@@ -55,6 +55,7 @@ PREFIX="${PIR_DEPLOY_PREFIX:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
 REF=""
 WITH_PROJECT_INIT=0
 TEST_ONLY=0
+TESTS=1
 CLIPPY=1
 
 # publish: ON by default (this is a deploy script). Opt out with --no-push / --no-release.
@@ -74,6 +75,8 @@ while [ $# -gt 0 ]; do
     --with-project-init) WITH_PROJECT_INIT=1; shift ;;
     --test-only)     TEST_ONLY=1; shift ;;
     --no-clippy)     CLIPPY=0; shift ;;
+    --no-tests)      TESTS=0; shift ;;
+    --fast)          TESTS=0; CLIPPY=0; shift ;;
     --push)          PUSH=1; shift ;;
     --no-push)       PUSH=0; shift ;;
     --push-remote)   PUSH_REMOTE="$2"; shift 2 ;;
@@ -125,10 +128,14 @@ cd "$SRC"
 grep -q '^name = "pir"' Cargo.toml || die "$SRC: Cargo.toml is not pir"
 
 # --------------------------------------------------------------- tests + build
-say "running unit tests (cargo test --release --locked)"
-cargo test --release --locked 2>&1 | tail -25 || true
-# cargo test fails the pipe with set -o pipefail only if it errors; assert exit:
-cargo test --release --locked >/dev/null || die "unit tests failed"
+if [ "$TESTS" -eq 1 ]; then
+  say "running unit tests (cargo test --release --locked)"
+  cargo test --release --locked 2>&1 | tail -25 || true
+  # cargo test fails the pipe with set -o pipefail only if it errors; assert exit:
+  cargo test --release --locked >/dev/null || die "unit tests failed"
+else
+  say "skipping unit tests (--no-tests / --fast)"
+fi
 
 if [ "$CLIPPY" -eq 1 ]; then
   if command -v cargo-clippy >/dev/null 2>&1 || cargo clippy --version >/dev/null 2>&1; then
