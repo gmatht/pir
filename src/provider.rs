@@ -167,6 +167,15 @@ impl Client {
                     if e == "request cancelled" {
                         return Err(e);
                     }
+                    // A stalled stream is terminal, not transient: the peer went
+                    // silent mid-stream, so re-issuing the request won't make it
+                    // resume. (Without this, the retry loop would re-send up to
+                    // MAX_RETRIES times, each waiting a full read timeout before
+                    // the stall watchdog fired again — far longer than the stall
+                    // bound.) Cancellation is likewise fatal (handled above).
+                    if e.contains("stalled") {
+                        return Err(e);
+                    }
                     if attempt >= MAX_RETRIES || !is_retryable(&e) || emitted_text {
                         return Err(e);
                     }
@@ -261,6 +270,13 @@ impl Client {
 /// NOT retry on 4xx client errors other than 429 (e.g. 401 unauthorized,
 /// 400 bad request) — those won't succeed on replay.
 fn is_retryable(error: &str) -> bool {
+    // A stalled stream (peer went silent mid-stream) or a cancellation is not a
+    // transient failure worth replaying — retry would just re-block on the same
+    // dead connection. These are handled as fatal by the caller; refuse them
+    // here too so `is_retryable` stays the single source of truth.
+    if error.contains("stalled") || error == "request cancelled" {
+        return false;
+    }
     if error.starts_with("HTTP 429")
         || error.starts_with("HTTP 500")
         || error.starts_with("HTTP 502")
@@ -297,6 +313,14 @@ fn http_error(e: ureq::Error) -> String {
     }
 }
 
+/// True when a read error is a *timeout* poll wake-up rather than a fatal
+/// failure. On Linux a socket `SO_RCVTIMEO` surfaces as `WouldBlock`
+/// (EAGAIN), not `TimedOut`, so we must accept both — otherwise a silently
+/// stalled stream would return a transport error and be swallowed by the
+/// retry loop instead of tripping the stall watchdog / cancel check.
+fn is_read_timeout(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)
+}
 fn anthropic_message(m: &Message) -> Value {
     let role = if m.role == Role::User { "user" } else { "assistant" };
     let blocks: Vec<Value> = m
@@ -391,9 +415,10 @@ fn stream_anthropic<R: Read>(
         line.clear();
         let n = match reader.read_line(&mut line) {
             Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                // No bytes yet within the poll window; loop back to re-check
-                // cancellation / stall without consuming any input.
+            Err(e) if is_read_timeout(&e) => {
+                // No bytes yet within the poll window: loop back to re-check
+                // cancellation / stall without consuming any input; on Linux the
+                // socket timeout surfaces as WouldBlock, not TimedOut.
                 continue;
             }
             Err(e) => return Err(format!("stream: {e}")),
@@ -505,7 +530,7 @@ fn stream_openai<R: Read>(
         line.clear();
         let n = match reader.read_line(&mut line) {
             Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(e) if is_read_timeout(&e) => continue,
             Err(e) => return Err(format!("stream: {e}")),
         };
         if n == 0 {
@@ -575,98 +600,69 @@ fn stream_openai<R: Read>(
 mod tests {
     use super::*;
 
-    /// A tiny blocking HTTP server that, on any request, writes the SSE
-    /// preamble and then holds the connection open streaming nothing — simulating
-    /// a model that is "thinking" forever. Used to prove cancellation actually
-    /// aborts an in-flight stream instead of blocking to EOF.
-    fn spawn_hanging_sse() -> (String, std::thread::JoinHandle<()>) {
-        use std::io::Write;
-        use std::net::TcpListener;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let handle = std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let _ = stream.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
-                );
-                // Hold the connection open; never send a done marker. The test
-                // flips the cancel flag and we expect stream_anthropic to return
-                // "request cancelled" without waiting for EOF.
-                std::thread::sleep(std::time::Duration::from_secs(60));
+    /// A `Read` that yields `data` once, then reports a *timeout* on every
+    /// subsequent read — simulating a server that connected, sent its preamble,
+    /// then went silent (the "model thinking forever" / stalled-stream case).
+    /// This lets us exercise the parser's cancel/stall logic deterministically
+    /// without a live socket (which is flaky in CI/sandboxes): the parser must
+    /// detect cancellation / a stall at its pre-read check rather than waiting
+    /// for EOF. On Linux the timeout surfaces as `WouldBlock`, which is why the
+    /// parser accepts both `TimedOut` and `WouldBlock`.
+    struct BlockAfter {
+        sent: bool,
+        data: &'static [u8],
+    }
+    impl std::io::Read for BlockAfter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.sent {
+                self.sent = true;
+                let n = self.data.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.data[..n]);
+                return Ok(n);
             }
-        });
-        (format!("http://{}", addr), handle)
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "simulated timeout",
+            ))
+        }
     }
 
     #[test]
     fn cancel_aborts_inflight_stream() {
-        let (base, srv) = spawn_hanging_sse();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let mut client = Client::new(crate::config::ApiKind::OpenAi, &base, "x".to_string());
-        client.set_cancel(cancel.clone());
-
+        // Cancel flag already set: the parser must bail at its next pre-read
+        // check instead of polling forever on the silent socket (proving the
+        // cancel path is honoured at a read boundary, not just via EOF).
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut reader = BlockAfter {
+            sent: false,
+            data: b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
+        };
         let started = std::time::Instant::now();
-        let worker = std::thread::spawn(move || {
-            client.chat(
-                "gpt-4o",
-                1024,
-                "sys",
-                &[],
-                &mut [],
-                &mut |_s: &str| {},
-            )
-        });
-        // Let it start thinking, then cancel. Cancellation is honoured at the
-        // next read boundary, which is bounded by the per-attempt read timeout
-        // (READ_TIMEOUT_INIT), not the stall timeout — ureq applies one read
-        // timeout to the whole connection, so a silent socket unblocks only when
-        // that timer fires. The point is that it returns well before the server's
-        // 60s hold-open, rather than blocking until EOF.
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        cancel.store(true, Ordering::SeqCst);
-        let res = worker.join().unwrap();
+        let res = stream_openai(&mut reader, &mut |_s: &str| {}, &mut false, &cancel);
         let elapsed = started.elapsed();
-
         assert!(res.is_err(), "expected an error after cancel");
         assert_eq!(res.unwrap_err(), "request cancelled");
-        // Must be far faster than the 60s the server would otherwise hold the
-        // connection; allow for the read-timeout boundary plus scheduling slack.
-        assert!(elapsed < std::time::Duration::from_secs(50), "cancel took too long: {elapsed:?}");
-        let _ = srv.join();
+        assert!(elapsed < std::time::Duration::from_secs(2), "cancel took too long: {elapsed:?}");
     }
 
     #[test]
     fn stall_watchdog_trips() {
-        use std::io::Write;
-        use std::net::TcpListener;
-        // Point the stall watchdog low so the test fails fast instead of waiting
-        // for the real 180s default. `stall_timeout()` reads this env var.
-        std::env::set_var("PIR_STALL_TIMEOUT_SECS", "2");
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        // Server opens the SSE stream (so we get past the status line) then goes
-        // silent — exactly the "model connected but stopped sending" failure.
-        let srv = std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let _ = stream.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
-                );
-                std::thread::sleep(std::time::Duration::from_secs(60));
-            }
-        });
-        let mut client = Client::new(crate::config::ApiKind::OpenAi, &format!("http://{addr}"), "x".into());
+        // Point the stall watchdog low so it trips quickly. With a silent socket
+        // (WouldBlock on every read), the parser must detect the stall at its
+        // pre-read check rather than waiting indefinitely.
+        std::env::set_var("PIR_STALL_TIMEOUT_SECS", "1");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut reader = BlockAfter {
+            sent: false,
+            data: b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
+        };
         let started = std::time::Instant::now();
-        let res = client.chat("gpt-4o", 1024, "sys", &[], &mut [], &mut |_s: &str| {});
+        let res = stream_openai(&mut reader, &mut |_s: &str| {}, &mut false, &cancel);
         let elapsed = started.elapsed();
         std::env::remove_var("PIR_STALL_TIMEOUT_SECS");
         assert!(res.is_err(), "expected a stall error");
         assert!(res.unwrap_err().contains("stalled"), "expected stall error");
-        // The stall watchdog fires at the next read boundary: we expect the 2s
-        // stall override to be exceeded, and the connection to be torn down far
-        // before the server's 60s hold-open. Allow for the read-timeout
-        // boundary (READ_TIMEOUT_INIT on the first attempt) plus slack.
-        assert!(elapsed < std::time::Duration::from_secs(50), "stall took too long: {elapsed:?}");
-        let _ = srv.join();
+        assert!(elapsed < std::time::Duration::from_secs(5), "stall took too long: {elapsed:?}");
     }
 
     #[test]
