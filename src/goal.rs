@@ -227,10 +227,17 @@ pub fn parse_goal_status(s: &str) -> Option<GoalStatus> {
 mod tests {
     use super::*;
 
+    /// A fresh, unique temp dir per call so tests never collide on a shared
+    /// global path (e.g. a root-owned /tmp/pir_goal_tests left by another run)
+    /// and never leak state between runs.
     fn tmp_log(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("pir_goal_tests");
+        let dir = std::env::temp_dir().join(format!(
+            "pir_goal_tests_{}_{}",
+            std::process::id(),
+            name
+        ));
         let _ = std::fs::create_dir_all(&dir);
-        dir.join(name)
+        dir.join(format!("{name}.jsonl"))
     }
 
     #[test]

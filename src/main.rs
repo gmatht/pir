@@ -18,6 +18,8 @@ use crate::notify::{AgentEvent, SharedBus};
 use std::io::BufRead;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 const HELP: &str = r#"pir — a featherweight pi-compatible coding agent
@@ -62,6 +64,9 @@ COMMANDS
   /create [name]           scaffold a new project (seeds from clipboard .md spec)
 
   Lines ending in & run in the background: "fix the parser &"  => /bg fix the parser
+
+  While a turn is running you can keep typing: Enter queues the line as the next
+  prompt, /commands still work, and ctrl-c stops the turn after its current step.
 "#;
 
 struct BgSession {
@@ -80,11 +85,14 @@ struct BgSession {
 struct BackgroundJobs {
     next_id: usize,
     jobs: Vec<BgSession>,
+    /// Whether the interactive foreground turn is currently running. Set by the
+    /// REPL so `/jobs` can show it alongside background jobs.
+    fg_running: bool,
 }
 
 impl BackgroundJobs {
     fn new() -> Self {
-        BackgroundJobs { next_id: 1, jobs: Vec::new() }
+        BackgroundJobs { next_id: 1, jobs: Vec::new(), fg_running: false }
     }
 
     /// Spawn a background task. `builder` constructs the agent (already
@@ -158,6 +166,10 @@ impl BackgroundJobs {
                 j.log.display()
             ));
         }
+        if self.fg_running {
+            out.push_str(&term::bold("  foreground turn: running\n"));
+            out.push_str(&term::dim("    (type /cancel or ctrl-c to stop)\n"));
+        }
         out.push_str(&term::dim("foreground with: /fg <id>  (reloads that session)\n"));
         out
     }
@@ -166,6 +178,12 @@ impl BackgroundJobs {
         if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
             j.joined = true;
         }
+    }
+
+    /// Mark whether the foreground interactive turn is currently running, so
+    /// `list()` can surface it.
+    fn set_fg_running(&mut self, running: bool) {
+        self.fg_running = running;
     }
 }
 
@@ -328,6 +346,10 @@ fn main() {
         None
     };
 
+    // Cooperative cancellation flag for the foreground turn. Set by the REPL
+    // (ctrl-c) to ask a running turn to stop at the next safe boundary.
+    let fg_cancel = Arc::new(AtomicBool::new(false));
+
     let mut agent = match Agent::new(
         provider.clone(),
         model.clone(),
@@ -335,6 +357,7 @@ fn main() {
         false,
         bus.clone(),
         resume.as_ref(),
+        fg_cancel.clone(),
     ) {
         Ok(a) => a,
         Err(e) => die(&e),
@@ -370,10 +393,11 @@ fn main() {
         let mut jobs = BackgroundJobs::new();
         let provider = provider.clone();
         let model = model.clone();
+        let bcancel = Arc::new(AtomicBool::new(false));
         jobs.spawn(prompt, agent.log_path.clone().unwrap_or_default(), {
             let bus = bus.clone();
             move || {
-                Agent::new(provider, model, full_auto, true, bus, None)
+                Agent::new(provider, model, full_auto, true, bus, None, bcancel)
                     .expect("agent build in background thread")
             }
         });
@@ -420,9 +444,23 @@ fn main() {
     if let Some(p) = &agent.log_path {
         println!("{}", term::dim(&format!("session log: {}", p.display())));
     }
-    println!("{}", term::dim("/help for commands · ctrl-d to quit"));
+    println!("{}", term::dim("/help for commands · ctrl-d to quit · type while a turn runs; ctrl-c cancels it"));
 
     let mut jobs = BackgroundJobs::new();
+
+    // The interactive agent lives behind an Option so a running turn can *take*
+    // ownership of it onto a worker thread (the lock is not held during the
+    // turn — only the brief take/put around spawning/joining). This keeps the
+    // REPL responsive: the model streams on a worker thread while the main
+    // thread reads input, drains notifications, and reacts to ctrl-c.
+    let agent_slot: Arc<Mutex<Option<Agent>>> = Arc::new(Mutex::new(Some(agent)));
+
+    // Running foreground turn state.
+    let mut fg_handle: Option<JoinHandle<()>> = None;
+    // Prompts queued by the user while a turn runs (submitted on Enter).
+    let mut pending: Vec<String> = Vec::new();
+    // Partial line buffer for the raw-mode input while a turn runs.
+    let mut input_buf = String::new();
 
     let mut line = String::new();
     loop {
@@ -430,7 +468,7 @@ fn main() {
 
         // Surface notifications from ALL agents (foreground + background) on the
         // active screen before showing the prompt. Background sessions publish
-        // to the shared bus while this loop is blocked on read_line, so this is
+        // to the shared bus while the main thread is pumping input, so this is
         // where their "done" notifications become visible.
         let feed = bus.drain_feed();
         let rendered = crate::notify::render_feed(&feed);
@@ -438,7 +476,81 @@ fn main() {
             print!("{rendered}");
             let _ = std::io::stdout().flush();
         }
+        // Reap any finished background jobs so their handles don't leak.
+        jobs.reap();
 
+        // If a foreground turn finished, join it and either start the next
+        // queued prompt or return to the idle prompt.
+        if let Some(h) = fg_handle.as_ref() {
+            if h.is_finished() {
+                let h = fg_handle.take().unwrap();
+                let _ = h.join();
+                term::raw::disable_raw();
+                // Report token usage from the (now-returned) agent.
+                if let Some(a) = agent_slot.lock().unwrap().as_ref() {
+                    println!(
+                        "{}",
+                        term::dim(&format!(
+                            "· {} in / {} out tokens",
+                            fmt_tok(a.usage.input),
+                            fmt_tok(a.usage.output)
+                        ))
+                    );
+                }
+                if let Some(next) = pending.drain(..).next() {
+                    fg_handle = Some(run_foreground_turn(
+                        &agent_slot,
+                        &fg_cancel,
+                        next,
+                    ));
+                    term::raw::enable_raw();
+                }
+            }
+        }
+
+        if fg_handle.is_some() {
+            // A turn is running on a worker thread: stay responsive. Poll
+            // non-blocking input; Enter queues the next prompt, ctrl-c requests
+            // cancellation, ctrl-d stops the session.
+            match term::raw::poll_input(&mut input_buf) {
+                term::raw::RawInput::Line(s) => {
+                    let s = s.trim();
+                    if s.is_empty() {
+                        input_buf.clear();
+                    } else if s.starts_with('/') {
+                        // Slash commands are handled immediately, even mid-turn.
+                        input_buf.clear();
+                        handle_command(
+                            &s[1..],
+                            &agent_slot,
+                            &providers,
+                            &mut jobs,
+                            full_auto,
+                            &bus,
+                        );
+                    } else {
+                        pending.push(s.to_string());
+                        input_buf.clear();
+                        println!("{}", term::dim("· queued; will run when current turn ends"));
+                    }
+                }
+                term::raw::RawInput::Interrupt => {
+                    fg_cancel.store(true, Ordering::SeqCst);
+                    println!("{}", term::dim("· cancelling turn (after current step)…"));
+                }
+                term::raw::RawInput::Eof => {
+                    fg_cancel.store(true, Ordering::SeqCst);
+                    // Let the running turn finish its current step, then exit.
+                    let _ = fg_handle.take().unwrap().join();
+                    term::raw::disable_raw();
+                    return;
+                }
+                term::raw::RawInput::None => { /* nothing pending; loop */ }
+            }
+            continue;
+        }
+
+        // Idle: full rustyline editing.
         match term::read_line(&format!("{} ", term::cyan("❯"))) {
             None => {
                 println!();
@@ -454,30 +566,54 @@ fn main() {
         let bg = input.ends_with('&') && !input.trim_end_matches('&').is_empty();
         let input = input.trim_end_matches('&').trim();
         if let Some(cmd) = input.strip_prefix('/') {
-            handle_command(cmd, &mut agent, &providers, &mut jobs, full_auto, &bus);
+            handle_command(cmd, &agent_slot, &providers, &mut jobs, full_auto, &bus);
         } else if bg {
             // Run this prompt as a fresh background job that keeps its own
             // session log (the foreground session is unaffected).
+            let (provider, model) = {
+                let g = agent_slot.lock().unwrap();
+                let a = g.as_ref().expect("agent present while idle");
+                (a.provider(), a.model())
+            };
             let log = session_log_path();
-            let provider = agent.provider();
-            let model = agent.model();
+            let bcancel = Arc::new(AtomicBool::new(false));
             let bus = bus.clone();
             jobs.spawn(input.to_string(), log, move || {
-                Agent::new(provider, model, full_auto, true, bus, None).expect("bg agent")
+                Agent::new(provider, model, full_auto, true, bus, None, bcancel)
+                    .expect("bg agent")
             });
         } else {
-            let _ = agent.turn(input);
-            agent.notify_on_exit(AgentEvent::Idle);
-            println!(
-                "{}",
-                term::dim(&format!(
-                    "· {} in / {} out tokens",
-                    fmt_tok(agent.usage.input),
-                    fmt_tok(agent.usage.output)
-                ))
-            );
+            fg_handle = Some(run_foreground_turn(
+                &agent_slot,
+                &fg_cancel,
+                input.to_string(),
+            ));
+            term::raw::enable_raw();
         }
     }
+}
+
+/// Spawn the given prompt as a foreground turn on a worker thread, *moving* the
+/// agent out of `agent_slot` for the duration (so the lock is never held during
+/// the turn), then returning it when the turn completes. Resets the cancel flag
+/// at the start and publishes an Idle/Error event when done.
+fn run_foreground_turn(
+    agent_slot: &Arc<Mutex<Option<Agent>>>,
+    cancel: &Arc<AtomicBool>,
+    prompt: String,
+) -> JoinHandle<()> {
+    let slot = agent_slot.clone();
+    let cancel = cancel.clone();
+    thread::spawn(move || {
+        cancel.store(false, Ordering::SeqCst);
+        let mut a = slot.lock().unwrap().take().expect("agent present");
+        let ev = match a.turn(&prompt) {
+            Ok(()) => AgentEvent::Idle,
+            Err(e) => AgentEvent::Error { message: e },
+        };
+        a.notify_on_exit(ev);
+        *slot.lock().unwrap() = Some(a);
+    })
 }
 
 /// A fresh session log path for a background job (tagged so it never collides
@@ -488,13 +624,33 @@ fn session_log_path() -> PathBuf {
     dir.join(format!("pir-{}-sh{}-bg{}.jsonl", term::timestamp_compact(), term::parent_shell_pid(), std::process::id()))
 }
 
-fn handle_command(cmd: &str, agent: &mut Agent, providers: &[Provider], jobs: &mut BackgroundJobs, full_auto: bool, bus: &SharedBus) {
+type AgentSlot = Arc<Mutex<Option<Agent>>>;
+
+/// Handle a slash command. `agent_slot` holds the interactive agent behind an
+/// `Option` so a running foreground turn can own it on its worker thread;
+/// commands that need the agent take it only briefly. `jobs` surfaces
+/// background work and shows whether the foreground turn is running; `/cancel`
+/// asks the running turn to stop (the REPL owns the cancel flag, set on ctrl-c,
+/// so `/cancel` is advisory — prefer ctrl-c).
+fn handle_command(
+    cmd: &str,
+    agent_slot: &AgentSlot,
+    providers: &[Provider],
+    jobs: &mut BackgroundJobs,
+    full_auto: bool,
+    bus: &SharedBus,
+) {
     let mut parts = cmd.split_whitespace();
     let cmd = parts.next().unwrap_or("");
     let rest: Vec<&str> = parts.collect();
     match cmd {
         "h" | "help" => print!("{HELP}"),
         "m" | "model" => {
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                eprintln!("pir: agent busy (turn running) — try again when idle");
+                return;
+            };
             if rest.is_empty() {
                 println!("current model: {}", agent.label());
             } else {
@@ -514,16 +670,24 @@ fn handle_command(cmd: &str, agent: &mut Agent, providers: &[Provider], jobs: &m
             if prompt.trim().is_empty() {
                 eprintln!("usage: /bg <prompt>  (or end a line with &)");
             } else {
+                let (provider, model) = {
+                    let g = agent_slot.lock().unwrap();
+                    let a = g.as_ref().expect("agent present");
+                    (a.provider(), a.model())
+                };
                 let log = session_log_path();
-                let provider = agent.provider();
-                let model = agent.model();
+                let bcancel = Arc::new(AtomicBool::new(false));
                 let bus = bus.clone();
                 jobs.spawn(prompt, log, move || {
-                    Agent::new(provider, model, full_auto, true, bus, None).expect("bg agent")
+                    Agent::new(provider, model, full_auto, true, bus, None, bcancel)
+                        .expect("bg agent")
                 });
             }
         }
-        "jobs" | "background" => print!("{}", jobs.list()),
+        "jobs" | "background" | "running" => {
+            jobs.set_fg_running(agent_slot.lock().unwrap().is_some() == false);
+            print!("{}", jobs.list());
+        }
         "fg" | "foreground" => {
             let id = match rest.first().and_then(|s| s.parse::<usize>().ok()) {
                 Some(id) => id,
@@ -539,6 +703,11 @@ fn handle_command(cmd: &str, agent: &mut Agent, providers: &[Provider], jobs: &m
             // Foreground = reload that job's session into this agent and hand
             // control back to the user. The background thread has its own copy
             // of the history; reloading the transcript reconciles them.
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                eprintln!("pir: agent busy (turn running) — cancel it first");
+                return;
+            };
             agent.clear();
             agent.load_session(&log);
             jobs.mark_joined(id);
@@ -556,6 +725,11 @@ fn handle_command(cmd: &str, agent: &mut Agent, providers: &[Provider], jobs: &m
             create_project(&name);
         }
         "goal" => {
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                eprintln!("pir: agent busy (turn running) — try again when idle");
+                return;
+            };
             let obj: String = rest.join(" ");
             if obj.trim().is_empty() {
                 agent.show_goal();
@@ -565,6 +739,11 @@ fn handle_command(cmd: &str, agent: &mut Agent, providers: &[Provider], jobs: &m
             }
         }
         "continue" | "cont" => {
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                eprintln!("pir: agent busy (turn running) — try again when idle");
+                return;
+            };
             let lp = agent.log_path.clone();
             if let Some(p) = lp {
                 agent.attach_goal(&p);
@@ -572,14 +751,25 @@ fn handle_command(cmd: &str, agent: &mut Agent, providers: &[Provider], jobs: &m
             agent.continue_goal();
         }
         "clear" => {
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                eprintln!("pir: agent busy (turn running) — try again when idle");
+                return;
+            };
             agent.clear();
             println!("history cleared");
         }
-        "usage" => println!(
-            "{} in / {} out tokens this session",
-            fmt_tok(agent.usage.input),
-            fmt_tok(agent.usage.output)
-        ),
+        "usage" => {
+            let g = agent_slot.lock().unwrap();
+            match g.as_ref() {
+                Some(agent) => println!(
+                    "{} in / {} out tokens this session",
+                    fmt_tok(agent.usage.input),
+                    fmt_tok(agent.usage.output)
+                ),
+                None => eprintln!("pir: agent busy (turn running) — try again when idle"),
+            }
+        }
         "q" | "quit" | "exit" => std::process::exit(0),
         other => eprintln!("unknown command /{other} — try /help"),
     }
@@ -761,8 +951,7 @@ fn die(msg: &str) -> ! {
 /// user and chown the project directory (must run as root).
 #[cfg(unix)]
 fn run_project_subcommand(rest: &[String]) {
-    use std::path::PathBuf;
-    let mut name: Option<String> = None;
+        let mut name: Option<String> = None;
     let mut path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut it = rest.iter();
     while let Some(a) = it.next() {
@@ -805,8 +994,7 @@ fn run_project_subcommand(_rest: &[String]) {
 /// spec (the `unmd2.sh` format of `### path` headers + ``` code blocks), offer
 /// to extract it into the new project.
 fn create_project(name: &str) -> Option<std::path::PathBuf> {
-    use std::path::PathBuf;
-
+    
     let name = if name.trim().is_empty() {
         let suggested = std::env::current_dir()
             .ok()

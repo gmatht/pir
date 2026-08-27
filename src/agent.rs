@@ -1,6 +1,6 @@
 use crate::config::{self, ApiKind, Model, Provider};
 use crate::goal::{GoalStatus, GoalStore};
-use crate::notify::{self, AgentEvent, SharedBus};
+use crate::notify::{AgentEvent, SharedBus};
 use crate::plugin::{Outcome, Registry};
 use crate::provider::Client;
 use crate::term;
@@ -9,6 +9,8 @@ use serde_json::{json, Value};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub struct Agent {
     pub provider: Provider,
@@ -26,6 +28,11 @@ pub struct Agent {
     /// prints to the terminal). Used for backgrounded sessions, which still
     /// persist everything to the session log and emit notifications.
     quiet: bool,
+    /// Cooperative cancellation flag. Set by the REPL (e.g. on ctrl-c) to ask
+    /// the running turn to stop at the next safe boundary. The turn checks it
+    /// before each model call and after each tool batch, so it never aborts
+    /// mid-tool; the in-progress step always completes first.
+    cancel: Arc<AtomicBool>,
 }
 
 impl Agent {
@@ -40,6 +47,7 @@ impl Agent {
         quiet: bool,
         bus: SharedBus,
         resume_from: Option<&PathBuf>,
+        cancel: Arc<AtomicBool>,
     ) -> Result<Self, String> {
         let client = make_client(&provider)?;
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -95,6 +103,7 @@ impl Agent {
             goal_store,
             notify: bus,
             quiet,
+            cancel,
         })
     }
 
@@ -475,6 +484,16 @@ impl Agent {
         let specs = self.registry.specs();
 
         loop {
+            // Cooperative cancellation: bail out at this safe boundary (start
+            // of a new model call) if the REPL requested a stop.
+            if self.cancel.load(Ordering::SeqCst) {
+                self.cancel.store(false, Ordering::SeqCst);
+                if !self.quiet {
+                    println!("{}", term::dim("· turn cancelled"));
+                }
+                self.notify.publish(self.turn_done_event(), false);
+                return Ok(());
+            }
             self.trim();
 
             let mut on_text = |t: &str| {
@@ -542,6 +561,17 @@ impl Agent {
             }
             log_line(&mut self.log, &results);
             self.history.push(results);
+
+            // Cooperative cancellation: stop after this batch of tools
+            // completes (the in-progress step always finishes first).
+            if self.cancel.load(Ordering::SeqCst) {
+                self.cancel.store(false, Ordering::SeqCst);
+                if !self.quiet {
+                    println!("{}", term::dim("· turn cancelled"));
+                }
+                self.notify.publish(self.turn_done_event(), false);
+                return Ok(());
+            }
         }
     }
 

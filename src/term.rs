@@ -293,3 +293,160 @@ fn plain_read_line(prompt: &str) -> Option<String> {
         Err(_) => None,
     }
 }
+
+
+/// Non-blocking, raw-mode terminal input used while a foreground agent turn is
+/// running on a worker thread. Lets the REPL stay responsive: the user can type
+/// (the partial line is echoed) and press Enter to queue the next turn, or
+/// ctrl-c to request cancellation — without the main thread ever blocking on a
+/// read. This is intentionally minimal (no history/cursor nav): rich editing is
+/// reserved for the idle rustyline prompt. Only printable ASCII plus
+/// backspace/enter/ctrl-c/ctrl-d are handled; other bytes are ignored so escape
+/// sequences (arrows) don't corrupt the buffer.
+///
+/// `enable_raw`/`disable_raw` manage the terminal attributes and the
+/// non-blocking flag on stdin; the REPL toggles them around the running turn.
+pub mod raw {
+    use std::io::{self, Write};
+    use std::os::unix::io::AsRawFd;
+    use std::sync::Mutex;
+
+    /// Terminal state captured around a raw-mode session. Guarded by a Mutex so
+    /// access is never via a raw `&mut` to a static (sound under the 2024
+    /// edition rules). There is only ever one REPL, so the lock is uncontended.
+    struct RawState {
+        orig_termios: Option<libc::termios>,
+        orig_nonblock: Option<bool>,
+        active: bool,
+    }
+
+    static STATE: Mutex<RawState> = Mutex::new(RawState {
+        orig_termios: None,
+        orig_nonblock: None,
+        active: false,
+    });
+
+    /// Put stdin into raw, non-blocking mode (no canonical line editing, no
+    /// echo, reads return immediately). Idempotent.
+    pub fn enable_raw() {
+        let mut st = STATE.lock().unwrap();
+        if st.active {
+            return;
+        }
+        unsafe {
+            let fd = io::stdin().as_raw_fd();
+            let mut tios: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut tios) == 0 {
+                st.orig_termios = Some(tios);
+                let mut raw = tios;
+                raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+                raw.c_cc[libc::VMIN] = 0;
+                raw.c_cc[libc::VTIME] = 0;
+                libc::tcsetattr(fd, libc::TCSANOW, &raw);
+            }
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            st.orig_nonblock = Some(flags & libc::O_NONBLOCK != 0);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            st.active = true;
+        }
+    }
+
+    /// Restore the previous terminal attributes and blocking mode. Idempotent.
+    pub fn disable_raw() {
+        let mut st = STATE.lock().unwrap();
+        if !st.active {
+            return;
+        }
+        unsafe {
+            let fd = io::stdin().as_raw_fd();
+            if let Some(t) = st.orig_termios.take() {
+                libc::tcsetattr(fd, libc::TCSANOW, &t);
+            }
+            if let Some(was) = st.orig_nonblock.take() {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                let newflags = if was {
+                    flags | libc::O_NONBLOCK
+                } else {
+                    flags & !libc::O_NONBLOCK
+                };
+                libc::fcntl(fd, libc::F_SETFL, newflags);
+            }
+            st.active = false;
+        }
+    }
+
+    /// Outcome of a single non-blocking poll/consume of pending stdin bytes.
+    pub enum RawInput {
+        /// Nothing was available (caller should pump notifications and retry).
+        None,
+        /// A full line was submitted (Enter). The buffer is consumed.
+        Line(String),
+        /// ctrl-c: caller should request cancellation of the running turn.
+        Interrupt,
+        /// ctrl-d: caller should stop the session.
+        Eof,
+    }
+
+    /// Consume any available input, echoing printable chars and managing a
+    /// backspace. Returns `RawInput::Line` only when Enter is pressed; callers
+    /// pass the *same* `buf` each iteration so partial typing persists.
+    pub fn poll_input(buf: &mut String) -> RawInput {
+        let fd = io::stdin().as_raw_fd();
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pfd, 1, 0) } <= 0 {
+            return RawInput::None;
+        }
+        let mut tmp = [0u8; 256];
+        let mut nread = 0;
+        loop {
+            let r = unsafe {
+                libc::read(
+                    fd,
+                    tmp.as_mut_ptr() as *mut libc::c_void,
+                    tmp.len(),
+                )
+            };
+            if r <= 0 {
+                break;
+            }
+            nread = r as usize;
+            break;
+        }
+        if nread == 0 {
+            return RawInput::None;
+        }
+        let mut stdout = io::stdout();
+        for &b in &tmp[..nread] {
+            match b {
+                0x0a | 0x0d => {
+                    let line = std::mem::take(buf);
+                    return RawInput::Line(line);
+                }
+                0x7f | 0x08 => {
+                    if !buf.is_empty() {
+                        buf.pop();
+                        let _ = stdout.write_all(b"\x08 \x08");
+                        let _ = stdout.flush();
+                    }
+                }
+                0x03 => {
+                    buf.clear();
+                    return RawInput::Interrupt;
+                }
+                0x04 => return RawInput::Eof,
+                0x1b => { /* ignore ESC sequences (arrows, etc.) */ }
+                c if c >= 0x20 && c < 0x7f => {
+                    buf.push(c as char);
+                    let _ = stdout.write_all(&[c]);
+                    let _ = stdout.flush();
+                }
+                _ => { /* ignore other control bytes */ }
+            }
+        }
+        RawInput::None
+    }
+}

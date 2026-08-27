@@ -82,6 +82,10 @@ sudo -u ai_rpi sudo ai-apt-install curl      # ai_* apt install (logged)
 - When `pir` itself runs as an `ai_*` user (via `su-ai`/`become_user`), it defaults to
   **full-auto and will not prompt to confirm each command** — the account is the sandbox boundary.
   Override with `pir --confirm` or `PI_CONFIRM=1` (and `pir -y`/`PI_FULL_AUTO=1` to force it).
+- Long-running `bash` commands: after 10s a live elapsed timer shows on the TTY; after 10 min
+  the command is **detached into a background job** and control returns to the agent (which can
+  `job_status`/`job_kill` it). This avoids blocking an unattended `ai_*` agent waiting on a human.
+  A hard 2h ceiling still kills runaway commands.
 
 ## ai_* package installation (logged, validated)
 To let agents install dependencies without broad root, `ai_*` users get a single passwordless

@@ -15,7 +15,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -282,10 +282,10 @@ impl Builtin {
         let id = input["id"].as_u64().ok_or("job_status: missing 'id'")?;
         if id == 0 {
             if self.jobs.is_empty() {
-                return Ok("(no active background jobs)");
+                return Ok("(no active background jobs)".to_string());
             }
             let mut out = String::from("active background jobs:\n");
-            for j in &self.jobs {
+            for j in &mut self.jobs {
                 let running = j.child.try_wait().map(|s| s.is_none()).unwrap_or(true);
                 out.push_str(&format!(
                     "  job#{}  running={}  elapsed={}  cmd={}\n",
@@ -354,9 +354,11 @@ impl Builtin {
             let _ = slot.child.wait();
         }
         let status = slot.child.try_wait().map_err(|e| format!("wait: {e}"))?;
-        // Let the drains finish into their buffers, then drop the job.
-        let _ = slot.drain_out.join();
-        let _ = slot.drain_err.join();
+        // Take the drain handles out of the slot so we can join them.
+        let drain_out = std::mem::replace(&mut slot.drain_out, std::thread::spawn(|| {}));
+        let drain_err = std::mem::replace(&mut slot.drain_err, std::thread::spawn(|| {}));
+        let _ = drain_out.join();
+        let _ = drain_err.join();
         self.jobs.retain(|j| j.id != id);
         match status {
             Some(s) => Ok(format!("job#{} stopped (exit {})", id, s.code().unwrap_or(-1))),
