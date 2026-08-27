@@ -7,7 +7,7 @@
 //! - Extract those blocks into real files on disk (a Rust port of unmd2.sh).
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Best-effort read of the system clipboard. Tries common CLIs in turn and
@@ -259,17 +259,45 @@ pub fn install_git_guard_hook(repo: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Resolve the absolute `.git` directory for `repo`, working from any
+/// subdirectory of a work tree (via `git rev-parse --absolute-git-dir`). Returns
+/// `None` when `repo` is not inside a git work tree.
+fn git_dir(repo: &Path) -> Option<PathBuf> {
+    Command::new("git")
+        .args(["rev-parse", "--absolute-git-dir"])
+        .current_dir(repo)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+}
+
+/// Resolve the work-tree root for `repo` (via `git rev-parse --show-toplevel`),
+/// so callers that write `.gitattributes` / hooks land in the right place even
+/// when invoked from a subdirectory. Falls back to `repo` itself.
+fn repo_root(repo: &Path) -> PathBuf {
+    Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(repo)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+        .unwrap_or_else(|| repo.to_path_buf())
+}
+
 /// True when `repo` is git and has no pir guard hook installed (so the startup
-/// warning / `/fix` suggestion applies). Always false under jj (git hooks are
-/// irrelevant there).
+/// warning / `/fix` suggestion applies). Resolves the actual git directory
+/// (not just `repo/.git`) so it works from a subdirectory of a work tree.
+/// Always false under jj (git hooks are irrelevant there).
 pub fn missing_git_guard(repo: &Path) -> bool {
     if detect_vcs(repo) == Vcs::Jj {
         return false;
     }
-    if !is_git_repo(repo) {
-        return false;
-    }
-    !repo.join(".git").join("hooks").join("pre-commit").exists()
+    let Some(gdir) = git_dir(repo) else {
+        return false; // not a git repo
+    };
+    !gdir.join("hooks").join("pre-commit").exists()
 }
 
 /// Make the `.git` setup sane for LLM use. Under git: install the guard hook,
@@ -282,8 +310,9 @@ pub fn fix_git_setup(repo: &Path) -> String {
     if detect_vcs(repo) == Vcs::Jj {
         return fix_jj_setup(repo);
     }
+    let root = repo_root(repo);
     let mut lines = Vec::new();
-    match install_git_guard_hook(repo) {
+    match install_git_guard_hook(&root) {
         Ok(true) => lines.push("✓ installed .git/hooks/pre-commit guard (refuses > {} bytes / binary; bypass with --no-verify)".replace("{}", &commit_max_bytes().to_string())),
         Ok(false) => lines.push("• a pre-commit hook already exists; left it in place (not the pir guard). Run `git commit --no-verify` if needed, or replace it manually.".to_string()),
         Err(e) => lines.push(format!("✗ could not install guard hook: {e}")),
@@ -296,8 +325,9 @@ pub fn fix_git_setup(repo: &Path) -> String {
         lines.push(format!("✓ git config {k}={v}"));
     }
     // .gitattributes: mark obvious binary extensions so `git` treats them as
-    // binary (the hook keys off git's binary detection).
-    let attrs = repo.join(".gitattributes");
+    // binary (the hook keys off git's binary detection). Written at the work-tree
+    // root (not the cwd) so it applies to the whole repo.
+    let attrs = root.join(".gitattributes");
     let mut attr = String::from(
         "# pir: mark common binary extensions so git reports them as binary\n\
          *.bin binary\n*.exe binary\n*.dll binary\n*.so binary\n*.dylib binary\n\

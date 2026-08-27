@@ -72,6 +72,38 @@ pub fn out_flush() {
     let _ = io::stdout().flush();
 }
 
+/// Width of the terminal in columns (used to size the REPL hrule). Falls back
+/// to 80 when the size can't be queried (e.g. a pipe or a non-tty).
+pub fn terminal_width() -> usize {
+    #[cfg(unix)]
+    {
+        unsafe {
+            let mut ws: libc::winsize = std::mem::zeroed();
+            if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws as *mut libc::winsize) == 0
+                && ws.ws_col > 0
+            {
+                return ws.ws_col as usize;
+            }
+        }
+    }
+    80
+}
+
+/// A horizontal rule across the full terminal width (dimmed when color is on).
+/// Drawn between the "thinking" spinner and the live REPL prompt while a turn
+/// runs, so the REPL is visually "under" the spinner.
+pub fn hrule() -> String {
+    let w = terminal_width();
+    let bar = "─".repeat(w.min(200));
+    dim(&bar)
+}
+
+/// The live REPL prompt shown under the spinner while a turn runs. Mirrors the
+/// idle rustyline prompt (`❯ `) so typed-ahead input looks like a normal line.
+pub fn repl_prompt() -> String {
+    format!("{} ", cyan("❯"))
+}
+
 fn paint(code: &str, s: &str) -> String {
     if color() { format!("\x1b[{code}m{s}\x1b[0m") } else { s.to_string() }
 }
@@ -331,9 +363,25 @@ fn plain_read_line(prompt: &str) -> Option<String> {
 
 /// A small terminal spinner shown while we're waiting for the model to produce
 /// its first token (the request is in flight but the stream hasn't started). It
-/// animates on a background thread and overwrites its own line; call `stop()`
-/// the moment real output arrives. When stdout isn't a tty the spinner is a
-/// silent no-op so logs / pipes stay clean.
+/// animates on a background thread and overwrites its own block of lines; call
+/// `stop()` the moment real output arrives. When stdout isn't a tty the spinner
+/// is a silent no-op so logs / pipes stay clean.
+///
+/// The spinner renders a compact block under the agent's text while a turn
+/// runs:
+///
+/// ```text
+/// ⠋ thinking…
+/// ────────────────────────────────────────────   (hrule, full terminal width)
+/// ❯ <what the user is typing live>               (live REPL prompt)
+/// ```
+///
+/// i.e. the hrule and a live REPL prompt sit *under* the "thinking" indicator,
+/// and the user's keystrokes (recorded into `typeahead` by the REPL thread)
+/// appear on the prompt line instead of being clobbered by the spinner. This
+/// fixes the "REPL doesn't display during thinking" bug: the spinner thread is
+/// the **only** thing that writes to stdout while it's alive, so it owns the
+/// whole block and re-renders it in place each tick.
 pub struct Spinner {
     handle: Option<JoinHandle<()>>,
     alive: Arc<AtomicBool>,
@@ -341,18 +389,18 @@ pub struct Spinner {
 
 impl Spinner {
     /// Start spinning with the given leading label (e.g. "thinking"). Returns a
-    /// `Spinner` whose `stop()` clears the line. Pass `false` for `enabled` to
+    /// `Spinner` whose `stop()` clears the block. Pass `false` for `enabled` to
     /// get a no-op spinner (used for quiet / non-tty contexts).
     ///
     /// `typeahead` is a buffer the REPL thread fills with any keystrokes the
     /// user types *while* the turn is running (the REPL runs in raw mode and is
     /// blocked waiting on the network). The spinner thread is the **only** thing
-    /// that writes to stdout while it's alive, so it owns the "thinking" line
-    /// and renders both the animation and the user's type-ahead there. This
-    /// avoids two threads racing on stdout — the previous design had the main
-    /// REPL thread echo keystrokes directly *and* the spinner rewrite the same
-    /// line, which clobbered the user's input mid-thought (the "REPL doesn't
-    /// display during thinking" bug).
+    /// that writes to stdout while it's alive, so it owns the "thinking" block
+    /// (the spinner + hrule + live REPL prompt) and renders the user's typing
+    /// on the prompt line below the hrule. This avoids two threads racing on
+    /// stdout — the previous design had the main REPL thread echo keystrokes
+    /// directly *and* the spinner rewrite the same line, which clobbered the
+    /// user's input mid-thought (the "REPL doesn't display during thinking" bug).
     pub fn start(label: &str, typeahead: Arc<Mutex<String>>, enabled: bool) -> Spinner {
         if !enabled {
             return Spinner { handle: None, alive: Arc::new(AtomicBool::new(false)) };
@@ -364,30 +412,46 @@ impl Spinner {
             let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
             let mut i = 0usize;
             let mut out = io::stdout();
+            let mut drawn = false;
             while a.load(Ordering::SeqCst) {
                 let frame = if color() { format!("\x1b[36m{}\x1b[0m", frames[i % frames.len()]) } else { frames[i % frames.len()].to_string() };
                 // Read the user's in-progress line (recorded by the REPL thread)
-                // and show it on the spinner line so typing "displays" while the
-                // model thinks. `\x1b[K` clears any stale tail after a backspace.
+                // and show it on the live REPL line under the hrule so typing
+                // "displays" while the model thinks. On the first tick we draw
+                // the block from the current cursor position; afterwards we move
+                // up to the block's top line before redrawing, so the block stays
+                // anchored in place instead of scrolling. `\x1b[K` clears stale
+                // tails after a backspace.
                 let typed = typeahead.lock().map(|g| g.clone()).unwrap_or_default();
-                let tail = if typed.is_empty() {
-                    String::new()
+                let rule = hrule();
+                let prompt = repl_prompt();
+                let seq = if drawn {
+                    "\r\x1b[K\x1b[2A\r\x1b[K"
                 } else {
-                    format!("  ⌨ {}", typed)
+                    "\r\x1b[K"
                 };
-                let _ = out.write_all(format!("\r{} {}…{}{}", frame, label, tail, "\x1b[K").as_bytes());
+                let _ = out.write_all(
+                    format!(
+                        "{}{} {}…\n\x1b[K{}\n\x1b[K{}{}{}\x1b[K",
+                        seq, frame, label, rule, prompt, typed, "\x1b[K"
+                    )
+                    .as_bytes(),
+                );
                 let _ = out.flush();
+                drawn = true;
                 thread::sleep(Duration::from_millis(80));
                 i = i.wrapping_add(1);
             }
-            // Clear the spinner line so subsequent output starts clean.
-            let _ = out.write_all(b"\r\x1b[K");
+            // Clear the spinner block so subsequent output starts clean. The
+            // block is 3 lines tall: move up, clear each, then leave the cursor
+            // on a fresh line below.
+            let _ = out.write_all(b"\r\x1b[K\x1b[2A\r\x1b[K\x1b[K\x1b[K\r\x1b[K\n");
             let _ = out.flush();
         });
         Spinner { handle: Some(handle), alive }
     }
 
-    /// Stop the spinner and erase its line. Safe to call multiple times.
+    /// Stop the spinner and erase its block. Safe to call multiple times.
     pub fn stop(&mut self) {
         if self.alive.swap(false, Ordering::SeqCst) {
             if let Some(h) = self.handle.take() {
