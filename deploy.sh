@@ -38,13 +38,15 @@
 #        the mapping; verified via `id ai_<project>` + `pir --version` as that
 #        user.
 #
-# Publishing to GitHub is OPT-IN and never happens by default. Use:
-#      * `--push [--push-remote origin] [--push-branch main]` — git push ref/tag
-#      * `--tag vX.Y.Z` — create + push an annotated tag
-#      * `--release` — implies --push + tag (from Cargo.toml version) + upload the
-#        built binary to a GitHub Release via `gh` (requires `gh auth login`).
-#    Without any of these, deploy.sh only builds, tests, and installs locally —
-#    it will NOT touch a remote.
+# Publishing to GitHub is ON BY DEFAULT (this is a deploy script). It will:
+#      * `git push` the current ref to `origin` (override with --push-remote /
+#        --push-branch, disable with --no-push).
+#      * With `--tag vX.Y.Z` it also creates + pushes an annotated tag.
+#      * With `--release` it additionally creates a GitHub Release for the tag
+#        (from Cargo.toml version if --tag is omitted) and uploads the built
+#        binary via `gh` (requires `gh auth login`).
+#    To build/test/install WITHOUT touching the remote, pass `--no-push` and
+#    omit `--tag`/`--release`, or use `--test-only`.
 
 set -euo pipefail
 
@@ -55,8 +57,8 @@ WITH_PROJECT_INIT=0
 TEST_ONLY=0
 CLIPPY=1
 
-# publish (all opt-in; nothing is pushed to GitHub unless explicitly requested)
-PUSH=0
+# publish: ON by default (this is a deploy script). Opt out with --no-push / --no-release.
+PUSH=1
 PUSH_REMOTE="${PIR_DEPLOY_REMOTE:-origin}"
 PUSH_BRANCH=""
 TAG=""
@@ -73,6 +75,7 @@ while [ $# -gt 0 ]; do
     --test-only)     TEST_ONLY=1; shift ;;
     --no-clippy)     CLIPPY=0; shift ;;
     --push)          PUSH=1; shift ;;
+    --no-push)       PUSH=0; shift ;;
     --push-remote)   PUSH_REMOTE="$2"; shift 2 ;;
     --push-remote=*) PUSH_REMOTE="${1#*=}"; shift ;;
     --push-branch)   PUSH_BRANCH="$2"; shift 2 ;;
@@ -80,6 +83,7 @@ while [ $# -gt 0 ]; do
     --tag)           TAG="$2"; shift 2 ;;
     --tag=*)         TAG="${1#*=}"; shift ;;
     --release)       RELEASE=1; PUSH=1; shift ;;
+    --no-release)    RELEASE=0; shift ;;
     -h|--help)       usage 0 ;;
     *) echo "deploy.sh: unknown arg '$1'" >&2; usage 1 ;;
   esac
