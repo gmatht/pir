@@ -39,14 +39,25 @@ pub fn lookup_user(user: &str) -> Result<(u32, u32), String> {
 /// providers are loaded but *before* the agent is built and any tool runs.
 #[cfg(unix)]
 pub fn become_user(user: &str) -> Result<(), String> {
+    let (uid, gid) = lookup_user(user)?;
     let euid = unsafe { libc::geteuid() };
+    // Already running as the target user (e.g. `sudo -u ai_X pir …`): there is
+    // nothing to drop, but still point the agent at its self-owned toolchain
+    // dirs so crates / gh don't land in the invoking user's home.
+    if euid == uid {
+        apply_toolchain_env(user);
+        return Ok(());
+    }
+    // Otherwise we can only switch if we currently hold root (setuid
+    // privilege). A non-root process that isn't already the target can't
+    // escalate, so report that clearly rather than silently running as the
+    // wrong identity.
     if euid != 0 {
         return Err(format!(
-            "pir must run as root to switch to user '{user}'. Re-run as root, or use \
-             `sudo -u {user} pir ...`"
+            "pir must run as root (or already as '{user}') to switch to user '{user}'. \
+             Re-run as root, or use `sudo -u {user} pir ...`"
         ));
     }
-    let (uid, gid) = lookup_user(user)?;
     unsafe {
         // Drop supplementary groups first, then gid, then uid (order matters:
         // once uid is dropped we can no longer setgid).
@@ -60,7 +71,23 @@ pub fn become_user(user: &str) -> Result<(), String> {
             return Err(format!("failed to setuid to '{user}'"));
         }
     }
+    // Point the (now unprivileged) agent at its own, self-owned toolchain dirs
+    // so it can fetch crates / use gh without touching root's files.
+    apply_toolchain_env(user);
     Ok(())
+}
+
+/// Set CARGO_HOME / GH_CONFIG_DIR (if the user was provisioned with self-owned
+/// dirs) so the (now unprivileged) agent can fetch crates / use gh without
+/// touching root's files. Called from `become_user` both for the drop-to-root
+/// path and the already-the-target no-op path.
+#[cfg(unix)]
+fn apply_toolchain_env(user: &str) {
+    for (k, v) in toolchain_env_for(user) {
+        unsafe {
+            std::env::set_var(k, v);
+        }
+    }
 }
 
 /// Return the home directory of the currently running user (best-effort, for
@@ -139,7 +166,124 @@ pub fn provision(
 
     // 3. Record mapping.
     crate::config::set_project_user(project, user, &path_s)?;
-    Ok(format!("project '{project}' -> user '{user}' (run as root, or `sudo -u {user} pir ...`)"))
+
+    // 4. Give the agent user its own network-capable toolchain dirs.
+    //    `ai_*` users run as themselves (non-root) but $HOME is usually still
+    //    inherited from root, so the default /root/.cargo and /root/.config/gh
+    //    are unwritable. Create self-owned CARGO_HOME and GH_CONFIG_DIR so the
+    //    agent can fetch crates and use gh without touching root's files.
+    //    `toolchain_env_for` exposes these so a launch as this user picks them
+    //    up.
+    setup_agent_toolchain(user)?;
+
+    Ok(format!(
+        "project '{project}' -> user '{user}' (run as root, or `sudo -u {user} pir ...`)\n\
+         agent toolchain (self-owned): CARGO_HOME=~{user}/.cargo GH_CONFIG_DIR=~{user}/.config/gh"
+    ))
+}
+
+/// Create self-owned `CARGO_HOME` and `GH_CONFIG_DIR` for an `ai_*` user and
+/// return the env overrides as `KEY=VALUE` pairs. The dirs live under the
+/// user's real home (resolved via getpwnam) so the agent can write its cargo
+/// registry cache and a gh config without touching root's files. Must be
+/// called as root.
+#[cfg(unix)]
+fn setup_agent_toolchain(user: &str) -> Result<(), String> {
+    use std::process::Command;
+
+    let (_, _) = lookup_user(user)?; // ensure user exists
+    // Resolve the agent user's real home directory.
+    let home = {
+        let cuser = std::ffi::CString::new(user).map_err(|_| format!("invalid user '{user}'"))?;
+        let mut buf = vec![0u8; 4096];
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        unsafe {
+            if libc::getpwnam_r(
+                cuser.as_ptr(),
+                &mut pwd,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result,
+            ) != 0
+                || result.is_null()
+                || pwd.pw_dir.is_null()
+            {
+                return Err(format!("cannot resolve home for user '{user}'"));
+            }
+            std::ffi::CStr::from_ptr(pwd.pw_dir).to_str().map(|s| s.to_string()).unwrap_or_default()
+        }
+    };
+    if home.is_empty() {
+        return Err(format!("user '{user}' has no home directory"));
+    }
+    let cargo_home = std::path::Path::new(&home).join(".cargo");
+    let gh_config = std::path::Path::new(&home).join(".config").join("gh");
+    for d in [&cargo_home, &gh_config] {
+        let _ = std::fs::create_dir_all(d);
+        let status = Command::new("chown")
+            .args(["-R", &format!("{user}:{user}"), d.to_string_lossy().as_ref()])
+            .status()
+            .map_err(|e| format!("chown: {e}"))?;
+        if !status.success() {
+            return Err(format!("chown failed for {} (exit {})", d.display(), status.code().unwrap_or(-1)));
+        }
+    }
+    // A minimal gh config dir so `gh` doesn't fall back to /root/.config/gh.
+    // `gh` creates config.yml on first use; we just ensure the dir is owned.
+    println!(
+        "agent toolchain ready for {user}: CARGO_HOME={} GH_CONFIG_DIR={}",
+        cargo_home.display(),
+        gh_config.display()
+    );
+    Ok(())
+}
+
+/// Return the `CARGO_HOME` / `GH_CONFIG_DIR` overrides for a project's
+/// execution user, if that user was provisioned with a self-owned toolchain.
+/// `pir` exports these via `set_project_user` metadata; this reads them back
+/// so a launch as `ai_X` picks up the agent-owned dirs. Returns an empty vec
+/// when no override is recorded.
+#[cfg(unix)]
+pub fn toolchain_env_for(user: &str) -> Vec<(String, String)> {
+    let cuser = match std::ffi::CString::new(user) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut buf = vec![0u8; 4096];
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    unsafe {
+        if libc::getpwnam_r(
+            cuser.as_ptr(),
+            &mut pwd,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        ) != 0
+            || result.is_null()
+            || pwd.pw_dir.is_null()
+        {
+            return Vec::new();
+        }
+    }
+    let home = match unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir).to_str() } {
+        Ok(s) => s.to_string(),
+        Err(_) => return Vec::new(),
+    };
+    if home.is_empty() {
+        return Vec::new();
+    }
+    let cargo_home = std::path::Path::new(&home).join(".cargo");
+    let gh_config = std::path::Path::new(&home).join(".config").join("gh");
+    let mut out = Vec::new();
+    if cargo_home.is_dir() {
+        out.push(("CARGO_HOME".into(), cargo_home.to_string_lossy().into_owned()));
+    }
+    if gh_config.is_dir() {
+        out.push(("GH_CONFIG_DIR".into(), gh_config.to_string_lossy().into_owned()));
+    }
+    out
 }
 
 /// Resolve the project name to use for the metadata/log directory. If the
