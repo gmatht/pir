@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# rootreq-enforcer — privileged (root) enforcer for agent privilege-escalation
+# requests, in the same "request, don't take" spirit as perm-enforcer.
+#
+# Reads queued requests from the spool, VALIDATES each against an allowlist of
+# exact intents, and applies the MINIMAL grant:
+#   - apt-install <pkgs>  -> runs the logged, validated /usr/local/sbin/ai-apt-install
+#                            wrapper (deploy it first; see install-skynet-ai.sh).
+#   - mk-ai-user <ai_NAME>-> runs /usr/local/sbin/mk-ai-user (creates ai_*).
+#   - su-ai <ai_NAME>     -> runs /usr/local/sbin/su-ai (switch to ai_*).
+#   - command <safe>      -> runs the single allowlisted read-only command.
+#
+# Every action is appended to /var/log/ai-permctl.log. Nothing here grants the
+# agent blanket root; the agent only ever *receives* the specific, allowlisted
+# effect it asked for. Revoke/deny are logged; ai-apt-install/mk-ai-user/su-ai
+# are themselves root-owned wrappers that re-validate their arguments.
+#
+# MUST be run as root (or via a skynet_* passwordless sudo rule). Intended to be
+# wired to `sh-gate` / sudo:  sudo rootreq-enforcer
+
+set -euo pipefail
+
+REQUEST_DIR="${AI_PERM_REQUEST_DIR:-/tmp/ai-perm-requests}"
+AUDIT_LOG="${AI_PERM_AUDIT_LOG:-/var/log/ai-permctl.log}"
+STATE_DIR="${AI_PERM_STATE_DIR:-/var/lib/ai-permctl}"
+
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "rootreq-enforcer: must run as root (try: sudo rootreq-enforcer)" >&2
+    exit 1
+  fi
+}
+
+log() {
+  local ts; ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "$ts $*" >> "$AUDIT_LOG" 2>/dev/null || true
+  echo "$*" >&2
+}
+
+# Allowlist of intents we will ever honor.
+in_allowlist() {
+  case "$1" in
+    apt-install|mk-ai-user|su-ai|command) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Validate an argument for an intent (no shell metacharacters; ai_* shape).
+safe_token() {
+  local s="$1"
+  [ -n "$s" ] || return 1
+  case "$s" in
+    *[!A-Za-z0-9._+~-/]*) return 1 ;;   # reject anything outside the safe set
+    *) return 0 ;;
+  esac
+}
+
+ai_name() {
+  case "$1" in
+    ai_[a-zA-Z0-9]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Run a *specific* allowlisted read-only command. Keep this set tiny.
+safe_command() {
+  case "$1" in
+    id|uname|whoami|pwd|lsb_release) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+apply_request() {
+  local id="$1" intent="$2" arg="$3" reason="$4" by="$5"
+  if ! in_allowlist "$intent"; then
+    log "DENY $id: unknown intent '$intent'"; return 1
+  fi
+  if ! safe_token "$arg"; then
+    log "DENY $id: arg has disallowed characters: '$arg'"; return 1
+  fi
+
+  case "$intent" in
+    apt-install)
+      if [ ! -x /usr/local/sbin/ai-apt-install ]; then
+        log "DENY $id: /usr/local/sbin/ai-apt-install missing (run install-skynet-ai.sh)"; return 1
+      fi
+      log "GRANT $id: apt-install pkg='$arg' reason='$reason' by=$by"
+      sudo /usr/local/sbin/ai-apt-install "$arg" ;;
+    mk-ai-user)
+      ai_name "$arg" || { log "DENY $id: not an ai_* name: '$arg'"; return 1; }
+      if [ ! -x /usr/local/sbin/mk-ai-user ]; then
+        log "DENY $id: /usr/local/sbin/mk-ai-user missing (run install-skynet-ai.sh)"; return 1
+      fi
+      log "GRANT $id: mk-ai-user '$arg' reason='$reason' by=$by"
+      sudo /usr/local/sbin/mk-ai-user "$arg" ;;
+    su-ai)
+      ai_name "$arg" || { log "DENY $id: not an ai_* name: '$arg'"; return 1; }
+      if [ ! -x /usr/local/sbin/su-ai ]; then
+        log "DENY $id: /usr/local/sbin/su-ai missing (run install-skynet-ai.sh)"; return 1
+      fi
+      log "GRANT $id: su-ai '$arg' reason='$reason' by=$by"
+      sudo /usr/local/sbin/su-ai "$arg" ;;
+    command)
+      safe_command "$arg" || { log "DENY $id: command not allowlisted: '$arg'"; return 1; }
+      log "GRANT $id: command '$arg' reason='$reason' by=$by"
+      "$arg" ;;
+  esac
+}
+
+# --------------------------------------------------------------- main
+require_root
+mkdir -p "$STATE_DIR"
+touch "$AUDIT_LOG" 2>/dev/null || true
+
+processed=0
+shopt -s nullglob
+for req in "$REQUEST_DIR"/*.json; do
+  op="$(jq -r .op "$req" 2>/dev/null)"
+  [ "$op" = "request-root" ] || { log "SKIP non-request-root op='$op' file=$req"; continue; }
+  apply_request \
+    "$(jq -r .id "$req")" \
+    "$(jq -r .intent "$req")" \
+    "$(jq -r .arg "$req")" \
+    "$(jq -r .reason "$req")" \
+    "$(jq -r .requested_by "$req")" \
+    && processed=$((processed+1))
+  rm -f "$req"
+done
+
+echo "rootreq-enforcer: processed $processed request(s). Log: $AUDIT_LOG"

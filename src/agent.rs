@@ -65,7 +65,7 @@ impl Agent {
         cancel: Arc<AtomicBool>,
         typeahead: Arc<Mutex<String>>,
     ) -> Result<Self, String> {
-        let client = make_client(&provider)?;
+        let client = make_client(&provider, cancel.clone())?;
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
         let mut registry = Registry::new(cwd.clone(), full_auto);
@@ -193,7 +193,7 @@ impl Agent {
     }
 
     pub fn switch(&mut self, provider: Provider, model: Model) -> Result<(), String> {
-        self.client = make_client(&provider)?;
+        self.client = make_client(&provider, self.cancel.clone())?;
         self.provider = provider;
         self.model = model;
         Ok(())
@@ -747,7 +747,7 @@ impl Agent {
     }
 }
 
-fn make_client(provider: &Provider) -> Result<Client, String> {
+fn make_client(provider: &Provider, cancel: Arc<AtomicBool>) -> Result<Client, String> {
     let kind = provider
         .kind()
         .ok_or_else(|| format!("provider '{}' has no baseUrl", provider.pid()))?;
@@ -767,7 +767,12 @@ fn make_client(provider: &Provider) -> Result<Client, String> {
             config::pi_dir().join("models.json").display()
         )
     })?;
-    Ok(Client::new(kind, &base, key))
+    let mut client = Client::new(kind, &base, key);
+    // Share the agent's cancellation flag so a Ctrl-C/Ctrl-D during an in-flight
+    // model call aborts the streaming read promptly instead of blocking until
+    // the whole response arrives.
+    client.set_cancel(cancel);
+    Ok(client)
 }
 
 fn approx_tokens(history: &[Message]) -> usize {

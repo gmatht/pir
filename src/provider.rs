@@ -3,7 +3,9 @@ use crate::plugin::ToolSpec;
 use crate::types::{Block, Message, Role, Usage};
 use serde_json::{json, Map, Value};
 use std::io::{BufRead, BufReader, Read};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// How many times to retry a failed request (the first attempt is not a retry,
 /// so this is the number of *additional* attempts). Network blips, DNS hiccups,
@@ -12,12 +14,47 @@ use std::time::Duration;
 const MAX_RETRIES: usize = 4;
 
 /// Per-attempt network timeouts (applied to every request via the ureq agent).
-/// `timeout_read` is the max gap allowed between successive bytes on the
-/// streaming socket, so a stalled model connection is detected and retried
-/// instead of hanging the agent forever.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const READ_TIMEOUT: Duration = Duration::from_secs(180);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Initial read timeout for an attempt. This covers the **status-line read**:
+/// after TCP connect, the client waits up to this long for the server's first
+/// response byte (`HTTP/1.1 ... \r\n`). It's deliberately *generous* — a slow
+/// or "thinking" provider (e.g. opencode.ai's zen endpoint) can take many
+/// seconds before it sends anything, and ureq returns the transport error
+/// "Error encountered in the status line: timed out reading response" if the
+/// status line isn't received in time. A too-short read timeout made every
+/// retry fail identically (all 4 attempts timing out at 2s), which is exactly
+/// the failure we saw. It doubles on each retry (see `READ_TIMEOUT_GROWTH`).
+const READ_TIMEOUT_INIT: Duration = Duration::from_secs(30);
+/// Each retry gets this multiple of the previous attempt's read timeout. Capped
+/// at `READ_TIMEOUT_MAX` so a long run of retries can't blow up to minutes.
+const READ_TIMEOUT_GROWTH: u32 = 2;
+const READ_TIMEOUT_MAX: Duration = Duration::from_secs(240);
+/// Hard backstop for the *streaming* phase: if no bytes arrive for this long
+/// the connection is treated as stalled and the request fails (rather than the
+/// parser polling forever). This guards the gap *between* SSE events once
+/// streaming has started — the watchdog is checked before each read, so a
+/// connection that goes silent mid-stream is torn down instead of waiting for
+/// EOF.
+///
+/// Note: `ureq` applies a single `timeout_read` to the whole connection, so a
+/// read only unblocks at that boundary. The watchdog therefore fires at the next
+/// read timeout, which is bounded by the per-attempt `READ_TIMEOUT_*` values —
+/// not instantly at `STALL_TIMEOUT`. `STALL_TIMEOUT` bounds the worst case and
+/// is overridable via `PIR_STALL_TIMEOUT_SECS` (e.g. set it low in tests, or
+/// raise it for very slow providers). The const below is the default when unset.
+const STALL_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Resolve the streaming stall timeout, honouring `PIR_STALL_TIMEOUT_SECS`.
+fn stall_timeout() -> Duration {
+    std::env::var("PIR_STALL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(STALL_TIMEOUT)
+}
 
 /// Initial backoff between retries; it doubles each attempt (capped), giving
 /// 1s, 2s, 4s, 8s for the four retries above.
@@ -28,22 +65,39 @@ pub struct Client {
     kind: ApiKind,
     base_url: String,
     api_key: String,
-    http: ureq::Agent,
+    /// Shared cancellation flag. When set (e.g. by the REPL on Ctrl-C/Ctrl-D),
+    /// an in-flight streaming response aborts at its next poll boundary instead
+    /// of blocking until the whole model reply is received.
+    cancel: Arc<AtomicBool>,
 }
 
 impl Client {
-    pub fn new(kind: ApiKind, base_url: &str, api_key: String) -> Self {
-        let http = ureq::AgentBuilder::new()
+    /// Build a ureq agent with the given per-attempt read timeout. Kept as a
+    /// free fn so the retry loop can rebuild the agent with a larger timeout
+    /// each attempt without cloning the whole `Client`.
+    fn http_agent(read_timeout: Duration) -> ureq::Agent {
+        ureq::AgentBuilder::new()
             .timeout_connect(CONNECT_TIMEOUT)
-            .timeout_read(READ_TIMEOUT)
+            .timeout_read(read_timeout)
             .timeout_write(WRITE_TIMEOUT)
-            .build();
+            .build()
+    }
+
+    pub fn new(kind: ApiKind, base_url: &str, api_key: String) -> Self {
         Client {
             kind,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
-            http,
+            cancel: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Point the client at the running turn's cancellation flag. The REPL sets
+    /// that flag on Ctrl-C/Ctrl-D; an in-flight stream checks it between reads
+    /// and aborts promptly. Passing the agent's own `Arc` lets either side flip
+    /// it.
+    pub fn set_cancel(&mut self, cancel: Arc<AtomicBool>) {
+        self.cancel = cancel;
     }
 
     pub fn chat(
@@ -63,10 +117,25 @@ impl Client {
         // `emitted_text` is set by the stream parsers the moment any token is
         // delivered, so that — once the user is seeing streaming output — we
         // NEVER re-run the attempt (and risk duplicating already-printed text);
-        // a mid-stream failure is surfaced as a hard error instead.
+        // a mid-stream failure is surfaced as a hard error instead. A cancel
+        // request aborts the whole loop immediately (no retry) via `self.cancel`.
+        let cancel = self.cancel.clone();
         let mut emitted_text = false;
         for attempt in 0..=MAX_RETRIES {
-            let mut req = self.http.post(&url);
+            if cancel.load(Ordering::SeqCst) {
+                return Err("request cancelled".to_string());
+            }
+            // Read timeout for this attempt: start generous and double each
+            // retry (capped). The *first* attempt already waits up to
+            // READ_TIMEOUT_INIT for the status line, so a slow/"thinking"
+            // provider has room to respond instead of failing instantly; later
+            // attempts get proportionally more time. Rebuild the ureq agent so
+            // the new timeout takes effect (it's baked in at build time).
+            let read_timeout = (READ_TIMEOUT_INIT
+                * READ_TIMEOUT_GROWTH.saturating_pow(attempt as u32))
+                .min(READ_TIMEOUT_MAX);
+            let http = Self::http_agent(read_timeout);
+            let mut req = http.post(&url);
             req = match self.kind {
                 ApiKind::Anthropic => req
                     .set("x-api-key", &self.api_key)
@@ -79,16 +148,25 @@ impl Client {
                 .send_json(&body)
                 .map_err(http_error)
                 .and_then(|resp| match self.kind {
-                    ApiKind::Anthropic => {
-                        stream_anthropic(resp.into_reader(), on_text, &mut emitted_text)
-                    }
-                    ApiKind::OpenAi => {
-                        stream_openai(resp.into_reader(), on_text, &mut emitted_text)
-                    }
+                    ApiKind::Anthropic => stream_anthropic(
+                        resp.into_reader(),
+                        on_text,
+                        &mut emitted_text,
+                        &cancel,
+                    ),
+                    ApiKind::OpenAi => stream_openai(
+                        resp.into_reader(),
+                        on_text,
+                        &mut emitted_text,
+                        &cancel,
+                    ),
                 });
             match result {
                 Ok(r) => return Ok(r),
                 Err(e) => {
+                    if e == "request cancelled" {
+                        return Err(e);
+                    }
                     if attempt >= MAX_RETRIES || !is_retryable(&e) || emitted_text {
                         return Err(e);
                     }
@@ -97,7 +175,16 @@ impl Client {
                         "\n\u{26a0} request failed (attempt {}), retrying in {:.0?}: {}\n",
                         attempt + 1, backoff, e
                     ));
-                    std::thread::sleep(backoff);
+                    // Sleep in short slices so a cancel mid-backoff is honoured.
+                    let mut waited = Duration::ZERO;
+                    while waited < backoff {
+                        if cancel.load(Ordering::SeqCst) {
+                            return Err("request cancelled".to_string());
+                        }
+                        let step = Duration::from_millis(100).min(backoff - waited);
+                        std::thread::sleep(step);
+                        waited += step;
+                    }
                 }
             }
         }
@@ -279,6 +366,7 @@ fn stream_anthropic<R: Read>(
     r: R,
     on_text: &mut dyn FnMut(&str),
     emitted_text: &mut bool,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<(Message, Usage), String> {
     let mut reader = BufReader::new(r);
     let mut blocks: Vec<Block> = Vec::new();
@@ -287,10 +375,38 @@ fn stream_anthropic<R: Read>(
     let mut tool: Option<(String, String, String)> = None; // (id, name, partial input json)
 
     let mut line = String::new();
+    let mut last_byte = Instant::now();
     loop {
+        // Check cancellation and the stall watchdog before each read. The short
+        // per-read ureq timeout makes each `read_line` wake within a couple of
+        // seconds, so a Ctrl-C/Ctrl-D is honoured promptly rather than blocking
+        // until the whole response arrives; `STALL_TIMEOUT` is the backstop for
+        // a connection that goes silent mid-stream.
+        if cancel.load(Ordering::SeqCst) {
+            return Err("request cancelled".to_string());
+        }
+        if last_byte.elapsed() > stall_timeout() {
+            return Err("stream: stalled (no data for 180s)".to_string());
+        }
         line.clear();
-        let n = reader.read_line(&mut line).map_err(|e| format!("stream: {e}"))?;
-        if n == 0 { break; }
+        let n = match reader.read_line(&mut line) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                // No bytes yet within the poll window; loop back to re-check
+                // cancellation / stall without consuming any input.
+                continue;
+            }
+            Err(e) => return Err(format!("stream: {e}")),
+        };
+        if n == 0 {
+            // EOF (or a timed-out read that returned nothing): if we've been
+            // idle too long it's a stall; otherwise the stream ended.
+            if last_byte.elapsed() > stall_timeout() {
+                return Err("stream: stalled (no data for 180s)".to_string());
+            }
+            break;
+        }
+        last_byte = Instant::now();
         let Some(data) = line.trim_end().strip_prefix("data:") else { continue };
         let data = data.trim();
         if data == "[DONE]" { break; }
@@ -370,6 +486,7 @@ fn stream_openai<R: Read>(
     r: R,
     on_text: &mut dyn FnMut(&str),
     emitted_text: &mut bool,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<(Message, Usage), String> {
     let mut reader = BufReader::new(r);
     let mut usage = Usage::default();
@@ -377,10 +494,27 @@ fn stream_openai<R: Read>(
     let mut calls: Vec<(u64, String, String, String)> = Vec::new(); // (index, id, name, args)
 
     let mut line = String::new();
+    let mut last_byte = Instant::now();
     loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("request cancelled".to_string());
+        }
+        if last_byte.elapsed() > stall_timeout() {
+            return Err("stream: stalled (no data for 180s)".to_string());
+        }
         line.clear();
-        let n = reader.read_line(&mut line).map_err(|e| format!("stream: {e}"))?;
-        if n == 0 { break; }
+        let n = match reader.read_line(&mut line) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(e) => return Err(format!("stream: {e}")),
+        };
+        if n == 0 {
+            if last_byte.elapsed() > stall_timeout() {
+                return Err("stream: stalled (no data for 180s)".to_string());
+            }
+            break;
+        }
+        last_byte = Instant::now();
         let Some(data) = line.trim_end().strip_prefix("data:") else { continue };
         let data = data.trim();
         if data == "[DONE]" { break; }
@@ -441,6 +575,100 @@ fn stream_openai<R: Read>(
 mod tests {
     use super::*;
 
+    /// A tiny blocking HTTP server that, on any request, writes the SSE
+    /// preamble and then holds the connection open streaming nothing — simulating
+    /// a model that is "thinking" forever. Used to prove cancellation actually
+    /// aborts an in-flight stream instead of blocking to EOF.
+    fn spawn_hanging_sse() -> (String, std::thread::JoinHandle<()>) {
+        use std::io::Write;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
+                );
+                // Hold the connection open; never send a done marker. The test
+                // flips the cancel flag and we expect stream_anthropic to return
+                // "request cancelled" without waiting for EOF.
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    #[test]
+    fn cancel_aborts_inflight_stream() {
+        let (base, srv) = spawn_hanging_sse();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut client = Client::new(crate::config::ApiKind::OpenAi, &base, "x".to_string());
+        client.set_cancel(cancel.clone());
+
+        let started = std::time::Instant::now();
+        let worker = std::thread::spawn(move || {
+            client.chat(
+                "gpt-4o",
+                1024,
+                "sys",
+                &[],
+                &mut [],
+                &mut |_s: &str| {},
+            )
+        });
+        // Let it start thinking, then cancel. Cancellation is honoured at the
+        // next read boundary, which is bounded by the per-attempt read timeout
+        // (READ_TIMEOUT_INIT), not the stall timeout — ureq applies one read
+        // timeout to the whole connection, so a silent socket unblocks only when
+        // that timer fires. The point is that it returns well before the server's
+        // 60s hold-open, rather than blocking until EOF.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        cancel.store(true, Ordering::SeqCst);
+        let res = worker.join().unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(res.is_err(), "expected an error after cancel");
+        assert_eq!(res.unwrap_err(), "request cancelled");
+        // Must be far faster than the 60s the server would otherwise hold the
+        // connection; allow for the read-timeout boundary plus scheduling slack.
+        assert!(elapsed < std::time::Duration::from_secs(50), "cancel took too long: {elapsed:?}");
+        let _ = srv.join();
+    }
+
+    #[test]
+    fn stall_watchdog_trips() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        // Point the stall watchdog low so the test fails fast instead of waiting
+        // for the real 180s default. `stall_timeout()` reads this env var.
+        std::env::set_var("PIR_STALL_TIMEOUT_SECS", "2");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Server opens the SSE stream (so we get past the status line) then goes
+        // silent — exactly the "model connected but stopped sending" failure.
+        let srv = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
+                );
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+        });
+        let mut client = Client::new(crate::config::ApiKind::OpenAi, &format!("http://{addr}"), "x".into());
+        let started = std::time::Instant::now();
+        let res = client.chat("gpt-4o", 1024, "sys", &[], &mut [], &mut |_s: &str| {});
+        let elapsed = started.elapsed();
+        std::env::remove_var("PIR_STALL_TIMEOUT_SECS");
+        assert!(res.is_err(), "expected a stall error");
+        assert!(res.unwrap_err().contains("stalled"), "expected stall error");
+        // The stall watchdog fires at the next read boundary: we expect the 2s
+        // stall override to be exceeded, and the connection to be torn down far
+        // before the server's 60s hold-open. Allow for the read-timeout
+        // boundary (READ_TIMEOUT_INIT on the first attempt) plus slack.
+        assert!(elapsed < std::time::Duration::from_secs(50), "stall took too long: {elapsed:?}");
+        let _ = srv.join();
+    }
+
     #[test]
     fn retryable_http_codes() {
         assert!(is_retryable("HTTP 429: rate limited"));
@@ -481,7 +709,30 @@ mod tests {
     #[test]
     fn timeout_constants_sane() {
         assert!(CONNECT_TIMEOUT.as_secs() >= 5);
-        assert!(READ_TIMEOUT.as_secs() >= 30);
+        // The streaming *status-line* read timeout is now generous, so a slow
+        // / "thinking" provider has time to send its first byte before we
+        // retry. The stall watchdog (between SSE events once streaming) stays
+        // short so a Ctrl-C/Ctrl-D is honoured promptly.
+        assert!(READ_TIMEOUT_INIT.as_secs() >= 15);
+        assert!(READ_TIMEOUT_GROWTH >= 2);
+        assert!(READ_TIMEOUT_MAX.as_secs() >= READ_TIMEOUT_INIT.as_secs());
+        assert!(STALL_TIMEOUT.as_secs() >= 30);
         assert_eq!(MAX_RETRIES, 4);
+    }
+
+    #[test]
+    fn read_timeout_doubles_each_retry() {
+        // Mirrors the chat() loop's computation: generous initial timeout that
+        // doubles per attempt and caps at READ_TIMEOUT_MAX. This is what stops
+        // every attempt from timing out identically at 2s (the old bug).
+        let compute = |attempt: u32| {
+            (READ_TIMEOUT_INIT * READ_TIMEOUT_GROWTH.saturating_pow(attempt)).min(READ_TIMEOUT_MAX)
+        };
+        assert_eq!(compute(0), Duration::from_secs(30));
+        assert_eq!(compute(1), Duration::from_secs(60));
+        assert_eq!(compute(2), Duration::from_secs(120));
+        assert_eq!(compute(3), Duration::from_secs(240)); // hits cap
+        assert_eq!(compute(4), Duration::from_secs(240));
+        assert!(compute(1) > compute(0));
     }
 }

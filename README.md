@@ -72,6 +72,21 @@ sudo ./target/release/pir project init      # creates ai_<project>, chowns cwd
 sudo -u ai_<project> ./target/release/pir    # ...then run as that user
 ```
 
+`pir project init` (run as **root**) also gives the new `ai_<project>` user its
+own, self-owned **network-capable toolchain directories**, so the agent can do
+its job without touching root's files:
+
+- `~ai_<project>/.cargo` — a writable `CARGO_HOME` (the default `/root/.cargo`
+  is `0700` root, so an unprivileged agent can't write its registry cache).
+- `~ai_<project>/.config/gh` — a writable `GH_CONFIG_DIR` (preferred over
+  widening traversal on root's `~/.config/gh`; see `ai-permctl`).
+
+When `pir` drops privileges to `ai_<project>` (via `become_user`), it exports
+`CARGO_HOME` / `GH_CONFIG_DIR` pointing at those dirs (resolved by
+`user::toolchain_env_for`). Net effect: **`ai_*` agents have outbound network
+access** (fetch crates, call APIs, push to GitHub) but own none of root's
+files. The `ai-permctl` read grant remains the only path to root's `gh` config.
+
 ---
 
 ## Usage
@@ -137,11 +152,17 @@ Model selection accepts `provider/model`, a bare model id, or a fuzzy substring
 pir/
 ├── Cargo.toml
 ├── build.rs                 # scans extensions/*/src/lib.rs -> generated registry
+├── deploy.sh                # build + test + install gate (see below)
 ├── install-skynet-ai.sh     # optional: deploy the ai_* permission model (root)
 ├── SKYNET-AI-PERMS.md       # design notes for the permission model
+├── .gitignore               # merged Rust/editor/OS + /.pir ignores
+├── .gitwhitelist            # source/doc/script patterns always tracked
+├── scripts/
+│   └── git-wl-add           # force-add files matching .gitwhitelist
 ├── unmd.sh / unmd2.sh       # extract markdown file specs into a project tree
 ├── extensions/
-│   └── builtin/             # example statically-linked extension
+│   ├── builtin/             # example statically-linked extension
+│   └── autocommit/          # optional: commit after every prompt (off by default)
 └── src/
     ├── main.rs      # CLI + REPL + background jobs + project commands
     ├── agent.rs     # the agent loop + session load/save + goal driving
@@ -194,6 +215,35 @@ impl ToolBackend for MyExt {
 Because extensions are compiled into `pir`, they can call any `crate::*` module
 (`crate::term`, `crate::config`, …). See [`src/plugin.rs`](src/plugin.rs) for
 the full ABI.
+
+---
+
+## Ignore / whitelist (`git`)
+
+The repo uses two complementary files so source is never accidentally dropped
+while build/agent junk is never committed:
+
+- **`.gitignore`** — merges the standard **Rust** template (`/target`,
+  `*.rs.bk`; `Cargo.lock` is kept on purpose for reproducible binary builds),
+  common **editor/IDE** ignores (vim, emacs, VS Code, JetBrains), **OS** files
+  (`.DS_Store`, `Thumbs.db`, …), and the pir-specific **`/.pir`** per-project
+  agent metadata dir (session transcripts / history — local, not shared).
+- **`.gitwhitelist`** — the project-defining files that must *always* be
+  tracked even if `.gitignore` would exclude them: `src/**/*.rs` (every `.rs`
+  under `src/`, including `extensions/*/src/`), repo-root `*.rs` (`build.rs`),
+  `Cargo.toml`, `Cargo.lock`, `*.md` + `LICENSE.GPL3`, `*.sh` (incl.
+  `deploy.sh` / `install-skynet-ai.sh`), and the ignore/whitelist files
+  themselves.
+
+`scripts/git-wl-add` force-adds any untracked file matching `.gitwhitelist`
+(overriding `.gitignore`), idempotently — it only ever `git add`s (no commit /
+push) and never force-adds build artifacts. Run it after creating new source,
+docs, or scripts so they can't be left out:
+
+```sh
+./scripts/git-wl-add --dry-run   # show what would be added
+./scripts/git-wl-add             # force-add matching untracked files
+```
 
 ---
 

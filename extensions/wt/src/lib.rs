@@ -534,6 +534,22 @@ impl Wt {
     /// supports it (btrfs/xfs-reflink/apfs via `cp --reflink=always`), else a
     /// plain recursive copy. Returns a human-readable note (empty if skipped).
     /// Never touches `.git` — git manages worktree state.
+    /// If `PIR_WT_COW=1` and `PIR_WT_TEMPLATE` names a pre-built worktree dir,
+    /// clone its build directory (default `target/`, override `PIR_WT_BUILD_DIR`)
+    /// into the fresh worktree so the agent skips rebuilding. Strategy:
+    ///
+    /// 1. Take a *temporary exclusive* flock on the template's build dir. This
+    ///    guarantees the template is quiescent (no other agent mid-compile), so
+    ///    the cloned tree is complete — "make sure the objects are complete".
+    /// 2. If the lock is acquired, **hardlink** the tree (`cp -al`): zero extra
+    ///    disk, and the OS breaks the link the moment an agent rewrites an
+    ///    artifact, so the template stays pristine for the next agent.
+    /// 3. If the lock is busy (another agent building) or hardlink unsupported,
+    ///    fall back to reflink (`cp --reflink=always`, btrfs/xfs/apfs) or a plain
+    ///    copy. Never blocks waiting for the lock.
+    ///
+    /// Only build artifacts are cloned; the worktree's `.git` is never copied
+    /// (git owns worktree bookkeeping). Returns a human-readable note.
     fn maybe_cow_build_dir(&self, wt_dir: &Path) -> String {
         let cow_on = std::env::var_os("PIR_WT_COW").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
         if !cow_on {
@@ -555,24 +571,83 @@ impl Wt {
         if !src.exists() {
             return format!("[wt] PIR_WT_COW: template has no {b:?}; skipping CoW", b = build_rel);
         }
-        let method = if Self::cow_supported(wt_dir) { "reflink (CoW)" } else { "copy" };
-        let status = if Self::cow_supported(wt_dir) {
-            Command::new("cp")
-                .args(["--reflink=always", "-a", "--"])
-                .arg(&src)
-                .arg(&dst)
-                .status()
+
+        // Step 1: temporary exclusive lock on the template build dir so we only
+        // clone a complete, quiescent tree. Skip (build normally) if busy.
+        let Some(_lock) = Self::lock_build_dir(&src) else {
+            return format!(
+                "[wt] PIR_WT_COW: template {b:?} is locked (another agent building); will build normally",
+                b = build_rel
+            );
+        };
+
+        // Step 2: prefer hardlink (complete snapshot, CoW-on-write via link
+        // break). Fall back to reflink, then plain copy.
+        let (method, status) = if Self::hardlink_supported(wt_dir) {
+            ("hardlink", Command::new("cp").args(["-al", "--"]).arg(&src).arg(&dst).status())
+        } else if Self::cow_supported(wt_dir) {
+            ("reflink (CoW)", Command::new("cp").args(["--reflink=always", "-a", "--"]).arg(&src).arg(&dst).status())
         } else {
-            Command::new("cp").args(["-a", "--"]).arg(&src).arg(&dst).status()
+            ("copy", Command::new("cp").args(["-a", "--"]).arg(&src).arg(&dst).status())
         };
         match status {
             Ok(s) if s.success() => format!(
                 "[wt] CoW fast-path: cloned {b:?} from template via {m} (no rebuild needed)",
                 b = build_rel, m = method
             ),
-            Ok(_) => format!("[wt] PIR_WT_COW: cloning {b:?} failed; agent will build normally", b = build_rel),
+            Ok(_) => format!("[wt] PIR_WT_COW: cloning {b:?} via {m} failed; agent will build normally", b = build_rel, m = method),
             Err(e) => format!("[wt] PIR_WT_COW: clone error {e}; agent will build normally"),
         }
+    }
+
+    /// Take a temporary exclusive flock on `dir` (a lock file inside it). Returns
+    /// `Some(guard)` that releases the lock on drop; `None` if the lock is held
+    /// by another process (we don't wait — the template is busy). Unix only;
+    /// on non-unix this is a no-op `Some` so cloning still proceeds.
+    fn lock_build_dir(dir: &Path) -> Option<BuildLock> {
+        #[cfg(unix)]
+        {
+            let lock = dir.join(".pir-wt-build.lock");
+            let child = Command::new("flock")
+                .args(["-x", "-w", "0"])
+                .arg(&lock)
+                .arg("sleep")
+                .arg("1000000")
+                .spawn();
+            match child {
+                Ok(mut c) => {
+                    std::thread::sleep(std::time::Duration::from_millis(120));
+                    if c.try_wait().map(|w| w.is_some()).unwrap_or(true) {
+                        let _ = c.kill();
+                        None
+                    } else {
+                        Some(BuildLock::Flock(c))
+                    }
+                }
+                Err(_) => None,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir;
+            Some(BuildLock::Noop)
+        }
+    }
+
+    /// True when `cp -al` can hardlink within `dir`'s filesystem (same FS, and
+    /// coreutils present). Hardlink requires source==dest filesystem, which
+    /// holds because template and worktree are both under `.git/wt/`.
+    fn hardlink_supported(dir: &Path) -> bool {
+        let probe = dir.join(format!(".pir-wt-hl-probe-{}", std::process::id()));
+        let _ = std::fs::write(&probe, b"x");
+        let out = Command::new("cp")
+            .args(["-al", "--"])
+            .arg(&probe)
+            .arg(dir.join(format!(".pir-wt-hl-probe-{}-2", std::process::id())))
+            .status();
+        let _ = std::fs::remove_file(&probe);
+        let _ = std::fs::remove_file(dir.join(format!(".pir-wt-hl-probe-{}-2", std::process::id())));
+        out.map(|s| s.success()).unwrap_or(false)
     }
 
     /// True when the filesystem holding `dir` can do copy-on-write clones via
@@ -598,6 +673,23 @@ impl Wt {
 enum LockGuard {
     Flock(std::process::Child),
     File(std::fs::File),
+}
+
+/// RAII lock held while cloning a template build dir: guarantees the template
+/// is quiescent (no concurrent build) so the cloned tree is complete. Released
+/// on drop. `Flock` holds a `flock -x` child; `Noop` is the non-unix fallback.
+enum BuildLock {
+    Flock(std::process::Child),
+    Noop,
+}
+
+impl Drop for BuildLock {
+    fn drop(&mut self) {
+        if let BuildLock::Flock(c) = self {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
 }
 
 impl LockGuard {

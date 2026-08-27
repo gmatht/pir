@@ -1124,7 +1124,6 @@ fn create_project(name: &str) -> Option<std::path::PathBuf> {
 
     // Offer to seed the project from clipboard markdown (unmd2.sh format).
     if let Some(text) = crate::project::read_clipboard() {
-        eprintln!("DBG clipboard len={} mdlike={} first={:?}", text.len(), crate::project::looks_like_project_md(&text), text.chars().next());
         if crate::project::looks_like_project_md(&text) {
             let n = crate::project::count_md_files(&text);
             let ans = term::read_answer(&format!(
