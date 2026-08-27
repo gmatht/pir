@@ -16,6 +16,7 @@ include!(concat!(env!("OUT_DIR"), "/gen_registry.rs"));
 
 use crate::agent::Agent;
 use crate::config::Provider;
+use crate::config::Model;
 use crate::notify::SharedBus;
 use std::io::BufRead;
 use std::io::Write;
@@ -79,7 +80,9 @@ COMMANDS
   Lines ending in & run in the background: "fix the parser &"  => /bg fix the parser
 
   While a turn is running you can keep typing: Enter queues the line as the next
-  prompt, /commands still work, and ctrl-c stops the turn after its current step.
+  prompt, /commands still work, and a line ending in & is fired off as a new
+  background job while the current turn keeps streaming; ctrl-c stops the turn
+  after its current step.
 "#;
 
 struct BgSession {
@@ -138,6 +141,26 @@ impl BackgroundJobs {
             handle: Some(handle),
         });
         println!("{} backgrounded as job #{} (logs to {})", term::cyan("·"), id, log.display());
+    }
+
+    /// Spawn a background job from a prompt, using the current provider/model/
+    /// full-auto captured in `ctx` (so it works even while the foreground turn
+    /// owns the agent). A fresh session log is used so the background work
+    /// doesn't disturb the interactive history; run with `set_quiet(true)` so
+    /// the streaming output goes nowhere on the terminal (notifications fire on
+    /// completion instead). This is what both the `&`-suffix path and `/bg`
+    /// reach, whether typed at the idle prompt or *mid-turn*.
+    fn spawn_prompt(&mut self, prompt: String, ctx: &Arc<Mutex<(Provider, Model, bool)>>, bus: SharedBus) {
+        let (provider, model, full_auto) = {
+            let g = ctx.lock().unwrap();
+            (g.0.clone(), g.1.clone(), g.2)
+        };
+        let log = session_log_path();
+        let bcancel = Arc::new(AtomicBool::new(false));
+        self.spawn(prompt, log, move || {
+            Agent::new(provider, model, full_auto, true, bus, None, bcancel, Arc::new(Mutex::new(String::new())))
+                .expect("bg agent")
+        });
     }
 
     /// Join any finished worker threads so their handles don't leak; returns
@@ -397,7 +420,10 @@ fn main() {
 
     // Resume prior history if `-r`/`-c` was given.
     if let Some(session) = &resume {
-        agent.load_session(session);
+        let (_, summary) = agent.load_session(session);
+        if !summary.is_empty() {
+            println!("{}", term::dim(&summary));
+        }
         // Restore the model that was active when this session last ran, so a
         // resumed session doesn't silently drop back to the global default.
         if agent.apply_persisted_model() {
@@ -487,8 +513,10 @@ fn main() {
             Ok(()) => return,
             Err(e) => {
                 // Fall back to the streaming REPL if the TUI can't start
-                // (e.g. not a tty). Leave `agent` owned by `agent_slot` alone.
+                // (e.g. not a tty). Take the agent back out of the slot so the
+                // streaming path below can use it.
                 eprintln!("pir: --tui failed: {e}; falling back to plain REPL");
+                agent = agent_slot.lock().unwrap().take().expect("agent present");
             }
         }
     }
@@ -541,6 +569,17 @@ fn main() {
     // REPL responsive: the model streams on a worker thread while the main
     // thread reads input, drains notifications, and reacts to ctrl-c.
     let agent_slot: Arc<Mutex<Option<Agent>>> = Arc::new(Mutex::new(Some(agent)));
+
+    // Current provider/model/full-auto, mirrored out of the agent so a running
+    // foreground turn (which *takes* the agent out of `agent_slot`) can still
+    // spawn background jobs — `/bg` or a line ending in `&` typed mid-turn must
+    // not panic on a missing agent. Updated on startup, on each `/model`
+    // switch, and just before each foreground turn starts.
+    let current_ctx: Arc<Mutex<(Provider, Model, bool)>> = {
+        let g = agent_slot.lock().unwrap();
+        let a = g.as_ref().expect("agent present before REPL");
+        Arc::new(Mutex::new((a.provider(), a.model(), full_auto)))
+    };
 
     // Running foreground turn state.
     let mut fg_handle: Option<JoinHandle<()>> = None;
@@ -656,14 +695,25 @@ fn main() {
                             &bus,
                             &fg_cancel,
                             true,
+                            &current_ctx,
                         );
+                    } else if s.ends_with('&') && !s.trim_end_matches('&').trim().is_empty() {
+                        // A line ending in `&` typed *while a turn runs* is
+                        // backgrounded immediately (the best time to fire off
+                        // other work — the foreground keeps streaming). The
+                        // context is read from `current_ctx` (not the agent
+                        // slot, which a running turn owns), so this never panics.
+                        input_buf.clear();
+                        let prompt = s.trim_end_matches('&').trim().to_string();
+                        jobs.spawn_prompt(prompt, &current_ctx, bus.clone());
+                        term::out(&term::dim("· backgrounded; current turn continues"));
                     } else {
                         pending.push(s.to_string());
                         input_buf.clear();
                         term::out(&term::dim("· queued; will run when current turn ends"));
                     }
                 }
-                term::raw::RawInput::Interrupt => {
+                term::raw::RawInput::Interrupt | term::raw::RawInput::Cancel => {
                     if let Ok(mut g) = typeahead.lock() { g.clear(); }
                     fg_cancel.store(true, Ordering::SeqCst);
                     term::out(&term::dim("· cancelling turn (after current step)…"));
@@ -711,22 +761,11 @@ fn main() {
         let bg = input.ends_with('&') && !input.trim_end_matches('&').is_empty();
         let input = input.trim_end_matches('&').trim();
         if let Some(cmd) = input.strip_prefix('/') {
-            handle_command(cmd, &agent_slot, &providers, &mut jobs, full_auto, &bus, &fg_cancel, false);
+            handle_command(cmd, &agent_slot, &providers, &mut jobs, full_auto, &bus, &fg_cancel, false, &current_ctx);
         } else if bg {
             // Run this prompt as a fresh background job that keeps its own
             // session log (the foreground session is unaffected).
-            let (provider, model) = {
-                let g = agent_slot.lock().unwrap();
-                let a = g.as_ref().expect("agent present while idle");
-                (a.provider(), a.model())
-            };
-            let log = session_log_path();
-            let bcancel = Arc::new(AtomicBool::new(false));
-            let bus = bus.clone();
-            jobs.spawn(input.to_string(), log, move || {
-                Agent::new(provider, model, full_auto, true, bus, None, bcancel, Arc::new(Mutex::new(String::new())))
-                    .expect("bg agent")
-            });
+            jobs.spawn_prompt(input.to_string(), &current_ctx, bus.clone());
         } else {
             if let Ok(mut g) = typeahead.lock() { g.clear(); }
             fg_handle = Some(run_foreground_turn(
@@ -796,6 +835,7 @@ fn handle_command(
     bus: &SharedBus,
     cancel: &Arc<AtomicBool>,
     fg_running: bool,
+    current_ctx: &Arc<Mutex<(Provider, Model, bool)>>,
 ) {
     let mut parts = cmd.split_whitespace();
     let cmd = parts.next().unwrap_or("");
@@ -844,6 +884,12 @@ fn handle_command(
                 match config::select(providers, &rest.join(" ")) {
                     Ok((p, m)) => match agent.switch(p.clone(), m.clone()) {
                         Ok(()) => {
+                            // Keep the shared background-job context in sync so
+                            // any `/bg` or `&` fired afterwards uses the new model.
+                            if let Ok(mut ctx) = current_ctx.lock() {
+                                ctx.0 = p.clone();
+                                ctx.1 = m.clone();
+                            }
                             println!("→ {}", agent.label());
                             println!("{} (saved for this session; restored on resume)", term::dim("·"));
                         }
@@ -860,18 +906,7 @@ fn handle_command(
             if prompt.trim().is_empty() {
                 eprintln!("usage: /bg <prompt>  (or end a line with &)");
             } else {
-                let (provider, model) = {
-                    let g = agent_slot.lock().unwrap();
-                    let a = g.as_ref().expect("agent present");
-                    (a.provider(), a.model())
-                };
-                let log = session_log_path();
-                let bcancel = Arc::new(AtomicBool::new(false));
-                let bus = bus.clone();
-                jobs.spawn(prompt, log, move || {
-                    Agent::new(provider, model, full_auto, true, bus, None, bcancel, Arc::new(Mutex::new(String::new())))
-                        .expect("bg agent")
-                });
+                jobs.spawn_prompt(prompt, &current_ctx, bus.clone());
             }
         }
         "jobs" | "background" | "running" => {

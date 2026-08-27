@@ -380,11 +380,12 @@ impl Agent {
     }
 
     /// Replay the persisted transcript of `session` back into history so a
-    /// resumed session keeps its prior conversation. Also prints a short
-    /// summary. Returns the number of turns replayed.
-    pub fn load_session(&mut self, session: &PathBuf) -> usize {
+    /// resumed session keeps its prior conversation. Returns (turns, summary)
+    /// where `summary` is a short human-readable line suitable for the REPL to
+    /// print (empty when nothing was loaded).
+    pub fn load_session(&mut self, session: &PathBuf) -> (usize, String) {
         let mut turns = 0usize;
-        let Some(f) = File::open(session).ok() else { return 0 };
+        let Some(f) = File::open(session).ok() else { return (0, String::new()) };
         let mut pending: Option<Message> = None;
         for line in std::io::BufReader::new(f).lines().flatten() {
             if line.trim().is_empty() {
@@ -439,7 +440,7 @@ impl Agent {
             self.history.push(m);
         }
 
-        if turns > 0 {
+        let summary = if turns > 0 {
             let first = self.history.iter().find_map(|m| {
                 if m.role == Role::User {
                     m.text().lines().next().map(|l| l.to_string())
@@ -447,16 +448,15 @@ impl Agent {
                     None
                 }
             });
-            println!(
-                "{}",
-                term::dim(&format!(
-                    "resumed session ({} turns){}",
-                    turns,
-                    first.map(|f| format!(": {f}")).unwrap_or_default()
-                ))
-            );
-        }
-        turns
+            format!(
+                "resumed session ({} turns){}",
+                turns,
+                first.map(|f| format!(": {f}")).unwrap_or_default()
+            )
+        } else {
+            String::new()
+        };
+        (turns, summary)
     }
 
     /// Drive the agent to complete the active goal. Repeatedly prompts the
@@ -465,27 +465,33 @@ impl Agent {
     /// the `pir -c` / `/continue` entry point and is resilient to interrupts:
     /// each `update_goal` call persists, so re-running `pir -c` picks up where
     /// the last run stopped.
-    pub fn continue_goal(&mut self) {
+    /// Drive the active goal to completion. Returns a plaintext summary of
+    /// what happened (so either REPL front-end can render it — the streaming
+    /// REPL prints it, the TUI pushes it into the conversation pane). Resilient
+    /// to interrupts: each `update_goal` call persists, so re-running `pir -c`
+    /// picks up where the last run stopped.
+    pub fn continue_goal(&mut self) -> String {
         // Snapshot objective + pre-checks so we don't hold a borrow of
         // `goal_store` across the `turn` call (which needs `&mut self`).
         let (objective, already_done) = match &self.goal_store {
             Some(s) => (s.goal.objective.clone(), s.goal.status == GoalStatus::Complete),
             None => {
-                eprintln!("{} no active goal — start one with /goal <objective>", term::red("error:"));
-                return;
+                return "no start one with /goal <objective>".to_string();
             }
         };
         if already_done {
-            println!("{} goal already complete: {}", term::cyan("·"), objective);
+            let mut out = format!("goal already complete: {}\n", objective);
             if let Some(s) = &self.goal_store {
-                println!("{}", term::dim(&s.goal.summary()));
+                out.push_str(&s.goal.summary());
             }
-            return;
+            return out;
         }
 
-        println!("{} goal: {}", term::bold("continue"), objective);
+        let mut out = String::new();
+        out.push_str(&format!("goal: {}\n", objective));
         if let Some(s) = &self.goal_store {
-            println!("{}", term::dim(&s.goal.summary()));
+            out.push_str(&s.goal.summary());
+            out.push('\n');
         }
 
         loop {
@@ -512,13 +518,13 @@ impl Agent {
             );
             let before = self.usage.output;
             if self.turn(&prompt).is_err() {
-                println!("{} goal run errored; stopping", term::red("error:"));
+                out.push_str("goal run errored; stopping\n");
                 break;
             }
             let delta = self.usage.output - before;
             if delta == 0 {
                 // Model produced no tool calls and nothing progressed.
-                println!("{} model yielded without further progress; stopping", term::yellow("!"));
+                out.push_str("model yielded without further progress; stopping\n");
                 break;
             }
         }
@@ -527,26 +533,30 @@ impl Agent {
             Some(s) => s.goal.status.label().to_string(),
             None => "unknown".to_string(),
         };
-        println!("{} goal {}: {}", term::bold("done"), final_status, objective);
+        out.push_str(&format!("goal {}: {}\n", final_status, objective));
         if let Some(s) = &self.goal_store {
-            println!("{}", term::dim(&s.goal.summary()));
+            out.push_str(&s.goal.summary());
             if let Some(p) = s.path().to_str() {
-                println!("{}", term::dim(&format!("goal saved: {p}")));
+                out.push_str(&format!("\ngoal saved: {p}"));
             }
         }
+        out
     }
 
-    /// Print the active goal snapshot to the user (used by `/goal`).
-    pub fn show_goal(&self) {
+    /// Return a plaintext snapshot of the active goal (used by `/goal` and the
+    /// REPL front-end, which renders it however it likes).
+    pub fn show_goal(&self) -> String {
         match &self.goal_store {
             Some(s) => {
-                println!("{}", term::bold("goal"));
-                print!("{}", s.goal.summary());
+                let mut out = term::bold("goal");
+                out.push('\n');
+                out.push_str(&s.goal.summary());
                 if let Some(p) = s.path().to_str() {
-                    println!("{}", term::dim(&format!("saved: {p}")));
+                    out.push_str(&format!("\nsaved: {p}"));
                 }
+                out
             }
-            None => println!("{} no active goal; start one with /goal <objective>", term::yellow("·")),
+            None => "no active goal; start one with /goal <objective>".to_string(),
         }
     }
 
