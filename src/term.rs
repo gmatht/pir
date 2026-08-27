@@ -442,10 +442,18 @@ impl Spinner {
                 thread::sleep(Duration::from_millis(80));
                 i = i.wrapping_add(1);
             }
-            // Clear the spinner block so subsequent output starts clean. The
-            // block is 3 lines tall: move up, clear each, then leave the cursor
-            // on a fresh line below.
-            let _ = out.write_all(b"\r\x1b[K\x1b[2A\r\x1b[K\x1b[K\x1b[K\r\x1b[K\n");
+            // Erase the whole 3-line block (thinking line + hrule + draft-prompt
+            // line) and leave the cursor on its TOP line (L0). We use `\x1b[2K`
+            // (erase *entire* line) rather than `\x1b[K` (erase-to-EOL) — the
+            // cursor is at end-of-line, so erase-to-EOL would only clip the tail
+            // and leave "⠋ think" / "────" / "❯ hel" behind. The previous clear
+            // also left the cursor on L1 (the hrule) and skipped the hrule line
+            // entirely, so the next spinner's first draw anchored one line low
+            // and the prior "⠋ thinking…" was never erased — every tool round
+            // leaked another stray "thinking" onto the screen.
+            let _ = out.write_all(
+                b"\x1b[2A\x1b[2K\x1b[B\x1b[2K\x1b[B\x1b[2K\x1b[2A\x1b[2K",
+            );
             let _ = out.flush();
         });
         Spinner { handle: Some(handle), alive }
