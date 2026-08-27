@@ -10,7 +10,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub struct Agent {
     pub provider: Provider,
@@ -24,6 +24,10 @@ pub struct Agent {
     pub log_path: Option<PathBuf>,
     goal_store: Option<GoalStore>,
     notify: SharedBus,
+    /// Follow-up prompts queued by extension backends during `on_turn_end`
+    /// (e.g. the worktree extension asking the model to fix failing tests).
+    /// The REPL drains these into its prompt queue after the turn finishes.
+    continuations: Vec<String>,
     /// The most recent user prompt this agent is/was working on. Recorded so
     /// notifications can show *what* finished, not just "turn done".
     last_prompt: String,
@@ -36,13 +40,21 @@ pub struct Agent {
     /// before each model call and after each tool batch, so it never aborts
     /// mid-tool; the in-progress step always completes first.
     cancel: Arc<AtomicBool>,
+    /// Shared buffer the REPL fills with keystrokes the user types *while* a
+    /// turn runs. The thinking spinner reads it so the user's input stays
+    /// visible during "thinking" instead of being clobbered by competing stdout
+    /// writers. The REPL owns the only other reference; it only ever writes.
+    typeahead: Arc<Mutex<String>>,
 }
 
 impl Agent {
     /// `resume_from`, if set, continues the given session's log file instead
     /// of starting a fresh one (its parent-shell tag is preserved). `quiet`
     /// suppresses all terminal output (used for backgrounded sessions). `bus`
-    /// is the shared notification bus all agents publish to.
+    /// is the shared notification bus all agents publish to. `typeahead` is a
+    /// shared buffer the REPL fills with keystrokes typed while the turn runs;
+    /// the thinking spinner reads it so the user's input is shown while the
+    /// model thinks.
     pub fn new(
         provider: Provider,
         model: Model,
@@ -51,6 +63,7 @@ impl Agent {
         bus: SharedBus,
         resume_from: Option<&PathBuf>,
         cancel: Arc<AtomicBool>,
+        typeahead: Arc<Mutex<String>>,
     ) -> Result<Self, String> {
         let client = make_client(&provider)?;
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -107,7 +120,9 @@ impl Agent {
             notify: bus,
             quiet,
             cancel,
+            typeahead,
             last_prompt: String::new(),
+            continuations: Vec::new(),
         })
     }
 
@@ -497,6 +512,12 @@ impl Agent {
         self.history.push(msg);
 
         let specs = self.registry.specs();
+        let tty = crate::term::is_terminal();
+        // `spinner` is hoisted out of the per-message loop so the "thinking…"
+        // indicator can persist *below* the agent's text (a footer) between
+        // model calls, and so the next streamed token can erase it in place
+        // (via \r) before printing more text.
+        let mut spinner: Option<term::Spinner> = None;
 
         loop {
             // Cooperative cancellation: bail out at this safe boundary (start
@@ -504,6 +525,9 @@ impl Agent {
             if self.cancel.load(Ordering::SeqCst) {
                 self.cancel.store(false, Ordering::SeqCst);
                 if !self.quiet {
+                    if let Some(s) = spinner.as_mut() {
+                        s.stop();
+                    }
                     term::out(&term::dim("· turn cancelled"));
                 }
                 self.notify.publish(self.turn_done_event(), false);
@@ -514,25 +538,28 @@ impl Agent {
             // While we wait for the model's first token, show a spinner so it's
             // obvious the agent is "thinking". It stops the instant the stream
             // starts emitting text (and is skipped entirely when quiet / not a
-            // tty).
-            let mut spinner = if self.quiet {
-                term::Spinner::start("", false)
-            } else {
-                term::Spinner::start("thinking", crate::term::is_terminal())
-            };
-            let got_text = std::cell::Cell::new(false);
+            // tty). After the agent's text has printed, the spinner is shown
+            // again *below* the text as a footer (see the end of the loop), so
+            // it keeps indicating "thinking" while tools run / between calls.
+            // `self.typeahead` (filled by the REPL) is rendered on the spinner
+            // line so the user sees what they're typing while the model thinks.
+            if !self.quiet {
+                spinner = Some(term::Spinner::start("thinking", self.typeahead.clone(), tty));
+            }
+            // Stop the footer spinner (if running) the moment the model emits
+            // its first token, so the agent's text starts on a clean line.
+            // `stopped_here` tracks whether *this* call has already cleared it,
+            // so subsequent tokens in the same stream don't touch it again.
+            let mut stopped_here = false;
             let mut on_text = |t: &str| {
-                if !got_text.get() {
-                    got_text.set(true);
-                    if !self.quiet {
-                        spinner.stop();
+                if !self.quiet && !stopped_here {
+                    stopped_here = true;
+                    if let Some(s) = spinner.as_mut() {
+                        s.stop();
                     }
+                    spinner = None;
                 }
                 if !self.quiet {
-                    // `term::out` never panics on a transient write error
-                    // (e.g. EAGAIN on a non-blocking/full stdout), which a bare
-                    // `print!` would — that previously crashed the whole process
-                    // mid-turn.
                     term::out(t);
                 }
             };
@@ -544,8 +571,13 @@ impl Agent {
                 &specs,
                 &mut on_text,
             );
+            // Ensure the footer spinner is stopped (covers the no-output case),
+            // then move to a fresh line below the agent's text.
             if !self.quiet {
-                spinner.stop();
+                if let Some(s) = spinner.as_mut() {
+                    s.stop();
+                }
+                spinner = None;
                 println!();
             }
             let (assistant, usage) = match result {
@@ -559,7 +591,7 @@ impl Agent {
                         false,
                     );
                     if !self.quiet {
-                        self.registry.on_turn_end(user);
+                        self.continuations.extend(self.registry.on_turn_end(user));
                     }
                     return Err(e);
                 }
@@ -580,7 +612,7 @@ impl Agent {
             if calls.is_empty() {
                 self.notify.publish(self.turn_done_event(), false);
                 if !self.quiet {
-                    self.registry.on_turn_end(user);
+                    self.continuations.extend(self.registry.on_turn_end(user));
                 }
                 return Ok(());
             }
@@ -606,17 +638,38 @@ impl Agent {
             log_line(&mut self.log, &results);
             self.history.push(results);
 
+            // Between model calls (while tools are being executed, and before
+            // the next model call), show the spinner *below* the agent's text as
+            // a footer so it's clear the agent is still working. The next
+            // streamed token erases it in place via `\r`. `self.typeahead` is
+            // rendered on the spinner line so typed-ahead input stays visible.
+            if !self.quiet {
+                spinner = Some(term::Spinner::start("thinking", self.typeahead.clone(), tty));
+            }
+
             // Cooperative cancellation: stop after this batch of tools
             // completes (the in-progress step always finishes first).
             if self.cancel.load(Ordering::SeqCst) {
                 self.cancel.store(false, Ordering::SeqCst);
                 if !self.quiet {
+                    if let Some(s) = spinner.as_mut() {
+                        s.stop();
+                    }
                     term::out(&term::dim("· turn cancelled"));
                 }
                 self.notify.publish(self.turn_done_event(), false);
                 return Ok(());
             }
         }
+    }
+
+    /// Drain follow-up prompts queued by extension backends during the last
+    /// `on_turn_end`. The REPL calls this after a turn finishes and pushes any
+    /// returned prompts into its prompt queue (e.g. the worktree extension
+    /// asking the model to fix failing tests). Each call returns the backlog
+    /// once and resets it.
+    pub fn take_continuations(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.continuations)
     }
 
     /// Publish an exit notification to the shared bus (called from one-shot /

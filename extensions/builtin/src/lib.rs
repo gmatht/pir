@@ -374,9 +374,13 @@ fn read_file(input: &serde_json::Value) -> Result<String, String> {
     Ok(text)
 }
 
-fn list_dir(input: &serde_json::Value, cwd: &Path) -> Result<String, String> {
+fn list_dir(input: &serde_json::Value, anchor: &Path) -> Result<String, String> {
+    // Honor a live `chdir` into a worktree: resolve relative to the process
+    // cwd when it is inside the launch dir, else fall back to the launch anchor.
+    let live = std::env::current_dir().unwrap_or_else(|_| anchor.to_path_buf());
+    let base = if live.starts_with(anchor) { live } else { anchor.to_path_buf() };
     let path = input["path"].as_str().unwrap_or(".");
-    let dir = cwd.join(path);
+    let dir = base.join(path);
     let mut entries: Vec<String> = Vec::new();
     for entry in fs::read_dir(&dir).map_err(|e| format!("list_dir {}: {e}", dir.display()))? {
         let entry = entry.map_err(|e| e.to_string())?;
@@ -402,7 +406,11 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
     // the model (so an unattended agent never blocks waiting on a human).
     const CHECK_IN: Duration = Duration::from_secs(10 * 60);
 
-    let mut child = spawn_shell(command, &b.cwd)?;
+    // Run in the *live* process cwd, not the launch cwd, so extension backends
+    // (e.g. the worktree extension) can `cd` the agent into a linked worktree
+    // and have bash honor it. Falls back to `b.cwd` if the process cwd is gone.
+    let live_cwd = std::env::current_dir().unwrap_or_else(|_| b.cwd.clone());
+    let mut child = spawn_shell(command, &live_cwd)?;
     // Shared, capped output buffers drained on background threads so the pipe
     // never blocks and a detached job can be polled for partial output.
     let out_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(64 * 1024)));

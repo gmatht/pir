@@ -90,9 +90,14 @@ pub trait ToolBackend: Send {
     /// Called after each user turn completes (success or provider error), with
     /// the user's prompt text. Extensions use this for side effects that should
     /// follow every prompt — e.g. auto-committing the working tree and deriving
-    /// the commit message from `prompt`. Default no-op; the agent only invokes
-    /// this for non-background turns.
-    fn on_turn_end(&mut self, _prompt: &str) {}
+    /// the commit message from `prompt`. An extension may also return
+    /// follow-up prompts (strings) that the agent should run as additional
+    /// queued turns after this one — e.g. "tests failed, please fix". The agent
+    /// only invokes this for non-background turns. Default no-op returning no
+    /// follow-ups.
+    fn on_turn_end(&mut self, _prompt: &str) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Holds every linked backend. The model only ever sees `specs()`; it never
@@ -155,11 +160,15 @@ impl Registry {
     }
 
     /// Notify every backend that a user turn just completed. `prompt` is the
-    /// text the user submitted for that turn.
-    pub fn on_turn_end(&mut self, prompt: &str) {
+    /// text the user submitted for that turn. Returns any follow-up prompts
+    /// the backends want the agent to run next (e.g. a "fix the failing tests"
+    /// nudge), concatenated across all backends.
+    pub fn on_turn_end(&mut self, prompt: &str) -> Vec<String> {
+        let mut follow: Vec<String> = Vec::new();
         for b in &mut self.backends {
-            b.on_turn_end(prompt);
+            follow.extend(b.on_turn_end(prompt));
         }
+        follow
     }
 }
 

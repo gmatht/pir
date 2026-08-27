@@ -350,6 +350,12 @@ fn main() {
     // (ctrl-c) to ask a running turn to stop at the next safe boundary.
     let fg_cancel = Arc::new(AtomicBool::new(false));
 
+    // Live "what the user is typing" buffer shown by the thinking spinner while
+    // a turn runs (see `run_foreground_turn` / `term::Spinner`). The REPL thread
+    // only writes to it; the spinner thread is the sole stdout writer during a
+    // turn, so the user's keystrokes appear instead of being clobbered.
+    let typeahead: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+
     let mut agent = match Agent::new(
         provider.clone(),
         model.clone(),
@@ -358,6 +364,7 @@ fn main() {
         bus.clone(),
         resume.as_ref(),
         fg_cancel.clone(),
+        typeahead.clone(),
     ) {
         Ok(a) => a,
         Err(e) => die(&e),
@@ -397,7 +404,7 @@ fn main() {
         jobs.spawn(prompt, agent.log_path.clone().unwrap_or_default(), {
             let bus = bus.clone();
             move || {
-                Agent::new(provider, model, full_auto, true, bus, None, bcancel)
+                Agent::new(provider, model, full_auto, true, bus, None, bcancel, Arc::new(Mutex::new(String::new())))
                     .expect("agent build in background thread")
             }
         });
@@ -461,6 +468,12 @@ fn main() {
     let mut pending: Vec<String> = Vec::new();
     // Partial line buffer for the raw-mode input while a turn runs.
     let mut input_buf = String::new();
+    // `typeahead` (the *same* Arc the agent + spinner thread were built with,
+    // declared just before `Agent::new`) is reused here: the REPL thread only
+    // ever *writes* to it and the spinner thread *reads* it, so the user's
+    // keystrokes appear on the spinner line while the model thinks. Do NOT
+    // create a second `typeahead` here — a separate Arc would mean the REPL
+    // writes to a buffer the spinner never reads (the original bug).
     // Oneshot signal from the foreground worker: closed when the turn ends, so
     // the REPL's event-driven wait can wake without polling.
     let (done_tx, done_rx) = smol::channel::bounded(1);
@@ -497,6 +510,7 @@ fn main() {
                     )));
                 }
                 if let Some(next) = pending.drain(..).next() {
+                    if let Ok(mut g) = typeahead.lock() { g.clear(); }
                     fg_handle = Some(run_foreground_turn(
                         &agent_slot,
                         &fg_cancel,
@@ -504,6 +518,28 @@ fn main() {
                         done_tx.clone(),
                     ));
                     term::raw::enable_raw();
+                } else {
+                    // No user-queued prompt: drain any follow-up prompts the
+                    // extension backends queued during on_turn_end (e.g. the
+                    // worktree extension asking the model to fix failing tests)
+                    // and run them before returning to the idle prompt.
+                    let follow = {
+                        let mut g = agent_slot.lock().unwrap();
+                        match g.as_mut() {
+                            Some(a) => a.take_continuations(),
+                            None => Vec::new(),
+                        }
+                    };
+                    if let Some(next) = follow.into_iter().next() {
+                        if let Ok(mut g) = typeahead.lock() { g.clear(); }
+                        fg_handle = Some(run_foreground_turn(
+                            &agent_slot,
+                            &fg_cancel,
+                            next,
+                            done_tx.clone(),
+                        ));
+                        term::raw::enable_raw();
+                    }
                 }
             }
         }
@@ -513,10 +549,15 @@ fn main() {
             // (event-driven, ~0% CPU) until stdin is readable OR the worker
             // signals completion via `done_rx`; then drain any typed input.
             // Enter queues the next prompt, ctrl-c requests cancellation,
-            // ctrl-d stops the session.
-            match term::raw::wait_input(&mut input_buf, &done_rx) {
+            // ctrl-d stops the session. The user's keystrokes are recorded into
+            // `typeahead` (rendered by the thinking spinner) rather than echoed
+            // here, so the two stdout writers never race.
+            match term::raw::wait_input(&mut input_buf, &typeahead, &done_rx) {
                 term::raw::RawInput::Line(s) => {
                     let s = s.trim();
+                    // Clear the typeahead so the spinner line is blank before
+                    // the next prompt / queued message is printed.
+                    if let Ok(mut g) = typeahead.lock() { g.clear(); }
                     if s.is_empty() {
                         input_buf.clear();
                     } else if s.starts_with('/') {
@@ -537,10 +578,12 @@ fn main() {
                     }
                 }
                 term::raw::RawInput::Interrupt => {
+                    if let Ok(mut g) = typeahead.lock() { g.clear(); }
                     fg_cancel.store(true, Ordering::SeqCst);
                     term::out(&term::dim("· cancelling turn (after current step)…"));
                 }
                 term::raw::RawInput::Eof => {
+                    if let Ok(mut g) = typeahead.lock() { g.clear(); }
                     fg_cancel.store(true, Ordering::SeqCst);
                     // Let the running turn finish its current step, then exit.
                     let _ = fg_handle.take().unwrap().join();
@@ -581,10 +624,11 @@ fn main() {
             let bcancel = Arc::new(AtomicBool::new(false));
             let bus = bus.clone();
             jobs.spawn(input.to_string(), log, move || {
-                Agent::new(provider, model, full_auto, true, bus, None, bcancel)
+                Agent::new(provider, model, full_auto, true, bus, None, bcancel, Arc::new(Mutex::new(String::new())))
                     .expect("bg agent")
             });
         } else {
+            if let Ok(mut g) = typeahead.lock() { g.clear(); }
             fg_handle = Some(run_foreground_turn(
                 &agent_slot,
                 &fg_cancel,
@@ -601,6 +645,9 @@ fn main() {
 /// the turn), then returning it when the turn completes. Resets the cancel flag
 /// at the start and publishes an Idle/Error event when done. `done` is a oneshot
 /// the REPL awaits, so it can wake the moment the turn ends instead of polling.
+/// `typeahead` is not needed here: the agent already holds the shared buffer
+/// (the same Arc the REPL thread writes to), and the thinking spinner reads it
+/// directly from the agent (see [`crate::term::Spinner`]).
 fn run_foreground_turn(
     agent_slot: &Arc<Mutex<Option<Agent>>>,
     cancel: &Arc<AtomicBool>,
@@ -686,7 +733,7 @@ fn handle_command(
                 let bcancel = Arc::new(AtomicBool::new(false));
                 let bus = bus.clone();
                 jobs.spawn(prompt, log, move || {
-                    Agent::new(provider, model, full_auto, true, bus, None, bcancel)
+                    Agent::new(provider, model, full_auto, true, bus, None, bcancel, Arc::new(Mutex::new(String::new())))
                         .expect("bg agent")
                 });
             }

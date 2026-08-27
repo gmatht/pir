@@ -282,9 +282,9 @@ impl ToolBackend for AutoCommit {
         self.select_vcs(launch_cwd);
     }
 
-    fn on_turn_end(&mut self, prompt: &str) {
+    fn on_turn_end(&mut self, prompt: &str) -> Vec<String> {
         if !self.enabled {
-            return;
+            return Vec::new();
         }
         if let Some(outcome) = self.maybe_commit(prompt) {
             // Surface result/error to the terminal (non-fatal either way).
@@ -294,6 +294,7 @@ impl ToolBackend for AutoCommit {
                 println!("{}", crate::term::dim(&format!("[autocommit] {}", outcome.content)));
             }
         }
+        Vec::new()
     }
 }
 
