@@ -2,34 +2,42 @@
 //!
 //! Off by default; enable with `PIR_WT=1`. When enabled:
 //!
-//! * `wt_create` makes a linked git worktree (off the current `main`) and
-//!   `cd`s the agent into it, so subsequent `bash`/`edit_file`/`read_file`
-//!   calls operate there. The launch `cwd` (the main checkout) is remembered.
+//! * `wt_create` makes a linked git worktree off the repo's *trunk* branch
+//!   (auto-detected — `origin/HEAD`, else the checked-out branch, else
+//!   main/master/trunk/develop) with a fresh branch, and `cd`s the agent into
+//!   it so subsequent `bash`/`edit_file`/`read_file` calls operate there. The
+//!   trunk checkout is remembered and used for merges.
 //! * After each user turn (`on_turn_end`), if the agent is inside a `wt`
 //!   worktree, the extension auto-verifies the branch: it tries to fast-forward
-//!   `main` and runs project-type build + test checks (the verification command
-//!   is configurable per project; a sane default is chosen from the project
-//!   layout). If everything passes it attempts to merge the branch back into
-//!   `main` under an inter-agent lock so two agents never merge concurrently.
+//!   the trunk and runs project-type build + test checks (the verification
+//!   command is configurable per project via `PIR_WT_CHECK`; a default is
+//!   chosen from the project layout). If everything passes it merges the branch
+//!   back into the trunk under an inter-agent lock so two agents never merge
+//!   concurrently.
 //! * If verification fails, instead of merging it queues a follow-up prompt
-//!   asking the model to fix the breakage (the prompt is surfaced by the REPL
-//!   as the next turn). This is how the user's requirement "if tests DON'T pass,
-//!   ask the model to fix" is satisfied.
+//!   asking the model to fix the breakage (surfaced by the REPL as the next
+//!   turn) — up to `MAX_FIX_ATTEMPTS` times, then stops re-queueing so the user
+//!   can intervene. This is how "if tests DON'T pass, ask the model to fix" is
+//!   satisfied.
+//! * Conservative default: if no check command is configured/recognized (no
+//!   `PIR_WT_CHECK` and no Cargo.toml/package.json/pyproject.toml/Makefile), the
+//!   extension does NOT claim success — it skips auto-merge and asks for an
+//!   explicit `wt_merge`. This avoids silently merging unverified work.
 //! * `wt_merge` / `wt_verify` / `wt_status` / `wt_remove` are exposed as tools
-//!   for explicit control (e.g. when not running in full-auto). `on_turn_end`
-//!   only auto-merges when `PIR_WT_AUTO=1` (default on when `PIR_WT=1`).
+//!   for explicit control. `on_turn_end` only auto-merges when `PIR_WT_AUTO=1`
+//!   (default on when `PIR_WT=1`).
 //!
 //! Locking
 //! -------
 //! A repo-level lock (`<repo>/.git/wt-merge.lock`, flock-compatible) serializes
 //! auto-merge attempts so multiple agents (or the same agent across worktrees)
-//! don't merge simultaneously. The merge itself is done from the *main checkout*
-//! after `git worktree update`/pull, never from inside the worktree.
+//! don't merge simultaneously. The merge itself is done from the *trunk*
+//! checkout after a fast-forward, never from inside the worktree.
 //!
 //! Worktree location
 //! -----------------
 //! Worktrees live in `<repo>/.git/wt/<name>` by default (inside `.git`, so they
-//! are never seen by the main working tree and aren't committed). Override the
+//! are never seen by the trunk working tree and aren't committed). Override the
 //! parent with `PIR_WT_DIR`.
 
 use crate::plugin::{Outcome, Registry, ToolBackend, ToolSpec};
@@ -42,7 +50,24 @@ use std::sync::Mutex;
 /// worktrees at once (the repo lock below handles cross-process/cross-agent).
 static AUTO_GUARD: Mutex<()> = Mutex::new(());
 
+/// Max auto-fix prompts queued before we give up and stop re-queuing (so the
+/// model can't be asked to fix the same failing branch forever, blocking the
+/// user from ever typing).
+const MAX_FIX_ATTEMPTS: u32 = 2;
+
 const DEFAULT_BRANCH: &str = "main";
+
+/// Result of running verification in a worktree.
+enum Verdict {
+    /// Build/test passed (summary is the tail of output).
+    Passed(String),
+    /// Build/test failed (summary is the tail of output).
+    Failed(String),
+    /// No verification command could be determined (no PIR_WT_CHECK and no
+    /// recognized project type) — so *nothing was actually checked*. Callers
+    /// must NOT treat this as green.
+    NoChecks,
+}
 
 struct Wt {
     enabled: bool,
@@ -53,6 +78,9 @@ struct Wt {
     main_cwd: PathBuf,
     /// Per-process current worktree path (None = on main checkout).
     current: Option<PathBuf>,
+    /// How many consecutive auto-fix prompts we've queued (reset when checks
+    /// pass). Bounded by `max_fix` to avoid an infinite fix loop.
+    fix_attempts: u32,
 }
 
 impl Wt {
@@ -71,6 +99,7 @@ impl Wt {
             wt_parent,
             main_cwd: PathBuf::from("."),
             current: None,
+            fix_attempts: 0,
         }
     }
 
@@ -94,6 +123,54 @@ impl Wt {
                 None => return start.clone(),
             }
         }
+    }
+
+    /// Resolve the repo's trunk branch dynamically (don't assume `main`).
+    /// Prefers `origin/HEAD` (e.g. `origin/main`), then the local checked-out
+    /// branch of the main checkout, then `main`, then `master`.
+    fn trunk(&self) -> String {
+        let root = self.repo_root();
+        // 1) remote HEAD, e.g. refs/remotes/origin/main -> "main".
+        if let Ok(o) = Command::new("git")
+            .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+            .current_dir(&root)
+            .output()
+        {
+            if o.status.success() {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if let Some(name) = s.rsplit('/').next() {
+                    if !name.is_empty() && name != "HEAD" {
+                        return name.to_string();
+                    }
+                }
+            }
+        }
+        // 2) whatever branch the main checkout currently has checked out.
+        if let Ok(o) = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&root)
+            .output()
+        {
+            if o.status.success() {
+                let b = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if !b.is_empty() && b != "HEAD" {
+                    return b;
+                }
+            }
+        }
+        // 3) common trunk names.
+        for cand in [DEFAULT_BRANCH, "master", "trunk", "develop"] {
+            if Command::new("git")
+                .args(["show-ref", "--verify", "--quiet", &format!("refs/heads/{cand}")])
+                .current_dir(&root)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+            {
+                return cand.to_string();
+            }
+        }
+        DEFAULT_BRANCH.to_string()
     }
 
     fn wt_parent_abs(&self) -> PathBuf {
@@ -130,7 +207,9 @@ impl Wt {
     }
 
     /// Build + test verification command, chosen from the project layout, unless
-    /// `PIR_WT_CHECK` overrides it. Returns None if there is nothing to verify.
+    /// `PIR_WT_CHECK` overrides it. Returns `None` if there is nothing to verify
+    /// (no override and no recognized project type) — callers must treat that as
+    /// "we don't know", NOT as "pass".
     fn verify_cmd(&self, wt_dir: &Path) -> Option<String> {
         if let Ok(c) = std::env::var("PIR_WT_CHECK") {
             if !c.trim().is_empty() {
@@ -157,11 +236,12 @@ impl Wt {
         None
     }
 
-    /// Run the verification command inside the given worktree. Returns
-    /// (passed: bool, summary: String).
-    fn verify(&self, wt_dir: &Path) -> (bool, String) {
+    /// Run the verification command inside the given worktree. Never claims
+    /// success when no command could be determined (`Verdict::NoChecks`).
+    fn verify(&self, wt_dir: &Path) -> Verdict {
         let Some(cmd) = self.verify_cmd(wt_dir) else {
-            return (true, "no project-type checks configured; nothing to verify".into());
+            // Conservative: with no configured/recognized check, we do NOT auto-merge.
+            return Verdict::NoChecks;
         };
         let out = Command::new("bash")
             .arg("-lc")
@@ -174,9 +254,13 @@ impl Wt {
                 let mut log = String::from_utf8_lossy(&o.stdout).into_owned();
                 log.push_str(&String::from_utf8_lossy(&o.stderr));
                 crate::plugin::truncate(&mut log, 4000);
-                (passed, log)
+                if passed {
+                    Verdict::Passed(log)
+                } else {
+                    Verdict::Failed(log)
+                }
             }
-            Err(e) => (false, format!("verify spawn error: {e}")),
+            Err(e) => Verdict::Failed(format!("verify spawn error: {e}")),
         }
     }
 
@@ -217,20 +301,22 @@ impl Wt {
         }
     }
 
-    /// From the main checkout, fast-forward `main` to `origin/main` if a
-    /// fast-forward is possible (no local-only commits). Returns Ok(true) if
-    /// main is now up to date (or there's no upstream to ff), Ok(false) if it
-    /// couldn't ff (diverged), Err(msg) on an unexpected git failure.
+    /// From the main checkout, fast-forward the *trunk* branch to
+    /// `origin/<trunk>` if a fast-forward is possible (no local-only commits).
+    /// Returns Ok(true) if trunk is now up to date (or there's no upstream to ff),
+    /// Ok(false) if it couldn't ff (diverged), Err(msg) on an unexpected git failure.
     fn ff_main(&self) -> Result<bool, String> {
         let root = self.repo_root();
+        let trunk = self.trunk();
         let _ = Command::new("git")
             .args(["fetch", "--quiet", "origin"])
             .current_dir(&root)
             .status();
-        // If there's no origin/main to fast-forward against, just proceed (a
+        // If there's no origin/<trunk> to fast-forward against, just proceed (a
         // purely-local repo, or offline). Never block the merge for that.
+        let upstream = format!("origin/{trunk}");
         let has_upstream = Command::new("git")
-            .args(["rev-parse", "--verify", "origin/main"])
+            .args(["rev-parse", "--verify", &upstream])
             .current_dir(&root)
             .output()
             .map(|o| o.status.success())
@@ -239,7 +325,7 @@ impl Wt {
             return Ok(true);
         }
         let ff = Command::new("git")
-            .args(["merge", "--ff-only", "origin/main"])
+            .args(["merge", "--ff-only", &upstream])
             .current_dir(&root)
             .status();
         match ff {
@@ -259,12 +345,12 @@ impl Wt {
         };
         let root = self.repo_root();
 
-        // Make sure main is current; only fast-forward, never rewrite main.
+        // Make sure trunk is current; only fast-forward, never rewrite trunk.
         match self.ff_main() {
             Ok(true) => {}
             Ok(false) => {
                 return Outcome::err(
-                    "wt: main has diverged from origin/main and cannot be fast-forwarded; \
+                    "wt: trunk has diverged from origin and cannot be fast-forwarded; \
                      skipping auto-merge (pull/resolve manually)"
                         .into(),
                 );
@@ -272,14 +358,16 @@ impl Wt {
             Err(e) => return Outcome::err(e),
         }
 
+        let trunk = self.trunk();
         let status = Command::new("git")
-            .args(["merge", "--no-ff", "-m", &format!("Merge {branch} into main (pir wt)"), branch])
+            .args(["merge", "--no-ff", "-m", &format!("Merge {branch} into {trunk} (pir wt)"), branch])
             .current_dir(&root)
             .status();
         match status {
             Ok(s) if s.success() => Outcome::ok(format!(
-                "merged {branch} into main (in {})",
-                root.display()
+                "merged {branch} into {trunk} (in {})",
+                root.display(),
+                trunk = trunk
             )),
             Ok(_) => Outcome::err(
                 "wt: merge conflict or merge failed; resolve manually in the main checkout".into(),
@@ -288,7 +376,7 @@ impl Wt {
         }
     }
 
-    /// Full idle pipeline: ff main, verify, then merge or ask-the-model-to-fix.
+    /// Full idle pipeline: ff trunk, verify, then merge or ask-the-model-to-fix.
     /// Returns an optional follow-up prompt (to fix) and a human-readable line.
     fn auto_flow(&mut self) -> (Option<String>, String) {
         let Some(wt_dir) = self.current.clone() else {
@@ -305,28 +393,57 @@ impl Wt {
             .current_dir(&wt_dir)
             .status();
 
-        let (passed, summary) = self.verify(&wt_dir);
-        if !passed {
-            let msg = format!(
-                "wt: checks FAILED on branch {branch} — asking the model to fix.\n{summary}"
-            );
-            let fix_prompt = format!(
-                "Verification (build/test) failed in worktree {wt_dir}: {branch}.\n\
-                 Diagnose and fix the failure. Re-run the verification commands to confirm a clean build+test before finishing.",
-                wt_dir = wt_dir.display()
-            );
-            return (Some(fix_prompt), msg);
-        }
-
-        let merge = self.merge_into_main(&branch);
-        if merge.is_error {
-            (None, merge.content)
-        } else {
-            // Merged: drop the now-merged branch's worktree so we don't leave it
-            // lying around, then return to the main checkout.
-            let remove = self.remove_worktree(&wt_dir, &branch);
-            self.return_to_main();
-            (None, format!("{}\n{}", merge.content, remove.content))
+        let verdict = self.verify(&wt_dir);
+        match verdict {
+            Verdict::Failed(summary) => {
+                // Checks failed: ask the model to fix, but only up to MAX_FIX_ATTEMPTS
+                // times — beyond that, stop re-queuing so the user can intervene.
+                if self.fix_attempts >= MAX_FIX_ATTEMPTS {
+                    let msg = format!(
+                        "wt: checks STILL FAILED on {branch} after {} fix attempts; \
+                         not re-queueing. Resolve manually or run wt_merge when green.",
+                        MAX_FIX_ATTEMPTS
+                    );
+                    return (None, msg);
+                }
+                self.fix_attempts += 1;
+                let msg = format!(
+                    "wt: checks FAILED on branch {branch} (attempt {}/{}) — asking the model to fix.\n{summary}",
+                    self.fix_attempts, MAX_FIX_ATTEMPTS
+                );
+                let fix_prompt = format!(
+                    "Verification (build/test) failed in worktree {wt_dir}: {branch}.\n\
+                     Diagnose and fix the failure. Re-run the verification commands to confirm a clean build+test before finishing.",
+                    wt_dir = wt_dir.display()
+                );
+                (Some(fix_prompt), msg)
+            }
+            Verdict::NoChecks => {
+                // No verification command was configured/recognized: do NOT silently
+                // merge. Surface it and require an explicit wt_merge (or a PIR_WT_CHECK).
+                (
+                    None,
+                    format!(
+                        "wt: no build/test checks for {branch} (set PIR_WT_CHECK, or add a \
+                         Cargo.toml/package.json/pyproject.toml/Makefile). Skipping auto-merge; \
+                         run wt_merge to merge manually."
+                    ),
+                )
+            }
+            Verdict::Passed(summary) => {
+                // Checks passed: reset the fix counter and merge back.
+                self.fix_attempts = 0;
+                let merge = self.merge_into_main(&branch);
+                if merge.is_error {
+                    (None, merge.content)
+                } else {
+                    let remove = self.remove_worktree(&wt_dir, &branch);
+                    self.return_to_main();
+                    (None, format!("{}\n{}", merge.content, remove.content))
+                }
+                // `summary` is intentionally not echoed to the idle line to keep
+                // green merges quiet; it is still available via `wt_verify`.
+            }
         }
     }
 
@@ -377,10 +494,10 @@ impl Wt {
         let _ = std::fs::create_dir_all(&parent);
         let wt_dir = parent.join(&name);
 
-        // Always branch from the latest main (best-effort fast-forward; if there
-        // is no upstream we just branch from the local main).
+        // Always branch from the latest trunk (best-effort fast-forward; if there
+        // is no upstream we just branch from the local trunk).
         let _ = self.ff_main();
-        let start = DEFAULT_BRANCH.to_string();
+        let start = self.trunk();
         let add = Command::new("git")
             .args(["worktree", "add", "-b", &branch])
             .arg(&wt_dir)
@@ -473,10 +590,11 @@ impl ToolBackend for Wt {
             ToolSpec {
                 name: "wt_create",
                 description:
-                    "Create a linked git worktree off the current main with a fresh branch, and \
-                     cd the agent into it so subsequent tools operate there. Optionally pass a \
-                     'base' name to prefix the branch. The main checkout is remembered and used \
-                     for merges. Requires PIR_WT=1.",
+                    "Create a linked git worktree off the repo's trunk branch (auto-detected: \
+                     origin/HEAD, then the checked-out branch, else main/master/...) with a fresh \
+                     branch, and cd the agent into it so subsequent tools operate there. \
+                     Optionally pass a 'base' name to prefix the branch. The main checkout is \
+                     remembered and used for merges. Requires PIR_WT=1.",
                 schema: json!({
                     "type": "object",
                     "properties": {
@@ -527,11 +645,14 @@ impl ToolBackend for Wt {
                 let Some(wt_dir) = self.current.clone() else {
                     return Outcome::err("wt: not in a worktree".into());
                 };
-                let (passed, summary) = self.verify(&wt_dir);
-                if passed {
-                    Outcome::ok(format!("wt: checks passed\n{summary}"))
-                } else {
-                    Outcome::err(format!("wt: checks FAILED\n{summary}"))
+                match self.verify(&wt_dir) {
+                    Verdict::Passed(s) => Outcome::ok(format!("wt: checks passed\n{s}")),
+                    Verdict::Failed(s) => Outcome::err(format!("wt: checks FAILED\n{s}")),
+                    Verdict::NoChecks => Outcome::err(
+                        "wt: no build/test checks configured for this project (set PIR_WT_CHECK, or \
+                         add a Cargo.toml/package.json/pyproject.toml/Makefile). Nothing was verified."
+                            .into(),
+                    ),
                 }
             }
             "wt_merge" => {
@@ -552,14 +673,15 @@ impl ToolBackend for Wt {
                 match &self.current {
                     Some(wt_dir) => {
                         let branch = self.worktree_branch(wt_dir).unwrap_or_else(|| "(detached)".into());
+                        let trunk = self.trunk();
                         Outcome::ok(format!(
-                            "wt: in worktree {} on branch {branch}; main checkout at {}",
+                            "wt: in worktree {} on branch {branch}; trunk is {trunk} at {}",
                             wt_dir.display(),
                             self.repo_root().display()
                         ))
                     }
                     None => Outcome::ok(format!(
-                        "wt: on main checkout {} (no active worktree)",
+                        "wt: on the trunk checkout {} (no active worktree)",
                         self.repo_root().display()
                     )),
                 }
@@ -664,11 +786,12 @@ mod tests {
         Command::new("git").args(["add", "change.txt"]).current_dir(&here).status().unwrap();
         Command::new("git").args(["commit", "-qm", "add change"]).current_dir(&here).status().unwrap();
 
-        // Verify should pass (no project tooling).
-        let (passed, _) = wt.verify(&here);
-        assert!(passed, "verify should pass for an empty project");
+        // With a real check command set, verify() runs it and should pass.
+        std::env::set_var("PIR_WT_CHECK", "true");
+        let verdict = wt.verify(&here);
+        assert!(matches!(verdict, Verdict::Passed(_)), "verify should pass with PIR_WT_CHECK=true");
 
-        // Merge back into main from the main checkout.
+        // Merge back into trunk (main here) from the main checkout.
         let branch = wt.worktree_branch(&here).unwrap();
         let merged = wt.merge_into_main(&branch);
         assert!(!merged.is_error, "merge failed: {}", merged.content);
@@ -730,5 +853,34 @@ mod tests {
         assert!(!wt.enabled, "wt must be off by default");
         assert!(!wt.in_worktree());
         assert!(wt.specs().is_empty(), "no tools when disabled");
+    }
+
+    #[test]
+    fn no_checks_is_not_a_pass() {
+        // A bare repo (no PIR_WT_CHECK, no recognized project type) must report
+        // Verdict::NoChecks, never Verdict::Passed — so the extension will NOT
+        // silently auto-merge it.
+        std::env::remove_var("PIR_WT_CHECK");
+        let repo = scratch_repo();
+        let orig = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&repo).unwrap();
+        let wt = Wt::new();
+        assert!(matches!(wt.verify(&repo), Verdict::NoChecks), "bare repo => NoChecks");
+        let _ = fs::remove_dir_all(&repo);
+        let _ = std::env::set_current_dir(&orig);
+    }
+
+    #[test]
+    fn trunk_detection_prefers_checked_out_branch() {
+        // Repo whose default branch is "trunk" (not main). trunk() should pick it
+        // up from the checked-out branch.
+        let dir = scratch_repo();
+        let orig = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        Command::new("git").args(["checkout", "-qb", "trunk"]).current_dir(&dir).status().unwrap();
+        let wt = Wt::new();
+        assert_eq!(wt.trunk(), "trunk", "trunk() should detect the checked-out branch");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = std::env::set_current_dir(&orig);
     }
 }
