@@ -8,6 +8,8 @@ mod provider;
 mod term;
 mod types;
 mod user;
+#[cfg(feature = "tui")]
+mod tui;
 
 // Statically linked extensions, emitted by build.rs (type "a").
 include!(concat!(env!("OUT_DIR"), "/gen_registry.rs"));
@@ -209,6 +211,7 @@ fn main() {
     let mut as_user: Option<String> = None;
     let mut project_name: Option<String> = None;
     let mut bg_prompt: Option<String> = None;
+    let mut use_tui = false;
     let mut no_raw = false;
     let mut budget: Option<u64> = None;
 
@@ -282,6 +285,7 @@ fn main() {
                 println!("pir {}", env!("CARGO_PKG_VERSION"));
                 return;
             }
+            "--tui" => use_tui = true,
             x if x.starts_with('-') => die(&format!("unknown flag {x} — try --help")),
             x => prompt.push(x.to_string()),
         }
@@ -458,6 +462,35 @@ fn main() {
             Err(e) => agent.notify_on_exit(agent.error_event(e)),
         }
         return;
+    }
+
+    // Opt-in full-screen TUI REPL (--tui). The default streaming REPL stays the
+    // normal path; this only runs when the `tui` feature is compiled in AND the
+    // user passes --tui. It owns the terminal (alternate screen + raw mode via
+    // crossterm) and renders a conversation pane + footer pane (thinking +
+    // live draft prompt) with its own scrollback — no hand-rolled ANSI block,
+    // so the stray-spinner class of bug can't recur.
+    #[cfg(feature = "tui")]
+    if use_tui {
+        let agent_slot: Arc<Mutex<Option<Agent>>> = Arc::new(Mutex::new(Some(agent)));
+        let (done_tx, _done_rx) = smol::channel::bounded(1);
+        match crate::tui::run(
+            &agent_slot,
+            &fg_cancel,
+            &typeahead,
+            &providers,
+            &bus,
+            &done_tx,
+            full_auto,
+            running_as_agent,
+        ) {
+            Ok(()) => return,
+            Err(e) => {
+                // Fall back to the streaming REPL if the TUI can't start
+                // (e.g. not a tty). Leave `agent` owned by `agent_slot` alone.
+                eprintln!("pir: --tui failed: {e}; falling back to plain REPL");
+            }
+        }
     }
 
     println!("{}", term::bold("pir"));
@@ -715,7 +748,7 @@ fn main() {
 /// `typeahead` is not needed here: the agent already holds the shared buffer
 /// (the same Arc the REPL thread writes to), and the thinking spinner reads it
 /// directly from the agent (see [`crate::term::Spinner`]).
-fn run_foreground_turn(
+pub(crate) fn run_foreground_turn(
     agent_slot: &Arc<Mutex<Option<Agent>>>,
     cancel: &Arc<AtomicBool>,
     prompt: String,

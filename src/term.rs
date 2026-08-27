@@ -734,7 +734,22 @@ pub mod raw {
                     // return immediately and let the caller handle it.
                     return RawInput::Suspend;
                 }
-                0x1b => { /* ignore ESC sequences (arrows, etc.) */ }
+                0x1b => {
+                    // ESC is ambiguous: a lone Esc should cancel the turn (like
+                    // ctrl-c), but it's also the lead byte of arrow/function-key
+                    // sequences (e.g. ← = 0x1b 0x5b 0x44). So peek for follow-up
+                    // bytes with a short timeout: if none arrive, it's a lone Esc
+                    // → cancel; otherwise it's an escape sequence → consume and
+                    // ignore (we don't do cursor movement while raw).
+                    if lone_escape(fd) {
+                        buf.clear();
+                        if let Ok(mut g) = typeahead.lock() { g.clear(); }
+                        return RawInput::Cancel;
+                    }
+                    // Sequence: drain the remaining bytes so they don't leak into
+                    // the next poll, then ignore.
+                    drain_escape_sequence(fd);
+                }
                 c if c >= 0x20 && c < 0x7f => {
                     buf.push(c as char);
                     if let Ok(mut g) = typeahead.lock() {

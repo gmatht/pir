@@ -45,6 +45,7 @@ pub fn become_user(user: &str) -> Result<(), String> {
     // nothing to drop, but still point the agent at its self-owned toolchain
     // dirs so crates / gh don't land in the invoking user's home.
     if euid == uid {
+        ensure_home_dir(user);
         apply_toolchain_env(user);
         return Ok(());
     }
@@ -73,8 +74,72 @@ pub fn become_user(user: &str) -> Result<(), String> {
     }
     // Point the (now unprivileged) agent at its own, self-owned toolchain dirs
     // so it can fetch crates / use gh without touching root's files.
+    ensure_home_dir(user);
     apply_toolchain_env(user);
     Ok(())
+}
+
+/// Idempotently ensure the target user's home directory exists and is owned by
+/// them. Called from `become_user` at every `pir` launch so an `ai_*` agent
+/// always has a usable home — creation paths (e.g. `useradd -M`, or an
+/// `ai_*` account made outside `pir project init`) can otherwise leave the home
+/// absent, which would make the agent write config/cargo/gh into a missing path.
+///
+/// Under root we can both `mkdir` and `chown`/`chmod`; when already running as
+/// the target we can only `mkdir` (best-effort, and only if the parent is
+/// writable), which is intentionally non-fatal.
+#[cfg(unix)]
+fn ensure_home_dir(user: &str) {
+    use std::process::Command;
+
+    let home = {
+        let cuser = match std::ffi::CString::new(user) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let mut buf = vec![0u8; 4096];
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        unsafe {
+            if libc::getpwnam_r(
+                cuser.as_ptr(),
+                &mut pwd,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result,
+            ) != 0
+                || result.is_null()
+                || pwd.pw_dir.is_null()
+            {
+                return; // can't resolve a home to create
+            }
+            match std::ffi::CStr::from_ptr(pwd.pw_dir).to_str() {
+                Ok(s) => s.to_string(),
+                Err(_) => return,
+            }
+        }
+    };
+    if home.is_empty() {
+        return;
+    }
+    let home_p = std::path::Path::new(&home);
+    if home_p.exists() {
+        return; // already present; leave it alone
+    }
+    let euid = unsafe { libc::geteuid() };
+    if euid == 0 {
+        let _ = std::fs::create_dir_all(home_p);
+        let _ = Command::new("chown")
+            .args(["-R", &format!("{user}:{user}"), &home])
+            .status();
+        let _ = Command::new("chmod").args(["700", &home]).status();
+        println!("ensured home {home} owned by {user}");
+    } else {
+        // Best-effort: only works if the parent directory is writable by the
+        // already-target user. Non-fatal — the launch proceeds and the
+        // missing-home case surfaces through normal write failures.
+        let _ = std::fs::create_dir_all(home_p);
+    }
 }
 
 /// Set CARGO_HOME / GH_CONFIG_DIR (if the user was provisioned with self-owned

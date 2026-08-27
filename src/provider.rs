@@ -2,9 +2,11 @@ use crate::config::ApiKind;
 use crate::plugin::ToolSpec;
 use crate::types::{Block, Message, Role, Usage};
 use serde_json::{json, Map, Value};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Error, ErrorKind, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// How many times to retry a failed request (the first attempt is not a retry,
@@ -153,21 +155,33 @@ impl Client {
             let result: Result<(Message, Usage), String> = req
                 .send_json(&body)
                 .map_err(http_error)
-                .and_then(|resp| match self.kind {
-                    ApiKind::Anthropic => stream_anthropic(
-                        resp.into_reader(),
-                        on_text,
-                        &mut emitted_text,
-                        &mut saw_tool_calls,
-                        &cancel,
-                    ),
-                    ApiKind::OpenAi => stream_openai(
-                        resp.into_reader(),
-                        on_text,
-                        &mut emitted_text,
-                        &mut saw_tool_calls,
-                        &cancel,
-                    ),
+                .and_then(|resp| {
+                    // Wrap the blocking response body in a cancelable reader so
+                    // a Ctrl-C is honoured within tens of milliseconds even
+                    // while `ureq` is blocked in its network `recv` (waiting on
+                    // a slow / "thinking" provider or between SSE events). The
+                    // status-line read itself is left untouched (it stays
+                    // generous so slow providers don't fail on connect), and the
+                    // cancelable reader only governs the streaming body — which
+                    // is where the wait actually happens during a turn.
+                    let body_reader = CancelableReader::new(resp.into_reader(), cancel.clone());
+                    let mut reader = BufReader::new(body_reader);
+                    match self.kind {
+                        ApiKind::Anthropic => stream_anthropic(
+                            &mut reader,
+                            on_text,
+                            &mut emitted_text,
+                            &mut saw_tool_calls,
+                            &cancel,
+                        ),
+                        ApiKind::OpenAi => stream_openai(
+                            &mut reader,
+                            on_text,
+                            &mut emitted_text,
+                            &mut saw_tool_calls,
+                            &cancel,
+                        ),
+                    }
                 });
             match result {
                 Ok(r) => return Ok(r),
@@ -269,6 +283,123 @@ impl Client {
             })).collect()),
         );
         (format!("{}/chat/completions", self.base_url), Value::Object(body))
+    }
+}
+
+/// Wrap a blocking `Read` so it can be cancelled promptly. `ureq`'s blocking
+/// reader is parked inside a blocking `recv` that can sit for the full read
+/// timeout (up to 30s on a slow / "thinking" provider, or `STALL_TIMEOUT`=180s
+/// between SSE events). `std`/libc **auto-restart `EINTR`** on socket reads, so a
+/// signal-based interrupt does *not* break that wait — a cooperative
+/// `AtomicBool` check only runs at the next *successful* read boundary, which
+/// is exactly why a plain Ctrl-C could leave "cancelling turn…" spinning for
+/// seconds while the worker was still blocked on the network.
+///
+/// This reader solves it without touching the status-line read (which must stay
+/// generous) or relying on EINTR: a dedicated pump thread drains the underlying
+/// reader into a small channel, while `read()` polls that channel with a short
+/// (20ms) timeout. The moment `cancel` is set, the next poll returns an error
+/// instead of waiting for the next network byte — so a turn is honoured within
+/// tens of milliseconds (well under the 50ms target), every time, regardless of
+/// how long the peer is stalled. The pump thread is torn down on drop.
+struct CancelableReader<R: Read + Send + 'static> {
+    rx: mpsc::Receiver<u8>,
+    cancel: Arc<AtomicBool>,
+    pump: Option<thread::JoinHandle<()>>,
+}
+
+impl<R: Read + Send + 'static> CancelableReader<R> {
+    fn new(mut src: R, cancel: Arc<AtomicBool>) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<u8>(256);
+        let pump = thread::spawn(move || {
+            let mut buf = [0u8; 256];
+            loop {
+                match src.read(&mut buf) {
+                    Ok(0) => {
+                        // EOF: nothing more to read. The receiver will see
+                        // `Disconnected` once `tx` drops at the end of this
+                        // closure. No further bytes needed.
+                        break;
+                    }
+                    Ok(n) => {
+                        for &b in &buf[..n] {
+                            // Block only if the channel is full (the parser is
+                            // behind). On disconnect (reader dropped) stop.
+                            if tx.send(b).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Any read error (including a real timeout): stop the
+                        // pump. If it was a stall/timeout, the parser's own
+                        // watchdog (keyed off `last_byte`) will trip shortly;
+                        // if it was cancellation, `read()` will surface that
+                        // first. Either way we don't busy-spin on errors.
+                        break;
+                    }
+                }
+            }
+        });
+        CancelableReader { rx, cancel, pump: Some(pump) }
+    }
+}
+
+impl<R: Read + Send + 'static> Read for CancelableReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        if self.cancel.load(Ordering::SeqCst) {
+            return Err(Error::new(ErrorKind::Interrupted, "request cancelled"));
+        }
+        // Short poll so cancellation is honoured within milliseconds even when
+        // no bytes are arriving (a stalled / "thinking" provider).
+        match self.rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(b) => {
+                buf[0] = b;
+                // Greedily pull any immediately-available bytes to fill `buf`
+                // (avoid one-syscall-per-byte) without blocking past the poll.
+                let mut filled = 1;
+                while filled < buf.len() {
+                    match self.rx.try_recv() {
+                        Ok(b) => {
+                            buf[filled] = b;
+                            filled += 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                Ok(filled)
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // No byte within the poll window: re-check cancel and keep
+                // waiting (the pump is still draining the socket). `ErrorKind`
+                // here is `WouldBlock` so the SSE parsers' `is_read_timeout`
+                // treats it as a benign poll wake-up, not a fatal error.
+                if self.cancel.load(Ordering::SeqCst) {
+                    return Err(Error::new(ErrorKind::Interrupted, "request cancelled"));
+                }
+                Err(Error::new(ErrorKind::WouldBlock, "no data within poll window"))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Pump has ended (EOF or its own error). Surface cancellation if
+                // it was requested, else report EOF via a clean 0-byte read.
+                if self.cancel.load(Ordering::SeqCst) {
+                    return Err(Error::new(ErrorKind::Interrupted, "request cancelled"));
+                }
+                Ok(0)
+            }
+        }
+    }
+}
+
+impl<R: Read + Send + 'static> Drop for CancelableReader<R> {
+    fn drop(&mut self) {
+        // Signal cancellation so the pump stops even if the parser never set it
+        // (e.g. the stream ended first). This also unblocks `tx.send` (the
+        // receiver is gone), letting the pump thread exit promptly.
+        self.cancel.store(true, Ordering::SeqCst);
+        if let Some(h) = self.pump.take() {
+            let _ = h.join();
+        }
     }
 }
 
@@ -430,7 +561,17 @@ fn stream_anthropic<R: Read>(
                 // socket timeout surfaces as WouldBlock, not TimedOut.
                 continue;
             }
-            Err(e) => return Err(format!("stream: {e}")),
+            Err(e) => {
+                // The cancelable body reader interrupts with `ErrorKind::Interrupted`
+                // (message "request cancelled") the instant the cooperative flag
+                // is set. Surface that as the canonical cancellation error so the
+                // chat loop stops immediately (no retry/backoff), instead of being
+                // wrapped into a non-matching "stream: request cancelled".
+                if cancel.load(Ordering::SeqCst) || e.kind() == std::io::ErrorKind::Interrupted {
+                    return Err("request cancelled".to_string());
+                }
+                return Err(format!("stream: {e}"));
+            }
         };
         if n == 0 {
             // EOF (or a timed-out read that returned nothing): if we've been
@@ -542,7 +683,12 @@ fn stream_openai<R: Read>(
         let n = match reader.read_line(&mut line) {
             Ok(n) => n,
             Err(e) if is_read_timeout(&e) => continue,
-            Err(e) => return Err(format!("stream: {e}")),
+            Err(e) => {
+                if cancel.load(Ordering::SeqCst) || e.kind() == std::io::ErrorKind::Interrupted {
+                    return Err("request cancelled".to_string());
+                }
+                return Err(format!("stream: {e}"));
+            }
         };
         if n == 0 {
             if last_byte.elapsed() > stall_timeout() {

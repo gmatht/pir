@@ -12,6 +12,17 @@ rustyline = "14"                                 # line editing: history + curso
 libc = "0.2"                                     # uid/gid drop for per-project users
 smol = "2"                                       # async runtime: event-driven stdin wait while a turn runs
 
+# Optional TUI deps, only built when `--features tui` is set (so the default
+# binary stays lightweight and the locked build cache is unaffected).
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", optional = true }
+
+[features]
+# Opt-in full-screen TUI REPL: a real layout engine (no hand-rolled ANSI block)
+# with a conversation pane + footer pane (thinking + live draft prompt) and
+# in-app scrollback. Off by default; enable with `cargo run --features tui -- --tui`.
+tui = ["dep:ratatui", "dep:crossterm"]
+
 [profile.release]
 strip = true
 lto = true
