@@ -275,12 +275,12 @@ pub fn provision(
     crate::config::set_project_user(project, user, &path_s)?;
 
     // 4. Give the agent user its own network-capable toolchain dirs.
-    //    `ai_*` users run as themselves (non-root) but $HOME is usually still
-    //    inherited from root, so the default /root/.cargo and /root/.config/gh
-    //    are unwritable. Create self-owned CARGO_HOME and GH_CONFIG_DIR so the
-    //    agent can fetch crates and use gh without touching root's files.
-    //    `toolchain_env_for` exposes these so a launch as this user picks them
-    //    up.
+    //    `ai_*` users run as themselves (non-root) and `toolchain_env_for`
+    //    derives CARGO_HOME/GH_CONFIG_DIR from the user's *real* home
+    //    (not $HOME), so crates/gh land under ~ai_X (e.g. /home/ai_rpi/.cargo),
+    //    never /root/.cargo. Create + own those dirs so the agent can fetch
+    //    crates and use gh without touching root's files. `become_user` applies
+    //    these env vars at every launch.
     setup_agent_toolchain(user)?;
 
     // 5. Make the `.git` setup sane for LLM use on a fresh project: install the
