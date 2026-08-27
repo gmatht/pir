@@ -520,6 +520,9 @@ impl Agent {
                         eprintln!("{} {e}", term::red("error:"));
                     }
                     self.notify.publish(AgentEvent::Error { message: e.clone() }, false);
+                    if !self.quiet {
+                        self.registry.on_turn_end(user);
+                    }
                     return Err(e);
                 }
             };
@@ -538,6 +541,9 @@ impl Agent {
 
             if calls.is_empty() {
                 self.notify.publish(self.turn_done_event(), false);
+                if !self.quiet {
+                    self.registry.on_turn_end(user);
+                }
                 return Ok(());
             }
 

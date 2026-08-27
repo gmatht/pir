@@ -75,6 +75,24 @@ pub trait ToolBackend: Send {
     fn specs(&self) -> Vec<ToolSpec>;
     /// Run a tool by name. Return [`Outcome::err`] for unknown names.
     fn run(&mut self, name: &str, input: &Value) -> Outcome;
+
+    /// Called once when the backend is attached to an agent, before the first
+    /// turn. `launch_cwd` is the directory pir was started in (used by
+    /// extensions that must anchor state to the project rather than the
+    /// current working directory).
+    fn on_session_start(&mut self, _launch_cwd: &std::path::Path) {}
+
+    /// Called once when the agent/REPL is shutting down. Use it to release
+    /// resources the backend created (e.g. git worktrees). Returning an error
+    /// is logged but does not abort exit.
+    fn on_exit(&mut self) {}
+
+    /// Called after each user turn completes (success or provider error), with
+    /// the user's prompt text. Extensions use this for side effects that should
+    /// follow every prompt — e.g. auto-committing the working tree and deriving
+    /// the commit message from `prompt`. Default no-op; the agent only invokes
+    /// this for non-background turns.
+    fn on_turn_end(&mut self, _prompt: &str) {}
 }
 
 /// Holds every linked backend. The model only ever sees `specs()`; it never
@@ -120,6 +138,28 @@ impl Registry {
     }
     pub fn is_empty(&self) -> bool {
         self.backends.is_empty()
+    }
+
+    /// Notify every backend that a session has begun.
+    pub fn session_started(&mut self, launch_cwd: &std::path::Path) {
+        for b in &mut self.backends {
+            b.on_session_start(launch_cwd);
+        }
+    }
+
+    /// Notify every backend that the agent is shutting down.
+    pub fn exited(&mut self) {
+        for b in &mut self.backends {
+            b.on_exit();
+        }
+    }
+
+    /// Notify every backend that a user turn just completed. `prompt` is the
+    /// text the user submitted for that turn.
+    pub fn on_turn_end(&mut self, prompt: &str) {
+        for b in &mut self.backends {
+            b.on_turn_end(prompt);
+        }
     }
 }
 
