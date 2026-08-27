@@ -74,11 +74,39 @@ Set `PIR_WT_CHECK` to a shell command to pin verification explicitly.
   `base` is given to `wt_create`).
 * Requires git and `flock` (present on Linux/macOS).
 
+## Copy-on-write fast-path (optional)
+
+Creating a worktree with `git worktree add` already shares the git object
+database across agents (only a checkout is materialized), so it's cheap. But
+the agent's **build artifacts** (e.g. Rust `target/`, hundreds of MB) are not
+shared, so each agent recompiles from scratch.
+
+Set `PIR_WT_COW=1` and point `PIR_WT_TEMPLATE` at a *pre-built* worktree dir:
+
+```
+PIR_WT_COW=1 PIR_WT_TEMPLATE=/repo/.git/wt/_built cargo build   # build a template once
+PIR_WT_COW=1 PIR_WT_TEMPLATE=/repo/.git/wt/_built pir            # agents clone target/ via CoW
+```
+
+`wt_create` then clones the template's build dir (default `target/`, override
+with `PIR_WT_BUILD_DIR`) into the fresh worktree. On a **CoW filesystem**
+(btrfs, xfs with reflink, apfs) this uses `cp --reflink=always`, so the clone is
+near-instant and near-zero-space until files diverge. On a non-CoW FS (ext4,
+this environment) it detects reflink isn't supported and falls back to a plain
+copy — or, if `PIR_WT_COW` is unset, skips the clone entirely and lets the
+agent build normally.
+
+**Safety:** only build artifacts are cloned. The worktree's `.git` is never
+copied — `git` owns worktree bookkeeping, so CoW cloning can't corrupt it.
+`btrfs subvolume snapshot` is not used directly (it would duplicate `.git`); the
+reflink clone of just the build dir achieves the same space/time win without
+that pitfall.
+
 ## Tools
 
 | Tool | Purpose |
 |------|---------|
-| `wt_create` | create worktree off trunk + branch, cd into it |
+| `wt_create` | create worktree off trunk + branch, cd into it (optional CoW build clone) |
 | `wt_verify` | run build/test checks for the current worktree |
 | `wt_merge`  | merge current branch into trunk (under lock) + remove worktree |
 | `wt_status` | report current worktree / branch / trunk checkout |

@@ -507,15 +507,89 @@ impl Wt {
         if !add.map(|s| s.success()).unwrap_or(false) {
             return Outcome::err(format!("wt: git worktree add failed (branch {branch})"));
         }
+        // Optional CoW fast-path: clone a pre-built template worktree's build
+        // dir (e.g. target/) into the fresh worktree so the agent doesn't
+        // recompile from scratch. Only when PIR_WT_COW=1 and PIR_WT_TEMPLATE
+        // points at an existing worktree dir. We copy only build artifacts,
+        // never the worktree's .git (git owns worktree bookkeeping).
+        let cow_note = self.maybe_cow_build_dir(&wt_dir);
         // Move the agent into the worktree so bash/edit_file operate there.
         if let Err(e) = std::env::set_current_dir(&wt_dir) {
             return Outcome::err(format!("wt: created {wt_dir} but cd failed: {e}", wt_dir = wt_dir.display()));
         }
         self.current = Some(wt_dir.clone());
-        Outcome::ok(format!(
+        let mut msg = format!(
             "created worktree {wt_dir} on branch {branch} (from {start}); cd'd into it. Run wt_status to inspect, or finish the turn to auto-verify+merge.",
             wt_dir = wt_dir.display()
-        ))
+        );
+        if !cow_note.is_empty() {
+            msg.push_str(&format!("\n{cow_note}"));
+        }
+        Outcome::ok(msg)
+    }
+
+    /// If `PIR_WT_COW=1` and `PIR_WT_TEMPLATE` names a pre-built worktree dir,
+    /// copy its build directory (default `target/`, override with
+    /// `PIR_WT_BUILD_DIR`) into `wt_dir` using copy-on-write when the filesystem
+    /// supports it (btrfs/xfs-reflink/apfs via `cp --reflink=always`), else a
+    /// plain recursive copy. Returns a human-readable note (empty if skipped).
+    /// Never touches `.git` — git manages worktree state.
+    fn maybe_cow_build_dir(&self, wt_dir: &Path) -> String {
+        let cow_on = std::env::var_os("PIR_WT_COW").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+        if !cow_on {
+            return String::new();
+        }
+        let Some(template) = std::env::var_os("PIR_WT_TEMPLATE") else {
+            return String::new();
+        };
+        let template = PathBuf::from(template);
+        if !template.is_dir() {
+            return format!(
+                "[wt] PIR_WT_COW set but PIR_WT_TEMPLATE {p:?} is not a directory; skipping CoW",
+                p = template.display()
+            );
+        }
+        let build_rel = std::env::var("PIR_WT_BUILD_DIR").unwrap_or_else(|_| "target".into());
+        let src = template.join(&build_rel);
+        let dst = wt_dir.join(&build_rel);
+        if !src.exists() {
+            return format!("[wt] PIR_WT_COW: template has no {b:?}; skipping CoW", b = build_rel);
+        }
+        let method = if Self::cow_supported(wt_dir) { "reflink (CoW)" } else { "copy" };
+        let status = if Self::cow_supported(wt_dir) {
+            Command::new("cp")
+                .args(["--reflink=always", "-a", "--"])
+                .arg(&src)
+                .arg(&dst)
+                .status()
+        } else {
+            Command::new("cp").args(["-a", "--"]).arg(&src).arg(&dst).status()
+        };
+        match status {
+            Ok(s) if s.success() => format!(
+                "[wt] CoW fast-path: cloned {b:?} from template via {m} (no rebuild needed)",
+                b = build_rel, m = method
+            ),
+            Ok(_) => format!("[wt] PIR_WT_COW: cloning {b:?} failed; agent will build normally", b = build_rel),
+            Err(e) => format!("[wt] PIR_WT_COW: clone error {e}; agent will build normally"),
+        }
+    }
+
+    /// True when the filesystem holding `dir` can do copy-on-write clones via
+    /// `cp --reflink=always` (btrfs, xfs with reflink, apfs, ...). Probe by
+    /// attempting a reflink copy of a tiny temp file — the only reliable,
+    /// portable test (fstype strings vary across platforms).
+    fn cow_supported(dir: &Path) -> bool {
+        let probe = dir.join(format!(".pir-wt-cow-probe-{}", std::process::id()));
+        let _ = std::fs::write(&probe, b"x");
+        let out = Command::new("cp")
+            .args(["--reflink=always", "--"])
+            .arg(&probe)
+            .arg(dir.join(format!(".pir-wt-cow-probe-{}-2", std::process::id())))
+            .status();
+        let _ = std::fs::remove_file(&probe);
+        let _ = std::fs::remove_file(dir.join(format!(".pir-wt-cow-probe-{}-2", std::process::id())));
+        out.map(|s| s.success()).unwrap_or(false)
     }
 }
 
@@ -593,8 +667,10 @@ impl ToolBackend for Wt {
                     "Create a linked git worktree off the repo's trunk branch (auto-detected: \
                      origin/HEAD, then the checked-out branch, else main/master/...) with a fresh \
                      branch, and cd the agent into it so subsequent tools operate there. \
-                     Optionally pass a 'base' name to prefix the branch. The main checkout is \
-                     remembered and used for merges. Requires PIR_WT=1.",
+                     Optionally pass a 'base' name to prefix the branch. The trunk checkout is \
+                     remembered and used for merges. Requires PIR_WT=1. With PIR_WT_COW=1 and \
+                     PIR_WT_TEMPLATE=<prebuilt-worktree>, the build dir (target/, or PIR_WT_BUILD_DIR) \
+                     is cloned copy-on-write (btrfs/xfs-reflink/apfs) so the agent skips rebuilding.",
                 schema: json!({
                     "type": "object",
                     "properties": {
@@ -853,6 +929,16 @@ mod tests {
         assert!(!wt.enabled, "wt must be off by default");
         assert!(!wt.in_worktree());
         assert!(wt.specs().is_empty(), "no tools when disabled");
+    }
+
+    #[test]
+    fn cow_supported_gracefully_false_on_non_cow_fs() {
+        // On ext4 (this env) reflink isn't supported, so cow_supported must
+        // report false and the create() fast-path degrades to plain worktree
+        // add. On btrfs/xfs-reflink it would return true and clone via reflink.
+        let dir = scratch_repo();
+        assert!(!Wt::cow_supported(&dir), "ext4 has no CoW reflink; must be false");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
