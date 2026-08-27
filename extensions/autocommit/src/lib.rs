@@ -76,7 +76,15 @@ impl AutoCommit {
     /// Resolve which VCS to use, based on `PIR_VCS` and availability.
     fn select_vcs(&mut self, cwd: &Path) {
         self.jj_available = Self::jj_is_real();
-        let choice = std::env::var("PIR_VCS").unwrap_or_else(|_| "git".into());
+        // Default: prefer jj when the repo is already a jj repo (.jj dir, or
+        // `jj root` succeeds), else git. An explicit PIR_VCS always wins.
+        let choice = std::env::var("PIR_VCS").unwrap_or_else(|_| {
+            if crate::project::detect_vcs(cwd) == crate::project::Vcs::Jj {
+                "jj".into()
+            } else {
+                "git".into()
+            }
+        });
         match choice.as_str() {
             "jj" => {
                 if self.jj_available {
@@ -166,7 +174,72 @@ impl AutoCommit {
             let _ = Command::new("git").args(["reset", "-q"]).current_dir(&self.cwd).status();
             return Err("refusing to commit: ignored file would be staged".into());
         }
+        // Guard against committing huge/binary files even if the repo's
+        // pre-commit hook is somehow absent (the hook is the primary guard;
+        // this is defense-in-depth so the agent refuses loudly on its own).
+        // Bypass with PIR_COMMIT_NO_VERIFY=1 (mirrors `git commit --no-verify`).
+        if std::env::var_os("PIR_COMMIT_NO_VERIFY").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) {
+            return Ok(());
+        }
+        if let Err(e) = self.guard_no_bloat() {
+            let _ = Command::new("git").args(["reset", "-q"]).current_dir(&self.cwd).status();
+            return Err(e);
+        }
         Ok(())
+    }
+
+    /// Refuse to stage files that are too large or binary. Uses the same
+    /// threshold as the pre-commit hook (`PIR_COMMIT_MAX_BYTES`, default 1 MiB).
+    fn guard_no_bloat(&self) -> Result<(), String> {
+        let max = crate::project::commit_max_bytes();
+        let out = Command::new("git")
+            .args(["diff", "--cached", "--name-only", "--diff-filter=ACMR"])
+            .current_dir(&self.cwd)
+            .output();
+        let files = match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+            _ => return Ok(()), // can't enumerate -> don't block
+        };
+        let mut offenders = Vec::new();
+        for f in files.lines() {
+            let f = f.trim();
+            if f.is_empty() {
+                continue;
+            }
+            // Size check.
+            let sz = Command::new("git")
+                .args(["cat-file", "-s", &format!(":{f}")])
+                .current_dir(&self.cwd)
+                .output();
+            if let Ok(o) = sz {
+                let s = String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().unwrap_or(0);
+                if s > max {
+                    offenders.push(format!("{f} ({s} bytes > {max})"));
+                    continue;
+                }
+            }
+            // Binary check: git reports `- -` in numstat for binary content.
+            let num = Command::new("git")
+                .args(["diff", "--cached", "--numstat", "--", f])
+                .current_dir(&self.cwd)
+                .output();
+            if let Ok(o) = num {
+                let line = String::from_utf8_lossy(&o.stdout);
+                if line.split_whitespace().take(2).collect::<Vec<_>>() == ["-", "-"] {
+                    offenders.push(format!("{f} (binary)"));
+                }
+            }
+        }
+        if offenders.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "refusing to commit: {} too large/binary. Raise PIR_COMMIT_MAX_BYTES, or set \
+                 PIR_COMMIT_NO_VERIFY=1 to override once.\n  - {}",
+                if offenders.len() == 1 { "file is" } else { "files are" },
+                offenders.join("\n  - ")
+            ))
+        }
     }
 
     fn git_nothing_to_commit(&self) -> bool {
