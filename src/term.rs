@@ -451,7 +451,11 @@ pub mod raw {
             events: libc::POLLIN,
             revents: 0,
         };
-        if unsafe { libc::poll(&mut pfd, 1, 0) } <= 0 {
+        // Poll with a short timeout so the REPL thread sleeps between checks
+        // instead of spinning at 100% CPU while a worker turn is just waiting
+        // on the network. 30ms keeps typing responsive without a busy loop.
+        const POLL_MS: libc::c_int = 30;
+        if unsafe { libc::poll(&mut pfd, 1, POLL_MS) } <= 0 {
             return RawInput::None;
         }
         let mut tmp = [0u8; 256];
@@ -476,6 +480,11 @@ pub mod raw {
             }
         }
         if nread == 0 {
+            // No bytes ready yet (poll timed out): tell the caller so it can
+            // loop. Crucially this returns *without* busy-spinning — the poll
+            // below sleeps for `POLL_MS` between checks, so the main thread idles
+            // while a worker turn is just waiting on the network instead of
+            // pegging a CPU core at 100%.
             return RawInput::None;
         }
         let mut stdout = io::stdout();
