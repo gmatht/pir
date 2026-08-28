@@ -17,7 +17,7 @@ use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -865,6 +865,29 @@ fn truncate_mid(s: &str, max: usize) -> String {
 }
 
 fn spawn_shell(command: &str, cwd: &Path) -> Result<std::process::Child, String> {
+    // Hard-kill behind every `timeout`: GNU `timeout` alone sends only
+    // SIGTERM, so a child that ignores/traps TERM (or is wedged) survives the
+    // model's `timeout 120 cargo test`, keeps the stdout pipe open, and hangs
+    // the `| tail` consumer — which is exactly how a "timeout 120" runs 400s+
+    // in the field. We don't parse or rewrite the command text (fragile,
+    // quoting-aware); instead every pir-spawned `bash -c` sources `BASH`
+    // (non-interactive shells read it), where the model's timeout is wrapped
+    // with `-k 5` (KILL 5s after the TERM if still alive). User-defined
+    // overrides in the same file win over this default.
+    #[cfg(unix)]
+    {
+        let script = r#"
+__pir_timeout_default() { command timeout -k 5 "$@"; }
+timeout() { __pir_timeout_default "$@"; }
+"#;
+        let stash_dir = std::env::temp_dir().join("pir-timeout");
+        let _ = fs::create_dir_all(&stash_dir);
+        let path = stash_dir.join("bashenv");
+        let exists = fs::read_to_string(&path).map(|s| s.contains("__pir_timeout_default")).unwrap_or(false);
+        if !exists {
+            let _ = fs::write(&path, script);
+        }
+    }
     let build = |prog: &str, flag: &str| {
         let mut c = Command::new(prog);
         c.arg(flag).arg(command);
@@ -875,6 +898,18 @@ fn spawn_shell(command: &str, cwd: &Path) -> Result<std::process::Child, String>
         // `process_group(0)` is the cross-platform way to request it.
         #[cfg(unix)]
         c.process_group(0);
+        // Source the hard-kill timeout wrapper (see above): every
+        // non-interactive `bash -c` sources `$BASH_ENV`. (`BASH` itself can't
+        // be used — bash overwrites it with its own path.) `sh -c` fallbacks
+        // don't read it but that path is rare and this wrapper is
+        // defence-in-depth, not the primary containment.
+        #[cfg(unix)]
+        {
+            let path = std::env::temp_dir().join("pir-timeout/bashenv");
+            if path.is_file() {
+                c.env("BASH_ENV", path);
+            }
+        }
         c
     };
     let (prog, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("bash", "-c") };
