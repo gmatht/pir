@@ -1,4 +1,5 @@
 //! Backwards-compatible free-function facade over [`super::model`].
+#![allow(missing_docs)]
 //!
 //! The per-widget adapter ([`crate::backends_zork_adapter`]) was written against
 //! the old `backends::zork::*` free functions, which mutably operated on a
@@ -8,7 +9,8 @@
 
 use std::os::raw::c_void;
 
-use super::model::{with_state, MenuItemData};
+pub use super::model::MenuItemData;
+use super::model::with_state;
 
 pub type Callback = Box<dyn FnMut()>;
 
@@ -125,6 +127,3 @@ pub fn set_focus(_id: usize) {}
 pub fn quit() {
     with_state(|s| s.quit());
 }
-
-/// Convenience re-export so adapter code referencing `MenuItemData` keeps working.
-pub use MenuItemData as ZorkMenuItemData;

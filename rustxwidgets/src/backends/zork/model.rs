@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 pub type Callback = Box<dyn FnMut()>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct MenuItemData {
     pub label: String,
     pub action: String,
@@ -449,7 +449,7 @@ impl ZorkState {
                 }
                 _ => None,
             },
-            None,
+            None => None,
         };
         if became.is_some() {
             self.click(id);
@@ -503,11 +503,15 @@ impl ZorkState {
                     ZorkKind::Window { title }
                     | ZorkKind::Dialog { title } => s.title = Some(title.clone()),
                     ZorkKind::Label { text } | ZorkKind::TextView { text } => s.text = Some(text.clone()),
-                    ZorkKind::Button { label }
-                    | ZorkKind::CheckButton { label, .. }
-                    | ZorkKind::RadioButton { label, .. } => s.label = Some(label.clone()),
-                    ZorkKind::CheckButton { checked, .. }
-                    | ZorkKind::RadioButton { checked, .. } => s.checked = Some(*checked),
+                    ZorkKind::Button { label } => s.label = Some(label.clone()),
+                    ZorkKind::CheckButton { label, checked } => {
+                        s.label = Some(label.clone());
+                        s.checked = Some(*checked);
+                    }
+                    ZorkKind::RadioButton { label, checked, .. } => {
+                        s.label = Some(label.clone());
+                        s.checked = Some(*checked);
+                    }
                     ZorkKind::DropDown { items, selected } => {
                         s.items = Some(items.clone());
                         s.selected = *selected;

@@ -186,6 +186,18 @@ mod pancurses_backend {
 
     thread_local! {
         static PC_STATE: RefCell<PcState> = RefCell::new(PcState::new());
+        /// Optional host frame hook, invoked on the main thread after each
+        /// render. Lets a host application mirror external state into the widget
+        /// tree without its own timer thread (e.g. flush a chat transcript into
+        /// a TextView before every refresh). Cleared automatically on quit.
+        static FRAME_HOOK: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+    }
+
+    /// Install (or clear with `None`) a host frame hook run on every main-loop
+    /// iteration after rendering. The closure is invoked synchronously on the
+    /// UI thread, so it may mutate widgets directly.
+    pub fn set_frame_hook(hook: Option<Box<dyn FnMut()>>) {
+        FRAME_HOOK.with(|h| *h.borrow_mut() = hook);
     }
 
     fn with_state<F, R>(f: F) -> R
@@ -369,6 +381,14 @@ mod pancurses_backend {
                 with_state(|s| {
                     if !s.spreadsheet_output.is_empty() {
                         emit_sgr(&s.spreadsheet_output);
+                    }
+                });
+                // Host frame hook: lets a host app mirror external state into the
+                // widget tree on the main thread (e.g. flush a transcript into a
+                // TextView). Runs every loop iteration; cleared on quit.
+                FRAME_HOOK.with(|h| {
+                    if let Some(cb) = h.borrow_mut().as_mut() {
+                        cb();
                     }
                 });
                 match root.getch() {

@@ -64,7 +64,7 @@ impl BackendApp for ZorkApp {
     }
 }
 
-fn short_desc(state: &ZorkState, node: &ZorkNode) -> String {
+fn short_desc(_state: &ZorkState, node: &ZorkNode) -> String {
     match &node.kind {
         ZorkKind::Window { title } => format!("Window \"{}\"", title),
         ZorkKind::Button { label } => format!("Button \"{}\"", label),
@@ -90,8 +90,11 @@ fn short_desc(state: &ZorkState, node: &ZorkNode) -> String {
     }
 }
 
-fn dir_name(dirs: &[(&str, &ZorkNode)], id: usize) -> &str {
-    dirs.iter().find(|(_, t)| t.id == id).map(|(d, _)| *d).unwrap_or("?")
+fn dir_name(dirs: &[(&str, &ZorkNode)], id: usize) -> String {
+    dirs.iter()
+        .find(|(_, t)| t.id == id)
+        .map(|(d, _)| (*d).to_string())
+        .unwrap_or_else(|| "?".to_string())
 }
 
 fn describe_room(state: &ZorkState, node: &ZorkNode) {

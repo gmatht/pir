@@ -24,6 +24,8 @@ pub mod backends_wasm_adapter;
 pub mod backends_android_adapter;
 #[cfg(feature = "pancurses")]
 pub mod backends_pancurses_adapter;
+#[cfg(feature = "pancurses")]
+pub use crate::backends::pancurses::set_frame_hook;
 #[cfg(feature = "zork")]
 pub mod backends_zork_adapter;
 

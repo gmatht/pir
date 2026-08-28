@@ -7,20 +7,26 @@
 //! `select`) are synchronous and fire callbacks immediately, and state is
 //! asserted via getters or [`ZorkState::snapshot`].
 //!
+//! Each widget handle owns a shared `Rc<RefCell<ZorkState>>`, so widget methods
+//! (e.g. [`Label::set_text`]) do not require a `&Harness` reference and closures
+//! can capture handles without borrowing the harness.
+//!
 //! ```
+//! use std::rc::Rc;
+//! use std::cell::Cell;
 //! use rustxwidgets::backends::zork::harness::Harness;
 //!
-//! let mut h = Harness::new();
+//! let h = Harness::new();
 //! let label = h.create_label("count: 0");
 //! let btn = h.create_button("inc");
-//! let counter = std::rc::Rc::new(std::cell::Cell::new(0));
+//! let counter = Rc::new(Cell::new(0));
 //! {
 //!     let c = counter.clone();
 //!     let l = label.clone();
-//!     btn.on_click(&h, move || {
+//!     btn.on_click(move || {
 //!         let n = c.get() + 1;
 //!         c.set(n);
-//!         l.set_text(&h, &format!("count: {}", n));
+//!         l.set_text(&format!("count: {}", n));
 //!     });
 //! }
 //! h.click(&btn);
@@ -31,20 +37,21 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::backends::zork::model::{MenuItemData, ZorkKind, ZorkState};
+use crate::backends::zork::model::{MenuItemData, ZorkState};
 
 /// Opaque, cloneable handle to a node in the harness model.
 ///
-/// Cloning a handle is cheap and shares the same underlying node id; the
-/// backing [`ZorkState`] lives in the [`Harness`].
+/// Cloning a handle is cheap: it shares the same underlying node id and the same
+/// backing [`ZorkState`].
 #[derive(Clone)]
 pub struct Widget {
     pub(crate) id: usize,
+    pub(crate) state: Rc<RefCell<ZorkState>>,
 }
 
 impl Widget {
-    pub(crate) fn new(id: usize) -> Self {
-        Widget { id }
+    pub(crate) fn new(id: usize, state: Rc<RefCell<ZorkState>>) -> Self {
+        Widget { id, state }
     }
 }
 
@@ -54,8 +61,9 @@ pub trait AsId {
     fn id(&self) -> usize;
 }
 
-/// Typed test harness. Owns its own model so tests are isolated from the
-/// thread-local singleton and from each other.
+/// Typed test harness. Owns its own model (shared via [`Rc`] with the widget
+/// handles it produces) so tests are isolated from the thread-local singleton and
+/// from each other.
 pub struct Harness {
     state: Rc<RefCell<ZorkState>>,
 }
@@ -73,14 +81,6 @@ impl Harness {
         }
     }
 
-    pub(crate) fn state(&self) -> std::cell::Ref<'_, ZorkState> {
-        self.state.borrow()
-    }
-
-    pub(crate) fn state_mut(&self) -> std::cell::RefMut<'_, ZorkState> {
-        self.state.borrow_mut()
-    }
-
     /// Borrow the underlying model for direct assertions (e.g. via
     /// [`ZorkState::snapshot`]).
     pub fn with_state<R>(&self, f: impl FnOnce(&ZorkState) -> R) -> R {
@@ -90,63 +90,110 @@ impl Harness {
     // -- creation --
 
     pub fn create_window(&self) -> Window {
-        Window(Widget::new(self.state.borrow_mut().create_window()))
+        let id = self.state.borrow_mut().create_window();
+        Window(Widget::new(id, self.state.clone()))
     }
     pub fn create_dialog(&self) -> Dialog {
-        Dialog(Widget::new(self.state.borrow_mut().create_dialog()))
+        let id = self.state.borrow_mut().create_dialog();
+        Dialog(Widget::new(id, self.state.clone()))
     }
     pub fn create_button(&self, label: &str) -> Button {
-        Button(Widget::new(self.state.borrow_mut().create_button(label)))
+        let id = self.state.borrow_mut().create_button(label);
+        Button(Widget::new(id, self.state.clone()))
     }
     pub fn create_label(&self, text: &str) -> Label {
-        Label(Widget::new(self.state.borrow_mut().create_label(text)))
+        let id = self.state.borrow_mut().create_label(text);
+        Label(Widget::new(id, self.state.clone()))
     }
     pub fn create_box(&self, horizontal: bool, spacing: i32) -> BoxWidget {
-        BoxWidget(Widget::new(self.state.borrow_mut().create_box(horizontal, spacing)))
+        let id = self.state.borrow_mut().create_box(horizontal, spacing);
+        BoxWidget(Widget::new(id, self.state.clone()))
     }
     pub fn create_grid(&self) -> Grid {
-        Grid(Widget::new(self.state.borrow_mut().create_grid()))
+        let id = self.state.borrow_mut().create_grid();
+        Grid(Widget::new(id, self.state.clone()))
     }
     pub fn create_entry(&self) -> Entry {
-        Entry(Widget::new(self.state.borrow_mut().create_entry()))
+        let id = self.state.borrow_mut().create_entry();
+        Entry(Widget::new(id, self.state.clone()))
     }
     pub fn create_textview(&self) -> TextView {
-        TextView(Widget::new(self.state.borrow_mut().create_textview()))
+        let id = self.state.borrow_mut().create_textview();
+        TextView(Widget::new(id, self.state.clone()))
     }
     pub fn create_dropdown(&self, items: &[&str]) -> DropDown {
-        DropDown(Widget::new(self.state.borrow_mut().create_dropdown(items)))
+        let id = self.state.borrow_mut().create_dropdown(items);
+        DropDown(Widget::new(id, self.state.clone()))
     }
     pub fn create_checkbutton(&self, label: &str) -> CheckButton {
-        CheckButton(Widget::new(self.state.borrow_mut().create_checkbutton(label)))
+        let id = self.state.borrow_mut().create_checkbutton(label);
+        CheckButton(Widget::new(id, self.state.clone()))
     }
     pub fn create_radiobutton(&self, group: Option<&RadioButton>, label: &str) -> RadioButton {
         let gid = group.map(|r| r.0.id);
-        RadioButton(Widget::new(self.state.borrow_mut().create_radiobutton(gid, label)))
+        let id = self.state.borrow_mut().create_radiobutton(gid, label);
+        RadioButton(Widget::new(id, self.state.clone()))
     }
     pub fn create_menu(&self) -> Menu {
-        Menu(Widget::new(self.state.borrow_mut().create_menu()))
+        let id = self.state.borrow_mut().create_menu();
+        Menu(Widget::new(id, self.state.clone()))
     }
 
-    // -- actions --
+    // -- actions (operate on the shared state) --
 
     /// Fire the callbacks registered on a widget. For `Button` this is a click;
     /// for `CheckButton`/`RadioButton` it re-fires without toggling (use
     /// [`Self::toggle`] to toggle).
+    ///
+    /// Callbacks are taken out of the shared state and fired *after* releasing the
+    /// borrow, so a callback may freely mutate the model (re-entrancy safe).
     pub fn click(&self, w: &impl AsId) {
         let id = w.id();
-        self.state.borrow_mut().click(id);
+        let mut cbs = {
+            let mut state = self.state.borrow_mut();
+            match state.node_mut(id) {
+                Some(n) => std::mem::take(&mut n.callbacks),
+                None => return,
+            }
+        };
+        for cb in cbs.iter_mut() {
+            cb();
+        }
+        if let Some(n) = self.state.borrow_mut().node_mut(id) {
+            n.callbacks = cbs;
+        }
+    }
+
+    /// Take the callbacks off a node and fire them outside any borrow of the
+    /// shared state (re-entrancy safe).
+    fn fire_callbacks(&self, id: usize) {
+        let mut cbs = {
+            let mut state = self.state.borrow_mut();
+            match state.node_mut(id) {
+                Some(n) => std::mem::take(&mut n.callbacks),
+                None => return,
+            }
+        };
+        for cb in cbs.iter_mut() {
+            cb();
+        }
+        if let Some(n) = self.state.borrow_mut().node_mut(id) {
+            n.callbacks = cbs;
+        }
     }
 
     /// Type text into an `Entry` and fire its `changed` callbacks.
     pub fn type_into(&self, w: &impl AsId, text: &str) {
         let id = w.id();
-        self.state.borrow_mut().type_into(id, text);
+        self.state.borrow_mut().set_entry_text(id, text);
+        self.fire_callbacks(id);
     }
 
     /// Toggle a `CheckButton` or `RadioButton` and fire its callbacks.
     pub fn toggle(&self, w: &impl AsId) {
         let id = w.id();
         self.state.borrow_mut().toggle(id);
+        self.fire_callbacks(id);
     }
 
     /// Select a menu item (by 1-based index) on a `Menu`/`MenuBar` and fire its
@@ -157,7 +204,7 @@ impl Harness {
         if index == 0 || index > len {
             return;
         }
-        self.state.borrow_mut().click(id);
+        self.fire_callbacks(id);
     }
 
     /// Set a child of a container widget (Window/Box/Grid/Dialog), replacing any
@@ -215,9 +262,13 @@ macro_rules! widget_handle {
             }
         }
         impl $name {
-            /// Register a callback fired by `Harness::click`.
-            pub fn on_click(&self, h: &Harness, f: impl FnMut() + 'static) {
-                h.state.borrow_mut().add_callback(self.0.id, Box::new(f));
+            /// The internal node id (useful for diagnostics / snapshot lookups).
+            pub fn id(&self) -> usize {
+                self.0.id
+            }
+            /// Register a callback fired by [`Harness::click`].
+            pub fn on_click(&self, f: impl FnMut() + 'static) {
+                self.0.state.borrow_mut().add_callback(self.0.id, Box::new(f));
             }
         }
     };
@@ -237,69 +288,64 @@ widget_handle!(RadioButton);
 widget_handle!(Menu);
 
 impl Window {
-    pub fn set_title(&self, h: &Harness, title: &str) {
-        h.state.borrow_mut().set_window_title(self.0.id, title);
+    pub fn set_title(&self, title: &str) {
+        self.0.state.borrow_mut().set_window_title(self.0.id, title);
     }
 }
 
 impl Label {
-    pub fn set_text(&self, h: &Harness, text: &str) {
-        h.state.borrow_mut().set_label_text(self.0.id, text);
+    pub fn set_text(&self, text: &str) {
+        self.0.state.borrow_mut().set_label_text(self.0.id, text);
     }
 }
 
 impl Entry {
-    pub fn set_text(&self, h: &Harness, text: &str) {
-        h.state.borrow_mut().set_entry_text(self.0.id, text);
+    pub fn set_text(&self, text: &str) {
+        self.0.state.borrow_mut().set_entry_text(self.0.id, text);
     }
-    pub fn connect_changed(&self, h: &Harness, f: impl FnMut() + 'static) {
-        h.state.borrow_mut().add_callback(self.0.id, Box::new(f));
+    pub fn connect_changed(&self, f: impl FnMut() + 'static) {
+        self.0.state.borrow_mut().add_callback(self.0.id, Box::new(f));
     }
 }
 
 impl TextView {
-    pub fn set_text(&self, h: &Harness, text: &str) {
-        h.state.borrow_mut().set_textview_text(self.0.id, text);
+    pub fn set_text(&self, text: &str) {
+        self.0.state.borrow_mut().set_textview_text(self.0.id, text);
     }
 }
 
 impl CheckButton {
-    pub fn set_checked(&self, h: &Harness, checked: bool) {
-        h.state.borrow_mut().set_checkbutton_checked(self.0.id, checked);
+    pub fn set_checked(&self, checked: bool) {
+        self.0.state.borrow_mut().set_checkbutton_checked(self.0.id, checked);
     }
-    pub fn on_toggle(&self, h: &Harness, f: impl FnMut() + 'static) {
-        h.state.borrow_mut().add_callback(self.0.id, Box::new(f));
+    pub fn on_toggle(&self, f: impl FnMut() + 'static) {
+        self.0.state.borrow_mut().add_callback(self.0.id, Box::new(f));
     }
 }
 
 impl RadioButton {
-    pub fn set_checked(&self, h: &Harness, checked: bool) {
-        h.state.borrow_mut().set_radiobutton_checked(self.0.id, checked);
+    pub fn set_checked(&self, checked: bool) {
+        self.0.state.borrow_mut().set_radiobutton_checked(self.0.id, checked);
     }
-    pub fn on_toggle(&self, h: &Harness, f: impl FnMut() + 'static) {
-        h.state.borrow_mut().add_callback(self.0.id, Box::new(f));
+    pub fn on_toggle(&self, f: impl FnMut() + 'static) {
+        self.0.state.borrow_mut().add_callback(self.0.id, Box::new(f));
     }
 }
 
 impl DropDown {
-    pub fn set_items(&self, h: &Harness, items: &[&str]) {
-        h.state.borrow_mut().set_dropdown_items(self.0.id, items);
+    pub fn set_items(&self, items: &[&str]) {
+        self.0.state.borrow_mut().set_dropdown_items(self.0.id, items);
     }
-    pub fn set_active(&self, h: &Harness, idx: i32) {
-        h.state.borrow_mut().set_dropdown_selected(self.0.id, idx);
+    pub fn set_active(&self, idx: i32) {
+        self.0.state.borrow_mut().set_dropdown_selected(self.0.id, idx);
     }
-    pub fn connect_changed(&self, h: &Harness, f: impl FnMut() + 'static) {
-        h.state.borrow_mut().add_callback(self.0.id, Box::new(f));
+    pub fn connect_changed(&self, f: impl FnMut() + 'static) {
+        self.0.state.borrow_mut().add_callback(self.0.id, Box::new(f));
     }
 }
 
 impl Menu {
-    pub fn append(&self, h: &Harness, label: &str, action: &str) {
-        h.state.borrow_mut().menu_append(self.0.id, label, action);
+    pub fn append(&self, label: &str, action: &str) {
+        self.0.state.borrow_mut().menu_append(self.0.id, label, action);
     }
 }
-
-// Keep `ZorkKind` referenced so the import is not flagged unused if a future
-// refactoring drops its only use in this module.
-#[allow(dead_code)]
-fn _kind_marker(_: ZorkKind) {}
