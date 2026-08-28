@@ -1056,6 +1056,16 @@ impl EventControllerKey {
             unsafe { get_kv(event) }
         } else { 0 }
     }
+
+    /// Get the modifier state from a GDK key event
+    ///
+    /// # Safety
+    /// `event` must be a valid GDK key event pointer.
+    pub unsafe fn get_state_static(loader: &Arc<Loader>, event: *mut c_void) -> u32 {
+        if let Some(get_st) = loader.symbols.gdk_event_get_state {
+            unsafe { get_st(event) }
+        } else { 0 }
+    }
 }
 
 impl Drop for EventControllerKey {
