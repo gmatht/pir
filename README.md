@@ -23,6 +23,8 @@ that `pi`'s providers use — the **Anthropic Messages API** and the
 - **Extensions** — drop a folder in `extensions/<name>/src/lib.rs` exporting
   `register()` and it is statically linked into the binary at compile time
   (no runtime loader, no `Cargo.toml`). See [`src/plugin.rs`](src/plugin.rs).
+  The `wt` extension (per-agent git worktrees, **on by default**) and
+  `autocommit` (commit after every prompt) are included.
 - **Resumable sessions** — `pir -r` reloads a past session (by index / time /
   preview) and keeps the conversation going.
 - **Goals** — a durable `<session>.goal.json` tracks multi-step objectives;
@@ -141,8 +143,12 @@ Model selection accepts `provider/model`, a bare model id, or a fuzzy substring
 | `PI_DIR` | override the `~/.pi` config directory |
 | `PIR_PROJECTS_DIR` | base dir for `/create` (default `~/.pi/projects`) |
 | `PI_FULL_AUTO` | force full-auto (no confirmations) |
-| `PI_CONFIRM` | force confirmation prompts (even as an `ai_*` user) |
-| `NO_COLOR` | disable ANSI colors |
+| `PI_CONFIRM force confirmation prompts (even as an `ai_*` user) |
+| `NO_COLOR` | disable |
+| `PIR_WT` | `0` disables per-agent worktree automation (on by default); `wt` tool is always available |
+| `PIR_WT_AUTO` | `0` disables auto-verify/merge on idle (worktrees still created) |
+| `PIR_WT_CHECK` | explicit build/test verify command for `wt` auto-merge |
+| `PIR_WT_DIR` | override worktree parent dir (default `<repo>/.git/wt`) |
 
 ---
 

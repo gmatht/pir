@@ -1,6 +1,8 @@
 //! wt — per-agent git worktrees with idle auto-verify + merge-back.
 //!
-//! Off by default; enable with `PIR_WT=1`. When enabled:
+//! **On by default** — every agent gets its own linked git worktree so its
+//! `bash`/`edit_file`/`read_file` calls never touch the trunk checkout. Disable
+//! with `PIR_WT=0`. When enabled:
 //!
 //! * `wt_create` makes a linked git worktree off the repo's *trunk* branch
 //!   (auto-detected — `origin/HEAD`, else the checked-out branch, else
@@ -25,7 +27,7 @@
 //!   explicit `wt_merge`. This avoids silently merging unverified work.
 //! * `wt_merge` / `wt_verify` / `wt_status` / `wt_remove` are exposed as tools
 //!   for explicit control. `on_turn_end` only auto-merges when `PIR_WT_AUTO=1`
-//!   (default on when `PIR_WT=1`).
+//!   (default on when `PIR_WT` is not `0`).
 //!
 //! Locking
 //! -------
@@ -85,7 +87,10 @@ struct Wt {
 
 impl Wt {
     fn new() -> Self {
-        let enabled = std::env::var_os("PIR_WT").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+        // Enabled by default; only `PIR_WT=0` (or empty) turns it off.
+        let enabled = std::env::var_os("PIR_WT")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true);
         let auto = std::env::var_os("PIR_WT_AUTO")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(enabled);
@@ -478,7 +483,7 @@ impl Wt {
     /// agent into it.
     fn create(&mut self, base: &str) -> Outcome {
         if !self.enabled {
-            return Outcome::err("wt is off (set PIR_WT=1 to enable worktree automation)".into());
+            return Outcome::err("wt is off (set PIR_WT=0 to disable worktree automation)".into());
         }
         if !self.is_git() {
             return Outcome::err("wt: not inside a git repository".into());
@@ -760,7 +765,7 @@ impl ToolBackend for Wt {
                      origin/HEAD, then the checked-out branch, else main/master/...) with a fresh \
                      branch, and cd the agent into it so subsequent tools operate there. \
                      Optionally pass a 'base' name to prefix the branch. The trunk checkout is \
-                     remembered and used for merges. Requires PIR_WT=1. With PIR_WT_COW=1 and \
+                     remembered and used for merges. Enabled by default (set PIR_WT=0 to disable). With PIR_WT_COW=1 and \
                      PIR_WT_TEMPLATE=<prebuilt-worktree>, the build dir (target/, or PIR_WT_BUILD_DIR) \
                      is cloned copy-on-write (btrfs/xfs-reflink/apfs) so the agent skips rebuilding.",
                 schema: json!({
@@ -783,7 +788,7 @@ impl ToolBackend for Wt {
                 description:
                     "Merge the current worktree's branch into main from the main checkout, under \
                      the inter-agent merge lock (fast-forward only of main; --no-ff merge of the \
-                     branch). Then removes the worktree. Requires PIR_WT=1.",
+                     branch). Then removes the worktree. Enabled by default (set PIR_WT=0 to disable).",
                 schema: json!({ "type": "object", "properties": {}, "required": [] }),
             },
             ToolSpec {
@@ -917,7 +922,7 @@ impl ToolBackend for Wt {
             if self.enabled {
                 format!("on (auto-merge {})", if self.auto { "enabled" } else { "disabled" })
             } else {
-                "off (set PIR_WT=1)".to_string()
+                "off (set PIR_WT=0 to disable worktree automation)".to_string()
             }
         ));
         Some(format!("[wt] {}", parts.join(" · ")))
@@ -1066,12 +1071,21 @@ mod tests {
     }
 
     #[test]
-    fn off_by_default_registers_no_tools() {
+    fn on_by_default_registers_tools() {
         std::env::remove_var("PIR_WT");
         let wt = Wt::new();
-        assert!(!wt.enabled, "wt must be off by default");
+        assert!(wt.enabled, "wt must be on by default");
         assert!(!wt.in_worktree());
+        assert!(!wt.specs().is_empty(), "tools should be registered when enabled");
+    }
+
+    #[test]
+    fn pirt_wt_0_turns_it_off() {
+        std::env::set_var("PIR_WT", "0");
+        let wt = Wt::new();
+        assert!(!wt.enabled, "PIR_WT=0 must disable wt");
         assert!(wt.specs().is_empty(), "no tools when disabled");
+        std::env::remove_var("PIR_WT");
     }
 
     #[test]
@@ -1090,6 +1104,7 @@ mod tests {
         // Verdict::NoChecks, never Verdict::Passed — so the extension will NOT
         // silently auto-merge it.
         std::env::remove_var("PIR_WT_CHECK");
+        std::env::set_var("PIR_WT", "0"); // disable so verify() is exercised standalone
         let repo = scratch_repo();
         let orig = std::env::current_dir().unwrap();
         std::env::set_current_dir(&repo).unwrap();
@@ -1097,6 +1112,7 @@ mod tests {
         assert!(matches!(wt.verify(&repo), Verdict::NoChecks), "bare repo => NoChecks");
         let _ = fs::remove_dir_all(&repo);
         let _ = std::env::set_current_dir(&orig);
+        std::env::remove_var("PIR_WT");
     }
 
     #[test]
@@ -1104,21 +1120,20 @@ mod tests {
         // On the main checkout (no worktree), startup_report must say we're on
         // the trunk checkout and report the automation on/off state — this is
         // the "why wasn't my worktree reported?" fix.
-        std::env::remove_var("PIR_WT");
+        std::env::set_var("PIR_WT", "0"); // for the "off" branch
         let repo = scratch_repo();
         let orig = std::env::current_dir().unwrap();
         std::env::set_current_dir(&repo).unwrap();
 
-        // Off (default): should still report the execution context.
+        // Off: should still report the execution context.
         let mut wt_off = Wt::new();
         wt_off.on_session_start(&repo);
         let off = wt_off.startup_report().unwrap();
         assert!(off.contains("trunk checkout"), "off report: {off}");
         assert!(off.contains("worktree automation: off"), "off report: {off}");
 
-        // On: should report automation enabled.
-        std::env::set_var("PIR_WT", "1");
-        std::env::remove_var("PIR_WT_AUTO");
+        // On (default): should report automation enabled.
+        std::env::remove_var("PIR_WT");
         let mut wt_on = Wt::new();
         wt_on.on_session_start(&repo);
         let on = wt_on.startup_report().unwrap();
