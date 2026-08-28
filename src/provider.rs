@@ -583,6 +583,24 @@ fn is_retryable(error: &str) -> bool {
     if error.contains("stalled") || error == "request cancelled" {
         return false;
     }
+    // Quota / usage-limit errors are terminal, not transient: a rate limit that
+    // names a *weekly* limit (or demands an upgrade/billing change) will not
+    // lift within the retry window, so backing off 60s..240s only delays the
+    // inevitable and keeps the user staring at a spinner instead of a usable
+    // REPL. End the turn now so the user can switch model/provider (`/model …`)
+    // and retry themselves.
+    let l = error.to_lowercase();
+    if l.contains("usage limit")
+        || l.contains("weekly usage")
+        || l.contains("rate limit exceeded")
+        || l.contains("quota exceeded")
+        || l.contains("quota_exceeded")
+        || l.contains("insufficient_quota")
+        || l.contains("upgrade for higher limits")
+        || l.contains("billing")
+    {
+        return false;
+    }
     if error.starts_with("HTTP 429")
         || error.starts_with("HTTP 500")
         || error.starts_with("HTTP 502")
@@ -1054,6 +1072,21 @@ mod tests {
     }
 
     #[test]
+    fn quota_limit_errors_are_fatal_not_retried() {
+        // A weekly/usage-limit 429 will not lift within the 60s..240s backoff
+        // window — retrying only delays returning the REPL to the user. The
+        // turn must end immediately instead.
+        assert!(!is_retryable(
+            "HTTP 429: you (gmatht) have reached your weekly usage limit, upgrade for higher limits: \
+             https://ollama.com/upgrade or add extra usage: https://ollama.com/settings (ref: d6f5)"
+        ));
+        assert!(!is_retryable("HTTP 429: quota exceeded for project"));
+        assert!(!is_retryable("HTTP 429: insufficient_quota - check billing"));
+        // A plain (transient) rate limit IS still retried.
+        assert!(is_retryable("HTTP 429: rate limited"));
+    }
+
+    #[test]
     fn retryable_transport_errors() {
         assert!(is_retryable("connection failed: Connection refused"));
         assert!(is_retryable("DNS lookup failed"));
@@ -1092,12 +1125,12 @@ mod tests {
         // doubles per attempt with NO upper bound — so the most stubborn slow
         // provider keeps getting more time instead of hitting a ceiling.
         let compute = |attempt: u32| READ_TIMEOUT_INIT * READ_TIMEOUT_GROWTH.saturating_pow(attempt);
-        assert_eq!(compute(0), Duration::from_secs(15));
-        assert_eq!(compute(1), Duration::from_secs(30));
-        assert_eq!(compute(2), Duration::from_secs(60));
-        assert_eq!(compute(3), Duration::from_secs(120));
-        assert_eq!(compute(4), Duration::from_secs(240));
-        assert_eq!(compute(10), Duration::from_secs(15360));
+        assert_eq!(compute(0), Duration::from_secs(120));
+        assert_eq!(compute(1), Duration::from_secs(240));
+        assert_eq!(compute(2), Duration::from_secs(480));
+        assert_eq!(compute(3), Duration::from_secs(960));
+        assert_eq!(compute(4), Duration::from_secs(1920));
+        assert_eq!(compute(10), Duration::from_secs(122_880));
         assert!(compute(1) > compute(0));
     }
 
@@ -1240,5 +1273,148 @@ mod tests {
             elapsed <= Duration::from_millis(50),
             "cancel took {elapsed:?}, must be <= 50ms"
         );
+    }
+
+    /// A local listener that accepts TCP connections but **never writes a
+    /// byte** — the "slow provider" case: `send_json` is parked in the connect
+    /// + status-line read until the per-attempt read timeout elapses. This is
+    /// exactly the phase that used to make a cancel appear to do nothing for
+    /// minutes (cancel was only re-checked at the *next retry boundary*,
+    /// i.e. after the whole read timeout — 120s on the first attempt).
+    fn never_sends_server() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        // Accept one connection (so ureq's connect succeeds and it parks in the
+        // status-line read) and just hold it without responding.
+        thread::spawn(move || {
+            let (_sock, _) = listener.accept().expect("accept");
+            thread::sleep(Duration::from_secs(5));
+            // socket dropped here: ureq sees EOF/error, but by then the test
+            // has already moved on (its worker thread is abandoned).
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn send_cancelable_honours_cancel_during_status_line_read() {
+        // Cancel pressed while `send_json` is still waiting on the connect +
+        // status-line read: `send_cancelable` must bail within its 10ms poll
+        // slice — NOT after the full per-attempt read timeout (120s on the
+        // first attempt), which is the original complaint.
+        let base_url = never_sends_server();
+        let mut client = Client::new(ApiKind::OpenAi, &base_url, "test-key".to_string());
+        // Wire the flag exactly like the REPL does (agent → set_cancel): the
+        // client only ever observes the flag it was handed.
+        let cancel = Arc::new(AtomicBool::new(false));
+        client.set_cancel(cancel.clone());
+        // Flip the flag ~250ms in, once the worker is parked on the read.
+        let cancel2 = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(250));
+            cancel2.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let res = client.chat(
+            "test-model",
+            16,
+            "sys",
+            &[Message { role: Role::User, blocks: vec![Block::Text("hi".into())] }],
+            &[],
+            &mut |_s: &str| {},
+            crate::config::ThinkingLevel::Off,
+            0,
+            &mut |_s: &str| {},
+        );
+        let elapsed = started.elapsed();
+        assert!(res.is_err(), "expected cancellation error, got {res:?}");
+        assert_eq!(res.unwrap_err(), "request cancelled");
+        // Generous upper bound (CI slop), but far below even one read timeout.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "cancel during status-line read took {elapsed:?}, must be prompt"
+        );
+    }
+
+    #[test]
+    fn send_cancelable_completes_when_provider_is_slow_but_alive() {
+        // A provider that waits ~300ms before answering must still succeed —
+        // the race must not turn a merely slow response into a cancellation.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        let _srv = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            use std::io::Write as _;
+            thread::sleep(Duration::from_millis(300));
+            let body = "{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n";
+            let frame = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {body}data: [DONE]\n\n"
+            );
+            let _ = sock.write_all(frame.as_bytes());
+            let _ = sock.flush();
+            // Hold the socket open briefly so ureq can drain the body before
+            // the test client sees EOF; then drop → clean EOF for the parser.
+            thread::sleep(Duration::from_millis(200));
+        });
+        let client = Client::new(ApiKind::OpenAi, &format!("http://{addr}"), "test-key".to_string());
+        // No cancel timer here at all — the slow-but-alive provider must be
+        // allowed to finish unmolested (the race must not misfire on it).
+        let mut text = String::new();
+        let res = client.chat(
+            "test-model",
+            16,
+            "sys",
+            &[Message { role: Role::User, blocks: vec![Block::Text("hi".into())] }],
+            &[],
+            &mut |t: &str| text.push_str(t),
+            crate::config::ThinkingLevel::Off,
+            0,
+            &mut |_s: &str| {},
+        );
+        assert!(res.is_ok(), "slow-but-alive provider must complete, got {res:?}");
+        assert!(text.contains("hi"), "expected streamed text, got {text:?}");
+    }
+
+    #[test]
+    fn send_cancelable_returns_response_when_it_arrives_before_cancel() {
+        // The response lands just before the flag is set: the race must return
+        // the real response (stream completes) rather than spuriously bailing.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        let _srv = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            use std::io::Write as _;
+            thread::sleep(Duration::from_millis(150));
+            let body = "{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}\n\n";
+            let frame = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {body}data: [DONE]\n\n"
+            );
+            let _ = sock.write_all(frame.as_bytes());
+            let _ = sock.flush();
+            thread::sleep(Duration::from_millis(200));
+        });
+        let mut client = Client::new(ApiKind::OpenAi, &format!("http://{addr}"), "test-key".to_string());
+        let cancel = Arc::new(AtomicBool::new(false));
+        // The server answers at ~150ms; the cancel timer fires at ~1.2s, after
+        // the response has already been returned and streaming has finished.
+        let cancel2 = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(1200));
+            cancel2.store(true, Ordering::SeqCst);
+        });
+        client.set_cancel(cancel);
+        let mut text = String::new();
+        let res = client.chat(
+            "test-model",
+            16,
+            "sys",
+            &[Message { role: Role::User, blocks: vec![Block::Text("hi".into())] }],
+            &[],
+            &mut |t: &str| text.push_str(t),
+            crate::config::ThinkingLevel::Off,
+            0,
+            &mut |_s: &str| {},
+        );
+        assert!(res.is_ok(), "response that lands before cancel must win, got {res:?}");
+        assert!(text.contains("ok"), "expected streamed text, got {text:?}");
     }
 }

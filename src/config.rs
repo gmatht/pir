@@ -755,7 +755,15 @@ pub fn match_models(providers: &[Provider], prefix: &str, limit: usize) -> Vec<S
         }
     }
 
-    out.sort();
+    // Prefix matches are what the user is typing (e.g. `op` -> `opencode/...`);
+    // they must outrank infix/substring matches (e.g. `anthrop**op**ic/...`,
+    // which would otherwise win merely by alphabetical order). Sort is stable,
+    // so ties keep the catalog order.
+    out.sort_by_key(|c| {
+        let hit = c.to_lowercase();
+        // 0 = starts with the prefix (best), 1 = contains it later (fallback).
+        if hit.starts_with(&p) { 0 } else { 1 }
+    });
     out.truncate(limit);
     out
 }
@@ -1066,5 +1074,30 @@ mod select_tests {
         let e = pick(&provs, "zzz");
         assert!(e.starts_with("ERR: no model matches 'zzz'"), "{e}");
         assert!(e.contains(":N"), "error should mention the :N escape hatch: {e}");
+    }
+
+    #[test]
+    fn completion_prefix_matches_rank_above_infix() {
+        // `op` is an infix of "anthropic" but a prefix of "opencode": the
+        // prefix hit must come first so `/model op<Tab>` offers opencode,
+        // not anthropic/... (which previously won via alphabetical sort).
+        let mut provs = providers();
+        provs.insert(
+            0,
+            Provider {
+                id: Some("opencode".into()),
+                name: None,
+                api: Some("openai".into()),
+                base_url: Some("https://opencode.ai/v1".into()),
+                api_key: None,
+                models: vec![mk("opencode-chat", "OpenCode Chat")],
+            },
+        );
+        let ms = match_models(&provs, "op", 10);
+        // Model-id matches return the bare id (documented continuation
+        // behaviour) — it resolves unambiguously to the opencode provider.
+        assert_eq!(ms.first().map(String::as_str), Some("opencode-chat"));
+        // The infix-only matches are still offered as fallbacks, just after.
+        assert!(ms.iter().any(|c| c.starts_with("anthropic/")), "infix matches must remain: {ms:?}");
     }
 }
