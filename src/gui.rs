@@ -89,12 +89,59 @@ fn longest_common_prefix(strs: &[&str]) -> String {
     first[..end].to_string()
 }
 
+/// Conversation line kinds, mirroring the TUI's ConvKind. Each renders with a
+/// coloured prefix via Pango markup in the conversation text view.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ConvKind {
+    User,
+    Assistant,
+    System,
+    Error,
+    Thinking,
+}
+
+impl ConvKind {
+    /// (hex foreground colour, prefix) — same palette as the TUI's `into_line`.
+    fn style(self) -> (&'static str, &'static str) {
+        match self {
+            ConvKind::User => ("#4ec9b0", "❯ "),
+            ConvKind::Assistant => ("#d4d4d4", "  "),
+            ConvKind::System => ("#569cd6", "· "),
+            ConvKind::Error => ("#f14c4c", "✗ "),
+            ConvKind::Thinking => ("#c586c0", "💭 "),
+        }
+    }
+}
+
+/// One conversation line (a single visual row in the pane).
+#[derive(Clone)]
+struct ConvLine {
+    kind: ConvKind,
+    text: String,
+}
+
+/// Escape text for inclusion in Pango markup (ampersand, angle brackets).
+fn escape_markup(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Render one conversation line as Pango markup with a coloured prefix span.
+/// The body text is escaped, so model output containing `<`/`&` stays intact.
+fn line_markup(line: &ConvLine) -> String {
+    let (color, prefix) = line.kind.style();
+    format!(
+        "<span foreground=\"{color}\">{}</span>{}",
+        escape_markup(prefix),
+        escape_markup(&line.text)
+    )
+}
+
 /// Shared per-UI state, guarded by a Mutex so both the Entry-activate callback
 /// (main thread) and the periodic drain callback (also main thread via glib)
 /// can see it. Since glib callbacks run on the main loop, contention is trivial.
 struct GuiState {
-    /// Rendered conversation text (the full transcript so far).
-    conv: String,
+    /// Conversation lines (the transcript so far), each with a colour kind.
+    conv: Vec<ConvLine>,
     /// Prompts queued by the user while a turn runs.
     pending: Vec<String>,
     /// Whether a foreground turn is currently running.
@@ -115,7 +162,7 @@ struct GuiState {
 impl GuiState {
     fn new() -> Self {
         GuiState {
-            conv: String::new(),
+            conv: Vec::new(),
             pending: Vec::new(),
             running: false,
             log_offset: 0,
@@ -124,7 +171,42 @@ impl GuiState {
             history: Vec::new(),
         }
     }
+
+    /// Append a conversation line, splitting on newlines and capping
+    /// scrollback so memory stays bounded. The cap only takes effect on a
+    /// `/clear`-style rebuild (see `clear`), because the GTK text buffer is
+    /// append-only between syncs — trimming mid-stream would desync
+    /// `RENDERED_LINES`. 4000 lines is a few hundred KB at most.
+    fn push(&mut self, kind: ConvKind, text: &str) {
+        for para in text.split('\n') {
+            self.conv.push(ConvLine { kind, text: para.to_string() });
+        }
+        if self.conv.len() > 4000 {
+            let drop = self.conv.len() - 4000;
+            self.conv.drain(0..drop);
+            RENDERED_LINES.fetch_sub(drop, std::sync::atomic::Ordering::SeqCst);
+            // The buffer now holds fewer lines than were rendered: force a
+            // rebuild on the next sync so the pane matches the model.
+            NEEDS_REBUILD.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Clear the conversation (e.g. /clear).
+    fn clear(&mut self) {
+        self.conv.clear();
+        NEEDS_REBUILD.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
+
+/// How many conversation lines have already been rendered into the GTK text
+/// buffer. `sync_textview` is append-only: it appends everything past this
+/// index, so each line gets its per-kind colour via Pango markup instead of
+/// one flat `set_text`.
+static RENDERED_LINES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Set when the text buffer must be rebuilt from scratch (after /clear or a
+/// scrollback trim dropped lines from the front of the model).
+static NEEDS_REBUILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Arrow-Up/Down navigation state for the prompt Entry, shared between the key
 /// controller and the activate handler. `pos` indexes `history` (== len means
@@ -253,8 +335,8 @@ pub fn run(
     {
         let mut s = state.lock().unwrap();
         s.history = term::load_history_lines();
-        s.conv.push_str(&format!(
-            "pir · {} · GTK GUI  (/help for commands · Enter to send · ctrl-q to quit)\n",
+        s.push(ConvKind::System, &format!(
+            "pir · {} · GTK GUI  (/help for commands · Enter to send · ctrl-q to quit)",
             providers[0].pid()
         ));
         sync_textview(&widgets, &s);
@@ -352,7 +434,7 @@ pub fn run(
         }
         s.running = true;
         s.status = "running…".into();
-        s.conv.push_str(&format!("❯ {text}\n"));
+        s.push(ConvKind::User, &text);
         sync_textview(&entry_cb_widgets, &s);
         drop(s);
 
@@ -431,7 +513,7 @@ fn drain_once(
     let feed = bus.drain_feed();
     for e in &feed {
         if !matches!(e.kind, crate::notify::EventKind::Idle) {
-            s.conv.push_str(&format!("notify: {}\n", e.summary()));
+            s.push(ConvKind::System, &format!("notify: {}", e.summary()));
         }
     }
 
@@ -463,7 +545,7 @@ fn drain_once(
             if let Some(next) = next {
                 s.running = true;
                 s.status = "running…".into();
-                s.conv.push_str(&format!("❯ {next}\n"));
+                s.push(ConvKind::User, &next);
                 sync_textview(widgets, &s);
                 drop(s);
                 fg_quiet.store(false, Ordering::SeqCst);
@@ -509,7 +591,9 @@ fn drain_session_log(log: PathBuf, state: &mut GuiState) {
         let role = v.get("role").and_then(|r| r.as_str()).unwrap_or("");
         let blocks = v.get("blocks").and_then(|b| b.as_array());
         let mut text = String::new();
+        let mut kind = ConvKind::Assistant;
         if role == "user" {
+            kind = ConvKind::User;
             for b in blocks.into_iter().flatten() {
                 if b.get("type").and_then(|t| t.as_str()) == Some("text") {
                     if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
@@ -534,7 +618,7 @@ fn drain_session_log(log: PathBuf, state: &mut GuiState) {
                         if let Some(t) = b.get("thinking").and_then(|t| t.as_str()) {
                             let t = t.trim();
                             if !t.is_empty() {
-                                text.push_str(&format!("💭 {t}\n"));
+                                state.push(ConvKind::Thinking, &format!("💭 {t}"));
                             }
                         }
                     }
@@ -558,9 +642,8 @@ fn drain_session_log(log: PathBuf, state: &mut GuiState) {
         }
         let text = text.trim_end().to_string();
         if !text.is_empty() {
-            state.conv.push_str(&text);
-            state.conv.push('\n');
-        }
+            state.push(kind, &text);
+                    }
     }
     // Bound scrollback.
     if state.conv.len() > 200_000 {
@@ -583,11 +666,38 @@ fn configure_conversation_textview(tv: &TextView) {
     tv.set_can_focus(false);
 }
 
-/// Push the current conversation + status into the TextView (and the status
-/// Label). Cheap enough to call every drain tick.
+/// Render the status text as Pango markup: running/queued states in cyan,
+/// error-ish ("error", "cancel") in red, everything else dimmed grey.
+fn status_markup(status: &str) -> String {
+    let color = if status.contains("running") || status.contains("queued") {
+        "#569cd6" // cyan: work in flight
+    } else if status.to_lowercase().contains("error") || status.contains("cancel") {
+        "#f14c4c" // red: trouble
+    } else {
+        "#9e9e9e" // dim grey: idle / usage
+    };
+    format!("<span foreground=\"{color}\">{}</span>", escape_markup(status))
+}
+
+/// Sync the GTK text buffer with the conversation model: append-only markup
+/// updates between rebuilds (colours per line, cheap on every 150ms tick),
+/// full rebuild after /clear or a scrollback trim.
 fn sync_textview(widgets: &GuiWidgets, state: &GuiState) {
-    widgets.textview.set_text(&state.conv);
-    widgets.status.set_text(&state.status);
+    use std::sync::atomic::Ordering;
+    if NEEDS_REBUILD.swap(false, Ordering::SeqCst) {
+        widgets.textview.set_text("");
+        RENDERED_LINES.store(0, Ordering::SeqCst);
+    }
+    let rendered = RENDERED_LINES.load(Ordering::SeqCst);
+    if state.conv.len() > rendered {
+        for line in &state.conv[rendered..] {
+            widgets.textview.append_markup(&line_markup(line));
+            widgets.textview.append_text("\n");
+        }
+        RENDERED_LINES.store(state.conv.len(), Ordering::SeqCst);
+    }
+    widgets.textview.scroll_to_end();
+    widgets.status.set_markup(&status_markup(&state.status));
 }
 
 /// Handle a slash command inline (a GUI-appropriate subset). Mirrors the
@@ -607,9 +717,9 @@ fn handle_command(
     let mut s = state.lock().unwrap();
     match cmd {
         "h" | "help" => {
-            s.conv.push_str(
+            s.push(ConvKind::System,
                 "commands: /help /model <sel> /models /goal [obj] /continue /clear /undo\n\
-                 \x20  /cancel  /thinking  /sessions  /usage  /exit  /quit\n",
+                 \x20  /cancel  /thinking  /sessions  /usage  /exit  /quit",
             );
         }
         "exit" | "quit" | "q" => {
@@ -621,25 +731,25 @@ fn handle_command(
         "cancel" | "c" => {
             if s.running {
                 cancel.store(true, Ordering::SeqCst);
-                s.conv.push_str("· requesting cancel (turn stops now)\n");
+                s.push(ConvKind::System, "· requesting cancel (turn stops now)");
             } else {
-                s.conv.push_str("· no turn running to cancel\n");
+                s.push(ConvKind::System, "· no turn running to cancel");
             }
         }
         "clear" => {
-            s.conv.clear();
-            s.conv.push_str("pir · GTK GUI\n");
+            s.clear();
+            s.push(ConvKind::System, "pir · GTK GUI");
         }
         "thinking" => {
             let mut g = agent_slot.lock().unwrap();
             let Some(agent) = g.as_mut() else {
-                s.conv.push_str("· agent busy (turn running) — try again when idle\n");
+                s.push(ConvKind::System, "· agent busy (turn running) — try again when idle");
                 return;
             };
             let arg = rest.join(" ");
             if arg.trim().is_empty() {
-                s.conv.push_str(&format!(
-                    "· thinking level: {}  (/thinking <off|minimal|low|medium|high|xhigh|max> [show|hide])\n",
+                s.push(ConvKind::System, &format!(
+                    "· thinking level: {}  (/thinking <off|minimal|low|medium|high|xhigh|max> [show|hide])",
                     agent.thinking_level().as_str()
                 ));
                 return;
@@ -662,81 +772,82 @@ fn handle_command(
             let level_arg = words.join(" ");
             if !level_arg.is_empty() {
                 match crate::config::ThinkingLevel::parse(&level_arg) {
-                    Some(lvl) => s.conv.push_str(&format!("· {}\n", agent.set_thinking(lvl))),
+                    Some(lvl) => s.push(ConvKind::System, &format!("· {}", agent.set_thinking(lvl))),
                     None => {
-                        s.conv.push_str(&format!(
-                            "· usage: /thinking [<off|minimal|low|medium|high|xhigh|max>] [show|hide] (got '{level_arg}')\n"
-                        ));
+                        s.push(
+                            ConvKind::Error,
+                            &format!("· usage: /thinking [<off|minimal|low|medium|high|xhigh|max>] [show|hide] (got '{level_arg}')"),
+                        );
                         return;
                     }
                 }
             }
             if let Some(on) = show {
                 s.show_thinking = on;
-                s.conv.push_str(&format!("· {}\n", agent.set_show_thinking(on)));
+                s.push(ConvKind::System, &format!("· {}", agent.set_show_thinking(on)));
             }
         }
         "usage" => {
             let g = agent_slot.lock().unwrap();
             match g.as_ref() {
-                Some(a) => s.conv.push_str(&format!(
-                    "{} in / {} out tokens this session\n",
+                Some(a) => s.push(ConvKind::System, &format!(
+                    "{} in / {} out tokens this session",
                     fmt_tok(a.usage.input),
                     fmt_tok(a.usage.output)
                 )),
-                None => s.conv.push_str("· agent busy (turn running)\n"),
+                None => s.push(ConvKind::System, "· agent busy (turn running)"),
             }
         }
         "models" => {
             for p in providers {
-                s.conv.push_str(&format!("{}\n", p.pid()));
+                s.push(ConvKind::System, &p.pid());
                 for m in &p.models {
-                    s.conv.push_str(&format!("  {}\n", m.id));
+                    s.push(ConvKind::System, &format!("  {}", m.id));
                 }
             }
         }
         "model" | "m" => {
             let mut g = agent_slot.lock().unwrap();
             let Some(agent) = g.as_mut() else {
-                s.conv.push_str("· agent busy (turn running) — try again when idle\n");
+                s.push(ConvKind::System, "· agent busy (turn running) — try again when idle");
                 return;
             };
             if rest.is_empty() {
-                s.conv.push_str(&format!("current model: {}\n", agent.label()));
+                s.push(ConvKind::System, &format!("current model: {}", agent.label()));
             } else {
                 match crate::config::select(providers, &rest.join(" ")) {
                     Ok((p, m)) => match agent.switch(p.clone(), m.clone()) {
-                        Ok(()) => s.conv.push_str(&format!("→ {}\n", agent.label())),
-                        Err(e) => s.conv.push_str(&format!("{e}\n")),
+                        Ok(()) => s.push(ConvKind::System, &format!("→ {}", agent.label())),
+                        Err(e) => s.push(ConvKind::Error, &format!("{e}")),
                     },
-                    Err(e) => s.conv.push_str(&format!("{e}\n")),
+                    Err(e) => s.push(ConvKind::Error, &format!("{e}")),
                 }
             }
         }
         "sessions" => {
-            s.conv.push_str("use `pir -r` from a terminal to resume sessions\n");
+            s.push(ConvKind::System, "use `pir -r` from a terminal to resume sessions");
         }
         "goal" => {
             let mut g = agent_slot.lock().unwrap();
             let Some(agent) = g.as_mut() else {
-                s.conv.push_str("· agent busy\n");
+                s.push(ConvKind::System, "· agent busy");
                 return;
             };
             let obj: String = rest.join(" ");
             if obj.trim().is_empty() {
                 match agent.goal_snapshot() {
-                    Some(g) => s.conv.push_str(&g),
-                    None => s.conv.push_str("no goal set — try /goal <objective>\n"),
+                    Some(g) => s.push(ConvKind::System, &g),
+                    None => s.push(ConvKind::System, "no goal set — try /goal <objective>"),
                 }
             } else {
                 agent.start_goal(&obj);
-                s.conv.push_str(&format!("goal started: {obj}\n"));
+                s.push(ConvKind::System, &format!("goal started: {obj}"));
             }
         }
         "continue" | "cont" => {
             let mut g = agent_slot.lock().unwrap();
             let Some(agent) = g.as_mut() else {
-                s.conv.push_str("· agent busy\n");
+                s.push(ConvKind::System, "· agent busy");
                 return;
             };
             let lp = agent.log_path.clone();
@@ -744,27 +855,27 @@ fn handle_command(
                 agent.attach_goal(&p);
             }
             let out = agent.continue_goal();
-            s.conv.push_str(&out);
+            s.push(ConvKind::System, &out);
         }
         "undo" => {
             let mut g = agent_slot.lock().unwrap();
             let Some(agent) = g.as_mut() else {
-                s.conv.push_str("· agent busy\n");
+                s.push(ConvKind::System, "· agent busy");
                 return;
             };
             let all = rest.first().map(|x| *x == "all").unwrap_or(false);
-            s.conv.push_str(&agent.undo(all));
+            s.push(ConvKind::System, &agent.undo(all));
         }
         other => {
             // Try extension-registered slash commands.
             let mut g = agent_slot.lock().unwrap();
             let Some(agent) = g.as_mut() else {
-                s.conv.push_str("· agent busy\n");
+                s.push(ConvKind::System, "· agent busy");
                 return;
             };
             match agent.run_registered_command(other, rest.join(" ").trim()) {
-                Some(outcome) => s.conv.push_str(&format!("{}\n", outcome.content)),
-                None => s.conv.push_str(&format!("unknown command /{other} — try /help\n")),
+                Some(outcome) => s.push(ConvKind::System, &outcome.content),
+                None => s.push(ConvKind::Error, &format!("unknown command /{other} — try /help")),
             }
         }
     }
@@ -935,5 +1046,82 @@ mod gui_history_tests {
         // After reset we're back at the live draft: Up jumps to newest again.
         assert_eq!(nav.navigate(-1, "draft", &hist), Some("b".into()));
         assert_eq!(nav.draft, "draft");
+    }
+}
+
+#[cfg(test)]
+mod gui_colour_tests {
+    use super::*;
+
+    #[test]
+    fn escapes_markup_metacharacters() {
+        assert_eq!(escape_markup("a & b"), "a &amp; b");
+        assert_eq!(escape_markup("<tag>"), "&lt;tag&gt;");
+        assert_eq!(escape_markup("x < y > z & w"), "x &lt; y &gt; z &amp; w");
+        assert_eq!(escape_markup("plain"), "plain");
+    }
+
+    #[test]
+    fn model_markup_is_escaped_so_spans_cannot_inject() {
+        // Model output containing angle brackets must render literally,
+        // never become a Pango tag.
+        let line = ConvLine { kind: ConvKind::Assistant, text: "<b>not bold</b> & <i>x</i>".into() };
+        let m = line_markup(&line);
+        assert!(m.contains("&lt;b&gt;not bold&lt;/b&gt;"));
+        assert!(!m.contains("<b>"));
+        assert!(m.contains("&amp;"));
+    }
+
+    #[test]
+    fn kind_colours_match_the_tui_palette() {
+        let (user_c, user_p) = ConvKind::User.style();
+        assert_eq!(user_c, "#4ec9b0");
+        assert_eq!(user_p, "❯ ");
+        let (err_c, err_p) = ConvKind::Error.style();
+        assert_eq!(err_c, "#f14c4c");
+        assert_eq!(err_p, "✗ ");
+        let (think_c, think_p) = ConvKind::Thinking.style();
+        assert_eq!(think_c, "#c586c0");
+        assert_eq!(think_p, "💭 ");
+        let (sys_c, _) = ConvKind::System.style();
+        assert_eq!(sys_c, "#569cd6");
+    }
+
+    #[test]
+    fn line_markup_wraps_prefix_in_coloured_span() {
+        let line = ConvLine { kind: ConvKind::User, text: "hello".into() };
+        let m = line_markup(&line);
+        assert!(m.starts_with("<span foreground=\"#4ec9b0\">"));
+        assert!(m.contains("❯ </span>hello"));
+    }
+
+    #[test]
+    fn status_markup_colours_by_state() {
+        assert!(status_markup("running…").contains("#569cd6"));
+        assert!(status_markup("queued: foo").contains("#569cd6"));
+        assert!(status_markup("error: boom").contains("#f14c4c"));
+        assert!(status_markup("idle").contains("#9e9e9e"));
+        assert!(status_markup("12 in / 34 out tokens").contains("#9e9e9e"));
+        // The text itself is preserved (escaped).
+        assert!(status_markup("running <now>").contains("running &lt;now&gt;"));
+    }
+
+    #[test]
+    fn push_splits_newlines_into_lines_and_clear_resets() {
+        let mut s = GuiState::new();
+        s.push(ConvKind::System, "one\ntwo");
+        assert_eq!(s.conv.len(), 2);
+        assert_eq!(s.conv[0].text, "one");
+        assert_eq!(s.conv[1].text, "two");
+        s.clear();
+        assert!(s.conv.is_empty());
+    }
+
+    #[test]
+    fn tab_completion_still_works_with_colour_model() {
+        // The colour rework must not affect the completion paths.
+        assert_eq!(complete_idle("/cle"), Some("/clear".to_string()));
+        assert_eq!(complete_idle("/thinking hig"), Some("/thinking high".to_string()));
+        assert_eq!(complete_idle("plain"), None);
     }
 }
