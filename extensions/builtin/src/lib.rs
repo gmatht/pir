@@ -703,17 +703,36 @@ pub(crate) fn kill_process_tree(child: &mut std::process::Child) -> Option<std::
         unsafe {
             let _ = libc::kill(-pgid, libc::SIGTERM);
         }
+        // Overall budget for the whole kill dance. Every wait below is a
+        // *polling* try_wait — never a blocking `child.wait()` — because a
+        // SIGKILLed child that is stuck in an uninterruptible sleep (D state,
+        // e.g. on a wedged mount) can take arbitrarily long to die; a blocking
+        // wait would hold `job_kill` forever and wedge the agent loop/REPL
+        // (the "job_kill then silence" hang). We reap exactly once, whenever
+        // try_wait first reports the child gone, and give up after the budget.
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         loop {
             match child.try_wait() {
-                // TERM landed: this try_wait already reaped the child.
+                // TERM (or KILL) landed: this try_wait already reaped the child.
                 Ok(Some(status)) => return Some(status),
+                // Still alive and TERM's grace is spent: escalate to SIGKILL.
                 Ok(None) if std::time::Instant::now() >= deadline => {
                     unsafe {
                         let _ = libc::kill(-pgid, libc::SIGKILL);
                     }
                     let _ = child.kill();
-                    return child.wait().ok();
+                    // Keep polling; a D-state child may survive KILL for a
+                    // while. Never block — drop out once the budget expires and
+                    // let the caller (job_kill) report what it knows.
+                    let hard = std::time::Instant::now() + std::time::Duration::from_millis(100);
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(status)) => return Some(status),
+                            Ok(None) if std::time::Instant::now() >= hard => return None,
+                            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                            Err(_) => return None,
+                        }
+                    }
                 }
                 Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
                 Err(_) => return None,
@@ -905,5 +924,37 @@ mod esc_tests {
         std::thread::sleep(Duration::from_millis(2500));
         let out = b.job_kill(&json!({ "id": 1 })).expect("job_kill must return");
         assert!(out.contains("already finished"), "got: {out}");
+    }
+
+    #[test]
+    fn job_kill_escaped_grandchild_holding_pipe_returns_promptly() {
+        // The remaining production hang after the process-group fix: a
+        // grandchild that calls `setsid` puts itself in a NEW session/process
+        // group, so `kill(-pgid)` never reaches it. It also keeps the
+        // stdout/stderr pipe write-ends open (it didn't redirect them), so the
+        // drain threads block forever. The old kill_process_tree then did a
+        // *blocking* `child.wait()` after SIGKILL — but the `bash -c` child may
+        // linger in an uninterruptible sleep waiting on that still-open pipe,
+        // so the wait never returns and job_kill wedges the agent loop/REPL
+        // (the "job_kill then silence" hang). Regression: the whole kill dance
+        // must stay poll-based and bounded, so job_kill returns promptly even
+        // when a child won't die on the first KILL.
+        std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1");
+        let mut b = Builtin::new(PathBuf::from("."), true, Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let start = Instant::now();
+        // `setsid` escapes the group AND inherits (holds) stdout/stderr.
+        let detached = run_shell(
+            &mut b,
+            "setsid bash -c 'while true; do echo alive; sleep 1; done' & echo detached-ok; sleep 60",
+        )
+        .expect("run_shell result");
+        assert!(detached.contains("[detached]"), "expected detachment, got: {detached}");
+        let out = b.job_kill(&json!({ "id": 1 })).expect("job_kill must return");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "job_kill took {elapsed:?} — the escaped-grandchild hang is back"
+        );
+        assert!(out.contains("job#1"), "unexpected job_kill reply: {out}");
     }
 }
