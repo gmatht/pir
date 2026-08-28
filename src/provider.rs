@@ -21,13 +21,18 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Initial read timeout for an attempt. This covers the **status-line read**:
 /// after TCP connect, the client waits up to this long for the server's first
-/// response byte (`HTTP/1.1 ... \r\n`). 15s is enough for most providers to
-/// start responding, while still failing fast (and triggering a retry) when a
-/// provider is genuinely unreachable — rather than waiting 30s+ before the
-/// first retry. It doubles on each retry (see `READ_TIMEOUT_GROWTH`) with
-/// **no upper bound** — a slow/"thinking" provider keeps getting more time on
-/// each attempt rather than hitting a hard ceiling and failing forever.
-const READ_TIMEOUT_INIT: Duration = Duration::from_secs(15);
+/// response byte (`HTTP/1.1 ... \r\n`). 120s gives even slow/"thinking"
+/// providers plenty of room to start responding before we give up on the first
+/// attempt (and retry with a doubled timeout). It doubles on each retry (see
+/// `READ_TIMEOUT_GROWTH`) with **no upper bound** — a stubborn slow provider
+/// keeps getting more time on each attempt rather than hitting a hard ceiling
+/// and failing forever.
+///
+/// A long status-line read does **not** make cancellation slow: the connect +
+/// status-line phase is run on a worker thread and raced against the `cancel`
+/// flag (see `send_cancelable`), so an ESC/ctrl-c is honoured within tens of
+/// milliseconds even while we're still waiting on the socket for the first byte.
+const READ_TIMEOUT_INIT: Duration = Duration::from_secs(120);
 /// Each retry gets this multiple of the previous attempt's read timeout. There
 /// is deliberately no cap: the timeout is *unlimited*, simply doubling each
 /// retry so the most stubborn slow provider eventually has room to respond.
@@ -112,6 +117,54 @@ impl Client {
             .build()
     }
 
+    /// Run `ureq`'s blocking `send_json` (the connect + status-line read) on a
+    /// worker thread, raced against the cooperative `cancel` flag.
+    ///
+    /// `ureq`'s connect + status-line read is a *single* blocking call: it only
+    /// honours `timeout_read` at the `SO_RCVTIMEO` boundary and never observes
+    /// the `cancel` flag at all. So pressing ESC/ctrl-c while we are still
+    /// waiting on a slow provider for the first byte would otherwise do nothing
+    /// until the whole read timeout (`READ_TIMEOUT_INIT`, now 120s) had elapsed
+    /// — and even then only re-check `cancel` at the *next* retry boundary.
+    /// That is exactly why "cancelling turn…" could appear to hang for minutes
+    /// while the socket was still connecting. Running the call on a thread lets
+    /// us observe `cancel` promptly: the instant it is set we abandon the
+    /// attempt (detaching the worker and its socket) and return `Err`, so
+    /// `chat` reports cancellation within tens of milliseconds. If the real
+    /// response arrives first we hand its reader back and streaming proceeds
+    /// (the stream itself is cancelable via the fast `CancelableReader`).
+    fn send_cancelable(
+        req: ureq::Request,
+        body: &Value,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<ureq::Response, String> {
+        // Clone the body (ureq borrows it) so the worker owns its own copy, and
+        // share the cancel flag by Arc. We poll the join handle cheaply (10ms
+        // slices) so the blocking `join` only runs once the response is actually
+        // ready — or once cancel is set, in which case we bail out immediately.
+        let body = body.clone();
+        let cancel = cancel.clone();
+        let handle = std::thread::spawn(move || req.send_json(body));
+        while !cancel.load(Ordering::SeqCst) {
+            if handle.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if cancel.load(Ordering::SeqCst) {
+            // Abandon the in-flight connect/status-line read. The underlying
+            // socket is dropped with the detached worker; the OS reclaims it. We
+            // do NOT flip `cancel` here (it's owned by the REPL/agent and is the
+            // source of truth) — just abandon this attempt.
+            drop(handle);
+            return Err("request cancelled".to_string());
+        }
+        match handle.join() {
+            Ok(res) => res.map_err(http_error),
+            Err(_) => Err("request cancelled".to_string()),
+        }
+    }
+
     pub fn new(kind: ApiKind, base_url: &str, api_key: String) -> Self {
         Client {
             kind,
@@ -178,11 +231,13 @@ impl Client {
                     .set("anthropic-version", "2023-06-01"),
                 ApiKind::OpenAi => req.set("Authorization", &format!("Bearer {}", self.api_key)),
             };
-            // `send_json` returns a `ureq::Error`; map it to our `String` error
-            // before streaming so the two parsers share one error type.
-            let result: Result<(Message, Usage), String> = req
-                .send_json(&body)
-                .map_err(http_error)
+            // `send_json` is the connect + status-line read; run it on a worker
+            // thread so a cancel pressed *during* the request-setup wait is
+            // honoured promptly (see `send_cancelable`) instead of only at the
+            // next retry boundary. A cancel here surfaces as an `Err` that the
+            // loop returns immediately ("request cancelled"). `send_cancelable`
+            // already returns our `String` error type ( `ureq::Error`).
+            let result: Result<(Message, Usage), String> = Self::send_cancelable(req, &body, &cancel)
                 .and_then(|resp| {
                     // Wrap the blocking response body in a cancelable reader so
                     // a Ctrl-C is honoured within tens of milliseconds even

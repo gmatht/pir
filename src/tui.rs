@@ -139,6 +139,7 @@ enum ConvKind {
     Assistant,
     System,
     Error,
+    Thinking,
 }
 
 struct ConvLine {
@@ -153,6 +154,7 @@ impl ConvLine {
             ConvKind::Assistant => (Color::Gray, "  "),
             ConvKind::System => (Color::Cyan, "· "),
             ConvKind::Error => (Color::Red, "✗ "),
+            ConvKind::Thinking => (Color::Magenta, "💭 "),
         };
         let mut spans = Vec::new();
         if color {
@@ -181,6 +183,11 @@ struct TuiState {
     bg_handles: Vec<(usize, JoinHandle<()>)>,
     /// Monotonic id source for detached turns.
     next_bg_id: usize,
+    /// Whether to show thinking blocks in the conversation pane.
+    show_thinking: bool,
+    /// A transient hint/suggestion shown in the footer (e.g. the options for a
+    /// typed `/` command, or completions revealed by Tab).
+    hint: String,
 }
 
 impl TuiState {
@@ -197,6 +204,8 @@ impl TuiState {
             log_offset: 0,
             bg_handles: Vec::new(),
             next_bg_id: 1,
+            show_thinking: true,
+            hint: String::new(),
         }
     }
 
@@ -537,7 +546,8 @@ fn draw(
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray));
         // Footer shows the live status + the current draft prompt. We append a
-        // dim workspace/model line beneath the draft so the status is always
+        // dim workspace/model line + a transient hint (e.g. `/` command options
+        // or Tab completions) beneath the draft so the status is always
         // visible in the full-screen layout.
         let mut footer_lines = Vec::new();
         footer_lines.push(Line::from(Span::styled(
@@ -553,6 +563,13 @@ fn draw(
             format!("  workspace: {workspace}   model: {model}"),
             Style::default().fg(Color::DarkGray),
         )));
+        // Transient hint line (only rendered when non-empty).
+        if !state.hint.is_empty() {
+            footer_lines.push(Line::from(Span::styled(
+                format!("  {}", state.hint),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
         let footer = Paragraph::new(Text::from(footer_lines))
             .block(footer_block)
             .style(Style::default());
@@ -712,6 +729,85 @@ fn update_tui_typeahead(buf: &str, typeahead: &Arc<Mutex<String>>) {
         g.clear();
         g.push_str(buf);
     }
+}
+
+/// Update the footer hint based on the current idle draft. Shows the available
+/// `/thinking` options when the user has typed `/thinking` (with no further
+/// argument), and otherwise a generic nudge to press Tab for completions.
+fn update_tui_hint(state: &mut TuiState, buf: &str) {
+    if buf == "/thinking" {
+        state.hint = "[Tab] options: show | hide | on | off  (no arg toggles)".to_string();
+    } else if buf == "/" {
+        state.hint = "[Tab] completes commands; try /thinking".to_string();
+    } else {
+        state.hint.clear();
+    }
+}
+
+/// Idle-mode Tab completion. Currently completes `/`-commands (and the
+/// `/thinking` sub-arguments). Returns `Some(completed)` with the new buffer
+/// when exactly one (or a common) completion exists, else `None`.
+fn complete_idle(buf: &str) -> Option<String> {
+    let commands = [
+        "help", "model", "models", "goal", "continue", "clear", "fix", "undo", "bg", "jobs",
+        "thinking", "cancel", "shell", "exit",
+    ];
+    if buf == "/thinking" {
+        return Some("/thinking ".to_string());
+    }
+    if buf.starts_with("/thinking ") {
+        let arg = buf.trim_start_matches("/thinking ").trim_start();
+        let opts = ["show", "hide", "on", "off"];
+        let matches: Vec<&str> = opts.iter().copied().filter(|o| o.starts_with(arg)).collect();
+        if matches.len() == 1 {
+            return Some(format!("/thinking {}", matches[0]));
+        }
+        if matches.len() > 1 {
+            // Complete to the longest common prefix.
+            let lcp = longest_common_prefix(&matches);
+            if !lcp.is_empty() && lcp != arg {
+                return Some(format!("/thinking {}", lcp));
+            }
+        }
+        return None;
+    }
+    if buf.starts_with('/') {
+        let frag = buf.trim_start_matches('/');
+        if frag.contains(' ') {
+            return None; // past the command word; nothing to complete
+        }
+        let matches: Vec<&str> = commands.iter().copied().filter(|c| c.starts_with(frag)).collect();
+        if matches.len() == 1 {
+            return Some(format!("/{}", matches[0]));
+        }
+        if matches.len() > 1 {
+            let lcp = longest_common_prefix(&matches);
+            if !lcp.is_empty() && lcp != frag {
+                return Some(format!("/{}", lcp));
+            }
+        }
+    }
+    None
+}
+
+/// Longest common prefix of a set of strings (empty when empty/inconsistent).
+fn longest_common_prefix(strs: &[&str]) -> String {
+    if strs.is_empty() {
+        return String::new();
+    }
+    let first = strs[0];
+    let mut end = first.len();
+    for s in strs.iter().skip(1) {
+        let mut i = 0;
+        while i < end && i < s.len() && s.as_bytes()[i] == first.as_bytes()[i] {
+            i += 1;
+        }
+        end = i;
+        if end == 0 {
+            break;
+        }
+    }
+    first[..end].to_string()
 }
 
 /// Outcome of a raw read (mirrors `term::raw::RawInput`).
@@ -883,6 +979,15 @@ fn read_idle_line(
                     }
                     c if c >= 0x20 && c < 0x7f => {
                         buf.push(c as char);
+                        update_tui_typeahead(&buf, ctx.typeahead);
+                        update_tui_hint(state, &buf);
+                    }
+                    0x09 => {
+                        if let Some(completed) = complete_idle(&buf) {
+                            buf = completed;
+                            update_tui_typeahead(&buf, ctx.typeahead);
+                            update_tui_hint(state, &buf);
+                        }
                     }
                     _ => { /* ignore other control bytes */ }
                 }
@@ -944,6 +1049,18 @@ fn drain_session_log(log: PathBuf, state: &mut TuiState) -> usize {
                         if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
                             text.push_str(t);
                             text.push('\n');
+                        }
+                    }
+                    Some("thinking") => {
+                        if let Some(t) = b.get("thinking").and_then(|t| t.as_str()) {
+                            if !state.show_thinking {
+                                continue;
+                            }
+                            let t = t.trim();
+                            if t.is_empty() {
+                                continue;
+                            }
+                            state.push(ConvKind::Thinking, &format!("💭 {t}"));
                         }
                     }
                     Some("tool_use") => {
@@ -1131,6 +1248,36 @@ fn handle_command(
                 spawn_background(ctx, state, prompt);
             }
         }
+        "thinking" => {
+            let mut g = ctx.agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                state.push(ConvKind::System, "· agent busy (turn running) — try again when idle");
+                return;
+            };
+            match rest.first().map(|s| s.to_string()).unwrap_or_default().as_str() {
+                "" => {
+                    state.show_thinking = !state.show_thinking;
+                    state.push(ConvKind::System, &agent.set_show_thinking(state.show_thinking));
+                }
+                "show" => {
+                    state.show_thinking = true;
+                    state.push(ConvKind::System, &agent.set_show_thinking(state.show_thinking));
+                }
+                "hide" => {
+                    state.show_thinking = false;
+                    state.push(ConvKind::System, &agent.set_show_thinking(state.show_thinking));
+                }
+                "on" => {
+                    state.show_thinking = true;
+                    state.push(ConvKind::System, &agent.set_show_thinking(state.show_thinking));
+                }
+                "off" => {
+                    state.show_thinking = false;
+                    state.push(ConvKind::System, &agent.set_show_thinking(state.show_thinking));
+                }
+                other => state.push(ConvKind::Error, &format!("usage: /thinking [show|hide|on|off] (got '{other}')")),
+            }
+        }
         "rebuild" => {
             state.push(ConvKind::System, "· /rebuild is only available in the streaming REPL");
         }
@@ -1144,3 +1291,58 @@ commands: /help /model <sel> /models /goal [obj] /continue /clear /fix /undo [al
 /bg <text> /jobs /cancel
 /sh [cmd args]  drop to a shell, or run a command via $SHELL (sh -c)
 Esc or ctrl-c cancels the running turn; ctrl-d quits; lines ending in & run in the background";
+
+#[cfg(test)]
+mod tui_completion_tests {
+    use super::*;
+
+    #[test]
+    fn tab_completes_unique_command() {
+        assert_eq!(complete_idle("/cle"), Some("/clear".to_string()));
+    }
+
+    #[test]
+    fn tab_completes_to_common_prefix() {
+        // "m" could be model or models → common prefix is "model".
+        assert_eq!(complete_idle("/m"), Some("/model".to_string()));
+        // "mo" is already the full prefix of both; second Tab (now "model" + space
+        // is needed) stays at the common prefix until disambiguated.
+        assert_eq!(complete_idle("/mod"), Some("/model".to_string()));
+    }
+
+    #[test]
+    fn tab_does_not_complete_past_command_word() {
+        assert_eq!(complete_idle("/model xyz"), None);
+    }
+
+    #[test]
+    fn tab_completes_thinking_to_arg() {
+        assert_eq!(complete_idle("/thinking"), Some("/thinking ".to_string()));
+        assert_eq!(complete_idle("/thinking s"), Some("/thinking show".to_string()));
+        assert_eq!(complete_idle("/thinking h"), Some("/thinking hide".to_string()));
+    }
+
+    #[test]
+    fn tab_no_completion_for_plain_text() {
+        assert_eq!(complete_idle("hello world"), None);
+    }
+
+    #[test]
+    fn longest_common_prefix_basic() {
+        assert_eq!(longest_common_prefix(&["show", "hide", "on", "off"]), "");
+        assert_eq!(longest_common_prefix(&["show", "shrink"]), "sh");
+        assert_eq!(longest_common_prefix(&["model", "models"]), "model");
+        assert_eq!(longest_common_prefix(&[]), "");
+    }
+
+    #[test]
+    fn hint_recommends_thinking_options() {
+        let mut s = TuiState::new();
+        update_tui_hint(&mut s, "/thinking");
+        assert!(s.hint.contains("show") && s.hint.contains("hide"));
+        update_tui_hint(&mut s, "/");
+        assert!(s.hint.contains("Tab"));
+        update_tui_hint(&mut s, "hello");
+        assert!(s.hint.is_empty());
+    }
+}
