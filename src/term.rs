@@ -846,7 +846,56 @@ pub mod raw {
     use std::io::{self, Write};
     use std::os::unix::io::AsRawFd;
     use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
+
+    /// Millisecond timestamp (process-monotonic via `SystemTime`) of the most
+    /// recent keystroke the raw reader saw — any printable char, backspace,
+    /// Enter, or control key. Shared with the agent's thinking-stream callback
+    /// so streamed reasoning can be *deferred* while the user is actively
+    /// typing: the thinking text is held back until the keyboard has been idle
+    /// for a moment (see `KEYBOARD_IDLE_BEFORE_THINKING_MS`), so the model's
+    /// reasoning never wipes the in-progress line the user is typing.
+    static LAST_KEY_MILLIS: AtomicU64 = AtomicU64::new(0);
+
+    /// How long the keyboard must be idle (no keypress) before streamed
+    /// "thinking" output is allowed to print. 1s: a typing burst isn't
+    /// interrupted, and a short pause is all it takes for reasoning to appear.
+    pub const KEYBOARD_IDLE_BEFORE_THINKING_MS: u64 = 1000;
+
+    fn now_millis() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Record a keystroke (called by the raw reader on any input event).
+    pub fn note_keypress() {
+        LAST_KEY_MILLIS.store(now_millis(), Ordering::SeqCst);
+    }
+
+    /// Milliseconds since the last keystroke (u64::MAX if none yet this
+    /// process, so "no keys ever" counts as fully idle).
+    pub fn millis_since_keypress() -> u64 {
+        let last = LAST_KEY_MILLIS.load(Ordering::SeqCst);
+        if last == 0 {
+            return u64::MAX;
+        }
+        now_millis().saturating_sub(last)
+    }
+
+    /// True when the keyboard has been idle for at least
+    /// [`KEYBOARD_IDLE_BEFORE_THINKING_MS`] (or no key was ever pressed).
+    pub fn keyboard_idle_long_enough() -> bool {
+        millis_since_keypress() >= KEYBOARD_IDLE_BEFORE_THINKING_MS
+    }
+
+    /// Test hook: pretend the keyboard is idle (clears the last-key clock).
+    #[cfg(test)]
+    pub(crate) fn reset_keypress_clock() {
+        LAST_KEY_MILLIS.store(0, Ordering::SeqCst);
+    }
 
     /// Upper bound on one `wait_input` block, in milliseconds. `readable()` on
     /// a pipe at EOF fires immediately *forever*, so without a bounded wait the
@@ -1093,6 +1142,9 @@ pub mod raw {
         if nread == 0 {
             return RawInput::None;
         }
+        // A real input event arrived: mark the keyboard active so deferred
+        // thinking output keeps waiting (see `note_keypress`).
+        note_keypress();
         // `pasting` tracks whether we're inside a bracketed-paste wrapper
         // (`ESC[200~` … `ESC[201~`). It is local because `read_chunk` always
         // drains every available byte (above), so a whole paste is consumed
@@ -1797,5 +1849,40 @@ mod highlight_tests {
         assert_eq!(highlight("TODO"), "TODO");
         set_transparent_highlight(false);
         assert_eq!(highlight("TODO"), "TODO");
+    }
+}
+
+#[cfg(test)]
+mod keyboard_idle_tests {
+    use super::raw::*;
+    use std::sync::Mutex;
+
+    /// The last-keypress clock is process-global; serialise these tests so a
+    /// parallel test's `note_keypress()` can't flake another's assertions.
+    static CLOCK_LOCK: Mutex<()> = Mutex::new(());
+
+    // No keypress ever recorded in this process => the keyboard counts as fully
+    // idle, so streamed thinking prints immediately.
+    #[test]
+    fn no_keypress_counts_as_idle() {
+        let _g = CLOCK_LOCK.lock().unwrap();
+        reset_keypress_clock();
+        assert!(keyboard_idle_long_enough());
+        assert!(millis_since_keypress() >= KEYBOARD_IDLE_BEFORE_THINKING_MS);
+    }
+
+    // A fresh keypress must gate thinking output for the idle window.
+    #[test]
+    fn fresh_keypress_gates_thinking() {
+        let _g = CLOCK_LOCK.lock().unwrap();
+        reset_keypress_clock();
+        note_keypress();
+        assert!(
+            millis_since_keypress() < KEYBOARD_IDLE_BEFORE_THINKING_MS,
+            "a key just pressed must be inside the idle window"
+        );
+        assert!(!keyboard_idle_long_enough());
+        // Restore global state for other tests (process-wide clock).
+        reset_keypress_clock();
     }
 }

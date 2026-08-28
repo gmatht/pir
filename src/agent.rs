@@ -1090,11 +1090,24 @@ impl Agent {
             // is then drawn *after* the thinking completes (back at the idle
             // prompt) instead of sitting on top of the reasoning and hiding
             // most of it.
+            //
+            // Deferral: the spinner line doubles as the user's live typing
+            // echo (the REPL records keystrokes into `typeahead` and the
+            // spinner thread renders them). Printing reasoning *while the
+            // user is typing* would wipe that in-progress line, so thinking
+            // is held in a buffer until the keyboard has been idle for at
+            // least `KEYBOARD_IDLE_BEFORE_THINKING_MS` (1s). It is force-
+            // flushed on stop_spinner/boundaries so nothing is lost or
+            // reordered relative to the reply.
             let show_thinking = self.show_thinking;
+            let mut think_buf = String::new();
             let mut on_think = |t: &str| {
                 if !self.silent() && show_thinking {
                     stop_spinner();
-                    term::out(&format!("{}", term::dim(t)));
+                    think_buf.push_str(t);
+                    if term::raw::keyboard_idle_long_enough() {
+                        term::out(&format!("{}", term::dim(&std::mem::take(&mut think_buf))));
+                    }
                 }
             };
             let result = self.client.chat(
@@ -1108,6 +1121,13 @@ impl Agent {
                 self.model.context.unwrap_or(200_000),
                 &mut on_think,
             );
+            // Flush any thinking that arrived while the user was still typing
+            // (deferred above) BEFORE the reply text / tool output prints, so
+            // reasoning never appears interleaved after the response it
+            // preceded — and the buffer can't leak into the next model call.
+            if !think_buf.is_empty() {
+                term::out(&format!("{}", term::dim(&std::mem::take(&mut think_buf))));
+            }
             // Ensure the footer spinner is stopped (covers the no-output case),
             // then move to a fresh line below the agent's text.
             if !self.silent() {
@@ -1123,6 +1143,9 @@ impl Agent {
                     // as well as stderr, so a mid-turn provider error isn't lost
                     // below already-printed tokens. The on-screen notification
                     // feed also gets an Error event.
+                    if !think_buf.is_empty() {
+                        term::out(&format!("{}", term::dim(&std::mem::take(&mut think_buf))));
+                    }
                     if !self.silent() {
                         term::out(&format!("\r\x1b[K{}\n", term::red(&format!("✗ turn error: {e}"))));
                     } else {
