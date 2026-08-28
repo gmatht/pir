@@ -1326,6 +1326,17 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     // Formula entry change
     let shared_entry = shared.clone();
+    // GTK4: Return in the formula entry fires "activate" (the Entry on_key
+    // key-press-event path is GTK3-only).  Without this, cell edits typed in
+    // the formula bar are never committed — the root cause of
+    // "GTK4 cell edit not producing recording output" in the mainloop fork.
+    {
+        let shared_a = shared.clone();
+        let _ = formula_entry.connect_activate(move |_ev| {
+            handle_key(key::RETURN, &shared_a);
+        });
+    }
+
     formula_entry.connect_changed(move || {
         on_formula_entry_changed(&shared_entry);
     })?;
@@ -1504,8 +1515,10 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         formula_entry.on_key(Box::new(move |keyval: u32| -> bool {
             shared_k2.key_counter.set(shared_k2.key_counter.get() + 1);
             shared_k2.last_key.set(keyval);
-            let masked = keyval & 0xFF;
-            if masked == RETURN || masked == ESCAPE {
+            // Compare the FULL keyval against the platform constants:
+            // on Unix RETURN is 0xFF0D, so masking with 0xFF (0x0D) never
+            // matched and Return in the formula entry was silently dropped.
+            if keyval == RETURN || keyval == ESCAPE {
                 handle_key(keyval, &shared_k);
                 true
             } else {
@@ -1527,8 +1540,19 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     win.set_child(&vbox);
     win.present();
 
+    // Queue an explicit redraw on the toplevel window: a canvas-only
+    // queue_draw may not cascade to the toplevel's frame clock.  Marking
+    // the window dirty ensures the frame clock is armed before the
+    // start_edit() canvas queue_redraw.
+    win.queue_redraw();
+
     // Start editing at A1 immediately so typing goes into the cell
     start_edit(&shared);
+
+    // Pump events after start_edit() so the frame clock processes the
+    // pending redraw and the focus change BEFORE the main loop starts.
+    // Prevents blank windows on slow virtual displays (Xvfb/WSL).
+    rxapp.pump_events(500);
 
     rxapp.run()?;
     Ok(())
