@@ -17,6 +17,11 @@ smol = "2"                                       # async runtime: event-driven s
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
 
+# Optional GUI dep (rustxwidgets), only compiled when `--features gui` (GTK via
+# dlopen) or `--features pancurses` is set. The single crate exposes both
+# backends behind the `gtk`/`pancurses` cargo features.
+rustxwidgets = { path = "rustxWidgets/rustxwidgets", version = "0.1.0", default-features = false, optional = true }
+
 [features]
 # Full-screen TUI REPL: a real layout engine (no hand-rolled ANSI block)
 # with a conversation pane + footer pane (thinking + live draft prompt) and
@@ -24,6 +29,10 @@ crossterm = { version = "0.28", optional = true }
 # `--no-tui` (or just build without the feature) to use the streaming REPL.
 default = []
 tui = ["dep:ratatui", "dep:crossterm"]
+# Graphical (GTK) REPL built on rustxwidgets' dlopen'd GTK backend.
+gui = ["dep:rustxwidgets", "rustxwidgets/gtk"]
+# Curses (pancurses) REPL built on rustxwidgets' pancurses backend.
+pancurses = ["dep:rustxwidgets", "rustxwidgets/pancurses"]
 
 [profile.release]
 strip = true

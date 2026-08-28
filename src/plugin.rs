@@ -48,6 +48,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[derive(Clone)]
 pub struct ToolSpec {
     pub name: &'static str,
     pub description: &'static str,
@@ -66,6 +67,57 @@ impl Outcome {
     pub fn err(content: String) -> Self {
         Outcome { content, is_error: true }
     }
+}
+
+/// Lifecycle events the agent emits to every backend through the event bus
+/// (see [`ToolBackend::on_event`]). Mirrors the subset of `pi`'s extension
+/// event taxonomy that `pir` can surface synchronously. `ToolCall` is special:
+/// it is a *pre-flight* hook the agent calls **before** running a tool, and a
+/// backend may block the call by returning [`HookResult::block`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventKind {
+    /// Fired before a tool runs. `payload` carries `{"toolName", "input"}`.
+    /// Backends may block (e.g. permission gates).
+    ToolCall,
+    /// An assistant turn started (model stream begins).
+    TurnStart,
+    /// A user turn finished (model answered and all tools executed).
+    TurnEnd,
+    /// The agent session started (after all backends are attached).
+    SessionStart,
+    /// The agent loop began an LLM call.
+    AgentStart,
+    /// The whole run settled (`agent_end`).
+    AgentEnd,
+}
+
+/// Result of a pre-flight `ToolCall` hook. Returning `block: true` stops the
+/// tool from executing for this turn; `reason` is shown to the user and fed
+/// back to the model as the tool result.
+#[derive(Debug, Clone)]
+pub struct HookResult {
+    pub block: bool,
+    pub reason: Option<String>,
+    /// When `block` is set, hint that the agent should stop asking for more
+    /// tools this turn (mirrors `pi`'s `terminate`).
+    pub terminate: bool,
+}
+
+impl HookResult {
+    pub fn allow() -> Self {
+        HookResult { block: false, reason: None, terminate: false }
+    }
+    pub fn block(reason: impl Into<String>) -> Self {
+        HookResult { block: true, reason: Some(reason.into()), terminate: false }
+    }
+}
+
+/// A REPL slash command an extension registers (e.g. `/mycommand`). The REPL
+/// dispatches unknown `/name` words to `Registry::run_command`.
+#[derive(Clone)]
+pub struct CommandSpec {
+    pub name: String,
+    pub description: String,
 }
 
 /// A source of one or more tools. Implement this in an extension and register
@@ -107,6 +159,35 @@ pub trait ToolBackend: Send {
     /// follow-ups.
     fn on_turn_end(&mut self, _prompt: &str) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Pre-flight hook for **every** tool call. The agent invokes this *before*
+    /// `run`. Return [`HookResult::block`] to veto a tool (e.g. a permission
+    /// gate blocking `rm -rf`). The default allows all calls. This is how
+    /// `pi`'s `on("tool_call")` blocking semantics are expressed in `pir`'s
+    /// synchronous ABI.
+    fn on_tool_call(&mut self, _name: &str, _input: &Value) -> HookResult {
+        HookResult::allow()
+    }
+
+    /// Lifecycle event bus. The agent calls this for each [`EventKind`] at the
+    /// matching point. Backends use it for observability / side effects
+    /// (e.g. notify, branch summarization). The default ignores all events.
+    /// `payload` is a JSON object with event-specific fields.
+    fn on_event(&mut self, _kind: EventKind, _payload: &Value) {}
+
+    /// Slash commands this backend contributes to the REPL (e.g. `/mycommand`).
+    /// The REPL dispatches an unrecognized `/name` to [`run_command`]. The
+    /// default contributes none.
+    fn commands(&self) -> Vec<CommandSpec> {
+        Vec::new()
+    }
+
+    /// Run a registered slash command with the rest of the line as `args`.
+    /// Return [`Outcome::err`] for unknown command names. Only called for
+    /// command names this backend advertised via [`commands`].
+    fn run_command(&mut self, _name: &str, _args: &str) -> Outcome {
+        Outcome::err("unknown command".into())
     }
 
     /// Share the REPL's "go silent" switch with this backend, replacing its
@@ -215,6 +296,44 @@ impl Registry {
         for b in &mut self.backends {
             b.on_exit();
         }
+    }
+
+    /// Run every backend's pre-flight `tool_call` hook for a tool. The first
+    /// backend that returns `block: true` wins; its reason is returned as the
+    /// block. Tool execution is skipped when this returns `Some((reason,
+    /// terminate))`. Returns `None` when no backend objects (tool may run).
+    pub fn preflight_tool(&mut self, name: &str, input: &Value) -> Option<(String, bool)> {
+        for b in &mut self.backends {
+            let res = b.on_tool_call(name, input);
+            if res.block {
+                return Some((res.reason.unwrap_or_else(|| "blocked by extension".into()), res.terminate));
+            }
+        }
+        None
+    }
+
+    /// Emit a lifecycle event to every backend's event bus.
+    pub fn emit(&mut self, kind: EventKind, payload: &Value) {
+        for b in &mut self.backends {
+            b.on_event(kind.clone(), payload);
+        }
+    }
+
+    /// Return every slash command across all backends, keyed by name.
+    pub fn commands(&self) -> Vec<CommandSpec> {
+        self.backends.iter().flat_map(|b| b.commands()).collect()
+    }
+
+    /// Dispatch a slash command (the bare `name` without the leading `/`) to
+    /// the backend that owns it. Returns `None` when no backend registered the
+    /// command (the REPL then treats it as unknown).
+    pub fn run_command(&mut self, name: &str, args: &str) -> Option<Outcome> {
+        for b in &mut self.backends {
+            if b.commands().iter().any(|c| c.name == name) {
+                return Some(b.run_command(name, args));
+            }
+        }
+        None
     }
 
     /// Notify every backend that a user turn just completed. `prompt` is the

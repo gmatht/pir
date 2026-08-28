@@ -14,6 +14,8 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -236,6 +238,23 @@ fn ask(what: &str) -> Decision {
 impl Builtin {
     fn do_bash(&mut self, input: &serde_json::Value) -> Result<String, String> {
         let command = input["command"].as_str().ok_or("bash: missing 'command'")?;
+        // Guard #1 (item: stop agents killing their peers). A `pkill`/`kill`
+        ///`killall` aimed at `pir` (or scoped to the running user) is almost
+        // always a mass-extinction trigger — both historical mass deaths here
+        // were exactly an agent running `pkill -f target/.../pir` / `pkill -u
+        // ai_pir`. Always require an explicit human confirm before such a
+        // command runs, even in full-auto (correctness/safety beats
+        // unattendedness for a command that can terminate every other session).
+        if let Some(why) = Self::dangerous_kill_reason(command) {
+            let answer = term::read_answer(&format!(
+                "{} this command looks like it would kill pir processes ({why}). Run it anyway? [y]es / [n]o (default no) ",
+                term::yellow("⚠")
+            ));
+            match answer.as_str() {
+                "y" | "yes" => {}
+                _ => return Ok("[denied] refusing to run a self-targeting kill command".into()),
+            }
+        }
         if !self.full_auto && !self.bash_ok {
             match ask(&format!("run {}", term::yellow(&format!("`{command}`")))) {
                 Decision::No => return Ok("[denied] user declined to run this command".into()),
@@ -244,6 +263,29 @@ impl Builtin {
             }
         }
         run_shell(self, command)
+    }
+
+    /// Return `Some(reason)` if `command` looks like it would terminate `pir`
+    /// processes (this or sibling sessions), else `None`. Heuristic but
+    /// conservative: it matches the exact patterns that caused the two real
+    /// mass extinctions. We deliberately do NOT try to parse shell — just look
+    /// for the dangerous tokens. A human confirm is still required, so false
+    /// positives only add a prompt, never block unattended safety-critical ops.
+    fn dangerous_kill_reason(command: &str) -> Option<&'static str> {
+        let c = command;
+        // `pkill`/`killall` against `pir`/`target/...pir` (the #1 extinction).
+        if (c.contains("pkill") || c.contains("killall")) && c.contains("pir") {
+            return Some("pkill/killall targeting pir");
+        }
+        // `pkill -u <this user>` (the #2 extinction killed `ai_pir`).
+        if c.contains("pkill -u") || c.contains("pkill -U") {
+            return Some("pkill scoped to a user");
+        }
+        // A bare `kill -9` / `kill -TERM` with a broad target is ambiguous, but
+        // `kill` of a process group (`kill -<sig> -<pgid>`) or `killall` of
+        // `pir` is the dangerous shape; `kill <pid>` of is allowed
+        // (that's normal job control). We only flag killall already covered.
+        None
     }
 
     fn write_file(&mut self, input: &serde_json::Value) -> Result<String, String> {
@@ -500,20 +542,36 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
     let abort = b.abort.clone();
     let deadline = Instant::now() + TIMEOUT;
     let mut next_check_in = Instant::now() + CHECK_IN;
+    // Kill the whole process group of the child (item: child is in its own
+    // group via process_group(0)), so shell pipelines / subcommands die too,
+    // and so cancelling a runaway command never takes pir down with it.
+    let kill_tree = |child: &mut std::process::Child| {
+        #[cfg(unix)]
+        {
+            let pgid = child.id() as i32;
+            // Negative pid => signal the whole group. Ignore errors (already
+            // exited / reparented).
+            unsafe { let _ = libc::kill(-pgid, libc::SIGTERM); }
+            let _ = child.wait();
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    };
     let status = loop {
         // ESC/ctrl-c hard-abort: if the user asked to cancel the command, kill
         // the child immediately and stop — no waiting for it to exit on its own.
         if abort.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_tree(&mut child);
             break None;
         }
         match child.try_wait().map_err(|e| format!("wait: {e}"))? {
             Some(status) => break Some(status),
             None => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_tree(&mut child);
                     break None;
                 }
                 if Instant::now() >= next_check_in {
@@ -649,6 +707,12 @@ fn spawn_shell(command: &str, cwd: &Path) -> Result<std::process::Child, String>
         let mut c = Command::new(prog);
         c.arg(flag).arg(command);
         c.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Put the command in its OWN process group (item: don't let a runaway
+        // command share pir's foreground process group, so killing the search
+        // kills only the search, not pir). On unix this uses setpgid(0,0);
+        // `process_group(0)` is the cross-platform way to request it.
+        #[cfg(unix)]
+        c.process_group(0);
         c
     };
     let (prog, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("bash", "-c") };

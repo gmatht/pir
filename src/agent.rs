@@ -1,7 +1,7 @@
 use crate::config::{self, ApiKind, Model, Provider};
 use crate::goal::{GoalStatus, GoalStore};
 use crate::notify::{AgentEvent, SharedBus};
-use crate::plugin::{Outcome, Registry};
+use crate::plugin::{EventKind, Outcome, Registry};
 use crate::provider::Client;
 use crate::term;
 use crate::types::{Block, Message, Role, Usage};
@@ -174,6 +174,10 @@ impl Agent {
         registry.set_quiet_handle(quiet_req.clone());
         crate::register_all(&mut registry);
         registry.session_started(&cwd);
+        // Emit SessionStart so backends (e.g. the pi-extensions bridge) can
+        // spawn their child processes / load resources now that the agent and
+        // its cwd are known.
+        registry.emit(EventKind::SessionStart, &json!({ "cwd": cwd.display().to_string() }));
 
         let mut system = String::from(
             "You are pir, a minimal terminal coding agent (a lightweight Rust \
@@ -929,6 +933,10 @@ impl Agent {
             }
             self.trim();
 
+            // Emit TurnStart so backends know an assistant turn is beginning
+            // (this is the point the model stream starts).
+            self.registry.emit(EventKind::TurnStart, &json!({ "prompt": user }));
+
             // While we wait for the model's first token, show a spinner so it's
             // obvious the agent is "thinking". It stops the instant the stream
             // starts emitting text (and is skipped entirely when quiet / not a
@@ -1011,8 +1019,10 @@ impl Agent {
             self.history.push(assistant);
 
             if calls.is_empty() {
+                self.registry.emit(EventKind::AgentEnd, &json!({}));
                 self.notify.publish(self.turn_done_event(), false);
                 if !self.silent() {
+                    self.registry.emit(EventKind::TurnEnd, &json!({ "prompt": user }));
                     self.continuations.extend(self.registry.on_turn_end(user));
                 }
                 self.mark_status(SessionStatus::Completed, self.goal_pending(), "");
@@ -1023,6 +1033,25 @@ impl Agent {
             for (id, name, input) in &calls {
                 if !self.silent() {
                     term::out(&format!("{} {}", term::cyan("»"), describe_call(name, input)));
+                }
+                // Pre-flight extension hook: any backend may block this tool
+                // call (permission gates, protected paths, etc.). When blocked,
+                // we feed the reason back as the tool result so the model sees
+                // *why* and can adapt, and stop asking for more tools this turn
+                // if the hook requested `terminate`.
+                if let Some((reason, terminate)) = self.registry.preflight_tool(name, input) {
+                    if !self.silent() {
+                        term::out(&term::yellow(&format!("  · blocked: {reason}")));
+                    }
+                    results.blocks.push(Block::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: format!("blocked by extension: {reason}"),
+                        is_error: true,
+                    });
+                    if terminate {
+                        break;
+                    }
+                    continue;
                 }
                 // Snapshot the target file before a destructive edit so `/undo`
                 // can revert it. `write_file`/`edit_file` take `path`.
@@ -1147,6 +1176,29 @@ impl Agent {
 
     pub fn undo_available(&self) -> usize {
         self.undo_stack.len()
+    }
+
+    /// Dispatch a slash command to an extension backend (e.g. the
+    /// `pi-extensions` bridge), by bare `name` (no leading `/`). Returns `None`
+    /// when no extension registered this command (so the REPL can report it as
+    /// unknown). Backends are reached through the shared `Registry`.
+    pub fn run_registered_command(&mut self, name: &str, args: &str) -> Option<crate::plugin::Outcome> {
+        self.registry.run_command(name, args)
+    }
+
+    /// List every tool spec the registry currently exposes (built-in +
+    /// extension). Used by the `/ext` REPL diagnostic.
+    pub fn registry_spec_names(&self) -> Vec<String> {
+        self.registry.specs().iter().map(|s| s.name.to_string()).collect()
+    }
+
+    /// List every extension-registered slash command. Used by `/ext`.
+    pub fn registry_command_names(&self) -> Vec<(String, String)> {
+        self.registry
+            .commands()
+            .into_iter()
+            .map(|c| (c.name, c.description))
+            .collect()
     }
 
     /// Publish an exit notification to the shared bus (called from one-shot /

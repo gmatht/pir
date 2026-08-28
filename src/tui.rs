@@ -63,6 +63,12 @@ pub fn run(
     let backend = CrosstermBackend::new(stdout);
     let mut term = ratatui::Terminal::new(backend).map_err(|e| format!("terminal init: {e}"))?;
 
+    // Enable bracketed-paste mode so a *pasted* multiline block is delivered
+    // wrapped in `ESC[200~…ESC[201~` and treated as a single line instead of
+    // being split on every newline into a separate queued prompt. Paired with
+    // the `Cleanup` guard below (which disables it on exit).
+    let _ = crossterm::execute!(io::stdout(), crossterm::event::EnableBracketedPaste);
+
     // RAII guard: leave alternate screen + restore raw mode no matter how we exit.
     let _cleanup = Cleanup;
 
@@ -104,6 +110,7 @@ pub fn run(
 struct Cleanup;
 impl Drop for Cleanup {
     fn drop(&mut self) {
+        let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
         let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
         let _ = disable_raw_mode();
         let _ = io::stdout().flush();
@@ -570,7 +577,10 @@ fn wait_raw_input(ctx: &TuiCtx) -> RawKey {
 
 /// Drain non-blocking stdin into `buf`, translating control chars. While a turn
 /// runs we DON'T echo to stdout (ratatui owns the screen); we just record into
-/// `typeahead` for the footer to render.
+/// `typeahead` for the footer to render. Bracketed-paste aware: inside an
+/// `ESC[200~ … ESC[201~` wrapper, embedded newlines are kept as part of the
+/// line (a real `'\n'`) instead of ending it — so a pasted multiline block
+/// becomes a single queued prompt rather than one per line.
 fn read_raw_into(buf: &mut String, typeahead: &Arc<Mutex<String>>) -> RawKey {
     use std::os::unix::io::AsRawFd;
     let fd = io::stdin().as_raw_fd();
@@ -591,22 +601,29 @@ fn read_raw_into(buf: &mut String, typeahead: &Arc<Mutex<String>>) -> RawKey {
     if nread == 0 {
         return RawKey::None;
     }
+    let mut pasting = false;
     let mut i = 0usize;
     while i < nread {
         let b = tmp[i];
         i += 1;
         match b {
             0x0a | 0x0d => {
-                let line = std::mem::take(buf);
-                return RawKey::Line(line);
+                if pasting {
+                    // Inside a paste: keep the newline as part of the line
+                    // (CRLF already normalised to nothing by the CR arm).
+                    if b == 0x0a {
+                        buf.push('\n');
+                        update_tui_typeahead(buf, typeahead);
+                    }
+                } else {
+                    let line = std::mem::take(buf);
+                    return RawKey::Line(line);
+                }
             }
             0x7f | 0x08 => {
                 if !buf.is_empty() {
                     buf.pop();
-                    if let Ok(mut g) = typeahead.lock() {
-                        g.clear();
-                        g.push_str(buf);
-                    }
+                    update_tui_typeahead(buf, typeahead);
                 }
             }
             0x03 => {
@@ -626,10 +643,11 @@ fn read_raw_into(buf: &mut String, typeahead: &Arc<Mutex<String>>) -> RawKey {
             0x1b => {
                 // Esc is ambiguous: a lone Esc cancels the turn; it's also the
                 // lead byte of a CSI sequence (arrows, Home/End, F-keys:
-                // `0x1b 0x5b …`). Disambiguate on the byte after this one, which
-                // is almost always already buffered in `tmp` (the whole sequence
-                // arrives in a single terminal write). Only peek the fd when `0x1b`
-                // is the last buffered byte.
+                // `0x1b 0x5b …`; and the bracketed-paste wrappers
+                // `ESC[200~` / `ESC[201~`). Disambiguate on the byte after this
+                // one, which is almost always already buffered in `tmp` (the
+                // whole sequence arrives in a single terminal write). Only peek
+                // the fd when `0x1b` is the last buffered byte.
                 let next_is_csi = if i < nread {
                     tmp[i] == 0x5b
                 } else {
@@ -642,10 +660,27 @@ fn read_raw_into(buf: &mut String, typeahead: &Arc<Mutex<String>>) -> RawKey {
                     }
                     return RawKey::Cancel;
                 }
-                // CSI sequence: skip the `0x5b` (the `0x1b` is already consumed),
-                // then swallow parameter/terminator bytes until an alphabetic byte
-                // or `~`. Consume from the buffered `tmp` first so they don't leak
-                // into the printable-ASCII arm; top up any tail still on the fd.
+                // We're in a CSI sequence. Check for the bracketed-paste wrapper
+                // (`ESC[200~` starts, `ESC[201~` ends). The byte after `0x5b` is
+                // the first parameter byte.
+                let after_bracket = i + 1; // index just after `0x5b`
+                let is_paste_marker = after_bracket + 3 <= nread
+                    && tmp[after_bracket] == b'2'
+                    && tmp[after_bracket + 1] == b'0'
+                    && tmp[after_bracket + 2] == b'0'
+                    && (tmp[after_bracket + 3] == b'~' || tmp[after_bracket + 3] == b'1');
+                if is_paste_marker {
+                    // Flip the `pasting` flag and consume the four wrapper bytes
+                    // (`[ 2 0 0 ~` / `[ 2 0 1 ~`). The body stays literal text.
+                    pasting = tmp[after_bracket + 3] == b'0'; // `200~`=start
+                    i = after_bracket + 4;
+                    continue;
+                }
+                // Ordinary CSI sequence: skip the `0x5b` (the `0x1b` is already
+                // consumed), then swallow parameter/terminator bytes until an
+                // alphabetic byte or `~`. Consume from the buffered `tmp` first
+                // so they don't leak into the printable-ASCII arm; top up any
+                // tail still on the fd.
                 if i < nread && tmp[i] == 0x5b {
                     i += 1;
                 }
@@ -662,15 +697,21 @@ fn read_raw_into(buf: &mut String, typeahead: &Arc<Mutex<String>>) -> RawKey {
             }
             c if c >= 0x20 && c < 0x7f => {
                 buf.push(c as char);
-                if let Ok(mut g) = typeahead.lock() {
-                    g.clear();
-                    g.push_str(buf);
-                }
+                update_tui_typeahead(buf, typeahead);
             }
             _ => { /* ignore other control bytes */ }
         }
     }
     RawKey::None
+}
+
+/// Mirror `buf` into the shared TUI `typeahead` so the footer draft reflects
+/// the current line (including any pasted newlines).
+fn update_tui_typeahead(buf: &str, typeahead: &Arc<Mutex<String>>) {
+    if let Ok(mut g) = typeahead.lock() {
+        g.clear();
+        g.push_str(buf);
+    }
 }
 
 /// Outcome of a raw read (mirrors `term::raw::RawInput`).
@@ -745,14 +786,30 @@ fn read_idle_line(
         let n = unsafe { libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
         if n > 0 {
             let mut i = 0usize;
+            // `pasting` tracks whether we're inside a bracketed-paste wrapper; it
+            // is local because `read_idle_line` holds the whole terminal here
+            // and the read below drains the entire paste in one syscall. A
+            // pasted multiline block therefore stays one line (newlines become
+            // real `'\n'`s) until the user presses Enter outside a paste.
+            let mut pasting = false;
             while i < n as usize {
                 let b = tmp[i];
                 i += 1;
                 match b {
                     0x0a | 0x0d => {
-                        let line = std::mem::take(&mut buf);
-                        state.draft.clear();
-                        return Some(line);
+                        if pasting {
+                            // Inside a paste: keep the newline (CRLF collapsed
+                            // to a single newline by the CR arm below). On the
+                            // bare LF just append it; on CR, only if not
+                            // immediately followed by an LF.
+                            if b == 0x0a || !(i < n as usize && tmp[i] == 0x0a) {
+                                buf.push('\n');
+                            }
+                        } else {
+                            let line = std::mem::take(&mut buf);
+                            state.draft.clear();
+                            return Some(line);
+                        }
                     }
                     0x7f | 0x08 => {
                         buf.pop();
@@ -766,11 +823,26 @@ fn read_idle_line(
                         return None;
                     }
                     0x1b => {
-                        // CSI sequence (arrows, etc.): skip it so it doesn't
-                        // leak into the buffer; handle Up/Down for history.
+                        // CSI sequence: handle Up/Down for history and the
+                        // bracketed-paste wrappers (`ESC[200~` start / `ESC[201~`
+                        // end). Other CSI (arrows Left/Right, etc.) we swallow so
+                        // it doesn't leak into the buffer.
                         let mut is_up = false;
                         let mut is_down = false;
                         if i < n as usize && tmp[i] == 0x5b {
+                            // Peek the parameter bytes to see if this is a paste
+                            // wrapper before consuming the sequence.
+                            let pb = i; // index of first param byte
+                            let is_paste = pb + 3 <= n as usize
+                                && tmp[pb] == b'2'
+                                && tmp[pb + 1] == b'0'
+                                && tmp[pb + 2] == b'0'
+                                && (tmp[pb + 3] == b'~' || tmp[pb + 3] == b'1');
+                            if is_paste {
+                                pasting = tmp[pb + 3] == b'0'; // `200~`=start
+                                i += 4;
+                                continue;
+                            }
                             i += 1;
                             let mut seq = [0u8; 8];
                             let mut k = 0usize;
@@ -822,10 +894,12 @@ fn read_idle_line(
 }
 
 /// Best-effort history for idle arrow-up recall in the TUI. History recall is a
-/// nicety; the canonical recorder lives in `term`, so we reuse an empty list
-/// here (the streaming REPL re-reads the `.history` file on the next prompt).
+/// nicety; the canonical recorder/loader lives in `term` (the streaming REPL's
+/// rustyline editor), so we read the same loaded history here — including the
+/// prompts from before a `pir -r` resume, which are stored in the session's
+/// `.history` file and loaded into the editor by `term::set_history_file`.
 fn read_history() -> Vec<String> {
-    Vec::new()
+    crate::term::load_history_lines()
 }
 
 /// Append any new transcript lines from `log` into the conversation pane. The

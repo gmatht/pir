@@ -59,6 +59,14 @@ pub struct SessionMeta {
     /// Unix epoch seconds at the time of the last write (best-effort).
     #[serde(default)]
     pub updated: u64,
+    /// Build stamp of the `pir` binary that wrote this status (e.g.
+    /// `0.1.0-<short-sha>`). Lets `scan_unfinished` distinguish statuses
+    /// written by this run from stale ones left by an older build (which is
+    /// why a pile of `pid=0`/`interrupted` files from a previous binary used
+    /// to flood `/unfinished`). Empty when unknown. A missing/old stamp is not
+    /// fatal — a session is still resumable; the stamp only informs display.
+    #[serde(default)]
+    pub built: String,
     #[serde(default)]
     pub last_prompt: String,
     /// When true, a goal file exists for this session and it is not complete.
@@ -94,6 +102,7 @@ pub fn write_status(
         status,
         pid,
         updated,
+        built: build_stamp(),
         last_prompt: last_prompt.to_string(),
         goal_pending,
         reason: reason.to_string(),
@@ -101,6 +110,21 @@ pub fn write_status(
     if let Ok(s) = serde_json::to_string_pretty(&meta) {
         let _ = fs::write(status_path(log), s);
     }
+}
+
+/// Best-effort build stamp of the currently-running binary, e.g.
+/// `0.1.0-abc1234`. Used to tag status sidecars so stale statuses left by an
+/// older build can be recognized. Reads the `PIR_BUILD_STAMP` env var (set by
+/// `deploy.sh`/cargo build wrapper when available), else the crate version
+/// from `CARGO_PKG_VERSION`. Never fails — falls back to an empty string.
+pub fn build_stamp() -> String {
+    if let Ok(s) = std::env::var("PIR_BUILD_STAMP") {
+        let s = s.trim().to_string();
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 pub fn read_status(log: &Path) -> Option<SessionMeta> {

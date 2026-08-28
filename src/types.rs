@@ -55,3 +55,14 @@ pub struct Usage {
     pub input: u64,
     pub output: u64,
 }
+
+impl Usage {
+    /// Estimate the USD cost of this usage at the given per-1k-token prices
+    /// `(input $/1k, output $/1k)`. Returns `None` when no price is known for
+    /// the model (so callers can display tokens without a fabricated cost).
+    pub fn cost(&self, price: Option<(f64, f64)>) -> Option<f64> {
+        let (in_p, out_p) = price?;
+        let cost = self.input as f64 / 1000.0 * in_p + self.output as f64 / 1000.0 * out_p;
+        Some(cost)
+    }
+}

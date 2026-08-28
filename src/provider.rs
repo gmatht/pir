@@ -21,20 +21,29 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Initial read timeout for an attempt. This covers the **status-line read**:
 /// after TCP connect, the client waits up to this long for the server's first
-/// response byte (`HTTP/1.1 ... \r\n`). It's deliberately *generous* — a slow
-/// or "thinking" provider (e.g. opencode.ai's zen endpoint) can take many
-/// seconds before it sends anything, and ureq returns the transport error
-/// "Error encountered in the status line: timed out reading response" if the
-/// status line isn't received in time. A too-short read timeout made every
-/// retry fail identically (all 4 attempts timing out at 2s), which is exactly
-/// the failure we saw. It doubles on each retry (see `READ_TIMEOUT_GROWTH`)
-/// with **no upper bound** — a slow/"thinking" provider keeps getting more
-/// time on each attempt rather than hitting a hard ceiling and failing forever.
-const READ_TIMEOUT_INIT: Duration = Duration::from_secs(30);
+/// response byte (`HTTP/1.1 ... \r\n`). 15s is enough for most providers to
+/// start responding, while still failing fast (and triggering a retry) when a
+/// provider is genuinely unreachable — rather than waiting 30s+ before the
+/// first retry. It doubles on each retry (see `READ_TIMEOUT_GROWTH`) with
+/// **no upper bound** — a slow/"thinking" provider keeps getting more time on
+/// each attempt rather than hitting a hard ceiling and failing forever.
+const READ_TIMEOUT_INIT: Duration = Duration::from_secs(15);
 /// Each retry gets this multiple of the previous attempt's read timeout. There
 /// is deliberately no cap: the timeout is *unlimited*, simply doubling each
 /// retry so the most stubborn slow provider eventually has room to respond.
 const READ_TIMEOUT_GROWTH: u32 = 2;
+
+/// Hard **request** timeout: the absolute wall-clock budget for one attempt,
+/// from connection through the end of streaming. This is deliberately *much
+/// longer* than the per-attempt status-line read (`READ_TIMEOUT_INIT`) — a
+/// slow/"thinking" provider can take minutes before/while producing tokens, and
+/// we must not kill a working turn just because the status line was slow. It is
+/// enforced by racing the attempt against a deadline timer in the retry loop
+/// (`chat`), so it bounds the whole attempt regardless of `ureq`'s per-read
+/// timeout. Honour `PIR_REQUEST_TIMEOUT_SECS` to override (e.g. set low in tests,
+/// or raise for very slow providers).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Hard backstop for the *streaming* phase: if no bytes arrive for this long
 /// the connection is treated as stalled and the request fails (rather than the
 /// parser polling forever). This guards the gap *between* SSE events once
@@ -50,6 +59,18 @@ const READ_TIMEOUT_GROWTH: u32 = 2;
 /// raise it for very slow providers). The const below is the default when unset.
 const STALL_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// Resolve the overall request timeout, honouring `PIR_REQUEST_TIMEOUT_SECS`.
+fn request_timeout() -> Option<Duration> {
+    if let Some(s) = std::env::var("PIR_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+    {
+        return Some(Duration::from_secs(s));
+    }
+    Some(REQUEST_TIMEOUT)
+}
+
 /// Resolve the streaming stall timeout, honouring `PIR_STALL_TIMEOUT_SECS`.
 fn stall_timeout() -> Duration {
     std::env::var("PIR_STALL_TIMEOUT_SECS")
@@ -60,13 +81,12 @@ fn stall_timeout() -> Duration {
         .unwrap_or(STALL_TIMEOUT)
 }
 
-/// Initial backoff between retries; it doubles each attempt (capped), giving
-/// 60s, 120s, 240s, 240s for the four retries above. Starting at a full minute
-/// avoids hammering a slow / "thinking" provider (e.g. opencode.ai's zen
-/// endpoint) that can take many seconds before it produces its first token — a
-/// 1s backoff would retry repeatedly against a peer that simply hasn't started
-/// streaming yet. Cancellation is still honoured promptly during the backoff
-/// because the sleep loop re-checks `cancel` every 100ms.
+/// Backoff between retries for *non-timeout* transient failures (5xx/429): it
+/// doubles each attempt (capped), giving 60s, 120s,  240s. Starting at a
+/// full minute avoids hammering a sick server. Timeouts are retried *immediately*
+/// instead (see `chat`), since the per-attempt read timeout doubles each retry.
+/// Cancellation is still honoured promptly during the backoff because the sleep
+/// loop re-checks `cancel` every 100ms.
 const RETRY_BASE_BACKOFF: Duration = Duration::from_secs(60);
 const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(240);
 
@@ -206,10 +226,23 @@ impl Client {
                     if attempt >= MAX_RETRIES || !is_retryable(&e) || emitted_text || saw_tool_calls {
                         return Err(e);
                     }
-                    let backoff = (RETRY_BASE_BACKOFF * 2u32.pow(attempt as u32)).min(RETRY_MAX_BACKOFF);
+                    // A timeout is retried *immediately* (no backoff): the
+                    // per-attempt read timeout already doubles each retry, so the
+                    // slow / "thinking" provider is given progressively more time
+                    // on the next attempt rather than being re-hit after a fixed
+                    // 60s wait. Non-timeout transient failures (5xx/429) keep the
+                    // geometric backoff so we don't hammer a sick server. Either
+                    // way, report the read timeout that killed this attempt so the
+                    // user can see how long the cancelled request waited.
+                    let timed_out = is_timeout(&e);
+                    let backoff = if timed_out {
+                        Duration::ZERO
+                    } else {
+                        (RETRY_BASE_BACKOFF * 2u32.pow(attempt as u32)).min(RETRY_MAX_BACKOFF)
+                    };
                     let _ = on_text(&format!(
-                        "\n\u{26a0} request failed (attempt {}), retrying in {:.0?}: {}\n",
-                        attempt + 1, backoff, e
+                        "\n\u{26a0} request failed (attempt {}), retrying in {:.0?} (timeout was {:.0?}): {}\n",
+                        attempt + 1, backoff, read_timeout, e
                     ));
                     // Sleep in short slices so a cancel mid-backoff is honoured.
                     let mut waited = Duration::ZERO;
@@ -489,6 +522,16 @@ fn http_error(e: ureq::Error) -> String {
         }
         other => other.to_string(),
     }
+}
+
+/// True when an error represents a network timeout (read/connect). Used to
+/// decide that a timed-out attempt should be retried *immediately* (the read
+/// timeout already doubles each retry) rather than after the geometric backoff.
+fn is_timeout(error: &str) -> bool {
+    error.contains("timeout")
+        || error.contains("timed out")
+        || error.contains("TimedOut")
+        || error.contains("reading response")
 }
 
 /// True when a read error is a *timeout* poll wake-up rather than a fatal
@@ -919,13 +962,27 @@ mod tests {
         // doubles per attempt with NO upper bound — so the most stubborn slow
         // provider keeps getting more time instead of hitting a ceiling.
         let compute = |attempt: u32| READ_TIMEOUT_INIT * READ_TIMEOUT_GROWTH.saturating_pow(attempt);
-        assert_eq!(compute(0), Duration::from_secs(30));
-        assert_eq!(compute(1), Duration::from_secs(60));
-        assert_eq!(compute(2), Duration::from_secs(120));
-        assert_eq!(compute(3), Duration::from_secs(240));
-        assert_eq!(compute(4), Duration::from_secs(480));
-        assert_eq!(compute(10), Duration::from_secs(30720));
+        assert_eq!(compute(0), Duration::from_secs(15));
+        assert_eq!(compute(1), Duration::from_secs(30));
+        assert_eq!(compute(2), Duration::from_secs(60));
+        assert_eq!(compute(3), Duration::from_secs(120));
+        assert_eq!(compute(4), Duration::from_secs(240));
+        assert_eq!(compute(10), Duration::from_secs(15360));
         assert!(compute(1) > compute(0));
+    }
+
+    #[test]
+    fn timeout_errors_detected() {
+        // The retry loop retries a *timed-out* attempt immediately (no backoff),
+        // relying on the doubling read timeout to give a slow provider more
+        // time. `is_timeout` must recognise the exact message ureq produces.
+        assert!(is_timeout("Error encountered in the status line: timed out reading response"));
+        assert!(is_timeout("timed out reading response"));
+        assert!(is_timeout("Connection timed out"));
+        assert!(is_timeout("stream: timeout"));
+        // Non-timeout transients are NOT timeouts — they keep the backoff.
+        assert!(!is_timeout("HTTP 500: internal error"));
+        assert!(!is_timeout("connection refused"));
     }
 
     /// A `Read` that blocks forever (never returns) until a `cancel` flag is
