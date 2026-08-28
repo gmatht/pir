@@ -306,6 +306,10 @@ pub struct Symbols {
     pub gtk_init: Option<GtkInit>,
     pub g_signal_emit_by_name: Option<GSignalEmitByName>,
     pub g_idle_add: Option<unsafe extern "C" fn(func: Option<unsafe extern "C" fn(*mut c_void) -> i32>, data: *mut c_void) -> u32>,
+    /// glib g_timeout_add(interval_ms, callback, user_data). Used for periodic
+    /// (e.g. streaming) redraws. The callback returns 0 to be removed, else 1
+    /// to keep firing.
+    pub g_timeout_add: Option<unsafe extern "C" fn(interval: u32, func: Option<unsafe extern "C" fn(*mut c_void) -> i32>, data: *mut c_void) -> u32>,
     // pango (optional)
     pub pango_layout_new: Option<unsafe extern "C" fn(context: *mut c_void) -> *mut c_void>,
     pub pango_layout_set_text: Option<unsafe extern "C" fn(layout: *mut c_void, text: *const i8, len: i32)>,
@@ -512,6 +516,7 @@ impl Symbols {
         let gtk_init = unsafe { sym::<GtkInit>(gtk, "gtk_init") };
         let g_signal_emit_by_name = unsafe { sym::<GSignalEmitByName>(gobject, "g_signal_emit_by_name") };
         let g_idle_add = unsafe { sym::<unsafe extern "C" fn(func: Option<unsafe extern "C" fn(*mut c_void) -> i32>, data: *mut c_void) -> u32>(glib, "g_idle_add") };
+        let g_timeout_add = unsafe { sym::<unsafe extern "C" fn(u32, Option<unsafe extern "C" fn(*mut c_void) -> i32>, *mut c_void) -> u32>(glib, "g_timeout_add") };
         // pango symbols are optional; we try to resolve them from the gtk lib too (some symbols may be available)
         let pango_layout_new = None;
         let pango_layout_set_text = None;
@@ -702,6 +707,7 @@ impl Symbols {
             gtk_widget_unparent, gtk_widget_get_parent,
             gtk_window_set_default_size,
             gtk_drawing_area_set_draw_func, gtk_drawing_area_set_content_width, gtk_drawing_area_set_content_height,
+            g_timeout_add,
             cairo_text_extents, cairo_save, cairo_restore, cairo_clip, cairo_line_to, cairo_paint,
         })
     }

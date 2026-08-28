@@ -1690,6 +1690,68 @@ pub unsafe fn idle_add_once(loader: &Arc<Loader>, cb: Box<dyn FnMut()>) {
     }
 }
 
+extern "C" fn timeout_trampoline(data: *mut c_void) -> i32 {
+    unsafe {
+        if data.is_null() {
+            return 0;
+        }
+        let boxed: Box<Box<dyn FnMut()>> = Box::from_raw(data as *mut Box<dyn FnMut()>);
+        let mut cb = boxed;
+        (*cb)();
+    }
+    0 // one-shot: removed after firing
+}
+
+extern "C" fn timeout_recurring_trampoline(data: *mut c_void) -> i32 {
+    unsafe {
+        if data.is_null() {
+            return 0;
+        }
+        let boxed: &mut Box<dyn FnMut()> = &mut *(data as *mut Box<dyn FnMut()>);
+        (*boxed)();
+    }
+    1 // keep firing
+}
+
+/// Schedule `cb` to run once on the main loop after `interval_ms`
+/// milliseconds (via glib `g_timeout_add`). Falls back to running it inline if
+/// the symbol is unavailable.
+pub unsafe fn timeout_add_once(loader: &Arc<Loader>, interval_ms: u32, cb: Box<dyn FnMut()>) {
+    if let Some(timeout_add) = loader.symbols.g_timeout_add {
+        let raw = Box::into_raw(Box::new(cb)) as *mut c_void;
+        unsafe { timeout_add(interval_ms, Some(timeout_trampoline), raw); }
+    } else {
+        let mut cb = cb;
+        cb();
+    }
+}
+
+/// Schedule `cb` to run *repeatedly* every `interval_ms` milliseconds until it
+/// returns false (i.e. the callback stops by returning). The closure receives
+/// nothing; it must self-terminate by dropping its own handle / checking a flag
+/// it captured (the trampoline keeps it alive as long as it returns true).
+///
+/// The closure should check a shared "stop" flag it captured (e.g. an
+/// `Arc<AtomicBool>`) and simply return early (or schedule its own
+/// `quit_main_loop`) when it no longer wants to fire. Returns the glib source
+/// id, or 0 if the symbol is unavailable (in which case the callback is run
+/// once inline as a degraded fallback).
+pub unsafe fn timeout_add_recurring(
+    loader: &Arc<Loader>,
+    interval_ms: u32,
+    cb: Box<dyn FnMut()>,
+) -> u32 {
+    if let Some(timeout_add) = loader.symbols.g_timeout_add {
+        let raw = Box::into_raw(Box::new(cb)) as *mut c_void;
+        unsafe { timeout_add(interval_ms, Some(timeout_recurring_trampoline), raw) }
+    } else {
+        // No glib timer available: run once as a best-effort fallback.
+        let mut cb = cb;
+        cb();
+        0
+    }
+}
+
 /// Unparent a widget (GTK4) — remove from its parent container
 pub unsafe fn widget_unparent(loader: &Arc<Loader>, widget: *mut c_void) {
     if let Some(unparent) = loader.symbols.gtk_widget_unparent {
