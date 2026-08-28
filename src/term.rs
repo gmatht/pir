@@ -212,11 +212,39 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y + i64::from(m <= 2), m, d)
 }
 
-/// rustyline helper: offers `/model` tab-completion plus a live preview
-/// (up to ten matching `provider/model` labels) of the typed prefix.
+/// rustyline helper: offers `/model` argument tab-completion plus
+/// slash-command-name completion (so `/def` → `/default-model`) and a live
+/// preview (up to ten matching `provider/model` labels) of a typed prefix.
 struct PirHelper;
 
 impl rustyline::Helper for PirHelper {}
+
+/// The known slash commands, used for command-name completion (the user can
+/// type a `/`-prefix and Tab to complete it). Keeping this as the single source
+/// of truth means new commands are auto-discoverable via completion.
+const SLASH_COMMANDS: &[&str] = &[
+    "/bg",
+    "/cancel",
+    "/clear",
+    "/continue",
+    "/create",
+    "/default-model",
+    "/exit",
+    "/fix",
+    "/fg",
+    "/goal",
+    "/help",
+    "/jobs",
+    "/model",
+    "/models",
+    "/project",
+    "/rebuild",
+    "/resume",
+    "/sessions",
+    "/undo",
+    "/unfinished",
+    "/usage",
+];
 
 impl Completer for PirHelper {
     type Candidate = String;
@@ -233,6 +261,23 @@ impl Completer for PirHelper {
         let rest = &left[start_idx..];
         let cmd_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
         let cmd = &rest[..cmd_end];
+        // No space yet: the user is still typing the command name itself
+        // (e.g. `/def`). Offer any slash command that starts with what they've
+        // typed, so `/default-<Tab>` completes to `/default-model`.
+        if !rest.contains(char::is_whitespace) {
+            if let Some(prefix) = cmd.strip_prefix('/') {
+                let matches: Vec<String> = SLASH_COMMANDS
+                    .iter()
+                    .filter(|c| c[1..].starts_with(prefix))
+                    .map(|c| c.to_string())
+                    .collect();
+                if matches.is_empty() {
+                    return Ok((0, Vec::new()));
+                }
+                return Ok((start_idx, matches));
+            }
+            return Ok((0, Vec::new()));
+        }
         if cmd != "/model" && cmd != "/m" {
             return Ok((0, Vec::new()));
         }
@@ -952,5 +997,51 @@ pub mod raw {
             i += 1;
         }
         RawInput::None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustyline::history::MemHistory;
+
+    // `Context` borrows a `History`; the helper ignores it, so an empty
+    // in-memory history (kept in a static so it outlives the `Context`) is fine.
+    fn ctx() -> Context<'static> {
+        static HISTORY: std::sync::OnceLock<MemHistory> = std::sync::OnceLock::new();
+        let h = HISTORY.get_or_init(MemHistory::new);
+        Context::new(h)
+    }
+
+    // `/default-` (no trailing space yet) must complete to `/default-model`,
+    // not fall through as "no completion". This is the regression from the
+    // "slash commands don't autocomplete" report.
+    #[test]
+    fn completes_slash_command_name_without_space() {
+        let h = PirHelper;
+        let (start, mut matches) = h.complete("/default-", "/default-".len(), &ctx()).unwrap();
+        matches.sort();
+        assert_eq!(matches, vec!["/default-model"]);
+        assert_eq!(start, 0);
+    }
+
+    #[test]
+    fn completes_unique_slash_prefix() {
+        let h = PirHelper;
+        let (_start, matches) = h.complete("/mod", "/mod".len(), &ctx()).unwrap();
+        assert!(matches.contains(&"/model".to_string()));
+        assert!(matches.contains(&"/models".to_string()));
+    }
+
+    #[test]
+    fn no_command_completion_when_space_present() {
+        // Once a space follows the command, command-name completion must not
+        // kick in (argument completion takes over, which returns nothing here
+        // because MODEL_PROVIDERS is unset in tests).
+        let h = PirHelper;
+        let (_start, matches) = h
+            .complete("/default-model ", "/default-model ".len(), &ctx())
+            .unwrap();
+        assert!(matches.is_empty());
     }
 }
