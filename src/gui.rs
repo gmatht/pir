@@ -101,6 +101,17 @@ pub fn run(
     window.set_child(&vbox);
     window.present();
 
+    // Keep keyboard focus on the Entry (the REPL prompt). Grab it right after
+    // the window is shown, and re-grab it every time it loses focus (e.g. the
+    // user clicks the scrollable TextView, or the periodic drain refreshes).
+    // `connect_focus_out_event` fires when focus leaves; we immediately
+    // `grab_focus` back so typing always lands in the Entry.
+    let entry_focus = entry.clone();
+    let _ = entry.connect_focus_out_event(move |_e: *mut c_void| {
+        entry_focus.grab_focus();
+        1 // stop propagation; keep focus here
+    });
+
     // -- Shared state --
     let state = Arc::new(Mutex::new(GuiState::new()));
     let widgets = GuiWidgets { textview: textview.clone(), status: status.clone() };
@@ -423,9 +434,50 @@ fn handle_command(
             s.conv.push_str("pir · GTK GUI\n");
         }
         "thinking" => {
-            s.show_thinking = !s.show_thinking;
-            let on = s.show_thinking;
-            s.conv.push_str(&format!("· thinking display {}\n", if on { "on" } else { "off" }));
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                s.conv.push_str("· agent busy (turn running) — try again when idle\n");
+                return;
+            };
+            let arg = rest.join(" ");
+            if arg.trim().is_empty() {
+                s.conv.push_str(&format!(
+                    "· thinking level: {}  (/thinking <off|minimal|low|medium|high|xhigh|max> [show|hide])\n",
+                    agent.thinking_level().as_str()
+                ));
+                return;
+            }
+            let mut show: Option<bool> = None;
+            let mut words: Vec<&str> = arg.split_whitespace().collect();
+            if let Some(last) = words.last().copied() {
+                match last {
+                    "show" => {
+                        show = Some(true);
+                        words.pop();
+                    }
+                    "hide" => {
+                        show = Some(false);
+                        words.pop();
+                    }
+                    _ => {}
+                }
+            }
+            let level_arg = words.join(" ");
+            if !level_arg.is_empty() {
+                match crate::config::ThinkingLevel::parse(&level_arg) {
+                    Some(lvl) => s.conv.push_str(&format!("· {}\n", agent.set_thinking(lvl))),
+                    None => {
+                        s.conv.push_str(&format!(
+                            "· usage: /thinking [<off|minimal|low|medium|high|xhigh|max>] [show|hide] (got '{level_arg}')\n"
+                        ));
+                        return;
+                    }
+                }
+            }
+            if let Some(on) = show {
+                s.show_thinking = on;
+                s.conv.push_str(&format!("· {}\n", agent.set_show_thinking(on)));
+            }
         }
         "usage" => {
             let g = agent_slot.lock().unwrap();
