@@ -12,7 +12,7 @@ use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{CompletionType, Config, Context, Editor};
 
-static COLOR: OnceLock<bool> = OnceLock::new();
+static COLOR_OVERRIDE: Mutex<Option<bool>> = Mutex::new(None);
 
 /// Providers, set once at startup, so the line-editor helper can offer
 /// `/model` tab-completion.
@@ -24,12 +24,23 @@ pub fn set_model_providers(providers: &[crate::config::Provider]) {
     let _ = MODEL_PROVIDERS.set(providers.to_vec());
 }
 
+/// Force colour on (`true`) or off (`false`). When unset (the default), colour
+/// is decided automatically from the terminal and `NO_COLOR`. An explicit call
+/// always overrides, so `--no-color` / forced colour win over the auto check.
 pub fn set_color(on: bool) {
-    let _ = COLOR.set(on);
+    if let Ok(mut g) = COLOR_OVERRIDE.lock() {
+        *g = Some(on);
+    }
 }
 
 fn color() -> bool {
-    *COLOR.get_or_init(|| io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none())
+    if let Ok(g) = COLOR_OVERRIDE.lock() {
+        if let Some(v) = *g {
+            return v;
+        }
+    }
+    // Auto: colour only when stdout is a terminal and NO_COLOR is unset.
+    io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
 
 /// Whether stdout is attached to an interactive terminal (used by the
@@ -42,6 +53,27 @@ pub fn is_terminal() -> bool {
 /// predicate). Used by the TUI to colour conversation lines.
 pub fn color_enabled() -> bool {
     color()
+}
+
+/// Whether highlighted text is rendered with a *transparent* background instead
+/// of an opaque colour block. Runtime-toggle via [`set_transparent_highlight`];
+/// default is opaque. A transparent highlight uses reverse video (`ESC[7m`),
+/// which paints the current foreground colour as the background — so the
+/// user's terminal theme shows *through* the highlight instead of an opaque
+/// rectangle being drawn over whatever is already on screen (e.g. inside the
+/// REPL's spinner block, or over a themed background). See [`highlight`].
+static TRANSPARENT_HL: Mutex<bool> = Mutex::new(false);
+
+/// Toggle transparent highlighting. Pass `true` for reverse-video (transparent)
+/// highlights, `false` for an opaque colour block. Safe to call any time.
+pub fn set_transparent_highlight(on: bool) {
+    if let Ok(mut g) = TRANSPARENT_HL.lock() {
+        *g = on;
+    }
+}
+
+fn transparent_highlight() -> bool {
+    *TRANSPARENT_HL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Write `s` to stdout, never panicking and never busy-spinning on a slow or
@@ -145,8 +177,31 @@ fn paint(code: &str, s: &str) -> String {
 pub fn dim(s: &str) -> String { paint("2", s) }
 pub fn bold(s: &str) -> String { paint("1", s) }
 pub fn red(s: &str) -> String { paint("31", s) }
+pub fn green(s: &str) -> String { paint("32", s) }
 pub fn yellow(s: &str) -> String { paint("33", s) }
 pub fn cyan(s: &str) -> String { paint("36", s) }
+
+/// Render `s` as highlighted text. By default the highlight is an opaque
+/// colour block (bright background, bold text) so it stands out on a plain
+/// terminal. When transparent highlighting is enabled (see
+/// [`set_transparent_highlight`]) it instead uses SGR reverse video (`ESC[7m`),
+/// whose background is the terminal's *current* foreground colour — so the
+/// highlight appears as an inverted sliver that lets the underlying theme/REPL
+/// show through rather than an opaque rectangle being painted over whatever is
+/// already on screen (e.g. inside the spinner block while a turn runs, or over
+/// a themed background). With colour disabled both modes fall back to plain
+/// text. The returned string always closes the SGR sequence so the rest of the
+/// line is unaffected.
+pub fn highlight(s: &str) -> String {
+    if !color() {
+        return s.to_string();
+    }
+    if transparent_highlight() {
+        format!("\x1b[7m{s}\x1b[27m")
+    } else {
+        format!("\x1b[1;97;44m{s}\x1b[0m")
+    }
+}
 
 pub fn read_answer(prompt: &str) -> String {
     eprint!("{prompt} ");
@@ -154,6 +209,35 @@ pub fn read_answer(prompt: &str) -> String {
     let mut s = String::new();
     let _ = io::stdin().read_line(&mut s);
     s.trim().to_lowercase()
+}
+
+/// Read a line from the terminal with echo disabled (for secrets such as API
+/// keys). Used by the `/login` command. On unix this briefly turns off the
+/// terminal's `ECHO` flag (restoring it afterwards) so the key isn't shown as
+/// the user types; on non-unix, or when the terminal state can't be fetched, it
+/// falls back to a normal line read (which may echo). The prompt is printed to
+/// stderr so it never pollutes piped stdout.
+pub fn read_secret(prompt: &str) -> String {
+    eprint!("{prompt} ");
+    let _ = io::stderr().flush();
+    #[cfg(unix)]
+    unsafe {
+        let fd = libc::STDIN_FILENO;
+        let mut tios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut tios) == 0 {
+            let mut raw = tios;
+            raw.c_lflag &= !libc::ECHO;
+            libc::tcsetattr(fd, libc::TCSANOW, &raw);
+            let mut s = String::new();
+            let _ = io::stdin().read_line(&mut s);
+            libc::tcsetattr(fd, libc::TCSANOW, &tios);
+            eprintln!();
+            return s.trim().to_string();
+        }
+    }
+    let mut s = String::new();
+    let _ = io::stdin().read_line(&mut s);
+    s.trim().to_string()
 }
 
 pub fn epoch() -> u64 {
@@ -246,6 +330,8 @@ const SLASH_COMMANDS: &[&str] = &[
     "/goal",
     "/help",
     "/jobs",
+    "/login",
+    "/logout",
     "/model",
     "/model*",
     "/models",
@@ -388,7 +474,8 @@ fn load_history() {
         let mut g = e.borrow_mut();
         let Some(rl) = g.as_mut() else { return };
         if let Some(path) = HISTORY_FILE.with(|f| f.borrow().clone()) {
-            let _ = rl.load_history(&path);
+            let r = rl.load_history(&path);
+            eprintln!("pir-debug load_history: path={:?} err={:?}", path, r.err());
         }
     });
 }
@@ -397,6 +484,23 @@ fn save_history(rl: &mut Editor<PirHelper, rustyline::history::DefaultHistory>) 
     if let Some(path) = HISTORY_FILE.with(|f| f.borrow().clone()) {
         let _ = rl.save_history(&path);
     }
+}
+
+/// Return the currently-loaded line-editor history (most-recent-last order),
+/// used by the TUI's idle prompt for arrow-up/down recall. Shares the same
+/// `.history` file the streaming REPL loads into the rustyline editor, so the
+/// TUI shows the exact same previous prompts (including those from before a
+/// `pir -r` resume). Returns an empty vec when no history has been loaded yet.
+pub fn load_history_lines() -> Vec<String> {
+    let lines = EDITOR.with(|e| {
+        let g = e.borrow();
+        match g.as_ref() {
+            Some(rl) => rl.history().iter().cloned().collect(),
+            None => Vec::new(),
+        }
+    });
+    eprintln!("pir-debug load_history_lines: {} entries", lines.len());
+    lines
 }
 
 /// Read a line with full line editing: arrow-up/down history, left/right
@@ -737,6 +841,7 @@ pub mod raw {
     }
 
     /// Outcome of a single non-blocking poll/consume of pending stdin bytes.
+    #[derive(Debug, PartialEq)]
     pub enum RawInput {
         /// Nothing was available (caller should pump notifications and retry).
         None,
@@ -936,11 +1041,12 @@ pub mod raw {
                     // paste wrapper (`ESC[200~` starts, `ESC[201~` ends).
                     if let Some(start) = paste_marker_at(&tmp[..nread], i) {
                         // It's `ESC[200~` (start) or `ESC[201~` (end). Consume
-                        // the four wrapper bytes (`[ 2 0 0 ~` / `[ 2 0 1 ~`) and
-                        // flip the `pasting` flag. The body between them keeps
-                        // being literal text (newlines included).
+                        // the whole wrapper (`ESC [ 2 0 0 ~` = 6 bytes including
+                        // the 0x1b at index `i`) and flip the `pasting` flag. The
+                        // body between them keeps being literal text (newlines
+                        // included). `continue` skips the loop's trailing `i += 1`.
                         pasting = start; // `200~` = start
-                        i += 6; // skip `ESC [ 2 0 0 ~` / `ESC [ 2 0 1 ~`
+                        i += 6;
                         continue;
                     }
                     // Ordinary CSI sequence (arrows, Home/End, F-keys): swallow
@@ -991,21 +1097,21 @@ pub mod raw {
     }
 
     /// True when the bytes at `idx` (in `buf`, where `buf[idx] == 0x1b`) begin a
-    /// bracketed-paste wrapper: `ESC [ 2 0 0 ~` (start) or `ESC [ 2 0 1 ~` (end).
-    /// Returns `Some(is_start)` for a paste wrapper, `None` for an ordinary CSI
-    /// sequence. Used by every raw reader so the streaming REPL and the TUI
-    /// never diverge. `buf` must contain the full wrapper (the caller already
-    /// drained the whole keystroke/paste into `buf` for this tick).
-    fn paste_marker_at(buf: &[u8], idx: usize) -> Option<bool> {
-        // buf[idx] == 0x1b, buf[idx+1] == 0x5b, then "[ 2 0 0 ~" / "[ 2 0 1 ~".
+    /// bracketed-paste wrapper. `pub(crate)` so the unit tests can exercise it
+    /// directly.
+    pub(crate) fn paste_marker_at(buf: &[u8], idx: usize) -> Option<bool> {
+        // buf[idx] == 0x1b, buf[idx+1] == 0x5b (`[`), then "2 0 0 ~" / "2 0 1 ~".
+        // Both wrappers terminate in `~`; they differ in the *third* parameter
+        // byte (`0` = start, `1` = end). So: buf[a]=='2', buf[a+1]=='0',
+        // buf[a+2] in {'0','1'}, buf[a+3]=='~'.
         let a = idx + 2; // first parameter byte ('2')
         if a + 3 < buf.len()
             && buf[a] == b'2'
             && buf[a + 1] == b'0'
-            && buf[a + 2] == b'0'
-            && (buf[a + 3] == b'~' || buf[a + 3] == b'1')
+            && (buf[a + 2] == b'0' || buf[a + 2] == b'1')
+            && buf[a + 3] == b'~'
         {
-            Some(buf[a + 3] == b'0') // `200~` = start
+            Some(buf[a + 2] == b'0') // `200~` = start
         } else {
             None
         }
@@ -1142,10 +1248,11 @@ pub mod raw {
                     }
                     // We're in a CSI sequence; check for the bracketed-paste
                     // wrapper (`ESC[200~` start / `ESC[201~` end) before the
-                    // generic swallow below.
-                    if let Some(start) = paste_marker_at(bytes, i) {
+                    // generic swallow below. NOTE: the loop has already done
+                    // `i += 1` past the 0x1b, so the wrapper starts at `i - 1`.
+                    if let Some(start) = paste_marker_at(bytes, i - 1) {
                         pasting = start; // `200~` = start
-                        i += 6; // skip `ESC [ 2 0 0 ~` / `ESC [ 2 0 1 ~`
+                        i += 5; // skip `[ 2 0 0 ~` / `[ 2 0 1 ~` (0x1b at i-1)
                         continue;
                     }
                     i += 1; // skip 0x1b
@@ -1270,6 +1377,71 @@ mod tests {
 }
 
 #[cfg(test)]
+mod paste_tests {
+    use super::raw::{paste_marker_at, translate, RawInput};
+    use std::sync::{Arc, Mutex};
+
+    fn ta() -> Arc<Mutex<String>> {
+        Arc::new(Mutex::new(String::new()))
+    }
+
+    // A pasted multiline block is delivered wrapped in `ESC[200~ … ESC[201~`.
+    // We must keep the embedded newlines as part of ONE prompt, not split it
+    // into one prompt per line. Regression guard for "pasting multiline text
+    // while a turn runs queues multiple prompts".
+    #[test]
+    fn paste_wrapped_multiline_is_single_line() {
+        let bytes: Vec<u8> = [
+            b'\x1b', b'[', b'2', b'0', b'0', b'~',
+            b'l', b'i', b'n', b'e', b' ', b'o', b'n', b'e',
+            b'\n',
+            b'l', b'i', b'n', b'e', b' ', b't', b'w', b'o',
+            b'\n',
+            b'l', b'i', b'n', b'e', b' ', b't', b'h', b'r', b'e', b'e',
+            b'\x1b', b'[', b'2', b'0', b'1', b'~',
+        ]
+        .to_vec();
+        let mut buf = String::new();
+        let r = translate(&mut buf, &ta(), &bytes);
+        assert_eq!(r, RawInput::None, "paste must NOT end the line early");
+        assert_eq!(buf, "line one\nline two\nline three");
+    }
+
+    // A lone Enter (outside any paste) still ends the line as before.
+    #[test]
+    fn bare_enter_ends_line() {
+        let bytes = b"hello\n".to_vec();
+        let mut buf = String::new();
+        let r = translate(&mut buf, &ta(), &bytes);
+        assert_eq!(r, RawInput::Line("hello".to_string()));
+    }
+
+    // CRLF inside a paste should normalise to a single LF, not two.
+    #[test]
+    fn paste_crlf_normalised() {
+        let bytes: Vec<u8> = [
+            b'\x1b', b'[', b'2', b'0', b'0', b'~',
+            b'a', b'\r', b'\n', b'b',
+            b'\x1b', b'[', b'2', b'0', b'1', b'~',
+        ]
+        .to_vec();
+        let mut buf = String::new();
+        let r = translate(&mut buf, &ta(), &bytes);
+        assert_eq!(r, RawInput::None);
+        assert_eq!(buf, "a\nb");
+    }
+
+    // `paste_marker_at` must only match the bracketed-paste wrappers, not an
+    // ordinary CSI sequence like an arrow key (`ESC [ A`).
+    #[test]
+    fn only_paste_markers_are_detected() {
+        assert_eq!(paste_marker_at(&[b'\x1b', b'[', b'2', b'0', b'0', b'~'], 0), Some(true));
+        assert_eq!(paste_marker_at(&[b'\x1b', b'[', b'2', b'0', b'1', b'~'], 0), Some(false));
+        assert_eq!(paste_marker_at(&[b'\x1b', b'[', b'A'], 0), None);
+    }
+}
+
+#[cfg(test)]
 mod status_line_tests {
     use super::*;
     #[test]
@@ -1277,5 +1449,71 @@ mod status_line_tests {
         let s = status_line("/home/me/project", "anthropic/claude");
         assert!(s.contains("workspace: /home/me/project"));
         assert!(s.contains("model: anthropic/claude"));
+    }
+}
+
+#[cfg(test)]
+mod highlight_tests {
+    use super::*;
+
+    // Drive the shared colour switch so these tests are deterministic.
+    fn set_color_for_test(on: bool) {
+        set_color(on);
+    }
+
+    // With colour on, `highlight` must produce ANSI-wrapped text and the
+    // SGR sequence must be *closed* so the rest of the line is unaffected.
+    #[test]
+    fn highlight_emits_sgr_and_closes_it() {
+        set_color_for_test(true);
+        let hl = highlight("TODO");
+        assert!(hl.starts_with("\x1b["), "expected an SGR open sequence: {hl:?}");
+        assert!(hl.ends_with("\x1b[0m") || hl.ends_with("\x1b[27m"),
+            "highlight must reset SGR at the end: {hl:?}");
+        // The logical text survives inside the escapes.
+        let inner = hl.trim_matches(|c: char| c == '\x1b' || c == '[' || c == 'm' || c.is_ascii_digit())
+            .to_string();
+        assert!(inner.contains("TODO"), "highlight must preserve the text: {hl:?}");
+    }
+
+    // Default (opaque) highlight uses an opaque colour block escape, NOT the
+    // reverse-video escape — so a solid rectangle is drawn over whatever is
+    // behind it.
+    #[test]
+    fn default_highlight_is_opaque_block() {
+        set_color_for_test(true);
+        set_transparent_highlight(false);
+        let hl = highlight("x");
+        assert!(hl.contains("44m"), "opaque highlight should set a background colour (44m): {hl:?}");
+        assert!(!hl.contains("\x1b[7m"), "opaque highlight must NOT use reverse video: {hl:?}");
+    }
+
+    // Transparent highlight uses SGR reverse video (ESC[7m…ESC[27m) whose
+    // background is the terminal's *current* foreground colour — i.e. it lets
+    // whatever is already on screen (the theme / REPL) show through, instead of
+    // painting an opaque rectangle. This is exactly the "transparent highlight"
+    // behaviour: no fixed background colour escape, only the reverse flag.
+    #[test]
+    fn transparent_highlight_uses_reverse_video_not_opaque_block() {
+        set_color_for_test(true);
+        set_transparent_highlight(true);
+        let hl = highlight("x");
+        assert!(hl.contains("\x1b[7m"), "transparent highlight must use reverse video (ESC[7m): {hl:?}");
+        assert!(hl.contains("\x1b[27m"), "transparent highlight must reset reverse video (ESC[27m): {hl:?}");
+        assert!(!hl.contains("44m"), "transparent highlight must NOT set an opaque background colour: {hl:?}");
+        // And it still carries the original text.
+        assert!(hl.contains('x'), "transparent highlight must preserve text: {hl:?}");
+    }
+
+    // With colour disabled (e.g. piped output), `highlight` must pass the text
+    // through untouched sequences), regardless of the transparent
+    // toggles.
+    #[test]
+    fn highlight_no_color_is_plain() {
+        set_color_for_test(false);
+        set_transparent_highlight(true);
+        assert_eq!(highlight("TODO"), "TODO");
+        set_transparent_highlight(false);
+        assert_eq!(highlight("TODO"), "TODO");
     }
 }

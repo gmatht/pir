@@ -28,6 +28,92 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+// ---------------------------------------------------------------------------
+// Death-provenance + child reaping (items 4, 7).
+//
+// Two historical "all pir processes died at once" incidents were caused by an
+// agent running a scoped `pkill`/`kill` (handled now by the bash-tool guard),
+// but there was *no log of what sent the kill*. We install a signal handler
+// that, on SIGTERUP/SIGINT, appends a tiny provenance note (signal
+// number + parent pid + build stamp) to this session's `.status.json` sidecar
+// so the cause is reconstructable from the logs later. We also set
+// PR_SET_PDEATHSIG so a dead parent (e.g. a closed tmux pane) delivers SIGHUP
+// to us, and we reap any spawned command process groups on exit (item 4: a
+// `pir` that dies no longer leaves its `bash` children orphaned to init).
+// ---------------------------------------------------------------------------
+
+/// Path to the active session's `.status.json`, set once `agent` is built.
+/// The signal handler reads it (under the lock) to know where to log.
+static ACTIVE_STATUS: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// Pid of the most recently spawned command's process group, so we can reap it
+/// on exit. Set by the bash tool via [`set_active_child_pgid`]; read on exit.
+static ACTIVE_CHILD_PGID: Mutex<Option<i32>> = Mutex::new(None);
+
+#[cfg(unix)]
+pub fn set_active_child_pgid(pgid: i32) {
+    *ACTIVE_CHILD_PGID.lock().unwrap() = Some(pgid);
+}
+
+/// Install the death-provenance signal handler and PR_SET_PDEATHSIG. Best-
+/// effort: any failure is silently ignored (we must never refuse to start).
+fn install_death_tracking() {
+    #[cfg(unix)]
+    {
+        // If our parent (the tmux pane / shell) dies, ask the kernel to send us
+        // SIGHUP so we tear down cleanly instead of lingering.
+        unsafe {
+            let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGHUP);
+        }
+
+        extern "C" fn handler(signo: libc::c_int) {
+            // Build a one-line provenance note and append it to the status file.
+            let ppid = unsafe { libc::getppid() };
+            let self_pid = std::process::id();
+            let note = format!(
+                "[death] received signal {signo} (SIGHUP={}) at {} from ppid={}; pir pid={}\n",
+                libc::SIGHUP,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                ppid,
+                self_pid,
+            );
+            // Reap any spawned command group so our children don't outlive us.
+            if let Some(pgid) = *ACTIVE_CHILD_PGID.lock().unwrap() {
+                unsafe { let _ = libc::kill(-pgid, libc::SIGKILL); }
+            }
+            // Append to the active status sidecar if there is one. We never
+            // create or truncate it — only append — so a real status write
+            // (which happens via session::write_status) is preserved.
+            if let Some(path) = ACTIVE_STATUS.lock().unwrap().clone() {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                    let _ = f.write_all(note.as_bytes());
+                }
+            }
+            // Default disposition: re-raise so the process actually terminates.
+            unsafe {
+                libc::signal(signo, libc::SIG_DFL);
+                libc::raise(signo);
+            }
+        }
+
+        for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+            unsafe {
+                if libc::signal(sig, handler as libc::sighandler_t) == libc::SIG_ERR {
+                    // ignore — handler install failed for this signal
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ACTIVE_STATUS; // keep the static referenced on non-unix
+    }
+}
+
 const HELP: &str = r#"pir — a featherweight pi-compatible coding agent
 
 USAGE
@@ -82,6 +168,8 @@ COMMANDS
                           the "no commit guard hook" startup warning on an existing repo
   /rebuild                cargo build + exec the fresh binary (unix)
   /create [name]           scaffold a new project (seeds from clipboard .md spec)
+  /login [provider]        store an API key for a provider in ~/.pi/agent/auth.json
+  /logout [provider]       remove a stored provider credential from auth.json
 
   Lines ending in & run in the background: "fix the parser &"  => /bg fix the parser
 
@@ -336,6 +424,10 @@ fn main() {
                 print!("{HELP}");
                 return;
             }
+            "--abi" => {
+                print_abi();
+                return;
+            }
             "-V" | "--version" => {
                 println!("pir {}", env!("CARGO_PKG_VERSION"));
                 return;
@@ -354,6 +446,11 @@ fn main() {
         Err(e) => die(&e),
     };
     term::set_model_providers(&providers);
+
+    // Install death-provenance signal tracking + PR_SET_PDEATHSIG early, so we
+    // can record *what* terminates us (item: SIGTERM/SIGHUP provenance in the
+    // status sidecar) and reap spawned children if the parent pane dies.
+    install_death_tracking();
 
     // Drop privileges to the per-project user *after* config/providers are
     // loaded but *before* the agent (and any tool) runs. On non-unix this is a
@@ -1201,6 +1298,118 @@ fn handle_command(
             }
         }
         "models" => print!("{}", list_models(providers)),
+        "login" => {
+            // Store an API key for a provider in ~/.pi/agent/auth.json (pi's
+            // `/login`, minus the OAuth/subscription flows). With an argument we
+            // use it as the provider id; with none we list the known providers
+            // (from the catalog) plus any already-stored ones and let the user
+            // pick one. On success the key is saved and — if that provider is
+            // already in the live model catalog — the agent switches to its
+            // first model so the credential is live immediately. Environment
+            // variables (`{env:VAR}` in models.json) take precedence over stored
+            // keys, exactly as at startup.
+            if fg_running {
+                eprintln!("pir: a turn is running — finish or /cancel it first, then /login");
+                return;
+            }
+            let provider_id = match rest.first().copied() {
+                Some(id) => id.trim().to_string(),
+                None => {
+                    if providers.is_empty() {
+                        term::read_answer("provider id: ")
+                    } else {
+                        println!("{}", term::bold("providers (from your model catalog):"));
+                        for p in providers {
+                            println!("  - {}", p.pid());
+                        }
+                        for id in config::stored_auth_providers() {
+                            if !providers.iter().any(|p| p.pid().eq_ignore_ascii_case(&id)) {
+                                println!("  - {}  {}", id, term::dim("(stored, not in catalog)"));
+                            }
+                        }
+                        term::read_answer("provider id: ")
+                    }
+                }
+            };
+            let provider_id = provider_id.trim().to_string();
+            if provider_id.is_empty() {
+                return;
+            }
+            let key = term::read_secret(&format!("API key for {provider_id}: "));
+            if key.is_empty() {
+                eprintln!("pir: empty key — nothing saved");
+                return;
+            }
+            match config::set_auth_key(&provider_id, &key) {
+                Ok(path) => {
+                    println!(
+                        "{} saved API key for '{}' in {}",
+                        term::green("✓"),
+                        provider_id,
+                        path.display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("pir: {e}");
+                    return;
+                }
+            }
+            // If the provider is in the live catalog, switch to its first model
+            // so the credential is usable immediately. Re-resolve the provider
+            // list (it now includes the freshly stored key) so a provider that
+            // was only present via a stored key works without a restart.
+            match config::load_providers() {
+                Ok(fresh) => {
+                    if let Some(p) = fresh.iter().find(|p| p.pid().eq_ignore_ascii_case(&provider_id)) {
+                        if !p.models.is_empty() {
+                            let mut g = agent_slot.lock().unwrap();
+                            let Some(agent) = g.as_mut() else {
+                                println!("{} key saved; it will be available after reload", term::dim("·"));
+                                return;
+                            };
+                            if agent.switch(p.clone(), p.models[0].clone()).is_ok() {
+                                if let Ok(mut ctx) = current_ctx.lock() {
+                                    ctx.0 = p.clone();
+                                    ctx.1 = p.models[0].clone();
+                                }
+                                println!("→ switched to {}", agent.label());
+                            }
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        "logout" => {
+            // Remove a stored credential from ~/.pi/agent/auth.json (pi's
+            // `/logout`, which only touches the auth file — environment-variable
+            // and models.json config are untouched). With no argument we list
+            // what's stored; with one we remove that provider's entry.
+            let stored = config::stored_auth_providers();
+            let provider_id = match rest.first().copied() {
+                Some(id) => id.trim().to_string(),
+                None => {
+                    if stored.is_empty() {
+                        println!("{} no stored credentials in {}", term::dim("·"), config::auth_path().display());
+                        return;
+                    }
+                    println!("{}", term::bold("stored credentials:"));
+                    for id in &stored {
+                        println!("  - {id}");
+                    }
+                    term::read_answer("provider id to log out: ")
+                }
+            };
+            let provider_id = provider_id.trim().to_string();
+            if provider_id.is_empty() {
+                return;
+            }
+            match config::remove_auth_key(&provider_id) {
+                Ok(true) => println!("{} removed stored credential for '{}'", term::green("✓"), provider_id),
+                Ok(false) => eprintln!("pir: no stored credential for '{}'", provider_id),
+                Err(e) => eprintln!("pir: {e}"),
+            }
+        }
         "dm" | "default-model" | "model-default" => {
             // Set the default model for *new* sessions by persisting it to
             // ~/.pi/agent/settings.json. With no argument, just show the
@@ -1470,8 +1679,88 @@ fn handle_command(
             let all = rest.first().map(|s| *s == "all").unwrap_or(false);
             println!("{}", agent.undo(all));
         }
+        "ext" => {
+            // Diagnostic: list tools + slash commands currently provided by
+            // extensions (e.g. the pi-extensions bridge), including ones the
+            // model may call. Quiet when there are none.
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                eprintln!("pir: agent busy (turn running) — try again when idle");
+                return;
+            };
+            let tools = agent.registry_spec_names();
+            let cmds = agent.registry_command_names();
+            println!("{} extension tools ({}):", term::bold("ext"), tools.len());
+            for t in &tools {
+                println!("  - {t}");
+            }
+            println!("{} extension commands ({}):", term::bold("ext"), cmds.len());
+            for (n, d) in &cmds {
+                println!("  - /{n}  {d}");
+            }
+        }
         "q" | "quit" | "exit" => std::process::exit(0),
-        other => eprintln!("unknown command /{other} — try /help"),
+        other => {
+            // Unknown to the built-in set. Try extension-registered slash
+            // commands (e.g. from the `pi-extensions` bridge). The agent owns
+            // the registry; we take it briefly, run the command, and report the
+            // result. Returns None when no extension claimed the name.
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                eprintln!("pir: agent busy (turn running) — try again when idle");
+                return;
+            };
+            match agent.run_registered_command(other, rest.join(" ").trim()) {
+                Some(outcome) => {
+                    if outcome.is_error {
+                        eprintln!("{}", outcome.content);
+                    } else {
+                        println!("{}", outcome.content);
+                    }
+                }
+                None => eprintln!("unknown command /{other} — try /help"),
+            }
+        }
+    }
+}
+
+/// Print the machine-readable extension ABI surface this `pir` build supports
+/// (used by `pir --abi` and by the pre-install analyzer in the `pi-extensions`
+/// host). Keep this in sync with `extensions/pi-extensions/ABI.md`.
+fn print_abi() {
+    println!("pir extension ABI (pi-extensions bridge surface)");
+    println!();
+    println!("events:");
+    for e in [
+        "session_start",
+        "turn_start",
+        "turn_end",
+        "agent_start",
+        "agent_end",
+    ] {
+        println!("  - {e}");
+    }
+    println!("pi.* API:");
+    for a in [
+        "pi.on(event, handler)",
+        "pi.registerTool({name,label,description,parameters,execute})",
+        "pi.registerCommand(name, {description, handler})",
+    ] {
+        println!("  - {a}");
+    }
+    println!("ctx.ui.*:");
+    for a in ["ctx.ui.notify(text, level)", "ctx.ui.confirm(title, body) -> bool"] {
+        println!("  - {a}");
+    }
+    println!("ctx.sessionManager.*:");
+    println!("  - ctx.sessionManager.getSessionFile() -> string");
+    println!("NOT supported (extension may break or be auto-stubbed):");
+    for a in [
+        "ctx.ui.custom() / setStatus / setWidget / input (TUI widgets)",
+        "before_provider_request / before_provider_headers (provider interception)",
+        "ctx.ui.confirm is auto-approved (no blocking UI on the host yet)",
+    ] {
+        println!("  - {a}");
     }
 }
 
