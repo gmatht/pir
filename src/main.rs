@@ -2,6 +2,7 @@ mod agent;
 mod config;
 mod goal;
 mod notify;
+mod picker;
 mod plugin;
 mod project;
 mod provider;
@@ -11,6 +12,8 @@ mod types;
 mod user;
 #[cfg(feature = "tui")]
 mod tui;
+#[cfg(feature = "gui")]
+mod gui;
 
 // Statically linked extensions, emitted by build.rs (type "a").
 include!(concat!(env!("OUT_DIR"), "/gen_registry.rs"));
@@ -132,6 +135,7 @@ OPTIONS
   -c, --continue [token]     resume a session and continue its goal (pir -c)
   -u, --as <user>            run project commands as this user (default ai_<project>)
   --tui                use the full-screen TUI REPL (requires the `tui` feature)
+  --gui                use the graphical GTK REPL (requires the `gui` feature)
   --no-tui             use the plain streaming REPL (this is the default build)
   --no-raw             use line-buffered stdin (no raw mode) — for constrained
                        terminals / screen where raw input misbehaves
@@ -356,6 +360,12 @@ fn main() {
     let mut use_tui = false;
     #[cfg(not(feature = "tui"))]
     let mut use_tui = false;
+    // The graphical GTK REPL is used only when the `gui` feature is compiled in
+    // AND `--gui` is passed.
+    #[cfg(feature = "gui")]
+    let mut use_gui = false;
+    #[cfg(not(feature = "gui"))]
+    let mut use_gui = false;
     let mut no_raw = false;
     let mut budget: Option<u64> = None;
 
@@ -435,6 +445,7 @@ fn main() {
             }
             "--no-tui" => use_tui = false,
             "--tui" => use_tui = true,
+            "--gui" => use_gui = true,
             x if x.starts_with('-') => die(&format!("unknown flag {x} — try --help")),
             x => prompt.push(x.to_string()),
         }
@@ -687,6 +698,37 @@ fn main() {
                 agent.set_quiet(false);
             }
         }
+    }
+
+    // Graphical GTK REPL (only when the `gui` feature AND `--gui` is passed).
+    // The agent is switched to `quiet` mode (it streams only to its session log)
+    // and the GUI renders the conversation by draining that log — same
+    // separation the TUI uses. Falls back to the streaming REPL if the GTK
+    // backend can't initialise.
+    #[cfg(feature = "gui")]
+    if use_gui {
+        agent.set_quiet(true);
+        let agent_slot: Arc<Mutex<Option<Agent>>> = Arc::new(Mutex::new(Some(agent)));
+        match crate::gui::run(
+            &agent_slot,
+            &fg_cancel,
+            &fg_quiet,
+            &providers,
+            &bus,
+            full_auto,
+        ) {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("pir: --gui failed: {e}; falling back to plain REPL");
+                agent = agent_slot.lock().unwrap().take().expect("agent present");
+                agent.set_quiet(false);
+            }
+        }
+    }
+    #[cfg(not(feature = "gui"))]
+    if use_gui {
+        eprintln!("pir: --gui requires the `gui` feature (build with --features gui)");
+        // fall through to the streaming REPL below
     }
 
     println!("{}", term::bold("pir"));
@@ -1828,9 +1870,19 @@ fn list_sessions() -> String {
     out
 }
 
-/// Find the session file for a `-r` token: an index from `/sessions`, a
+/// Find the session file for a `-r` token: an index from the listing, a
 /// fragment of the timestamp, or a fragment of the first-line preview.
 /// With no token, default to the latest session from this shell (bash).
+///
+/// When there is no session from this shell (and no explicit token), instead of
+/// the old line-prompt we launch the interactive arrow-key picker (`picker::
+/// pick_session`): a full-screen two-pane UI that lists every session for this
+/// project (newest first) and shows a live preview of the highlighted session's
+/// first/last prompts and the tail of its last thinking + response. Enter /
+/// Right resumes the highlighted one; `y` resumes the newest; `n`/Esc/ctrl-c/
+/// ctrl-d/`q` start a fresh session. The picker only runs when stdin is a tty —
+/// with piped/scripted stdin we fall back to a simple `read_answer` so we never
+/// block forever.
 fn resolve_resume(token: Option<&str>) -> Option<PathBuf> {
     let mut sessions = scan_sessions()?;
     if sessions.is_empty() {
@@ -1857,31 +1909,46 @@ fn resolve_resume(token: Option<&str>) -> Option<PathBuf> {
     match chosen {
         Some(s) => Some(s.path.clone()),
         None => {
-            if token.is_none() {
-                // No session from this shell. Don't dead-end: show the
-                // sessions that exist for this project (they may be from a
-                // different shell/terminal) and offer to resume one. Only
-                // prompt when stdin is an interactive terminal — otherwise
-                // `read_answer` would block forever on piped/scripted stdin.
-                eprintln!("pir: no session from this shell yet — other sessions in this project:");
-                eprintln!("{}", list_sessions());
-                if std::io::stdin().is_terminal() {
-                    let ans = term::read_answer("resume one? [idx | y=latest | n]");
-                    let ans = ans.as_str();
-                    let pick = if ans.is_empty() || ans == "n" || ans == "no" {
-                        None
-                    } else if ans == "y" || ans == "yes" {
-                        Some(0usize)
-                    } else {
-                        ans.parse::<usize>().ok()
-                    };
-                    match pick.and_then(|n| sessions.get(n)) {
-                        Some(s) => return Some(s.path.clone()),
-                        None => eprintln!("pir: ok — not resuming (start fresh, or `pir -r <idx>` next time)"),
+            if token.is_some() {
+                eprintln!("pir: no session matches '{token:?}'");
+                return None;
+            }
+            // No session from this shell. Don't dead-end: offer the interactive
+            // picker over every session in this project (they may be from a
+            // different shell/terminal), with a live preview. The picker drives
+            // stdin in raw mode and restores it on exit.
+            eprintln!("pir: no session from this shell yet — pick one to resume:");
+            if std::io::stdin().is_terminal() {
+                let my_pid = term::parent_shell_pid();
+                let items = build_pick_items(&sessions, my_pid);
+                match crate::picker::pick_session(&items) {
+                    crate::picker::PickResult::Resume(idx) => {
+                        if let Some(s) = sessions.get(idx) {
+                            return Some(s.path.clone());
+                        }
+                    }
+                    crate::picker::PickResult::Cancel => {
+                        eprintln!("pir: ok — not resuming (start fresh, or `pir -r <idx>` next time)");
+                        return None;
                     }
                 }
             } else {
-                eprintln!("pir: no session matches '{token:?}'");
+                // Non-interactive stdin: fall back to the plain line prompt so a
+                // scripted `pir -r` doesn't block forever.
+                eprintln!("{}", list_sessions());
+                let ans = term::read_answer("resume one? [idx | y=latest | n]");
+                let ans = ans.as_str();
+                let pick = if ans.is_empty() || ans == "n" || ans == "no" {
+                    None
+                } else if ans == "y" || ans == "yes" {
+                    Some(0usize)
+                } else {
+                    ans.parse::<usize>().ok()
+                };
+                match pick.and_then(|n| sessions.get(n)) {
+                    Some(s) => return Some(s.path.clone()),
+                    None => eprintln!("pir: ok — not resuming (start fresh, or `pir -r <idx>` next time)"),
+                }
             }
             None
         }
@@ -1894,6 +1961,25 @@ struct Session {
     shell_pid: u32,
     mtime: std::time::SystemTime,
     preview: String,
+}
+
+/// Build the candidate list for the interactive `pir -r` picker from a scanned
+/// session set (already sorted newest-first). Carries the `from_here` flag so
+/// the picker can highlight sessions that came from this shell.
+fn build_pick_items(sessions: &[Session], my_pid: u32) -> Vec<crate::picker::PickItem> {
+    sessions
+        .iter()
+        .enumerate()
+        .map(|(idx, s)| crate::picker::PickItem {
+            index: idx,
+            name: s.name.clone(),
+            shell_pid: s.shell_pid,
+            from_here: s.shell_pid == my_pid,
+            mtime: s.mtime,
+            path: s.path.clone(),
+            preview_line: s.preview.clone(),
+        })
+        .collect()
 }
 
 fn scan_sessions() -> Option<Vec<Session>> {
