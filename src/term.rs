@@ -38,6 +38,12 @@ pub fn is_terminal() -> bool {
     io::stdout().is_terminal()
 }
 
+/// True when ANSI colour is currently enabled (mirrors the private `color()`
+/// predicate). Used by the TUI to colour conversation lines.
+pub fn color_enabled() -> bool {
+    color()
+}
+
 /// Write `s` to stdout, never panicking and never busy-spinning on a slow or
 /// full pipe. `print!`/`write!` to a non-blocking or full stdout return
 /// `EAGAIN` ("Resource temporarily unavailable"), and Rust's std macros *panic*
@@ -614,9 +620,13 @@ pub mod raw {
         Line(String),
         /// ctrl-c: caller should request cancellation of the running turn.
         Interrupt,
+        /// A lone Escape key: caller should request cancellation of the running
+        /// turn (treated like ctrl-c). An Escape that is the lead byte of an
+        /// arrow/function-key sequence is *not* a lone Escape — disambiguated
+        /// in `read_chunk` by peeking at the byte after `0x1b`.
+        Cancel,
         /// ctrl-d: caller should stop the session.
         Eof,
-        /// ctrl-z: caller should pause (suspend) the whole process and return to
         /// the parent shell. The REPL implements this by raising `SIGTSTP`
         /// (after dropping raw mode so the shell is usable) and re-enabling raw
         /// on resume. The partial input line is preserved across the suspend —
@@ -694,7 +704,15 @@ pub mod raw {
         if nread == 0 {
             return RawInput::None;
         }
-        for &b in &tmp[..nread] {
+        // Process bytes sequentially with an index so we can look *ahead* at the
+        // byte following an ESC (needed to tell a lone Esc from the lead of an
+        // arrow/function-key sequence). `read_chunk` already drained every byte
+        // that was available this tick into `tmp`, so a follow-up byte that
+        // arrived in the SAME tick is right here in the buffer — no second fd
+        // read is required for the common case.
+        let mut i = 0usize;
+        while i < nread {
+            let b = tmp[i];
             match b {
                 0x0a | 0x0d => {
                     let line = std::mem::take(buf);
@@ -706,8 +724,6 @@ pub mod raw {
                         // Update the shared typeahead so the spinner drops the
                         // removed character (it owns the only stdout writer).
                         if let Ok(mut g) = typeahead.lock() {
-                            // Keep `g` only as long as needed; drop before any
-                            // other stdout writer could race.
                             g.clear();
                             g.push_str(buf);
                         }
@@ -736,19 +752,52 @@ pub mod raw {
                 }
                 0x1b => {
                     // ESC is ambiguous: a lone Esc should cancel the turn (like
-                    // ctrl-c), but it's also the lead byte of arrow/function-key
-                    // sequences (e.g. ← = 0x1b 0x5b 0x44). So peek for follow-up
-                    // bytes with a short timeout: if none arrive, it's a lone Esc
-                    // → cancel; otherwise it's an escape sequence → consume and
-                    // ignore (we don't do cursor movement while raw).
-                    if lone_escape(fd) {
+                    // ctrl-c), but it's also the lead byte of a CSI sequence
+                    // (arrows, Home/End, F-keys: `0x1b 0x5b …`). Disambiguate on
+                    // the byte that follows this one:
+                    //   * if the next byte is `0x5b` (`[`) it's a CSI sequence →
+                    //     swallow it (we do no cursor movement while raw);
+                    //   * otherwise it's a lone Esc → cancel the turn.
+                    // The next byte is almost always already in `tmp` (the whole
+                    // sequence arrives in one terminal write); only when `0x1b`
+                    // is the final buffered byte do we peek the fd briefly.
+                    let next_is_csi = if i + 1 < nread {
+                        tmp[i + 1] == 0x5b
+                    } else {
+                        matches!(read_byte_timeout(fd, std::time::Duration::from_millis(25)), Some(0x5b))
+                    };
+                    if !next_is_csi {
                         buf.clear();
-                        if let Ok(mut g) = typeahead.lock() { g.clear(); }
+                        if let Ok(mut g) = typeahead.lock() {
+                            g.clear();
+                        }
                         return RawInput::Cancel;
                     }
-                    // Sequence: drain the remaining bytes so they don't leak into
-                    // the next poll, then ignore.
-                    drain_escape_sequence(fd);
+                    // CSI sequence: skip this `0x1b` and the `0x5b`, then swallow
+                    // the parameter/terminator bytes. Consume from `tmp` first
+                    // (the bulk of the sequence arrived in this same batch) up to
+                    // its terminator (an alphabetic byte or `~`), then top up any
+                    // tail still in flight on the fd. We MUST consume the buffered
+                    // body here — otherwise those bytes would fall through to the
+                    // printable-ASCII arm and corrupt `buf`.
+                    i += 1; // skip `0x1b`
+                    if i < nread && tmp[i] == 0x5b {
+                        i += 1; // skip `0x5b` if it was buffered
+                    }
+                    while i < nread {
+                        let b = tmp[i];
+                        i += 1;
+                        if b.is_ascii_alphabetic() || b == b'~' {
+                            break; // terminator consumed
+                        }
+                    }
+                    if i >= nread {
+                        // The terminator wasn't in this batch; the rest is on the
+                        // fd. Top up (bounded) so it doesn't leak into the next poll.
+                        drain_csi_sequence(fd);
+                    }
+                    // `i` now sits just past the consumed sequence (or at `nread`);
+                    // the outer `while` advances it once more, which is correct.
                 }
                 c if c >= 0x20 && c < 0x7f => {
                     buf.push(c as char);
@@ -759,6 +808,148 @@ pub mod raw {
                 }
                 _ => { /* ignore other control bytes */ }
             }
+            i += 1;
+        }
+        RawInput::None
+    }
+
+    /// Read a single byte from the (already non-blocking) fd, polling up to
+    /// `timeout` so we can tell a lone Esc from the start of a CSI sequence
+    /// without blocking forever. Returns `None` on timeout/EOF. EAGAIN/EINTR are
+    /// retried until the deadline, since the fd is non-blocking.
+    fn read_byte_timeout(fd: libc::c_int, timeout: std::time::Duration) -> Option<u8> {
+        let start = std::time::Instant::now();
+        let mut b: u8 = 0;
+        loop {
+            let r = unsafe { libc::read(fd, &mut b as *mut u8 as *mut libc::c_void, 1) };
+            if r == 1 {
+                return Some(b);
+            }
+            if r == 0 {
+                return None; // EOF
+            }
+            // r < 0 (EAGAIN/EINTR): wait until the deadline, then give up.
+            if start.elapsed() >= timeout {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Consume the remainder of a CSI escape sequence (after the `0x1b 0x5b`
+    /// lead-in) so its bytes don't leak into the next input poll. CSI sequences
+    /// terminate on an alphabetic byte (e.g. `A`–`D` for arrows, `H`/`F` for
+    /// Home/End) or `~` (F-keys / modified keys); we read with the already
+    /// non-blocking fd until we hit a terminator or a short deadline cap.
+    fn drain_csi_sequence(fd: libc::c_int) {
+        let mut buf = [0u8; 32];
+        let mut n = 0usize;
+        let start = std::time::Instant::now();
+        loop {
+            let r = unsafe { libc::read(fd, buf.as_mut_ptr().add(n) as *mut libc::c_void, 1) };
+            if r == 1 {
+                let b = buf[n];
+                n += 1;
+                if b.is_ascii_alphabetic() || b == b'~' {
+                    break; // sequence terminated
+                }
+                if n >= buf.len() {
+                    break; // absurdly long; stop to avoid spinning
+                }
+            } else if r <= 0 {
+                // EAGAIN/EINTR/EOF: give a brief grace period in case the tail
+                // of the sequence is still in flight, then stop.
+                if start.elapsed() >= std::time::Duration::from_millis(25) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+    }
+
+    /// Shared control-character translation used by both the streaming REPL
+    /// (`read_chunk`) and the TUI's raw input reader, so the two front-ends
+    /// never diverge in how Enter / ctrl-c / ctrl-d / esc / backspace are
+    /// interpreted. `bytes` is the chunk just read from fd 0; `buf` accumulates
+    /// the current line and `typeahead` mirrors it for the spinner/footer. ESC
+    /// handling mirrors `read_chunk`'s CSI-aware disambiguation: when a `0x1b`
+    /// is followed by `0x5b` (`[`) it is a CSI sequence (arrows, Home/End, F-keys)
+    /// and is swallowed; otherwise it is a lone Esc → cancel. Because the TUI
+    /// buffers a whole chunk before calling, the bytes following a `0x1b` are
+    /// already present in `bytes`, so no second fd read is needed in the common
+    /// case.
+    pub fn translate(buf: &mut String, typeahead: &Arc<Mutex<String>>, bytes: &[u8]) -> RawInput {
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let fd = io::stdin().as_raw_fd();
+            let b = bytes[i];
+            match b {
+                0x0a | 0x0d => {
+                    let line = std::mem::take(buf);
+                    return RawInput::Line(line);
+                }
+                0x7f | 0x08 => {
+                    if !buf.is_empty() {
+                        buf.pop();
+                        if let Ok(mut g) = typeahead.lock() {
+                            g.clear();
+                            g.push_str(buf);
+                        }
+                    }
+                }
+                0x03 => {
+                    buf.clear();
+                    if let Ok(mut g) = typeahead.lock() {
+                        g.clear();
+                    }
+                    return RawInput::Interrupt;
+                }
+                0x04 => {
+                    buf.clear();
+                    if let Ok(mut g) = typeahead.lock() {
+                        g.clear();
+                    }
+                    return RawInput::Eof;
+                }
+                0x1a => return RawInput::Suspend,
+                0x1b => {
+                    let next_is_csi = if i + 1 < bytes.len() {
+                        bytes[i + 1] == 0x5b
+                    } else {
+                        matches!(read_byte_timeout(fd, std::time::Duration::from_millis(25)), Some(0x5b))
+                    };
+                    if !next_is_csi {
+                        buf.clear();
+                        if let Ok(mut g) = typeahead.lock() {
+                            g.clear();
+                        }
+                        return RawInput::Cancel;
+                    }
+                    i += 1; // skip 0x1b
+                    if i < bytes.len() && bytes[i] == 0x5b {
+                        i += 1; // skip 0x5b
+                    }
+                    while i < bytes.len() {
+                        let c = bytes[i];
+                        i += 1;
+                        if c.is_ascii_alphabetic() || c == b'~' {
+                            break;
+                        }
+                    }
+                    if i >= bytes.len() {
+                        drain_csi_sequence(fd);
+                    }
+                }
+                c if c >= 0x20 && c < 0x7f => {
+                    buf.push(c as char);
+                    if let Ok(mut g) = typeahead.lock() {
+                        g.clear();
+                        g.push_str(buf);
+                    }
+                }
+                _ => { /* ignore other control bytes */ }
+            }
+            i += 1;
         }
         RawInput::None
     }

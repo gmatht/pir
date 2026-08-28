@@ -20,7 +20,8 @@ crossterm = { version = "0.28", optional = true }
 [features]
 # Opt-in full-screen TUI REPL: a real layout engine (no hand-rolled ANSI block)
 # with a conversation pane + footer pane (thinking + live draft prompt) and
-# in-app scrollback. Off by default; enable with `cargo run --features tui -- --tui`.
+# in-app scrollback. On by default; pass `--no-tui` to use the streaming REPL.
+default = ["tui"]
 tui = ["dep:ratatui", "dep:crossterm"]
 
 [profile.release]

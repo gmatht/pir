@@ -43,8 +43,9 @@ OPTIONS
   -r, --resume [token]       resume a session; token selects by index/time/preview
   -c, --continue [token]     resume a session and continue its goal (pir -c)
   -u, --as <user>            run project commands as this user (default ai_<project>)
-  -h, --help  -V, --version
-
+  --tui                force the full-screen TUI REPL (default when built
+                       with the `tui` feature)
+  --no-tui             use the plain streaming REPL instead of the TUI
   --no-raw             use line-buffered stdin (no raw mode) — for constrained
                        terminals / screen where raw input misbehaves
   --budget <tokens>    optional cumulative in+out token cap; turn stops (with a
@@ -52,7 +53,7 @@ OPTIONS
 
 CONFIG (reused from pi, never modified)
   ~/.pi/models.json          providers, models, api keys ("{env:VAR}" supported)
-  ~/.pi/agent/settings.json  optional default model ("model" key)
+  ~/.pisettings.json  optional default model ("defaultModel" key)
   ~/.pi/AGENTS.md, ./AGENTS.md   appended to the system prompt
   ~/.pi/agent/sessions/      pir session transcripts + goal files (pir-*.jsonl/.goal.json)
   ~/.pi/agent/projects.json  project -> execution-user mappings (set by `pir project init`)
@@ -235,6 +236,11 @@ fn main() {
     let mut as_user: Option<String> = None;
     let mut project_name: Option<String> = None;
     let mut bg_prompt: Option<String> = None;
+    // The full-screen ratatui REPL is the default when the `tui` feature is
+    // compiled in; pass `--no-tui` to use the streaming REPL instead.
+    #[cfg(feature = "tui")]
+    let mut use_tui = true;
+    #[cfg(not(feature = "tui"))]
     let mut use_tui = false;
     let mut no_raw = false;
     let mut budget: Option<u64> = None;
@@ -309,6 +315,7 @@ fn main() {
                 println!("pir {}", env!("CARGO_PKG_VERSION"));
                 return;
             }
+            "--no-tui" => use_tui = false,
             "--tui" => use_tui = true,
             x if x.starts_with('-') => die(&format!("unknown flag {x} — try --help")),
             x => prompt.push(x.to_string()),
@@ -491,12 +498,12 @@ fn main() {
         return;
     }
 
-    // Opt-in full-screen TUI REPL (--tui). The default streaming REPL stays the
-    // normal path; this only runs when the `tui` feature is compiled in AND the
-    // user passes --tui. It owns the terminal (alternate screen + raw mode via
-    // crossterm) and renders a conversation pane + footer pane (thinking +
-    // live draft prompt) with its own scrollback — no hand-rolled ANSI block,
-    // so the stray-spinner class of bug can't recur.
+    // Full-screen TUI REPL (default when the `tui` feature is compiled in;
+    // pass `--no-tui` to use the streaming REPL). It owns the terminal
+    // (alternate screen + raw mode via crossterm) and renders a conversation
+    // pane + footer pane (thinking + live draft prompt) with its own
+    // scrollback — no hand-rolled ANSI block, so the stray-spinner class of
+    // bug can't recur.
     #[cfg(feature = "tui")]
     if use_tui {
         let agent_slot: Arc<Mutex<Option<Agent>>> = Arc::new(Mutex::new(Some(agent)));
@@ -898,6 +905,14 @@ fn handle_command(
                             }
                             println!("→ {}", agent.label());
                             println!("{} (saved for this session; restored on resume)", term::dim("·"));
+                            println!(
+                                "{}",
+                                term::dim(&format!(
+                                    "to use this by default in new sessions, add to {}:\n  {}",
+                                    config::pi_dir().join("agent").join("settings.json").display(),
+                                    format!("{{ \"defaultModel\": \"{}\" }}", agent.label())
+                                ))
+                            );
                         }
                         Err(e) => eprintln!("{e}"),
                     },
