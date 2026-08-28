@@ -650,15 +650,6 @@ fn is_retryable(error: &str) -> bool {
     {
         return true;
     }
-    // A misrouted request: the response was HTML / non-JSON, meaning the call
-    // never reached the model API (proxy/gateway 404, transient routing flap,
-    // or an upstream outage). Retry it immediately (no backoff) so a momentary
-    // blip doesn't abort the whole turn — the identical request will succeed
-    // once routing recovers. A *genuine* API error comes back as JSON (handled
-    // above), so a real 404 ("model not found") is still fatal.
-    if error.contains("misrouted") {
-        return true;
-    }
     // Transport-layer (non-HTTP) failures: ureq reports these as bare
     // messages; they are retryable connection/timeout/IO problems.
     if error.starts_with("HTTP ") {
@@ -668,18 +659,18 @@ fn is_retryable(error: &str) -> bool {
 }
 
 /// Classify an HTTP error response body and produce a short, terminal-safe
-/// detail string (no megabytes of HTML pasted into the UI). The returned text
-/// also carries a *marker* that `is_retryable` reads to decide whether the
-/// failure was a genuine model-API error (fatal) or an upstream/proxy mishap
-/// (transient, worth replaying).
+/// detail string (no megabytes of HTML pasted into the UI).
 ///
 /// Key case: a `404` whose body is **HTML** is not the model API rejecting the
 /// request — it's a proxy / gateway / load-balancer `404`, i.e. the request
-/// never reached the API (misrouted `baseUrl`, a transient routing flap, or an
-/// upstream outage). That is *transient*, so it's marked `misrouted` and the
-/// retry loop replays it instead of aborting the turn on a momentary blip. A
-/// genuine API `404` (JSON, e.g. "model does not exist") is fatal — replaying
-/// the identical request can never succeed.
+/// never reached the API (misrouted `baseUrl`, a dead proxy, or an upstream
+/// outage). That is *not* transient in a way we can replay our way out of, and
+/// it is *not* a genuine API 404 (which would come back as JSON). We surface it
+/// as `misrouted` so the turn ends (the agent drops back to the REPL rather
+/// than aborting) and the message tells the user to switch provider/baseUrl
+/// instead of us silently retrying a request that can't succeed on this route.
+/// A genuine API `404` (JSON, e.g. "model does not exist") is fatal too, but
+/// with a different, actionable message (switch model/provider).
 pub(crate) fn http_status_detail(code: u16, body: &str) -> String {
     // If the API spoke JSON, prefer `error.message` / `message`. A JSON body
     // (even without a known message field) means the *model API* answered — so
@@ -711,13 +702,14 @@ pub(crate) fn http_status_detail(code: u16, body: &str) -> String {
     }
     if trimmed.starts_with('<') || trimmed.to_ascii_lowercase().starts_with("<!doctype") {
         // HTML came back, not the API. A `404` here is a proxy/gateway 404:
-        // the request never reached the model API, so it's transient — mark it
-        // `misrouted` for `is_retryable`. Other HTML status codes (e.g. a
-        // gateway `502` returning HTML) are already retried on their numeric
-        // code, so they just get a short summary (no `misrouted` marker needed).
+        // the request never reached the model API. Mark it `misrouted` so the
+        // turn ends at the REPL with an actionable hint (try a different
+        // provider / fix the baseUrl) rather than us auto-retrying a dead route.
+        // Other HTML status codes (e.g. a gateway `502` returning HTML) are
+        // already retried on their numeric code, so just summarize them.
         if code == 404 {
             return format!(
-                "HTTP {code}: misrouted (non-JSON {}-byte body) — proxy/gateway 404, likely transient",
+                "HTTP {code}: misrouted (non-JSON {}-byte body) — the request never reached the model API; check the provider baseUrl or try a different provider (/model …)",
                 trimmed.len()
             );
         }
@@ -1194,11 +1186,12 @@ mod tests {
     }
 
     #[test]
-    fn misrouted_404_is_retryable() {
+    fn misrouted_404_is_fatal_no_retry() {
         // A non-JSON 404 (proxy/gateway 404 → request never reached the API) is
-        // transient: replay it so a routing flap doesn't abort the turn.
+        // fatal: we drop back to the REPL and let the user switch provider
+        // rather than auto-retrying a route that can't succeed.
         let detail = http_status_detail(404, "<!DOCTYPE html><html><body>404</body></html>");
-        assert!(is_retryable(&detail), "got: {detail}");
+        assert!(!is_retryable(&detail), "got: {detail}");
     }
 
     #[test]

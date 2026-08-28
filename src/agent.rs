@@ -1152,6 +1152,10 @@ impl Agent {
                 self.thinking,
                 self.model.context.unwrap_or(200_000),
                 &mut on_think,
+                // Per-model overrides (OpenCode Zen's per-model API/URL).
+                self.provider.model_api(&self.model),
+                self.provider.model_base_url(&self.model),
+                !self.model.no_reasoning_effort,
             );
             // Flush any thinking that arrived while the user was still typing
             // (deferred above) BEFORE the reply text / tool output prints, so
@@ -1180,6 +1184,14 @@ impl Agent {
                     }
                     if !self.silent() {
                         term::out(&format!("\r\x1b[K{}\n", term::red(&format!("✗ turn error: {e}"))));
+                        // A misrouted request never reached the model API (wrong
+                        // baseUrl / dead proxy). Don't auto-retry — hand the user
+                        // back to the REPL and point them at a provider switch.
+                        if e.contains("misrouted") {
+                            term::out(&term::yellow(
+                                "  · the request didn't reach the model API — try a different provider (/model <provider>/<model>) or fix the provider baseUrl, then resend",
+                            ));
+                        }
                     } else {
                         eprintln!("{} {e}", term::red("error:"));
                     }
@@ -1490,16 +1502,30 @@ impl Agent {
 }
 
 fn make_client(provider: &Provider, cancel: Arc<AtomicBool>) -> Result<Client, String> {
+    // The model is unknown at construction time; per-model overrides are
+    // re-applied per-call (see `chat`). Here we resolve the provider-level
+    // defaults, falling back to the first model's override when the provider
+    // itself has no baseUrl (e.g. a stored OpenCode key with no models.json).
     let kind = provider
-        .kind()
+        .models
+        .first()
+        .and_then(|m| provider.model_api(m))
+        .or_else(|| provider.kind())
         .ok_or_else(|| format!("provider '{}' has no baseUrl", provider.pid()))?;
     let base = match provider.base_url.as_deref() {
         Some(b) if !b.is_empty() => b.trim_end_matches('/').to_string(),
-        _ => match kind {
-            ApiKind::Anthropic => "https://api.anthropic.com/v1".to_string(),
-            ApiKind::OpenAi => {
-                return Err(format!("provider '{}' has no baseUrl", provider.pid()))
-            }
+        _ => match provider
+            .models
+            .first()
+            .and_then(|m| provider.model_base_url(m).map(str::to_string))
+        {
+            Some(b) => b.trim_end_matches('/').to_string(),
+            None => match kind {
+                ApiKind::Anthropic => "https://api.anthropic.com/v1".to_string(),
+                ApiKind::OpenAi => {
+                    return Err(format!("provider '{}' has no baseUrl", provider.pid()))
+                }
+            },
         },
     };
     let key = provider.api_key().ok_or_else(|| {
