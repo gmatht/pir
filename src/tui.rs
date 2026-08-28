@@ -20,7 +20,6 @@ use crate::agent::Agent;
 use crate::config::Provider;
 use crate::notify::SharedBus;
 use crate::term;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -29,7 +28,8 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use std::io::{self, Stdout, Write};
+use std::io::{self, Read, Seek, SeekFrom, Stdout, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -45,6 +45,7 @@ type AgentSlot = Arc<Mutex<Option<Agent>>>;
 pub fn run(
     agent_slot: &AgentSlot,
     fg_cancel: &Arc<AtomicBool>,
+    fg_quiet: &Arc<AtomicBool>,
     typeahead: &Arc<Mutex<String>>,
     providers: &[Provider],
     bus: &SharedBus,
@@ -73,6 +74,7 @@ pub fn run(
     let ctx = TuiCtx {
         agent_slot,
         fg_cancel,
+        fg_quiet,
         typeahead,
         providers,
         bus,
@@ -112,6 +114,7 @@ impl Drop for Cleanup {
 struct TuiCtx<'a> {
     agent_slot: &'a AgentSlot,
     fg_cancel: &'a Arc<AtomicBool>,
+    fg_quiet: &'a Arc<AtomicBool>,
     typeahead: &'a Arc<Mutex<String>>,
     providers: &'a [Provider],
     bus: &'a SharedBus,
@@ -163,6 +166,14 @@ struct TuiState {
     usage: String,
     spinner_frame: usize,
     last_tick: Instant,
+    /// Byte offset into the session log that we've already rendered into the
+    /// conversation pane (so `drain_session_log` only appends new lines).
+    log_offset: u64,
+    /// Detached (backgrounded) turns: (id, worker handle). Kept alive so they
+    /// keep running after the foreground returns to idle. Reaped when finished.
+    bg_handles: Vec<(usize, JoinHandle<()>)>,
+    /// Monotonic id source for detached turns.
+    next_bg_id: usize,
 }
 
 impl TuiState {
@@ -176,6 +187,9 @@ impl TuiState {
             usage: String::new(),
             spinner_frame: 0,
             last_tick: Instant::now(),
+            log_offset: 0,
+            bg_handles: Vec::new(),
+            next_bg_id: 1,
         }
     }
 
@@ -219,6 +233,16 @@ fn run_inner(
                     state.push(ConvKind::System, &format!("notify: {}", e.summary()));
                 }
             }
+        }
+
+        // Tail the session log so the conversation pane reflects the agent's
+        // real output. The TUI's agent runs in `quiet` mode (ratatui owns the
+        // screen), but the agent still writes every message to its log file
+        // unconditionally — so we render that. This is the key difference from
+        // the streaming REPL: there is no competing stdout writer to garble the
+        // alternate screen.
+        if let Some(log) = ctx.agent_slot.lock().unwrap().as_ref().and_then(|a| a.log_path.clone()) {
+            drain_session_log(log, &mut state);
         }
 
         // If the foreground turn finished, join it and either start the next
@@ -298,6 +322,31 @@ fn run_inner(
                         // ignored
                     } else if let Some(cmd) = s.strip_prefix('/') {
                         handle_command(ctx, &mut state, cmd, &mut fg_handle, &mut pending);
+                    } else if s == "&" {
+                        // A bare `&` typed *while a turn runs* detaches the
+                        // running foreground turn into the background: flip the
+                        // shared "go quiet" switch (the worker stops streaming to
+                        // the log while ratatui tails it) and adopt its worker
+                        // handle as a background job, so the TUI returns to idle
+                        // while the turn keeps working. The footer shows
+                        // "#tasks running: N" as the only sign of life.
+                        let log = {
+                            let g = ctx.agent_slot.lock().unwrap();
+                            g.as_ref().and_then(|a| a.log_path().cloned()).unwrap_or_default()
+                        };
+                        let prompt = {
+                            let g = ctx.agent_slot.lock().unwrap();
+                            g.as_ref().map(|a| a.last_prompt.clone()).unwrap_or_default()
+                        };
+                        let h = fg_handle.take().expect("fg running");
+                        let id = state.detach(h);
+                        ctx.fg_quiet.store(true, Ordering::SeqCst);
+                        state.running = false;
+                        state.status = "idle".into();
+                        state.push(
+                            ConvKind::System,
+                            &format!("· detached running turn as job #{id} — it keeps working in the background"),
+                        );
                     } else {
                         pending.push(s.to_string());
                         state.push(ConvKind::System, &format!("· queued: {s}"));
@@ -308,7 +357,7 @@ fn run_inner(
                         g.clear();
                     }
                     ctx.fg_cancel.store(true, Ordering::SeqCst);
-                    state.push(ConvKind::System, "· cancelling turn (after current step)…");
+                    state.push(ConvKind::System, "· cancelling turn (ESC/ctrl-c) — stopping now…");
                 }
                 RawKey::Eof => {
                     ctx.fg_cancel.store(true, Ordering::SeqCst);
@@ -328,20 +377,27 @@ fn run_inner(
             }
         } else {
             let line = read_idle_line(term, &mut state, ctx);
-            let input = line.trim().to_string();
-            if input.is_empty() {
-                continue;
-            }
-            if let Some(cmd) = input.strip_prefix('/') {
-                handle_command(ctx, &mut state, cmd, &mut fg_handle, &mut pending);
-            } else if input.ends_with('&') && !input.trim_end_matches('&').is_empty() {
-                let prompt = input.trim_end_matches('&').trim().to_string();
-                spawn_background(ctx, &mut state, prompt);
-            } else if fg_handle.is_none() {
-                fg_handle = Some(spawn_turn(ctx, input.clone()));
-                term::push_history(&input);
-            } else {
-                pending.push(input);
+            match line {
+                // ctrl-d quit: return cleanly so the Cleanup guard restores the
+                // terminal (raw mode + alt screen) instead of process::exit.
+                None => break,
+                Some(input) => {
+                    let input = input.trim().to_string();
+                    if input.is_empty() {
+                        continue;
+                    }
+                    if let Some(cmd) = input.strip_prefix('/') {
+                        handle_command(ctx, &mut state, cmd, &mut fg_handle, &mut pending);
+                    } else if input.ends_with('&') && !input.trim_end_matches('&').is_empty() {
+                        let prompt = input.trim_end_matches('&').trim().to_string();
+                        spawn_background(ctx, &mut state, prompt);
+                    } else if fg_handle.is_none() {
+                        fg_handle = Some(spawn_turn(ctx, input.clone()));
+                        term::push_history(&input);
+                    } else {
+                        pending.push(input);
+                    }
+                }
             }
         }
     }
@@ -352,7 +408,55 @@ fn run_inner(
 /// Spawn a foreground turn on a worker thread (moves the agent out of the slot,
 /// like the streaming REPL does) and returns the join handle.
 fn spawn_turn(ctx: &TuiCtx, prompt: String) -> JoinHandle<()> {
-    run_foreground_turn(ctx.agent_slot, ctx.fg_cancel, prompt, ctx.done_tx.clone())
+    run_foreground_turn(
+        ctx.agent_slot,
+        ctx.fg_cancel,
+        &ctx.fg_quiet,
+        prompt,
+        ctx.done_tx.clone(),
+    )
+}
+
+impl TuiState {
+    /// Detach a running foreground turn into the background: keep its worker
+    /// handle alive (so it keeps running) and count it. Returns the (1-based)
+    /// background id assigned. The footer then shows "#tasks running: N" as the
+    /// only sign of life while it works.
+    fn detach(&mut self, handle: JoinHandle<()>) -> usize {
+        let id = self.next_bg_id;
+        self.next_bg_id += 1;
+        self.bg_handles.push((id, handle));
+        id
+    }
+
+    /// Reap finished detached turns so their handles don't leak; returns how
+    /// many finished this call. We take the vec by value (`mem::take`) so the
+    /// reaper owns the handles and can `join()` them without borrowing `self`
+    /// across the `self.push` that logs completion.
+    fn reap_bg(&mut self) -> usize {
+        let mut finished = 0;
+        let mut done_ids: Vec<usize> = Vec::new();
+        let mut remaining: Vec<(usize, JoinHandle<()>)> = Vec::new();
+        for (id, h) in std::mem::take(&mut self.bg_handles) {
+            if h.is_finished() {
+                let _ = h.join();
+                finished += 1;
+                done_ids.push(id);
+            } else {
+                remaining.push((id, h));
+            }
+        }
+        self.bg_handles = remaining;
+        for id in done_ids {
+            self.push(ConvKind::System, &format!("· #{id} finished"));
+        }
+        finished
+    }
+
+    /// How many detached (backgrounded) turns are still running.
+    fn tasks_running(&self) -> usize {
+        self.bg_handles.len()
+    }
 }
 
 /// Spawn a background job (keeps its own session log). Mirrors `/bg` + trailing
@@ -608,44 +712,87 @@ fn drain_csi_sequence(fd: libc::c_int) {
 }
 
 /// Idle line editing: render a live draft in the footer while the user types,
-/// with arrow-up/down history and backspace. Blocking on keypress (we are idle,
-/// so this is fine). On Enter returns the line. Rendered through the real
-/// `ratatui::Terminal` so the draft is visible immediately.
+/// with arrow-up/down history and backspace. We deliberately use a non-blocking
+/// `libc::read` loop (NOT crossterm's `event::poll`, which does not time out in
+/// raw mode under some ptys and would hang the REPL) — same mechanism as the
+/// running-turn path, so the TUI stays the sole screen owner. On Enter returns
+/// the line; ctrl-d returns `None` so the caller can break out cleanly and the
+/// `Cleanup` guard restores raw mode + the alternate screen.
 fn read_idle_line(
     term: &mut ratatui::Terminal<CrosstermBackend<Stdout>>,
     state: &mut TuiState,
     ctx: &TuiCtx,
-) -> String {
-    let mut buf = String::new();
+) -> Option<String> {
+    use std::os::unix::io::AsRawFd;
+    let fd = io::stdin().as_raw_fd();
     let history: Vec<String> = read_history();
     let mut hist_idx: i32 = -1; // -1 = current (not recalling)
+    let mut buf = String::new();
 
     loop {
         state.draft = buf.clone();
         state.status = "idle".into();
         draw(term, state, &state.status, &buf, false, ctx.running_as_agent);
 
-        if event::poll(Duration::from_millis(200)).unwrap_or(false) {
-            if let Ok(ev) = event::read() {
-                match ev {
-                    Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
-                        KeyCode::Enter => {
-                            state.draft.clear();
-                            return buf;
+        // Non-blocking read with a short poll so we keep redrawing (the footer
+        // draft stays live) and never block on a pty that won't deliver events.
+        let mut tmp = [0u8; 256];
+        let n = unsafe { libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
+        if n > 0 {
+            let mut i = 0usize;
+            while i < n as usize {
+                let b = tmp[i];
+                i += 1;
+                match b {
+                    0x0a | 0x0d => {
+                        let line = std::mem::take(&mut buf);
+                        state.draft.clear();
+                        return Some(line);
+                    }
+                    0x7f | 0x08 => {
+                        buf.pop();
+                    }
+                    0x03 => {
+                        state.draft.clear();
+                        return Some(String::new());
+                    }
+                    0x04 => {
+                        state.draft.clear();
+                        return None;
+                    }
+                    0x1b => {
+                        // CSI sequence (arrows, etc.): skip it so it doesn't
+                        // leak into the buffer; handle Up/Down for history.
+                        let mut is_up = false;
+                        let mut is_down = false;
+                        if i < n as usize && tmp[i] == 0x5b {
+                            i += 1;
+                            let mut seq = [0u8; 8];
+                            let mut k = 0usize;
+                            while i < n as usize && k < seq.len() {
+                                seq[k] = tmp[i];
+                                i += 1;
+                                k += 1;
+                                if tmp[i - 1].is_ascii_alphabetic() {
+                                    break;
+                                }
+                            }
+                            if k >= 1 {
+                                match seq[0] {
+                                    b'A' => is_up = true,
+                                    b'B' => is_down = true,
+                                    _ => {}
+                                }
+                            }
                         }
-                        KeyCode::Char(c) => buf.push(c),
-                        KeyCode::Backspace => {
-                            buf.pop();
-                        }
-                        KeyCode::Up => {
+                        if is_up {
                             if !history.is_empty() {
                                 if hist_idx < (history.len() as i32) - 1 {
                                     hist_idx += 1;
                                 }
                                 buf = history[(history.len() as i32 - 1 - hist_idx) as usize].clone();
                             }
-                        }
-                        KeyCode::Down => {
+                        } else if is_down {
                             if hist_idx > 0 {
                                 hist_idx -= 1;
                                 buf = history[(history.len() as i32 - 1 - hist_idx) as usize].clone();
@@ -653,32 +800,19 @@ fn read_idle_line(
                                 hist_idx = -1;
                                 buf.clear();
                             }
+                        } else {
+                            buf.clear();
                         }
-                        KeyCode::PageUp => {
-                            if state.scroll < state.conv.len() as u16 {
-                                state.scroll += 1;
-                            }
-                        }
-                        KeyCode::PageDown => {
-                            if state.scroll > 0 {
-                                state.scroll -= 1;
-                            }
-                        }
-                        KeyCode::Esc => buf.clear(),
-                        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                            state.draft.clear();
-                            return String::new();
-                        }
-                        KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                            std::process::exit(0);
-                        }
-                        _ => {}
-                    },
-                    Event::Resize(_, _) => { /* redrawn next iteration */ }
-                    _ => {}
+                    }
+                    c if c >= 0x20 && c < 0x7f => {
+                        buf.push(c as char);
+                    }
+                    _ => { /* ignore other control bytes */ }
                 }
             }
         }
+        // Small sleep so we don't busy-loop at 100% CPU while idle.
+        std::thread::sleep(Duration::from_millis(30));
     }
 }
 
@@ -687,6 +821,78 @@ fn read_idle_line(
 /// here (the streaming REPL re-reads the `.history` file on the next prompt).
 fn read_history() -> Vec<String> {
     Vec::new()
+}
+
+/// Append any new transcript lines from `log` into the conversation pane. The
+/// agent runs in `quiet` mode (its streaming never reaches the TUI's screen),
+/// but it writes every message to its session log — so we render that instead
+/// of letting a second stdout writer fight ratatui. `state.log_offset` tracks
+/// how much of the file we've already rendered so we only append new lines.
+fn drain_session_log(log: PathBuf, state: &mut TuiState) -> usize {
+    use serde_json::Value;
+    let mut f = match std::fs::OpenOptions::new().read(true).open(&log) {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+    let _ = f.seek(SeekFrom::Start(state.log_offset)).is_ok();
+    let mut buf = String::new();
+    if f.read_to_string(&mut buf).is_err() {
+        return 0;
+    }
+    state.log_offset += buf.len() as u64;
+    let mut added = 0usize;
+    for line in buf.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let role = v.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let blocks = v.get("blocks").and_then(|b| b.as_array());
+        let mut text = String::new();
+        let mut kind = ConvKind::System;
+        if role == "user" {
+            kind = ConvKind::User;
+            for b in blocks.into_iter().flatten() {
+                if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                        text.push_str(t);
+                        text.push('\n');
+                    }
+                }
+            }
+        } else if role == "assistant" {
+            kind = ConvKind::Assistant;
+            for b in blocks.into_iter().flatten() {
+                match b.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => {
+                        if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                            text.push_str(t);
+                            text.push('\n');
+                        }
+                    }
+                    Some("tool_use") => {
+                        let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                        if name == "update_goal" {
+                            continue;
+                        }
+                        text.push_str(&format!("» {name}\n"));
+                    }
+                    Some("tool_result") => {
+                        let c = b.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                        let c: String = c.lines().take(1).collect::<Vec<_>>().join(" ");
+                        text.push_str(&format!("  {c}\n"));
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            continue;
+        }
+        let text = text.trim_end().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        state.push(kind, &text);
+        added += 1;
+    }
+    added
 }
 
 /// Convenience token formatter.
@@ -782,6 +988,7 @@ fn handle_command(
             };
             agent.clear();
             state.conv.clear();
+            state.log_offset = 0;
             state.push(ConvKind::System, "history cleared");
         }
         "fix" => {
@@ -800,6 +1007,39 @@ fn handle_command(
             };
             let all = rest.first().map(|s| *s == "all").unwrap_or(false);
             state.push(ConvKind::System, &agent.undo(all));
+        }
+        "sh" | "shell" => {
+            // `/sh` drops to an interactive shell (after leaving the TUI's
+            // alternate screen + raw mode so the child owns the terminal), or
+            // `/sh COMMAND ARGS …` runs a command via the shell and returns. The
+            // child inherits pir's identity (the possibly-dropped `ai_*` user),
+            // cwd and env. We redraw once on return so the screen is sane.
+            let args: Vec<&str> = rest;
+            let _ = disable_raw_mode();
+            let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
+            let _ = io::stdout().flush();
+            let code = crate::run_shell(args);
+            // Re-enter the TUI: re-establish raw mode + alternate screen.
+            let _ = enable_raw_mode();
+            let _ = crossterm::execute!(io::stdout(), EnterAlternateScreen);
+            let _ = io::stdout().flush();
+            // Reset the conversation pane's log tail so the shell's noise doesn't
+            // leak into scrollback, and refresh the agent's usage readout.
+            state.log_offset = ctx
+                .agent_slot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|a| a.log_path.clone())
+                .and_then(|p| std::fs::metadata(&p).ok().map(|m| m.len()))
+                .unwrap_or(state.log_offset);
+            if let Some(c) = code {
+                if c != 0 {
+                    state.push(ConvKind::Error, &format!("· shell exited with status {c}"));
+                }
+            } else {
+                state.push(ConvKind::Error, "· could not start shell");
+            }
         }
         "jobs" | "background" | "running" => {
             state.push(ConvKind::System, "· background jobs (see /bg <text> to start one)");
@@ -822,5 +1062,6 @@ fn handle_command(
 
 const HELP_TUI: &str = "\
 commands: /help /model <sel> /models /goal [obj] /continue /clear /fix /undo [all] \
-/bg <text> /jobs /cancel /exit
+/bg <text> /jobs /cancel
+/sh [cmd args]  drop to a shell, or run a command via $SHELL (sh -c)
 Esc or ctrl-c cancels the running turn; ctrl-d quits; lines ending in & run in the background";

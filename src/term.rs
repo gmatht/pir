@@ -241,6 +241,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "/rebuild",
     "/resume",
     "/sessions",
+    "/sh",
     "/undo",
     "/unfinished",
     "/usage",
@@ -599,6 +600,13 @@ pub mod raw {
     static ENABLED: Mutex<bool> = Mutex::new(true);
     pub fn set_enabled(on: bool) {
         *ENABLED.lock().unwrap() = on;
+    }
+
+    /// Whether raw (non-canonical, non-blocking) mode is currently active. Used
+    /// by `/sh` to restore exactly the terminal state it found before dropping
+    /// to a child shell.
+    pub fn is_active() -> bool {
+        STATE.lock().unwrap().active
     }
 
     /// Put stdin into raw, non-blocking mode (no canonical line editing, no

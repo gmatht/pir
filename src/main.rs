@@ -26,6 +26,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
+use std::time::Duration;
 
 const HELP: &str = r#"pir — a featherweight pi-compatible coding agent
 
@@ -71,6 +73,7 @@ COMMANDS
   /help  /model <sel>  /models  /default-model <sel>  /sessions  /goal [objective]  /continue
   /bg <text>  /jobs  /fg <id>  /clear  /usage  /exit
   /undo [all]             revert the last file edit (or all) to its pre-edit state
+  /sh [cmd args]         drop to a shell, or run a command via $SHELL (sh -c)
   /project init            create the ai_<project> user and chown the cwd (root)
   /su-security <on|off|status>   enable/disable/inspect the su-based permission
                           model (sudoers.d/skynet-ai + wrappers); reversible (root)
@@ -469,9 +472,16 @@ fn main() {
 
  // Resume prior history if `-r`/`-c` was given.
     if let Some(session) = &resume {
-        let (_, summary) = agent.load_session(session);
-        if !summary.is_empty() {
-            println!("{}", term::dim(&summary));
+        let resumed = agent.load_session(session);
+        if resumed.turns > 0 {
+            println!("{}", resumed.banner(session));
+            // Seed arrow-up history with the session's prior prompts so the user
+            // can scroll back through them at the idle prompt.
+            for p in &resumed.prompts {
+                term::push_history(p);
+            }
+        } else if !resumed.summary.is_empty() {
+            println!("{}", term::dim(&resumed.summary));
         }
         // Restore the model + su-security choice that were active when this
         // session last ran, so a resumed session doesn't silently drop back to
@@ -924,6 +934,8 @@ pub(crate) fn run_foreground_turn(
     })
 }
 
+type AgentSlot = Arc<Mutex<Option<Agent>>>;
+
 /// A fresh session log path for a background job (tagged so it never collides
 /// with the foreground session or another job).
 fn session_log_path() -> PathBuf {
@@ -931,8 +943,6 @@ fn session_log_path() -> PathBuf {
     let _ = std::fs::create_dir_all(&dir);
     dir.join(format!("pir-{}-sh{}-bg{}.jsonl", term::timestamp_compact(), term::parent_shell_pid(), std::process::id()))
 }
-
-type AgentSlot = Arc<Mutex<Option<Agent>>>;
 
 /// Handle a slash command. `agent_slot` holds the interactive agent behind an
 /// `Option` so a running foreground turn can own it on its worker thread;
@@ -1078,10 +1088,16 @@ fn handle_command(
                 return;
             };
             agent.clear();
-            agent.load_session(&log);
+            let resumed = agent.load_session(&log);
             agent.apply_persisted_su_security();
             jobs.mark_joined(id);
             println!("{} foregrounded job #{} from {}", term::bold("·"), id, log.display());
+            if resumed.turns > 0 {
+                println!("{}", resumed.banner(&log));
+                for p in &resumed.prompts {
+                    term::push_history(p);
+                }
+            }
         }
         "unfin" | "unfinished" => {
             // Show sessions that were interrupted, crashed (process gone but
@@ -1110,9 +1126,14 @@ fn handle_command(
                 return;
             };
             agent.clear();
-            let (_, summary) = agent.load_session(&path);
-            if !summary.is_empty() {
-                println!("{}", term::dim(&summary));
+            let resumed = agent.load_session(&path);
+            if resumed.turns > 0 {
+                println!("{}", resumed.banner(&path));
+                for p in &resumed.prompts {
+                    term::push_history(p);
+                }
+            } else if !resumed.summary.is_empty() {
+                println!("{}", term::dim(&resumed.summary));
             }
             agent.apply_persisted_model();
             agent.apply_persisted_su_security();
@@ -1231,6 +1252,35 @@ fn handle_command(
             // stale agent running). Build failures print the tail and leave the
             // current session intact.
             rebuild_and_exec();
+        }
+        "sh" | "shell" => {
+            // Drop down to an interactive shell (`/sh`), or run a single command
+            // and return (`/sh COMMAND ARG1 ARG2 …`). The shell inherits the
+            // agent's (possibly dropped) identity, cwd, env and stdio, so it runs
+            // exactly as the current `pir` would — just with a human at the keys.
+            // We restore raw mode only if the REPL had it active (mid-turn) so a
+            // child shell isn't left fighting the REPL's terminal attributes; at
+            // the idle prompt raw is already off, so nothing to do.
+            if fg_running {
+                eprintln!("pir: a turn is running — finish or /cancel it first, then /sh");
+                return;
+            }
+            let args: Vec<&str> = rest;
+            let was_raw = term::raw::is_active();
+            if was_raw {
+                term::raw::disable_raw();
+            }
+            let status = run_shell(args);
+            if was_raw {
+                term::raw::enable_raw();
+            }
+            if let Some(code) = status {
+                if code != 0 {
+                    eprintln!("pir: shell exited with status {}", code);
+                }
+            } else {
+                eprintln!("pir: could not start shell");
+            }
         }
         "usage" => {
             let g = agent_slot.lock().unwrap();
@@ -1505,6 +1555,33 @@ fn rebuild_and_exec() {
 #[cfg(not(unix))]
 fn rebuild_and_exec() {
     eprintln!("pir: /rebuild (exec) is only supported on unix");
+}
+
+/// `/sh [cmd args]` — drop into an interactive shell, or run a command via the
+/// shell and return. With no args it execs the user's login shell (`$SHELL`,
+/// else `/bin/sh`) so they get a familiar prompt. With args it runs
+/// `cmd arg1 arg2 …` *through* the shell (`sh -c`), so pipes / globs / redirects
+/// / env-expansion behave exactly as at a normal prompt, and reports the exit
+/// status. The child inherits pir's stdio, identity (the possibly-dropped
+/// `ai_*` user), cwd and environment, so it behaves identically to the
+/// surrounding session. Returns the child's exit code, or `None` if the shell
+/// could not be spawned.
+fn run_shell(args: Vec<&str>) -> Option<i32> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let status = if args.is_empty() {
+        // Interactive: hand the terminal straight to the login shell.
+        std::process::Command::new(&shell).status()
+    } else {
+        // Single-shot: run the assembled command line through the shell.
+        std::process::Command::new(&shell)
+            .arg("-c")
+            .arg(args.join(" "))
+            .status()
+    };
+    match status {
+        Ok(s) => Some(s.code().unwrap_or(1)),
+        Err(_) => None,
+    }
 }
 
 /// `/create [name]` — scaffold a new project directory under `PIR_PROJECTS_DIR`
