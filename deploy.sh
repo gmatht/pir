@@ -62,6 +62,13 @@ set -euo pipefail
 # --------------------------------------------------------------- args
 PREFIX="${PIR_DEPLOY_PREFIX:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
 REF=""
+# SHARED_REPO: a checkout that holds external `path =` dependencies which are
+# NOT part of the pir repo itself (e.g. rustxWidgets, a sibling git checkout
+# sitting next to pir with its own .git and never tracked). When we deploy from
+# a worktree these dirs are absent, so cargo cannot resolve the path dependency
+# even when the feature that uses it is disabled. Point this at the main pir
+# checkout (auto-derived from the worktree if unset).
+SHARED_REPO=""
 WITH_PROJECT_INIT=0
 TEST_ONLY=0
 TESTS=1
@@ -83,6 +90,8 @@ while [ $# -gt 0 ]; do
     --prefix=*)      PREFIX="${1#*=}"; shift ;;
     --ref)           REF="$2"; shift 2 ;;
     --ref=*)         REF="${1#*=}"; shift ;;
+    --shared-repo)   SHARED_REPO="$2"; shift 2 ;;
+    --shared-repo=*) SHARED_REPO="${1#*=}"; shift ;;
     --with-project-init) WITH_PROJECT_INIT=1; shift ;;
     --test-only)     TEST_ONLY=1; shift ;;
     --no-clippy)     CLIPPY=0; shift ;;
@@ -172,6 +181,62 @@ cd "$SRC"
 grep -q '^name = "pir"' Cargo.toml || die "$SRC: Cargo.toml is not pir"
 dbg "SRC=$SRC  CLEANUP_WORKTREE=$CLEANUP_WORKTREE"
 step_done "source tree resolved -> $SRC"
+
+# --------------------------------------------------------------- external path deps
+# Some `path =` dependencies live OUTSIDE the pir repo (a sibling checkout with
+# its own .git, never tracked — e.g. rustxWidgets). A fresh worktree therefore
+# lacks them, and cargo refuses to resolve the path even when the feature that
+# uses the dep is disabled by default. Materialize any such missing path deps
+# from a sibling checkout (the main pir tree, by default) so the build works.
+step "materialize external path dependencies"
+# Default SHARED_REPO to the main worktree checkout when this is a worktree.
+if [ -z "$SHARED_REPO" ]; then
+  if git -C "$SRC" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    _MAIN="$(git -C "$SRC" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')"
+    # The first listed worktree is the main checkout (the .git dir's tree).
+    if [ -n "$_MAIN" ] && [ "$_MAIN" != "$SRC" ] && [ -d "$_MAIN" ]; then
+      SHARED_REPO="$_MAIN"
+    fi
+  fi
+fi
+dbg "SHARED_REPO='${SHARED_REPO:-<none>}'"
+# Parse `path = "..."` deps out of Cargo.toml (single line entries only).
+_PATHS="$(grep -oE 'path[[:space:]]*=[[:space:]]*"[^"]+"' "$SRC/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/' | sort -u)"
+# For each missing path dep, materialize its TOP-LEVEL component. External
+# path deps are usually a self-contained checkout (e.g. `rustxWidgets/` holds
+# `` plus transitive deps like `gtk_dynamic_loader`), so linking
+# only the leaf crate would leave its inner path deps unresolved.
+_LINKED=""
+for p in $_PATHS; do
+  _top="${p%%/*}"          # first path component (the external repo root)
+  case "$_LINKED" in
+    *"|$_top|"*) continue ;;   # already materialized this top-level dir
+  esac
+  if [ -e "$SRC/$_top" ]; then
+    say "  present: $_top/"
+    _LINKED="$_LINKED|$_top|"
+    continue
+  fi
+  _found=""
+  if [ -n "$SHARED_REPO" ] && [ -e "$SHARED_REPO/$_top" ]; then
+    _found="$SHARED_REPO/$_top"
+  fi
+  if [ -z "$_found" ] && [ -d "$SRC/.." ]; then
+    # Fall back to a sibling directory of the same basename next to SRC.
+    _sib="$SRC/../$(basename "$SRC")"
+    [ -e "$_sib/$_top" ] && _found="$_sib/$_top"
+  fi
+  if [ -z "$_found" ]; then
+    # Don't fail hard: an optional path dep that is genuinely unused may be
+    # tolerable. But a missing required path breaks the build, so surface it.
+    warn "external dep '$_top/' is missing from $SRC and no source found; build may fail"
+    continue
+  fi
+  say "  linking missing dep '$_top/' -> $_found"
+  ln -s "$_found" "$SRC/$_top" || warn "could not link '$_top/'"
+  _LINKED="$_LINKED|$_top|"
+done
+step_done "external path dependencies materialized"
 
 # --------------------------------------------------------------- tests + build
 if [ "$TESTS" -eq 1 ]; then
