@@ -45,6 +45,8 @@
 
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct ToolSpec {
     pub name: &'static str,
@@ -106,6 +108,14 @@ pub trait ToolBackend: Send {
     fn on_turn_end(&mut self, _prompt: &str) -> Vec<String> {
         Vec::new()
     }
+
+    /// Share the REPL's "go silent" switch with this backend, replacing its
+    /// private handle. The REPL holds the same `Arc`, so flipping it (to
+    /// background a running turn) silences any in-flight progress output the
+    /// backend emits — e.g. the `bash` tool's live elapsed clock — without the
+    /// REPL owning the worker. Default no-op for backends that don't stream to
+    /// the terminal.
+    fn set_quiet_handle(&mut self, _q: Arc<AtomicBool>) {}
 }
 
 /// Holds every linked backend. The model only ever sees `specs()`; it never
@@ -114,16 +124,43 @@ pub struct Registry {
     cwd: PathBuf,
     full_auto: bool,
     backends: Vec<Box<dyn ToolBackend>>,
+    /// Hard-abort flag for the foreground `bash` command, set the instant the
+    /// user presses ESC/ctrl-c. The cooperative `cancel` flag only stops a turn
+    /// *after* the current step finishes, but a long-running `bash` command can
+    /// still be executing inside that step — so the `bash` tool polls this and
+    /// kills its child immediately when it flips, aborting the command right
+    /// away (not after it exits on its own). The REPL sets it via
+    /// [`Registry::abort_active_command`]; the `bash` tool clears it on start.
+    pub abort: Arc<AtomicBool>,
 }
 
 impl Registry {
-    pub fn new(cwd: PathBuf, full_auto: bool) -> Self {
-        Registry { cwd, full_auto, backends: Vec::new() }
+    pub fn new(cwd: PathBuf, full_auto: bool, abort: Arc<AtomicBool>) -> Self {
+        Registry { cwd, full_auto, backends: Vec::new(), abort }
+    }
+
+    /// Signal the running foreground `bash` command to abort immediately. The
+    /// `bash` tool checks this between waits and kills its child. The REPL also
+    /// flips the cooperative `cancel` flag, so the turn ends after this step.
+    /// Always returns true (a no-op abort is harmless even if no command runs).
+    pub fn abort_active_command(&mut self) -> bool {
+        self.abort.store(true, Ordering::SeqCst);
+        true
     }
 
     /// Link an extension's backend.
     pub fn add(&mut self, backend: Box<dyn ToolBackend>) {
         self.backends.push(backend);
+    }
+
+    /// Share the REPL's "go silent" switch with every backend, so a turn
+    /// detached to the background (bare `&`) silences their in-flight terminal
+    /// output (e.g. the bash tool's live elapsed clock) without the REPL owning
+    /// the worker. Call once, right after construction (before the first turn).
+    pub fn set_quiet_handle(&mut self, q: Arc<AtomicBool>) {
+        for b in &mut self.backends {
+            b.set_quiet_handle(q.clone());
+        }
     }
 
     /// Flat list of every tool across all backends — sent to the model.

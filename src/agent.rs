@@ -30,12 +30,18 @@ pub struct Agent {
     /// The REPL drains these into its prompt queue after the turn finishes.
     continuations: Vec<String>,
     /// The most recent user prompt this agent is/was working on. Recorded so
-    /// notifications can show *what* finished, not just "turn done".
-    last_prompt: String,
+    /// notifications can show *what* finished, not just "turn done". `pub(crate)`
+    /// so the REPL can read it for the `&`-detach-to-background prompt label.
+    pub(crate) last_prompt: String,
     /// When true, the agent runs silently (no token streaming or per-tool
     /// prints to the terminal). Used for backgrounded sessions, which still
     /// persist everything to the session log and emit notifications.
     quiet: bool,
+    /// Shared request to silence streaming *mid-turn* (used to "background" a
+    /// running foreground turn: the REPL flips this so the worker stops writing
+    /// to stdout and the terminal can return to the idle prompt). Hoisted out
+    /// of the agent so the REPL can toggle it without owning the agent.
+    quiet_req: Arc<AtomicBool>,
     /// Cooperative cancellation flag. Set by the REPL (e.g. on ctrl-c) to ask
     /// the running turn to stop at the next safe boundary. The turn checks it
     /// before each model call and after each tool batch, so it never aborts
@@ -56,6 +62,73 @@ pub struct Agent {
     /// under `.pir/undo/`; `/undo` restores the most recent snapshot. Only file
     /// edits are checkpointed (bash is out of scope — the user can `git` it).
     undo_stack: Vec<(PathBuf, PathBuf)>,
+    /// Local, per-session authority flag (the "su based security" toggle).
+    /// When true (default), the agent stays confined to its sandbox identity
+    /// and must not escalate to the invoking user's authority. When false, the
+    /// agent is authorized to act with the *invoking user's full authority* for
+    /// this session. This is a self-imposed, in-session authorization only — it
+    /// never changes any system-wide configuration (no sudoers/wrappers are
+    /// touched). Persisted next to the session log so a resumed session keeps
+    /// its choice.
+    su_security_enabled: bool,
+}
+
+/// What `load_session` restored. The REPL (and `/fg`/`/resume`) renders
+/// [`SessionResume::banner`] so `-r` makes it clear which session came back,
+/// shows its first/last prompts and the tail of its final output, and seeds the
+/// line editor's arrow-up history with [`prompts`] so the user can scroll back
+/// through the session's prior prompts.
+pub struct SessionResume {
+    pub turns: usize,
+    /// One-line summary (kept for callers that want a compact line).
+    pub summary: String,
+    /// The session's first user prompt (full text).
+    pub first_prompt: String,
+    /// The session's last user prompt (full text).
+    pub last_prompt: String,
+    /// The tail of the session's last assistant message (full text).
+    pub last_output: String,
+    /// Every non-empty user prompt, in order — used to seed arrow-up history.
+    pub prompts: Vec<String>,
+}
+
+impl SessionResume {
+    /// Render a banner describing what was resumed: which session file, its
+    /// first/last prompts, and the tail of its last assistant output.
+    pub fn banner(&self, session: &Path) -> String {
+        let name = session
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| session.display().to_string());
+        let w = term::terminal_width().min(100);
+        let rule = "─".repeat(w);
+        let mut out = String::new();
+        out.push_str(&term::bold(&format!("resumed session: {name}  ({} turns)", self.turns)));
+        out.push('\n');
+        if !self.first_prompt.is_empty() {
+            out.push_str(&format!(
+                "{} first prompt: {}\n",
+                term::dim("·"),
+                term::dim(&self.first_prompt.lines().next().unwrap_or("").trim())
+            ));
+        }
+        if !self.last_prompt.is_empty() {
+            out.push_str(&format!(
+                "{} last  prompt: {}\n",
+                term::dim("·"),
+                term::dim(&self.last_prompt.lines().next().unwrap_or("").trim())
+            ));
+        }
+        if !self.last_output.is_empty() {
+            out.push_str(&term::dim(&rule));
+            out.push('\n');
+            out.push_str(&term::dim("last output (tail):\n"));
+            out.push_str(&tail_lines(&self.last_output, 40));
+            out.push('\n');
+            out.push_str(&term::dim(&rule));
+        }
+        out
+    }
 }
 
 impl Agent {
@@ -79,7 +152,16 @@ impl Agent {
         let client = make_client(&provider, cancel.clone())?;
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-        let mut registry = Registry::new(cwd.clone(), full_auto);
+        // The "go silent" switch must exist before the registry (and its
+        // backends) are built, because they capture a clone of it. The REPL
+        // holds the same `Arc`, so flipping it (to background a running turn)
+        // silences any in-flight terminal output the backends emit — e.g. the
+        // bash tool's live elapsed clock — without the REPL owning the worker.
+        let quiet_req = Arc::new(AtomicBool::new(false));
+        let mut registry = Registry::new(cwd.clone(), full_auto, cancel.clone());
+        // Share the REPL's "go silent" switch with the tool backends so a
+        // backgrounded turn silences their in-flight terminal output too.
+        registry.set_quiet_handle(quiet_req.clone());
         crate::register_all(&mut registry);
         registry.session_started(&cwd);
 
@@ -131,12 +213,14 @@ impl Agent {
             goal_store,
             notify: bus,
             quiet,
+            quiet_req,
             cancel,
             typeahead,
             last_prompt: String::new(),
             continuations: Vec::new(),
             token_budget: None,
             undo_stack: Vec::new(),
+            su_security_enabled: true,
         })
     }
 
@@ -190,6 +274,35 @@ impl Agent {
     /// Whether this agent is currently running in the background.
     pub fn is_quiet(&self) -> bool {
         self.quiet
+    }
+
+    /// Change whether this agent prints to the terminal. The TUI REPL builds a
+    /// quiet agent (ratatui owns the screen) and tails the session log instead
+    /// of letting the turn stream to stdout.
+    pub fn set_quiet(&mut self, q: bool) {
+        self.quiet = q;
+    }
+
+    /// Request silent streaming for a turn that is *already running* on a
+    /// worker thread. The REPL uses this to "background" the foreground turn:
+    /// once set, the worker stops printing to stdout (the terminal    /// the idle prompt) keeps running the
+    /// background. Read-only here — ownership stays with the REPL.
+    pub fn request_quiet(&self) {
+        self.quiet_req.store(true, Ordering::SeqCst);
+    }
+
+    /// Share the REPL's foreground "go quiet" handle with this agent, replacing
+    /// the agent's private handle. The REPL holds the same `Arc`, so flipping
+    /// it detaches (silences) the running turn without owning the agent.
+    pub fn set_quiet_handle(&mut self, handle: Arc<AtomicBool>) {
+        self.quiet_req = handle;
+    }
+
+    /// True when the turn should not write to the terminal, either because the
+    /// agent was built quiet (background job) or the REPL asked an in-flight
+    /// foreground turn to go quiet (detach to background).
+    fn silent(&self) -> bool {
+        self.quiet || self.quiet_req.load(Ordering::SeqCst)
     }
 
     /// Read-only access to the chosen provider/model (for spawning background
@@ -263,6 +376,65 @@ impl Agent {
     /// opt in via `--budget N` or `PIR_TOKEN_BUDGET`. Pass None to disable.
     pub fn set_token_budget(&mut self, budget: Option<u64>) {
         self.token_budget = budget;
+    }
+
+    /// Whether this session runs with the su-based security boundary on
+    /// (agent confined to its sandbox identity, default) or off (agent is
+    /// authorized to act with the invoking user's full authority for this
+    /// session only). This is purely a local, in-session authorization flag —
+    /// it never edits system files. Persisted next to the session log so a
+    /// resumed session keeps its choice.
+    pub fn su_security_enabled(&self) -> bool {
+        self.su_security_enabled
+    }
+
+    /// Set the local su-security authorization for this session. Returns the
+    /// reason it was recorded at (for audit). `reason` is required when turning
+    /// the boundary OFF, because disabling it lets the agent act with the
+    /// invoking user's full authority for this session.
+    pub fn set_su_security(&mut self, enabled: bool, reason: &str) -> String {
+        self.su_security_enabled = enabled;
+        let note = if reason.trim().is_empty() {
+            "(no reason given)".to_string()
+        } else {
+            reason.trim().to_string()
+        };
+        self.persist_su_security();
+        if enabled {
+            "su-based security ENABLED for this session (agent confined to its sandbox identity)".to_string()
+        } else {
+            format!(
+                "su-based security DISABLED for this session — agent authorized to act with the \
+                 invoking user's full authority (reason: {note}). This affects only this session; \
+                 no system-wide configuration was changed."
+            )
+        }
+    }
+
+    /// Persist the local su-security choice next to the session log
+    /// (`<log>.susec`) so a resumed session keeps it. Best-effort; a missing
+    /// log (one-shot) is silently skipped.
+    fn persist_su_security(&self) {
+        if let Some(p) = &self.log_path {
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let path = p.with_extension("susec");
+            let _ = std::fs::write(&path, if self.su_security_enabled { "1" } else { "0" });
+        }
+    }
+
+    /// Load a previously persisted su-security choice (from `<log>.susec`) for
+    /// a resumed session. Returns true if a value was restored.
+    pub fn apply_persisted_su_security(&mut self) -> bool {
+        let Some(p) = self.log_path.as_ref() else { return false };
+        match std::fs::read_to_string(p.with_extension("susec")) {
+            Ok(s) => {
+                self.su_security_enabled = s.trim() == "1";
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Begin a new goal for this session, persisting it next to the log.
@@ -389,12 +561,25 @@ impl Agent {
     }
 
     /// Replay the persisted transcript of `session` back into history so a
-    /// resumed session keeps its prior conversation. Returns (turns, summary)
-    /// where `summary` is a short human-readable line suitable for the REPL to
-    /// print (empty when nothing was loaded).
-    pub fn load_session(&mut self, session: &PathBuf) -> (usize, String) {
+    /// resumed session keeps its prior conversation. Returns a [`SessionResume`]
+    /// describing what was loaded (and the prior prompts, for arrow-up history).
+    /// When nothing was loaded, `turns == 0` and the rest is empty.
+    pub fn load_session(&mut self, session: &PathBuf) -> SessionResume {
         let mut turns = 0usize;
-        let Some(f) = File::open(session).ok() else { return (0, String::new()) };
+        let mut prompts: Vec<String> = Vec::new();
+        let mut first_prompt = String::new();
+        let mut last_user_prompt = String::new();
+        let mut last_assistant = String::new();
+        let Some(f) = File::open(session).ok() else {
+            return SessionResume {
+                turns: 0,
+                summary: String::new(),
+                first_prompt: String::new(),
+                last_prompt: String::new(),
+                last_output: String::new(),
+                prompts: Vec::new(),
+            };
+        };
         let mut pending: Option<Message> = None;
         for line in std::io::BufReader::new(f).lines().flatten() {
             if line.trim().is_empty() {
@@ -432,16 +617,48 @@ impl Agent {
                 if let Some(m) = pending.take() {
                     self.history.push(m);
                 }
-                pending = Some(Message { role: Role::User, blocks });
+                pending = Some(Message { role: Role::User, blocks: blocks.clone() });
                 turns += 1;
+                // Capture this prompt's full text for the banner + arrow-up history.
+                let text = blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        Block::Text(t) => Some(t.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .trim()
+                    .to_string();
+                if !text.is_empty() {
+                    if first_prompt.is_empty() {
+                        first_prompt = text.clone();
+                    }
+                    last_user_prompt = text.clone();
+                    prompts.push(text);
+                }
             } else {
                 // Assistant message: if we already have a pending user turn,
-                // pair them; otherwise just queue the assistant alone.
+                // pair them; otherwise just queue the assistant alone. Remember
+                // its text as the latest assistant output (shown as the tail).
                 if let Some(mut u) = pending.take() {
-                    u.blocks.extend(blocks);
+                    u.blocks.extend(blocks.clone());
                     self.history.push(u);
                 } else {
-                    self.history.push(Message { role: Role::Assistant, blocks });
+                    self.history.push(Message { role: Role::Assistant, blocks: blocks.clone() });
+                }
+                let text = blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        Block::Text(t) => Some(t.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .trim()
+                    .to_string();
+                if !text.is_empty() {
+                    last_assistant = text;
                 }
             }
         }
@@ -450,22 +667,26 @@ impl Agent {
         }
 
         let summary = if turns > 0 {
-            let first = self.history.iter().find_map(|m| {
-                if m.role == Role::User {
-                    m.text().lines().next().map(|l| l.to_string())
-                } else {
-                    None
-                }
-            });
             format!(
                 "resumed session ({} turns){}",
                 turns,
-                first.map(|f| format!(": {f}")).unwrap_or_default()
+                if first_prompt.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", first_prompt.lines().next().unwrap_or("").trim())
+                }
             )
         } else {
             String::new()
         };
-        (turns, summary)
+        SessionResume {
+            turns,
+            summary,
+            first_prompt,
+            last_prompt: last_user_prompt,
+            last_output: last_assistant,
+            prompts,
+        }
     }
 
     /// Drive the agent to complete the active goal. Repeatedly prompts the
@@ -599,7 +820,7 @@ impl Agent {
             if self.cancel.load(Ordering::SeqCst) {
                 self.cancel.store(false, Ordering::SeqCst);
                 self.mark_status(SessionStatus::Interrupted, self.goal_pending(), "cancelled");
-                if !self.quiet {
+                if !self.silent() {
                     if let Some(s) = spinner.as_mut() {
                         s.stop();
                     }
@@ -614,7 +835,7 @@ impl Agent {
             if let Some(budget) = self.token_budget {
                 let used = self.usage.input + self.usage.output;
                 if used >= budget {
-                    if !self.quiet {
+                    if !self.silent() {
                         if let Some(s) = spinner.as_mut() {
                             s.stop();
                         }
@@ -629,7 +850,7 @@ impl Agent {
                     }
                     self.mark_status(SessionStatus::Interrupted, self.goal_pending(), "token budget reached");
                     self.notify.publish(self.turn_done_event(), false);
-                    if !self.quiet {
+                    if !self.silent() {
                         self.continuations.extend(self.registry.on_turn_end(user));
                     }
                     return Ok(());
@@ -645,7 +866,7 @@ impl Agent {
             // it keeps indicating "thinking" while tools run / between calls.
             // `self.typeahead` (filled by the REPL) is rendered on the spinner
             // line so the user sees what they're typing while the model thinks.
-            if !self.quiet {
+            if !self.silent() {
                 spinner = Some(term::Spinner::start("thinking", self.typeahead.clone(), tty));
             }
             // Stop the footer spinner (if running) the moment the model emits
@@ -654,14 +875,14 @@ impl Agent {
             // so subsequent tokens in the same stream don't touch it again.
             let mut stopped_here = false;
             let mut on_text = |t: &str| {
-                if !self.quiet && !stopped_here {
+                if !self.silent() && !stopped_here {
                     stopped_here = true;
                     if let Some(s) = spinner.as_mut() {
                         s.stop();
                     }
                     spinner = None;
                 }
-                if !self.quiet {
+                if !self.silent() {
                     term::out(t);
                 }
             };
@@ -675,7 +896,7 @@ impl Agent {
             );
             // Ensure the footer spinner is stopped (covers the no-output case),
             // then move to a fresh line below the agent's text.
-            if !self.quiet {
+            if !self.silent() {
                 if let Some(s) = spinner.as_mut() {
                     s.stop();
                 }
@@ -689,7 +910,7 @@ impl Agent {
                     // as well as stderr, so a mid-turn provider error isn't lost
                     // below already-printed tokens. The on-screen notification
                     // feed also gets an Error event.
-                    if !self.quiet {
+                    if !self.silent() {
                         term::out(&format!("\r\x1b[K{}\n", term::red(&format!("✗ turn error: {e}"))));
                     } else {
                         eprintln!("{} {e}", term::red("error:"));
@@ -698,7 +919,7 @@ impl Agent {
                         AgentEvent::error(e.clone(), self.project_label(), self.last_prompt.clone()),
                         false,
                     );
-                    if !self.quiet {
+                    if !self.silent() {
                         self.continuations.extend(self.registry.on_turn_end(user));
                     }
                     self.mark_status(SessionStatus::Interrupted, self.goal_pending(), &format!("turn error: {e}"));
@@ -720,7 +941,7 @@ impl Agent {
 
             if calls.is_empty() {
                 self.notify.publish(self.turn_done_event(), false);
-                if !self.quiet {
+                if !self.silent() {
                     self.continuations.extend(self.registry.on_turn_end(user));
                 }
                 self.mark_status(SessionStatus::Completed, self.goal_pending(), "");
@@ -729,7 +950,7 @@ impl Agent {
 
             let mut results = Message { role: Role::User, blocks: Vec::new() };
             for (id, name, input) in &calls {
-                if !self.quiet {
+                if !self.silent() {
                     term::out(&format!("{} {}", term::cyan("»"), describe_call(name, input)));
                 }
                 // Snapshot the target file before a destructive edit so `/undo`
@@ -743,7 +964,7 @@ impl Agent {
                     Some(o) => o,
                     None => self.registry.execute(name, input),
                 };
-                if !self.quiet {
+                if !self.silent() {
                     term::out(&term::dim(&format!("  {}", first_line(&outcome.content))));
                 }
                 results.blocks.push(Block::ToolResult {
@@ -760,7 +981,7 @@ impl Agent {
             // a footer so it's clear the agent is still working. The next
             // streamed token erases it in place via `\r`. `self.typeahead` is
             // rendered on the spinner line so typed-ahead input stays visible.
-            if !self.quiet {
+            if !self.silent() {
                 spinner = Some(term::Spinner::start("thinking", self.typeahead.clone(), tty));
             }
 
@@ -769,7 +990,7 @@ impl Agent {
             if self.cancel.load(Ordering::SeqCst) {
                 self.cancel.store(false, Ordering::SeqCst);
                 self.mark_status(SessionStatus::Interrupted, self.goal_pending(), "cancelled");
-                if !self.quiet {
+                if !self.silent() {
                     if let Some(s) = spinner.as_mut() {
                         s.stop();
                     }
@@ -1032,6 +1253,19 @@ fn first_line(s: &str) -> String {
         out.push_str(" …");
     }
     out
+}
+
+/// Return the last `n` lines of `s`, indented so the block reads as a terminal
+/// "tail". Used by the resume banner to show the final page of a session's
+/// output without dumping the whole transcript.
+fn tail_lines(s: &str, n: usize) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..]
+        .iter()
+        .map(|l| format!("  {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn log_line(log: &mut Option<fs::File>, m: &Message) {

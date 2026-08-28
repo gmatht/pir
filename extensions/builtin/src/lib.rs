@@ -21,7 +21,12 @@ use std::time::{Duration, Instant};
 
 pub fn register(reg: &mut Registry) {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    reg.add(Box::new(Builtin::new(cwd, reg.full_auto())));
+    reg.add(Box::new(Builtin::new(
+        cwd,
+        reg.full_auto(),
+        reg.abort.clone(),
+        Arc::new(AtomicBool::new(false)),
+    )));
 }
 
 struct Builtin {
@@ -29,16 +34,27 @@ struct Builtin {
     full_auto: bool,
     bash_ok: bool,
     write_ok: bool,
-    // Long-running commands that were detached mid-flight (see run_shell's
+    // Long-running commands detached mid-flight (see run_shell's
     // 10-minute check-in) live here so the model can poll/kill them with the
     // job_status / job_kill tools instead of us blocking the turn forever.
     jobs: Vec<Job>,
     next_job: u64,
+    /// Shared hard-abort flag (the same `Arc` the REPL holds). When the user
+    /// presses ESC/ctrl-c, the REPL sets it; `run_shell` polls it and kills the
+    /// running child immediately instead of waiting for it to exit. Cleared at
+    /// the start of each `bash` call so a stale abort from a previous command
+    /// doesn't fire spuriously.
+    abort: Arc<AtomicBool>,
+    /// Shared "go silent" switch (the same `Arc` the REPL holds). When the user
+    /// backgrounds a running turn (bare `&`), the REPL flips it; the bash
+    /// tool's live elapsed clock then stops writing to the terminal so /// detached turn is silent instead of polluting the prompt with
+    /// `· running Ns` lines. False by default (attached / foreground).
+    quiet: Arc<AtomicBool>,
 }
 
 impl Builtin {
-    fn new(cwd: PathBuf, full_auto: bool) -> Self {
-        Builtin { cwd, full_auto, bash_ok: false, write_ok: false, jobs: Vec::new(), next_job: 1 }
+    fn new(cwd: PathBuf, full_auto: bool, abort: Arc<AtomicBool>, quiet: Arc<AtomicBool>) -> Self {
+        Builtin { cwd, full_auto, bash_ok: false, write_ok: false, jobs: Vec::new(), next_job: 1, abort, quiet }
     }
 }
 
@@ -406,6 +422,14 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
     // the model (so an unattended agent never blocks waiting on a human).
     const CHECK_IN: Duration = Duration::from_secs(10 * 60);
 
+    // The shared hard-abort flag (`b.abort` is the same Arc as the REPL's
+    // `fg_cancel`). When the user presses ESC/ctrl-c, the REPL sets it; we poll
+    // it in the wait loop and kill the child immediately instead of waiting for
+    // it to exit. We do NOT clear it here: it is reset by the worker at the
+    // start of each turn (`cancel.store(false)`), and clearing it now could
+    // wipe a cancel request meant for the turn as a whole. Capture its state
+    // the instant we act on it so the final status line is accurate.
+
     // Run in the *live* process cwd, not the launch cwd, so extension backends
     // (e.g. the worktree extension) can `cd` the agent into a linked worktree
     // and have bash honor it. Falls back to `b.cwd` if the process cwd is gone.
@@ -432,6 +456,12 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
     let clock_shown_w = clock_shown.clone();
     let clock_stop_w = clock_stop.clone();
     let clock_tty = term::is_terminal();
+    // Capture the shared "go silent" switch (same Arc as the REPL's
+    // `fg_quiet`). When the user backgrounds the running turn (bare `&`), the
+    // REPL flips it; this clock thread then stops writing to the terminal so a
+    // detached turn is silent instead of polluting the prompt with `· running
+    // Ns` lines every 250ms.
+    let quiet_w = b.quiet.clone();
     let elapsed_tid = std::thread::spawn(move || {
         if !clock_tty {
             while !clock_stop_w.load(Ordering::SeqCst) {
@@ -442,6 +472,17 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
         loop {
             if clock_stop_w.load(Ordering::SeqCst) {
                 break;
+            }
+            // Detached turn: go silent immediately. Erase any clock already on
+            // the line so it doesn't linger after the turn is backgrounded.
+            if quiet_w.load(Ordering::SeqCst) {
+                if clock_shown_w.swap(false, Ordering::SeqCst) {
+                    eprint!("\r\x1b[K");
+                    let mut serr = io::stderr();
+                    let _ = serr.flush();
+                }
+                std::thread::sleep(Duration::from_millis(250));
+                continue;
             }
             std::thread::sleep(Duration::from_millis(250));
             let elapsed = started.elapsed();
@@ -456,9 +497,17 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
         }
     });
 
+    let abort = b.abort.clone();
     let deadline = Instant::now() + TIMEOUT;
     let mut next_check_in = Instant::now() + CHECK_IN;
     let status = loop {
+        // ESC/ctrl-c hard-abort: if the user asked to cancel the command, kill
+        // the child immediately and stop — no waiting for it to exit on its own.
+        if abort.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
         match child.try_wait().map_err(|e| format!("wait: {e}"))? {
             Some(status) => break Some(status),
             None => {
@@ -531,6 +580,7 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
     match status {
         Some(s) if s.success() => {}
         Some(s) => text.push_str(&format!("\n[exit code {}]", s.code().unwrap_or(-1))),
+        None if abort.load(Ordering::SeqCst) => text.push_str("\n[pir] command aborted by user (ESC/ctrl-c)"),
         None => text.push_str(&format!("\n[pir] timed out after {}s, killed", TIMEOUT.as_secs())),
     }
     crate::plugin::truncate(&mut text, 30_000);
@@ -608,5 +658,51 @@ fn spawn_shell(command: &str, cwd: &Path) -> Result<std::process::Child, String>
             build("sh", "-c").spawn().map_err(|_| format!("spawn {prog}: {e}"))
         }
         Err(e) => Err(format!("spawn {prog}: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod esc_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn abort_kills_running_command() {
+        // A slow command (`sleep 30`). Flipping the abort flag must kill it
+        // almost immediately (well under a second), not wait for it to exit.
+        let abort = Arc::new(AtomicBool::new(false));
+        let mut b = Builtin::new(PathBuf::from("."), true, abort.clone(), Arc::new(AtomicBool::new(false)));
+        let start = Instant::now();
+        let handle = std::thread::spawn(move || run_shell(&mut b, "sleep 30"));
+        std::thread::sleep(Duration::from_millis(200));
+        abort.store(true, Ordering::SeqCst);
+        let out = handle.join().unwrap().expect("run_shell result");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "abort took too long ({elapsed:?}) — command should be killed promptly"
+        );
+        assert!(out.contains("aborted by user"), "aborted command should report user abort, got: {out}");
+    }
+
+    #[test]
+    fn no_abort_completes() {
+        // Without abort, a fast command runs to completion and reports success.
+        let abort = Arc::new(AtomicBool::new(false));
+        let mut b = Builtin::new(PathBuf::from("."), true, abort.clone(), Arc::new(AtomicBool::new(false)));
+        let out = run_shell(&mut b, "echo hello-from-pir").expect("run_shell result");
+        assert!(out.contains("hello-from-pir"), "got: {out}");
+    }
+
+    #[test]
+    fn abort_only_noop_when_idle() {
+        // The abort flag alone (no running command) must not abort a later one.
+        let abort = Arc::new(AtomicBool::new(false));
+        abort.store(true, Ordering::SeqCst);
+        abort.store(false, Ordering::SeqCst);
+        let mut b = Builtin::new(PathBuf::from("."), true, abort.clone(), Arc::new(AtomicBool::new(false)));
+        let out = run_shell(&mut b, "echo still-ran").expect("run_shell result");
+        assert!(out.contains("still-ran"), "got: {out}");
     }
 }

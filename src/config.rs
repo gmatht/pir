@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
 
@@ -586,6 +586,75 @@ pub fn select<'a>(
             "'{selector}' is ambiguous: {}",
             hits.iter().map(|(p, m)| p.label(m)).collect::<Vec<_>>().join(", ")
         )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-instance model broadcast
+// ---------------------------------------------------------------------------
+//
+// `pir` is a process-per-terminal app: every open terminal has its own
+// independent `pir` with its own agent/bus, so there is no in-process way to
+// reach "all running instances". To let `/model*` switch the model in *every*
+// open terminal at once, `pir` publishes a tiny broadcast file under the
+// user's `~/.pi/agent/` and a lightweight watcher in each instance polls it.
+//
+// The file is owned by the user (under `~/.pi`), so the blast radius is
+// naturally scoped to that user's own terminals — never other users. Scope is
+// "same user", not "same shell", so a `/model*` from one of your terminals
+// reaches all of your other terminals too.
+
+/// Path of the cross-instance model-broadcast file.
+pub fn model_broadcast_path() -> PathBuf {
+    pi_dir().join("agent").join("model-broadcast.json")
+}
+
+/// The current model broadcast, if any and well-formed.
+pub fn read_model_broadcast() -> Option<ModelBroadcast> {
+    let raw = fs::read_to_string(model_broadcast_path()).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    Some(ModelBroadcast {
+        generation: v.get("generation").and_then(Value::as_u64).unwrap_or(0),
+        label: v.get("label").and_then(Value::as_str).unwrap_or("").to_string(),
+        by_pid: v.get("byPid").and_then(Value::as_u64).unwrap_or(0),
+        ts: v.get("ts").and_then(Value::as_u64).unwrap_or(0),
+    })
+}
+
+/// A single model-broadcast event published by `/model*`.
+#[derive(Clone, Debug)]
+pub struct ModelBroadcast {
+    /// Monotonic counter so watchers can detect "new since I last applied".
+    pub generation: u64,
+    /// The `provider/model` label to switch to.
+    pub label: String,
+    /// PID of the `pir` that originated the broadcast (so it can ignore itself).
+    pub by_pid: u64,
+    /// Epoch seconds when it was published.
+    pub ts: u64,
+}
+
+/// Publish a model-broadcast event for `label`, stamping it with the current
+/// process pid and a `generation` one greater than any previously recorded.
+/// Returns the generation that was written (useful for the originator to ignore
+/// its own echo). Best-effort: a write failure is silently ignored.
+pub fn publish_model_broadcast(label: &str) -> Option<u64> {
+    let p = model_broadcast_path();
+    if let Some(parent) = p.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let prev = read_model_broadcast().map(|b| b.generation).unwrap_or(0);
+    let generation = prev + 1;
+    let payload = json!({
+        "generation": generation,
+        "label": label,
+        "byPid": std::process::id(),
+        "ts": crate::term::epoch(),
+    });
+    if fs::write(&p, serde_json::to_string_pretty(&payload).unwrap_or_default()).is_ok() {
+        Some(generation)
+    } else {
+        None
     }
 }
 

@@ -231,13 +231,18 @@ mod tests {
 
     #[test]
     fn rewrites_find_slash_to_locate() {
-        std::env::set_var("PATH", std::env::var("PATH").unwrap_or_default());
         // Only meaningful when `locate` exists; skip otherwise.
         if Command::new("locate").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+            // A bare pattern gets `*` wildcards wrapped; one that already
+            // contains `*` is used verbatim.
             let (c, ok) = Prep::safe_find("find / -name '*.rs'");
             assert!(ok, "find / should be rewritten");
             assert!(c.starts_with("locate"), "got {c}");
-            assert!(c.contains("*.rs*"), "got {c}");
+            assert_eq!(c, "locate *.rs", "pattern with * is used verbatim");
+
+            let (c2, ok2) = Prep::safe_find("find / -name Cargo.toml");
+            assert!(ok2, "find / should be rewritten");
+            assert_eq!(c2, "locate *Cargo.toml*", "bare pattern gets wildcards");
         }
     }
 

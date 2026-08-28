@@ -496,14 +496,32 @@ impl Spinner {
     /// (the spinner + hrule + live REPL prompt) and renders the user's typing
     /// on the prompt line below the hrule. This avoids two threads racing on
     /// stdout — the previous design had the main REPL thread echo keystrokes
-    /// directly *and* the spinner rewrite the same line, which clobbered the
+    /// directly *and* the the same line, which clobbered the
     /// user's input mid-thought (the "REPL doesn't display during thinking" bug).
+    ///
+    /// `quiet` is the shared "go silent" switch the REPL flips to background a
+    /// running turn (bare `&`). When it is set, the spinner stops drawing
+    /// (and erases whatever it last drew) so a detached turn doesn't keep
+    /// writing its "thinking" block to the terminal behind the user's prompt.
     pub fn start(label: &str, typeahead: Arc<Mutex<String>>, enabled: bool) -> Spinner {
+        Spinner::start_with(label, typeahead, enabled, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Like [`Spinner::start`], but also stops drawing when `quiet` is set (used
+    /// by the agent, which passes its shared `quiet_req` so a turn detached
+    /// mid-"thinking" silences the spinner immediately).
+    pub fn start_with(
+        label: &str,
+        typeahead: Arc<Mutex<String>>,
+        enabled: bool,
+        quiet: Arc<AtomicBool>,
+    ) -> Spinner {
         if !enabled {
             return Spinner { handle: None, alive: Arc::new(AtomicBool::new(false)) };
         }
         let alive = Arc::new(AtomicBool::new(true));
         let a = alive.clone();
+        let q = quiet.clone();
         let label = label.to_string();
         let handle = thread::spawn(move || {
             let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -511,6 +529,19 @@ impl Spinner {
             let mut out = io::stdout();
             let mut drawn = false;
             while a.load(Ordering::SeqCst) {
+                // Detached turn: stop drawing and erase whatever we last drew so
+                // the backgrounded turn leaves a clean prompt behind it.
+                if q.load(Ordering::SeqCst) {
+                    if drawn {
+                        let _ = out.write_all(
+                            b"\x1b[2A\x1b[2K\x1b[B\x1b[2K\x1b[B\x1b[2K\x1b[2A\x1b[2K",
+                        );
+                        let _ = out.flush();
+                        drawn = false;
+                    }
+                    std::thread::sleep(Duration::from_millis(80));
+                    continue;
+                }
                 let frame = if color() { format!("\x1b[36m{}\x1b[0m", frames[i % frames.len()]) } else { frames[i % frames.len()].to_string() };
                 // Read the user's in-progress line (recorded by the REPL thread)
                 // and show it on the live REPL line under the hrule so typing
@@ -548,10 +579,12 @@ impl Spinner {
             // entirely, so the next spinner's first draw anchored one line low
             // and the prior "⠋ thinking…" was never erased — every tool round
             // leaked another stray "thinking" onto the screen.
-            let _ = out.write_all(
-                b"\x1b[2A\x1b[2K\x1b[B\x1b[2K\x1b[B\x1b[2K\x1b[2A\x1b[2K",
-            );
-            let _ = out.flush();
+            if drawn {
+                let _ = out.write_all(
+                    b"\x1b[2A\x1b[2K\x1b[B\x1b[2K\x1b[B\x1b[2K\x1b[2A\x1b[2K",
+                );
+                let _ = out.flush();
+            }
         });
         Spinner { handle: Some(handle), alive }
     }
