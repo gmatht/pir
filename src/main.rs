@@ -52,7 +52,7 @@ OPTIONS
 
 CONFIG (reused from pi, never modified)
   ~/.pi/models.json          providers, models, api keys ("{env:VAR}" supported)
-  ~/.pisettings.json  optional default model ("defaultModel" key)
+  ~/.pi/agent/settings.json  optional default model ("defaultModel" / "defaultProvider")
   ~/.pi/AGENTS.md, ./AGENTS.md   appended to the system prompt
   ~/.pi/agent/sessions/      pir session transcripts + goal files (pir-*.jsonl/.goal.json)
   ~/.pi/agent/projects.json  project -> execution-user mappings (set by `pir project init`)
@@ -72,6 +72,8 @@ COMMANDS
   /bg <text>  /jobs  /fg <id>  /clear  /usage  /exit
   /undo [all]             revert the last file edit (or all) to its pre-edit state
   /project init            create the ai_<project> user and chown the cwd (root)
+  /su-security <on|off|status>   enable/disable/inspect the su-based permission
+                          model (sudoers.d/skynet-ai + wrappers); reversible (root)
   /fix                     make the .git setup sane for LLM use (install commit
                           guard hook + .gitattributes; jj-aware). Run it if you see
                           the "no commit guard hook" startup warning on an existing repo
@@ -142,6 +144,27 @@ impl BackgroundJobs {
             handle: Some(handle),
         });
         println!("{} backgrounded as job #{} (logs to {})", term::cyan("·"), id, log.display());
+    }
+
+    /// Adopt an *already-running* foreground turn as a background job: take over
+    /// its worker handle + its session log so it shows up in `/jobs` and keeps
+    /// running to completion (notifications still fire on the shared bus). The
+    /// turn's agent must already have been told to go quiet (see
+    /// `Agent::request_quiet`) so it stops writing to the terminal. Used by the
+    /// `&`-to-background-the-current-turn path. The returned id is what `/fg`
+    /// will later reattach to.
+    fn attach_fg(&mut self, handle: JoinHandle<()>, log: PathBuf, prompt: String) -> usize {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.jobs.push(BgSession {
+            id,
+            prompt,
+            log,
+            started: std::time::SystemTime::now(),
+            joined: false,
+            handle: Some(handle),
+        });
+        id
     }
 
     /// Spawn a background job from a prompt, using the current provider/model/
@@ -235,10 +258,10 @@ fn main() {
     let mut as_user: Option<String> = None;
     let mut project_name: Option<String> = None;
     let mut bg_prompt: Option<String> = None;
-    // The full-screen ratatui REPL is the default when the `tui` feature is
-    // compiled in; pass `--no-tui` to use the streaming REPL instead.
+    // The full-screen ratatui REPL is used only when the `tui` feature is
+    // compiled in AND `--tui` is passed; otherwise the streaming REPL runs.
     #[cfg(feature = "tui")]
-    let mut use_tui = true;
+    let mut use_tui = false;
     #[cfg(not(feature = "tui"))]
     let mut use_tui = false;
     let mut no_raw = false;
@@ -405,6 +428,12 @@ fn main() {
     // (ctrl-c) to ask a running turn to stop at the next safe boundary.
     let fg_cancel = Arc::new(AtomicBool::new(false));
 
+    // Shared "go silent" switch for the *current* foreground turn: the REPL
+    // flips it (via `Agent::request_quiet`) to *detach* a running turn into the
+    // background. Once set, the worker stops streaming to stdout and the
+    // terminal returns to the idle prompt while the turn keeps running.
+    let fg_quiet: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
     // Live "what the user is typing" buffer shown by the thinking spinner while
     // a turn runs (see `run_foreground_turn` / `term::Spinner`). The REPL thread
     // only writes to it; the spinner thread is the sole stdout writer during a
@@ -497,8 +526,8 @@ fn main() {
         return;
     }
 
-    // Full-screen TUI REPL (default when the `tui` feature is compiled in; pass
-    // `--no-tui` to use the streaming REPL). It owns the terminal (alternate
+    // Full-screen TUI REPL (only when the `tui` feature AND
+    // `--tui` is passed; otherwise the streaming REPL above runs). It owns the terminal (alternate
     // screen + raw mode via crossterm) and renders a conversation pane + footer
     // pane (thinking + live draft prompt) with its own scrollback — no
     // hand-rolled ANSI block, so the stray-spinner class of bug can't recur.
@@ -513,6 +542,7 @@ fn main() {
         match crate::tui::run(
             &agent_slot,
             &fg_cancel,
+            &fg_quiet,
             &typeahead,
             &providers,
             &bus,
@@ -652,6 +682,7 @@ fn main() {
                     fg_handle = Some(run_foreground_turn(
                         &agent_slot,
                         &fg_cancel,
+                        &fg_quiet,
                         next,
                         done_tx.clone(),
                     ));
@@ -674,6 +705,7 @@ fn main() {
                         fg_handle = Some(run_foreground_turn(
                             &agent_slot,
                             &fg_cancel,
+                            &fg_quiet,
                             next,
                             done_tx.clone(),
                         ));
@@ -713,12 +745,37 @@ fn main() {
                             true,
                             &current_ctx,
                         );
+                    } else if s == "&" {
+                        // A bare `&` typed *while a turn runs* detaches the
+                        // running foreground turn into the background: flip the
+                        // shared "go quiet" switch (the worker stops streaming
+                        // to stdout) and adopt its worker handle as a background
+                        // job, so the REPL returns to the idle prompt while the
+                        // turn keeps running. The only sign of life is
+                        // "#tasks running: N · Idle".
+                        input_buf.clear();
+                        let log = {
+                            let g = agent_slot.lock().unwrap();
+                            g.as_ref().and_then(|a| a.log_path().cloned()).unwrap_or_default()
+                        };
+                        let prompt = {
+                            let g = agent_slot.lock().unwrap();
+                            g.as_ref().map(|a| a.last_prompt.clone()).unwrap_or_default()
+                        };
+                        let h = fg_handle.take().expect("fg running");
+                        let id = jobs.attach_fg(h, log, prompt);
+                        // `h` is now owned by `jobs` (kept alive, never joined/dropped here).
+                        fg_quiet.store(true, Ordering::SeqCst);
+                        term::raw::disable_raw();
+                        term::out(&term::dim(&format!(
+                            "· detached running turn as job #{} — it keeps working in the background",
+                            id
+                        )));
                     } else if s.ends_with('&') && !s.trim_end_matches('&').trim().is_empty() {
-                        // A line ending in `&` typed *while a turn runs* is
-                        // backgrounded immediately (the best time to fire off
-                        // other work — the foreground keeps streaming). The
-                        // context is read from `current_ctx` (not the agent
-                        // slot, which a running turn owns), so this never panics.
+                        // A prompt line ending in `&` typed *while a turn runs*
+                        // starts a brand-new background job (the foreground keeps
+                        // streaming). The context is read from `current_ctx`, so
+                        // this never panics on the agent being owned by the turn.
                         input_buf.clear();
                         let prompt = s.trim_end_matches('&').trim().to_string();
                         jobs.spawn_prompt(prompt, &current_ctx, bus.clone());
@@ -761,7 +818,13 @@ fn main() {
             continue;
         }
 
-        // Idle: full rustyline editing.
+        // Idle: full rustyline editing. Show a compact tasks indicator so a
+        // backgrounded (detached) turn is visible at a glance — the only sign of
+        // it is "#tasks running: N · Idle", with N > 0 while it works.
+        let tasks_running = jobs.jobs.iter().filter(|j| j.handle.is_some()).count();
+        if tasks_running > 0 {
+            term::out(&term::dim(&format!("#tasks running: {} · Idle\n", tasks_running)));
+        }
         match term::read_line(&format!("{} ", term::cyan("❯"))) {
             None => {
                 println!();
@@ -773,20 +836,28 @@ fn main() {
         if input.is_empty() {
             continue;
         }
-        // `&` suffix => run the rest in the background.
-        let bg = input.ends_with('&') && !input.trim_end_matches('&').is_empty();
+        // A prompt ending in `&` at the idle prompt runs in its OWN session (a
+        // fresh background job that keeps its own session log); the interactive
+        // session is untouched. A bare `&` at idle does nothing (there is no
+        // running turn to detach).
+        let bg = input.ends_with('&') && !input.trim_end_matches('&').trim().is_empty();
         let input = input.trim_end_matches('&').trim();
+        if input.is_empty() {
+            continue;
+        }
         if let Some(cmd) = input.strip_prefix('/') {
             handle_command(cmd, &agent_slot, &providers, &mut jobs, full_auto, &bus, &fg_cancel, false, &current_ctx);
         } else if bg {
-            // Run this prompt as a fresh background job that keeps its own
-            // session log (the foreground session is unaffected).
             jobs.spawn_prompt(input.to_string(), &current_ctx, bus.clone());
         } else {
             if let Ok(mut g) = typeahead.lock() { g.clear(); }
+            // A fresh foreground turn starts un-silenced; reset the detach
+            // switch so a previously detached turn's quiet state can't leak.
+            fg_quiet.store(false, Ordering::SeqCst);
             fg_handle = Some(run_foreground_turn(
                 &agent_slot,
                 &fg_cancel,
+                &fg_quiet,
                 input.to_string(),
                 done_tx.clone(),
             ));
@@ -802,18 +873,27 @@ fn main() {
 /// the REPL awaits, so it can wake the moment the turn ends instead of polling.
 /// `typeahead` is not needed here: the agent already holds the shared buffer
 /// (the same Arc the REPL thread writes to), and the thinking spinner reads it
-/// directly from the agent (see [`crate::term::Spinner`]).
+/// directly from the agent (see [`crate::term::Spinner`]). `quiet_handle` is the
+/// REPL's shared "go silent" switch: the REPL flips it (via `Agent::request_quiet`)
+/// to *detach* a running turn into the background — once set, the worker stops
+/// streaming to stdout and the terminal returns to the idle prompt while the
+/// turn keeps running.
 pub(crate) fn run_foreground_turn(
     agent_slot: &Arc<Mutex<Option<Agent>>>,
     cancel: &Arc<AtomicBool>,
+    quiet_handle: &Arc<AtomicBool>,
     prompt: String,
     done: smol::channel::Sender<()>,
 ) -> JoinHandle<()> {
     let slot = agent_slot.clone();
     let cancel = cancel.clone();
+    let quiet_handle = quiet_handle.clone();
     thread::spawn(move || {
         cancel.store(false, Ordering::SeqCst);
         let mut a = slot.lock().unwrap().take().expect("agent present");
+        // Hand the worker the shared quiet switch so the REPL can detach this
+        // turn to the background mid-flight without owning the agent.
+        a.set_quiet_handle(quiet_handle);
         let ev = match a.turn(&prompt) {
             Ok(()) => a.idle_event(),
             Err(e) => a.error_event(e),
@@ -924,7 +1004,7 @@ fn handle_command(
             }
         }
         "models" => print!("{}", list_models(providers)),
-        "dm" | "default-model" => {
+        "dm" | "default-model" | "model-default" => {
             // Set the default model for *new* sessions by persisting it to
             // ~/.pi/agent/settings.json. With no argument, just show the
             // current default (if any).
@@ -1026,6 +1106,34 @@ fn handle_command(
                 run_project_subcommand(&rest.iter().map(|s| s.to_string()).collect::<Vec<_>>());
             } else {
                 eprintln!("unknown /project subcommand '{}' — try /project init", rest[0]);
+            }
+        }
+        "su-security" | "susec" => {
+            // Toggle the su-based permission model (the sudoers.d/skynet-ai
+            // gate + the su-ai/mk-ai-user/su-underling wrappers) on or off. The
+            // operation is reversible: artifacts are renamed to `*.disabled`
+            // (sudo silently ignores files containing a '.'), and `status`
+            // reports the current state without mutating anything. Root only.
+            let arg = rest.first().copied().unwrap_or("status");
+            match arg {
+                "on" | "enable" | "1" => match crate::user::set_su_security(true) {
+                    Ok(msg) => println!("{msg}"),
+                    Err(e) => eprintln!("pir: {e}"),
+                },
+                "off" | "disable" | "0" => match crate::user::set_su_security(false) {
+                    Ok(msg) => println!("{msg}"),
+                    Err(e) => eprintln!("pir: {e}"),
+                },
+                "status" | "state" => {
+                    let (state, detail) = crate::user::su_security_status();
+                    println!("su-based security: {}", term::bold(&state));
+                    for line in detail {
+                        println!("{}", term::dim(&line));
+                    }
+                }
+                other => eprintln!(
+                    "usage: /su-security <on|off|status>  (reversible; requires root)"
+                ),
             }
         }
         "create" => {

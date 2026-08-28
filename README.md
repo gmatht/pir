@@ -113,6 +113,7 @@ COMMANDS (REPL)
   /help  /model <sel>  /models  /sessions  /goal [objective]  /continue
   /bg <text>  /jobs  /fg <id>  /clear  /usage  /exit
   /project init            create the ai_<project> user and chown the cwd (root)
+  /su-security <on|off|status>  enable/disable/inspect the su-based permission model (root)
   /create [name]           scaffold a new project (seeds from clipboard .md spec)
 ```
 

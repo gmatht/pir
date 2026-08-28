@@ -425,3 +425,152 @@ pub fn session_dir_for(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
     }
     None
 }
+
+// ----------------------------------------------------------------------------
+// su-based security toggle
+//
+// The "su based security" boundary is the set of root-owned artifacts deployed
+// by `install-skynet-ai.sh`:
+//   - `/etc/sudoers.d/skynet-ai`        — the sudoers gate (the real boundary)
+//   - `/usr/local/sbin/su-ai`           — wrapper: skynet -> ai_* (no password)
+//   - `/usr/local/sbin/mk-ai-user`      — wrapper: create an ai_* account
+//   - `/usr/local/sbin/su-underling`    — wrapper: X -> X__* underlings
+//
+// Disabling the security *removes* the delegation (strangers can no longer
+// switch between the sandbox accounts via passwordless su). The operation is
+// fully REVERSIBLE: artifacts are renamed to `*.disabled`, which sudoers
+// silently ignores (it skips files containing a '.'), and re-enabling restores
+// them — re-validating the sudoers with `visudo -cf` before accepting it.
+// Requires root, mirroring `provision` / `pir project init`.
+
+/// The four artifacts that constitute the su-based permission model.
+const SUDOERS_CONF: &str = "/etc/sudoers.d/skynet-ai";
+const SU_WRAPPERS: &[&str] = &[
+    "/usr/local/sbin/su-ai",
+    "/usr/local/sbin/mk-ai-user",
+    "/usr/local/sbin/su-underling",
+];
+
+/// Report the current state of the su-based security model.
+#[cfg(unix)]
+pub fn su_security_status() -> (String, Vec<String>) {
+    use std::path::Path;
+    let sudoers = Path::new(SUDOERS_CONF);
+    let sudoers_dis_path = format!("{SUDOERS_CONF}.disabled");
+    let sudoers_dis = Path::new(&sudoers_dis_path);
+    let mut detail = Vec::new();
+
+    let (state, gate) = if sudoers.exists() {
+        ("ENABLED", "sudoers active")
+    } else if sudoers_dis.exists() {
+        ("DISABLED", "sudoers renamed to .disabled")
+    } else {
+        ("NOT INSTALLED", "no sudoers.d/skynet-ai present")
+    };
+    detail.push(format!("  gate: {gate} ({SUDOERS_CONF})"));
+
+    let mut active = Vec::new();
+    let mut disabled = Vec::new();
+    for w in SU_WRAPPERS {
+        if Path::new(w).exists() {
+            active.push(w.to_string());
+        }
+        let d = format!("{w}.disabled");
+        if Path::new(&d).exists() {
+            disabled.push(d);
+        }
+    }
+    detail.push(format!(
+        "  wrappers active ({}): {}",
+        active.len(),
+        if active.is_empty() {
+            "(none)".into()
+        } else {
+            active.join(", ")
+        }
+    ));
+    if !disabled.is_empty() {
+        detail.push(format!("  wrappers disabled: {}", disabled.join(", ")));
+    }
+    (state.to_string(), detail)
+}
+
+/// Enable (`enabled=true`) or disable (`enabled=false`) the su-based security
+/// model. Reversible (artifacts are renamed, not deleted). Root only.
+#[cfg(unix)]
+pub fn set_su_security(enabled: bool) -> Result<String, String> {
+    use std::path::Path;
+
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("`/su-security` must run as root (re-run as root, or `sudo pir …`)".into());
+    }
+
+    let sudoers = Path::new(SUDOERS_CONF);
+    let sudoers_dis_path = format!("{SUDOERS_CONF}.disabled");
+    let sudoers_dis = Path::new(&sudoers_dis_path);
+    let mut log: Vec<String> = Vec::new();
+
+    // --- The sudoers gate (the authoritative boundary) -----------------------
+    if enabled {
+        if sudoers.exists() {
+            log.push("sudoers already enabled".into());
+        } else if sudoers_dis.exists() {
+            std::fs::rename(sudoers_dis, sudoers).map_err(|e| format!("rename sudoers: {e}"))?;
+            // Never accept a sudoers file that fails validation; roll back.
+            let ok = std::process::Command::new("visudo")
+                .arg("-cf")
+                .arg(sudoers)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !ok {
+                let _ = std::fs::rename(sudoers, sudoers_dis);
+                return Err("re-enabled sudoers failed `visudo -cf`; reverted to disabled".into());
+            }
+            log.push("sudoers re-enabled (visudo-validated)".into());
+        } else {
+            return Err(format!(
+                "su-based security is not installed (no {SUDOERS_CONF}); deploy it with install-skynet-ai.sh"
+            ));
+        }
+    } else if sudoers.exists() {
+        std::fs::rename(sudoers, sudoers_dis).map_err(|e| format!("rename sudoers: {e}"))?;
+        log.push("sudoers disabled (renamed to .disabled; sudo ignores it)".into());
+    } else if sudoers_dis.exists() {
+        log.push("sudoers already disabled".into());
+    } else {
+        log.push("no sudoers.d/skynet-ai present (nothing to disable)".into());
+    }
+
+    // --- The supporting wrappers ----------------------------------------------
+    for w in SU_WRAPPERS {
+        let p = Path::new(w);
+        let d = format!("{w}.disabled");
+        let dp = Path::new(&d);
+        if enabled {
+            if dp.exists() {
+                std::fs::rename(dp, p).map_err(|e| format!("rename {d}: {e}"))?;
+                log.push(format!("restored wrapper {w}"));
+            }
+        } else if p.exists() {
+            std::fs::rename(p, dp).map_err(|e| format!("rename {w}: {e}"))?;
+            log.push(format!("disabled wrapper {w}"));
+        }
+    }
+
+    let action = if enabled { "ENABLED" } else { "DISABLED" };
+    Ok(format!("su-based security {action}:\n{}", log.join("\n")))
+}
+
+#[cfg(not(unix))]
+pub fn su_security_status() -> (String, Vec<String>) {
+    (
+        "unsupported".to_string(),
+        vec!["su-based security toggle is only supported on unix".to_string()],
+    )
+}
+
+#[cfg(not(unix))]
+pub fn set_su_security(_enabled: bool) -> Result<String, String> {
+    Err("su-based security toggle is only supported on unix".into())
+}
