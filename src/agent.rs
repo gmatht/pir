@@ -5,6 +5,7 @@ use crate::plugin::{Outcome, Registry};
 use crate::provider::Client;
 use crate::term;
 use crate::types::{Block, Message, Role, Usage};
+use crate::session::SessionStatus;
 use serde_json::{json, Value};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, Write};
@@ -80,6 +81,7 @@ impl Agent {
 
         let mut registry = Registry::new(cwd.clone(), full_auto);
         crate::register_all(&mut registry);
+        registry.session_started(&cwd);
 
         let mut system = String::from(
             "You are pir, a minimal terminal coding agent (a lightweight Rust \
@@ -197,6 +199,13 @@ impl Agent {
     }
     pub fn model(&self) -> Model {
         self.model.clone()
+    }
+
+    /// Collect startup banners from every extension backend (e.g. the worktree
+    /// extension reporting the agent's current worktree). Printed by the REPL
+    /// before the first prompt.
+    pub fn startup_reports(&mut self) -> Vec<String> {
+        self.registry.startup_reports()
     }
 
     /// The path of the session transcript (used to foreground a session).
@@ -573,7 +582,9 @@ impl Agent {
         let msg = Message::user(user);
         log_line(&mut self.log, &msg);
         self.history.push(msg);
-
+        // Record that a turn is now in flight (so a crash/network failure mid-turn
+        // leaves a discoverable "unfinished" session owned by this live process).
+        self.mark_status(SessionStatus::Active, self.goal_pending(), "");
         let specs = self.registry.specs();
         let tty = crate::term::is_terminal();
         // `spinner` is hoisted out of the per-message loop so the "thinking…"
@@ -587,6 +598,7 @@ impl Agent {
             // of a new model call) if the REPL requested a stop.
             if self.cancel.load(Ordering::SeqCst) {
                 self.cancel.store(false, Ordering::SeqCst);
+                self.mark_status(SessionStatus::Interrupted, self.goal_pending(), "cancelled");
                 if !self.quiet {
                     if let Some(s) = spinner.as_mut() {
                         s.stop();
@@ -615,6 +627,7 @@ impl Agent {
                             ))
                         ));
                     }
+                    self.mark_status(SessionStatus::Interrupted, self.goal_pending(), "token budget reached");
                     self.notify.publish(self.turn_done_event(), false);
                     if !self.quiet {
                         self.continuations.extend(self.registry.on_turn_end(user));
@@ -688,6 +701,7 @@ impl Agent {
                     if !self.quiet {
                         self.continuations.extend(self.registry.on_turn_end(user));
                     }
+                    self.mark_status(SessionStatus::Interrupted, self.goal_pending(), &format!("turn error: {e}"));
                     return Err(e);
                 }
             };
@@ -709,6 +723,7 @@ impl Agent {
                 if !self.quiet {
                     self.continuations.extend(self.registry.on_turn_end(user));
                 }
+                self.mark_status(SessionStatus::Completed, self.goal_pending(), "");
                 return Ok(());
             }
 
@@ -753,6 +768,7 @@ impl Agent {
             // completes (the in-progress step always finishes first).
             if self.cancel.load(Ordering::SeqCst) {
                 self.cancel.store(false, Ordering::SeqCst);
+                self.mark_status(SessionStatus::Interrupted, self.goal_pending(), "cancelled");
                 if !self.quiet {
                     if let Some(s) = spinner.as_mut() {
                         s.stop();
@@ -874,6 +890,30 @@ impl Agent {
     /// Build an `Error` event from a turn's error message.
     pub fn error_event(&self, message: String) -> AgentEvent {
         AgentEvent::error(message, self.project_label(), self.last_prompt.clone())
+    }
+
+    /// Persist this session's liveness/end-status sidecar so unfinished
+    /// conversations can be discovered and resumed later. Called by `turn`.
+    fn mark_status(&self, status: SessionStatus, goal_pending: bool, reason: &str) {
+        if let Some(p) = &self.log_path {
+            crate::session::write_status(
+                p,
+                status,
+                std::process::id(),
+                &self.last_prompt,
+                goal_pending,
+                reason,
+            );
+        }
+    }
+
+    /// True if a goal is attached and not yet complete (so this session still
+    /// has unfinished work even when the last turn ended cleanly).
+    fn goal_pending(&self) -> bool {
+        self.goal_store
+            .as_ref()
+            .map(|s| !s.goal.status.is_terminal())
+            .unwrap_or(false)
     }
 
     /// Crude context management: past ~budget tokens, keep the first user

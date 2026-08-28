@@ -82,6 +82,14 @@ pub trait ToolBackend: Send {
     /// current working directory).
     fn on_session_start(&mut self, _launch_cwd: &std::path::Path) {}
 
+    /// Called once, after `on_session_start` and after the agent is fully
+    /// constructed, to let a backend print a status banner at startup. Return
+    /// `Some(text)` and `pir` prints it (dimmed) before the first prompt;
+    /// `None` is silent. Default no-op (silent).
+    fn startup_report(&mut self) -> Option<String> {
+        None
+    }
+
     /// Called once when the agent/REPL is shutting down. Use it to release
     /// resources the backend created (e.g. git worktrees). Returning an error
     /// is logged but does not abort exit.
@@ -150,6 +158,19 @@ impl Registry {
         for b in &mut self.backends {
             b.on_session_start(launch_cwd);
         }
+    }
+
+    /// Collect startup-report banners from every backend (e.g. the worktree
+    /// extension reporting the current worktree). Returns the lines for the
+    /// caller to print (dimmed) before the first prompt.
+    pub fn startup_reports(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        for b in &mut self.backends {
+            if let Some(line) = b.startup_report() {
+                out.push(line);
+            }
+        }
+        out
     }
 
     /// Notify every backend that the agent is shutting down.

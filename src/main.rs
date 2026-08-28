@@ -5,6 +5,7 @@ mod notify;
 mod plugin;
 mod project;
 mod provider;
+mod session;
 mod term;
 mod types;
 mod user;
@@ -539,6 +540,11 @@ fn main() {
             config::pi_dir().display()
         ))
     );
+    // Surface extension startup banners (e.g. the worktree extension reporting
+    // which worktree we launched in) before the first prompt.
+    for line in agent.startup_reports() {
+        println!("{}", term::dim(&line));
+    }
     // Show the execution user when it isn't the invoking root (per-project
     // `ai_X` sandbox), so it's clear commands run as that identity.
     #[cfg(unix)]
@@ -939,6 +945,44 @@ fn handle_command(
             agent.load_session(&log);
             jobs.mark_joined(id);
             println!("{} foregrounded job #{} from {}", term::bold("·"), id, log.display());
+        }
+        "unfin" | "unfinished" => {
+            // Show sessions that were interrupted, crashed (process gone but
+            // turn never finished), or still have a goal in progress — and which
+            // no live process is currently driving.
+            print!("{}", session::list_unfinished());
+        }
+        "resume" | "res" => {
+            // Resume an unfinished session (from `/unfinished`, index 0 = newest)
+            // into the *current* interactive agent and, if a goal is attached,
+            // drive it to the next pending step. Nothing is actively mutating the
+            // chosen session because `scan_unfinished` only returns sessions with
+            // no live client. The current session's history is replaced.
+            let token: String = rest.join(" ");
+            if token.trim().is_empty() {
+                eprintln!("usage: /resume <index|path-fragment>   (see /unfinished)");
+                return;
+            }
+            let Some(path) = session::resolve_unfinished(&token) else {
+                eprintln!("pir: no unfinished session matches '{token}'");
+                return;
+            };
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                eprintln!("pir: agent busy (turn running) — cancel it first");
+                return;
+            };
+            agent.clear();
+            let (_, summary) = agent.load_session(&path);
+            if !summary.is_empty() {
+                println!("{}", term::dim(&summary));
+            }
+            agent.apply_persisted_model();
+            if agent.goal_snapshot().is_some() {
+                agent.attach_goal(&path);
+                let out = agent.continue_goal();
+                term::out(&out);
+            }
         }
         "project" => {
             if rest.is_empty() || rest[0] == "init" {

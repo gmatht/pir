@@ -872,6 +872,57 @@ impl ToolBackend for Wt {
         self.repo = launch_cwd.to_path_buf();
     }
 
+    /// Startup banner: report the worktree the agent is launching in (or the
+    /// trunk checkout), plus whether per-session worktree automation is on.
+    /// Always printed (even when `wt` is "off") so the operator always knows the
+    /// agent's execution context — this answers "what worktree am I in and why
+    /// wasn't it reported before".
+    fn startup_report(&mut self) -> Option<String> {
+        let root = self.repo_root();
+        // Where are we right now? Prefer the worktree the *process* is in
+        // (current_dir) since `on_session_start` set main_cwd to the launch dir;
+        // if an extension/worktree created one, `self.current` reflects it.
+        let here = self.current.clone().or_else(|| std::env::current_dir().ok());
+        let mut parts: Vec<String> = Vec::new();
+        let state = match &here {
+            Some(d) => {
+                // Is this directory a linked worktree (not the main checkout)?
+                let is_wt = Command::new("git")
+                    .args(["rev-parse", "--show-toplevel"])
+                    .current_dir(d)
+                    .output()
+                    .map(|o| {
+                        let top = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        !top.is_empty() && top != self.repo_root().display().to_string()
+                    })
+                    .unwrap_or(false);
+                if is_wt {
+                    let branch = Command::new("git")
+                        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                        .current_dir(d)
+                        .output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .unwrap_or_default();
+                    format!("in worktree {} on branch {}", d.display(), branch)
+                } else {
+                    let branch = self.trunk();
+                    format!("on trunk checkout {} (branch {})", root.display(), branch)
+                }
+            }
+            None => format!("on trunk checkout {} (branch {})", root.display(), self.trunk()),
+        };
+        parts.push(state);
+        parts.push(format!(
+            "worktree automation: {}",
+            if self.enabled {
+                format!("on (auto-merge {})", if self.auto { "enabled" } else { "disabled" })
+            } else {
+                "off (set PIR_WT=1)".to_string()
+            }
+        ));
+        Some(format!("[wt] {}", parts.join(" · ")))
+    }
+
     fn on_turn_end(&mut self, _prompt: &str) -> Vec<String> {
         if !self.enabled || !self.auto || !self.in_worktree() {
             return Vec::new();
@@ -1046,6 +1097,36 @@ mod tests {
         assert!(matches!(wt.verify(&repo), Verdict::NoChecks), "bare repo => NoChecks");
         let _ = fs::remove_dir_all(&repo);
         let _ = std::env::set_current_dir(&orig);
+    }
+
+    #[test]
+    fn startup_report_reports_trunk_when_not_in_worktree() {
+        // On the main checkout (no worktree), startup_report must say we're on
+        // the trunk checkout and report the automation on/off state — this is
+        // the "why wasn't my worktree reported?" fix.
+        std::env::remove_var("PIR_WT");
+        let repo = scratch_repo();
+        let orig = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&repo).unwrap();
+
+        // Off (default): should still report the execution context.
+        let mut wt_off = Wt::new();
+        wt_off.on_session_start(&repo);
+        let off = wt_off.startup_report().unwrap();
+        assert!(off.contains("trunk checkout"), "off report: {off}");
+        assert!(off.contains("worktree automation: off"), "off report: {off}");
+
+        // On: should report automation enabled.
+        std::env::set_var("PIR_WT", "1");
+        std::env::remove_var("PIR_WT_AUTO");
+        let mut wt_on = Wt::new();
+        wt_on.on_session_start(&repo);
+        let on = wt_on.startup_report().unwrap();
+        assert!(on.contains("worktree automation: on"), "on report: {on}");
+
+        let _ = fs::remove_dir_all(&repo);
+        let _ = std::env::set_current_dir(&orig);
+        std::env::remove_var("PIR_WT");
     }
 
     #[test]
