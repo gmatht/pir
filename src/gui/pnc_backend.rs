@@ -81,14 +81,23 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
                 if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0
                 {
-                    return (ws.ws_col as usize, ws.ws_row as usize);
+                    (ws.ws_col as usize, ws.ws_row as usize)
+                } else {
+                    let cols: usize = std::env::var("COLUMNS")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(80);
+                    (cols, 50usize)
                 }
             }
-            let cols: usize = std::env::var("COLUMNS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(80);
-            (cols, 50usize)
+            #[cfg(not(unix))]
+            {
+                let cols: usize = std::env::var("COLUMNS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(80);
+                (cols, 50usize)
+            }
         }
     };
     let data_width = term_cols

@@ -1091,7 +1091,7 @@ fn fold_numbers(func: crate::ops::AggFunc, xs: &[f64]) -> String {
     }
 }
 
-fn footer_row_agg_func(grid: &Grid, footer_row_idx: usize) -> Option<crate::ops::AggFunc> {
+pub(crate) fn footer_row_agg_func(grid: &Grid, footer_row_idx: usize) -> Option<crate::ops::AggFunc> {
     let key_col = ColumnAddr::Left(MARGIN_COLS - 1);
     let val = grid.get(&CellAddr::Footer {
         row: footer_row_idx as u32,

@@ -1,5 +1,5 @@
 use crate::gui::dialogs;
-use rustxwidgets::common::{Menu, SimpleAction};
+use rustxwidgets::{Menu, SimpleAction};
 
 pub struct MenuAction {
     pub label: &'static str,
@@ -72,7 +72,7 @@ pub fn action_kind_to_name(kind: MenuActionKind) -> &'static str {
 
 /// Build a submenu model from action descriptors.
 pub fn build_submenu(rxapp: &rustxwidgets::App, items: &[MenuAction], prefix: &str) -> Result<Menu, Box<dyn std::error::Error>> {
-    let mut menu = rxapp.new_menu()?;
+    let mut menu = rxapp.create_menu()?;
     for item in items {
         let name = action_kind_to_name(item.action);
         menu.append(item.label, &format!("{}.{}", prefix, name));
@@ -86,8 +86,12 @@ pub fn register_action<F: FnMut() + 'static>(
     name: &str,
     mut f: F,
 ) -> Result<SimpleAction, Box<dyn std::error::Error>> {
-    let action = rxapp.new_simple_action(name)?;
+    let action = rxapp.create_simple_action(name)?;
+    #[cfg(feature = "pancurses")]
+    action.on_activate(move || f());
+    #[cfg(not(feature = "pancurses"))]
     action.connect_activate(move |_| f())?;
+    #[cfg(not(feature = "pancurses"))]
     rxapp.register_action(&action)?;
     Ok(action)
 }
@@ -112,9 +116,9 @@ pub fn handle_action(name: &str) {
             }
         }
         "quit" => {
-            #[cfg(unix)]
+            #[cfg(all(unix, not(feature = "pancurses")))]
             let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-            #[cfg(windows)]
+            #[cfg(all(windows, not(feature = "pancurses")))]
             rustxwidgets::backends_nwg_adapter::quit_main_loop();
         }
         "find" => dialogs::find_dialog(|result| {

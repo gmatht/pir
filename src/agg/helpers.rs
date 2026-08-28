@@ -2,6 +2,63 @@ use crate::formula::cell_effective_display;
 use crate::grid::{CellAddr, ColumnAddr, GridBox as Grid, MainRange, MARGIN_COLS};
 use crate::ops::{AggFunc, AggregateDef};
 
+// Re-exported for the always-compiled default UI (ui/mod.rs, ui_core.rs) which
+// cannot reach the gui-gated gui::compute version.
+pub(crate) use crate::ods::footer_row_agg_func;
+
+/// Compute a footer aggregate value across all main rows for a given column.
+/// Mirrors gui::compute::footer_special_col_aggregate but lives in this always
+/// compiled module so the default ratatui UI can use it.
+pub(crate) fn footer_special_col_aggregate(
+    grid: &Grid,
+    footer_func: AggFunc,
+    global_col: usize,
+    main_rows: usize,
+    main_cols: usize,
+) -> Option<String> {
+    let row_func = right_col_agg_func(grid, global_col);
+    let data_cols = data_main_col_count(grid);
+    let mut samples: Vec<f64> = Vec::new();
+    for r in 0..main_rows {
+        let row_val = if let Some(func) = row_func {
+            crate::agg::compute_aggregate(
+                grid,
+                &AggregateDef {
+                    func,
+                    source: MainRange {
+                        row_start: r as u32,
+                        row_end: r as u32 + 1,
+                        col_start: 0,
+                        col_end: data_cols as u32,
+                    },
+                },
+            )
+        } else if global_col < MARGIN_COLS {
+            String::new()
+        } else if global_col < MARGIN_COLS + main_cols {
+            cell_effective_display(
+                grid,
+                &CellAddr::Main {
+                    row: r as u32,
+                    col: (global_col - MARGIN_COLS) as u32,
+                },
+            )
+        } else {
+            cell_effective_display(
+                grid,
+                &CellAddr::Right {
+                    col: (global_col - MARGIN_COLS - main_cols),
+                    row: r as u32,
+                },
+            )
+        };
+        if let Some(n) = parse_num(&row_val) {
+            samples.push(n);
+        }
+    }
+    Some(fold_numbers(footer_func, &samples))
+}
+
 // Internal helpers kept private to this module
 pub(crate) fn right_col_agg_func(grid: &Grid, global_col: usize) -> Option<AggFunc> {
     let main_cols = grid.main_cols();
