@@ -21,6 +21,70 @@ use crate::run_foreground_turn;
 
 type AgentSlot = Arc<Mutex<Option<Agent>>>;
 
+/// GDK keyval for the Tab key (GDK_KEY_Tab).
+const GDK_KEY_TAB: u32 = 0xff09;
+
+/// Idle-mode Tab completion. Completes `/`-command names (and a couple of
+/// argument lists). Returns `Some(completed)` with the new buffer when exactly
+/// one (or a common) completion exists, else `None`. Mirrors the TUI's
+/// `complete_idle`.
+fn complete_idle(buf: &str) -> Option<String> {
+    let commands = [
+        "help", "model", "models", "goal", "continue", "clear", "fix", "undo", "bg", "jobs",
+        "thinking", "cancel", "shell", "exit", "usage", "sessions",
+    ];
+    // `/thinking <arg>` sub-argument completion.
+    if buf.starts_with("/thinking ") {
+        let arg = buf.trim_start_matches("/thinking ").trim_start();
+        let opts = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "show", "hide"];
+        return complete_one_of(&opts, arg, "/thinking ");
+    }
+    if buf.starts_with('/') {
+        let frag = buf.trim_start_matches('/');
+        if frag.contains(' ') {
+            return None; // past the command word; nothing to complete
+        }
+        return complete_one_of(&commands, frag, "/");
+    }
+    None
+}
+
+/// Complete `frag` against `opts`, returning `Some(format!("{prefix}{match}"))`
+/// when exactly one (or a common) prefix exists, else `None`.
+fn complete_one_of(opts: &[&str], frag: &str, prefix: &str) -> Option<String> {
+    let matches: Vec<&str> = opts.iter().copied().filter(|o| o.starts_with(frag)).collect();
+    if matches.len() == 1 {
+        return Some(format!("{prefix}{}", matches[0]));
+    }
+    if matches.len() > 1 {
+        let lcp = longest_common_prefix(&matches);
+        if !lcp.is_empty() && lcp != frag {
+            return Some(format!("{prefix}{lcp}"));
+        }
+    }
+    None
+}
+
+/// Longest common prefix of a set of strings (empty when empty/inconsistent).
+fn longest_common_prefix(strs: &[&str]) -> String {
+    if strs.is_empty() {
+        return String::new();
+    }
+    let first = strs[0];
+    let mut end = first.len();
+    for s in strs.iter().skip(1) {
+        let mut i = 0;
+        while i < end && i < s.len() && s.as_bytes()[i] == first.as_bytes()[i] {
+            i += 1;
+        }
+        end = i;
+        if end == 0 {
+            break;
+        }
+    }
+    first[..end].to_string()
+}
+
 /// Shared per-UI state, guarded by a Mutex so both the Entry-activate callback
 /// (main thread) and the periodic drain callback (also main thread via glib)
 /// can see it. Since glib callbacks run on the main loop, contention is trivial.
@@ -111,6 +175,36 @@ pub fn run(
         entry_focus.grab_focus();
         1 // stop propagation; keep focus here
     });
+
+    // Tab completion: an EventControllerKey on the Entry intercepts the Tab
+    // key (GDK_KEY_Tab) before it moves focus, completes the current buffer
+    // via `complete_idle`, and replaces the entry text + cursor. Returns 1
+    // (handled) so focus never leaves the prompt. The controller is kept alive
+    // in `_key_controllers` for the whole `app.run()` so its Drop (which unrefs
+    // and removes it from the widget) never fires early.
+    let mut _key_controllers: Vec<Box<rustxwidgets::gtk_dynamic_loader::EventControllerKey>> = Vec::new();
+    let entry_comp = entry.clone();
+    let entry_comp_cb = entry.clone();
+    unsafe {
+        if let Some(loader) = rustxwidgets::backends::gtk::loader() {
+            if let Ok(ctrl) = rustxwidgets::gtk_dynamic_loader::EventControllerKey::new(loader.clone()) {
+                let _ = ctrl.connect_key_pressed(move |keyval: u32| -> i32 {
+                    if keyval == GDK_KEY_TAB {
+                        let cur = entry_comp_cb.get_text().unwrap_or_default();
+                        if let Some(completed) = complete_idle(&cur) {
+                            entry_comp_cb.set_text(&completed);
+                            entry_comp_cb.set_position(-1); // cursor to end
+                        }
+                        1 // handled: keep focus, don't let Tab traverse
+                    } else {
+                        0 // propagate other keys
+                    }
+                });
+                ctrl.add_to_widget(&entry_comp);
+                _key_controllers.push(Box::new(ctrl));
+            }
+        }
+    }
 
     // -- Shared state --
     let state = Arc::new(Mutex::new(GuiState::new()));
@@ -589,5 +683,46 @@ fn fmt_tok(n: u64) -> String {
         format!("{:.1}k", n as f64 / 1000.0)
     } else {
         n.to_string()
+    }
+}
+
+#[cfg(test)]
+mod gui_completion_tests {
+    use super::*;
+
+    #[test]
+    fn tab_completes_unique_command() {
+        assert_eq!(complete_idle("/cle"), Some("/clear".to_string()));
+    }
+
+    #[test]
+    fn tab_completes_to_common_prefix() {
+        assert_eq!(complete_idle("/mod"), Some("/model".to_string()));
+        assert_eq!(complete_idle("/m"), Some("/model".to_string())); // model+models share LCP "model"
+    }
+
+    #[test]
+    fn tab_does_not_complete_past_command_word() {
+        assert_eq!(complete_idle("/model xyz"), None);
+    }
+
+    #[test]
+    fn tab_completes_thinking_arg() {
+        assert_eq!(complete_idle("/thinking hig"), Some("/thinking high".to_string()));
+        assert_eq!(complete_idle("/thinking off"), Some("/thinking off".to_string())); // full match
+        assert_eq!(complete_idle("/thinking mini"), Some("/thinking minimal".to_string()));
+    }
+
+    #[test]
+    fn tab_does_nothing_on_plain_prompt() {
+        assert_eq!(complete_idle("hello"), None);
+        assert_eq!(complete_idle(""), None);
+    }
+
+    #[test]
+    fn longest_common_prefix_basic() {
+        assert_eq!(longest_common_prefix(&["show", "hide", "on", "off"]), "");
+        assert_eq!(longest_common_prefix(&["model", "models"]), "model");
+        assert_eq!(longest_common_prefix(&[]), "");
     }
 }
