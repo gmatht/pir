@@ -22,3 +22,5 @@ pub use ui_core::format_cell_display;
 pub mod ui;
 #[cfg(any(feature = "gui", feature = "pancurses"))]
 pub mod gui;
+#[cfg(feature = "rustxwidgets-term")]
+pub mod rustxwidgets_term;

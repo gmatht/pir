@@ -184,6 +184,12 @@ impl App {
         sheet.grid.set(&addr, text);
     }
 
+    /// Borrow the active workbook. Used by the rustxWidgets terminal adapter
+    /// (`crate::ui::rustxwidgets_term`) to build a `SpreadsheetModel`.
+    pub fn workbook(&self) -> &WorkbookState {
+        &self.core.workbook
+    }
+
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "gui")]
         if self.backend.as_ref().map_or(true, |b| matches!(b, Backend::Gui)) {

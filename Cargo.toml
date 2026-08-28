@@ -18,6 +18,9 @@ gui = ["dep:rustxwidgets", "rustxwidgets/gtk", "dep:gtk_dynamic_loader"]
 pancurses = ["rustxwidgets/pancurses"]
 gtk = ["gui"]
 combined-gui = ["gui", "pancurses"]
+# Converge corro's terminal spreadsheet view onto rustxWidgets
+# (backend-agnostic SpreadsheetModel), keeping `src/ui` as the reference fork.
+rustxwidgets-term = ["gui", "rustxwidgets/ratatui", "rustxwidgets/headless"]
 
 [dependencies]
 ratatui = { version = "0.29", optional = true }
