@@ -1,131 +1,43 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
+//! Interactive text REPL driver over the [`crate::backends::zork::model`].
+//!
+//! This is deliberately *one* of possibly many drivers of the pure model. It is
+//! kept for manual exploration and demos. For automated tests prefer
+//! [`crate::backends::zork::harness::Harness`].
+
 use std::io::{self, BufRead, Write};
-use std::os::raw::c_void;
 
-pub type Callback = Box<dyn FnMut()>;
+use crate::backends::BackendApp;
+use crate::backends::zork::model::{ZorkKind, ZorkNode, ZorkState};
 
-#[derive(Clone, Debug)]
-pub struct MenuItemData {
-    pub label: String,
-    pub action: String,
-    pub submenu: Option<Vec<MenuItemData>>,
+pub struct ZorkApp {
+    state: ZorkState,
 }
 
-#[derive(Clone, Debug)]
-pub enum ZorkKind {
-    Window { title: String },
-    Button { label: String },
-    Label { text: String },
-    BoxWidget { horizontal: bool, spacing: i32 },
-    Grid { cols: usize, rows: usize },
-    Entry { buffer: String, cursor: usize },
-    CheckButton { label: String, checked: bool },
-    RadioButton { label: String, checked: bool, group_id: usize },
-    Dialog { title: String },
-    Menu,
-    MenuBar,
-    SimpleAction,
-    DropDown { items: Vec<String>, selected: Option<usize> },
-    TextView { text: String },
-}
-
-pub struct ZorkNode {
-    pub id: usize,
-    pub kind: ZorkKind,
-    pub parent: Option<usize>,
-    pub children: Vec<usize>,
-    pub callbacks: Vec<Callback>,
-}
-
-pub struct ZorkState {
-    pub nodes: Vec<ZorkNode>,
-    pub next_id: usize,
-    pub running: bool,
-    pub current_id: usize,
-    pub prev_location: Option<usize>,
-    /// Menu model items keyed by menu node id.
-    pub menu_items: HashMap<usize, Vec<MenuItemData>>,
-}
-
-impl ZorkState {
+impl ZorkApp {
     pub fn new() -> Self {
-        ZorkState {
-            nodes: Vec::new(),
-            next_id: 1,
-            running: true,
-            current_id: 0,
-            prev_location: None,
-            menu_items: HashMap::new(),
-        }
-    }
-
-    pub fn alloc_id(&mut self) -> usize {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
-    }
-
-    pub fn add_node(&mut self, kind: ZorkKind, parent: Option<usize>) -> usize {
-        let id = self.alloc_id();
-        // If this is the first node (Window), set current_id
-        if self.nodes.is_empty() {
-            self.current_id = id;
-        }
-        self.nodes.push(ZorkNode {
-            id,
-            kind,
-            parent,
-            children: Vec::new(),
-            callbacks: Vec::new(),
-        });
-        if let Some(pid) = parent {
-            if let Some(p) = self.nodes.iter_mut().find(|n| n.id == pid) {
-                p.children.push(id);
-            }
-        }
-        id
-    }
-
-    pub fn node_mut(&mut self, id: usize) -> Option<&mut ZorkNode> {
-        self.nodes.iter_mut().find(|n| n.id == id)
-    }
-
-    pub fn node(&self, id: usize) -> Option<&ZorkNode> {
-        self.nodes.iter().find(|n| n.id == id)
+        ZorkApp { state: ZorkState::new() }
     }
 }
 
-thread_local! {
-    static ZORK_STATE: RefCell<ZorkState> = RefCell::new(ZorkState::new());
+impl Default for ZorkApp {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-fn with_state<F, R>(f: F) -> R
-where
-    F: FnOnce(&mut ZorkState) -> R,
-{
-    ZORK_STATE.with(|s| f(&mut s.borrow_mut()))
-}
-
-pub struct ZorkApp;
-
-impl crate::backends::BackendApp for ZorkApp {
-    fn run(self: Box<Self>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        with_state(|s| {
-            if s.nodes.is_empty() {
-                return;
-            }
-            s.running = true;
-        });
+impl BackendApp for ZorkApp {
+    fn run(mut self: Box<Self>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.state.nodes.is_empty() {
+            return Ok(());
+        }
+        self.state.running = true;
 
         let mut rl = rustyline::DefaultEditor::new()?;
 
-        while with_state(|s| s.running) {
-            with_state(|s| {
-                if let Some(node) = s.node(s.current_id) {
-                    describe_room(s, node);
-                }
-            });
+        while self.state.running {
+            if let Some(node) = self.state.node(self.state.current_id) {
+                describe_room(&self.state, node);
+            }
 
             let prompt = "> ";
             let readline = rl.readline(prompt);
@@ -134,12 +46,12 @@ impl crate::backends::BackendApp for ZorkApp {
                     let trimmed = line.trim().to_string();
                     if !trimmed.is_empty() {
                         rl.add_history_entry(&trimmed)?;
-                        with_state(|s| execute_command(s, &trimmed));
+                        execute_command(&mut self.state, &trimmed);
                     }
                 }
                 Err(rustyline::error::ReadlineError::Interrupted)
                 | Err(rustyline::error::ReadlineError::Eof) => {
-                    with_state(|s| s.running = false);
+                    self.state.running = false;
                 }
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -152,7 +64,35 @@ impl crate::backends::BackendApp for ZorkApp {
     }
 }
 
-// -- Room description --
+fn short_desc(state: &ZorkState, node: &ZorkNode) -> String {
+    match &node.kind {
+        ZorkKind::Window { title } => format!("Window \"{}\"", title),
+        ZorkKind::Button { label } => format!("Button \"{}\"", label),
+        ZorkKind::Label { text } => {
+            let preview: String = text.chars().take(30).collect();
+            let preview = if text.chars().count() > 30 { format!("{}...", preview) } else { text.clone() };
+            format!("Label: \"{}\"", preview)
+        }
+        ZorkKind::Entry { .. } => "Entry".into(),
+        ZorkKind::CheckButton { label, .. } => format!("CheckButton \"{}\"", label),
+        ZorkKind::RadioButton { label, .. } => format!("RadioButton \"{}\"", label),
+        ZorkKind::BoxWidget { horizontal, .. } => format!("{} Box", if *horizontal { "Horizontal" } else { "Vertical" }),
+        ZorkKind::Grid { .. } => "Grid".into(),
+        ZorkKind::Dialog { title } => format!("Dialog \"{}\"", title),
+        ZorkKind::DropDown { items, selected } => {
+            let current = selected.and_then(|s| items.get(s)).map(|s| s.as_str()).unwrap_or("(none)");
+            format!("DropDown [{}]", current)
+        }
+        ZorkKind::TextView { .. } => "TextView".into(),
+        ZorkKind::Menu => "Menu".into(),
+        ZorkKind::MenuBar => "MenuBar".into(),
+        ZorkKind::SimpleAction => "SimpleAction".into(),
+    }
+}
+
+fn dir_name(dirs: &[(&str, &ZorkNode)], id: usize) -> &str {
+    dirs.iter().find(|(_, t)| t.id == id).map(|(d, _)| *d).unwrap_or("?")
+}
 
 fn describe_room(state: &ZorkState, node: &ZorkNode) {
     println!();
@@ -173,7 +113,13 @@ fn describe_room(state: &ZorkState, node: &ZorkNode) {
         }
         ZorkKind::Entry { buffer, .. } => {
             let preview: String = buffer.chars().take(40).collect();
-            let preview = if buffer.is_empty() { "empty".into() } else if buffer.chars().count() > 40 { format!("{}...", preview) } else { buffer.clone() };
+            let preview = if buffer.is_empty() {
+                "empty".into()
+            } else if buffer.chars().count() > 40 {
+                format!("{}...", preview)
+            } else {
+                buffer.clone()
+            };
             println!("You are at an Entry containing \"{}\".", preview);
         }
         ZorkKind::CheckButton { label, checked } => {
@@ -222,7 +168,6 @@ fn describe_room(state: &ZorkState, node: &ZorkNode) {
         }
     }
 
-    // Compass directions
     let parent_dir = node.parent.and_then(|pid| state.node(pid));
     let children: Vec<&ZorkNode> = node.children.iter().filter_map(|cid| state.node(*cid)).collect();
     let siblings: Vec<&ZorkNode> = if let Some(pid) = node.parent {
@@ -264,28 +209,30 @@ fn describe_room(state: &ZorkState, node: &ZorkNode) {
     if !dirs.is_empty() {
         println!();
         for (dir, target) in &dirs {
-            let desc = short_desc(target);
+            let desc = short_desc(state, target);
             println!("To the {}: {}", dir, desc);
         }
     }
 
-    // Numbered list
     println!();
     println!("You see:");
-    println!("  0. (yourself) {}", short_desc(node));
+    println!("  0. (yourself) {}", short_desc(state, node));
     let mut idx = 1;
     for (_, target) in &dirs {
-        println!("  {}. {} ({})", idx, short_desc(target), dirs.iter().find(|(_d, t)| t.id == target.id).map(|(d, _)| *d).unwrap_or("?"));
+        println!("  {}. {} ({})", idx, short_desc(state, target), dir_name(&dirs, target.id));
         idx += 1;
     }
-    // Add any other nodes in the same parent that aren't already listed
     if let Some(pid) = node.parent {
         if let Some(p) = state.node(pid) {
             for cid in &p.children {
-                if *cid == node.id { continue; }
-                if dirs.iter().any(|(_, t)| t.id == *cid) { continue; }
+                if *cid == node.id {
+                    continue;
+                }
+                if dirs.iter().any(|(_, t)| t.id == *cid) {
+                    continue;
+                }
                 if let Some(other) = state.node(*cid) {
-                    println!("  {}. {}", idx, short_desc(other));
+                    println!("  {}. {}", idx, short_desc(state, other));
                     idx += 1;
                 }
             }
@@ -293,34 +240,6 @@ fn describe_room(state: &ZorkState, node: &ZorkNode) {
     }
     println!();
 }
-
-fn short_desc(node: &ZorkNode) -> String {
-    match &node.kind {
-        ZorkKind::Window { title } => format!("Window \"{}\"", title),
-        ZorkKind::Button { label } => format!("Button \"{}\"", label),
-        ZorkKind::Label { text } => {
-            let preview: String = text.chars().take(30).collect();
-            let preview = if text.chars().count() > 30 { format!("{}...", preview) } else { text.clone() };
-            format!("Label: \"{}\"", preview)
-        }
-        ZorkKind::Entry { .. } => "Entry".into(),
-        ZorkKind::CheckButton { label, .. } => format!("CheckButton \"{}\"", label),
-        ZorkKind::RadioButton { label, .. } => format!("RadioButton \"{}\"", label),
-        ZorkKind::BoxWidget { horizontal, .. } => format!("{} Box", if *horizontal { "Horizontal" } else { "Vertical" }),
-        ZorkKind::Grid { .. } => "Grid".into(),
-        ZorkKind::Dialog { title } => format!("Dialog \"{}\"", title),
-        ZorkKind::DropDown { items, selected } => {
-            let current = selected.and_then(|s| items.get(s)).map(|s| s.as_str()).unwrap_or("(none)");
-            format!("DropDown [{}]", current)
-        }
-        ZorkKind::TextView { .. } => "TextView".into(),
-        ZorkKind::Menu => "Menu".into(),
-        ZorkKind::MenuBar => "MenuBar".into(),
-        ZorkKind::SimpleAction => "SimpleAction".into(),
-    }
-}
-
-// -- Command execution --
 
 fn execute_command(state: &mut ZorkState, line: &str) {
     let parts: Vec<&str> = line.split_whitespace().collect();
@@ -360,9 +279,7 @@ fn execute_command(state: &mut ZorkState, line: &str) {
                     match &node.kind {
                         ZorkKind::Button { .. } => {
                             println!("You press the button. It clicks!");
-                            for cb in &mut node.callbacks {
-                                cb();
-                            }
+                            node.fire_callbacks();
                         }
                         ZorkKind::MenuBar => {
                             println!("You click the MenuBar. Use 'select <n>' to choose an item.");
@@ -390,7 +307,10 @@ fn execute_command(state: &mut ZorkState, line: &str) {
             }
             let num: usize = match args[0].parse() {
                 Ok(n) => n,
-                Err(_) => { println!("Usage: select <number>"); return; }
+                Err(_) => {
+                    println!("Usage: select <number>");
+                    return;
+                }
             };
             let items = state.menu_items.get(&state.current_id).cloned().unwrap_or_default();
             if num == 0 || num > items.len() {
@@ -400,16 +320,12 @@ fn execute_command(state: &mut ZorkState, line: &str) {
             let item = &items[num - 1];
             println!("You selected \"{}\".", item.label);
             if item.submenu.is_some() {
-                // Navigate into submenu
                 println!("Opening submenu...");
             }
             if !item.action.is_empty() {
                 println!("Action: {}", item.action);
-                // Fire callbacks on the parent menu
                 if let Some(node) = state.node_mut(state.current_id) {
-                    for cb in &mut node.callbacks {
-                        cb();
-                    }
+                    node.fire_callbacks();
                 }
             }
         }
@@ -434,20 +350,9 @@ fn execute_command(state: &mut ZorkState, line: &str) {
             let mut input = String::new();
             io::stdin().lock().read_line(&mut input).ok();
             let text = input.trim().to_string();
-            if let Some(n) = state.node_mut(state.current_id) {
-                if let ZorkKind::Entry { ref mut buffer, ref mut cursor } = n.kind {
-                    buffer.clear();
-                    buffer.push_str(&text);
-                    *cursor = buffer.len();
-                }
-            }
+            state.set_entry_text(state.current_id, &text);
             println!("You inscribed \"{}\" into the Entry.", text);
-            // Fire changed callbacks
-            if let Some(n) = state.node_mut(state.current_id) {
-                for cb in &mut n.callbacks {
-                    cb();
-                }
-            }
+            state.click(state.current_id);
         }
         "read" => {
             examine(state, state.current_id);
@@ -458,16 +363,12 @@ fn execute_command(state: &mut ZorkState, line: &str) {
                     ZorkKind::CheckButton { ref mut checked, .. } => {
                         *checked = !*checked;
                         println!("CheckButton is now {}.", if *checked { "checked" } else { "unchecked" });
-                        for cb in &mut n.callbacks {
-                            cb();
-                        }
+                        n.fire_callbacks();
                     }
                     ZorkKind::RadioButton { ref mut checked, .. } => {
                         *checked = !*checked;
                         println!("RadioButton is now {}.", if *checked { "selected" } else { "not selected" });
-                        for cb in &mut n.callbacks {
-                            cb();
-                        }
+                        n.fire_callbacks();
                     }
                     _ => println!("You can't toggle that."),
                 }
@@ -475,11 +376,11 @@ fn execute_command(state: &mut ZorkState, line: &str) {
         }
         "inventory" | "i" => {
             println!("Current path:");
-            let mut path = Vec::new();
+            let mut path: Vec<String> = Vec::new();
             let mut cur = Some(state.current_id);
             while let Some(id) = cur {
                 if let Some(node) = state.node(id) {
-                    path.push(short_desc(node));
+                    path.push(short_desc(state, node));
                     cur = node.parent;
                 } else {
                     break;
@@ -520,11 +421,10 @@ fn execute_command(state: &mut ZorkState, line: &str) {
             println!("  help / ?              - show this help");
         }
         _ => {
-            // Try interpreting as a number for navigation
             if let Ok(num) = cmd.parse::<usize>() {
                 let target = resolve_number_target(state, num);
                 if let Some(id) = target {
-                    let desc = state.node(id).map(short_desc).unwrap_or_default();
+                    let desc = state.node(id).map(|n| short_desc(state, n)).unwrap_or_default();
                     state.prev_location = Some(state.current_id);
                     state.current_id = id;
                     println!("You move to {}.", desc);
@@ -542,7 +442,6 @@ fn resolve_arg_to_id(state: &ZorkState, arg: &str) -> Option<usize> {
     if let Ok(num) = arg.parse::<usize>() {
         resolve_number_target(state, num)
     } else {
-        // Try matching by direction word
         let dir = arg.to_lowercase();
         navigate_find(state, &dir)
     }
@@ -553,20 +452,19 @@ fn resolve_number_target(state: &ZorkState, num: usize) -> Option<usize> {
         return Some(state.current_id);
     }
     let node = state.node(state.current_id)?;
-    let mut items = Vec::new();
+    let mut items: Vec<usize> = Vec::new();
 
-    // Collect reachable items
     let siblings: Vec<usize> = if let Some(pid) = node.parent {
-        state.node(pid).map(|p| {
-            p.children.clone()
-        }).unwrap_or_default()
+        state.node(pid).map(|p| p.children.clone()).unwrap_or_default()
     } else {
         Vec::new()
     };
     let children: Vec<usize> = node.children.clone();
 
     for id in &siblings {
-        if *id == node.id { continue; }
+        if *id == node.id {
+            continue;
+        }
         items.push(*id);
     }
     for id in &children {
@@ -625,17 +523,16 @@ fn navigate_to(state: &mut ZorkState, dir: &str) {
         state.prev_location = Some(state.current_id);
         state.current_id = target_id;
         println!("You go {}.", dir);
-    } else {
-        // Try numbered navigation
-        if let Ok(num) = dir.parse::<usize>() {
-            if let Some(id) = resolve_number_target(state, num) {
-                let desc = state.node(id).map(short_desc).unwrap_or_default();
-                state.prev_location = Some(state.current_id);
-                state.current_id = id;
-                println!("You move to {}.", desc);
-                return;
-            }
+    } else if let Ok(num) = dir.parse::<usize>() {
+        if let Some(id) = resolve_number_target(state, num) {
+            let desc = state.node(id).map(|n| short_desc(state, n)).unwrap_or_default();
+            state.prev_location = Some(state.current_id);
+            state.current_id = id;
+            println!("You move to {}.", desc);
+        } else {
+            println!("You can't go that way.");
         }
+    } else {
         println!("You can't go that way.");
     }
 }
@@ -720,305 +617,4 @@ fn examine(state: &ZorkState, id: usize) {
     } else {
         println!("Nothing to examine.");
     }
-}
-
-// -- Factory functions --
-
-pub fn init() -> Result<Box<dyn crate::backends::BackendApp>, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(Box::new(ZorkApp))
-}
-
-fn find_window_id(state: &ZorkState) -> Option<usize> {
-    state.nodes.iter().find(|n| matches!(n.kind, ZorkKind::Window { .. } | ZorkKind::Dialog { .. })).map(|n| n.id)
-}
-
-pub fn create_window() -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(with_state(|s| s.add_node(ZorkKind::Window { title: String::new() }, None)))
-}
-
-pub fn create_button(label: &str) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(with_state(|s| s.add_node(ZorkKind::Button { label: label.to_string() }, find_window_id(s))))
-}
-
-pub fn create_label(text: &str) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(with_state(|s| s.add_node(ZorkKind::Label { text: text.to_string() }, find_window_id(s))))
-}
-
-pub fn create_box(horizontal: bool, spacing: i32) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(with_state(|s| s.add_node(ZorkKind::BoxWidget { horizontal, spacing }, find_window_id(s))))
-}
-
-pub fn create_grid() -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(with_state(|s| s.add_node(ZorkKind::Grid { cols: 0, rows: 0 }, find_window_id(s))))
-}
-
-pub fn create_entry() -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(with_state(|s| s.add_node(ZorkKind::Entry { buffer: String::new(), cursor: 0 }, find_window_id(s))))
-}
-
-pub fn create_menu() -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    let id = with_state(|s| s.add_node(ZorkKind::Menu, find_window_id(s)));
-    with_state(|s| { s.menu_items.insert(id, Vec::new()); });
-    Ok(id)
-}
-
-pub fn menu_append(menu_id: usize, label: &str, action: &str) {
-    with_state(|s| {
-        if let Some(items) = s.menu_items.get_mut(&menu_id) {
-            items.push(MenuItemData { label: label.to_string(), action: action.to_string(), submenu: None });
-        }
-    });
-}
-
-pub fn menu_append_submenu(menu_id: usize, label: &str, submenu_id: usize) {
-    with_state(|s| {
-        let sub_items = s.menu_items.get(&submenu_id).cloned().unwrap_or_default();
-        if let Some(items) = s.menu_items.get_mut(&menu_id) {
-            items.push(MenuItemData { label: label.to_string(), action: String::new(), submenu: Some(sub_items) });
-        }
-    });
-}
-
-pub fn create_simple_action(_name: &str) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(with_state(|s| s.add_node(ZorkKind::SimpleAction, find_window_id(s))))
-}
-
-pub unsafe fn create_menubar(model_id: usize, _action_group: *mut c_void) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    let bar_id = with_state(|s| s.add_node(ZorkKind::MenuBar, find_window_id(s)));
-    let items = with_state(|s| s.menu_items.get(&model_id).cloned().unwrap_or_default());
-    // Store the top-level item labels on the MenuBar itself
-    with_state(|s| {
-        s.menu_items.insert(bar_id, items.clone());
-    });
-    // Create submenu nodes as children
-    with_state(|s| {
-        for item in &items {
-            if let Some(sub) = &item.submenu {
-                let sub_id = s.add_node(ZorkKind::Menu, Some(bar_id));
-                s.menu_items.insert(sub_id, sub.clone());
-            }
-        }
-    });
-    Ok(bar_id)
-}
-
-pub fn create_dialog() -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(with_state(|s| s.add_node(ZorkKind::Dialog { title: String::new() }, find_window_id(s))))
-}
-
-pub fn create_dropdown(items: &[&str]) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    let items_str: Vec<String> = items.iter().map(|s| s.to_string()).collect();
-    Ok(with_state(|s| s.add_node(ZorkKind::DropDown { items: items_str, selected: None }, find_window_id(s))))
-}
-
-pub fn create_checkbutton(label: &str) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(with_state(|s| s.add_node(ZorkKind::CheckButton { label: label.to_string(), checked: false }, find_window_id(s))))
-}
-
-pub fn create_radiobutton(group_id: Option<usize>, label: &str) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    let gid = group_id.unwrap_or(0);
-    Ok(with_state(|s| s.add_node(ZorkKind::RadioButton { label: label.to_string(), checked: false, group_id: gid }, find_window_id(s))))
-}
-
-pub fn create_textview() -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(with_state(|s| s.add_node(ZorkKind::TextView { text: String::new() }, find_window_id(s))))
-}
-
-// -- Setters/getters --
-
-pub fn set_window_title(id: usize, title: &str) {
-    with_state(|s| {
-        if let Some(n) = s.node_mut(id) {
-            if let ZorkKind::Window { title: ref mut t } = n.kind {
-                *t = title.to_string();
-            }
-        }
-    });
-}
-
-pub fn set_label_text(id: usize, text: &str) {
-    with_state(|s| {
-        if let Some(n) = s.node_mut(id) {
-            if let ZorkKind::Label { text: ref mut t } = n.kind {
-                *t = text.to_string();
-            }
-        }
-    });
-}
-
-pub fn get_label_text(id: usize) -> Option<String> {
-    with_state(|s| {
-        s.node(id).and_then(|n| {
-            if let ZorkKind::Label { ref text } = n.kind {
-                Some(text.clone())
-            } else {
-                None
-            }
-        })
-    })
-}
-
-pub fn set_label_visible(_id: usize, _visible: bool) {}
-
-pub fn add_callback(id: usize, cb: Box<dyn FnMut()>) {
-    with_state(|s| {
-        if let Some(n) = s.node_mut(id) {
-            n.callbacks.push(cb);
-        }
-    });
-}
-
-pub fn set_entry_text(id: usize, text: &str) {
-    with_state(|s| {
-        if let Some(n) = s.node_mut(id) {
-            if let ZorkKind::Entry { ref mut buffer, ref mut cursor } = n.kind {
-                *buffer = text.to_string();
-                *cursor = buffer.len();
-            }
-        }
-    });
-}
-
-pub fn get_entry_text(id: usize) -> Option<String> {
-    with_state(|s| {
-        s.node(id).and_then(|n| {
-            if let ZorkKind::Entry { ref buffer, .. } = n.kind {
-                Some(buffer.clone())
-            } else {
-                None
-            }
-        })
-    })
-}
-
-pub fn set_textview_text(id: usize, text: &str) {
-    with_state(|s| {
-        if let Some(n) = s.node_mut(id) {
-            if let ZorkKind::TextView { text: ref mut t } = n.kind {
-                *t = text.to_string();
-            }
-        }
-    });
-}
-
-pub fn get_textview_text(id: usize) -> Option<String> {
-    with_state(|s| {
-        s.node(id).and_then(|n| {
-            if let ZorkKind::TextView { ref text } = n.kind {
-                Some(text.clone())
-            } else {
-                None
-            }
-        })
-    })
-}
-
-pub fn set_dropdown_items(id: usize, items: &[&str]) {
-    with_state(|s| {
-        if let Some(n) = s.node_mut(id) {
-            if let ZorkKind::DropDown { items: ref mut items_vec, .. } = n.kind {
-                *items_vec = items.iter().map(|s| s.to_string()).collect();
-            }
-        }
-    });
-}
-
-pub fn set_dropdown_selected(id: usize, idx: i32) {
-    with_state(|s| {
-        if let Some(n) = s.node_mut(id) {
-            if let ZorkKind::DropDown { ref mut selected, ref items } = n.kind {
-                *selected = if idx >= 0 && (idx as usize) < items.len() { Some(idx as usize) } else { None };
-            }
-        }
-    });
-}
-
-pub fn get_dropdown_selected(id: usize) -> i32 {
-    with_state(|s| {
-        s.node(id).and_then(|n| {
-            if let ZorkKind::DropDown { ref selected, .. } = n.kind {
-                selected.map(|s| s as i32)
-            } else {
-                None
-            }
-        }).unwrap_or(-1)
-    })
-}
-
-pub fn get_checkbutton_checked(id: usize) -> bool {
-    with_state(|s| {
-        s.node(id).map(|n| {
-            if let ZorkKind::CheckButton { ref checked, .. } = n.kind {
-                *checked
-            } else {
-                false
-            }
-        }).unwrap_or(false)
-    })
-}
-
-pub fn get_radiobutton_checked(id: usize) -> bool {
-    with_state(|s| {
-        s.node(id).map(|n| {
-            if let ZorkKind::RadioButton { ref checked, .. } = n.kind {
-                *checked
-            } else {
-                false
-            }
-        }).unwrap_or(false)
-    })
-}
-
-pub fn set_checkbutton_checked(id: usize, checked: bool) {
-    with_state(|s| {
-        if let Some(n) = s.node_mut(id) {
-            if let ZorkKind::CheckButton { checked: ref mut c, .. } = n.kind {
-                *c = checked;
-            }
-        }
-    });
-}
-
-pub fn set_radiobutton_checked(id: usize, checked: bool) {
-    with_state(|s| {
-        if let Some(n) = s.node_mut(id) {
-            if let ZorkKind::RadioButton { checked: ref mut c, .. } = n.kind {
-                *c = checked;
-            }
-        }
-    });
-}
-
-pub fn set_child(parent_id: usize, child_id: usize) {
-    with_state(|s| {
-        s.nodes.iter_mut().for_each(|n| n.children.retain(|c| *c != child_id));
-        if let Some(parent) = s.node_mut(parent_id) {
-            parent.children.push(child_id);
-        }
-        if let Some(child) = s.node_mut(child_id) {
-            child.parent = Some(parent_id);
-        }
-    });
-}
-
-pub fn append_child(parent_id: usize, child_id: usize) {
-    set_child(parent_id, child_id);
-}
-
-pub fn layout_box(_id: usize) {}
-
-pub fn layout_grid(_id: usize) {}
-
-pub fn entry_set_text(id: usize, text: &str) {
-    set_entry_text(id, text);
-}
-
-pub fn entry_text(id: usize) -> Option<String> {
-    get_entry_text(id)
-}
-
-pub fn set_focus(_id: usize) {}
-
-pub fn quit() {
-    with_state(|s| s.running = false);
 }

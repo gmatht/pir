@@ -464,6 +464,10 @@ mod pancurses_adapter {
         pub(crate) id: usize,
     }
 
+    impl Clone for Spreadsheet {
+        fn clone(&self) -> Self { Spreadsheet { id: self.id } }
+    }
+
     impl AsRef<*mut c_void> for Spreadsheet {
         fn as_ref(&self) -> &*mut c_void {
             unsafe { &*(&self.id as *const usize as *const *mut c_void) }
@@ -477,11 +481,62 @@ mod pancurses_adapter {
     }
 
     impl Spreadsheet {
+        pub fn id(&self) -> usize { self.id }
         pub fn set_cell(&self, row: u32, col: u32, text: &str) {
             crate::backends::pancurses::spreadsheet_set_cell(self.id, row, col, text);
         }
         pub fn get_cell(&self, row: u32, col: u32) -> Option<String> {
             crate::backends::pancurses::spreadsheet_get_cell(self.id, row, col)
+        }
+        pub fn set_raw_cell(&self, row: u32, col: u32, text: &str) {
+            crate::backends::pancurses::spreadsheet_set_raw_cell(self.id, row, col, text);
+        }
+        pub fn set_cell_style(&self, row: u32, col: u32, style: u8) {
+            crate::backends::pancurses::spreadsheet_set_cell_style(self.id, row, col, style);
+        }
+        pub fn cursor_position(&self) -> Option<(u32, u32)> {
+            crate::backends::pancurses::spreadsheet_cursor_position(self.id)
+        }
+        pub fn set_cursor(&self, row: u32, col: u32) {
+            crate::backends::pancurses::spreadsheet_set_cursor(self.id, row, col);
+        }
+        pub fn set_editing(&self, editing: bool, edit_buf: &str, edit_pos: usize) {
+            crate::backends::pancurses::spreadsheet_set_edit_state(self.id, editing, edit_buf, edit_pos);
+        }
+        pub fn set_grid_config(&self, margin_cols: u32, main_cols: u32) {
+            crate::backends::pancurses::spreadsheet_set_grid_config(self.id, margin_cols, main_cols);
+        }
+        pub fn set_row_counts(&self, header_rows: u32, main_rows: u32) {
+            crate::backends::pancurses::spreadsheet_set_row_counts(self.id, header_rows, main_rows);
+        }
+        pub fn set_column_layout(&self, layout: Vec<(u32, u32, String)>) {
+            crate::backends::pancurses::spreadsheet_set_column_layout(self.id, layout);
+        }
+        pub fn set_row_labels(&self, labels: Vec<(u32, String)>) {
+            crate::backends::pancurses::spreadsheet_set_row_labels(self.id, labels);
+        }
+        pub fn set_menu_text(&self, text: &str) {
+            crate::backends::pancurses::spreadsheet_set_menu_text(self.id, text);
+        }
+        pub fn set_border_title(&self, text: &str) {
+            crate::backends::pancurses::spreadsheet_set_border_title(self.id, text);
+        }
+        pub fn set_status_text(&self, text: &str) {
+            crate::backends::pancurses::spreadsheet_set_status_text(self.id, text);
+        }
+        pub fn set_formula_bar_trailing(&self, text: &str) {
+            crate::backends::pancurses::spreadsheet_set_formula_bar_trailing(self.id, text);
+        }
+        pub fn set_tab_data(&self, titles: &[String], active: usize) {
+            crate::backends::pancurses::spreadsheet_set_tab_data(self.id, titles, active);
+        }
+        pub fn set_formula_bar(&self, address_label: &Label, entry: &Entry) {
+            crate::backends::pancurses::spreadsheet_set_formula_bar(
+                self.id, address_label.id, entry.id,
+            );
+        }
+        pub fn commit_formula_bar(&self) {
+            crate::backends::pancurses::spreadsheet_commit_formula_bar(self.id);
         }
     }
 
@@ -579,6 +634,34 @@ mod pancurses_adapter {
         crate::backends::pancurses::create_spreadsheet(rows, cols)
             .map(|id| Spreadsheet { id })
             .map_err(|e| Error::Backend(format!("{}", e)))
+    }
+
+    pub fn add_cursor_move_callback<F: FnMut(u32, u32) + 'static>(f: F) {
+        crate::backends::pancurses::spreadsheet_add_cursor_move_callback(f);
+    }
+    pub fn add_commit_edit_callback<F: FnMut(u32, u32, String) + 'static>(f: F) {
+        crate::backends::pancurses::spreadsheet_add_commit_edit_callback(f);
+    }
+    pub fn spreadsheet_set_cell(id: usize, r: u32, c: u32, text: &str) {
+        crate::backends::pancurses::spreadsheet_set_cell(id, r, c, text);
+    }
+    pub fn spreadsheet_set_cell_style(id: usize, r: u32, c: u32, style: u8) {
+        crate::backends::pancurses::spreadsheet_set_cell_style(id, r, c, style);
+    }
+    pub fn spreadsheet_set_column_layout(id: usize, layout: Vec<(u32, u32, String)>) {
+        crate::backends::pancurses::spreadsheet_set_column_layout(id, layout);
+    }
+    pub fn spreadsheet_set_border_title(id: usize, text: &str) {
+        crate::backends::pancurses::spreadsheet_set_border_title(id, text);
+    }
+    pub fn spreadsheet_set_row_labels(id: usize, labels: Vec<(u32, String)>) {
+        crate::backends::pancurses::spreadsheet_set_row_labels(id, labels);
+    }
+    pub fn spreadsheet_set_grid_config(id: usize, margin_cols: u32, main_cols: u32) {
+        crate::backends::pancurses::spreadsheet_set_grid_config(id, margin_cols, main_cols);
+    }
+    pub fn spreadsheet_set_edit_state(id: usize, editing: bool, edit_buf: &str, edit_pos: usize) {
+        crate::backends::pancurses::spreadsheet_set_edit_state(id, editing, edit_buf, edit_pos);
     }
 }
 
