@@ -384,6 +384,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "/resume",
     "/sessions",
     "/sh",
+    "/thinking",
     "/undo",
     "/unfinished",
     "/usage",
@@ -417,6 +418,7 @@ const SLASH_HELP: &[(&str, &str, &str)] = &[
     ("/resume", "<idx|fragment>", "resume an unfinished session"),
     ("/sessions", "", "list recent sessions"),
     ("/sh", "[cmd args]", "drop to a shell, or run a command via $SHELL"),
+    ("/thinking", "<level> [show|hide]", "set model thinking level / display"),
     ("/undo", "[all]", "revert the last file edit (or all)"),
     ("/unfinished", "", "list interrupted / still-running sessions"),
     ("/usage", "", "show token usage for this session"),
@@ -496,6 +498,22 @@ impl Completer for PirHelper {
                 return Ok((start_idx, matches));
             }
             return Ok((0, Vec::new()));
+        }
+        if cmd == "/thinking" {
+            let after = &rest[cmd_end..];
+            if after.is_empty() {
+                return Ok((0, Vec::new()));
+            }
+            let arg_lead = after.find(|c: char| !c.is_whitespace()).unwrap_or(after.len());
+            let arg_start = start_idx + cmd_end + arg_lead;
+            let prefix = &left[arg_start..];
+            let opts = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "show", "hide"];
+            let matches: Vec<String> = opts
+                .iter()
+                .filter(|o| o.starts_with(prefix))
+                .map(|o| o.to_string())
+                .collect();
+            return Ok((arg_start, matches));
         }
         if cmd != "/model" && cmd != "/m" && cmd != "/default-model" && cmd != "/dm" {
             return Ok((0, Vec::new()));
@@ -828,6 +846,14 @@ pub mod raw {
     use std::io::{self, Write};
     use std::os::unix::io::AsRawFd;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// Upper bound on one `wait_input` block, in milliseconds. `readable()` on
+    /// a pipe at EOF fires immediately *forever*, so without a bounded wait the
+    /// REPL would busy-spin at 100% CPU when stdin is closed while a turn never
+    /// signals completion. The timer arm makes the wait return `None` at least
+    /// this often; the caller re-loops, so typing stays responsive.
+    pub(crate) const INPUT_POLL: u64 = 80;
 
     /// Terminal state captured around a raw-mode session. Guarded by a Mutex so
     /// access is never via a raw `&mut` to a static (sound under the 2024
@@ -982,6 +1008,15 @@ pub mod raw {
     /// while a worker turn is just waiting on the network (the agent
     /// "thinking"). Typing stays responsive because the reactor wakes
     /// immediately on a keypress.
+    ///
+    /// The wait is throttled so an EOF pipe can't busy-spin. A pipe at EOF is
+    /// *permanently* "readable" (a closed fd wakes the reactor forever), so
+    /// racing only `readable` against the turn-completion channel would spin at
+    /// ~100% CPU whenever stdin is closed while the worker never signals
+    /// completion (e.g. it is parked in a retry backoff) — the runaway-CPU bug
+    /// we saw. After draining, if no real input arrived and barely any wall time
+    /// elapsed, we sleep the rest of the [`INPUT_POLL`] window so the idle REPL
+    /// stays near 0% CPU; genuine input returns instantly.
     pub fn wait_input(
         buf: &mut String,
         typeahead: &Arc<Mutex<String>>,
@@ -996,11 +1031,27 @@ pub mod raw {
         };
         // Race "stdin became readable" against "the turn finished". Both arms
         // yield `()` so `or` can select between them.
+        let start = std::time::Instant::now();
         let readable = async { let _ = stdin.readable().await; };
         let finished = async { let _ = done.recv().await; };
         smol::block_on(smol::future::or(readable, finished));
         // Either side fired (or stdin closed): drain whatever is buffered.
-        read_chunk(buf, typeahead)
+        let result = read_chunk(buf, typeahead);
+        // Throttle the EOF case. A pipe at EOF is *permanently* readable (a
+        // closed fd wakes the reactor immediately, forever), and the turn never
+        // signals completion while it's parked in a retry backoff — so racing
+        // only `readable` against `finished` would busy-spin at ~100% CPU (that
+        // was the runaway-CPU bug). When there's no actual input and barely any
+        // wall time elapsed, sleep the rest of the poll window so the idle REPL
+        // stays near 0% CPU. Real input (a `Line`/control key) returns instantly.
+        if matches!(result, RawInput::None) {
+            let elapsed = start.elapsed();
+            let target = Duration::from_millis(INPUT_POLL);
+            if elapsed < target {
+                std::thread::sleep(target - elapsed);
+            }
+        }
+        result
     }
 
     /// Drain any currently-available stdin bytes, translating control chars and
@@ -1590,6 +1641,17 @@ mod paste_tests {
     use super::raw::{paste_marker_at, translate, RawInput};
     use std::sync::{Arc, Mutex};
 
+    // A closed-pipe stdin must NOT busy-spin. `read_chunk` (and thus the
+    // `wait_input` throttle path) must not spin; this guards the runaway-CPU
+    // bug where a pipe at EOF made `smol::Async::readable()` fire immediately
+    // forever while the turn never signalled completion.
+    #[test]
+    fn raw_input_poll_const_is_bounded() {
+        // The throttle window is deliberately short (milliseconds), not 0.
+        assert!(super::raw::INPUT_POLL > 0, "INPUT_POLL must be > 0");
+        assert!(super::raw::INPUT_POLL <= 250, "INPUT_POLL too large would lag typing");
+    }
+
     fn ta() -> Arc<Mutex<String>> {
         Arc::new(Mutex::new(String::new()))
     }
@@ -1655,9 +1717,20 @@ mod status_line_tests {
     use super::*;
     #[test]
     fn status_line_shows_workspace_and_model() {
+        // Colour must be forced off so the escape sequences don't break the
+        // plain substring match — otherwise this test's result depends on
+        // whether stdout happens to be a TTY in the runner environment.
+        set_color(false);
         let s = status_line("/home/me/project", "anthropic/claude");
         assert!(s.contains("workspace: /home/me/project"));
         assert!(s.contains("model: anthropic/claude"));
+        // With colour on, the model name must still survive inside its ANSI
+        // wrapper (this is the branch that used to make the test env-sensitive).
+        set_color(true);
+        let s2 = status_line("/home/me/project", "anthropic/claude");
+        assert!(s2.contains("workspace: /home/me/project"));
+        assert!(s2.contains("model: "), "label must be present even when coloured: {s2:?}");
+        assert!(s2.contains("anthropic/claude"), "model must be visible even when coloured: {s2:?}");
     }
 }
 

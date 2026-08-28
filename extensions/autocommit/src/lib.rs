@@ -413,8 +413,14 @@ mod tests {
         .to_string()
     }
 
+    /// These tests mutate process-global `PIR_AUTO_COMMIT` and share a single
+    /// fixed scratch-dir path, so they must not run in parallel. Cargo runs
+    /// tests on many threads by default, so we serialise them with a mutex.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn auto_commits_prompt_as_subject_and_skips_meta_commands() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("PIR_AUTO_COMMIT", "1");
         std::env::remove_var("PIR_VCS");
         let dir = scratch_repo();
@@ -448,6 +454,7 @@ mod tests {
 
     #[test]
     fn off_by_default_does_nothing() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("PIR_AUTO_COMMIT");
         std::env::remove_var("PIR_VCS");
         let dir = scratch_repo();

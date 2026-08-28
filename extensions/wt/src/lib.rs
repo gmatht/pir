@@ -984,6 +984,13 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// These tests mutate the process-global `current_dir` (via `Chdir`) and the
+    /// `PIR_WT`/`PIR_WT_CHECK` env vars, which race when cargo runs tests in
+    /// parallel on multiple threads. Serialise them so `repo_root()`/`trunk()`
+    /// always resolve against the right scratch repo and env reads aren't
+    /// clobbered by a concurrent test.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
     /// RAII guard that `cd`s into `dir` and restores the previous cwd on drop —
     /// even if the test panics. Without this, a panicking test leaves the
     /// process in a (possibly already-removed) temp dir, which then breaks
@@ -1047,6 +1054,7 @@ mod tests {
 
     #[test]
     fn creates_branch_and_merges_back_when_checks_pass() {
+        let _lock = TEST_LOCK.lock().unwrap();
         std::env::set_var("PIR_WT", "1");
         std::env::remove_var("PIR_WT_AUTO");
         let repo = scratch_repo();
@@ -1128,6 +1136,7 @@ mod tests {
 
     #[test]
     fn on_by_default_registers_tools() {
+        let _lock = TEST_LOCK.lock().unwrap();
         std::env::remove_var("PIR_WT");
         let wt = Wt::new();
         assert!(wt.enabled, "wt must be on by default");
@@ -1137,6 +1146,7 @@ mod tests {
 
     #[test]
     fn pirt_wt_0_turns_it_off() {
+        let _lock = TEST_LOCK.lock().unwrap();
         std::env::set_var("PIR_WT", "0");
         let wt = Wt::new();
         assert!(!wt.enabled, "PIR_WT=0 must disable wt");
@@ -1159,6 +1169,7 @@ mod tests {
         // A bare repo (no PIR_WT_CHECK, no recognized project type) must report
         // Verdict::NoChecks, never Verdict::Passed — so the extension will NOT
         // silently auto-merge it.
+        let _lock = TEST_LOCK.lock().unwrap();
         std::env::remove_var("PIR_WT_CHECK");
         std::env::set_var("PIR_WT", "0"); // disable so verify() is exercised standalone
         let repo = scratch_repo();
@@ -1173,6 +1184,7 @@ mod tests {
         // On the main checkout (no worktree), startup_report must say we're on
         // the trunk checkout and report the automation on/off state — this is
         // the "why wasn't my worktree reported?" fix.
+        let _lock = TEST_LOCK.lock().unwrap();
         std::env::set_var("PIR_WT", "0"); // for the "off" branch
         let repo = scratch_repo();
         let _chdir = Chdir::new(&repo);
@@ -1196,6 +1208,7 @@ mod tests {
     fn trunk_detection_prefers_checked_out_branch() {
         // Repo whose default branch is "trunk" (not main). trunk() should pick it
         // up from the checked-out branch.
+        let _lock = TEST_LOCK.lock().unwrap();
         let dir = scratch_repo();
         let _chdir = Chdir::new(&dir);
         Command::new("git").args(["checkout", "-qb", "trunk"]).current_dir(&dir).status().unwrap();
