@@ -1704,6 +1704,7 @@ name = "rustxwidgets"
 version = "0.1.0"
 dependencies = [
  "cairo-sys-rs 0.23.0-alpha",
+ "crossterm",
  "gdk4-sys",
  "gio-sys 0.23.0-alpha",
  "glib-sys 0.23.0-alpha",
@@ -1720,10 +1721,12 @@ dependencies = [
  "once_cell",
  "pancurses",
  "proptest",
+ "ratatui",
  "rustyline",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "unicode-width 0.2.0",
  "wasm-bindgen",
  "web-sys",
  "winapi",
