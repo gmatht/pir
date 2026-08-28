@@ -1,5 +1,5 @@
 use crate::core::state::CoreApp;
-use crate::grid::{SheetCursor, HEADER_ROWS, MARGIN_COLS};
+use crate::grid::{CellAddr, SheetCursor, HEADER_ROWS, MARGIN_COLS};
 use crate::io::load_workbook_revisions_partial;
 use crate::io::PartialReplay;
 use std::path::Path;
@@ -163,6 +163,25 @@ impl App {
 
     pub fn set_backend(&mut self, backend: Backend) {
         self.backend = Some(backend);
+    }
+
+    /// Save the current workbook to its path (mirrors the "save" GUI action).
+    pub fn save(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let p = self
+            .core
+            .path
+            .clone()
+            .ok_or_else(|| -> Box<dyn std::error::Error> { "no file path set".into() })?;
+        let snapshot = crate::ops::WorkbookSnapshot::from_workbook(&self.core.workbook);
+        crate::io::save_workbook(&p, &snapshot)?;
+        self.core.status = "Saved".into();
+        Ok(())
+    }
+
+    /// Set a cell's text on the active sheet (headless/test helper).
+    pub fn set_cell(&mut self, addr: CellAddr, text: String) {
+        let sheet = self.core.workbook.active_sheet_mut();
+        sheet.grid.set(&addr, text);
     }
 
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {

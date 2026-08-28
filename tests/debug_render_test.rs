@@ -10,7 +10,7 @@ fn main() {
     
     // Simulate cursor at A2 after some keypress
     // In the real scenario, cursor would be at main row 1, col A (global index MARGIN_COLS)
-    let sheet = app.core.workbook.active_sheet().clone();
+    let sheet = app.workbook.active_sheet().clone();
     let grid = &sheet.grid;
     let hr = HEADER_ROWS;
     let mr = grid.main_rows();

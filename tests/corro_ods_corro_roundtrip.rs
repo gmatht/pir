@@ -16,7 +16,7 @@ use std::path::Path;
 
 use corro::export::{delimited_export_matrix, DelimitedExportOptions, ExportContent};
 use corro::formula::{cell_effective_display, refresh_spills, set_eval_context};
-use corro::grid::{CellAddr, HEADER_ROWS, MARGIN_COLS};
+use corro::grid::{CellAddr, ColumnAddr, HEADER_ROWS, MARGIN_COLS};
 use corro::ods::{export_ods_bytes_workbook_with_options, import_ods_workbook};
 use zip::ZipArchive;
 use corro::ops::WorkbookState;
@@ -176,11 +176,11 @@ fn debug_subtotal_b11_inspect() {
     eprintln!("export col_start={c0} data_rows[0]={:?}", dr.first());
     let h703 = CellAddr::Header {
         row: (HEADER_ROWS - 1) as u32,
-        col: 703,
+        col: ColumnAddr::Main(703),
     };
     let h706 = CellAddr::Header {
         row: (HEADER_ROWS - 1) as u32,
-        col: 706,
+        col: ColumnAddr::Main(706),
     };
     eprintln!("before header col 703: {:?}", g0.text(&h703));
     eprintln!("before header col 706: {:?}", g0.text(&h706));
@@ -212,7 +212,7 @@ fn debug_subtotal_b11_inspect() {
     let g = &wb.sheets[0].state.grid;
     let hb = CellAddr::Header {
         row: (HEADER_ROWS - 1) as u32,
-        col: (MARGIN_COLS as u32) + 1,
+        col: ColumnAddr::Main((MARGIN_COLS as u32) + 1),
     };
     let b11 = CellAddr::Main { row: 10, col: 1 };
     eprintln!("header B~1 raw: {:?}", g.text(&hb));

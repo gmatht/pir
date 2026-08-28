@@ -1,10 +1,10 @@
-use corro::grid::{CellAddr, Grid, GridBox, GridImpl};
+use corro::grid::{CellAddr, ColumnAddr, Grid, GridBox, GridImpl};
 
 #[test]
 fn grid_impl_parity_get_set_and_size() {
     let mut g = Grid::new(2, 2);
     g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
-    g.set(&CellAddr::Header { row: 0, col: 0 }, "h".into());
+    g.set(&CellAddr::Header { row: 0, col: ColumnAddr::Main(0) }, "h".into());
 
     let mut boxg = GridBox::new(g.clone());
 
@@ -17,7 +17,7 @@ fn grid_impl_parity_get_set_and_size() {
         Some("a")
     );
     assert_eq!(
-        boxg.get_owned(&CellAddr::Header { row: 0, col: 0 })
+        boxg.get_owned(&CellAddr::Header { row: 0, col: ColumnAddr::Main(0) })
             .as_deref(),
         Some("h")
     );
