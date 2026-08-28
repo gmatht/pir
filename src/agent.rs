@@ -7,6 +7,7 @@ use crate::term;
 use crate::types::{Block, Message, Role, Usage};
 use crate::session::SessionStatus;
 use serde_json::{json, Value};
+use std::cell::{Cell, RefCell};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -987,8 +988,25 @@ impl Agent {
         // `spinner` is hoisted out of the per-message loop so the "thinking…"
         // indicator can persist *below* the agent's text (a footer) between
         // model calls, and so the next streamed token can erase it in place
-        // (via \r) before printing more text.
-        let mut spinner: Option<term::Spinner> = None;
+        // (via \r) before printing more text. It lives in a `RefCell` (and the
+        // "already stopped this call" flag in a `Cell`) so both the text and
+        // thinking stream callbacks can stop it without tripping the borrow
+        // checker — see `stop_spinner` below.
+        let spinner: RefCell<Option<term::Spinner>> = RefCell::new(None);
+        let stopped_here = Cell::new(false);
+
+        // Stop the "thinking…" spinner (and its REPL prompt block) exactly once
+        // per model call, the moment the first token — text *or* reasoning —
+        // arrives. Shared by both stream callbacks so the spinner's 80ms
+        // redraws can never clobber streaming output.
+        let stop_spinner = || {
+            if !stopped_here.get() {
+                stopped_here.set(true);
+                if let Some(mut s) = spinner.borrow_mut().take() {
+                    s.stop();
+                }
+            }
+        };
 
         loop {
             // Cooperative cancellation: bail out at this safe boundary (start
@@ -997,7 +1015,7 @@ impl Agent {
                 self.cancel.store(false, Ordering::SeqCst);
                 self.mark_status(SessionStatus::Interrupted, self.goal_pending(), "cancelled");
                 if !self.silent() {
-                    if let Some(s) = spinner.as_mut() {
+                    if let Some(mut s) = spinner.borrow_mut().take() {
                         s.stop();
                     }
                     term::out(&term::dim("· turn cancelled"));
@@ -1012,10 +1030,9 @@ impl Agent {
                 let used = self.usage.input + self.usage.output;
                 if used >= budget {
                     if !self.silent() {
-                        if let Some(s) = spinner.as_mut() {
+                        if let Some(mut s) = spinner.borrow_mut().take() {
                             s.stop();
                         }
-                        spinner = None;
                         term::out(&format!(
                             "\r\x1b[K{}\n",
                             term::yellow(&format!(
@@ -1038,6 +1055,12 @@ impl Agent {
             // (this is the point the model stream starts).
             self.registry.emit(EventKind::TurnStart, &json!({ "prompt": user }));
 
+            // Reset the per-call "already stopped" latch so a *new* spinner on
+            // this model call (the footer re-shown after tools ran) can be
+            // stopped by the first streamed token. The latch is shared between
+            // the text and reasoning callbacks via `stop_spinner`.
+            stopped_here.set(false);
+
             // While we wait for the model's first token, show a spinner so it's
             // obvious the agent is "thinking". It stops the instant the stream
             // starts emitting text (and is skipped entirely when quiet / not a
@@ -1047,31 +1070,30 @@ impl Agent {
             // `self.typeahead` (filled by the REPL) is rendered on the spinner
             // line so the user sees what they're typing while the model thinks.
             if !self.silent() {
-                spinner = Some(term::Spinner::start("thinking", self.typeahead.clone(), tty));
+                *spinner.borrow_mut() = Some(term::Spinner::start("thinking", self.typeahead.clone(), tty));
             }
             // Stop the footer spinner (if running) the moment the model emits
             // its first token, so the agent's text starts on a clean line.
             // `stopped_here` tracks whether *this* call has already cleared it,
             // so subsequent tokens in the same stream don't touch it again.
-            let mut stopped_here = false;
             let mut on_text = |t: &str| {
-                if !self.silent() && !stopped_here {
-                    stopped_here = true;
-                    if let Some(s) = spinner.as_mut() {
-                        s.stop();
-                    }
-                    spinner = None;
-                }
                 if !self.silent() {
+                    stop_spinner();
                     term::out(t);
                 }
             };
             // Reasoning/thinking content. When show-thinking is off the thinking
             // blocks are still collected + parsed (and logged), they're just not
-            // printed to the live terminal.
+            // printed to the live terminal. The spinner is stopped the moment
+            // reasoning begins (via `stop_spinner`), so its 80ms redraws don't
+            // clobber the dimmed thinking text as it streams — the REPL prompt
+            // is then drawn *after* the thinking completes (back at the idle
+            // prompt) instead of sitting on top of the reasoning and hiding
+            // most of it.
             let show_thinking = self.show_thinking;
             let mut on_think = |t: &str| {
                 if !self.silent() && show_thinking {
+                    stop_spinner();
                     term::out(&format!("{}", term::dim(t)));
                 }
             };
@@ -1089,10 +1111,9 @@ impl Agent {
             // Ensure the footer spinner is stopped (covers the no-output case),
             // then move to a fresh line below the agent's text.
             if !self.silent() {
-                if let Some(s) = spinner.as_mut() {
+                if let Some(mut s) = spinner.borrow_mut().take() {
                     s.stop();
                 }
-                spinner = None;
                 println!();
             }
             let (assistant, usage) = match result {
@@ -1195,7 +1216,7 @@ impl Agent {
             // streamed token erases it in place via `\r`. `self.typeahead` is
             // rendered on the spinner line so typed-ahead input stays visible.
             if !self.silent() {
-                spinner = Some(term::Spinner::start("thinking", self.typeahead.clone(), tty));
+                *spinner.borrow_mut() = Some(term::Spinner::start("thinking", self.typeahead.clone(), tty));
             }
 
             // Cooperative cancellation: stop after this batch of tools
@@ -1204,7 +1225,7 @@ impl Agent {
                 self.cancel.store(false, Ordering::SeqCst);
                 self.mark_status(SessionStatus::Interrupted, self.goal_pending(), "cancelled");
                 if !self.silent() {
-                    if let Some(s) = spinner.as_mut() {
+                    if let Some(mut s) = spinner.borrow_mut().take() {
                         s.stop();
                     }
                     term::out(&term::dim("· turn cancelled"));

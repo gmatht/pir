@@ -144,19 +144,63 @@ pub fn terminal_width() -> usize {
     80
 }
 
-/// A horizontal rule across the full terminal width (dimmed when color is on).
-/// Drawn between the "thinking" spinner and the live REPL prompt while a turn
-/// runs, so the REPL is visually "under" the spinner.
-pub fn hrule() -> String {
-    let w = terminal_width();
-    let bar = "─".repeat(w.min(200));
-    dim(&bar)
+/// Height of the terminal in rows (used by the `pir -r` session picker to size
+/// its two panes). Falls back to 24 when the size can't be queried.
+pub fn terminal_height() -> usize {
+    #[cfg(unix)]
+    {
+        unsafe {
+            let mut ws: libc::winsize = std::mem::zeroed();
+            if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws as *mut libc::winsize) == 0
+                && ws.ws_row > 0
+            {
+                return ws.ws_row as usize;
+            }
+        }
+    }
+    24
 }
 
-/// The live REPL prompt shown under the spinner while a turn runs. Mirrors the
-/// idle rustyline prompt (`❯ `) so typed-ahead input looks like a normal line.
-pub fn repl_prompt() -> String {
-    format!("{} ", cyan("❯"))
+/// Clip `s` to at most `n` *visible* (ANSI-stripped) characters, appending a
+/// `…` when truncated. Used by the session picker to fit preview text into a
+/// column without splitting inside an escape sequence.
+pub fn clip(s: &str, n: usize) -> String {
+    let s = s.trim();
+    if visible_len(s) <= n {
+        return s.to_string();
+    }
+    // Truncate on visible-character boundaries.
+    let mut out = String::new();
+    let mut vis = 0usize;
+    for c in s.chars() {
+        if vis >= n.saturating_sub(1) {
+            break;
+        }
+        out.push(c);
+        vis += 1;
+    }
+    out.push('…');
+    out
+}
+
+/// Visible (ANSI-strip) length of a string.
+pub fn visible_len(s: &str) -> usize {
+    let mut len = 0;
+    let mut esc = false;
+    for c in s.chars() {
+        if esc {
+            if c == 'm' {
+                esc = false;
+            }
+            continue;
+        }
+        if c == '\x1b' {
+            esc = true;
+            continue;
+        }
+        len += 1;
+    }
+    len
 }
 
 /// A one-line status bar rendered beneath the prompt, showing the active
@@ -651,21 +695,19 @@ pub fn push_history(line: &str) {
 /// `stop()` the moment real output arrives. When stdout isn't a tty the spinner
 /// is a silent no-op so logs / pipes stay clean.
 ///
-/// The spinner renders a compact block under the agent's text while a turn
-/// runs:
+/// The spinner renders a single compact line while a turn runs:
 ///
 /// ```text
-/// ⠋ thinking…
-/// ────────────────────────────────────────────   (hrule, full terminal width)
-/// ❯ <what the user is typing live>               (live REPL prompt)
+/// ⠋ thinking… <what the user is typing live>
 /// ```
 ///
-/// i.e. the hrule and a live REPL prompt sit *under* the "thinking" indicator,
-/// and the user's keystrokes (recorded into `typeahead` by the REPL thread)
-/// appear on the prompt line instead of being clobbered by the spinner. This
-/// fixes the "REPL doesn't display during thinking" bug: the spinner thread is
-/// the **only** thing that writes to stdout while it's alive, so it owns the
-/// whole block and re-renders it in place each tick.
+/// The user's keystrokes (recorded into `typeahead` by the REPL thread) are
+/// shown inline after the label so typing stays visible while the model thinks,
+/// without a fragile multi-line block under the spinner. This is the **only**
+/// thing that writes to stdout while it's alive; it redraws its one line in
+/// place each tick and fully erases it on `stop()` — so a replaced spinner can
+/// never leave a stray "thinking…" / "────" line behind (the old 3-line block
+/// drifted on `\x1b[2A` line-arithmetic between tool rounds).
 pub struct Spinner {
     handle: Option<JoinHandle<()>>,
     alive: Arc<AtomicBool>,
@@ -679,12 +721,12 @@ impl Spinner {
     /// `typeahead` is a buffer the REPL thread fills with any keystrokes the
     /// user types *while* the turn is running (the REPL runs in raw mode and is
     /// blocked waiting on the network). The spinner thread is the **only** thing
-    /// that writes to stdout while it's alive, so it owns the "thinking" block
-    /// (the spinner + hrule + live REPL prompt) and renders the user's typing
-    /// on the prompt line below the hrule. This avoids two threads racing on
-    /// stdout — the previous design had the main REPL thread echo keystrokes
-    /// directly *and* the the same line, which clobbered the
-    /// user's input mid-thought (the "REPL doesn't display during thinking" bug).
+    /// that writes to stdout while it's alive, so it owns the single "thinking"
+    /// line and renders the user's typing on it (inline after the label). This
+    /// avoids two threads racing on stdout — the previous design had the main
+    /// REPL thread echo keystrokes directly *and* the same line, which clobbered
+    /// the user's input mid-thought (the "REPL doesn't display during thinking"
+    /// bug).
     ///
     /// `quiet` is the shared "go silent" switch the REPL flips to background a
     /// running turn (bare `&`). When it is set, the spinner stops drawing
@@ -714,64 +756,40 @@ impl Spinner {
             let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
             let mut i = 0usize;
             let mut out = io::stdout();
-            let mut drawn = false;
             while a.load(Ordering::SeqCst) {
-                // Detached turn: stop drawing and erase whatever we last drew so
-                // the backgrounded turn leaves a clean prompt behind it.
+                // Detached turn: erase the spinner and go silent so a backgrounded
+                // turn leaves a clean terminal behind it.
                 if q.load(Ordering::SeqCst) {
-                    if drawn {
-                        let _ = out.write_all(
-                            b"\x1b[2A\x1b[2K\x1b[B\x1b[2K\x1b[B\x1b[2K\x1b[2A\x1b[2K",
-                        );
-                        let _ = out.flush();
-                        drawn = false;
-                    }
+                    let _ = out.write_all(b"\r\x1b[2K");
+                    let _ = out.flush();
                     std::thread::sleep(Duration::from_millis(80));
                     continue;
                 }
                 let frame = if color() { format!("\x1b[36m{}\x1b[0m", frames[i % frames.len()]) } else { frames[i % frames.len()].to_string() };
-                // Read the user's in-progress line (recorded by the REPL thread)
-                // and show it on the live REPL line under the hrule so typing
-                // "displays" while the model thinks. On the first tick we draw
-                // the block from the current cursor position; afterwards we move
-                // up to the block's top line before redrawing, so the block stays
-                // anchored in place instead of scrolling. `\x1b[K` clears stale
-                // tails after a backspace.
+                // Render the user's in-progress line (recorded by the REPL thread)
+                // inline after the label, so typing stays visible while the model
+                // thinks — without a fragile multi-line block under the spinner.
+                // The old 3-line block (thinking + hrule + a fake `❯` prompt line)
+                // drifted on \x1b[2A line-arithmetic between tool rounds, leaking
+                // stray "thinking…" / "────" lines and clobbering the REPL prompt.
                 let typed = typeahead.lock().map(|g| g.clone()).unwrap_or_default();
-                let rule = hrule();
-                let prompt = repl_prompt();
-                let seq = if drawn {
-                    "\r\x1b[K\x1b[2A\r\x1b[K"
-                } else {
-                    "\r\x1b[K"
-                };
-                let _ = out.write_all(
-                    format!(
-                        "{}{} {}…\n\x1b[K{}\n\x1b[K{}{}{}\x1b[K",
-                        seq, frame, label, rule, prompt, typed, "\x1b[K"
-                    )
-                    .as_bytes(),
-                );
+                // Single clean line: CR to column 0, erase the whole line, then
+                // rewrite. One line means the erase/redraw can never drift, so no
+                // lines accumulate. `\x1b[2K` clears the entire line.
+                let mut line = format!("\r\x1b[2K{frame} {label}…");
+                if !typed.is_empty() {
+                    line.push_str("  ");
+                    line.push_str(&typed);
+                }
+                let _ = out.write_all(line.as_bytes());
                 let _ = out.flush();
-                drawn = true;
-                thread::sleep(Duration::from_millis(80));
+                std::thread::sleep(Duration::from_millis(80));
                 i = i.wrapping_add(1);
             }
-            // Erase the whole 3-line block (thinking line + hrule + draft-prompt
-            // line) and leave the cursor on its TOP line (L0). We use `\x1b[2K`
-            // (erase *entire* line) rather than `\x1b[K` (erase-to-EOL) — the
-            // cursor is at end-of-line, so erase-to-EOL would only clip the tail
-            // and leave "⠋ think" / "────" / "❯ hel" behind. The previous clear
-            // also left the cursor on L1 (the hrule) and skipped the hrule line
-            // entirely, so the next spinner's first draw anchored one line low
-            // and the prior "⠋ thinking…" was never erased — every tool round
-            // leaked another stray "thinking" onto the screen.
-            if drawn {
-                let _ = out.write_all(
-                    b"\x1b[2A\x1b[2K\x1b[B\x1b[2K\x1b[B\x1b[2K\x1b[2A\x1b[2K",
-                );
-                let _ = out.flush();
-            }
+            // On stop, erase the spinner line and leave the cursor at column 0 so
+            // the next output (streamed model text) starts cleanly on that line.
+            let _ = out.write_all(b"\r\x1b[2K");
+            let _ = out.flush();
         });
         Spinner { handle: Some(handle), alive }
     }
@@ -1333,9 +1351,9 @@ pub mod raw {
                     // wrapper (`ESC[200~` start / `ESC[201~` end) before the
                     // generic swallow below. NOTE: the loop has already done
                     // `i += 1` past the 0x1b, so the wrapper starts at `i - 1`.
-                    if let Some(start) = paste_marker_at(bytes, i - 1) {
+                    if let Some(start) = paste_marker_at(bytes, i) {
                         pasting = start; // `200~` = start
-                        i += 5; // skip `[ 2 0 0 ~` / `[ 2 0 1 ~` (0x1b at i-1)
+                        i += 6; // skip `ESC [ 2 0 0 ~` / `ESC [ 2 0 1 ~`
                         continue;
                     }
                     i += 1; // skip 0x1b
@@ -1363,6 +1381,76 @@ pub mod raw {
         }
         RawInput::None
     }
+
+    /// Put stdin into raw, non-blocking mode for the `pir -r` session picker
+    /// specifically. Unlike [`enable_raw`] (used by the running-turn input),
+    /// this does NOT enable bracketed-paste and uses a *separate* termios save
+    /// slot so the picker's raw session never interacts with the REPL's.
+    /// Idempotent; pair with [`disable_raw_picker`].
+    pub fn enable_raw_picker() {
+        let mut st = PICKER_STATE.lock().unwrap();
+        if st.active {
+            return;
+        }
+        unsafe {
+            let fd = io::stdin().as_raw_fd();
+            let mut tios: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut tios) == 0 {
+                st.orig_termios = Some(tios);
+                let mut raw = tios;
+                // No ISIG so ctrl-c/ctrl-z arrive as raw bytes (we handle them
+                // ourselves rather than letting them raise a signal).
+                raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+                raw.c_cc[libc::VMIN] = 0;
+                raw.c_cc[libc::VTIME] = 0;
+                libc::tcsetattr(fd, libc::TCSANOW, &raw);
+            }
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            st.orig_nonblock = Some(flags & libc::O_NONBLOCK != 0);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            st.active = true;
+        }
+    }
+
+    /// Restore the terminal attributes saved by [`enable_raw_picker`].
+    pub fn disable_raw_picker() {
+        let mut st = PICKER_STATE.lock().unwrap();
+        if !st.active {
+            return;
+        }
+        unsafe {
+            let fd = io::stdin().as_raw_fd();
+            if let Some(t) = st.orig_termios.take() {
+                libc::tcsetattr(fd, libc::TCSANOW, &t);
+            }
+            if let Some(was) = st.orig_nonblock.take() {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                let newflags = if was {
+                    flags | libc::O_NONBLOCK
+                } else {
+                    flags & !libc::O_NONBLOCK
+                };
+                libc::fcntl(fd, libc::F_SETFL, newflags);
+            }
+            st.active = false;
+        }
+    }
+
+    /// Expose [`translate`] under a picker-friendly name. The session picker
+    /// drives stdin in raw mode and only needs the shared CSI-aware translation
+    /// (arrows, ctrl-c/ctrl-d, lone Esc). Kept as an alias so the picker call
+    /// site reads clearly.
+    pub fn translate_picker(buf: &mut String, typeahead: &Arc<Mutex<String>>, bytes: &[u8]) -> RawInput {
+        translate(buf, typeahead, bytes)
+    }
+
+    /// Separate termios save slot for the picker, so enabling it can never
+    /// disturb the REPL's running-turn raw state stored in [`STATE`].
+    static PICKER_STATE: Mutex<RawState> = Mutex::new(RawState {
+        orig_termios: None,
+        orig_nonblock: None,
+        active: false,
+    });
 }
 
 #[cfg(test)]
