@@ -1916,6 +1916,10 @@ pub struct SimpleAction {
 }
 
 impl SimpleAction {
+    /// Raw GAction pointer (for adding to a GActionMap / action group).
+    pub fn inner_ptr(&self) -> *mut c_void {
+        self.inner
+    }
     pub fn new(loader: Arc<Loader>, name: &str) -> Result<Self, Error> {
         let symbols = &loader.symbols;
         let ctor = symbols.g_simple_action_new.ok_or(Error::MissingSymbol("g_simple_action_new".into()))?;
@@ -2190,6 +2194,13 @@ impl Dialog {
             }
         } else {
             Err(Error::MissingSymbol("g_signal_connect_data".into()))
+        }
+    }
+
+    /// Dismiss/destroy the dialog widget.
+    pub fn close(&self) {
+        if let Some(destroy) = self.loader.symbols.gtk_widget_destroy {
+            unsafe { destroy(self.inner); }
         }
     }
 

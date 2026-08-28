@@ -46,12 +46,15 @@ pub trait Widget {
 }
 
 /// Core App wrapper that holds a boxed backend application.
+#[derive(Clone)]
 pub struct App {
     inner: Arc<Box<dyn crate::backends::BackendApp>>,
     #[cfg(windows)]
     parent_cell: Rc<RefCell<Option<*mut c_void>>>,
     #[cfg(windows)]
     action_registry: Rc<RefCell<HashMap<String, Box<dyn FnMut()>>>>,
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    action_group: Rc<RefCell<Option<*mut c_void>>>,
 }
 
 impl App {
@@ -68,6 +71,8 @@ impl App {
             parent_cell: Rc::new(RefCell::new(None)),
             #[cfg(windows)]
             action_registry: Rc::new(RefCell::new(HashMap::new())),
+            #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+            action_group: Rc::new(RefCell::new(None)),
         });
         #[cfg(feature = "pancurses")]
         return Ok(App { inner: Arc::new(b) });
@@ -170,6 +175,35 @@ impl App {
     #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_spreadsheet(&self, rows: usize, cols: usize) -> Result<crate::backends_gtk_adapter::Spreadsheet, Error> {
         crate::backends_gtk_adapter::create_spreadsheet(rows, cols)
+    }
+
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    /// Return the app-wide GActionGroup pointer used to bind the menubar.
+    /// Creates a GSimpleActionGroup on first use.
+    pub fn ensure_action_group(&self) -> Result<*mut c_void, Error> {
+        let mut g = self.action_group.borrow_mut();
+        if g.is_none() {
+            let ptr = crate::backends::gtk::loader()
+                .and_then(|l| l.symbols.g_simple_action_group_new)
+                .map(|f| unsafe { f() })
+                .unwrap_or(std::ptr::null_mut());
+            if ptr.is_null() {
+                return Err(Error::Backend("failed to create GSimpleActionGroup".into()));
+            }
+            *g = Some(ptr);
+        }
+        Ok(g.unwrap())
+    }
+
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    /// Add an action to the app-wide action group so the menubar can activate it.
+    pub fn register_action(&self, action: &crate::backends_gtk_adapter::SimpleAction) -> Result<(), Error> {
+        let group = self.ensure_action_group()?;
+        let add = crate::backends::gtk::loader()
+            .and_then(|l| l.symbols.g_action_map_add_action)
+            .ok_or_else(|| Error::Backend("g_action_map_add_action missing".into()))?;
+        unsafe { add(group, action.0.inner_ptr()) };
+        Ok(())
     }
 
     // -- Windows paths --
@@ -508,6 +542,8 @@ impl From<Box<dyn crate::backends::BackendApp>> for App {
             parent_cell: Rc::new(RefCell::new(None)),
             #[cfg(windows)]
             action_registry: Rc::new(RefCell::new(HashMap::new())),
+            #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+            action_group: Rc::new(RefCell::new(None)),
         }
     }
 }

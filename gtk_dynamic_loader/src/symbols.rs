@@ -48,6 +48,7 @@ pub type GApplicationRun = unsafe extern "C" fn(application: *mut c_void, argc: 
 pub type GApplicationRegister = unsafe extern "C" fn(application: *mut c_void, cancellable: *mut c_void, error: *mut *mut c_void) -> i32;
 pub type GSimpleActionNew = unsafe extern "C" fn(name: *const i8, parameter_type: *mut c_void) -> *mut c_void;
 pub type GActionMapAddAction = unsafe extern "C" fn(map: *mut c_void, action: *mut c_void);
+pub type GSimpleActionGroupNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GActionGroupActivateAction = unsafe extern "C" fn(group: *mut c_void, action_name: *const i8, parameter: *mut c_void);
 pub type GActionMapLookupAction = unsafe extern "C" fn(map: *mut c_void, action_name: *const i8) -> *mut c_void;
 pub type GActionActivate = unsafe extern "C" fn(action: *mut c_void, parameter: *mut c_void);
@@ -286,6 +287,7 @@ pub struct Symbols {
     pub g_application_run: Option<GApplicationRun>,
     pub g_application_register: Option<GApplicationRegister>,
     pub g_simple_action_new: Option<GSimpleActionNew>,
+    pub g_simple_action_group_new: Option<GSimpleActionGroupNew>,
     pub g_action_map_add_action: Option<GActionMapAddAction>,
     pub g_action_group_activate_action: Option<GActionGroupActivateAction>,
     pub g_action_map_lookup_action: Option<GActionMapLookupAction>,
@@ -564,6 +566,7 @@ impl Symbols {
         let g_action_map_add_action = open_sym_try!(libs, "libgio", GActionMapAddAction, "g_action_map_add_action").or_else(|| unsafe { sym::<GActionMapAddAction>(glib, "g_action_map_add_action") });
         let g_action_group_activate_action = open_sym_try!(libs, "libgio", GActionGroupActivateAction, "g_action_group_activate_action").or_else(|| unsafe { sym::<GActionGroupActivateAction>(glib, "g_action_group_activate_action") });
         let g_action_map_lookup_action = open_sym_try!(libs, "libgio", GActionMapLookupAction, "g_action_map_lookup_action").or_else(|| unsafe { sym::<GActionMapLookupAction>(glib, "g_action_map_lookup_action") });
+        let g_simple_action_group_new = open_sym_try!(libs, "libgio", GSimpleActionGroupNew, "g_simple_action_group_new").or_else(|| unsafe { sym::<GSimpleActionGroupNew>(glib, "g_simple_action_group_new") });
         let g_action_activate = open_sym_try!(libs, "libgio", GActionActivate, "g_action_activate").or_else(|| unsafe { sym::<GActionActivate>(glib, "g_action_activate") });
         let g_menu_new = open_sym_try!(libs, "libgio", GMenuNew, "g_menu_new").or_else(|| unsafe { sym::<GMenuNew>(glib, "g_menu_new") });
         let g_menu_append = open_sym_try!(libs, "libgio", GMenuAppend, "g_menu_append").or_else(|| unsafe { sym::<GMenuAppend>(glib, "g_menu_append") });
@@ -669,7 +672,7 @@ impl Symbols {
             cairo_move_to, cairo_set_source_rgb, cairo_set_source_rgba, cairo_rectangle, cairo_fill, cairo_stroke, cairo_set_line_width, cairo_select_font_face, cairo_set_font_size, cairo_show_text,
             gtk_widget_queue_draw,
             gtk_file_chooser_native_new, gtk_native_dialog_run, gtk_file_chooser_get_filename, gtk_widget_destroy, g_free, gdk_display_get_default, gdk_screen_get_default, gtk_style_context_add_provider_for_display, gtk_style_context_add_provider_for_screen, gdk_event_get_keyval, gdk_keyval_from_name, gdk_event_get_state,
-            gtk_application_new, g_application_run, g_application_register, g_simple_action_new, g_action_map_add_action, g_action_group_activate_action, g_action_map_lookup_action, g_action_activate,
+            gtk_application_new, g_application_run, g_application_register, g_simple_action_new, g_action_map_add_action, g_action_group_activate_action, g_action_map_lookup_action, g_action_activate, g_simple_action_group_new,
             g_menu_new, g_menu_append, g_application_set_app_menu, g_application_set_menubar, g_menu_append_submenu, gtk_popover_menu_bar_new_from_model, gtk_menu_bar_new, gtk_menu_new, gtk_menu_item_new_with_label, gtk_menu_shell_append, gtk_menu_item_set_submenu, gtk_window_set_application, gtk_widget_insert_action_group, gtk_actionable_set_detailed_action_name, g_menu_model_get_n_items, g_menu_model_get_item_attribute_value, g_menu_model_get_item_link, g_variant_get_string, g_variant_unref,
             gtk_label_set_xalign,
             gtk_event_controller_key_new,

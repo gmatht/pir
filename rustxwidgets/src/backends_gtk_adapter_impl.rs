@@ -254,6 +254,7 @@ mod gtk_adapter {
         pub fn get_content_area(&self) -> *mut c_void { self.0.get_content_area() }
         pub fn append_content_area(&self, child: &impl AsRef<*mut c_void>) { self.0.append_content_area(child); }
         pub fn present(&self) { self.0.present(); }
+        pub fn close(&self) { self.0.close(); }
         pub fn connect_response<F: FnMut(i32) + 'static>(&self, f: F) -> Result<u64, Error> {
             self.0.connect_response(f).map_err(|e| Error::Backend(format!("{}", e)))
         }
