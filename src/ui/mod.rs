@@ -13297,6 +13297,62 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::path::PathBuf;
 
+    /// Drive the *real* ratatui input handler with faked keypresses and assert a
+    /// genuine feature (view-sort) executes. This is a behavioural driver test:
+    /// we never call the sort routine directly, we fake the keystrokes a user
+    /// would press and let `handle_key` dispatch them through the menu system.
+    #[test]
+    fn drive_sort_via_faked_keypresses() {
+        // Unsorted 3-row column A: rows 0,1,2 hold 3,1,2.
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(3, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "3".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "1".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 2, col: 0 }, "2".into());
+
+        // Sanity: not sorted yet (ascending by value would be rows 1,2,0).
+        let before = app.state.grid.sorted_main_rows();
+        assert_ne!(before, vec![1, 2, 0], "precondition: grid must start unsorted");
+
+        // Fake the keypresses a user would press to sort by column A:
+        //   Alt+f  -> open the File menu (real menu-open key path)
+        //   s      -> 'S' shortcut selects "Sort view" -> Mode::SortView
+        //   A      -> column spec typed into the SortView buffer
+        //   Enter  -> apply the view sort (ascending) on column A
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        // The view is now sorted ascending by column A -> row order 1,2,0.
+        let sorted = app.state.grid.sorted_main_rows();
+        assert_eq!(sorted, vec![1, 2, 0]);
+
+        let col_a_sorted: Vec<String> = sorted
+            .iter()
+            .map(|&r| {
+                app.state
+                    .grid
+                    .get(&CellAddr::Main { row: r as u32, col: 0 })
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(
+            col_a_sorted,
+            vec!["1".to_string(), "2".to_string(), "3".to_string()]
+        );
+    }
+
     fn docs_test_path(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("docs/test")

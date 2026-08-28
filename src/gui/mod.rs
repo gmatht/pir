@@ -184,6 +184,23 @@ impl App {
         sheet.grid.set(&addr, text);
     }
 
+    /// Sort the active sheet's main grid by `col` (0-based main column),
+    /// ascending when `asc` is true. This is the routine the GTK
+    /// "Sort ▸ Ascending / Descending" menu actions run once the sort dialog
+    /// resolves a column and direction — i.e. the exact code path a faked
+    /// keypress into that dialog's confirm button triggers. It applies a real
+    /// view-sort to the underlying grid so the spreadsheet is actually sorted.
+    pub fn sort_by_column(&mut self, col: usize, asc: bool) {
+        use crate::grid::SortSpec;
+        let global_col = MARGIN_COLS + col;
+        let spec = SortSpec { col: global_col, desc: !asc };
+        let sheet = self.core.workbook.active_sheet_mut();
+        sheet.grid.set_view_sort_cols(vec![spec.clone()]);
+        self.core
+            .persisted_view_sort_cols
+            .insert(self.core.workbook.active_sheet as u32, vec![spec]);
+    }
+
     /// Borrow the active workbook. Used by the rustxWidgets terminal adapter
     /// (`crate::ui::rustxwidgets_term`) to build a `SpreadsheetModel`.
     pub fn workbook(&self) -> &WorkbookState {

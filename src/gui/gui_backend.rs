@@ -1026,15 +1026,17 @@ fn handle_menu_action(name: &str, state: &GuiState) {
             let wb = crate::ops::WorkbookState::default();
             dialogs::sort_dialog(&wb, |result| {
                 if let Some((col, asc)) = result {
-                    app.core.status = format!("Sort col {col} asc: {asc}");
+                    app.sort_by_column(col, asc);
+                    app.core.status = format!("Sorted col {col} {}", if asc { "asc" } else { "desc" });
                 }
             });
         }
         "sort_desc" => {
             let wb = crate::ops::WorkbookState::default();
             dialogs::sort_dialog(&wb, |result| {
-                if let Some((col, asc)) = result {
-                    app.core.status = format!("Sort col {col} desc: {}", !asc);
+                if let Some((col, _asc)) = result {
+                    app.sort_by_column(col, false);
+                    app.core.status = format!("Sorted col {col} desc");
                 }
             });
         }
