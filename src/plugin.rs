@@ -54,6 +54,16 @@ pub struct ToolSpec {
     pub schema: Value,
 }
 
+/// A slash command an extension registers with the agent (e.g. for the
+/// `pi-extensions` bridge). Unlike tools — which the *model* calls — slash
+/// commands are invoked by the user at the REPL (commands that no built-in
+/// claimed). `name` is the command word after the leading `/` (e.g. `ext`);
+/// `description` is what `/help` shows.
+pub struct CommandSpec {
+    pub name: &'static str,
+    pub description: &'static str,
+}
+
 pub struct Outcome {
     pub content: String,
     pub is_error: bool,
@@ -116,6 +126,20 @@ pub trait ToolBackend: Send {
     /// REPL owning the worker. Default no-op for backends that don't stream to
     /// the terminal.
     fn set_quiet_handle(&mut self, _q: Arc<AtomicBool>) {}
+
+    /// Slash commands this backend contributes to the REPL (invoked by the
+    /// user, e.g. `/ext`). Default: no commands.
+    fn command_specs(&self) -> Vec<CommandSpec> {
+        Vec::new()
+    }
+
+    /// Run a registered slash command byargs` is the trimmed
+    /// after the command word. Return `None` if this backend doesn't own the
+    /// name (so the agent can keep looking / fall back to "unknown command").
+    /// Default: never claims a command.
+    fn run_command(&mut self, _name: &str, _args: &str) -> Option<Outcome> {
+        None
+    }
 }
 
 /// Holds every linked backend. The model only ever sees `specs()`; it never
@@ -175,6 +199,31 @@ impl Registry {
             }
         }
         Outcome::err(format!("unknown tool '{name}'"))
+    }
+
+    /// Flat list of every tool name across all backends (for `/ext` diagnostics).
+    pub fn spec_names(&self) -> Vec<String> {
+        self.backends.iter().flat_map(|b| b.specs().into_iter().map(|s| s.name.to_string())).collect()
+    }
+
+    /// Flat list of every registered slash command `(name, description)` across
+    /// all backends (for `/ext` diagnostics).
+    pub fn command_specs(&self) -> Vec<(String, String)> {
+        self.backends
+            .iter()
+            .flat_map(|b| b.command_specs().into_iter().map(|c| (c.name.to_string(), c.description.to_string())))
+            .collect()
+    }
+
+    /// Dispatch a registered slash command to the backend that owns it.
+    /// Returns `None` if no backend claims the name.
+    pub fn run_command(&mut self, name: &str, args: &str) -> Option<Outcome> {
+        for b in &mut self.backends {
+            if b.command_specs().iter().any(|c| c.name == name) {
+                return b.run_command(name, args);
+            }
+        }
+        None
     }
 
     pub fn cwd(&self) -> &PathBuf {

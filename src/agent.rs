@@ -332,6 +332,22 @@ impl Agent {
         self.registry.startup_reports()
     }
 
+    /// Flat list of every tool name across all backends (for `/ext` diagnostics).
+    pub fn registry_spec_names(&self) -> Vec<String> {
+        self.registry.spec_names()
+    }
+
+    /// Flat list of every registered slash command across all backends.
+    pub fn registry_command_names(&self) -> Vec<(String, String)> {
+        self.registry.command_specs()
+    }
+
+    /// Dispatch a registered slash command to the owning backend; `None` if no
+    /// backend claims the name (so the REPL can fall back to "unknown command").
+    pub fn run_registered_command(&mut self, name: &str, args: &str) -> Option<crate::plugin::Outcome> {
+        self.registry.run_command(name, args)
+    }
+
     /// The path of the session transcript (used to foreground a session).
     pub fn log_path(&self) -> Option<&PathBuf> {
         self.log_path.as_ref()

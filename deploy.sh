@@ -47,6 +47,15 @@
 #        binary via `gh` (requires `gh auth login`).
 #    To build/test/install WITHOUT touching the remote, pass `--no-push` and
 #    omit `--tag`/`--release`, or use `--test-only`.
+#
+# Progress / debug output
+# -----------------------
+#   --verbose, -v   show per-step timing (how long each phase took)
+#   --debug,   -d   verbose + dump an environment/context banner (rust/cargo
+#                   versions, PATH, cwd, uid, and relevant PIR_/CARGO_/RUST_/
+#                   PI_/API_KEY env vars). Useful when a phase fails.
+#   Each top-level phase prints a `step N/8` marker so you can see how far the
+#   deploy got and where it stalled.
 
 set -euo pipefail
 
@@ -57,6 +66,8 @@ WITH_PROJECT_INIT=0
 TEST_ONLY=0
 TESTS=1
 CLIPPY=1
+VERBOSE=0
+DEBUG=0
 
 # publish: ON by default (this is a deploy script). Opt out with --no-push / --no-release.
 PUSH=1
@@ -77,6 +88,8 @@ while [ $# -gt 0 ]; do
     --no-clippy)     CLIPPY=0; shift ;;
     --no-tests)      TESTS=0; shift ;;
     --fast)          TESTS=0; CLIPPY=0; shift ;;
+    --verbose|-v)    VERBOSE=1; shift ;;
+    --debug|-d)      VERBOSE=1; DEBUG=1; shift ;;
     --push)          PUSH=1; shift ;;
     --no-push)       PUSH=0; shift ;;
     --push-remote)   PUSH_REMOTE="$2"; shift 2 ;;
@@ -97,6 +110,26 @@ say()  { printf '\033[1;32m[deploy]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[deploy]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[deploy] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# step: print a numbered step header and (in --debug) start a stopwatch.
+_step_no=0
+_step_t0=""
+step() {
+  _step_no=$((_step_no + 1))
+  _step_t0="$(date +%s.%N)"
+  printf '\033[1;36m[deploy] \033[1;35mstep %d/%d\033[0m %s\n' \
+    "$_step_no" "${_STEP_TOTAL:-?}" "$*"
+}
+# step_done: print elapsed time for the last step (debug/verbose only).
+step_done() {
+  [ "$VERBOSE" -eq 1 ] || return 0
+  local now t
+  now="$(date +%s.%N)"
+  t="$(awk -v a="$_step_t0" -v b="$now" 'BEGIN{printf "%.2fs", b-a}')"
+  printf '\033[1;36m[deploy]\033[0m   ✓ %s (took %s)\n' "$*" "$t"
+}
+# dbg: dump debug info when --debug is set.
+dbg() { [ "$DEBUG" -eq 1 ] || return 0; printf '\033[0;90m[deploy:dbg]\033[0m %s\n' "$*"; }
+
 need() { command -v "$1" >/dev/null 2>&1 || die "required tool not found: $1"; }
 ver_ge() { # $1 have (x.y.z)  $2 min (x.y)
   awk -v h="$1" -v m="$2" 'BEGIN{
@@ -106,13 +139,24 @@ ver_ge() { # $1 have (x.y.z)  $2 min (x.y)
     exit 0 }'
 }
 
-need rustc; need cargo; need git
+need rustc; need cargo
 
 # Rust >= 1.70 (IsTerminal). Strip pre-release suffix.
 RUST_VER="$(rustc --version | awk '{print $2}' | sed 's/-.*//')"
 ver_ge "$RUST_VER" "1.70" || die "rustc $RUST_VER < 1.70 required"
 
+# Total number of top-level steps (for the step progress markers). Phases that
+# are conditionally skipped still reserve their slot; the marker simply won't print.
+_STEP_TOTAL=8
+
+dbg "PREFIX=$PREFIX VERBOSE=$VERBOSE DEBUG=$DEBUG PUSH=$PUSH REF='${REF}'"
+dbg "rustc=$(rustc --version)  cargo=$(cargo --version)"
+dbg "PATH=$PATH"
+dbg "git=$(git --version)  cwd=$(pwd)  user=$(id -un) (uid $(id -u))"
+[ "$DEBUG" -eq 1 ] && dbg "env: $(env | grep -E '^(PIR_|CARGO_|RUST_|PI_|ANTHROPIC_|OPENAI_)' | sort | tr '\n' ' ')"
+
 # --------------------------------------------------------------- source tree
+step "resolve source tree${REF:+ (ref $REF)}"
 SRC="$(pwd)"
 CLEANUP_WORKTREE=0
 if [ -n "$REF" ]; then
@@ -126,20 +170,29 @@ fi
 cd "$SRC"
 [ -f Cargo.toml ] || die "$SRC: not a pir repo (Cargo.toml missing)"
 grep -q '^name = "pir"' Cargo.toml || die "$SRC: Cargo.toml is not pir"
+dbg "SRC=$SRC  CLEANUP_WORKTREE=$CLEANUP_WORKTREE"
+step_done "source tree resolved -> $SRC"
 
 # --------------------------------------------------------------- tests + build
 if [ "$TESTS" -eq 1 ]; then
-  say "running unit tests (cargo test --release --locked)"
-  cargo test --release --locked 2>&1 | tail -25 || true
+  step "run unit tests (cargo test --release --locked)"
+  # Capture to a log file (not a live `| tail` pipe) so the run can't be
+  # starved by an unrelated process holding the pipeline's write end open, and
+  # so the output survives for debugging. We tail the file afterwards.
+  _TLOG="$(mktemp "${TMPDIR:-/tmp}/pir-deploy-test.XXXXXX.log")"
+  cargo test --release --locked >"$_TLOG" 2>&1 || true
+  dbg "cargo test log: $_TLOG ($(wc -l < "$_TLOG") lines)"
+  tail -25 "$_TLOG"
   # cargo test fails the pipe with set -o pipefail only if it errors; assert exit:
   cargo test --release --locked >/dev/null || die "unit tests failed"
+  step_done "unit tests passed"
 else
   say "skipping unit tests (--no-tests / --fast)"
 fi
 
 if [ "$CLIPPY" -eq 1 ]; then
   if command -v cargo-clippy >/dev/null 2>&1 || cargo clippy --version >/dev/null 2>&1; then
-    say "clippy (deny-level errors fail the deploy; warnings are non-fatal)"
+    step "lint gate (cargo clippy; deny-level errors fail)"
     # Capture full output; fail only if clippy emitted a hard error (deny lint
     # or compile failure), not on ordinary warnings.
     CLIPPY_OUT="$(cargo clippy --release --locked 2>&1)"
@@ -148,18 +201,21 @@ if [ "$CLIPPY" -eq 1 ]; then
       die "clippy reported one or more errors (deny-level lint or compile failure)"
     fi
     say "  clippy clean (no errors)"
+    step_done "clippy clean"
   else
     warn "cargo-clippy not installed; skipping lint gate"
   fi
 fi
 
-say "building release (cargo build --release --locked)"
+step "build release (cargo build --release --locked)"
 cargo build --release --locked || die "release build failed"
 BIN="$SRC/target/release/pir"
 [ -x "$BIN" ] || die "binary not produced at $BIN"
+dbg "BIN=$BIN  size=$(stat -c%s "$BIN" 2>/dev/null || echo '?') bytes"
+step_done "release build at $BIN"
 
 # --------------------------------------------------------------- binary smoke
-say "smoke tests on built binary"
+step "smoke tests on built binary"
 V="$($BIN --version 2>&1)" || die "--version failed"
 [[ "$V" =~ ^pir\ [0-9]+\.[0-9]+\.[0-9]+ ]] || die "unexpected --version output: $V"
 say "  version ok: $V"
@@ -169,6 +225,7 @@ say "  --help ok"
 
 # With no API key the provider/config path must fail gracefully (no panic).
 rc=0
+dbg "spawning one-shot with no API key (expect graceful non-zero exit, no panic)"
 env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u PI_MODEL \
   bash -c "echo '' | '$BIN' >/dev/null 2>&1" || rc=$?
 if [ "$rc" -eq 0 ]; then
@@ -178,8 +235,9 @@ if dmesg 2>/dev/null | tail -1 | grep -qi 'pir.*core dumped'; then
   die "binary crashed (core dump) on missing API key"
 fi
 say "  graceful no-key failure ok (exit=$rc)"
+step_done "smoke tests passed (version='$V')"
 
-[ "$TEST_ONLY" -eq 1 ] && { say "test-only mode; skipping install and publish."; exit 0; }
+[ "$TEST_ONLY" -eq 1 ] && { say "test-only mode; skipping install and publish."; step_done "test-only complete"; exit 0; }
 
 # --------------------------------------------------------------- publish guard
 if [ "$RELEASE" -eq 1 ]; then
@@ -195,7 +253,7 @@ if [ "$PUSH" -eq 1 ] || [ -n "$TAG" ]; then
 fi
 
 # --------------------------------------------------------------- install
-say "installing to $PREFIX"
+step "install to $PREFIX"
 mkdir -p "$PREFIX"
 INSTALLED="$PREFIX/pir"
 install -m 0755 "$BIN" "$INSTALLED"
@@ -210,9 +268,11 @@ esac
 # verify it resolves
 "$INSTALLED" --version >/dev/null 2>&1 || die "installed binary failed --version check"
 say "  installed binary --version ok"
+step_done "installed $INSTALLED"
 
 # --------------------------------------------------------------- project user (root opt)
 if [ "$WITH_PROJECT_INIT" -eq 1 ]; then
+  step "provision per-project user (pir project init)"
   [ "$(id -u)" -eq 0 ] || die "--with-project-init requires root"
   say "provisioning per-project user (pir project init)"
   "$INSTALLED" project init || die "project init failed"
@@ -222,11 +282,13 @@ if [ "$WITH_PROJECT_INIT" -eq 1 ]; then
   sudo -u "ai_$PROJ" "$INSTALLED" --version >/dev/null 2>&1 \
     || warn "could not verify --version as ai_$PROJ (may lack ~/.pi config)"
   say "  ai_$PROJ provisioned"
+  step_done "ai_$PROJ provisioned"
 fi
 
 # --------------------------------------------------------------- publish to GitHub (opt-in)
 if [ "$PUSH" -eq 1 ] || [ -n "$TAG" ] || [ "$RELEASE" -eq 1 ]; then
-  say "publishing to GitHub"
+  step "publish to GitHub ($PUSH_REMOTE, tag='${TAG:-none}', release=$RELEASE)"
+  dbg "PUSH_REF will derive to: ${PUSH_BRANCH:-${REF:-HEAD}}"
 
   # Default the ref to push: an explicit --push-branch, else HEAD, else REF.
   PUSH_REF="${PUSH_BRANCH:-${REF:-HEAD}}"
@@ -269,6 +331,7 @@ if [ "$PUSH" -eq 1 ] || [ -n "$TAG" ] || [ "$RELEASE" -eq 1 ]; then
       || die "gh release create failed for $TAG"
     say "  released $TAG on GitHub"
   fi
+  step_done "publish complete"
 fi
 
 say "deploy complete: $INSTALLED  ($V)"
