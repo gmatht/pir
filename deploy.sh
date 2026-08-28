@@ -15,9 +15,12 @@
 #        build/install step and the per-project-user step separate.
 #      * Parallelism: a detached worktree lets you keep developing (or run
 #        CI) in the main tree while a release is built elsewhere.
-#    This script builds in the current dir by default, but `--ref <tag|sha>`
-#    materializes a throwaway `git worktree` of that ref and deploys from it,
-#    then cleans it up.
+#    This script builds in the current dir by default for local/test runs
+#    (--test-only / --no-push), but any PUBLISH run (--release / --push / --tag)
+#    automatically materializes a throwaway `git worktree` of HEAD and deploys
+#    from it, then cleans it up — so you never ship the shared, possibly dirty
+#    working tree. Override the ref with `--ref <tag|sha>`, or force in-place
+#    with `--in-place`.
 #
 # Q: What tests should it do?
 #      * Build reproducibility: `cargo build --release --locked` (lockfile must
@@ -69,6 +72,11 @@ REF=""
 # even when the feature that uses it is disabled. Point this at the main pir
 # checkout (auto-derived from the worktree if unset).
 SHARED_REPO=""
+# IN_PLACE: by default a PUBLISH run (--release/--push/--tag) deploys from a
+# clean throwaway worktree of HEAD, never the dirty shared working tree, so we
+# never ship a competing dev's half-edited files (or accidental WIP). Pass
+# --in-place to build/test/install in the current directory instead.
+IN_PLACE=0
 WITH_PROJECT_INIT=0
 TEST_ONLY=0
 TESTS=1
@@ -92,6 +100,7 @@ while [ $# -gt 0 ]; do
     --ref=*)         REF="${1#*=}"; shift ;;
     --shared-repo)   SHARED_REPO="$2"; shift 2 ;;
     --shared-repo=*) SHARED_REPO="${1#*=}"; shift ;;
+    --in-place)      IN_PLACE=1; shift ;;
     --with-project-init) WITH_PROJECT_INIT=1; shift ;;
     --test-only)     TEST_ONLY=1; shift ;;
     --no-clippy)     CLIPPY=0; shift ;;
@@ -168,6 +177,16 @@ dbg "git=$(git --version)  cwd=$(pwd)  user=$(id -un) (uid $(id -u))"
 step "resolve source tree${REF:+ (ref $REF)}"
 SRC="$(pwd)"
 CLEANUP_WORKTREE=0
+# By default a PUBLISH run (--release/--push/--tag) deploys from a clean
+# throwaway worktree of HEAD, NOT the current shared working tree, so we never
+# ship another worker's half-edited files or accidental WIP. Local-only runs
+# (--test-only, --no-push) stay in the current directory. --ref overrides the
+# ref; --in-place forces the current directory.
+if [ -z "$REF" ] && [ "$IN_PLACE" -eq 0 ] && [ "$TEST_ONLY" -eq 0 ]; then
+  if [ "$PUSH" -eq 1 ] || [ -n "$TAG" ] || [ "$RELEASE" -eq 1 ]; then
+    REF="HEAD"
+  fi
+fi
 if [ -n "$REF" ]; then
   [ -f Cargo.toml ] || die "run deploy.sh from inside the pir repo (so git worktree can be added)"
   WT="$(mktemp -d "${TMPDIR:-/tmp}/pir-deploy.XXXXXX")"
