@@ -88,6 +88,7 @@ mod gtk_adapter {
     }
 
     impl Clone for Label { fn clone(&self) -> Self { Label(self.0.clone()) } }
+    impl Widget for Label { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
 
     #[repr(transparent)]
     pub struct BoxWidget(pub GBox);
@@ -244,6 +245,7 @@ mod gtk_adapter {
     pub struct Dialog(pub GDialog);
     impl Widget for Dialog { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
     impl AsRef<*mut c_void> for Dialog { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+    impl Clone for Dialog { fn clone(&self) -> Self { Dialog(self.0.clone()) } }
 
     impl Dialog {
         pub fn set_title(&self, title: &str) { self.0.set_title(title); }

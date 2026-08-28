@@ -2064,6 +2064,7 @@ impl Drop for MenuBar {
 }
 
 // ---- Dialog ----
+#[derive(Clone)]
 pub struct Dialog {
     inner: *mut c_void,
     loader: Arc<Loader>,

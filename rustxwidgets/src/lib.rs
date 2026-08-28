@@ -5,6 +5,11 @@ pub mod prelude;
 pub mod core;
 pub mod spreadsheet;
 pub mod overflow;
+
+/// Re-export the dynamic GTK loader so host apps using the `gtk` backend can reach
+/// raw symbols (signal wiring, event state, ...) without depending on it directly.
+#[cfg(feature = "gtk")]
+pub use gtk_dynamic_loader;
 pub mod lifecycle_stress;
 pub mod backends;
 #[cfg(all(feature = "gtk4-rs", target_os = "linux", not(feature = "zork")))]
