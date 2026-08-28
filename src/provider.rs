@@ -650,6 +650,15 @@ fn is_retryable(error: &str) -> bool {
     {
         return true;
     }
+    // A misrouted request: the response was HTML / non-JSON, meaning the call
+    // never reached the model API (proxy/gateway 404, transient routing flap,
+    // or an upstream outage). Retry it immediately (no backoff) so a momentary
+    // blip doesn't abort the whole turn — the identical request will succeed
+    // once routing recovers. A *genuine* API error comes back as JSON (handled
+    // above), so a real 404 ("model not found") is still fatal.
+    if error.contains("misrouted") {
+        return true;
+    }
     // Transport-layer (non-HTTP) failures: ureq reports these as bare
     // messages; they are retryable connection/timeout/IO problems.
     if error.starts_with("HTTP ") {
@@ -658,48 +667,82 @@ fn is_retryable(error: &str) -> bool {
     true
 }
 
+/// Classify an HTTP error response body and produce a short, terminal-safe
+/// detail string (no megabytes of HTML pasted into the UI). The returned text
+/// also carries a *marker* that `is_retryable` reads to decide whether the
+/// failure was a genuine model-API error (fatal) or an upstream/proxy mishap
+/// (transient, worth replaying).
+///
+/// Key case: a `404` whose body is **HTML** is not the model API rejecting the
+/// request — it's a proxy / gateway / load-balancer `404`, i.e. the request
+/// never reached the API (misrouted `baseUrl`, a transient routing flap, or an
+/// upstream outage). That is *transient*, so it's marked `misrouted` and the
+/// retry loop replays it instead of aborting the turn on a momentary blip. A
+/// genuine API `404` (JSON, e.g. "model does not exist") is fatal — replaying
+/// the identical request can never succeed.
+pub(crate) fn http_status_detail(code: u16, body: &str) -> String {
+    // If the API spoke JSON, prefer `error.message` / `message`. A JSON body
+    // (even without a known message field) means the *model API* answered — so
+    // the status is authoritative and not a routing mishap.
+    if let Some(v) = serde_json::from_str::<Value>(body).ok() {
+        let detail = v
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| v.get("message").and_then(Value::as_str).map(str::to_string));
+        match detail {
+            Some(d) => return format!("HTTP {code}: {d}"),
+            None => {
+                // JSON but no message: collapse it so it's readable but bounded.
+                let collapsed = body
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(200)
+                    .collect::<String>();
+                return format!("HTTP {code}: {collapsed}");
+            }
+        }
+    }
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return format!("HTTP {code}: (empty response body)");
+    }
+    if trimmed.starts_with('<') || trimmed.to_ascii_lowercase().starts_with("<!doctype") {
+        // HTML came back, not the API. A `404` here is a proxy/gateway 404:
+        // the request never reached the model API, so it's transient — mark it
+        // `misrouted` for `is_retryable`. Other HTML status codes (e.g. a
+        // gateway `502` returning HTML) are already retried on their numeric
+        // code, so they just get a short summary (no `misrouted` marker needed).
+        if code == 404 {
+            return format!(
+                "HTTP {code}: misrouted (non-JSON {}-byte body) — proxy/gateway 404, likely transient",
+                trimmed.len()
+            );
+        }
+        return format!(
+            "HTTP {code}: non-JSON response ({} bytes) — not a model-API error (misrouted baseUrl?)",
+            trimmed.len()
+        );
+    }
+    // Some other plain-text body: keep it but bounded.
+    let collapsed = trimmed
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(200)
+        .collect::<String>();
+    format!("HTTP {code}: {collapsed}")
+}
+
 fn http_error(e: ureq::Error) -> String {
     match e {
         ureq::Error::Status(code, resp) => {
             let mut body = String::new();
             let _ = resp.into_reader().take(8192).read_to_string(&mut body);
-            // Prefer a JSON `error.message` / `message` field when the API
-            // spoke JSON. Otherwise the response is not a model-API error and
-            // dumping it whole (e.g. a misrouted 404 returning an entire HTML
-            // "Not Found" page) just floods the terminal. Collapse whitespace
-            // and, for HTML/non-JSON bodies, summarize as a short length note
-            // instead of pasting the markup.
-            let detail = serde_json::from_str::<Value>(&body)
-                .ok()
-                .and_then(|v| {
-                    v.pointer("/error/message")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .or_else(|| v.get("message").and_then(Value::as_str).map(str::to_string))
-                });
-            let detail = match detail {
-                Some(d) => d,
-                None => {
-                    let trimmed = body.trim();
-                    if trimmed.is_empty() {
-                        "(empty response body)".to_string()
-                    } else if trimmed.starts_with('<')
-                        || trimmed.to_ascii_lowercase().starts_with("<!doctype")
-                    {
-                        // A non-JSON (HTML) response: almost certainly a
-                        // misrouted request, not a model error. Don't paste the
-                        // markup — just note what came back so the routing
-                        // misconfiguration is obvious without trashing the UI.
-                        format!("non-JSON response ({} bytes) — not a model-API error (misrouted baseUrl?)", body.len())
-                    } else {
-                        // Some other plain-text body: keep it but bounded.
-                        let collapsed: String =
-                            trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
-                        collapsed.chars().take(200).collect::<String>()
-                    }
-                }
-            };
-            format!("HTTP {code}: {detail}")
+            http_status_detail(code, &body)
         }
         other => other.to_string(),
     }
@@ -1134,22 +1177,36 @@ mod tests {
     fn http_error_summarizes_non_json_body() {
         // A misrouted 404 returning an HTML "Not Found" page must NOT be dumped
         // across the terminal; summarize it so the routing misconfig is obvious
-        // without flooding the UI. (We can't construct a `ureq::Error::Status`
-        // directly, so exercise the string the parser would surface — the real
-        // body is collapsed by `http_error` before it's reported.)
+        // without flooding the UI. The `misrouted` marker also tells
+        // `is_retryable` to replay the request instead of aborting the turn.
         let html = "<!DOCTYPE html><html><head><title>Not Found</title></head>\
                     <body><div>404 - Page Not Found</div></body></html>";
-        // Mirror `http_error`'s collapse so the behaviour is locked in: HTML is
-        // summarised, never pasted wholesale.
-        let collapsed = if html.trim_start().to_ascii_lowercase().starts_with("<!doctype")
-            || html.trim_start().starts_with('<')
-        {
-            format!("non-JSON response ({} bytes) — not a model-API error (misrouted baseUrl?)", html.len())
-        } else {
-            html.to_string()
-        };
-        assert!(collapsed.starts_with("non-JSON response"), "got: {collapsed}");
-        assert!(!collapsed.contains("Page Not Found"), "HTML must not be pasted: {collapsed}");
+        let detail = http_status_detail(404, html);
+        assert!(detail.starts_with("HTTP 404: misrouted"), "got: {detail}");
+        assert!(detail.contains("misrouted"), "got: {detail}");
+        assert!(!detail.contains("Page Not Found"), "HTML must not be pasted: {detail}");
+        // A genuine (JSON) 404 is summarized but NOT marked misrouted, so it
+        // stays fatal.
+        let json = r#"{"error":{"message":"model does not exist"}}"#;
+        let detail2 = http_status_detail(404, json);
+        assert!(detail2.starts_with("HTTP 404: model does not exist"), "got: {detail2}");
+        assert!(!detail2.contains("misrouted"), "genuine 404 must not be retryable: {detail2}");
+    }
+
+    #[test]
+    fn misrouted_404_is_retryable() {
+        // A non-JSON 404 (proxy/gateway 404 → request never reached the API) is
+        // transient: replay it so a routing flap doesn't abort the turn.
+        let detail = http_status_detail(404, "<!DOCTYPE html><html><body>404</body></html>");
+        assert!(is_retryable(&detail), "got: {detail}");
+    }
+
+    #[test]
+    fn genuine_json_404_is_fatal() {
+        // A JSON 404 means the model API answered and rejected the request;
+        // replaying the identical call can't help, so it's fatal.
+        let detail = http_status_detail(404, r#"{"error":{"message":"model not found"}}"#);
+        assert!(!is_retryable(&detail), "got: {detail}");
     }
 
     #[test]
