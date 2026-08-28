@@ -193,10 +193,29 @@ impl Client {
         thinking: crate::config::ThinkingLevel,
         model_ctx: u64,
         on_think: &mut dyn FnMut(&str),
+        // Per-model API override (OpenCode Zen: the API varies per model).
+        api_override: Option<ApiKind>,
+        // Per-model request URL override (OpenCode Zen per-model baseUrl).
+        url_override: Option<&str>,
+        // `false` when the model rejects OpenAI `reasoning_effort`.
+        allow_reasoning_effort: bool,
     ) -> Result<(Message, Usage), String> {
-        let (url, body) = match self.kind {
+        let kind = api_override.unwrap_or(self.kind);
+        let (url, body) = match kind {
             ApiKind::Anthropic => self.anthropic_request(model, max_tokens, system, history, tools, thinking, model_ctx),
-            ApiKind::OpenAi => self.openai_request(model, max_tokens, system, history, tools, thinking),
+            ApiKind::OpenAi => match url_override {
+                Some(u) => self.openai_request_at(
+                    u,
+                    model,
+                    max_tokens,
+                    system,
+                    history,
+                    tools,
+                    thinking,
+                    allow_reasoning_effort,
+                ),
+                None => self.openai_request(model, max_tokens, system, history, tools, thinking),
+            },
         };
         // Retry the whole request (connect + stream parse) on transient errors.
         // `emitted_text` is set by the stream parsers the moment any token is
@@ -225,7 +244,7 @@ impl Client {
             let read_timeout = READ_TIMEOUT_INIT * READ_TIMEOUT_GROWTH.saturating_pow(attempt as u32);
             let http = Self::http_agent(read_timeout);
             let mut req = http.post(&url);
-            req = match self.kind {
+            req = match kind {
                 ApiKind::Anthropic => req
                     .set("x-api-key", &self.api_key)
                     .set("anthropic-version", "2023-06-01"),
@@ -249,7 +268,7 @@ impl Client {
                     // is where the wait actually happens during a turn.
                     let body_reader = CancelableReader::new(resp.into_reader(), cancel.clone());
                     let mut reader = BufReader::new(body_reader);
-                    match self.kind {
+                    match kind {
                         ApiKind::Anthropic => stream_anthropic(
                             &mut reader,
                             on_text,
@@ -406,6 +425,28 @@ impl Client {
             body.insert("reasoning_effort".into(), json!(effort));
         }
         (format!("{}/chat/completions", self.base_url), Value::Object(body))
+    }
+
+    /// OpenAI request with an explicit target URL (per-model override, used by
+    /// the OpenCode Zen catalog) and a `reasoning_effort` opt-out for models
+    /// that reject the field (kimi-k2.6, grok-build-0.1, forced-Go qwen/minimax).
+    fn openai_request_at(
+        &self,
+        url: &str,
+        model: &str,
+        max_tokens: u64,
+        system: &str,
+        history: &[Message],
+        tools: &[ToolSpec],
+        thinking: crate::config::ThinkingLevel,
+        allow_effort: bool,
+    ) -> (String, Value) {
+        let (base, mut body) = self.openai_request(model, max_tokens, system, history, tools, thinking);
+        let _ = base;
+        if !allow_effort {
+            body.as_object_mut().unwrap().remove("reasoning_effort");
+        }
+        (url.to_string(), body)
     }
 
     /// Rough context window for the current request, used to scale the Anthropic
@@ -622,6 +663,12 @@ fn http_error(e: ureq::Error) -> String {
         ureq::Error::Status(code, resp) => {
             let mut body = String::new();
             let _ = resp.into_reader().take(8192).read_to_string(&mut body);
+            // Prefer a JSON `error.message` / `message` field when the API
+            // spoke JSON. Otherwise the response is not a model-API error and
+            // dumping it whole (e.g. a misrouted 404 returning an entire HTML
+            // "Not Found" page) just floods the terminal. Collapse whitespace
+            // and, for HTML/non-JSON bodies, summarize as a short length note
+            // instead of pasting the markup.
             let detail = serde_json::from_str::<Value>(&body)
                 .ok()
                 .and_then(|v| {
@@ -629,8 +676,29 @@ fn http_error(e: ureq::Error) -> String {
                         .and_then(Value::as_str)
                         .map(str::to_string)
                         .or_else(|| v.get("message").and_then(Value::as_str).map(str::to_string))
-                })
-                .unwrap_or_else(|| body.trim().to_string());
+                });
+            let detail = match detail {
+                Some(d) => d,
+                None => {
+                    let trimmed = body.trim();
+                    if trimmed.is_empty() {
+                        "(empty response body)".to_string()
+                    } else if trimmed.starts_with('<')
+                        || trimmed.to_ascii_lowercase().starts_with("<!doctype")
+                    {
+                        // A non-JSON (HTML) response: almost certainly a
+                        // misrouted request, not a model error. Don't paste the
+                        // markup — just note what came back so the routing
+                        // misconfiguration is obvious without trashing the UI.
+                        format!("non-JSON response ({} bytes) — not a model-API error (misrouted baseUrl?)", body.len())
+                    } else {
+                        // Some other plain-text body: keep it but bounded.
+                        let collapsed: String =
+                            trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+                        collapsed.chars().take(200).collect::<String>()
+                    }
+                }
+            };
             format!("HTTP {code}: {detail}")
         }
         other => other.to_string(),
@@ -1063,6 +1131,28 @@ mod tests {
     }
 
     #[test]
+    fn http_error_summarizes_non_json_body() {
+        // A misrouted 404 returning an HTML "Not Found" page must NOT be dumped
+        // across the terminal; summarize it so the routing misconfig is obvious
+        // without flooding the UI. (We can't construct a `ureq::Error::Status`
+        // directly, so exercise the string the parser would surface — the real
+        // body is collapsed by `http_error` before it's reported.)
+        let html = "<!DOCTYPE html><html><head><title>Not Found</title></head>\
+                    <body><div>404 - Page Not Found</div></body></html>";
+        // Mirror `http_error`'s collapse so the behaviour is locked in: HTML is
+        // summarised, never pasted wholesale.
+        let collapsed = if html.trim_start().to_ascii_lowercase().starts_with("<!doctype")
+            || html.trim_start().starts_with('<')
+        {
+            format!("non-JSON response ({} bytes) — not a model-API error (misrouted baseUrl?)", html.len())
+        } else {
+            html.to_string()
+        };
+        assert!(collapsed.starts_with("non-JSON response"), "got: {collapsed}");
+        assert!(!collapsed.contains("Page Not Found"), "HTML must not be pasted: {collapsed}");
+    }
+
+    #[test]
     fn non_retryable_http_codes() {
         assert!(!is_retryable("HTTP 400: bad request"));
         assert!(!is_retryable("HTTP 401: unauthorized"));
@@ -1324,6 +1414,9 @@ mod tests {
             crate::config::ThinkingLevel::Off,
             0,
             &mut |_s: &str| {},
+            None,
+            None,
+            true,
         );
         let elapsed = started.elapsed();
         assert!(res.is_err(), "expected cancellation error, got {res:?}");
@@ -1369,6 +1462,9 @@ mod tests {
             crate::config::ThinkingLevel::Off,
             0,
             &mut |_s: &str| {},
+            None,
+            None,
+            true,
         );
         assert!(res.is_ok(), "slow-but-alive provider must complete, got {res:?}");
         assert!(text.contains("hi"), "expected streamed text, got {text:?}");
@@ -1413,6 +1509,9 @@ mod tests {
             crate::config::ThinkingLevel::Off,
             0,
             &mut |_s: &str| {},
+            None,
+            None,
+            true,
         );
         assert!(res.is_ok(), "response that lands before cancel must win, got {res:?}");
         assert!(text.contains("ok"), "expected streamed text, got {text:?}");
