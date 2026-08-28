@@ -43,9 +43,8 @@ OPTIONS
   -r, --resume [token]       resume a session; token selects by index/time/preview
   -c, --continue [token]     resume a session and continue its goal (pir -c)
   -u, --as <user>            run project commands as this user (default ai_<project>)
-  --tui                force the full-screen TUI REPL (default when built
-                       with the `tui` feature)
-  --no-tui             use the plain streaming REPL instead of the TUI
+  --tui                use the full-screen TUI REPL (requires the `tui` feature)
+  --no-tui             use the plain streaming REPL (this is the default build)
   --no-raw             use line-buffered stdin (no raw mode) — for constrained
                        terminals / screen where raw input misbehaves
   --budget <tokens>    optional cumulative in+out token cap; turn stops (with a
@@ -69,7 +68,7 @@ AGENT USERS RUN UNATTENDED
   PIR_CONFIRM=1 to force prompts even as an ai_* user.
 
 COMMANDS
-  /help  /model <sel>  /models  /sessions  /goal [objective]  /continue
+  /help  /model <sel>  /models  /default-model <sel>  /sessions  /goal [objective]  /continue
   /bg <text>  /jobs  /fg <id>  /clear  /usage  /exit
   /undo [all]             revert the last file edit (or all) to its pre-edit state
   /project init            create the ai_<project> user and chown the cwd (root)
@@ -498,14 +497,17 @@ fn main() {
         return;
     }
 
-    // Full-screen TUI REPL (default when the `tui` feature is compiled in;
-    // pass `--no-tui` to use the streaming REPL). It owns the terminal
-    // (alternate screen + raw mode via crossterm) and renders a conversation
-    // pane + footer pane (thinking + live draft prompt) with its own
-    // scrollback — no hand-rolled ANSI block, so the stray-spinner class of
-    // bug can't recur.
+    // Full-screen TUI REPL (default when the `tui` feature is compiled in; pass
+    // `--no-tui` to use the streaming REPL). It owns the terminal (alternate
+    // screen + raw mode via crossterm) and renders a conversation pane + footer
+    // pane (thinking + live draft prompt) with its own scrollback — no
+    // hand-rolled ANSI block, so the stray-spinner class of bug can't recur.
+    // The agent is switched to `quiet` mode first so its token streaming never
+    // reaches the screen (ratatui owns every cursor); the TUI renders the
+    // conversation by tailing the agent's session log instead.
     #[cfg(feature = "tui")]
     if use_tui {
+        agent.set_quiet(true);
         let agent_slot: Arc<Mutex<Option<Agent>>> = Arc::new(Mutex::new(Some(agent)));
         let (done_tx, _done_rx) = smol::channel::bounded(1);
         match crate::tui::run(
@@ -521,10 +523,11 @@ fn main() {
             Ok(()) => return,
             Err(e) => {
                 // Fall back to the streaming REPL if the TUI can't start
-                // (e.g. not a tty). Take the agent back out of the slot so the
-                // streaming path below can use it.
+                // (e.g. not a tty). Take the agent back out of the slot and
+                // restore its stdout streaming so the fallback works.
                 eprintln!("pir: --tui failed: {e}; falling back to plain REPL");
                 agent = agent_slot.lock().unwrap().take().expect("agent present");
+                agent.set_quiet(false);
             }
         }
     }
@@ -921,6 +924,25 @@ fn handle_command(
             }
         }
         "models" => print!("{}", list_models(providers)),
+        "dm" | "default-model" => {
+            // Set the default model for *new* sessions by persisting it to
+            // ~/.pi/agent/settings.json. With no argument, just show the
+            // current default (if any).
+            if rest.is_empty() {
+                match config::default_model_setting() {
+                    Some(d) => println!("default model (new sessions): {}", d),
+                    None => println!("{} no default model set", term::dim("·")),
+                }
+                return;
+            }
+            match config::select(providers, &rest.join(" ")) {
+                Ok((p, m)) => match config::set_default_model(&p.pid(), &m.id) {
+                    Ok(path) => println!("→ default model set to {} (saved in {})", p.label(m), path.display()),
+                    Err(e) => eprintln!("pir: {e}"),
+                },
+                Err(e) => eprintln!("{e}"),
+            }
+        }
         "sessions" => print!("{}", list_sessions()),
         "bg" => {
             let prompt: String = rest.join(" ");

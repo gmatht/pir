@@ -274,6 +274,30 @@ pub fn default_model_setting() -> Option<String> {
     Some(format!("{}/{}", provider, model))
 }
 
+/// Persist a provider/model as the default for new pir sessions by writing it
+/// into `~/.pi/agent/settings.json` under `defaultProvider`/`defaultModel`
+/// (the keys [`default_model_setting`] reads at startup). Creates the file /
+/// `agent` dir if missing, and preserves any other keys already present.
+pub fn set_default_model(provider: &str, model: &str) -> Result<PathBuf, String> {
+    let p = pi_dir().join("agent").join("settings.json");
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    let mut v: Value = fs::read_to_string(&p)
+        .ok()
+        .and_then(|r| serde_json::from_str(&r).ok())
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    if !v.is_object() {
+        v = Value::Object(serde_json::Map::new());
+    }
+    let obj = v.as_object_mut().unwrap();
+    obj.insert("defaultProvider".into(), Value::String(provider.to_string()));
+    obj.insert("defaultModel".into(), Value::String(model.to_string()));
+    fs::write(&p, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    Ok(p)
+}
+
 /// Path to the projects.json file that maps project names to the per-project
 /// execution user and path. Created/updated by `pir project init`.
 pub fn projects_file() -> PathBuf {
