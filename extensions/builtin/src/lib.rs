@@ -407,19 +407,37 @@ impl Builtin {
             return Err(format!("job_kill: no such job #{id}"));
         };
         let was_running = slot.child.try_wait().map(|s| s.is_none()).unwrap_or(true);
-        if was_running {
-            let _ = slot.child.kill();
-            let _ = slot.child.wait();
-        }
-        let status = slot.child.try_wait().map_err(|e| format!("wait: {e}"))?;
-        // Take the drain handles out of the slot so we can join them.
+        // Kill the WHOLE process group (the child got process_group(0)), not
+        // just the direct `bash -c` child: grandchildren like `cargo`/`rustc`
+        // survive a lone SIGKILL to the child and keep the output pipes open,
+        // which used to hang the drain joins below forever — job_kill never
+        // returned, so the agent loop and the REPL with it (the recorded
+        // "job_kill then silence" hang). If it had already exited, just reap.
+        let status = if was_running {
+            kill_process_tree(&mut slot.child)
+        } else {
+            slot.child.wait().ok()
+        };
+        // Take the drain handles out of the slot so we can join them — but
+        // bounded: if anything still holds the pipe (a grandchild that raced
+        // the kill, an orphaned `cmd &`), abandon the drain thread instead of
+        // blocking the REPL forever. The thread dies with the process and the
+        // output already captured in the shared buffer stays readable.
         let drain_out = std::mem::replace(&mut slot.drain_out, std::thread::spawn(|| {}));
         let drain_err = std::mem::replace(&mut slot.drain_err, std::thread::spawn(|| {}));
-        let _ = drain_out.join();
-        let _ = drain_err.join();
+        join_drain(drain_out);
+        join_drain(drain_err);
         self.jobs.retain(|j| j.id != id);
         match status {
-            Some(s) => Ok(format!("job#{} stopped (exit {})", id, s.code().unwrap_or(-1))),
+            Some(s) if !was_running => Ok(format!(
+                "job#{} had already finished (exit {}); nothing to kill",
+                id,
+                s.code().unwrap_or(-1)
+            )),
+            Some(s) => match s.code() {
+                Some(c) => Ok(format!("job#{} stopped (exit {})", id, c)),
+                None => Ok(format!("job#{} killed (by signal)", id)),
+            },
             None => Ok(format!("job#{} killed", id)),
         }
     }
@@ -462,7 +480,13 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
     const SHOW_AFTER: Duration = Duration::from_secs(10);
     // After this long, detach into a background job and hand control back to
     // the model (so an unattended agent never blocks waiting on a human).
-    const CHECK_IN: Duration = Duration::from_secs(10 * 60);
+    // Overridable for tests/CI via PIR_SHELL_CHECK_IN_SECS.
+    let check_in_secs: u64 = std::env::var("PIR_SHELL_CHECK_IN_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(10 * 60);
+    let check_in = Duration::from_secs(check_in_secs);
 
     // The shared hard-abort flag (`b.abort` is the same Arc as the REPL's
     // `fg_cancel`). When the user presses ESC/ctrl-c, the REPL sets it; we poll
@@ -541,24 +565,13 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
 
     let abort = b.abort.clone();
     let deadline = Instant::now() + TIMEOUT;
-    let mut next_check_in = Instant::now() + CHECK_IN;
+    let mut next_check_in = Instant::now() + check_in;
     // Kill the whole process group of the child (item: child is in its own
     // group via process_group(0)), so shell pipelines / subcommands die too,
     // and so cancelling a runaway command never takes pir down with it.
+    // TERM first, bounded grace, then KILL for survivors.
     let kill_tree = |child: &mut std::process::Child| {
-        #[cfg(unix)]
-        {
-            let pgid = child.id() as i32;
-            // Negative pid => signal the whole group. Ignore errors (already
-            // exited / reparented).
-            unsafe { let _ = libc::kill(-pgid, libc::SIGTERM); }
-            let _ = child.wait();
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        kill_process_tree(child);
     };
     let status = loop {
         // ESC/ctrl-c hard-abort: if the user asked to cancel the command, kill
@@ -621,10 +634,13 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
         let _ = serr.flush();
     }
 
-    let _ = drain_out.join();
-    let _ = drain_err.join();
+    // Bounded joins: if something outside the group still holds the pipe (an
+    // orphaned `cmd &` from the command string), don't block the REPL forever
+    // waiting for EOF — abandon the drain thread instead.
+    let drains_done = join_drain(drain_out) && join_drain(drain_err);
     let out = out_buf.lock().unwrap().clone();
     let err = err_buf.lock().unwrap().clone();
+    let _ = drains_done;
 
     let mut text = String::from_utf8_lossy(&out).to_string();
     let err_text = String::from_utf8_lossy(&err).to_string();
@@ -664,6 +680,74 @@ fn copy_capped(r: &mut impl Read, buf: &Arc<Mutex<Vec<u8>>>) {
             }
             Err(_) => break,
         }
+    }
+}
+
+/// Kill a detached job's WHOLE process group: TERM the group, wait briefly,
+/// then KILL any survivors. `Child::kill()` only signals the direct
+/// `bash -c` child, so grandchildren (`cargo`, `rustc`, `sleep 30` behind a
+/// pipe) survived and kept the output pipes open — which hung `job_kill`'s
+/// drain joins forever and wedged the agent loop/REPL. The child was spawned
+/// with `process_group(0)`, so its pgid == its pid and `kill(-pgid)` reaches
+/// every descendant that didn't create its own group.
+///
+/// Returns the child's exit status (reaped exactly once, here).
+pub(crate) fn kill_process_tree(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
+    #[cfg(unix)]
+    {
+        let pgid = child.id() as i32;
+        // Negative pid => signal the whole group; TERM first so well-behaved
+        // children can flush, then a bounded grace period, then KILL for
+        // anything still alive. Errors ignored (already exited / reparented /
+        // group gone).
+        unsafe {
+            let _ = libc::kill(-pgid, libc::SIGTERM);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            match child.try_wait() {
+                // TERM landed: this try_wait already reaped the child.
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    unsafe {
+                        let _ = libc::kill(-pgid, libc::SIGKILL);
+                    }
+                    let _ = child.kill();
+                    return child.wait().ok();
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                Err(_) => return None,
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+        child.wait().ok()
+    }
+}
+
+/// Join a drain thread, but never longer than `max`: a pipe whose write end
+/// is still held by a surviving/orphaned process would otherwise block this
+/// join forever and wedge the agent loop. Returns true if the thread finished
+/// in time; if not, it is detached and will die with the process (output
+/// already captured stays in the shared buffer).
+fn join_drain(h: JoinHandle<()>) -> bool {
+    // JoinHandle has no timed join on stable; poll `is_finished()` and join
+    // only once the thread is done (join then returns immediately). If the
+    // deadline passes, drop the handle — that detaches the thread, which dies
+    // with the process, and the already-captured output stays in the buffer.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        if h.is_finished() {
+            let _ = h.join();
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            drop(h); // detach; never block the REPL on a stuck pipe
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
 
@@ -768,5 +852,58 @@ mod esc_tests {
         let mut b = Builtin::new(PathBuf::from("."), true, abort.clone(), Arc::new(AtomicBool::new(false)));
         let out = run_shell(&mut b, "echo still-ran").expect("run_shell result");
         assert!(out.contains("still-ran"), "got: {out}");
+    }
+
+    #[test]
+    fn job_kill_survives_grandchild_holding_pipe() {
+        // The exact production hang: a detached `sleep` keeps running with its
+        // output redirected (it inherits and holds the stdout/stderr pipes).
+        // The old job_kill only killed the direct `bash -c` child and then
+        // joined the drain threads, which blocked forever on EOF that never
+        // came — job_kill never returned, the agent loop wedged, and the REPL
+        // never came back. Regression: the group kill + bounded joins must
+        // make job_kill return promptly.
+        std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1");
+        let mut b = Builtin::new(PathBuf::from("."), true, Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let start = Instant::now();
+        let detached = run_shell(&mut b, "sleep 60 > /dev/null 2>&1 & echo detached-ok; sleep 60").expect("run_shell result");
+        assert!(detached.contains("[detached]"), "expected detachment, got: {detached}");
+        let out = b.job_kill(&json!({ "id": 1 })).expect("job_kill must return");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "job_kill took {elapsed:?} — the old forever-join hang is back"
+        );
+        assert!(out.contains("job#1"), "unexpected job_kill reply: {out}");
+    }
+
+    #[test]
+    fn job_kill_reports_signal_not_success() {
+        // Killing a running job should report it was stopped by a signal, not
+        // a success exit code (previously `s.code()` on a signal death was
+        // surfaced as -1, reading like a normal failure).
+        std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1");
+        let mut b = Builtin::new(PathBuf::from("."), true, Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let detached = run_shell(&mut b, "sleep 60").expect("run_shell result");
+        assert!(detached.contains("[detached]"), "expected detachment, got: {detached}");
+        let out = b.job_kill(&json!({ "id": 1 })).expect("job_kill must return");
+        assert!(
+            out.contains("signal") || out.contains("stopped"),
+            "expected a stopped/killed report, got: {out}"
+        );
+        assert!(!out.contains("exit 0"), "signal death must not read as success, got: {out}");
+    }
+
+    #[test]
+    fn job_kill_after_finish_reports_already_finished() {
+        std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1");
+        let mut b = Builtin::new(PathBuf::from("."), true, Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        // 2s command, 1s check-in: guaranteed to detach before it can finish.
+        let detached = run_shell(&mut b, "sleep 2").expect("run_shell result");
+        assert!(detached.contains("[detached]"), "expected detachment, got: {detached}");
+        // Wait for the job to finish on its own, then kill the corpse.
+        std::thread::sleep(Duration::from_millis(2500));
+        let out = b.job_kill(&json!({ "id": 1 })).expect("job_kill must return");
+        assert!(out.contains("already finished"), "got: {out}");
     }
 }
