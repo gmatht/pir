@@ -12,6 +12,23 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+
+/// Process-wide "kill every detached job" switch, created by the first
+/// `Agent::new` and shared with every backend via
+/// `Registry::set_job_kill_handle`. The REPL flips it when the user presses
+/// ESC/ctrl-c (or quits) so detached jobs die even while the agent that owns
+/// them is running on the turn's worker thread. Backends also poll it inside
+/// their own wait loops (a detached job's parent command observes it too).
+static JOB_KILL_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+/// The process-wide job-kill switch (read by the REPL / wait loops). It
+/// exists only after the first agent was built; before that there are no
+/// jobs to kill.
+pub fn job_kill_flag() -> Option<Arc<AtomicBool>> {
+    JOB_KILL_FLAG.get().cloned()
+}
+
 use std::sync::{Arc, Mutex};
 
 pub struct Agent {
@@ -184,6 +201,13 @@ impl Agent {
         // Share the REPL's "go silent" switch with the tool backends so a
         // backgrounded turn silences their in-flight terminal output too.
         registry.set_quiet_handle(quiet_req.clone());
+        // Share the REPL's "kill every detached job" switch so an ESC/ctrl-c
+        // (or quitting) also stops long-running commands the backend detached
+        // into background jobs — previously they kept running, held the output
+        // pipes, and wedged later commands and `job_kill`.
+        let job_kill_flag = Arc::new(AtomicBool::new(false));
+        registry.set_job_kill_handle(job_kill_flag.clone());
+        let _ = JOB_KILL_FLAG.set(job_kill_flag);
         crate::register_all(&mut registry);
         registry.session_started(&cwd);
         // Emit SessionStart so backends (e.g. the pi-extensions bridge) can
@@ -348,6 +372,14 @@ impl Agent {
     /// before the first prompt.
     pub fn startup_reports(&mut self) -> Vec<String> {
         self.registry.startup_reports()
+    }
+
+    /// Kill every long-running command any backend detached into a background
+    /// job (ESC/ctrl-c / quit sweep). Bounded: backend implementations must
+    /// use poll-based kills so this never blocks the REPL's input thread.
+    /// Returns how many running jobs were killed.
+    pub fn registry_kill_all_jobs(&mut self) -> usize {
+        self.registry.kill_all_jobs()
     }
 
     /// The path of the session transcript (used to foreground a session).

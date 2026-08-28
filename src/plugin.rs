@@ -197,6 +197,25 @@ pub trait ToolBackend: Send {
     /// REPL owning the worker. Default no-op for backends that don't stream to
     /// the terminal.
     fn set_quiet_handle(&mut self, _q: Arc<AtomicBool>) {}
+
+    /// Share the REPL's "kill detached jobs" switch with this backend. The
+    /// REPL flips it when the user presses ESC/ctrl-c (or quits), asking the
+    /// backend to kill every long-running command it detached into a
+    /// background job — the flag exists because the worker thread *takes* the
+    /// agent (and with it the backend) out of the agent slot while a turn
+    /// runs, so the REPL cannot reach the backend directly. Backends may
+    /// either poll the flag or act on it on demand; whoever acts clears it.
+    /// Default no-op for backends that keep no jobs.
+    fn set_job_kill_handle(&mut self, _f: Arc<AtomicBool>) {}
+
+    /// Kill every long-running command this backend has detached into a
+    /// background job (the user pressed ESC/ctrl-c: stop *everything*).
+    /// Implementations must use poll-based, bounded waits — this is
+    /// called from the REPL's input thread and must never block it. Returns
+    /// how many *running* jobs were killed. Default: no jobs kept, kill 0.
+    fn kill_all_jobs(&mut self) -> usize {
+        0
+    }
 }
 
 /// Holds every linked backend. The model only ever sees `specs()`; it never
@@ -242,6 +261,26 @@ impl Registry {
         for b in &mut self.backends {
             b.set_quiet_handle(q.clone());
         }
+    }
+
+    /// Share the REPL's "kill detached jobs" switch with every backend. The
+    /// REPL flips it when the user presses ESC/ctrl-c (or quits); backends
+    /// with detached long-running commands then kill them promptly (see
+    /// [`ToolBackend::set_job_kill_handle`]). Call once, right after
+    /// construction.
+    pub fn set_job_kill_handle(&mut self, f: Arc<AtomicBool>) {
+        for b in &mut self.backends {
+            b.set_job_kill_handle(f.clone());
+        }
+    }
+
+    /// Kill every long-running command any backend has detached into a
+    /// background job (ESC/ctrl-c semantics: stop *everything* now). Called
+    /// synchronously by the REPL; must never block (backends are required to
+    /// use bounded, poll-based kills). Returns the number of running jobs
+    /// killed, for a status line.
+    pub fn kill_all_jobs(&mut self) -> usize {
+        self.backends.iter_mut().map(|b| b.kill_all_jobs()).sum()
     }
 
     /// Flat list of every tool across all backends — sent to the model.

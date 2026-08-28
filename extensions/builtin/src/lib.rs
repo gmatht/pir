@@ -52,11 +52,51 @@ struct Builtin {
     /// tool's live elapsed clock then stops writing to the terminal so /// detached turn is silent instead of polluting the prompt with
     /// `· running Ns` lines. False by default (attached / foreground).
     quiet: Arc<AtomicBool>,
+    /// Shared "kill every detached job" switch (the same `Arc` the REPL
+    /// holds). The REPL flips it when the user presses ESC/ctrl-c (or quits):
+    /// detached jobs are otherwise untouchable from the REPL (the agent that
+    /// owns them is taken out of the agent slot mid-turn), so the only ways
+    /// to stop one were `job_kill` by the model or exiting pir entirely. The
+    /// `run_shell` wait loop of the *foreground* command polls this flag too,
+    /// so an ESC kills the running command AND every detached job in one go.
+    /// Consumed (cleared) by whoever acts on it.
+    job_kill: Arc<AtomicBool>,
 }
 
 impl Builtin {
     fn new(cwd: PathBuf, full_auto: bool, abort: Arc<AtomicBool>, quiet: Arc<AtomicBool>) -> Self {
-        Builtin { cwd, full_auto, bash_ok: false, write_ok: false, jobs: Vec::new(), next_job: 1, abort, quiet }
+        Builtin {
+            cwd,
+            full_auto,
+            bash_ok: false,
+            write_ok: false,
+            jobs: Vec::new(),
+            next_job: 1,
+            abort,
+            quiet,
+            job_kill: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Kill EVERY detached job (ESC/ctrl-c semantics). Bounded: each kill uses
+    /// the poll-based `kill_process_tree` (no blocking waits), and the drained
+    /// output stays readable in the shared buffer. Returns how many *running*
+    /// jobs were killed.
+    fn kill_all_jobs(&mut self) -> usize {
+        let mut killed = 0;
+        for j in self.jobs.iter_mut() {
+            if j.child.try_wait().map(|s| s.is_none()).unwrap_or(true) {
+                kill_process_tree(&mut j.child);
+                killed += 1;
+            }
+            // Abandon the drains (bounded join) — never block the REPL thread.
+            let do_ = std::mem::replace(&mut j.drain_out, std::thread::spawn(|| {}));
+            let de = std::mem::replace(&mut j.drain_err, std::thread::spawn(|| {}));
+            join_drain(do_);
+            join_drain(de);
+        }
+        self.jobs.clear();
+        killed
     }
 }
 
@@ -78,6 +118,14 @@ struct Job {
 impl ToolBackend for Builtin {
     fn name(&self) -> &'static str {
         "builtin"
+    }
+
+    fn set_job_kill_handle(&mut self, f: Arc<AtomicBool>) {
+        self.job_kill = f;
+    }
+
+    fn kill_all_jobs(&mut self) -> usize {
+        Builtin::kill_all_jobs(self)
     }
 
     fn specs(&self) -> Vec<ToolSpec> {
@@ -576,7 +624,17 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
     let status = loop {
         // ESC/ctrl-c hard-abort: if the user asked to cancel the command, kill
         // the child immediately and stop — no waiting for it to exit on its own.
+        // Also consume the shared job-kill switch: an ESC must stop EVERY
+        // detached job too, not just this foreground command (they used to keep
+        // running, holding output pipes and wedging later commands/jobs).
         if abort.load(Ordering::SeqCst) {
+            b.kill_all_jobs();
+            kill_tree(&mut child);
+            break None;
+        }
+        if b.job_kill.swap(false, Ordering::SeqCst) {
+            // Same semantics, arriving via the registry's job-kill switch.
+            b.kill_all_jobs();
             kill_tree(&mut child);
             break None;
         }
@@ -584,6 +642,7 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
             Some(status) => break Some(status),
             None => {
                 if Instant::now() >= deadline {
+                    b.kill_all_jobs();
                     kill_tree(&mut child);
                     break None;
                 }
@@ -911,6 +970,39 @@ mod esc_tests {
             "expected a stopped/killed report, got: {out}"
         );
         assert!(!out.contains("exit 0"), "signal death must not read as success, got: {out}");
+    }
+
+    #[test]
+    fn esc_flag_sweep_kills_detached_jobs() {
+        std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1");
+        let job_kill = Arc::new(AtomicBool::new(false));
+        let mut b = Builtin::new(PathBuf::from("."), true, Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        b.set_job_kill_handle(job_kill.clone());
+        // Detach job #1 (a long command), then job #2 (its parent also hangs).
+        let d1 = run_shell(&mut b, "sleep 60").expect("detach 1");
+        assert!(d1.contains("[detached]"), "got: {d1}");
+        let d2 = run_shell(&mut b, "sleep 60 & sleep 60").expect("detach 2");
+        assert!(d2.contains("[detached]"), "got: {d2}");
+        assert_eq!(b.jobs.len(), 2, "two detached jobs must be tracked");
+        // ESC semantics: flip the shared flag, the wait loop consumes it and
+        // sweeps every detached job.
+        job_kill.store(true, Ordering::SeqCst);
+        assert!(b.job_kill.swap(false, Ordering::SeqCst), "flag must be observable");
+        assert!(!b.job_kill.load(Ordering::SeqCst), "flag must be consumed");
+        let killed = b.kill_all_jobs();
+        assert_eq!(killed, 2, "both running jobs must be killed");
+        assert!(b.jobs.is_empty(), "sweep must drop every detached job");
+    }
+
+    #[test]
+    fn kill_all_jobs_via_trait_kills_running_children() {
+        std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1");
+        let mut b = Builtin::new(PathBuf::from("."), true, Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let d = run_shell(&mut b, "sleep 60").expect("detach");
+        assert!(d.contains("[detached]"), "got: {d}");
+        let killed = ToolBackend::kill_all_jobs(&mut b);
+        assert_eq!(killed, 1, "the running job must be reported killed");
+        assert!(b.jobs.is_empty());
     }
 
     #[test]

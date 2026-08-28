@@ -161,6 +161,9 @@ AGENT USERS RUN UNATTENDED
 
 COMMANDS
   /help  /model <sel>  /models  /default-model <sel>  /sessions  /goal [objective]  /continue
+  /thinking [<level>] [show|hide]   set the model's thinking level
+                          (off|minimal|low|medium|high|xhigh|max) and/or toggle
+                          whether streamed reasoning is displayed; no arg = status
   /model* <sel>  /model-all <sel>   broadcast a model switch to ALL your open pir terminals (also sets the new default)
   /bg <text>  /jobs  /fg <id>  /clear  /usage  /exit
   /undo [all]             revert the last file edit (or all) to its pre-edit state
@@ -601,13 +604,14 @@ fn main() {
         } else if !resumed.summary.is_empty() {
             println!("{}", term::dim(&resumed.summary));
         }
-        // Restore the model + su-security choice that were active when this
-        // session last ran, so a resumed session doesn't silently drop back to
-        // the global defaults.
+        // Restore the model + su-security + thinking choice that were active
+        // when this session last ran, so a resumed session doesn't silently
+        // drop back to the global defaults.
         if agent.apply_persisted_model() {
             // (model restored silently; the startup banner below shows it)
         }
         agent.apply_persisted_su_security();
+        agent.apply_persisted_thinking();
     }
 
     // Resolve the token budget (off by default). `--budget N` wins; else the
@@ -987,15 +991,43 @@ fn main() {
                 term::raw::RawInput::Interrupt | term::raw::RawInput::Cancel => {
                     if let Ok(mut g) = typeahead.lock() { g.clear(); }
                     fg_cancel.store(true, Ordering::SeqCst);
-                    // The running turn aborts immediately: any in-flight bash
-                    // command is killed right away, and the model loop stops at
-                    // its next safe boundary. The worker then joins and the REPL
-                    // returns to a clean idle prompt, ready for a new command.
+                    // ESC/ctrl-c = stop EVERYTHING, now. The cooperative cancel
+                    // only ends the turn after the current step; hard-abort
+                    // kills the in-flight foreground command — and the sweep
+                    // below also kills every *detached* background job (they
+                    // were otherwise untouchable from the REPL: the agent that
+                    // owns them sits on the turn's worker thread). Two paths:
+                    //  - agent in slot (idle): kill synchronously;
+                    //  - turn running: flip the shared job-kill flag, which the
+                    //    agent's own bash wait loop consumes within 250ms and
+                    //    sweeps on our behalf.
+                    let mut killed = {
+                        let mut g = agent_slot.lock().unwrap();
+                        match g.as_mut() {
+                            Some(a) => a.registry_kill_all_jobs(),
+                            None => 0,
+                        }
+                    };
+                    if let Some(f) = crate::agent::job_kill_flag() {
+                        f.store(true, Ordering::SeqCst);
+                    }
+                    let _ = killed;
                     term::out(&term::dim("· cancelling turn (ESC/ctrl-c)…"));
                 }
                 term::raw::RawInput::Eof => {
                     if let Ok(mut g) = typeahead.lock() { g.clear(); }
                     fg_cancel.store(true, Ordering::SeqCst);
+                    // Quitting (ctrl-d) also sweeps detached jobs so pir's
+                    // children don't linger holding output pipes after we exit.
+                    {
+                        let mut g = agent_slot.lock().unwrap();
+                        if let Some(a) = g.as_mut() {
+                            let _ = a.registry_kill_all_jobs();
+                        }
+                    }
+                    if let Some(f) = crate::agent::job_kill_flag() {
+                        f.store(true, Ordering::SeqCst);
+                    }
                     // Let the running turn finish its current step, then exit.
                     let _ = fg_handle.take().unwrap().join();
                     term::raw::disable_raw();
@@ -1510,6 +1542,7 @@ fn handle_command(
             agent.clear();
             let resumed = agent.load_session(&log);
             agent.apply_persisted_su_security();
+            agent.apply_persisted_thinking();
             jobs.mark_joined(id);
             println!("{} foregrounded job #{} from {}", term::bold("·"), id, log.display());
             if resumed.turns > 0 {
@@ -1557,6 +1590,7 @@ fn handle_command(
             }
             agent.apply_persisted_model();
             agent.apply_persisted_su_security();
+            agent.apply_persisted_thinking();
             if agent.goal_snapshot().is_some() {
                 agent.attach_goal(&path);
                 let out = agent.continue_goal();
@@ -1635,6 +1669,54 @@ fn handle_command(
             } else {
                 agent.start_goal(&obj);
                 println!("goal started: {}", obj);
+            }
+        }
+        "thinking" => {
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                eprintln!("pir: agent busy (turn running) — try again when idle");
+                return;
+            };
+            let arg = rest.join(" ");
+            if arg.trim().is_empty() {
+                // No argument: report the current level.
+                println!("thinking level: {}", agent.thinking_level().as_str());
+                println!(
+                    "{}",
+                    term::dim("set it with /thinking <off|minimal|low|medium|high|xhigh|max>; add 'show'/'hide' to toggle display")
+                );
+                return;
+            }
+            // Parse an optional trailing show/hide flag.
+            let mut show: Option<bool> = None;
+            let mut words: Vec<&str> = arg.split_whitespace().collect();
+            if let Some(last) = words.last().copied() {
+                match last {
+                    "show" => {
+                        show = Some(true);
+                        words.pop();
+                    }
+                    "hide" => {
+                        show = Some(false);
+                        words.pop();
+                    }
+                    _ => {}
+                }
+            }
+            let level_arg = words.join(" ");
+            if !level_arg.is_empty() {
+                match crate::config::ThinkingLevel::parse(&level_arg) {
+                    Some(lvl) => println!("{}", agent.set_thinking(lvl)),
+                    None => {
+                        eprintln!(
+                            "usage: /thinking [<off|minimal|low|medium|high|xhigh|max>] [show|hide]  (got '{level_arg}')"
+                        );
+                        return;
+                    }
+                }
+            }
+            if let Some(on) = show {
+                println!("{}", agent.set_show_thinking(on));
             }
         }
         "continue" | "cont" => {
