@@ -261,6 +261,7 @@ pub fn list_unfinished() -> String {
             term::dim(&format!("sh{}", e.shell_pid)),
             truncate(&e.preview, 80),
         ));
+        out.push('\n');
     }
     out.push_str(&term::dim("resume with: /resume <index|path-fragment>"));
     out
@@ -285,6 +286,98 @@ pub fn resolve_unfinished(token: &str) -> Option<PathBuf> {
         .into_iter()
         .find(|e| e.name.to_lowercase().contains(&lower))
         .map(|e| e.path)
+}
+
+/// A compact preview of a session's conversation, used by the interactive
+/// `pir -r` session picker (the arrow-key picker) to show, for the highlighted
+/// session, the first user prompt, the last user prompt, and the tail of the
+/// model's last thinking + response. Cheap: a single linear scan of the
+/// (typically small) session log.
+pub struct SessionPreview {
+    pub turns: usize,
+    pub first_prompt: String,
+    pub last_prompt: String,
+    pub last_thinking: String,
+    pub last_output: String,
+}
+
+/// Produce a [`SessionPreview`] for `path` by scanning its JSONL transcript.
+/// Missing/empty logs yield an all-empty preview (the picker still shows the
+/// session's name + tag). Tolerant of malformed lines.
+pub fn read_preview(path: &Path) -> SessionPreview {
+    let mut turns = 0usize;
+    let mut first_prompt = String::new();
+    let mut last_prompt = String::new();
+    let mut last_thinking = String::new();
+    let mut last_output = String::new();
+    if let Ok(f) = fs::File::open(path) {
+        for line in std::io::BufReader::new(f).lines().flatten() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let role = v.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            let blocks = v.get("blocks").and_then(|b| b.as_array());
+            if role == "user" {
+                if let Some(arr) = blocks {
+                    let text = arr
+                        .iter()
+                        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<&str>>()
+                        .join("\n")
+                        .trim()
+                        .to_string();
+                    if !text.is_empty() {
+                        if first_prompt.is_empty() {
+                            first_prompt = text.clone();
+                        }
+                        last_prompt = text.clone();
+                        turns += 1;
+                    }
+                }
+            } else if role == "assistant" {
+                if let Some(arr) = blocks {
+                    let mut thinking = String::new();
+                    let mut text = String::new();
+                    for b in arr {
+                        match b.get("type").and_then(|t| t.as_str()) {
+                            Some("thinking") => {
+                                if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                                    thinking.push_str(t);
+                                    thinking.push('\n');
+                                }
+                            }
+                            Some("text") => {
+                                if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                                    text.push_str(t);
+                                    text.push('\n');
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    let thinking = thinking.trim().to_string();
+                    let text = text.trim().to_string();
+                    if !thinking.is_empty() {
+                        last_thinking = thinking;
+                    }
+                    if !text.is_empty() {
+                        last_output = text;
+                    }
+                }
+            }
+        }
+    }
+    SessionPreview {
+        turns,
+        first_prompt,
+        last_prompt,
+        last_thinking,
+        last_output,
+    }
 }
 
 fn truncate(s: &str, n: usize) -> String {

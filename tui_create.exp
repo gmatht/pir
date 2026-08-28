@@ -1,0 +1,10 @@
+#!/usr/bin/expect -f
+set timeout 60
+spawn /root/src/pir/target/debug/pir
+expect "❯"
+send "tui seed prompt one\r"
+expect "❯"
+send "tui seed prompt two\r"
+expect "❯"
+send "\x04"
+expect eof

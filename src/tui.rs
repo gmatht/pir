@@ -232,6 +232,11 @@ fn run_inner(
     ctx: &TuiCtx,
 ) -> Result<(), String> {
     let mut state = TuiState::new();
+    // Sync the display flag with the agent's (possibly persisted) choice so a
+    // resumed session doesn't show/hide thinking contrary to what it saved.
+    if let Some(agent) = ctx.agent_slot.lock().unwrap().as_ref() {
+        state.show_thinking = agent.show_thinking();
+    }
     state.push(
         ConvKind::System,
         &format!(
@@ -758,7 +763,7 @@ fn update_tui_typeahead(buf: &str, typeahead: &Arc<Mutex<String>>) {
 /// argument), and otherwise a generic nudge to press Tab for completions.
 fn update_tui_hint(state: &mut TuiState, buf: &str) {
     if buf == "/thinking" {
-        state.hint = "[Tab] options: show | hide | on | off  (no arg toggles)".to_string();
+        state.hint = "[Tab] levels: off | minimal | low | medium | high | xhigh | max · show | hide".to_string();
     } else if buf == "/" {
         state.hint = "[Tab] completes commands; try /thinking".to_string();
     } else {
@@ -779,7 +784,7 @@ fn complete_idle(buf: &str) -> Option<String> {
     }
     if buf.starts_with("/thinking ") {
         let arg = buf.trim_start_matches("/thinking ").trim_start();
-        let opts = ["show", "hide", "on", "off"];
+        let opts = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "show", "hide"];
         let matches: Vec<&str> = opts.iter().copied().filter(|o| o.starts_with(arg)).collect();
         if matches.len() == 1 {
             return Some(format!("/thinking {}", matches[0]));
@@ -1296,28 +1301,48 @@ fn handle_command(
                 state.push(ConvKind::System, "· agent busy (turn running) — try again when idle");
                 return;
             };
-            match rest.first().map(|s| s.to_string()).unwrap_or_default().as_str() {
-                "" => {
-                    state.show_thinking = !state.show_thinking;
-                    state.push(ConvKind::System, &agent.set_show_thinking(state.show_thinking));
+            let arg = rest.join(" ");
+            if arg.trim().is_empty() {
+                state.push(
+                    ConvKind::System,
+                    &format!(
+                        "thinking level: {}  · /thinking <off|minimal|low|medium|high|xhigh|max> [show|hide]",
+                        agent.thinking_level().as_str()
+                    ),
+                );
+                return;
+            }
+            let mut show: Option<bool> = None;
+            let mut words: Vec<&str> = arg.split_whitespace().collect();
+            if let Some(last) = words.last().copied() {
+                match last {
+                    "show" => {
+                        show = Some(true);
+                        words.pop();
+                    }
+                    "hide" => {
+                        show = Some(false);
+                        words.pop();
+                    }
+                    _ => {}
                 }
-                "show" => {
-                    state.show_thinking = true;
-                    state.push(ConvKind::System, &agent.set_show_thinking(state.show_thinking));
+            }
+            let level_arg = words.join(" ");
+            if !level_arg.is_empty() {
+                match crate::config::ThinkingLevel::parse(&level_arg) {
+                    Some(lvl) => state.push(ConvKind::System, &agent.set_thinking(lvl)),
+                    None => {
+                        state.push(
+                            ConvKind::Error,
+                            &format!("usage: /thinking [<off|minimal|low|medium|high|xhigh|max>] [show|hide] (got '{level_arg}')"),
+                        );
+                        return;
+                    }
                 }
-                "hide" => {
-                    state.show_thinking = false;
-                    state.push(ConvKind::System, &agent.set_show_thinking(state.show_thinking));
-                }
-                "on" => {
-                    state.show_thinking = true;
-                    state.push(ConvKind::System, &agent.set_show_thinking(state.show_thinking));
-                }
-                "off" => {
-                    state.show_thinking = false;
-                    state.push(ConvKind::System, &agent.set_show_thinking(state.show_thinking));
-                }
-                other => state.push(ConvKind::Error, &format!("usage: /thinking [show|hide|on|off] (got '{other}')")),
+            }
+            if let Some(on) = show {
+                state.show_thinking = on;
+                state.push(ConvKind::System, &agent.set_show_thinking(on));
             }
         }
         "rebuild" => {
@@ -1361,7 +1386,15 @@ mod tui_completion_tests {
     fn tab_completes_thinking_to_arg() {
         assert_eq!(complete_idle("/thinking"), Some("/thinking ".to_string()));
         assert_eq!(complete_idle("/thinking s"), Some("/thinking show".to_string()));
-        assert_eq!(complete_idle("/thinking h"), Some("/thinking hide".to_string()));
+        // `h` is shared by `high` and `hide` — complete to the common prefix.
+        assert_eq!(complete_idle("/thinking h"), Some("/thinking hi".to_string()));
+        assert_eq!(complete_idle("/thinking hi"), None); // still ambiguous (high/hide)
+        assert_eq!(complete_idle("/thinking hig"), Some("/thinking high".to_string()));
+        assert_eq!(complete_idle("/thinking hid"), Some("/thinking hide".to_string()));
+        assert_eq!(complete_idle("/thinking m"), None); // ambiguous (minimal/medium/max)
+        assert_eq!(complete_idle("/thinking me"), Some("/thinking medium".to_string()));
+        assert_eq!(complete_idle("/thinking x"), Some("/thinking xhigh".to_string()));
+        assert_eq!(complete_idle("/thinking zzz"), None);
     }
 
     #[test]

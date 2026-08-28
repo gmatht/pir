@@ -1,0 +1,12 @@
+* Audit codebase, replace polling and esp. Busy waits with smol
+   - Document any remaining polling and busywaits and why they are hard to remove.
+
+- Continue developing GUI.
+
+/thinking
+
+Debug why /model op completes to something random...
+
+opencode extension?.
+
+Worktree pruning.
