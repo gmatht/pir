@@ -1,0 +1,42 @@
+SET $1:A1 1
+
+SET $1:A2 2
+
+SET $1:B1 4
+
+SET $1:B2 5
+
+SET $1:C~1 =TOTAL
+
+SET $1:[A3 =TOTAL
+
+SET $1:B2 105
+
+SET $1:[A4 MAX
+
+SET $1:[A5 =TOTAL
+
+SET $1:[A4 AVERAGE
+
+SET $1:[A~1 01234567890123456789
+
+SET $1:[A~1 
+
+SET $1:C1 d
+
+SET $1:C~1 asdf
+
+SET $1:C~1 =TOTAL
+
+$1:FILL C1=
+
+SET $1:C~1 =TOTAL
+
+SET $1:[A_1 =TOTAL
+
+SET $1:[A7 Extra
+
+SET $1:A7 1
+
+SET $1:B7 2
+

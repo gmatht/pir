@@ -28,7 +28,7 @@ pub enum Backend {
 }
 
 pub struct App {
-    core: CoreApp,
+    pub core: CoreApp,
     rev_limit: Option<usize>,
     rev_browse: bool,
     backend: Option<Backend>,
