@@ -703,6 +703,18 @@ fn start_edit_with(state: &GuiState, ch: char) {
     state.canvas.queue_redraw();
 }
 
+fn save_before_quit(state: &GuiState) {
+    // Commit any pending edit first so committed ops are written to the
+    // CORRO_LOG file via commit_workbook_op.
+    if state.editing.get() {
+        commit_edit(state);
+    }
+    #[cfg(unix)]
+    let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
+    #[cfg(windows)]
+    rustxwidgets::backends_nwg_adapter::quit_main_loop();
+}
+
 fn commit_edit(state: &GuiState) {
     state.editing.set(false);
     state.mode.set(GuiMode::Normal);
