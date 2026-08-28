@@ -71,6 +71,10 @@ pub struct Agent {
     /// touched). Persisted next to the session log so a resumed session keeps
     /// its choice.
     su_security_enabled: bool,
+    /// Cached provider list (loaded once, reused for model switches / resume).
+    /// Avoids re-reading and re-parsing `~/.pi/agent/models-store.json` on every
+    /// `/model` switch, resume, and `apply_persisted_model` call.
+    cached_providers: Vec<Provider>,
 }
 
 /// What `load_session` restored. The REPL (and `/fg`/`/resume`) renders
@@ -152,12 +156,18 @@ impl Agent {
         let client = make_client(&provider, cancel.clone())?;
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
+        // Load the provider list once and cache it on the agent, so model
+        // switches and resume lookups don't re-read the (possibly large)
+        // models-store.json every time. An empty/unreadable store falls back to
+        // an empty cache — every later `select`/switch simply fails to resolve
+        // and the caller surfaces the error.
+        let cached_providers = config::load_providers().unwrap_or_default();
+        let quiet_req = Arc::new(AtomicBool::new(false));
         // The "go silent" switch must exist before the registry (and its
         // backends) are built, because they capture a clone of it. The REPL
         // holds the same `Arc`, so flipping it (to background a running turn)
         // silences any in-flight terminal output the backends emit — e.g. the
         // bash tool's live elapsed clock — without the REPL owning the worker.
-        let quiet_req = Arc::new(AtomicBool::new(false));
         let mut registry = Registry::new(cwd.clone(), full_auto, cancel.clone());
         // Share the REPL's "go silent" switch with the tool backends so a
         // backgrounded turn silences their in-flight terminal output too.
@@ -221,6 +231,7 @@ impl Agent {
             token_budget: None,
             undo_stack: Vec::new(),
             su_security_enabled: true,
+            cached_providers,
         })
     }
 
@@ -356,10 +367,11 @@ impl Agent {
 
     /// If a model was persisted for this session (via `/model`), restore it on
     /// resume. Falls back to the existing provider/model when the persisted one
-    /// no longer resolves. Returns true if it switched.
+    /// no longer resolves. Returns true if it switched. Uses the cached
+    /// provider list (loaded once in `new`) rather than re-reading the store.
     pub fn apply_persisted_model(&mut self) -> bool {
         let Some(label) = self.persisted_model_label() else { return false };
-        match crate::config::select(&crate::config::load_providers().unwrap_or_default(), &label) {
+        match crate::config::select(&self.cached_providers, &label) {
             Ok((p, m)) => {
                 let _ = self.switch(p.clone(), m.clone());
                 true
@@ -467,16 +479,40 @@ impl Agent {
         if name != "update_goal" {
             return None;
         }
+        let action = input.get("action").and_then(Value::as_str).unwrap_or("");
+
+        // No active goal yet. Only `set_objective` can bootstrap one — so a
+        // fresh session can start a goal purely through the tool (as the tool
+        // description promises) instead of needing the `/goal` slash command.
+        // Every other action requires a goal to already exist.
         let store = match self.goal_store.as_mut() {
             Some(s) => s,
             None => {
-                return Some(Outcome {
-                    content: "No active goal. Call update_goal with action set_objective first.".into(),
-                    is_error: true,
-                })
+                if action == "set_objective" {
+                    let obj = input
+                        .get("objective")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    self.start_goal(&obj);
+                    match self.goal_store.as_mut() {
+                        Some(s) => s,
+                        None => {
+                            return Some(Outcome {
+                                content: "Could not start a goal (no session log and no writable cwd). Use /goal <objective> instead.".into(),
+                                is_error: true,
+                            })
+                        }
+                    }
+                } else {
+                    return Some(Outcome {
+                        content: "No active goal. Call update_goal with action set_objective first.".into(),
+                        is_error: true,
+                    });
+                }
             }
         };
-        let action = input.get("action").and_then(Value::as_str).unwrap_or("");
 
         let report = match action {
             "set_objective" => {
@@ -701,12 +737,22 @@ impl Agent {
     /// to interrupts: each `update_goal` call persists, so re-running `pir -c`
     /// picks up where the last run stopped.
     pub fn continue_goal(&mut self) -> String {
+        self.drive_goal(None)
+    }
+
+    /// Drive the active goal to completion. If `max_steps` is `Some(n)`, stop
+    /// after at most `n` model turns even if the goal isn't terminal yet — this
+    /// caps runaway loops without *limiting* the model: it still spends as many
+    /// tokens per step as it needs, we only log how many steps/tokens were used
+    /// and then hand control back. `None` (the default, used by `/continue` and
+    /// `pir -c`) means no cap. Returns a plaintext summary.
+    pub fn drive_goal(&mut self, max_steps: Option<usize>) -> String {
         // Snapshot objective + pre-checks so we don't hold a borrow of
         // `goal_store` across the `turn` call (which needs `&mut self`).
         let (objective, already_done) = match &self.goal_store {
             Some(s) => (s.goal.objective.clone(), s.goal.status == GoalStatus::Complete),
             None => {
-                return "no start one with /goal <objective>".to_string();
+                return "no goal started — start one with /goal <objective>".to_string();
             }
         };
         if already_done {
@@ -724,7 +770,23 @@ impl Agent {
             out.push('\n');
         }
 
+        let mut steps = 0usize;
+        let start_in = self.usage.input;
+        let start_out = self.usage.output;
         loop {
+            // Optional step cap (off by default). Logs the work done so far and
+            // yields instead of looping forever; it does NOT truncate the model
+            // or hide progress.
+            if let Some(limit) = max_steps {
+                if steps >= limit {
+                    out.push_str(&format!(
+                        "step cap ({limit}) reached — {steps} step(s) run, {} in / {} out tokens used this run\n",
+                        self.usage.input.saturating_sub(start_in),
+                        self.usage.output.saturating_sub(start_out),
+                    ));
+                    break;
+                }
+            }
             // Read the live goal into locals; no outstanding borrow past here.
             let (terminal, pending) = match &self.goal_store {
                 Some(s) => (
@@ -747,8 +809,10 @@ impl Agent {
                  done or the goal is complete/blocked."
             );
             let before = self.usage.output;
-            if self.turn(&prompt).is_err() {
-                out.push_str("goal run errored; stopping\n");
+            let res = self.turn(&prompt);
+            steps += 1;
+            if let Err(e) = res {
+                out.push_str(&format!("goal run errored ({e}); stopping\n"));
                 break;
             }
             let delta = self.usage.output - before;
@@ -763,7 +827,14 @@ impl Agent {
             Some(s) => s.goal.status.label().to_string(),
             None => "unknown".to_string(),
         };
-        out.push_str(&format!("goal {}: {}\n", final_status, objective));
+        out.push_str(&format!(
+            "goal {}: {}  ({} step(s), {} in / {} out tokens this run)\n",
+            final_status,
+            objective,
+            steps,
+            self.usage.input.saturating_sub(start_in),
+            self.usage.output.saturating_sub(start_out),
+        ));
         if let Some(s) = &self.goal_store {
             out.push_str(&s.goal.summary());
             if let Some(p) = s.path().to_str() {
@@ -1002,11 +1073,6 @@ impl Agent {
         }
     }
 
-    /// Drain follow-up prompts queued by extension backends during the last
-    /// `on_turn_end`. The REPL calls this after a turn finishes and pushes any
-    /// returned prompts into its prompt queue (e.g. the worktree extension
-    /// asking the model to fix failing tests). Each call returns the backlog
-    /// once and resets it.
     pub fn take_continuations(&mut self) -> Vec<String> {
         std::mem::take(&mut self.continuations)
     }
@@ -1196,10 +1262,22 @@ fn make_client(provider: &Provider, cancel: Arc<AtomicBool>) -> Result<Client, S
         },
     };
     let key = provider.api_key().ok_or_else(|| {
+        // The `{env:VAR}` reference (if any) was already resolved by
+        // `expand_env`; an `Err` here means the variable is unset/empty, which
+        // we name explicitly so the user isn't left with a generic failure.
+        if let Some(k) = provider.api_key.as_deref() {
+            if let Some(var) = k.strip_prefix("{env:").and_then(|r| r.strip_suffix('}')) {
+                return format!(
+                    "no API key for '{}' — the env var {var} is unset or empty (referenced in {}, or set apiKey directly)",
+                    provider.pid(),
+                    config::pi_dir().join("models-store.json").display()
+                );
+            }
+        }
         format!(
             "no API key for '{}' — export the env var referenced in {}, or set apiKey directly",
             provider.pid(),
-            config::pi_dir().join("models.json").display()
+            config::pi_dir().join("models-store.json").display()
         )
     })?;
     let mut client = Client::new(kind, &base, key);
@@ -1241,6 +1319,27 @@ fn describe_call(name: &str, input: &Value) -> String {
         "list_dir" => {
             let p = s("path");
             format!("ls    {}", if p.is_empty() { "." } else { p })
+        }
+        "update_goal" => {
+            let action = input.get("action").and_then(Value::as_str).unwrap_or("?");
+            let detail = match action {
+                "set_objective" => s("objective").to_string(),
+                "add_steps" => input
+                    .get("steps")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default(),
+                "set_status" => s("status").to_string(),
+                "set_step" => format!("#{} -> {}", input["step_id"], s("step_status")),
+                "note" => s("note").to_string(),
+                other => other.to_string(),
+            };
+            format!("goal  {action} {detail}")
         }
         other => other.to_string(),
     }
@@ -1322,4 +1421,67 @@ fn session_dir() -> PathBuf {
         }
     }
     config::pi_dir().join("agent").join("sessions")
+}
+
+#[cfg(test)]
+mod goal_bootstrap_tests {
+    use super::*;
+    use crate::config::Provider;
+    use crate::notify::shared_bus;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+
+    fn fresh_agent() -> Agent {
+        let p: Provider =
+            serde_json::from_str(r#"{"id":"test","baseUrl":"https://example.invalid/v1","apiKey":"x","api":"openai","models":[{"id":"m"}]}"#).unwrap();
+        let m = p.models[0].clone();
+        Agent::new(
+            p,
+            m,
+            true,
+            false,
+            shared_bus(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(String::new())),
+        )
+        .expect("agent")
+    }
+
+    #[test]
+    fn set_objective_bootstraps_goal_in_fresh_session() {
+        let mut a = fresh_agent();
+        assert!(a.goal_snapshot().is_none(), "should start with no goal");
+        let out = a.run_goal_tool(
+            "update_goal",
+            &serde_json::json!({"action":"set_objective","objective":"ship the thing"}),
+        );
+        let o = out.expect("outcome");
+        assert!(!o.is_error, "set_objective should not error: {}", o.content);
+        assert!(o.content.contains("objective set: ship the thing"));
+        assert!(a.goal_snapshot().is_some(), "goal should now exist");
+    }
+
+    #[test]
+    fn non_set_objective_errors_without_goal() {
+        let mut a = fresh_agent();
+        let out = a.run_goal_tool(
+            "update_goal",
+            &serde_json::json!({"action":"add_steps","steps":["x"]}),
+        );
+        let o = out.expect("outcome");
+        assert!(o.is_error, "add_steps without a goal must error");
+        assert!(o.content.contains("No active goal"));
+    }
+
+    #[test]
+    fn describe_call_shows_update_goal_args() {
+        let d = describe_call(
+            "update_goal",
+            &serde_json::json!({"action":"set_step","step_id":3,"step_status":"done"}),
+        );
+        assert!(d.contains("goal"), "got {d}");
+        assert!(d.contains("set_step"), "got {d}");
+        assert!(d.contains("#3"), "got {d}");
+    }
 }

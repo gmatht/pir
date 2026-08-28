@@ -620,7 +620,7 @@ impl Drop for Spinner {
 /// readable or the worker signals turn-completion, so the REPL thread sleeps
 /// (0% CPU) instead of polling.
 pub mod raw {
-    use std::io::{self};
+    use std::io::{self, Write};
     use std::os::unix::io::AsRawFd;
     use std::sync::{Arc, Mutex};
 
@@ -654,9 +654,31 @@ pub mod raw {
         STATE.lock().unwrap().active
     }
 
+    /// Enable bracketed-paste mode (`ESC [ ? 2 0 0 4 h`). While this is on, the
+    /// terminal wraps any pasted text in `ESC [ 2 0 0 ~ … ESC [ 2 0 1 ~`, so we
+    /// can tell pasted newlines apart from the user pressing Enter. Without it,
+    /// a *pasted* multiline block (which arrives in raw mode carrying literal
+    /// `\n` bytes) would be split on every line into a separate queued prompt —
+    /// the bug this guards against. Paired with `disable_bracketed_paste` in
+    /// `disable_raw`. Written directly (not via crossterm) so it works in the
+    /// streaming REPL's hand-rolled raw mode too. Best-effort; ignore errors.
+    fn enable_bracketed_paste() {
+        let _ = io::stdout().write_all(b"\x1b[?2004h");
+        let _ = io::stdout().flush();
+    }
+
+    /// Disable bracketed-paste mode (`ESC [ ? 2 0 0 4 l`).
+    fn disable_bracketed_paste() {
+        let _ = io::stdout().write_all(b"\x1b[?2004l");
+        let _ = io::stdout().flush();
+    }
+
     /// Put stdin into raw, non-blocking mode (no canonical line editing, no
     /// echo, reads return immediately). Idempotent. No-op when raw mode is
-    /// disabled (`--no-raw`).
+    /// disabled (`--no-raw`). Enables bracketed-paste mode as well so pasted
+    /// multiline text is delivered inside an `ESC[200~…ESC[201~` wrapper (see
+    /// `read_chunk`/`translate`), instead of being split line-by-line into
+    /// multiple queued prompts.
     pub fn enable_raw() {
         if !*ENABLED.lock().unwrap() {
             return;
@@ -681,9 +703,12 @@ pub mod raw {
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
             st.active = true;
         }
+        enable_bracketed_paste();
     }
 
     /// Restore the previous terminal attributes and blocking mode. Idempotent.
+    /// Also turns bracketed-paste mode back off so a pasted block in a different
+    /// program (or the shell after /sh) behaves normally.
     pub fn disable_raw() {
         if !*ENABLED.lock().unwrap() {
             return;
@@ -692,6 +717,7 @@ pub mod raw {
         if !st.active {
             return;
         }
+        disable_bracketed_paste();
         unsafe {
             let fd = io::stdin().as_raw_fd();
             if let Some(t) = st.orig_termios.take() {
@@ -776,6 +802,11 @@ pub mod raw {
     /// `stdin` is non-blocking (see `enable_raw`), so this returns as soon as no
     /// more bytes are readable. Backspace pops the buffer; ctrl-c/ctrl-d/Enter
     /// are surfaced to the caller. This thread never writes to stdout.
+    ///
+    /// Bracketed-paste aware: while a `ESC [ 2 0 0 ~ … ESC [ 2 0 1 ~` paste
+    /// wrapper is open, embedded newlines are kept as part of the line (as
+    /// `'\n'`) instead of being interpreted as Enter — so a *pasted* multiline
+    /// block becomes a single queued prompt rather than one prompt per line.
     fn read_chunk(buf: &mut String, typeahead: &Arc<Mutex<String>>) -> RawInput {
         let fd = io::stdin().as_raw_fd();
         let mut tmp = [0u8; 256];
@@ -783,6 +814,9 @@ pub mod raw {
         // stdin is non-blocking (see enable_raw), so read may return a partial
         // chunk; keep draining until it would block (r <= 0) or the buffer is
         // full. Without the loop a single read could leave bytes unconsumed.
+        // Crucially, this loop drains the *entire* paste (which the terminal
+        // delivers as a single write) in one `read_chunk` call, so the local
+        // `pasting` flag below stays valid for the whole wrapper.
         loop {
             let r = unsafe {
                 libc::read(
@@ -802,6 +836,11 @@ pub mod raw {
         if nread == 0 {
             return RawInput::None;
         }
+        // `pasting` tracks whether we're inside a bracketed-paste wrapper
+        // (`ESC[200~` … `ESC[201~`). It is local because `read_chunk` always
+        // drains every available byte (above), so a whole paste is consumed
+        // within a single call.
+        let mut pasting = false;
         // Process bytes sequentially with an index so we can look *ahead* at the
         // byte following an ESC (needed to tell a lone Esc from the lead of an
         // arrow/function-key sequence). `read_chunk` already drained every byte
@@ -812,9 +851,31 @@ pub mod raw {
         while i < nread {
             let b = tmp[i];
             match b {
-                0x0a | 0x0d => {
-                    let line = std::mem::take(buf);
-                    return RawInput::Line(line);
+                0x0a => {
+                    // LF. Outside a paste this ends the line (Enter → a queued
+                    // prompt). Inside a paste it's part of the pasted text, so we
+                    // keep it as a real newline in the buffer.
+                    if pasting {
+                        buf.push('\n');
+                        update_typeahead(buf, typeahead);
+                    } else {
+                        let line = std::mem::take(buf);
+                        return RawInput::Line(line);
+                    }
+                }
+                0x0d => {
+                    // CR. Outside a paste this also ends the line. Inside a paste
+                    // we normalise CRLF→LF: skip a CR that is immediately followed
+                    // by an LF (the LF will add the newline); otherwise keep it.
+                    if pasting {
+                        if !(i + 1 < nread && tmp[i + 1] == 0x0a) {
+                            buf.push('\n');
+                            update_typeahead(buf, typeahead);
+                        }
+                    } else {
+                        let line = std::mem::take(buf);
+                        return RawInput::Line(line);
+                    }
                 }
                 0x7f | 0x08 => {
                     if !buf.is_empty() {
@@ -851,10 +912,10 @@ pub mod raw {
                 0x1b => {
                     // ESC is ambiguous: a lone Esc should cancel the turn (like
                     // ctrl-c), but it's also the lead byte of a CSI sequence
-                    // (arrows, Home/End, F-keys: `0x1b 0x5b …`). Disambiguate on
+                    // (arrows, Home/End, F-keys: `0x1b 0x5b …`; and the bracketed
+                    // paste wrappers `ESC[200~` / `ESC[201~`). Disambiguate on
                     // the byte that follows this one:
-                    //   * if the next byte is `0x5b` (`[`) it's a CSI sequence →
-                    //     swallow it (we do no cursor movement while raw);
+                    //   * if the next byte is `0x5b` (`[`) it's a CSI sequence;
                     //   * otherwise it's a lone Esc → cancel the turn.
                     // The next byte is almost always already in `tmp` (the whole
                     // sequence arrives in one terminal write); only when `0x1b`
@@ -871,7 +932,18 @@ pub mod raw {
                         }
                         return RawInput::Cancel;
                     }
-                    // CSI sequence: skip this `0x1b` and the `0x5b`, then swallow
+                    // We're in a CSI sequence. Check whether it's a bracketed-
+                    // paste wrapper (`ESC[200~` starts, `ESC[201~` ends).
+                    if let Some(start) = paste_marker_at(&tmp[..nread], i) {
+                        // It's `ESC[200~` (start) or `ESC[201~` (end). Consume
+                        // the four wrapper bytes (`[ 2 0 0 ~` / `[ 2 0 1 ~`) and
+                        // flip the `pasting` flag. The body between them keeps
+                        // being literal text (newlines included).
+                        pasting = start; // `200~` = start
+                        i += 6; // skip `ESC [ 2 0 0 ~` / `ESC [ 2 0 1 ~`
+                        continue;
+                    }
+                    // Ordinary CSI sequence (arrows, Home/End, F-keys): swallow
                     // the parameter/terminator bytes. Consume from `tmp` first
                     // (the bulk of the sequence arrived in this same batch) up to
                     // its terminator (an alphabetic byte or `~`), then top up any
@@ -899,16 +971,44 @@ pub mod raw {
                 }
                 c if c >= 0x20 && c < 0x7f => {
                     buf.push(c as char);
-                    if let Ok(mut g) = typeahead.lock() {
-                        g.clear();
-                        g.push_str(buf);
-                    }
+                    update_typeahead(buf, typeahead);
                 }
                 _ => { /* ignore other control bytes */ }
             }
             i += 1;
         }
         RawInput::None
+    }
+
+    /// Mirror `buf` into the shared `typeahead` so the spinner/cursor reflects
+    /// the current draft (including any pasted newlines). Single small helper
+    /// so the three byte arms that mutate `buf` stay in sync.
+    fn update_typeahead(buf: &str, typeahead: &Arc<Mutex<String>>) {
+        if let Ok(mut g) = typeahead.lock() {
+            g.clear();
+            g.push_str(buf);
+        }
+    }
+
+    /// True when the bytes at `idx` (in `buf`, where `buf[idx] == 0x1b`) begin a
+    /// bracketed-paste wrapper: `ESC [ 2 0 0 ~` (start) or `ESC [ 2 0 1 ~` (end).
+    /// Returns `Some(is_start)` for a paste wrapper, `None` for an ordinary CSI
+    /// sequence. Used by every raw reader so the streaming REPL and the TUI
+    /// never diverge. `buf` must contain the full wrapper (the caller already
+    /// drained the whole keystroke/paste into `buf` for this tick).
+    fn paste_marker_at(buf: &[u8], idx: usize) -> Option<bool> {
+        // buf[idx] == 0x1b, buf[idx+1] == 0x5b, then "[ 2 0 0 ~" / "[ 2 0 1 ~".
+        let a = idx + 2; // first parameter byte ('2')
+        if a + 3 < buf.len()
+            && buf[a] == b'2'
+            && buf[a + 1] == b'0'
+            && buf[a + 2] == b'0'
+            && (buf[a + 3] == b'~' || buf[a + 3] == b'1')
+        {
+            Some(buf[a + 3] == b'0') // `200~` = start
+        } else {
+            None
+        }
     }
 
     /// Read a single byte from the (already non-blocking) fd, polling up to
@@ -971,28 +1071,45 @@ pub mod raw {
     /// interpreted. `bytes` is the chunk just read from fd 0; `buf` accumulates
     /// the current line and `typeahead` mirrors it for the spinner/footer. ESC
     /// handling mirrors `read_chunk`'s CSI-aware disambiguation: when a `0x1b`
-    /// is followed by `0x5b` (`[`) it is a CSI sequence (arrows, Home/End, F-keys)
-    /// and is swallowed; otherwise it is a lone Esc → cancel. Because the TUI
+    /// is followed by `0x5b` (`[`) it is a CSI sequence (arrows, Home/End, F-keys,
+    /// or a bracketed-paste wrapper `ESC[200~…ESC[201~`) and is swallowed; a
+    /// lone Esc → cancel. While a bracketed-paste wrapper is open, embedded
+    /// newlines are kept as part of the line (a real `'\n'`) instead of ending
+    /// it, so a pasted multiline block becomes a single prompt. Because the TUI
     /// buffers a whole chunk before calling, the bytes following a `0x1b` are
     /// already present in `bytes`, so no second fd read is needed in the common
     /// case.
     pub fn translate(buf: &mut String, typeahead: &Arc<Mutex<String>>, bytes: &[u8]) -> RawInput {
+        let mut pasting = false;
         let mut i = 0usize;
         while i < bytes.len() {
             let fd = io::stdin().as_raw_fd();
             let b = bytes[i];
             match b {
-                0x0a | 0x0d => {
-                    let line = std::mem::take(buf);
-                    return RawInput::Line(line);
+                0x0a => {
+                    if pasting {
+                        buf.push('\n');
+                        update_typeahead(buf, typeahead);
+                    } else {
+                        let line = std::mem::take(buf);
+                        return RawInput::Line(line);
+                    }
+                }
+                0x0d => {
+                    if pasting {
+                        if !(i + 1 < bytes.len() && bytes[i + 1] == 0x0a) {
+                            buf.push('\n');
+                            update_typeahead(buf, typeahead);
+                        }
+                    } else {
+                        let line = std::mem::take(buf);
+                        return RawInput::Line(line);
+                    }
                 }
                 0x7f | 0x08 => {
                     if !buf.is_empty() {
                         buf.pop();
-                        if let Ok(mut g) = typeahead.lock() {
-                            g.clear();
-                            g.push_str(buf);
-                        }
+                        update_typeahead(buf, typeahead);
                     }
                 }
                 0x03 => {
@@ -1023,6 +1140,14 @@ pub mod raw {
                         }
                         return RawInput::Cancel;
                     }
+                    // We're in a CSI sequence; check for the bracketed-paste
+                    // wrapper (`ESC[200~` start / `ESC[201~` end) before the
+                    // generic swallow below.
+                    if let Some(start) = paste_marker_at(bytes, i) {
+                        pasting = start; // `200~` = start
+                        i += 6; // skip `ESC [ 2 0 0 ~` / `ESC [ 2 0 1 ~`
+                        continue;
+                    }
                     i += 1; // skip 0x1b
                     if i < bytes.len() && bytes[i] == 0x5b {
                         i += 1; // skip 0x5b
@@ -1040,10 +1165,7 @@ pub mod raw {
                 }
                 c if c >= 0x20 && c < 0x7f => {
                     buf.push(c as char);
-                    if let Ok(mut g) = typeahead.lock() {
-                        g.clear();
-                        g.push_str(buf);
-                    }
+                    update_typeahead(buf, typeahead);
                 }
                 _ => { /* ignore other control bytes */ }
             }
@@ -1117,6 +1239,7 @@ mod tests {
                     name: Some("GPT Fake".into()),
                     context: None,
                     max_tokens: None,
+                    price_per_1k: None,
                 }],
             },
             Provider {
@@ -1130,6 +1253,7 @@ mod tests {
                     name: Some("Claude Fake".into()),
                     context: None,
                     max_tokens: None,
+                    price_per_1k: None,
                 }],
             },
         ];
