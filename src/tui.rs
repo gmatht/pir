@@ -892,14 +892,30 @@ fn read_idle_line(
     let mut hist_idx: i32 = -1; // -1 = current (not recalling)
     let mut buf = String::new();
 
+    // Register stdin with the smol reactor once, so each idle tick blocks
+    // event-driven (0% CPU) instead of polling in a sleep loop. Reused across
+    // iterations — the wrapper is just an fd registration, safe to hold.
+    let stdin_async = smol::Async::new(io::stdin());
+
     loop {
         state.draft = buf.clone();
         state.status = "idle".into();
         draw(term, state, &state.status, &buf, false, &crate::workspace_label(),
              &ctx.agent_slot.lock().unwrap().as_ref().map(|a| a.label()).unwrap_or_default());
 
-        // Non-blocking read with a short poll so we keep redrawing (the footer
-        // draft stays live) and never block on a pty that won't deliver events.
+        // Block until stdin becomes readable OR a short redraw tick fires. The
+        // timer keeps the footer draft/history-cursor live while typing idles,
+        // and the reactor wakes instantly on a real keypress — no busy loop.
+        // On an EOF pipe `readable()` fires immediately forever, so we throttle
+        // below (see the `n <= 0` branch) to stay near 0% CPU.
+        let started = std::time::Instant::now();
+        if let Ok(stdin) = stdin_async.as_ref() {
+            let readable = async { let _ = stdin.readable().await; };
+            let tick = smol::Timer::after(Duration::from_millis(30));
+            smol::block_on(smol::future::or(readable, async { let _ = tick.await; }));
+        }
+
+        // Non-blocking read (stdin is in raw mode, so it returns immediately).
         let mut tmp = [0u8; 256];
         let n = unsafe { libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
         if n > 0 {
@@ -1014,9 +1030,13 @@ fn read_idle_line(
                     _ => { /* ignore other control bytes */ }
                 }
             }
+        } else if started.elapsed() < Duration::from_millis(30) {
+            // No bytes arrived (EOF pipe or no input) and barely any wall time
+            // elapsed — an EOF pipe makes `readable()` fire immediately forever,
+            // which would otherwise busy-spin at 100% CPU. Sleep the remainder
+            // of the redraw tick so the idle TUI stays near 0% CPU.
+            std::thread::sleep(Duration::from_millis(30) - started.elapsed());
         }
-        // Small sleep so we don't busy-loop at 100% CPU while idle.
-        std::thread::sleep(Duration::from_millis(30));
     }
 }
 
