@@ -27,7 +27,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-use std::time::Duration;
 
 const HELP: &str = r#"pir — a featherweight pi-compatible coding agent
 
@@ -71,6 +70,7 @@ AGENT USERS RUN UNATTENDED
 
 COMMANDS
   /help  /model <sel>  /models  /default-model <sel>  /sessions  /goal [objective]  /continue
+  /model* <sel>  /model-all <sel>   broadcast a model switch to ALL your open pir terminals (also sets the new default)
   /bg <text>  /jobs  /fg <id>  /clear  /usage  /exit
   /undo [all]             revert the last file edit (or all) to its pre-edit state
   /sh [cmd args]         drop to a shell, or run a command via $SHELL (sh -c)
@@ -470,6 +470,15 @@ fn main() {
         Err(e) => die(&e),
     };
 
+    // Point the line editor's history file at the session's `.history` so the
+    // per-session prompt history (and the prompts we seed below when resuming)
+    // is persisted and recalled with arrow-up. Must run before the resume block
+    // so `push_history` during `-r`/`/fg` actually lands in this file.
+    if let Some(p) = &agent.log_path {
+        let hist = p.with_extension("history");
+        term::set_history_file(&hist);
+    }
+
  // Resume prior history if `-r`/`-c` was given.
     if let Some(session) = &resume {
         let resumed = agent.load_session(session);
@@ -538,11 +547,6 @@ fn main() {
         agent.notify_on_exit(agent.idle_event());
         return;
     }
-    if let Some(p) = &agent.log_path {
-        let hist = p.with_extension("history");
-        term::set_history_file(&hist);
-    }
-
     if !prompt.is_empty() {
         match agent.turn(&prompt.join(" ")) {
             Ok(()) => agent.notify_on_exit(agent.turn_done_event()),
@@ -652,6 +656,21 @@ fn main() {
         Arc::new(Mutex::new((a.provider(), a.model(), full_auto)))
     };
 
+    // Cross-instance model broadcast: `/model*` writes a small file
+    // (~/.pi/agent/model-broadcast.json) that every running pir of this user
+    // polls. We remember the latest generation we've *already* applied so the
+    // watcher doesn't re-apply an old broadcast on startup, and a separate
+    // thread queues newly-seen labels into `pending_model`; the REPL applies
+    // them when idle (or right after a turn ends / errors). `self_pid` is used
+    // so each instance ignores its own broadcast echo.
+    let broadcast_seen = config::read_model_broadcast().map(|b| b.generation).unwrap_or(0);
+    let pending_model: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let _watcher = spawn_model_broadcast_watcher(
+        broadcast_seen,
+        std::process::id(),
+        pending_model.clone(),
+    );
+
     // Running foreground turn state.
     let mut fg_handle: Option<JoinHandle<()>> = None;
     // Prompts queued by the user while a turn runs (submitted on Enter).
@@ -698,6 +717,20 @@ fn main() {
                         fmt_tok(a.usage.input),
                         fmt_tok(a.usage.output)
                     )));
+                }
+                // Apply any cross-instance model switch queued while this turn
+                // was running (a `/model*` from another terminal). We apply it
+                // the moment the agent is back in the slot (turn done or errored
+                // — both land here), so the next step uses the new model.
+                if let Some(label) = pending_model.lock().unwrap().take() {
+                    match apply_broadcast_model(&agent_slot, &current_ctx, &providers, &label) {
+                        Ok(new_label) => term::out(&term::dim(&format!(
+                            "· model switched to {new_label} (via /model* from another terminal)\n"
+                        ))),
+                        Err(e) => term::out(&term::dim(&format!(
+                            "· ignored model broadcast '{label}': {e}\n"
+                        ))),
+                    }
                 }
                 if let Some(next) = pending.drain(..).next() {
                     if let Ok(mut g) = typeahead.lock() { g.clear(); }
@@ -854,6 +887,27 @@ fn main() {
         if tasks_running > 0 {
             term::out(&term::dim(&format!("#tasks running: {} · Idle\n", tasks_running)));
         }
+        // Status line under the prompt: current workspace + model in use.
+        let workspace = workspace_label();
+        let model = {
+            let g = agent_slot.lock().unwrap();
+            g.as_ref().map(|a| a.label()).unwrap_or_default()
+        };
+        term::out(&format!("{}\n", term::status_line(&workspace, &model)));
+        // Apply any cross-instance model switch queued by the broadcast watcher
+        // (from a `/model*` in another terminal). We only do this while idle, so
+        // a mid-turn instance defers until it returns here — including after an
+        // error, which lands back at this prompt too.
+        if let Some(label) = pending_model.lock().unwrap().take() {
+            match apply_broadcast_model(&agent_slot, &current_ctx, &providers, &label) {
+                Ok(new_label) => term::out(&term::dim(&format!(
+                    "· model switched to {new_label} (via /model* from another terminal)\n"
+                ))),
+                Err(e) => term::out(&term::dim(&format!(
+                    "· ignored model broadcast '{label}': {e}\n"
+                ))),
+            }
+        }
         match term::read_line(&format!("{} ", term::cyan("❯"))) {
             None => {
                 println!();
@@ -931,6 +985,74 @@ pub(crate) fn run_foreground_turn(
         *slot.lock().unwrap() = Some(a);
         // Wake the REPL's event-driven wait so it joins this handle immediately.
         let _ = done.try_send(());
+    })
+}
+
+/// How often the cross-instance model-broadcast watcher polls
+/// `~/.pi/agent/model-broadcast.json` (a deliberately cheap, cooperative
+/// poll — there is no daemon, so this is as close to "live" as we get across
+/// independent `pir` processes without fs events).
+const BROADCAST_POLL: Duration = Duration::from_secs(2);
+
+/// Apply a `provider/model` label that arrived via the cross-instance model
+/// broadcast (`/model*`), switching the idle agent and syncing the shared
+/// background-job context. Returns the new label on success (for a status
+/// line), or an error string. Must be called only when the agent is idle
+/// (the slot is free), which the watcher/REPL guarantee before calling.
+fn apply_broadcast_model(
+    agent_slot: &AgentSlot,
+    current_ctx: &Arc<Mutex<(Provider, Model, bool)>>,
+    providers: &[Provider],
+    label: &str,
+) -> Result<String, String> {
+    // Re-resolve against *this* instance's providers, since another terminal
+    // may have a different model store. Drop the label if it resolves nowhere.
+    let (p, m) = config::select(providers, label)?;
+    let mut g = agent_slot.lock().unwrap();
+    let agent = g.as_mut().ok_or_else(|| "agent busy (turn running)".to_string())?;
+    agent.switch(p.clone(), m.clone())?;
+    if let Ok(mut ctx) = current_ctx.lock() {
+        ctx.0 = p.clone();
+        ctx.1 = m.clone();
+    }
+    Ok(format!("{}/{}", p.pid(), m.id))
+}
+
+/// Spawn the cross-instance model-broadcast watcher. It polls
+/// `~/.pi/agent/model-broadcast.json` every [`BROADCAST_POLL`]; when a newer
+/// generation (than `last_seen`) appears that *this* process didn't originate,
+/// it records the label in `pending_model` so the REPL applies it as soon as it
+/// is idle (or right after a running turn ends / errors). `self_pid` is used to
+/// ignore our own broadcast. Best-effort: any read/parse error is silently
+/// skipped.
+fn spawn_model_broadcast_watcher(
+    last_seen: u64,
+    self_pid: u32,
+    pending_model: Arc<Mutex<Option<String>>>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut seen = last_seen;
+        loop {
+            thread::sleep(BROADCAST_POLL);
+            let Some(b) = config::read_model_broadcast() else { continue };
+            if b.generation <= seen || b.generation == 0 {
+                continue;
+            }
+            // Ignore broadcasts we ourselves published.
+            if b.by_pid == self_pid as u64 {
+                seen = b.generation;
+                continue;
+            }
+            if b.label.is_empty() {
+                seen = b.generation;
+                continue;
+            }
+            seen = b.generation;
+            // Queue it; the REPL applies it when safe (idle / after turn ends).
+            if let Ok(mut pending) = pending_model.lock() {
+                *pending = Some(b.label);
+            }
+        }
     })
 }
 
@@ -1030,6 +1152,52 @@ fn handle_command(
                     },
                     Err(e) => eprintln!("{e}"),
                 }
+            }
+        }
+        "model*" | "model-all" => {
+            // Broadcast a model switch to *every* running pir instance for this
+            // user (each polls ~/.pi/agent/model-broadcast.json). On a match the
+            // other instances apply it the next time they're idle (or as soon as
+            // a running turn ends / errors). Also persists it as the new default
+            // for *future* sessions and switches this instance immediately.
+            if rest.is_empty() {
+                println!("usage: /model* <selector>   (switch the model in all open pir terminals)");
+                println!("{}", term::dim("also sets the new default for future sessions"));
+                return;
+            }
+            match config::select(providers, &rest.join(" ")) {
+                Ok((p, m)) => {
+                    // Switch this instance right now (we already own the agent
+                    // at the idle prompt; mid-turn we'd be in the fg_running arm).
+                    {
+                        let mut g = agent_slot.lock().unwrap();
+                        let Some(agent) = g.as_mut() else {
+                            eprintln!("pir: agent busy (turn running) — try again when idle");
+                            return;
+                        };
+                        match agent.switch(p.clone(), m.clone()) {
+                            Ok(()) => {
+                                if let Ok(mut ctx) = current_ctx.lock() {
+                                    ctx.0 = p.clone();
+                                    ctx.1 = m.clone();
+                                }
+                                println!("→ {} (this instance)", agent.label());
+                            }
+                            Err(e) => eprintln!("{e}"),
+                        }
+                    }
+                    // Persist as the default for new sessions too.
+                    let _ = config::set_default_model(&p.pid(), &m.id);
+                    // Broadcast to other running instances of this user.
+                    match config::publish_model_broadcast(&format!("{}/{}", p.pid(), m.id)) {
+                        Some(gen) => println!(
+                            "{} broadcasting to all your open terminals (generation {gen})",
+                            term::dim("·")
+                        ),
+                        None => eprintln!("pir: could not write broadcast file"),
+                    }
+                }
+                Err(e) => eprintln!("{e}"),
             }
         }
         "models" => print!("{}", list_models(providers)),
@@ -1555,6 +1723,32 @@ fn rebuild_and_exec() {
 #[cfg(not(unix))]
 fn rebuild_and_exec() {
     eprintln!("pir: /rebuild (exec) is only supported on unix");
+}
+
+/// Collapse `$HOME` to `~` in a path for a compact display, leaving other
+/// absolute paths intact. Used by the REPL status line's "Workspace" field.
+fn home_collapsed(path: &std::path::Path) -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = std::path::Path::new(&home);
+        if let Ok(suffix) = path.strip_prefix(home) {
+            return format!("~{}", suffix.to_string_lossy());
+        }
+    }
+    path.to_string_lossy().to_string()
+}
+
+/// The "Workspace" shown in the status line: the current working directory with
+/// `$HOME` collapsed to `~`. If `pir` was launched inside a git work tree we
+/// show the repo root instead of the cwd so the workspace reads the same from
+/// any subdirectory.
+pub(crate) fn workspace_label() -> String {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    if crate::project::is_git_repo(&cwd) {
+        if let Some(root) = crate::project::repo_root_opt(&cwd) {
+            return home_collapsed(&root);
+        }
+    }
+    home_collapsed(&cwd)
 }
 
 /// `/sh [cmd args]` — drop into an interactive shell, or run a command via the

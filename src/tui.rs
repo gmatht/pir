@@ -308,7 +308,8 @@ fn run_inner(
         } else {
             state.status.clone()
         };
-        draw(term, &state, &status_line, &draft, running, ctx.running_as_agent);
+        draw(term, &state, &status_line, &draft, running, &crate::workspace_label(),
+             &ctx.agent_slot.lock().unwrap().as_ref().map(|a| a.label()).unwrap_or_default());
 
         // ---- Input ----
         if running {
@@ -503,7 +504,8 @@ fn draw(
     status: &str,
     draft: &str,
     running: bool,
-    running_as_agent: bool,
+    workspace: &str,
+    model: &str,
 ) {
     let _ = term.draw(|f| {
         let size = f.area();
@@ -524,15 +526,12 @@ fn draw(
             .scroll((state.scroll, 0));
         f.render_widget(paragraph, chunks[0]);
 
-        let footer_title = if running_as_agent {
-            " agent user · full-auto "
-        } else {
-            " "
-        };
         let footer_block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(footer_title.to_string());
+            .border_style(Style::default().fg(Color::DarkGray));
+        // Footer shows the live status + the current draft prompt. We append a
+        // dim workspace/model line beneath the draft so the status is always
+        // visible in the full-screen layout.
         let mut footer_lines = Vec::new();
         footer_lines.push(Line::from(Span::styled(
             status.to_string(),
@@ -542,6 +541,11 @@ fn draw(
             Span::styled("❯ ", Style::default().fg(Color::Green)),
             Span::raw(draft.to_string()),
         ]));
+        // Status line: workspace + model in use (dimmed).
+        footer_lines.push(Line::from(Span::styled(
+            format!("  workspace: {workspace}   model: {model}"),
+            Style::default().fg(Color::DarkGray),
+        )));
         let footer = Paragraph::new(Text::from(footer_lines))
             .block(footer_block)
             .style(Style::default());
@@ -732,7 +736,8 @@ fn read_idle_line(
     loop {
         state.draft = buf.clone();
         state.status = "idle".into();
-        draw(term, state, &state.status, &buf, false, ctx.running_as_agent);
+        draw(term, state, &state.status, &buf, false, &crate::workspace_label(),
+             &ctx.agent_slot.lock().unwrap().as_ref().map(|a| a.label()).unwrap_or_default());
 
         // Non-blocking read with a short poll so we keep redrawing (the footer
         // draft stays live) and never block on a pty that won't deliver events.

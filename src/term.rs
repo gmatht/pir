@@ -127,6 +127,17 @@ pub fn repl_prompt() -> String {
     format!("{} ", cyan("❯"))
 }
 
+/// A one-line status bar rendered beneath the prompt, showing the active
+/// Workspace (the current working directory, with `$HOME` collapsed to `~`) and
+/// the model currently in use. Kept on a single dim line so the idle REPL is
+/// self-describing without scrolling the conversation. Callers that change cwd
+/// or switch model should re-render it (see the REPL loop / TUI).
+pub fn status_line(workspace: &str, model: &str) -> String {
+    let ws = dim(&format!("workspace: {workspace}"));
+    let md = dim(&format!("model: {}", cyan(model)));
+    format!("  {ws}   {md}")
+}
+
 fn paint(code: &str, s: &str) -> String {
     if color() { format!("\x1b[{code}m{s}\x1b[0m") } else { s.to_string() }
 }
@@ -236,6 +247,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "/help",
     "/jobs",
     "/model",
+    "/model*",
     "/models",
     "/project",
     "/rebuild",
@@ -1097,5 +1109,16 @@ mod tests {
         assert_eq!(matches, vec!["claude-fake".to_string()]);
         // The completion replaces only the argument (after the command + space).
         assert_eq!(start, "/default-model ".len());
+    }
+}
+
+#[cfg(test)]
+mod status_line_tests {
+    use super::*;
+    #[test]
+    fn status_line_shows_workspace_and_model() {
+        let s = status_line("/home/me/project", "anthropic/claude");
+        assert!(s.contains("workspace: /home/me/project"));
+        assert!(s.contains("model: anthropic/claude"));
     }
 }
