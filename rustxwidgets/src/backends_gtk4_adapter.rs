@@ -410,15 +410,90 @@ impl Overlay {
 }
 
 #[derive(Clone)]
-pub struct Spreadsheet(pub Canvas, pub Overlay);
+pub struct Spreadsheet(pub Canvas, pub Overlay, pub crate::spreadsheet::SharedModel);
 impl Spreadsheet {
-    pub fn new(_r: usize, _c: usize) -> Self { let c = Canvas::new(); let o = Overlay::new(); o.set_child(&c); Spreadsheet(c, o) }
-    pub fn set_cell(&self, _r: usize, _c: usize, _t: &str) {}
-    pub fn get_cell(&self, _r: usize, _c: usize) -> Option<String> { None }
+    pub fn id(&self) -> usize { std::rc::Rc::as_ptr(&self.2) as usize }
+    pub fn set_cell(&self, row: u32, col: u32, text: &str) {
+        self.2.borrow_mut().set_cell(row, col, text);
+        self.0.queue_redraw();
+    }
+    pub fn get_cell(&self, row: u32, col: u32) -> Option<String> { self.2.borrow().get_cell(row, col) }
+    pub fn set_raw_cell(&self, row: u32, col: u32, text: &str) {
+        self.2.borrow_mut().set_raw_cell(row, col, text);
+        self.0.queue_redraw();
+    }
+    pub fn set_cell_style(&self, row: u32, col: u32, style: u8) {
+        self.2.borrow_mut().set_cell_style(row, col, style);
+        self.0.queue_redraw();
+    }
+    pub fn cursor_position(&self) -> Option<(u32, u32)> { self.2.borrow().cursor_position() }
+    pub fn set_cursor(&self, row: u32, col: u32) {
+        self.2.borrow_mut().set_cursor(row, col);
+        self.0.queue_redraw();
+    }
+    pub fn set_editing(&self, editing: bool, edit_buf: &str, edit_pos: usize) {
+        self.2.borrow_mut().set_editing(editing, edit_buf, edit_pos);
+        self.0.queue_redraw();
+    }
+    pub fn set_grid_config(&self, margin_cols: u32, main_cols: u32) {
+        self.2.borrow_mut().set_grid_config(margin_cols, main_cols);
+        self.0.queue_redraw();
+    }
+    pub fn set_row_counts(&self, header_rows: u32, main_rows: u32) {
+        self.2.borrow_mut().set_row_counts(header_rows, main_rows);
+        self.0.queue_redraw();
+    }
+    pub fn set_column_layout(&self, layout: Vec<(u32, u32, String)>) {
+        self.2.borrow_mut().set_column_layout(layout);
+        self.0.queue_redraw();
+    }
+    pub fn set_row_labels(&self, labels: Vec<(u32, String)>) {
+        self.2.borrow_mut().set_row_labels(labels);
+        self.0.queue_redraw();
+    }
+    pub fn set_menu_text(&self, text: &str) {
+        self.2.borrow_mut().set_menu_text(text);
+        self.0.queue_redraw();
+    }
+    pub fn set_border_title(&self, text: &str) {
+        self.2.borrow_mut().set_border_title(text);
+        self.0.queue_redraw();
+    }
+    pub fn set_status_text(&self, text: &str) {
+        self.2.borrow_mut().set_status_text(text);
+        self.0.queue_redraw();
+    }
+    pub fn set_formula_bar_trailing(&self, text: &str) {
+        self.2.borrow_mut().set_formula_bar_trailing(text);
+        self.0.queue_redraw();
+    }
+    pub fn set_tab_data(&self, titles: &[String], active: usize) {
+        self.2.borrow_mut().set_tab_data(titles, active);
+        self.0.queue_redraw();
+    }
+    pub fn set_formula_bar(&self, address_label: &Label, entry: &Entry) {
+        let addr = address_label.get_text().unwrap_or_default();
+        let txt = entry.get_text().unwrap_or_default();
+        self.2.borrow_mut().set_formula_bar(&addr, &txt);
+        self.0.queue_redraw();
+    }
+    pub fn commit_formula_bar(&self) {
+        self.2.borrow_mut().commit_formula_bar();
+        self.0.queue_redraw();
+    }
     pub fn queue_redraw(&self) { self.0.queue_redraw(); }
     pub fn set_draw_callback(&self, cb: Box<dyn FnMut(&mut dyn DrawContext, i32, i32)>) { self.0.set_draw_callback(cb); }
+    pub fn on_click(&self, mut cb: Box<dyn FnMut(f64, f64)>) {
+        let model = self.2.clone();
+        self.0.on_click(Box::new(move |x, y| {
+            let (r, c) = match crate::spreadsheet::cell_at(&model.borrow(), x, y) {
+                Some((r, c)) => (r as f64, c as f64),
+                None => (x, y),
+            };
+            cb(r, c);
+        }));
+    }
     pub fn on_key(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) { self.0.on_key(cb); }
-    pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) { self.0.on_click(cb); }
     pub fn set_hexpand(&self, e: bool) { self.1.set_hexpand(e); }
     pub fn set_vexpand(&self, e: bool) { self.1.set_vexpand(e); }
     pub fn canvas(&self) -> &Canvas { &self.0 }
@@ -474,4 +549,25 @@ pub fn quit_main_loop() -> Result<(), Error> { Ok(()) }
 pub fn pump_main_context(count: usize) { for _ in 0..count { glib::MainContext::default().iteration(false); } }
 pub fn open_file(_t: &str) -> Result<Option<String>, Error> { Ok(None) }
 pub fn save_file(_t: &str) -> Result<Option<String>, Error> { Ok(None) }
-pub fn create_spreadsheet(r: usize, c: usize) -> Result<Spreadsheet, Error> { Ok(Spreadsheet::new(r, c)) }
+pub fn create_spreadsheet(r: usize, c: usize) -> Result<Spreadsheet, Error> {
+    let canvas = Canvas::new();
+    let overlay = Overlay::new();
+    let model = crate::spreadsheet::new_shared_model(r as u32, c as u32);
+    let mdraw = model.clone();
+    canvas.set_draw_callback(Box::new(move |dc: &mut dyn DrawContext, w: i32, h: i32| {
+        crate::spreadsheet::paint(&mdraw.borrow(), dc, w, h);
+    }));
+    let cw = 150i32; let ch = 28i32; let chw = 46i32;
+    let total_w = chw + c as i32 * cw;
+    let total_h = ch + r as i32 * ch;
+    canvas.set_size_request(total_w, total_h);
+    overlay.set_child(&canvas);
+    Ok(Spreadsheet(canvas, overlay, model))
+}
+
+pub fn add_cursor_move_callback<F: FnMut(u32, u32) + 'static>(f: F) {
+    crate::spreadsheet::add_global_cursor_move_callback(Box::new(f));
+}
+pub fn add_commit_edit_callback<F: FnMut(u32, u32, String) + 'static>(f: F) {
+    crate::spreadsheet::add_global_commit_edit_callback(Box::new(f));
+}

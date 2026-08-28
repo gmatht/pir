@@ -3,6 +3,7 @@
 
 pub mod prelude;
 pub mod core;
+pub mod spreadsheet;
 pub mod overflow;
 pub mod lifecycle_stress;
 pub mod backends;

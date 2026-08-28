@@ -121,17 +121,6 @@ mod gtk_backend {
         gtk_dynamic_loader::TextView::new(loader.clone())
     }
 
-    pub fn create_scrolled_textview() -> Result<gtk_dynamic_loader::ScrolledWindow, gtk_dynamic_loader::Error> {
-        let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
-        let sw = gtk_dynamic_loader::ScrolledWindow::new(loader.clone())?;
-        let tv = gtk_dynamic_loader::TextView::new(loader.clone())?;
-        tv.set_wrap_mode(loader.symbols.gtk_wrap_mode_word_char.ok());
-        sw.set_child(&tv);
-        // Keep the inner TextView reachable from the ScrolledWindow owner.
-        crate::backends::gtk::set_scrolled_child(sw.inner, tv.inner);
-        Ok(sw)
-    }
-
     pub fn create_drawing_area() -> Result<gtk_dynamic_loader::DrawingArea, gtk_dynamic_loader::Error> {
         let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
         gtk_dynamic_loader::DrawingArea::new(loader.clone())
