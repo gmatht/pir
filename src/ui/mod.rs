@@ -13826,6 +13826,171 @@ mod drive_feature_tests {
             app.mode
         );
     }
+
+    // ── Remaining Format ▸ Number / Scope variants ──
+    #[test]
+    fn drive_format_fixed0() {
+        let mut app = App::new(None);
+        open_menu(&mut app, 'e');
+        menu_right(&mut app, 2);
+        choose(&mut app, 'n'); // Number submenu
+        choose(&mut app, '0'); // Fixed 0
+        assert!(
+            matches!(app.mode, Mode::Normal),
+            "Format▸Number▸Fixed0 should apply (mode={:?})",
+            app.mode
+        );
+    }
+    #[test]
+    fn drive_format_fixed1() {
+        let mut app = App::new(None);
+        open_menu(&mut app, 'e');
+        menu_right(&mut app, 2);
+        choose(&mut app, 'n');
+        choose(&mut app, '1'); // Fixed 1
+        assert!(
+            matches!(app.mode, Mode::Normal),
+            "Format▸Number▸Fixed1 should apply (mode={:?})",
+            app.mode
+        );
+    }
+    #[test]
+    fn drive_format_fixed_custom() {
+        let mut app = App::new(None);
+        open_menu(&mut app, 'e');
+        menu_right(&mut app, 2);
+        choose(&mut app, 'n');
+        choose(&mut app, 'N'); // Fixed n -> decimals dialog
+        assert!(
+            matches!(app.mode, Mode::FormatDecimals { .. }),
+            "Format▸Number▸Fixed n should open the decimals dialog (mode={:?})",
+            app.mode
+        );
+    }
+    #[test]
+    fn drive_format_rational() {
+        let mut app = App::new(None);
+        open_menu(&mut app, 'e');
+        menu_right(&mut app, 2);
+        choose(&mut app, 'n');
+        choose(&mut app, 'r'); // Rational
+        assert!(
+            matches!(app.mode, Mode::Normal),
+            "Format▸Number▸Rational should apply (mode={:?})",
+            app.mode
+        );
+    }
+    #[test]
+    fn drive_format_scope_fullcol() {
+        let mut app = App::new(None);
+        open_menu(&mut app, 'e');
+        menu_right(&mut app, 2);
+        choose(&mut app, 's'); // Scope submenu
+        choose(&mut app, 'f'); // Full col
+        assert!(
+            matches!(app.mode, Mode::Menu { .. }),
+            "Format▸Scope▸Full col should apply (mode={:?})",
+            app.mode
+        );
+    }
+    #[test]
+    fn drive_format_scope_data() {
+        let mut app = App::new(None);
+        open_menu(&mut app, 'e');
+        menu_right(&mut app, 2);
+        choose(&mut app, 's');
+        choose(&mut app, 'd'); // Data
+        assert!(
+            matches!(app.mode, Mode::Menu { .. }),
+            "Format▸Scope▸Data should apply (mode={:?})",
+            app.mode
+        );
+    }
+    #[test]
+    fn drive_format_scope_special() {
+        let mut app = App::new(None);
+        open_menu(&mut app, 'e');
+        menu_right(&mut app, 2);
+        choose(&mut app, 's');
+        choose(&mut app, 's'); // Special
+        assert!(
+            matches!(app.mode, Mode::Menu { .. }),
+            "Format▸Scope▸Special should apply (mode={:?})",
+            app.mode
+        );
+    }
+    #[test]
+    fn drive_format_scope_cell() {
+        let mut app = App::new(None);
+        open_menu(&mut app, 'e');
+        menu_right(&mut app, 2);
+        choose(&mut app, 's');
+        choose(&mut app, 'c'); // Cell
+        assert!(
+            matches!(app.mode, Mode::Menu { .. }),
+            "Format▸Scope▸Cell should apply (mode={:?})",
+            app.mode
+        );
+    }
+    #[test]
+    fn drive_format_scope_selection() {
+        let mut app = App::new(None);
+        open_menu(&mut app, 'e');
+        menu_right(&mut app, 2);
+        choose(&mut app, 's'); // Scope submenu (Selection is item 5; 'l' is nav)
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Down, KeyModifiers::empty());
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        assert!(
+            matches!(app.mode, Mode::Menu { .. }),
+            "Format▸Scope▸Selection should apply (mode={:?})",
+            app.mode
+        );
+    }
+
+    // ── Help submenu ──
+    #[test]
+    fn drive_help_rows() {
+        let mut app = App::new(None);
+        open_menu(&mut app, 'h');
+        choose(&mut app, 'r'); // Row ops
+        assert!(
+            matches!(app.mode, Mode::Normal),
+            "Help▸Row ops sets status and returns to Normal (mode={:?})",
+            app.mode
+        );
+        assert!(!app.status.is_empty(), "Help▸Row ops should set a status hint");
+    }
+    #[test]
+    fn drive_help_cols() {
+        let mut app = App::new(None);
+        open_menu(&mut app, 'h');
+        choose(&mut app, 'c'); // Col ops
+        assert!(
+            matches!(app.mode, Mode::Normal),
+            "Help▸Col ops sets status and returns to Normal (mode={:?})",
+            app.mode
+        );
+        assert!(!app.status.is_empty(), "Help▸Col ops should set a status hint");
+    }
+    #[test]
+    fn drive_about() {
+        let mut app = App::new(None);
+        open_menu(&mut app, 'h');
+        choose(&mut app, 'a'); // About
+        assert!(matches!(app.mode, Mode::About), "Help▸About opens About mode (mode={:?})", app.mode);
+    }
+    #[test]
+    fn drive_help_full() {
+        let mut app = App::new(None);
+        open_menu(&mut app, 'h');
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down, KeyModifiers::empty());
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::empty()); // Full help
+        assert!(matches!(app.mode, Mode::Help), "Help▸Full help opens Help mode (mode={:?})", app.mode);
+    }
 }
 
 #[cfg(test)]
