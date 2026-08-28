@@ -804,6 +804,26 @@ pub fn select<'a>(
 ) -> Result<(&'a Provider, &'a Model), String> {
     let sel = selector.trim().to_lowercase();
 
+    // `:N` positional selector: pick the Nth model from the same flat
+    // (provider, then model) order `/models` prints, so an index shown by the
+    // listing always resolves. Out-of-range -> a helpful error, never a panic.
+    if let Some(num) = sel.strip_prefix(':') {
+        if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+            let flat: Vec<(&'a Provider, &'a Model)> = providers
+                .iter()
+                .flat_map(|p| p.models.iter().map(move |m| (p, m)))
+                .collect();
+            let n: usize = num.parse().unwrap_or(usize::MAX);
+            return match flat.get(n) {
+                Some((p, m)) => Ok((p, m)),
+                None => Err(format!(
+                    "no model at position {n} — `/models` numbers them 0..{}",
+                    flat.len().saturating_sub(1)
+                )),
+            };
+        }
+    }
+
     if let Some((pid, mid)) = selector.trim().split_once('/') {
         for p in providers {
             if p.pid().eq_ignore_ascii_case(pid) {
@@ -832,17 +852,45 @@ pub fn select<'a>(
             providers_with.iter().map(|p| p.label(m)).collect::<Vec<_>>().join(", ")
         ));
     }
+    // Partial substring match over the `provider/model` label, the model id,
+    // and the display name. If the text before the first `/` names (or
+    // prefixes) a known provider, narrow to that provider and match the
+    // remainder against just its models, so `openai/4.1` stays within openai
+    // (and `:N`-style fragments can't spill across providers). Otherwise fall
+    // back to the whole-label substring behaviour.
+    let (sel_provider, sel_text) = match sel.split_once('/') {
+        Some((pid, rest))
+            if providers.iter().any(|p| p.pid().to_lowercase().starts_with(pid)) =>
+        {
+            (Some(pid.to_string()), rest.trim().to_string())
+        }
+        _ => (None, sel.clone()),
+    };
     let hits: Vec<(&'a Provider, &'a Model)> = providers
         .iter()
         .flat_map(|p| p.models.iter().map(move |m| (p, m)))
         .filter(|(p, m)| {
-            format!("{}/{}", p.pid(), m.id).to_lowercase().contains(&sel)
-                || m.name.as_deref().unwrap_or("").to_lowercase().contains(&sel)
+            let empty = String::new();
+            let mid = m.id.to_lowercase();
+            let name = m.name.as_deref().unwrap_or(&empty).to_lowercase();
+            match &sel_provider {
+                Some(pid) => {
+                    p.pid().to_lowercase().starts_with(pid)
+                        && !sel_text.is_empty()
+                        && (mid.contains(&sel_text) || name.contains(&sel_text))
+                }
+                None => {
+                    format!("{}/{}", p.pid(), m.id).to_lowercase().contains(&sel)
+                        || name.contains(&sel)
+                }
+            }
         })
         .collect();
     match hits.as_slice() {
         [only] => Ok(*only),
-        [] => Err(format!("no model matches '{selector}'")),
+        [] => Err(format!(
+            "no model matches '{selector}' — try a partial match (id, name, provider/model) or `:N` from `/models`"
+        )),
         _ => Err(format!(
             "'{selector}' is ambiguous: {}",
             hits.iter().map(|(p, m)| p.label(m)).collect::<Vec<_>>().join(", ")
@@ -919,3 +967,104 @@ pub fn publish_model_broadcast(label: &str) -> Option<u64> {
     }
 }
 
+
+#[cfg(test)]
+mod select_tests {
+    use super::*;
+
+    fn mk(id: &str, name: &str) -> Model {
+        Model {
+            id: id.into(),
+            name: Some(name.into()),
+            context: Some(1000),
+            max_tokens: None,
+            price_per_1k: None,
+        }
+    }
+
+    fn providers() -> Vec<Provider> {
+        vec![
+            Provider {
+                id: Some("anthropic".into()),
+                name: None,
+                api: Some("anthropic".into()),
+                base_url: Some("https://api.anthropic.com/v1".into()),
+                api_key: None,
+                models: vec![
+                    mk("claude-sonnet-4-5", "Claude Sonnet 4.5"),
+                    mk("claude-haiku-4-5", "Claude Haiku 4.5"),
+                ],
+            },
+            Provider {
+                id: Some("openai".into()),
+                name: None,
+                api: Some("openai".into()),
+                base_url: Some("https://api.openai.com/v1".into()),
+                api_key: None,
+                models: vec![mk("gpt-4.1", "GPT-4.1"), mk("gpt-4.1-mini", "GPT-4.1 mini")],
+            },
+        ]
+    }
+
+    fn pick(provs: &[Provider], sel: &str) -> String {
+        select(provs, sel)
+            .map(|(p, m)| p.label(m))
+            .unwrap_or_else(|e| format!("ERR: {e}"))
+    }
+
+    #[test]
+    fn positional_colon_selects_models_order() {
+        let provs = providers();
+        // The same flat (provider, then model) order `list_models` prints.
+        assert_eq!(pick(&provs, ":0"), "anthropic/claude-sonnet-4-5");
+        assert_eq!(pick(&provs, ":1"), "anthropic/claude-haiku-4-5");
+        assert_eq!(pick(&provs, ":2"), "openai/gpt-4.1");
+        assert_eq!(pick(&provs, ":3"), "openai/gpt-4.1-mini");
+    }
+
+    #[test]
+    fn positional_out_of_range_and_junk() {
+        let provs = providers();
+        let err = pick(&provs, ":9");
+        assert!(err.starts_with("ERR: no model at position 9"), "{err}");
+        // A non-numeric `:` selector is not positional (falls through to the
+        // normal matcher, which errors with the usual message).
+        assert!(pick(&provs, ":x").starts_with("ERR: no model matches ':x'"), "{err}");
+    }
+
+    #[test]
+    fn provider_narrowed_partial_match() {
+        let provs = providers();
+        // `provider/fragment` narrows to that provider's models.
+        assert_eq!(pick(&provs, "anthropic/haiku"), "anthropic/claude-haiku-4-5");
+        // The provider part may be an abbreviated prefix; match on name too.
+        assert_eq!(pick(&provs, "anth/son"), "anthropic/claude-sonnet-4-5");
+        assert_eq!(pick(&provs, "openai/gpt-4.1-mini"), "openai/gpt-4.1-mini");
+        // Fragments matching several models of that provider stay ambiguous,
+        // but only within the named provider.
+        let e = pick(&provs, "openai/gpt");
+        assert!(e.starts_with("ERR: 'openai/gpt' is ambiguous:"), "{e}");
+        assert!(e.contains("openai/gpt-4.1, openai/gpt-4.1-mini"), "{e}");
+    }
+
+    #[test]
+    fn whole_label_substring_fallback_kept() {
+        let provs = providers();
+        // No known provider before the `/`: fall back to a substring match on
+        // the full `provider/model` label (the old behaviour).
+        assert_eq!(pick(&provs, "haiku-4-5"), "anthropic/claude-haiku-4-5");
+        // Bare id substring still resolves.
+        assert_eq!(pick(&provs, "4.1-mi"), "openai/gpt-4.1-mini");
+    }
+
+    #[test]
+    fn ambiguous_and_missing_report_choices() {
+        let provs = providers();
+        let e = pick(&provs, "4.1");
+        assert!(e.starts_with("ERR: '4.1' is ambiguous:"), "{e}");
+        assert!(e.contains("openai/gpt-4.1, openai/gpt-4.1-mini"), "{e}");
+        let e = pick(&provs, "zzz");
+        assert!(e.starts_with("ERR: no model matches 'zzz'"), "{e}");
+        assert!(e.contains(":N"), "error should mention the :N escape hatch: {e}");
+    }
+}

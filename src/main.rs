@@ -20,6 +20,7 @@ use crate::config::Provider;
 use crate::config::Model;
 use crate::notify::SharedBus;
 use std::io::BufRead;
+use std::io::IsTerminal;
 use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -1766,18 +1767,24 @@ fn print_abi() {
 
 fn list_models(providers: &[Provider]) -> String {
     let mut out = String::new();
+    let mut idx = 0usize;
     for p in providers {
         out.push_str(&format!("{}\n", term::bold(&p.pid())));
         for m in &p.models {
             let ctx = m.context.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
             out.push_str(&format!(
-                "  {:<44} ctx {:>7}  {}\n",
+                "  {:>3}  {:<41} ctx {:>7}  {}\n",
+                format!(":{idx}"),
                 m.id,
                 ctx,
                 m.name.as_deref().unwrap_or("")
             ));
+            idx += 1;
         }
     }
+    out.push_str(&term::dim(
+        "pick with /model <partial|provider/model|:N>  (indices are the :N shown above)\n",
+    ));
     out
 }
 
@@ -1851,8 +1858,28 @@ fn resolve_resume(token: Option<&str>) -> Option<PathBuf> {
         Some(s) => Some(s.path.clone()),
         None => {
             if token.is_none() {
-                eprintln!("pir: no session from this shell yet; use `pir -r <idx>` — see `pir -r` list");
+                // No session from this shell. Don't dead-end: show the
+                // sessions that exist for this project (they may be from a
+                // different shell/terminal) and offer to resume one. Only
+                // prompt when stdin is an interactive terminal — otherwise
+                // `read_answer` would block forever on piped/scripted stdin.
+                eprintln!("pir: no session from this shell yet — other sessions in this project:");
                 eprintln!("{}", list_sessions());
+                if std::io::stdin().is_terminal() {
+                    let ans = term::read_answer("resume one? [idx | y=latest | n]");
+                    let ans = ans.as_str();
+                    let pick = if ans.is_empty() || ans == "n" || ans == "no" {
+                        None
+                    } else if ans == "y" || ans == "yes" {
+                        Some(0usize)
+                    } else {
+                        ans.parse::<usize>().ok()
+                    };
+                    match pick.and_then(|n| sessions.get(n)) {
+                        Some(s) => return Some(s.path.clone()),
+                        None => eprintln!("pir: ok — not resuming (start fresh, or `pir -r <idx>` next time)"),
+                    }
+                }
             } else {
                 eprintln!("pir: no session matches '{token:?}'");
             }
