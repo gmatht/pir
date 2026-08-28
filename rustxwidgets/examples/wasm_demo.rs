@@ -2,7 +2,8 @@ use rustxwidgets::prelude::*;
 use std::rc::Rc;
 use std::cell::RefCell;
 
-fn main() {
+#[cfg(target_arch = "wasm32")]
+fn run() {
     let app = App::init().expect("init");
     let win = app.create_window().expect("window");
     win.set_title("rustxwidgets WASM demo");
@@ -31,4 +32,15 @@ fn main() {
 
     web_sys::console::log_1(&"WASM demo running".into());
     app.run().expect("run");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run() {
+    // web-sys is only linked on the wasm32 target; on other targets this demo
+    // is a compile-only stub so it still parses under `cargo build --examples`.
+    eprintln!("wasm_demo only runs on the wasm32 target");
+}
+
+fn main() {
+    run();
 }

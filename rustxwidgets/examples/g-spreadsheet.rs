@@ -20,7 +20,7 @@ fn compute_spans(grid: &Vec<Vec<gtk::Entry>>, loader: &std::sync::Arc<gtk_dynami
     // Use gtk_dynamic_loader measurement when available
         // widget_key is the pointer value encoded as usize; convert back to pointer
         let ptr = widget_key as *mut std::os::raw::c_void;
-        gtk_dynamic_loader::measure_text_px(loader, Some(ptr), s)
+        unsafe { gtk_dynamic_loader::measure_text_px(loader, Some(ptr), s) }
     })
 }
 
@@ -49,9 +49,11 @@ fn rebuild_overlays(overlay: &gtk_dynamic_loader::Overlay, overlay_labels: &Rc<R
             let left = (start_col as i32) * cell_w + cell_w; // account for header column
             let top = (r as i32 + 1) * cell_h; // account for header row
             let width = (len as i32) * cell_w;
-            gtk_dynamic_loader::widget_set_size_request(loader, *lbl.as_ref(), width, cell_h);
-            gtk_dynamic_loader::widget_set_margin_start(loader, *lbl.as_ref(), left);
-            gtk_dynamic_loader::widget_set_margin_top(loader, *lbl.as_ref(), top);
+            unsafe {
+                gtk_dynamic_loader::widget_set_size_request(loader, *lbl.as_ref(), width, cell_h);
+                gtk_dynamic_loader::widget_set_margin_start(loader, *lbl.as_ref(), left);
+                gtk_dynamic_loader::widget_set_margin_top(loader, *lbl.as_ref(), top);
+            }
 
             new_labels.push(lbl);
         }
@@ -187,9 +189,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let top = (r as i32 + 1) * cell_h; // account for header row
                 let width = (len as i32) * cell_w;
                 // set size and margins on the label
-                gtk_dynamic_loader::widget_set_size_request(&loader_clone, *lbl.as_ref(), width, cell_h);
-                gtk_dynamic_loader::widget_set_margin_start(&loader_clone, *lbl.as_ref(), left);
-                gtk_dynamic_loader::widget_set_margin_top(&loader_clone, *lbl.as_ref(), top);
+                unsafe {
+                    gtk_dynamic_loader::widget_set_size_request(&loader_clone, *lbl.as_ref(), width, cell_h);
+                    gtk_dynamic_loader::widget_set_margin_start(&loader_clone, *lbl.as_ref(), left);
+                    gtk_dynamic_loader::widget_set_margin_top(&loader_clone, *lbl.as_ref(), top);
+                }
 
                 overlay_labels_ref.borrow_mut().push(lbl);
             }

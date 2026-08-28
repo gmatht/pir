@@ -15,6 +15,15 @@ pub type GSignalConnectData = unsafe extern "C" fn(instance: *mut c_void, detail
 pub type GSignalConnect = unsafe extern "C" fn(instance: *mut c_void, detailed_signal: *const i8, c_handler: *mut c_void, data: *mut c_void) -> u64;
 pub type GSignalEmitByName = unsafe extern "C" fn(instance: *mut c_void, detailed_signal: *const i8) -> u64;
 
+// GObject property helpers (used to set text-tag attributes like "foreground"
+// without pulling in a full GObject binding). GValue is a small C struct
+// (8-byte GType id + 8-byte payload on 64-bit); we reserve 32 bytes, more than
+// enough, and pass it opaquely.
+pub type GObjectSetProperty = unsafe extern "C" fn(object: *mut c_void, property_name: *const i8, value: *const c_void);
+pub type GValueInit = unsafe extern "C" fn(value: *mut c_void, g_type: usize);
+pub type GValueSet = unsafe extern "C" fn(value: *mut c_void, v_string: *const i8);
+pub type GValueUnset = unsafe extern "C" fn(value: *mut c_void);
+
 pub type GtkWindowNew = unsafe extern "C" fn(window_type: i32) -> *mut c_void;
 pub type GtkWindowSetTitle = unsafe extern "C" fn(window: *mut c_void, title: *const i8);
 pub type GtkButtonNewWithLabel = unsafe extern "C" fn(label: *const i8) -> *mut c_void;
@@ -145,16 +154,29 @@ pub type GtkTextBufferGetEndIter = unsafe extern "C" fn(buffer: *mut c_void, ite
 pub type GtkTextIterCopy = unsafe extern "C" fn(iter: *mut c_void) -> *mut c_void;
 pub type GtkTextIterFree = unsafe extern "C" fn(iter: *mut c_void);
 pub type GtkTextViewSetWrapMode = unsafe extern "C" fn(text_view: *mut c_void, wrap_mode: i32);
+pub type GtkTextViewSetEditable = unsafe extern "C" fn(text_view: *mut c_void, editable: i32);
+pub type GtkTextViewGetEditable = unsafe extern "C" fn(text_view: *mut c_void) -> i32;
+
+// Rich text (text-buffer tags for coloured conversation output).
+// GValue is a small C struct (8-byte type id + payload); we pass it opaquely.
+pub type GtkTextBufferInsertMarkup = unsafe extern "C" fn(buffer: *mut c_void, iter: *mut c_void, markup: *const i8, len: i32);
+pub type GtkTextBufferInsert = unsafe extern "C" fn(buffer: *mut c_void, iter: *mut c_void, text: *const i8, len: i32);
+pub type GtkTextBufferGetIterAtOffset = unsafe extern "C" fn(buffer: *mut c_void, iter: *mut c_void, char_offset: i32);
+pub type GtkTextBufferGetCharCount = unsafe extern "C" fn(buffer: *mut c_void) -> i32;
+pub type GtkTextViewScrollToIter = unsafe extern "C" fn(text_view: *mut c_void, iter: *mut c_void, within_margin: f64, use_align: i32, xalign: f64, yalign: f64) -> i32;
+pub type GtkTextBufferCreateTag = unsafe extern "C" fn(buffer: *mut c_void, tag_name: *const i8, first_property_name: *const i8, ...) -> *mut c_void;
 
 // GtkWidget helper for visibility/event handling
 pub type GtkWidgetSetHexpand = unsafe extern "C" fn(widget: *mut c_void, expand: i32);
 pub type GtkWidgetSetVexpand = unsafe extern "C" fn(widget: *mut c_void, expand: i32);
 pub type GtkWidgetGetHexpand = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 pub type GtkWidgetGetVexpand = unsafe extern "C" fn(widget: *mut c_void) -> i32;
+pub type GtkWidgetGetCanFocus = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 
 // GtkEditable (GTK4 replacement for gtk_entry_get_text/set_text)
 pub type GtkEditableGetText = unsafe extern "C" fn(editable: *mut c_void) -> *const i8;
 pub type GtkEditableSetText = unsafe extern "C" fn(editable: *mut c_void, text: *const i8);
+pub type GtkEditableSetPosition = unsafe extern "C" fn(editable: *mut c_void, position: i32);
 
 // GtkWidget parent handling
 pub type GtkWidgetUnparent = unsafe extern "C" fn(widget: *mut c_void);
@@ -393,17 +415,31 @@ pub struct Symbols {
     pub gtk_text_buffer_get_end_iter: Option<GtkTextBufferGetEndIter>,
     pub gtk_text_iter_copy: Option<GtkTextIterCopy>,
     pub gtk_text_iter_free: Option<GtkTextIterFree>,
+    pub gtk_text_buffer_insert_markup: Option<GtkTextBufferInsertMarkup>,
+    pub gtk_text_buffer_insert: Option<GtkTextBufferInsert>,
+    pub gtk_text_buffer_get_iter_at_offset: Option<GtkTextBufferGetIterAtOffset>,
+    pub gtk_text_buffer_get_char_count: Option<GtkTextBufferGetCharCount>,
+    pub gtk_text_view_scroll_to_iter: Option<GtkTextViewScrollToIter>,
+    pub gtk_text_buffer_create_tag: Option<GtkTextBufferCreateTag>,
+    pub g_object_set_property: Option<GObjectSetProperty>,
+    pub g_value_init: Option<GValueInit>,
+    pub g_value_set_string: Option<GValueSet>,
+    pub g_value_unset: Option<GValueUnset>,
     pub gtk_text_view_set_wrap_mode: Option<GtkTextViewSetWrapMode>,
+    pub gtk_text_view_set_editable: Option<GtkTextViewSetEditable>,
+    pub gtk_text_view_get_editable: Option<GtkTextViewGetEditable>,
 
     // Widget helpers
     pub gtk_widget_set_hexpand: Option<GtkWidgetSetHexpand>,
     pub gtk_widget_set_vexpand: Option<GtkWidgetSetVexpand>,
     pub gtk_widget_get_hexpand: Option<GtkWidgetGetHexpand>,
     pub gtk_widget_get_vexpand: Option<GtkWidgetGetVexpand>,
+    pub gtk_widget_get_can_focus: Option<GtkWidgetGetCanFocus>,
 
     // GtkEditable (GTK4)
     pub gtk_editable_get_text: Option<GtkEditableGetText>,
     pub gtk_editable_set_text: Option<GtkEditableSetText>,
+    pub gtk_editable_set_position: Option<GtkEditableSetPosition>,
 
     // GtkWidget parent handling
     pub gtk_widget_unparent: Option<GtkWidgetUnparent>,
@@ -634,17 +670,31 @@ impl Symbols {
         let gtk_text_buffer_get_end_iter = unsafe { sym::<GtkTextBufferGetEndIter>(gtk, "gtk_text_buffer_get_end_iter") };
         let gtk_text_iter_copy = unsafe { sym::<GtkTextIterCopy>(gtk, "gtk_text_iter_copy") };
         let gtk_text_iter_free = unsafe { sym::<GtkTextIterFree>(gtk, "gtk_text_iter_free") };
+        let gtk_text_buffer_insert_markup = unsafe { sym::<GtkTextBufferInsertMarkup>(gtk, "gtk_text_buffer_insert_markup") };
+        let gtk_text_buffer_insert = unsafe { sym::<GtkTextBufferInsert>(gtk, "gtk_text_buffer_insert") };
+        let gtk_text_buffer_get_iter_at_offset = unsafe { sym::<GtkTextBufferGetIterAtOffset>(gtk, "gtk_text_buffer_get_iter_at_offset") };
+        let gtk_text_buffer_get_char_count = unsafe { sym::<GtkTextBufferGetCharCount>(gtk, "gtk_text_buffer_get_char_count") };
+        let gtk_text_view_scroll_to_iter = unsafe { sym::<GtkTextViewScrollToIter>(gtk, "gtk_text_view_scroll_to_iter") };
+        let gtk_text_buffer_create_tag = unsafe { sym::<GtkTextBufferCreateTag>(gtk, "gtk_text_buffer_create_tag") };
+        let g_object_set_property = unsafe { sym::<GObjectSetProperty>(gobject, "g_object_set_property") };
+        let g_value_init = unsafe { sym::<GValueInit>(gobject, "g_value_init") };
+        let g_value_set_string = unsafe { sym::<GValueSet>(gobject, "g_value_set_string") };
+        let g_value_unset = unsafe { sym::<GValueUnset>(gobject, "g_value_unset") };
         let gtk_text_view_set_wrap_mode = unsafe { sym::<GtkTextViewSetWrapMode>(gtk, "gtk_text_view_set_wrap_mode") };
+        let gtk_text_view_set_editable = unsafe { sym::<GtkTextViewSetEditable>(gtk, "gtk_text_view_set_editable") };
+        let gtk_text_view_get_editable = unsafe { sym::<GtkTextViewGetEditable>(gtk, "gtk_text_view_get_editable") };
 
         // Widget helpers
         let gtk_widget_set_hexpand = unsafe { sym::<GtkWidgetSetHexpand>(gtk, "gtk_widget_set_hexpand") };
         let gtk_widget_set_vexpand = unsafe { sym::<GtkWidgetSetVexpand>(gtk, "gtk_widget_set_vexpand") };
         let gtk_widget_get_hexpand = unsafe { sym::<GtkWidgetGetHexpand>(gtk, "gtk_widget_get_hexpand") };
         let gtk_widget_get_vexpand = unsafe { sym::<GtkWidgetGetVexpand>(gtk, "gtk_widget_get_vexpand") };
+        let gtk_widget_get_can_focus = unsafe { sym::<GtkWidgetGetCanFocus>(gtk, "gtk_widget_get_can_focus") };
 
         // GtkEditable (GTK4, replaces gtk_entry_get_text/set_text)
         let gtk_editable_get_text = unsafe { sym::<GtkEditableGetText>(gtk, "gtk_editable_get_text") };
         let gtk_editable_set_text = unsafe { sym::<GtkEditableSetText>(gtk, "gtk_editable_set_text") };
+        let gtk_editable_set_position = unsafe { sym::<GtkEditableSetPosition>(gtk, "gtk_editable_set_position") };
 
         // GtkWidget parent handling
         let gtk_widget_unparent = unsafe { sym::<GtkWidgetUnparent>(gtk, "gtk_widget_unparent") };
@@ -700,10 +750,11 @@ impl Symbols {
             gtk_drop_down_new, gtk_drop_down_set_selected, gtk_drop_down_get_selected, gtk_string_list_new,
             gtk_check_button_new_with_label, gtk_check_button_get_active, gtk_check_button_set_active, gtk_check_button_set_group, gtk_toggle_button_get_active, gtk_toggle_button_set_active,
             gtk_radio_button_new_with_label,
-            gtk_text_view_new, gtk_text_buffer_new, gtk_text_view_get_buffer, gtk_text_buffer_set_text, gtk_text_buffer_get_text, gtk_text_buffer_get_start_iter, gtk_text_buffer_get_end_iter, gtk_text_iter_copy, gtk_text_iter_free, gtk_text_view_set_wrap_mode,
+            gtk_text_view_new, gtk_text_buffer_new, gtk_text_view_get_buffer, gtk_text_buffer_set_text, gtk_text_buffer_get_text, gtk_text_buffer_get_start_iter, gtk_text_buffer_get_end_iter, gtk_text_iter_copy, gtk_text_iter_free, gtk_text_view_set_wrap_mode, gtk_text_view_set_editable, gtk_text_view_get_editable,
+            gtk_text_buffer_insert_markup, gtk_text_buffer_insert, gtk_text_buffer_get_iter_at_offset, gtk_text_buffer_get_char_count, gtk_text_view_scroll_to_iter, gtk_text_buffer_create_tag, g_object_set_property, g_value_init, g_value_set_string, g_value_unset,
             gtk_widget_set_hexpand, gtk_widget_set_vexpand,
-            gtk_widget_get_hexpand, gtk_widget_get_vexpand,
-            gtk_editable_get_text, gtk_editable_set_text,
+            gtk_widget_get_hexpand, gtk_widget_get_vexpand, gtk_widget_get_can_focus,
+            gtk_editable_get_text, gtk_editable_set_text, gtk_editable_set_position,
             gtk_widget_unparent, gtk_widget_get_parent,
             gtk_window_set_default_size,
             gtk_drawing_area_set_draw_func, gtk_drawing_area_set_content_width, gtk_drawing_area_set_content_height,

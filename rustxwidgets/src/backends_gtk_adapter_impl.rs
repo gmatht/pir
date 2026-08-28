@@ -153,6 +153,8 @@ mod gtk_adapter {
         pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
+        /// Set the cursor position (character index) within the entry's text.
+        pub fn set_position(&self, position: i32) { self.0.set_position(position); }
     }
 
     impl Clone for Entry { fn clone(&self) -> Self { Entry(self.0.clone()) } }
@@ -349,6 +351,19 @@ mod gtk_adapter {
         pub fn set_text(&self, text: &str) { self.0.set_text(text); }
         pub fn get_text(&self) -> Option<String> { self.0.get_text() }
         pub fn set_wrap_mode(&self, wrap_mode: i32) { self.0.set_wrap_mode(wrap_mode); }
+        /// Append Pango markup (e.g. `<span foreground="#e06c75">text</span>`)
+        /// at the end of the buffer.
+        pub fn append_markup(&self, markup: &str) { self.0.append_markup(markup); }
+        /// Append plain (unstyled) text at the end of the buffer.
+        pub fn append_text(&self, text: &str) { self.0.append_text_plain(text); }
+        /// Number of characters in the buffer.
+        pub fn char_count(&self) -> usize { self.0.char_count() }
+        /// Scroll the view so the end of the buffer is visible.
+        pub fn scroll_to_end(&self) { self.0.scroll_to_end(); }
+        pub fn set_editable(&self, editable: bool) { self.0.set_editable(editable); }
+        pub fn get_editable(&self) -> bool { self.0.get_editable() }
+        pub fn set_can_focus(&self, can_focus: bool) { self.0.set_can_focus(can_focus); }
+        pub fn get_can_focus(&self) -> bool { self.0.get_can_focus() }
         pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
@@ -462,6 +477,19 @@ mod gtk_adapter {
 
         pub fn queue_redraw(&self) {
             self.drawing_area.queue_draw();
+        }
+
+        pub fn set_hexpand(&self, expand: bool) {
+            let loader = crate::backends::gtk::loader();
+            if let Some(f) = loader.and_then(|l| l.symbols.gtk_widget_set_hexpand) {
+                unsafe { f(*self.drawing_area.as_ref(), if expand { 1 } else { 0 }) };
+            }
+        }
+        pub fn set_vexpand(&self, expand: bool) {
+            let loader = crate::backends::gtk::loader();
+            if let Some(f) = loader.and_then(|l| l.symbols.gtk_widget_set_vexpand) {
+                unsafe { f(*self.drawing_area.as_ref(), if expand { 1 } else { 0 }) };
+            }
         }
 
         pub fn set_size_request(&self, w: i32, h: i32) {
@@ -712,10 +740,16 @@ mod gtk_adapter {
             let mut cb = cb;
             self.0.on_key(Box::new(move |key: u32| { cb(key, 0u32) }));
         }
+        /// Return a reference to the underlying `Canvas` used for spreadsheet rendering.
         pub fn canvas(&self) -> &Canvas { &self.0 }
+        /// Return a reference to the `Overlay` that hosts the editing `Entry` widgets.
         pub fn overlay(&self) -> &Overlay { &self.1 }
     }
 
+    /// Build a cross-platform `Spreadsheet` widget backed by a `Canvas` + `Overlay`
+    /// and a shared [`crate::spreadsheet`] data model. `rows`/`cols` are the
+    /// number of main (data) rows/columns; the widget paints itself through the
+    /// model's `DrawContext` callback.
     pub fn create_spreadsheet(rows: usize, cols: usize) -> Result<Spreadsheet, Error> {
         let canvas = create_canvas()?;
         let overlay = create_overlay()?;
@@ -733,13 +767,18 @@ mod gtk_adapter {
         Ok(Spreadsheet(canvas, overlay, model))
     }
 
+    /// Register a backend-wide callback invoked whenever the spreadsheet cursor
+    /// moves (row, col). Mirrors [`crate::spreadsheet::add_global_cursor_move_callback`].
     pub fn add_cursor_move_callback<F: FnMut(u32, u32) + 'static>(f: F) {
         crate::spreadsheet::add_global_cursor_move_callback(Box::new(f));
     }
+    /// Register a backend-wide callback invoked when a cell edit is committed
+    /// (row, col, new_text). Mirrors [`crate::spreadsheet::add_global_commit_edit_callback`].
     pub fn add_commit_edit_callback<F: FnMut(u32, u32, String) + 'static>(f: F) {
         crate::spreadsheet::add_global_commit_edit_callback(Box::new(f));
     }
 
+    /// Exit the GTK main loop, terminating the application.
     pub fn quit_main_loop() -> Result<(), Error> {
         crate::backends::gtk::quit_main_loop().map_err(|e| Error::Backend(format!("{}", e)))
     }

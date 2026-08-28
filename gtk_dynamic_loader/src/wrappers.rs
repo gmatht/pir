@@ -1434,6 +1434,15 @@ impl Entry {
         }
     }
 
+    /// Set the cursor position (character index) within the entry's text.
+    /// -1 means the end. Uses `gtk_editable_set_position`.
+    pub fn set_position(&self, position: i32) {
+        guard_widget!(self, "Entry", "set_position");
+        if let Some(set_pos) = self.loader.symbols.gtk_editable_set_position {
+            unsafe { set_pos(self.inner, position); }
+        }
+    }
+
     pub fn connect_focus_in_event<F: FnMut(*mut c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
         guard_widget_or!(self, "Entry", "connect_focus_in_event", Err(Error::Other("entry dropped".into())));
         if self.loader.version() == crate::loader::Version::Gtk4 {
@@ -1662,6 +1671,13 @@ pub unsafe fn widget_set_valign(loader: &Arc<Loader>, widget: *mut c_void, align
 pub unsafe fn widget_set_can_target(loader: &Arc<Loader>, widget: *mut c_void, can_target: bool) {
     if let Some(set) = loader.symbols.gtk_widget_set_can_target {
         unsafe { set(widget, if can_target { 1 } else { 0 }); }
+    }
+}
+
+/// Set whether a widget can take keyboard focus (`gtk_widget_set_can_focus`).
+pub unsafe fn widget_set_can_focus(loader: &Arc<Loader>, widget: *mut c_void, can_focus: bool) {
+    if let Some(set) = loader.symbols.gtk_widget_set_can_focus {
+        unsafe { set(widget, if can_focus { 1 } else { 0 }); }
     }
 }
 
@@ -2672,6 +2688,116 @@ impl TextView {
         if let Some(set_wrap) = self.loader.symbols.gtk_text_view_set_wrap_mode {
             unsafe { set_wrap(self.inner, wrap_mode); }
         }
+    }
+
+    /// Append Pango markup at the end of the buffer (`insert_markup` applies
+    /// `<span foreground=...>`-style tags inline). Falls back to plain text
+    /// when the symbol is unavailable. A trailing newline is NOT added — pass
+    /// it inside `markup` when wanted.
+    pub fn append_markup(&self, markup: &str) {
+        guard_widget!(self, "TextView", "append_markup");
+        let symbols = &self.loader.symbols;
+ if let Some(get_buf) = symbols.gtk_text_view_get_buffer {
+            let buf = unsafe { get_buf(self.inner) };
+            if !buf.is_null() {
+                if let (Some(get_end), Some(insert)) = (symbols.gtk_text_buffer_get_end_iter, symbols.gtk_text_buffer_insert_markup) {
+                    // GtkTextIter is opaque; allocate generously (256 bytes).
+                    let mut end_iter = [0u8; 256];
+                    unsafe {
+                        get_end(buf, end_iter.as_mut_ptr() as *mut c_void);
+                        let c = CString::new(markup).unwrap();
+                        insert(buf, end_iter.as_mut_ptr() as *mut c_void, c.as_ptr(), -1);
+                    }
+                    return;
+                }
+            }
+        }
+        // Degraded fallback: plain text (markup tags would show literally, so
+        // strip them by only using the raw text).
+        self.append_text_plain(markup);
+    }
+
+    /// Append raw text (no markup) at the end of the buffer.
+    pub fn append_text_plain(&self, text: &str) {
+        guard_widget!(self, "TextView", "append_text_plain");
+        let symbols = &self.loader.symbols;
+        if let (Some(get_buf), Some(get_end)) = (symbols.gtk_text_view_get_buffer, symbols.gtk_text_buffer_get_end_iter) {
+            if let Some(insert) = symbols.gtk_text_buffer_insert {
+                let buf = unsafe { get_buf(self.inner) };
+                if !buf.is_null() {
+                    let mut end_iter = [0u8; 256];
+                    unsafe {
+                        get_end(buf, end_iter.as_mut_ptr() as *mut c_void);
+                        let c = CString::new(text).unwrap();
+                        insert(buf, end_iter.as_mut_ptr() as *mut c_void, c.as_ptr(), -1);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Number of characters currently in the buffer.
+    pub fn char_count(&self) -> usize {
+        guard_widget_or!(self, "TextView", "char_count", 0);
+        let symbols = &self.loader.symbols;
+        if let (Some(get_buf), Some(count)) = (symbols.gtk_text_view_get_buffer, symbols.gtk_text_buffer_get_char_count) {
+            let buf = unsafe { get_buf(self.inner) };
+            if !buf.is_null() {
+                return unsafe { count(buf) } as usize;
+            }
+        }
+        0
+    }
+
+    /// Scroll so the end of the buffer is visible (follow streaming output).
+    pub fn scroll_to_end(&self) {
+        guard_widget!(self, "TextView", "scroll_to_end");
+        let symbols = &self.loader.symbols;
+        if let (Some(get_buf), Some(get_end), Some(scroll)) = (
+            symbols.gtk_text_view_get_buffer,
+            symbols.gtk_text_buffer_get_end_iter,
+            symbols.gtk_text_view_scroll_to_iter,
+        ) {
+            let buf = unsafe { get_buf(self.inner) };
+            if !buf.is_null() {
+                let mut end_iter = [0u8; 256];
+                unsafe {
+                    get_end(buf, end_iter.as_mut_ptr() as *mut c_void);
+                    scroll(self.inner, end_iter.as_mut_ptr() as *mut c_void, 0.0, 0, 0.0, 1.0);
+                }
+            }
+        }
+    }
+
+    pub fn set_editable(&self, editable: bool) {
+        guard_widget!(self, "TextView", "set_editable");
+        if let Some(set_edit) = self.loader.symbols.gtk_text_view_set_editable {
+            unsafe { set_edit(self.inner, if editable { 1 } else { 0 }); }
+        }
+    }
+
+    /// Return whether the text view currently accepts input (`gtk_text_view_get_editable`).
+    pub fn get_editable(&self) -> bool {
+        guard_widget_or!(self, "TextView", "get_editable", false);
+        if let Some(get_edit) = self.loader.symbols.gtk_text_view_get_editable {
+            unsafe { get_edit(self.inner) != 0 }
+        } else { false }
+    }
+
+    /// Set whether the text view can take keyboard focus (so a click can't
+    /// steal typing away from the prompt Entry).
+    pub fn set_can_focus(&self, can_focus: bool) {
+ guard_widget!(self, "TextView", "set_can_focus");
+        unsafe { widget_set_can_focus(&self.loader, self.inner, can_focus); }
+    }
+
+    /// Return whether the text view can take keyboard focus
+    /// (`gtk_widget_get_can_focus`).
+    pub fn get_can_focus(&self) -> bool {
+        guard_widget_or!(self, "TextView", "get_can_focus", false);
+        if let Some(get_cf) = self.loader.symbols.gtk_widget_get_can_focus {
+            unsafe { get_cf(self.inner) != 0 }
+        } else { false }
     }
 
     pub fn set_size_request(&self, w: i32, h: i32) {
