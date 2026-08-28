@@ -148,10 +148,7 @@ pub fn run(
         .map_err(|e| format!("create_box: {e}"))?;
 
     let textview = app.create_textview().map_err(|e| format!("create_textview: {e}"))?;
-    textview.set_hexpand(true);
-    textview.set_vexpand(true);
-    // GTK wrap mode: 2 = GTK_WRAP_WORD_CHAR
-    textview.set_wrap_mode(2);
+    configure_conversation_textview(&textview);
     vbox.append(&textview);
 
     let entry = app.create_entry().map_err(|e| format!("create_entry: {e}"))?;
@@ -480,6 +477,20 @@ fn drain_session_log(log: PathBuf, state: &mut GuiState) {
     }
 }
 
+/// Configure the conversation pane's TextView. It must never capture keyboard
+/// focus or accept input: read-only + non-focusable, so clicking it (or a
+/// stray Tab) can't steal typing from the prompt Entry. Otherwise a half-typed
+/// word lands in the text view and the next periodic drain's `set_text` wipes
+/// it ("I typed half a word and it just disappeared").
+fn configure_conversation_textview(tv: &TextView) {
+    tv.set_hexpand(true);
+    tv.set_vexpand(true);
+    // GTK wrap mode: 2 = GTK_WRAP_WORD_CHAR
+    tv.set_wrap_mode(2);
+    tv.set_editable(false);
+    tv.set_can_focus(false);
+}
+
 /// Push the current conversation + status into the TextView (and the status
 /// Label). Cheap enough to call every drain tick.
 fn sync_textview(widgets: &GuiWidgets, state: &GuiState) {
@@ -724,5 +735,46 @@ mod gui_completion_tests {
         assert_eq!(longest_common_prefix(&["show", "hide", "on", "off"]), "");
         assert_eq!(longest_common_prefix(&["model", "models"]), "model");
         assert_eq!(longest_common_prefix(&[]), "");
+    }
+}
+
+#[cfg(test)]
+mod gui_focus_tests {
+    use super::*;
+
+    /// Reproducer for "the text area can capture the keyboard and a half-typed
+    /// word disappears": a bare GTK TextView (what the conversation pane used
+    /// before the fix) is editable AND can-take-focus by default, so clicking
+    /// it steals the keyboard from the prompt Entry — and the next drain tick's
+    /// `set_text` then wipes whatever was typed into it. Requires a display
+    /// (GTK init); skipped gracefully when no GTK backend can load.
+    #[test]
+    fn conversation_textview_must_not_capture_keyboard() {
+        // TextViews are created through the backend factory (App::init +
+        // create_textview), which also runs gtk_init inside Loader::new().
+        let Ok(app) = App::init() else {
+            eprintln!("skipping: no GTK backend/display available in this environment");
+            return;
+        };
+
+        // A TextView configured the way the GUI used to build it (no
+        // editable/can-focus constraints) exhibits the bug.
+        let Ok(buggy) = app.create_textview() else {
+            eprintln!("skipping: could not create textview");
+            return;
+        };
+        assert!(
+            buggy.get_editable() || buggy.get_can_focus(),
+            "precondition: a default TextView must be editable or focusable (that was the bug)"
+        );
+
+        // The fix: the GUI's configuration makes it inert to the keyboard.
+        let Ok(fixed) = app.create_textview() else {
+            eprintln!("skipping: could not create textview");
+            return;
+        };
+        configure_conversation_textview(&fixed);
+        assert!(!fixed.get_editable(), "conversation TextView must be read-only");
+        assert!(!fixed.get_can_focus(), "conversation TextView must not take keyboard focus");
     }
 }
