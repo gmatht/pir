@@ -9,10 +9,26 @@ pub trait BackendApp {
     fn run(self: Box<Self>) -> Result<(), BackendError>;
 }
 
+#[cfg(all(feature = "gtk4-rs", target_os = "linux", not(feature = "zork")))]
+pub mod gtk4_rs;
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
 pub mod gtk;
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+
+#[cfg(all(feature = "gtk4-rs", target_os = "linux", not(feature = "zork"), not(feature = "gtk")))]
+pub use self::gtk4_rs::init;
+
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork"), not(feature = "gtk4-rs")))]
 pub use self::gtk::init;
+
+#[cfg(all(feature = "gtk4-rs", feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+pub fn init() -> Result<Box<dyn BackendApp>, BackendError> {
+    let backend = std::env::var("BACKEND").unwrap_or_default();
+    if backend == "gtk3" || backend == "gtk" {
+        self::gtk::init()
+    } else {
+        self::gtk4_rs::init()
+    }
+}
 
 #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
 pub mod nwg;
