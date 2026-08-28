@@ -278,7 +278,7 @@ impl Completer for PirHelper {
             }
             return Ok((0, Vec::new()));
         }
-        if cmd != "/model" && cmd != "/m" {
+        if cmd != "/model" && cmd != "/m" && cmd != "/default-model" && cmd != "/dm" {
             return Ok((0, Vec::new()));
         }
         let after = &rest[cmd_end..];
@@ -308,7 +308,7 @@ impl Hinter for PirHelper {
         let rest = &left[start_idx..];
         let cmd_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
         let cmd = &rest[..cmd_end];
-        if cmd != "/model" && cmd != "/m" {
+        if cmd != "/model" && cmd != "/m" && cmd != "/default-model" && cmd != "/dm" {
             return None;
         }
         let after = &rest[cmd_end..];
@@ -1036,12 +1036,58 @@ mod tests {
     #[test]
     fn no_command_completion_when_space_present() {
         // Once a space follows the command, command-name completion must not
-        // kick in (argument completion takes over, which returns nothing here
-        // because MODEL_PROVIDERS is unset in tests).
+        // kick in (argument completion takes over). With providers set (by
+        // sibling tests) a non-matching argument yields an empty match list
+        // rather than any slash-command-name suggestions.
         let h = PirHelper;
         let (_start, matches) = h
-            .complete("/default-model ", "/default-model ".len(), &ctx())
+            .complete("/default-model zzznomatch ", "/default-model zzznomatch ".len(), &ctx())
             .unwrap();
         assert!(matches.is_empty());
+    }
+
+    // `default-model` must offer the same model argument completion as `/model`,
+    // so picking a default is as easy as switching the live model. Regression
+    // guard for "default-model should have the same completion as /model".
+    #[test]
+    fn default_model_completes_like_model() {
+        use crate::config::{Model, Provider};
+        let providers = vec![
+            Provider {
+                id: Some("openai".into()),
+                name: None,
+                base_url: Some("https://api.openai.com/v1".into()),
+                api_key: None,
+                api: Some("openai".into()),
+                models: vec![Model {
+                    id: "gpt-fake".into(),
+                    name: Some("GPT Fake".into()),
+                    context: None,
+                    max_tokens: None,
+                }],
+            },
+            Provider {
+                id: Some("anthropic".into()),
+                name: None,
+                base_url: Some("https://api.anthropic.com/v1".into()),
+                api_key: None,
+                api: Some("anthropic".into()),
+                models: vec![Model {
+                    id: "claude-fake".into(),
+                    name: Some("Claude Fake".into()),
+                    context: None,
+                    max_tokens: None,
+                }],
+            },
+        ];
+        crate::term::set_model_providers(&providers);
+        let h = PirHelper;
+        let (start, mut matches) = h
+            .complete("/default-model claude", "/default-model claude".len(), &ctx())
+            .unwrap();
+        matches.sort();
+        assert_eq!(matches, vec!["claude-fake".to_string()]);
+        // The completion replaces only the argument (after the command + space).
+        assert_eq!(start, "/default-model ".len());
     }
 }

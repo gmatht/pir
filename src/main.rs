@@ -84,8 +84,8 @@ COMMANDS
 
   While a turn is running you can keep typing: Enter queues the line as the next
   prompt, /commands still work, and a line ending in & is fired off as a new
-  background job while the current turn keeps streaming; ctrl-c stops the turn
-  after its current step.
+  background job while the current turn keeps streaming; ESC or ctrl-c cancels
+  the running turn instantly (kills any in-flight command right away).
 "#;
 
 struct BgSession {
@@ -352,6 +352,35 @@ fn main() {
     };
     term::set_model_providers(&providers);
 
+    // Drop privileges to the per-project user *after* config/providers are
+    // loaded but *before* the agent (and any tool) runs. On non-unix this is a
+    // no-op. All `bash`/file tools then execute as that user automatically.
+    //
+    // IMPORTANT: `become_user` rewrites `HOME` to the target (sandbox) user's
+    // real home, so `config::pi_dir()` now points at `~<user>/.pi`. We therefore
+    // resolve the *default* model **after** this drop (see below): the startup
+    // read and the `/default-model` write must consult the same settings file,
+    // otherwise the choice is silently lost on restart — the early read used to
+    // happen under the invoking user's HOME while the write happened under the
+    // (dropped-to) sandbox user's HOME.
+    #[cfg(unix)]
+    let resolved_user: Option<String> = {
+        let target = as_user.clone().unwrap_or_else(|| {
+            crate::config::resolve_project_user(None, project_name.as_deref())
+        });
+        if let Err(e) = crate::user::become_user(&target) {
+            die(&e);
+        }
+        Some(target)
+    };
+    #[cfg(not(unix))]
+    let resolved_user: Option<String> = None;
+
+    // Resolve the default model now that `HOME` reflects the effective
+    // (possibly dropped) identity, so the read and the `/default-model` write
+    // use the same `~/.pi/agent/settings.json`. Run as root under a per-project
+    // user, this is the sandbox user's home; run plainly as a user, it's that
+    // user's home.
     let explicit = model_sel.is_some();
     let selector = model_sel
         .or_else(|| std::env::var("PI_MODEL").ok())
@@ -370,22 +399,6 @@ fn main() {
             }
         }
     };
-
-    // Drop privileges to the per-project user *after* config/providers are
-    // loaded but *before* the agent (and any tool) runs. On non-unix this is a
-    // no-op. All `bash`/file tools then execute as that user automatically.
-    #[cfg(unix)]
-    let resolved_user: Option<String> = {
-        let target = as_user.clone().unwrap_or_else(|| {
-            crate::config::resolve_project_user(None, project_name.as_deref())
-        });
-        if let Err(e) = crate::user::become_user(&target) {
-            die(&e);
-        }
-        Some(target)
-    };
-    #[cfg(not(unix))]
-    let resolved_user: Option<String> = None;
 
     // Agent users (ai_*) run unattended: the sandbox boundary is the user
     // account itself, so we default to full-auto and suppress per-command
@@ -454,17 +467,19 @@ fn main() {
         Err(e) => die(&e),
     };
 
-    // Resume prior history if `-r`/`-c` was given.
+ // Resume prior history if `-r`/`-c` was given.
     if let Some(session) = &resume {
         let (_, summary) = agent.load_session(session);
         if !summary.is_empty() {
             println!("{}", term::dim(&summary));
         }
-        // Restore the model that was active when this session last ran, so a
-        // resumed session doesn't silently drop back to the global default.
+        // Restore the model + su-security choice that were active when this
+        // session last ran, so a resumed session doesn't silently drop back to
+        // the global defaults.
         if agent.apply_persisted_model() {
             // (model restored silently; the startup banner below shows it)
         }
+        agent.apply_persisted_su_security();
     }
 
     // Resolve the token budget (off by default). `--budget N` wins; else the
@@ -594,7 +609,7 @@ fn main() {
     if let Some(p) = &agent.log_path {
         println!("{}", term::dim(&format!("session log: {}", p.display())));
     }
-    println!("{}", term::dim("/help for commands · ctrl-d to quit · type while a turn runs; ctrl-c cancels it"));
+    println!("{}", term::dim("/help for commands · ctrl-d to quit · type while a turn runs; ESC/ctrl-c cancels it instantly"));
 
     // Warn on existing git projects that lack the LLM-safety guard hook, and
     // point at /fix. Skipped under jj (git hooks don't apply there).
@@ -789,7 +804,11 @@ fn main() {
                 term::raw::RawInput::Interrupt | term::raw::RawInput::Cancel => {
                     if let Ok(mut g) = typeahead.lock() { g.clear(); }
                     fg_cancel.store(true, Ordering::SeqCst);
-                    term::out(&term::dim("· cancelling turn (after current step)…"));
+                    // The running turn aborts immediately: any in-flight bash
+                    // command is killed right away, and the model loop stops at
+                    // its next safe boundary. The worker then joins and the REPL
+                    // returns to a clean idle prompt, ready for a new command.
+                    term::out(&term::dim("· cancelling turn (ESC/ctrl-c)…"));
                 }
                 term::raw::RawInput::Eof => {
                     if let Ok(mut g) = typeahead.lock() { g.clear(); }
@@ -948,7 +967,7 @@ fn handle_command(
                 eprintln!("pir: no turn running to cancel (idle)");
             } else {
                 cancel.store(true, Ordering::SeqCst);
-                println!("{} requesting cancel (turn will stop after its current step)", term::dim("·"));
+                println!("{} requesting cancel (turn stops now)", term::dim("·"));
             }
         }
         "h" | "help" => print!("{HELP}"),
@@ -1060,6 +1079,7 @@ fn handle_command(
             };
             agent.clear();
             agent.load_session(&log);
+            agent.apply_persisted_su_security();
             jobs.mark_joined(id);
             println!("{} foregrounded job #{} from {}", term::bold("·"), id, log.display());
         }
@@ -1095,6 +1115,7 @@ fn handle_command(
                 println!("{}", term::dim(&summary));
             }
             agent.apply_persisted_model();
+            agent.apply_persisted_su_security();
             if agent.goal_snapshot().is_some() {
                 agent.attach_goal(&path);
                 let out = agent.continue_goal();
@@ -1109,30 +1130,51 @@ fn handle_command(
             }
         }
         "su-security" | "susec" => {
-            // Toggle the su-based permission model (the sudoers.d/skynet-ai
-            // gate + the su-ai/mk-ai-user/su-underling wrappers) on or off. The
-            // operation is reversible: artifacts are renamed to `*.disabled`
-            // (sudo silently ignores files containing a '.'), and `status`
-            // reports the current state without mutating anything. Root only.
+            // Local, per-session authority toggle. When enabled (default) the
+            // agent stays confined to its sandbox identity; when disabled the
+            // agent is authorized to act with the *invoking user's full
+            // authority* for THIS session only. This is a self-imposed, in-
+            // session authorization flag — it never edits any system file
+            // (no sudoers/wrappers are touched) and has no effect on anything
+            // other than this agent's own authorization. Persisted per-session
+            // so a resumed session keeps its choice.
             let arg = rest.first().copied().unwrap_or("status");
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                eprintln!("pir: agent busy (turn running) — try again when idle");
+                return;
+            };
             match arg {
-                "on" | "enable" | "1" => match crate::user::set_su_security(true) {
-                    Ok(msg) => println!("{msg}"),
-                    Err(e) => eprintln!("pir: {e}"),
-                },
-                "off" | "disable" | "0" => match crate::user::set_su_security(false) {
-                    Ok(msg) => println!("{msg}"),
-                    Err(e) => eprintln!("pir: {e}"),
-                },
-                "status" | "state" => {
-                    let (state, detail) = crate::user::su_security_status();
-                    println!("su-based security: {}", term::bold(&state));
-                    for line in detail {
-                        println!("{}", term::dim(&line));
+                "on" | "enable" | "1" => {
+                    println!("{}", agent.set_su_security(true, ""));
+                }
+                "off" | "disable" | "0" => {
+                    // Disabling widens this session's authority to the invoking
+                    // user's full authority, so a reason is required. `status`
+                    // (and the lack of an explicit `off`) is non-destructive.
+                    let reason = rest.get(1..).map(|r| r.join(" ")).unwrap_or_default();
+                    if reason.trim().is_empty() {
+                        eprintln!(
+                            "usage: /su-security off <reason>  — disabling requires a reason\n\
+                             \x20\x20e.g. /su-security off need to install system packages"
+                        );
+                        return;
                     }
+                    println!("{}", agent.set_su_security(false, &reason));
+                }
+                "status" | "state" => {
+                    if agent.su_security_enabled() {
+                        println!("{}", term::bold("su-based security: ENABLED (agent confined to its sandbox identity)"));
+                    } else {
+                        println!(
+                            "{}",
+                            term::bold(" security: DISABLED (agent authorized with the invoking user's full authority, this session only)")
+                        );
+                    }
+                    println!("{}", term::dim("(local per-session flag; no system-wide configuration changed)"));
                 }
                 other => eprintln!(
-                    "usage: /su-security <on|off|status>  (reversible; requires root)"
+                    "usage: /su-security <on|off|status>   (off requires a reason; local to this session)"
                 ),
             }
         }
