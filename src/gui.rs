@@ -11,6 +11,7 @@
 use crate::agent::Agent;
 use crate::config::Provider;
 use crate::notify::SharedBus;
+use crate::term;
 use rustxwidgets::prelude::*;
 use std::os::raw::c_void;
 use std::path::PathBuf;
@@ -23,6 +24,9 @@ type AgentSlot = Arc<Mutex<Option<Agent>>>;
 
 /// GDK keyval for the Tab key (GDK_KEY_Tab).
 const GDK_KEY_TAB: u32 = 0xff09;
+/// GDK keyvals for the arrow keys (GDK_KEY_Up / GDK_KEY_Down).
+const GDK_KEY_UP: u32 = 0xff52;
+const GDK_KEY_DOWN: u32 = 0xff54;
 
 /// Idle-mode Tab completion. Completes `/`-command names (and a couple of
 /// argument lists). Returns `Some(completed)` with the new buffer when exactly
@@ -101,6 +105,11 @@ struct GuiState {
     status: String,
     /// Whether to show thinking blocks in the conversation.
     show_thinking: bool,
+    /// Prompt history (most-recent-LAST, same order rustyline keeps). Seeded
+    /// from the session's `.history` file at startup and appended on every
+    /// submitted prompt, so Arrow-Up recalls previous prompts like the
+    /// terminal REPLs.
+    history: Vec<String>,
 }
 
 impl GuiState {
@@ -112,7 +121,63 @@ impl GuiState {
             log_offset: 0,
             status: "idle".into(),
             show_thinking: true,
+            history: Vec::new(),
         }
+    }
+}
+
+/// Arrow-Up/Down navigation state for the prompt Entry, shared between the key
+/// controller and the activate handler. `pos` indexes `history` (== len means
+/// "past the last entry", i.e. the live draft); `draft` remembers the
+/// partially-typed line so Arrow-Down can restore it.
+#[derive(Default)]
+struct HistoryNav {
+    pos: Option<usize>,
+    draft: String,
+}
+
+impl HistoryNav {
+    /// Walk `history` in the given direction (-1 = older / Arrow-Up, +1 =
+    /// newer / Arrow-Down) from the current entry text. Returns the text the
+    /// Entry should now show, or `None` when the boundary is reached (no-op).
+    fn navigate(&mut self, dir: i32, cur: &str, history: &[String]) -> Option<String> {
+        if history.is_empty() {
+            return None;
+        }
+        let last = history.len() - 1;
+        match dir {
+            // Arrow-Up: go one entry older. From the live draft, remember the
+            // draft and jump to the newest entry.
+            -1 => {
+                let new_pos = match self.pos {
+                    None => {
+                        self.draft = cur.to_string();
+                        last
+                    }
+                    Some(p) if p == 0 => return None, // already oldest
+                    Some(p) => p - 1,
+                };
+                self.pos = Some(new_pos);
+                Some(history[new_pos].clone())
+            }
+            // Arrow-Down: go newer; past the newest entry restores the draft.
+            1 => {
+                let p = self.pos?; // not navigating: ignore Arrow-Down
+                if p >= last {
+                    self.pos = None;
+                    return Some(std::mem::take(&mut self.draft));
+                }
+                self.pos = Some(p + 1);
+                Some(history[p + 1].clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Reset the navigation state (called after a prompt is submitted).
+    fn reset(&mut self) {
+        self.pos = None;
+        self.draft.clear();
     }
 }
 
@@ -173,19 +238,42 @@ pub fn run(
         1 // stop propagation; keep focus here
     });
 
-    // Tab completion: an EventControllerKey on the Entry intercepts the Tab
-    // key (GDK_KEY_Tab) before it moves focus, completes the current buffer
-    // via `complete_idle`, and replaces the entry text + cursor. Returns 1
-    // (handled) so focus never leaves the prompt. The controller is kept alive
-    // in `_key_controllers` for the whole `app.run()` so its Drop (which unrefs
+    // Tab completion + history navigation: an EventControllerKey on the Entry
+    // intercepts Tab (completes the buffer via `complete_idle`) and
+    // Arrow-Up/Down (walks the prompt history), returning 1 (handled) so focus
+    // never leaves the prompt. The controller is kept alive in
+    // `_key_controllers` for the whole `app.run()` so its Drop (which unrefs
     // and removes it from the widget) never fires early.
+
+    // -- Shared state (created before the callbacks that capture it) --
+    let state = Arc::new(Mutex::new(GuiState::new()));
+    let widgets = GuiWidgets { textview: textview.clone(), status: status.clone() };
+    // Seed Arrow-Up history from the session's `.history` file (populated by
+    // main.rs at startup / on resume — the same store the streaming REPL uses).
+    {
+        let mut s = state.lock().unwrap();
+        s.history = term::load_history_lines();
+        s.conv.push_str(&format!(
+            "pir · {} · GTK GUI  (/help for commands · Enter to send · ctrl-q to quit)\n",
+            providers[0].pid()
+        ));
+        sync_textview(&widgets, &s);
+    }
+
+    // Arrow-Up/Down navigation state for the prompt Entry.
+    let hist_nav = Arc::new(Mutex::new(HistoryNav::default()));
+
     let mut _key_controllers: Vec<Box<rustxwidgets::gtk_dynamic_loader::EventControllerKey>> = Vec::new();
     let entry_comp = entry.clone();
     let entry_comp_cb = entry.clone();
-    unsafe {
+    let nav_for_keys = hist_nav.clone();
+    let hist_for_keys = state.clone();
+    {
         if let Some(loader) = rustxwidgets::backends::gtk::loader() {
             if let Ok(ctrl) = rustxwidgets::gtk_dynamic_loader::EventControllerKey::new(loader.clone()) {
                 let _ = ctrl.connect_key_pressed(move |keyval: u32| -> i32 {
+                    // Lock order is always nav -> state, and both are only
+                    // ever held briefly inside this callback.
                     if keyval == GDK_KEY_TAB {
                         let cur = entry_comp_cb.get_text().unwrap_or_default();
                         if let Some(completed) = complete_idle(&cur) {
@@ -193,6 +281,16 @@ pub fn run(
                             entry_comp_cb.set_position(-1); // cursor to end
                         }
                         1 // handled: keep focus, don't let Tab traverse
+                    } else if keyval == GDK_KEY_UP || keyval == GDK_KEY_DOWN {
+                        let dir = if keyval == GDK_KEY_UP { -1 } else { 1 };
+                        let cur = entry_comp_cb.get_text().unwrap_or_default();
+                        let mut nav = nav_for_keys.lock().unwrap();
+                        let history = hist_for_keys.lock().unwrap().history.clone();
+                        if let Some(new_text) = nav.navigate(dir, &cur, &history) {
+                            entry_comp_cb.set_text(&new_text);
+                            entry_comp_cb.set_position(-1);
+                        }
+                        1 // always swallow Up/Down so focus stays in the prompt
                     } else {
                         0 // propagate other keys
                     }
@@ -201,20 +299,6 @@ pub fn run(
                 _key_controllers.push(Box::new(ctrl));
             }
         }
-    }
-
-    // -- Shared state --
-    let state = Arc::new(Mutex::new(GuiState::new()));
-    let widgets = GuiWidgets { textview: textview.clone(), status: status.clone() };
-
-    // Initial system line.
-    {
-        let mut s = state.lock().unwrap();
-        s.conv.push_str(&format!(
-            "pir · {} · GTK GUI  (/help for commands · Enter to send · ctrl-q to quit)\n",
-            providers[0].pid()
-        ));
-        sync_textview(&widgets, &s);
     }
 
     let (done_tx, _done_rx) = smol::channel::bounded::<()>(1);
@@ -229,6 +313,7 @@ pub fn run(
     let entry_cb_widgets = widgets.clone();
     let entry_cb_done = done_tx.clone();
     let entry_in_cb = entry.clone();
+    let nav_for_activate = hist_nav.clone();
     let _ = entry.connect_activate(move |_data: *mut c_void| {
         let text = entry_in_cb.get_text().unwrap_or_default();
         entry_in_cb.set_text("");
@@ -236,6 +321,13 @@ pub fn run(
         if text.is_empty() {
             return;
         }
+
+        // Record the submitted line in the shared prompt history (in-memory +
+        // the session `.history` file) so Arrow-Up recalls it, exactly like
+        // the terminal REPLs. Also reset any in-progress Arrow-Up navigation.
+        term::push_history(&text);
+        entry_cb_state.lock().unwrap().history.push(text.clone());
+        nav_for_activate.lock().unwrap().reset();
 
         if let Some(cmd) = text.strip_prefix('/') {
             handle_command(
@@ -776,5 +868,72 @@ mod gui_focus_tests {
         configure_conversation_textview(&fixed);
         assert!(!fixed.get_editable(), "conversation TextView must be read-only");
         assert!(!fixed.get_can_focus(), "conversation TextView must not take keyboard focus");
+    }
+}
+
+#[cfg(test)]
+mod gui_history_tests {
+    use super::*;
+
+    fn h(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn arrow_up_recalls_newest_then_older() {
+        let hist = h(&["first", "second"]);
+        let mut nav = HistoryNav::default();
+        assert_eq!(nav.navigate(-1, "", &hist), Some("second".into()));
+        assert_eq!(nav.navigate(-1, "second", &hist), Some("first".into()));
+        // Already at the oldest entry: no-op.
+        assert_eq!(nav.navigate(-1, "first", &hist), None);
+    }
+
+    #[test]
+    fn arrow_down_returns_toward_draft() {
+        let hist = h(&["first", "second"]);
+        let mut nav = HistoryNav::default();
+        assert_eq!(nav.navigate(-1, "", &hist), Some("second".into()));
+        assert_eq!(nav.navigate(-1, "second", &hist), Some("first".into()));
+        assert_eq!(nav.navigate(1, "first", &hist), Some("second".into()));
+        // Past the newest entry: the remembered draft (empty here) returns.
+        assert_eq!(nav.navigate(1, "second", &hist), Some(String::new()));
+    }
+
+    #[test]
+    fn arrow_down_preserves_partially_typed_draft() {
+        let hist = h(&["old prompt"]);
+        let mut nav = HistoryNav::default();
+        // Half-typed a draft, then Arrow-Up.
+        assert_eq!(nav.navigate(-1, "half a wo", &hist), Some("old prompt".into()));
+        // Arrow-Down restores exactly the draft.
+        assert_eq!(nav.navigate(1, "old prompt", &hist), Some("half a wo".into()));
+    }
+
+    #[test]
+    fn empty_history_is_a_noop() {
+        let hist: Vec<String> = Vec::new();
+        let mut nav = HistoryNav::default();
+        assert_eq!(nav.navigate(-1, "", &hist), None);
+        assert_eq!(nav.navigate(1, "", &hist), None);
+    }
+
+    #[test]
+    fn arrow_down_without_up_is_ignored() {
+        let hist = h(&["x"]);
+        let mut nav = HistoryNav::default();
+        // Down before any Up: not navigating, keep the current text.
+        assert_eq!(nav.navigate(1, "live", &hist), None);
+    }
+
+    #[test]
+    fn reset_clears_navigation() {
+        let hist = h(&["a", "b"]);
+        let mut nav = HistoryNav::default();
+        assert_eq!(nav.navigate(-1, "", &hist), Some("b".into()));
+        nav.reset();
+        // After reset we're back at the live draft: Up jumps to newest again.
+        assert_eq!(nav.navigate(-1, "draft", &hist), Some("b".into()));
+        assert_eq!(nav.draft, "draft");
     }
 }
