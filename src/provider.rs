@@ -137,10 +137,13 @@ impl Client {
         history: &[Message],
         tools: &[ToolSpec],
         on_text: &mut dyn FnMut(&str),
+        thinking: crate::config::ThinkingLevel,
+        model_ctx: u64,
+        on_think: &mut dyn FnMut(&str),
     ) -> Result<(Message, Usage), String> {
         let (url, body) = match self.kind {
-            ApiKind::Anthropic => self.anthropic_request(model, max_tokens, system, history, tools),
-            ApiKind::OpenAi => self.openai_request(model, max_tokens, system, history, tools),
+            ApiKind::Anthropic => self.anthropic_request(model, max_tokens, system, history, tools, thinking, model_ctx),
+            ApiKind::OpenAi => self.openai_request(model, max_tokens, system, history, tools, thinking),
         };
         // Retry the whole request (connect + stream parse) on transient errors.
         // `emitted_text` is set by the stream parsers the moment any token is
@@ -198,6 +201,7 @@ impl Client {
                             &mut emitted_text,
                             &mut saw_tool_calls,
                             &cancel,
+                            on_think,
                         ),
                         ApiKind::OpenAi => stream_openai(
                             &mut reader,
@@ -205,6 +209,7 @@ impl Client {
                             &mut emitted_text,
                             &mut saw_tool_calls,
                             &cancel,
+                            on_think,
                         ),
                     }
                 });
@@ -267,22 +272,41 @@ impl Client {
         system: &str,
         history: &[Message],
         tools: &[ToolSpec],
+        thinking: crate::config::ThinkingLevel,
+        model_ctx: u64,
     ) -> (String, Value) {
+        // Anthropic requires `max_tokens` to be strictly greater than the
+        // thinking budget; clamp the budget so it never reaches/exceeds it.
+        let ctx = self.model_context(history).max(model_ctx);
+        let thinking_budget = thinking
+            .anthropic_budget(ctx)
+            .filter(|b| *b < max_tokens.saturating_sub(1024))
+            .map(|b| b.min(max_tokens.saturating_sub(1024)));
+        let mut body = json!({
+            "model": model,
+            "max_tokens": max_tokens,
+            "stream": true,
+            "system": system,
+            "messages": history.iter().filter(|m| !m.is_empty())
+                .map(anthropic_message).collect::<Vec<_>>(),
+            "tools": tools.iter().map(|t| json!({
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.schema,
+            })).collect::<Vec<_>>(),
+        });
+        if thinking.enabled() {
+            if let Some(budget) = thinking_budget {
+                body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+            } else {
+                // Level enabled but no safe budget (tiny context): request
+                // extended thinking with the provider's default budget.
+                body["thinking"] = json!({ "type": "enabled" });
+            }
+        }
         (
             format!("{}/messages", self.base_url),
-            json!({
-                "model": model,
-                "max_tokens": max_tokens,
-                "stream": true,
-                "system": system,
-                "messages": history.iter().filter(|m| !m.is_empty())
-                    .map(anthropic_message).collect::<Vec<_>>(),
-                "tools": tools.iter().map(|t| json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "input_schema": t.schema,
-                })).collect::<Vec<_>>(),
-            }),
+            body,
         )
     }
 
@@ -293,6 +317,7 @@ impl Client {
         system: &str,
         history: &[Message],
         tools: &[ToolSpec],
+        thinking: crate::config::ThinkingLevel,
     ) -> (String, Value) {
         let mut messages = vec![json!({ "role": "system", "content": system })];
         for m in history.iter().filter(|m| !m.is_empty()) {
@@ -320,7 +345,22 @@ impl Client {
                 "function": { "name": t.name, "description": t.description, "parameters": t.schema },
             })).collect()),
         );
+        // OpenAI reasoning effort (o-series models). Non-reasoning models ignore
+        // it, so we only set it when the level maps to a concrete effort.
+        if let Some(effort) = thinking.oai_effort() {
+            body.insert("reasoning_effort".into(), json!(effort));
+        }
         (format!("{}/chat/completions", self.base_url), Value::Object(body))
+    }
+
+    /// Rough context window for the current request, used to scale the Anthropic
+    /// thinking budget. Falls back to a common default when messages carry no
+    /// usable context (we don't have the model struct here, so approximate from
+    /// a 200k default). Kept cheap — only an estimate for budget sizing.
+    fn model_context(&self, _history: &[Message]) -> u64 {
+        // The agent forwards the model's real context via `model_ctx`, so this
+        // is only a fallback default (200k) when the caller supplies 0.
+        200_000
     }
 }
 
@@ -613,12 +653,17 @@ fn stream_anthropic<R: Read>(
     emitted_text: &mut bool,
     saw_tool_calls: &mut bool,
     cancel: &Arc<AtomicBool>,
+    on_think: &mut dyn FnMut(&str),
 ) -> Result<(Message, Usage), String> {
     let mut reader = BufReader::new(r);
     let mut blocks: Vec<Block> = Vec::new();
     let mut usage = Usage::default();
     let mut text = String::new();
-    let mut tool: Option<(String, String, String)> = None; // (id, name, partial input json)
+    let mut tool: Option<(String, String, String)> = None; // (id, name, partial)
+    // A separate buffer for a "thinking" content block (Anthropic extended
+    // thinking). Kept distinct from `text` so the two can be ordered correctly
+    // in the message's block list.
+    let mut thinking = String::new();
 
     let mut line = String::new();
     let mut last_byte = Instant::now();
@@ -675,12 +720,21 @@ fn stream_anthropic<R: Read>(
             }
             "content_block_start" => {
                 let b = &v["content_block"];
-                if b["type"].as_str() == Some("tool_use") {
-                    tool = Some((
-                        b["id"].as_str().unwrap_or_default().to_string(),
-                        b["name"].as_str().unwrap_or_default().to_string(),
-                        String::new(),
-                    ));
+                match b["type"].as_str() {
+                    Some("tool_use") => {
+                        tool = Some((
+                            b["id"].as_str().unwrap_or_default().to_string(),
+                            b["name"].as_str().unwrap_or_default().to_string(),
+                            String::new(),
+                        ));
+                    }
+                    Some("thinking") => {
+                        // Begin a thinking block; its deltas arrive as
+                        // `thinking_delta` and are flushed into a `Block::Thinking`
+                        // on `content_block_stop`.
+                        thinking.clear();
+                    }
+                    _ => {}
                 }
             }
             "content_block_delta" => {
@@ -699,7 +753,12 @@ fn stream_anthropic<R: Read>(
                             buf.push_str(d["partial_json"].as_str().unwrap_or(""));
                         }
                     }
-                    _ => {} // thinking_delta etc.
+                    "thinking_delta" => {
+                        let t = d["thinking"].as_str().unwrap_or("");
+                        on_think(t);
+                        thinking.push_str(t);
+                    }
+                    _ => {}
                 }
             }
             "content_block_stop" => {
@@ -707,6 +766,8 @@ fn stream_anthropic<R: Read>(
                     let input: Value = serde_json::from_str(&buf).unwrap_or_else(|_| json!({}));
                     blocks.push(Block::ToolUse { id, name, input });
                     *saw_tool_calls = true;
+                } else if !thinking.trim().is_empty() {
+                    blocks.push(Block::Thinking { text: std::mem::take(&mut thinking) });
                 } else if !text.trim().is_empty() {
                     blocks.push(Block::Text(std::mem::take(&mut text)));
                 } else {
@@ -731,6 +792,9 @@ fn stream_anthropic<R: Read>(
         let input: Value = serde_json::from_str(&buf).unwrap_or_else(|_| json!({}));
         blocks.push(Block::ToolUse { id, name, input });
     }
+    if !thinking.trim().is_empty() {
+        blocks.push(Block::Thinking { text: thinking });
+    }
     if !text.trim().is_empty() {
         blocks.push(Block::Text(text));
     }
@@ -746,10 +810,12 @@ fn stream_openai<R: Read>(
     emitted_text: &mut bool,
     saw_tool_calls: &mut bool,
     cancel: &Arc<AtomicBool>,
+    on_think: &mut dyn FnMut(&str),
 ) -> Result<(Message, Usage), String> {
     let mut reader = BufReader::new(r);
     let mut usage = Usage::default();
     let mut text = String::new();
+    let mut thinking = String::new();
     let mut calls: Vec<(u64, String, String, String)> = Vec::new(); // (index, id, name, args)
 
     let mut line = String::new();
@@ -799,6 +865,12 @@ fn stream_openai<R: Read>(
                 text.push_str(t);
             }
         }
+        // OpenAI o-series reasoning: `delta.reasoning` carries the model's
+        // chain-of-thought. Forward it to `on_think`.
+        if let Some(t) = delta["reasoning"].as_str() {
+            on_think(t);
+            thinking.push_str(t);
+        }
         if let Some(tcs) = delta["tool_calls"].as_array() {
             for tc in tcs {
                 let idx = tc["index"].as_u64().unwrap_or(0);
@@ -819,6 +891,9 @@ fn stream_openai<R: Read>(
         }
     }
     let mut blocks: Vec<Block> = Vec::new();
+    if !thinking.trim().is_empty() {
+        blocks.push(Block::Thinking { text: thinking });
+    }
     if !text.trim().is_empty() {
         blocks.push(Block::Text(text));
     }
@@ -878,7 +953,7 @@ mod tests {
             data: b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
         };
         let started = std::time::Instant::now();
-        let res = stream_openai(&mut reader, &mut |_s: &str| {}, &mut false, &mut false, &cancel);
+        let res = stream_openai(&mut reader, &mut |_s: &str| {}, &mut false, &mut false, &cancel, &mut |_s: &str| {});
         let elapsed = started.elapsed();
         assert!(res.is_err(), "expected an error after cancel");
         assert_eq!(res.unwrap_err(), "request cancelled");
@@ -897,7 +972,7 @@ mod tests {
             data: b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
         };
         let started = std::time::Instant::now();
-        let res = stream_openai(&mut reader, &mut |_s: &str| {}, &mut false, &mut false, &cancel);
+        let res = stream_openai(&mut reader, &mut |_s: &str| {}, &mut false, &mut false, &cancel, &mut |_s: &str| {});
         let elapsed = started.elapsed();
         std::env::remove_var("PIR_STALL_TIMEOUT_SECS");
         assert!(res.is_err(), "expected a stall error");

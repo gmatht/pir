@@ -46,6 +46,91 @@ impl Model {
     }
 }
 
+/// Reasoning / "extended thinking" level for models that support it (Anthropic
+/// Claude, OpenAI o-series, etc.). `Off` disables thinking entirely; the other
+/// levels scale the reasoning budget (Anthropic) or `reasoning_effort`
+/// (OpenAI). Parsed case-insensitively from `/thinking`, `--thinking`, or
+/// `PIR_THINKING`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThinkingLevel {
+    #[default]
+    Off,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl ThinkingLevel {
+    /// Parse a level name (case-insensitive). Accepts a few synonyms.
+    pub fn parse(s: &str) -> Option<ThinkingLevel> {
+        match s.trim().to_lowercase().as_str() {
+            "off" | "none" | "false" | "0" | "disable" | "disabled" => Some(ThinkingLevel::Off),
+            "min" | "minimal" | "tiny" => Some(ThinkingLevel::Minimal),
+            "low" => Some(ThinkingLevel::Low),
+            "med" | "medium" => Some(ThinkingLevel::Medium),
+            "high" => Some(ThinkingLevel::High),
+            "xhigh" | "x-high" | "extra" => Some(ThinkingLevel::XHigh),
+            "max" | "maximum" => Some(ThinkingLevel::Max),
+            _ => None,
+        }
+    }
+
+    /// The canonical name of this level (used for display + persistence).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ThinkingLevel::Off => "off",
+            ThinkingLevel::Minimal => "minimal",
+            ThinkingLevel::Low => "low",
+            ThinkingLevel::Medium => "medium",
+            ThinkingLevel::High => "high",
+            ThinkingLevel::XHigh => "xhigh",
+            ThinkingLevel::Max => "max",
+        }
+    }
+
+    /// Whether this level enables any extended thinking at all.
+    pub fn enabled(&self) -> bool {
+        !matches!(self, ThinkingLevel::Off)
+    }
+
+    /// Anthropic thinking budget (in tokens) for this level, given the model's
+    /// context window. Returns `None` when thinking is disabled or the context
+    /// is too small to afford a meaningful budget. The caller must ensure the
+    /// budget stays strictly below `max_tokens` (Anthropic requires it).
+    pub fn anthropic_budget(&self, ctx: u64) -> Option<u64> {
+        let c = ctx.max(1);
+        let b = match self {
+            ThinkingLevel::Off => return None,
+            ThinkingLevel::Minimal => return Some(1024),
+            ThinkingLevel::Low => c / 32,
+            ThinkingLevel::Medium => c / 12,
+            ThinkingLevel::High => c / 6,
+            ThinkingLevel::XHigh => c / 3,
+            ThinkingLevel::Max => (c * 2) / 3,
+        };
+        if b < 1024 {
+            None
+        } else {
+            Some(b)
+        }
+    }
+
+    /// OpenAI `reasoning_effort` value for this level, or `None` when thinking
+    /// is disabled. (Anthropic maps the same levels to a token budget instead;
+    /// OpenAI only exposes coarse effort levels.)
+    pub fn oai_effort(&self) -> Option<&'static str> {
+        match self {
+            ThinkingLevel::Off | ThinkingLevel::Minimal => None,
+            ThinkingLevel::Low => Some("low"),
+            ThinkingLevel::Medium => Some("medium"),
+            ThinkingLevel::High | ThinkingLevel::XHigh | ThinkingLevel::Max => Some("high"),
+        }
+    }
+}
+
 impl Provider {
     pub fn pid(&self) -> String {
         if let Some(id) = &self.id { return id.clone(); }

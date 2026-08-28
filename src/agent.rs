@@ -71,6 +71,17 @@ pub struct Agent {
     /// touched). Persisted next to the session log so a resumed session keeps
     /// its choice.
     su_security_enabled: bool,
+    /// Reasoning / "extended thinking" level for this session (see
+    /// `config::ThinkingLevel`). Threaded through to the provider request
+    /// (Anthropic thinking budget / OpenAI reasoning effort). `Off` (the
+    /// default) sends no thinking control at all — matching the prior behaviour.
+    /// Persisted next to the session log so a resumed session keeps the level.
+    thinking: config::ThinkingLevel,
+    /// Whether the model's reasoning/thinking content is shown on the terminal
+    /// as it streams. When false, thinking blocks are still collected + logged
+    /// but suppressed from the live output (toggle with `/thinking show`/
+    /// `/thinking hide`; persisted per session).
+    show_thinking: bool,
     /// Cached provider list (loaded once, reused for model switches / resume).
     /// Avoids re-reading and re-parsing `~/.pi/agent/models-store.json` on every
     /// `/model` switch, resume, and `apply_persisted_model` call.
@@ -235,6 +246,8 @@ impl Agent {
             token_budget: None,
             undo_stack: Vec::new(),
             su_security_enabled: true,
+            thinking: config::ThinkingLevel::Off,
+            show_thinking: true,
             cached_providers,
         })
     }
@@ -451,6 +464,94 @@ impl Agent {
             }
             Err(_) => false,
         }
+    }
+
+    /// Current reasoning / "extended thinking" level for this session.
+    pub fn thinking_level(&self) -> config::ThinkingLevel {
+        self.thinking
+    }
+
+    /// Whether the model's reasoning/thinking content is shown on the terminal.
+    pub fn show_thinking(&self) -> bool {
+        self.show_thinking
+    }
+
+    /// Set the reasoning level for this session (persisted so a resumed session
+    /// keeps it). Returns a short human-readable status line.
+    pub fn set_thinking(&mut self, level: config::ThinkingLevel) -> String {
+        self.thinking = level;
+        self.persist_thinking();
+        if level.enabled() {
+            let budget = self
+                .thinking
+                .anthropic_budget(self.model.context.unwrap_or(200_000));
+            match self.provider.kind() {
+                Some(ApiKind::Anthropic) => match budget {
+                    Some(b) => format!(
+                        "thinking: {}  (Anthropic budget ≈ {} tokens — may exceed the model's max unless it supports extended thinking)",
+                        level.as_str(), b
+                    ),
+                    None => format!(
+                        "thinking: {}  (model context too small for a meaningful thinking budget; will be ignored)",
+                        level.as_str()
+                    ),
+                },
+                Some(ApiKind::OpenAi) => match level.oai_effort() {
+                    Some(e) => format!("thinking: {}  (OpenAI reasoning_effort = {e})", level.as_str()),
+                    None => format!(
+                        "thinking: {}  (no OpenAI reasoning_effort for this level; will be ignored)",
+                        level.as_str()
+                    ),
+                },
+                None => format!("thinking: {}", level.as_str()),
+            }
+        } else {
+            "thinking: off".to_string()
+        }
+    }
+
+    /// Toggle whether the model's reasoning/thinking is shown on the terminal.
+    /// `on` enables display; `off` suppresses it (the thinking blocks are still
+    /// collected + logged). Persisted per session. Returns a status line.
+    pub fn set_show_thinking(&mut self, on: bool) -> String {
+        self.show_thinking = on;
+        self.persist_thinking();
+        if on {
+            "thinking display: on  (model reasoning will be shown as it streams)"
+        } else {
+            "thinking display: off  (model reasoning will be collected but hidden — use `/thinking show` to reveal it)"
+        }
+        .to_string()
+    }
+
+    /// Persist the thinking level + show-thinking flag next to the session log
+    /// (`<log>.thinking`) so a resumed session keeps them. Best-effort; a
+    /// missing log (one-shot) is silently skipped.
+    fn persist_thinking(&self) {
+        if let Some(p) = &self.log_path {
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let body = format!("{}\n{}", self.thinking.as_str(), if self.show_thinking { "1" } else { "0" });
+            let _ = std::fs::write(p.with_extension("thinking"), body);
+        }
+    }
+
+    /// Load a previously persisted thinking choice (from `<log>.thinking`) for a
+    /// resumed session. Returns true if a value was restored.
+    pub fn apply_persisted_thinking(&mut self) -> bool {
+        let Some(p) = self.log_path.as_ref() else { return false };
+        let Ok(s) = std::fs::read_to_string(p.with_extension("thinking")) else { return false };
+        let mut lines = s.lines();
+        if let Some(lvl) = lines.next().and_then(config::ThinkingLevel::parse) {
+            self.thinking = lvl;
+        } else {
+            return false;
+        }
+        if let Some(flag) = lines.next() {
+            self.show_thinking = flag.trim() == "1";
+        }
+        true
     }
 
     /// Begin a new goal for this session, persisting it next to the log.
@@ -965,6 +1066,15 @@ impl Agent {
                     term::out(t);
                 }
             };
+            // Reasoning/thinking content. When show-thinking is off the thinking
+            // blocks are still collected + parsed (and logged), they're just not
+            // printed to the live terminal.
+            let show_thinking = self.show_thinking;
+            let mut on_think = |t: &str| {
+                if !self.silent() && show_thinking {
+                    term::out(&format!("{}", term::dim(t)));
+                }
+            };
             let result = self.client.chat(
                 &self.model.id,
                 self.model.max_tokens.unwrap_or(8192),
@@ -972,6 +1082,9 @@ impl Agent {
                 &self.history,
                 &specs,
                 &mut on_text,
+                self.thinking,
+                self.model.context.unwrap_or(200_000),
+                &mut on_think,
             );
             // Ensure the footer spinner is stopped (covers the no-output case),
             // then move to a fresh line below the agent's text.
@@ -1348,6 +1461,7 @@ fn approx_tokens(history: &[Message]) -> usize {
                 .iter()
                 .map(|b| match b {
                     Block::Text(t) => t.len(),
+                    Block::Thinking { text } => text.len(),
                     Block::ToolUse { input, .. } => input.to_string().len() + 64,
                     Block::ToolResult { content, .. } => content.len() + 64,
                 })
@@ -1427,6 +1541,7 @@ fn log_line(log: &mut Option<fs::File>, m: &Message) {
         "role": role,
         "blocks": m.blocks.iter().map(|b| match b {
             Block::Text(t) => json!({ "type": "text", "text": t }),
+            Block::Thinking { text } => json!({ "type": "thinking", "text": text }),
             Block::ToolUse { id, name, input } =>
                 json!({ "type": "tool_use", "id": id, "name": name, "input": input }),
             Block::ToolResult { tool_use_id, content, is_error } =>

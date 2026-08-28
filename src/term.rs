@@ -345,6 +345,82 @@ const SLASH_COMMANDS: &[&str] = &[
     "/usage",
 ];
 
+/// Brief per-command help, shown inline (as a hint to the right of the cursor)
+/// the moment the user types a `/command` — mirroring pi's autocomplete
+/// dropdown, which displays each command's `description` + `argumentHint`. The
+/// `(name, argumentHint, description)` shape keeps it in lockstep with the
+/// `SLASH_COMMANDS` list above; commands without an argument use `""`.
+const SLASH_HELP: &[(&str, &str, &str)] = &[
+    ("/bg", "<prompt>", "run a prompt as a background job"),
+    ("/cancel", "", "stop the running turn now"),
+    ("/clear", "", "clear the conversation history"),
+    ("/continue", "", "resume the session and drive its next goal step"),
+    ("/create", "[name]", "scaffold a new project from a clipboard spec"),
+    ("/default-model", "<sel>", "set the default model for new sessions"),
+    ("/exit", "", "quit pir"),
+    ("/fix", "", "make the git setup LLM-safe (commit guard hook)"),
+    ("/fg", "<id>", "bring a background job to the foreground"),
+    ("/goal", "[objective]", "start or show the current goal"),
+    ("/help", "", "show all commands"),
+    ("/jobs", "", "list background jobs"),
+    ("/login", "<provider>", "store an API key for a provider"),
+    ("/logout", "<provider>", "remove a stored provider credential"),
+    ("/model", "<sel>", "switch the model for this session"),
+    ("/model*", "<sel>", "switch model in all open pir terminals"),
+    ("/models", "", "list available models"),
+    ("/project", "init", "create the ai_<project> user (root)"),
+    ("/rebuild", "", "cargo build and exec the fresh binary"),
+    ("/resume", "<idx|fragment>", "resume an unfinished session"),
+    ("/sessions", "", "list recent sessions"),
+    ("/sh", "[cmd args]", "drop to a shell, or run a command via $SHELL"),
+    ("/undo", "[all]", "revert the last file edit (or all)"),
+    ("/unfinished", "", "list interrupted / still-running sessions"),
+    ("/usage", "", "show token usage for this session"),
+];
+
+/// Look up a slash command's brief help for an inline hint. `line` is the text
+/// up to the cursor. Returns the `argumentHint` + description for the best match
+/// (a command that equals or is a strict prefix of the typed name), so typing
+/// `/login` shows its help immediately, while `Other text` shows nothing.
+fn command_help_hint(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let (cmd, has_arg) = match trimmed.split_once(char::is_whitespace) {
+        Some((c, rest)) if c.starts_with('/') => (c, !rest.trim().is_empty()),
+        None if trimmed.starts_with('/') => (trimmed, false),
+        _ => return None,
+    };
+    if cmd.len() <= 1 {
+        return None;
+    }
+    // Prefer an exact match; otherwise the command being typed (a prefix).
+    let entry = SLASH_HELP
+        .iter()
+        .find(|(name, _, _)| *name == cmd)
+        .or_else(|| SLASH_HELP.iter().find(|(name, _, _)| name.starts_with(cmd)));
+    let (name, arg, desc) = entry?;
+    if has_arg {
+        // Once an argument exists, pi stops showing command help; keep it quiet
+        // so the argument preview (e.g. a typed model prefix) is free to show.
+        if arg.is_empty() {
+            return None;
+        }
+        // Still typing the first argument: show the description as guidance.
+        return Some(desc.to_string());
+    }
+    let mut s = String::new();
+    if !arg.is_empty() {
+        s.push_str(arg);
+        s.push(' ');
+    }
+    s.push_str("— ");
+    s.push_str(desc);
+    // Suppress the hint for `/help` itself (its own description is the list).
+    if *name == "/help" {
+        return None;
+    }
+    Some(s)
+}
+
 impl Completer for PirHelper {
     type Candidate = String;
 
@@ -396,6 +472,13 @@ impl Completer for PirHelper {
 impl Hinter for PirHelper {
     type Hint = String;
     fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        // Brief per-command help: as soon as the user types a `/command` (e.g.
+        // `/login`), show its argument hint + description inline to the right of
+        // the cursor, mirroring pi's autocomplete dropdown. This takes priority
+        // over the model-preview hint, which only applies to /model arguments.
+        if let Some(help) = command_help_hint(line) {
+            return Some(help);
+        }
         // Show the first matching model as an inline preview while typing a
         // `/model` argument, so the user sees a suggestion to the right.
         let providers = MODEL_PROVIDERS.get().map(|v| v.as_slice()).unwrap_or(&[]);
@@ -1373,6 +1456,44 @@ mod tests {
         assert_eq!(matches, vec!["claude-fake".to_string()]);
         // The completion replaces only the argument (after the command + space).
         assert_eq!(start, "/default-model ".len());
+    }
+}
+
+#[cfg(test)]
+mod command_help_hint_tests {
+    use super::*;
+
+    // Typing `/login` (a known command, no argument yet) should surface its
+    // brief help inline, mirroring pi's autocomplete dropdown hint.
+    #[test]
+    fn shows_help_for_known_command() {
+        let hint = command_help_hint("/login");
+        let h = hint.expect("expected a hint for /login");
+        assert!(h.contains("<provider>"), "got: {h:?}");
+        assert!(h.contains("store an API key"), "got: {h:?}");
+    }
+
+    // A command being typed as a prefix should still match the brief help.
+    #[test]
+    fn shows_help_for_prefix() {
+        let hint = command_help_hint("/log");
+        assert!(hint.is_some(), "expected help for the /log* prefix");
+    }
+
+    // Non-command text (e.g. a normal prompt) must yield no hint.
+    #[test]
+    fn no_help_for_plain_text() {
+        assert!(command_help_hint("fix the parser").is_none());
+        assert!(command_help_hint("").is_none());
+    }
+
+    // `/help` itself is suppressed (its description is the command list); an
+    // argument-bearing command shows only the description once an arg is typed.
+    #[test]
+    fn help_self_suppressed_but_other_args_show_description() {
+        assert!(command_help_hint("/help").is_none());
+        let h = command_help_hint("/login openai").expect("expected description");
+        assert!(h.contains("store an API key"), "got: {h:?}");
     }
 }
 
