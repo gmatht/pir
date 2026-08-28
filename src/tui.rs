@@ -35,6 +35,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+/// Upper bound on one `wait_raw_input` block, in milliseconds. A pipe at EOF is
+/// permanently "readable", so without a bounded wait the TUI would busy-spin at
+/// 100% CPU when stdin is closed while the turn never signals completion.
+const INPUT_POLL: u64 = 80;
+
 use crate::run_foreground_turn;
 
 type AgentSlot = Arc<Mutex<Option<Agent>>>;
@@ -585,11 +590,28 @@ fn wait_raw_input(ctx: &TuiCtx) -> RawKey {
         Ok(s) => s,
         Err(_) => return RawKey::None,
     };
+    // Race "stdin became readable" against "the turn finished". A pipe at EOF is
+    // *permanently* readable (a closed fd wakes the reactor forever), so racing
+    // only `readable` against `done_rx` would busy-spin at 100% CPU whenever
+    // stdin is closed while the worker never signals completion (e.g. it is
+    // parked in a retry backoff) — the runaway-CPU bug. We throttle below.
+    let start = std::time::Instant::now();
     let readable = async { let _ = stdin.readable().await; };
     let finished = async { let _ = ctx.done_rx.recv().await; };
     smol::block_on(smol::future::or(readable, finished));
     let mut buf = String::new();
-    read_raw_into(&mut buf, ctx.typeahead)
+    let key = read_raw_into(&mut buf, ctx.typeahead);
+    // No actual input and barely any wall time elapsed (EOF pipe): sleep the
+    // rest of the poll window so the idle TUI stays near 0% CPU. Genuine input
+    // returns instantly.
+    if matches!(key, RawKey::None) {
+        let elapsed = start.elapsed();
+        let target = Duration::from_millis(INPUT_POLL);
+        if elapsed < target {
+            std::thread::sleep(target - elapsed);
+        }
+    }
+    key
 }
 
 /// Drain non-blocking stdin into `buf`, translating control chars. While a turn
