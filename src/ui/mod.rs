@@ -13292,6 +13292,543 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
 }
 
 #[cfg(test)]
+mod drive_feature_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // ── helpers: drive the *real* input handler with faked keypresses ──
+    fn press(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+        app.handle_key(KeyEvent::new(code, mods)).unwrap();
+    }
+    fn type_text(app: &mut App, s: &str) {
+        for c in s.chars() {
+            press(app, KeyCode::Char(c), KeyModifiers::empty());
+        }
+    }
+    fn open_menu(app: &mut App, section_alt: char) {
+        press(app, KeyCode::Char(section_alt), KeyModifiers::ALT);
+    }
+    fn choose(app: &mut App, shortcut: char) {
+        press(app, KeyCode::Char(shortcut), KeyModifiers::empty());
+    }
+    /// Open a top-level menu section and pick an item by its shortcut letter.
+    fn menu(app: &mut App, section_alt: char, shortcut: char) {
+        open_menu(app, section_alt);
+        choose(app, shortcut);
+    }
+    /// Move right `n` root sections in the open menu bar (File→Edit→Insert→Format→Sheet→Help).
+    fn menu_right(app: &mut App, n: usize) {
+        for _ in 0..n {
+            press(app, KeyCode::Right, KeyModifiers::empty());
+        }
+    }
+    fn esc(app: &mut App) {
+        press(app, KeyCode::Esc, KeyModifiers::empty());
+    }
+    fn a1() -> SheetCursor {
+        SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS }
+    }
+    fn main_cell(r: u32, c: u32) -> CellAddr {
+        CellAddr::Main { row: r, col: c }
+    }
+    fn set_selection(app: &mut App, r: u32, c: u32) {
+        app.selection_kind = SelectionKind::Cells;
+        app.anchor = Some(SheetCursor { row: HEADER_ROWS + r as usize, col: MARGIN_COLS + c as usize });
+        app.cursor = SheetCursor { row: HEADER_ROWS + r as usize, col: MARGIN_COLS + c as usize };
+    }
+
+    // ── Navigation (direct keys) ──
+    #[test]
+    fn drive_cursor_navigation_arrows() {
+        let mut app = App::new(None);
+        app.cursor = a1();
+        let start_col = app.cursor.col;
+        let start_row = app.cursor.row;
+        press(&mut app, KeyCode::Right, KeyModifiers::empty());
+        assert!(app.cursor.col > start_col, "Right moves cursor right");
+        press(&mut app, KeyCode::Left, KeyModifiers::empty());
+        assert_eq!(app.cursor.col, start_col, "Left undoes Right");
+        press(&mut app, KeyCode::Down, KeyModifiers::empty());
+        assert!(app.cursor.row > start_row, "Down moves cursor down");
+        press(&mut app, KeyCode::Up, KeyModifiers::empty());
+        assert_eq!(app.cursor.row, start_row, "Up undoes Down");
+    }
+
+    #[test]
+    fn drive_typing_starts_edit() {
+        let mut app = App::new(None);
+        app.cursor = a1();
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::empty());
+        assert!(
+            matches!(app.mode, Mode::Edit { .. }),
+            "typing a char in Normal mode starts edit mode"
+        );
+    }
+
+    // ── Editing (direct key) ──
+    #[test]
+    fn drive_edit_cell_commits_value() {
+        let mut app = App::new(None);
+        app.cursor = a1();
+        press(&mut app, KeyCode::F(2), KeyModifiers::empty()); // edit current cell
+        assert!(matches!(app.mode, Mode::Edit { .. }), "F2 enters edit mode");
+        type_text(&mut app, "42");
+        press(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        assert_eq!(
+            app.state.grid.get(&main_cell(0, 0)).unwrap_or_default(),
+            "42",
+            "typed value should be committed to A1"
+        );
+    }
+
+    // ── Edit menu (Alt+e + shortcut) ──
+    #[test]
+    fn drive_find_opens_dialog() {
+        let mut app = App::new(None);
+        menu(&mut app, 'e', 'f');
+        assert!(matches!(app.mode, Mode::Find { .. }), "Edit▸Find opens Find mode");
+    }
+    #[test]
+    fn drive_replace_opens_dialog() {
+        let mut app = App::new(None);
+        menu(&mut app, 'e', 'r');
+        assert!(matches!(app.mode, Mode::Replace { .. }), "Edit▸Replace opens Replace mode");
+    }
+    #[test]
+    fn drive_extrapolate_opens_dialog() {
+        let mut app = App::new(None);
+        menu(&mut app, 'e', 'e');
+        assert!(matches!(app.mode, Mode::Extrapolate { .. }), "Edit▸Extrapolate opens Extrapolate mode");
+    }
+    #[test]
+    fn drive_duplicate_copies_selection() {
+        let mut app = App::new(None);
+        app.state.grid.set(&main_cell(0, 0), "X".into());
+        set_selection(&mut app, 0, 0);
+        menu(&mut app, 'e', 'd'); // Duplicate -> Duplicate mode
+        assert!(matches!(app.mode, Mode::Duplicate), "Edit▸Duplicate enters Duplicate mode");
+        press(&mut app, KeyCode::Enter, KeyModifiers::empty()); // apply
+        let right = app.state.grid.get(&main_cell(0, 1)).unwrap_or_default();
+        let down = app.state.grid.get(&main_cell(1, 0)).unwrap_or_default();
+        assert!(
+            right == "X" || down == "X",
+            "Duplicate should copy the selection to an adjacent cell (right={right:?}, down={down:?})"
+        );
+    }
+    #[test]
+    fn drive_cut_clears_selection() {
+        let mut app = App::new(None);
+        app.state.grid.set(&main_cell(0, 0), "Z".into());
+        set_selection(&mut app, 0, 0);
+        menu(&mut app, 'e', 'x'); // Cut
+        assert!(
+            app.state.grid.get(&main_cell(0, 0)).unwrap_or_default().is_empty(),
+            "Cut should clear the selected cell"
+        );
+    }
+
+    // ── File menu (Alt+f + shortcut) ──
+    #[test]
+    fn drive_open_path_dialog() {
+        let mut app = App::new(None);
+        menu(&mut app, 'f', 'o');
+        assert!(matches!(app.mode, Mode::OpenPath { .. }), "File▸Open opens OpenPath mode");
+    }
+    #[test]
+    fn drive_save_sort_opens_persisted_sort() {
+        let mut app = App::new(None);
+        menu(&mut app, 'f', 'p'); // Persist sort
+        assert!(
+            matches!(app.mode, Mode::SortView { persist: true, .. }),
+            "File▸Persist sort opens SortView (persist=true)"
+        );
+    }
+    #[test]
+    fn drive_replay_enters_mode() {
+        let mut app = App::new(None);
+        menu(&mut app, 'f', 'r'); // Replay
+        assert!(
+            !matches!(app.mode, Mode::Normal),
+            "File▸Replay should leave Normal mode"
+        );
+    }
+    #[test]
+    fn drive_save_with_ctrl_s() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drive_save.corro");
+        let mut app = App::new(Some(path.clone()));
+        app.state.grid.set(&main_cell(0, 0), "hi".into());
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(path.exists(), "Ctrl+S should create the save file");
+    }
+
+    // ── Insert menu (Alt+i + shortcut) ──
+    #[test]
+    fn drive_insert_row_above() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(3, 2);
+        let before = app.state.grid.main_rows();
+        menu(&mut app, 'i', 'r');
+        assert_eq!(app.state.grid.main_rows(), before + 1, "Insert▸Rows grows the grid");
+    }
+    #[test]
+    fn drive_insert_col() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(3, 2);
+        let before = app.state.grid.main_cols();
+        menu(&mut app, 'i', 'c');
+        assert_eq!(app.state.grid.main_cols(), before + 1, "Insert▸Cols grows the grid");
+    }
+    #[test]
+    fn drive_insert_mitosis_row() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(3, 2);
+        let before = app.state.grid.main_rows();
+        menu(&mut app, 'i', 'm');
+        assert_eq!(app.state.grid.main_rows(), before + 1, "Insert▸Mitosis(Row) grows the grid");
+    }
+    #[test]
+    fn drive_insert_mitosis_col() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(3, 2);
+        let before = app.state.grid.main_cols();
+        menu(&mut app, 'i', 'o');
+        assert_eq!(app.state.grid.main_cols(), before + 1, "Insert▸Mitosis(Col) grows the grid");
+    }
+    #[test]
+    fn drive_insert_date() {
+        let mut app = App::new(None);
+        app.cursor = a1();
+        menu(&mut app, 'i', ';'); // Insert date -> edit mode pre-filled with today's date
+        assert!(matches!(app.mode, Mode::Edit { .. }), "Insert▸Date starts edit mode");
+        press(&mut app, KeyCode::Enter, KeyModifiers::empty()); // commit
+        assert!(
+            !app.state.grid.get(&main_cell(0, 0)).unwrap_or_default().is_empty(),
+            "Insert▸Date should write a non-empty value into the cell"
+        );
+    }
+    #[test]
+    fn drive_insert_time() {
+        let mut app = App::new(None);
+        app.cursor = a1();
+        menu(&mut app, 'i', ':'); // Insert time -> edit mode pre-filled with current time
+        assert!(matches!(app.mode, Mode::Edit { .. }), "Insert▸Time starts edit mode");
+        press(&mut app, KeyCode::Enter, KeyModifiers::empty()); // commit
+        assert!(
+            !app.state.grid.get(&main_cell(0, 0)).unwrap_or_default().is_empty(),
+            "Insert▸Time should write a non-empty value into the cell"
+        );
+    }
+
+    // ── Sheet menu (Alt+s + shortcut) ──
+    #[test]
+    fn drive_new_sheet() {
+        let mut app = App::new(None);
+        let before = app.workbook.sheets.len();
+        menu(&mut app, 's', 'n');
+        assert_eq!(app.workbook.sheets.len(), before + 1, "Sheet▸New adds a sheet");
+    }
+    #[test]
+    fn drive_sheet_next() {
+        let mut app = App::new(None);
+        menu(&mut app, 's', 'n'); // add a 2nd sheet
+        let first = app.view_sheet_id;
+        menu(&mut app, 's', ']'); // next sheet
+        assert_ne!(app.view_sheet_id, first, "Sheet▸Next should change the active sheet");
+    }
+    #[test]
+    fn drive_goto_cell_opens_dialog() {
+        let mut app = App::new(None);
+        menu(&mut app, 's', 'g');
+        assert!(matches!(app.mode, Mode::GoToCell { .. }), "Sheet▸Go opens GoToCell mode");
+    }
+    #[test]
+    fn drive_balance_books_opens_dialog() {
+        let mut app = App::new(None);
+        menu(&mut app, 's', 'b');
+        assert!(matches!(app.mode, Mode::BalanceBooks { .. }), "Sheet▸Balance opens BalanceBooks mode");
+    }
+    #[test]
+    fn drive_sheet_rename_opens_dialog() {
+        let mut app = App::new(None);
+        menu(&mut app, 's', 'r');
+        assert!(matches!(app.mode, Mode::SheetRename { .. }), "Sheet▸Rename opens SheetRename mode");
+    }
+
+    // ── Export menu (Alt+t + shortcut) ──
+    #[test]
+    fn drive_export_tsv_opens_dialog() {
+        let mut app = App::new(None);
+        menu(&mut app, 't', 't');
+        assert!(matches!(app.mode, Mode::ExportTsv { .. }), "Export▸TSV opens ExportTsv mode");
+    }
+    #[test]
+    fn drive_export_csv_opens_dialog() {
+        let mut app = App::new(None);
+        menu(&mut app, 't', 'c');
+        assert!(matches!(app.mode, Mode::ExportCsv { .. }), "Export▸CSV opens ExportCsv mode");
+    }
+    #[test]
+    fn drive_export_ascii_opens_dialog() {
+        let mut app = App::new(None);
+        menu(&mut app, 't', 'a');
+        assert!(matches!(app.mode, Mode::ExportAscii { .. }), "Export▸ASCII opens ExportAscii mode");
+    }
+
+    // ── Width menu (Alt+w + shortcut) ──
+    #[test]
+    fn drive_width_default_opens_dialog() {
+        let mut app = App::new(None);
+        menu(&mut app, 'w', 'd');
+        assert!(matches!(app.mode, Mode::SetMaxColWidth { .. }), "Width▸Default opens SetMaxColWidth mode");
+    }
+    #[test]
+    fn drive_width_column_opens_dialog() {
+        let mut app = App::new(None);
+        menu(&mut app, 'w', 'c');
+        assert!(matches!(app.mode, Mode::SetColWidth { .. }), "Width▸Column opens SetColWidth mode");
+    }
+
+    // ── Format menu (Alt+e, then two Rights to reach Format) ──
+    #[test]
+    fn drive_format_reset() {
+        let mut app = App::new(None);
+        app.state.grid.set_cell_format(main_cell(0, 0), CellFormat::default());
+        open_menu(&mut app, 'e');
+        menu_right(&mut app, 2); // Edit -> Insert -> Format
+        choose(&mut app, 'r'); // Reset
+        assert!(
+            matches!(app.mode, Mode::Normal),
+            "Format▸Reset should apply and return to Normal (mode={:?})",
+            app.mode
+        );
+    }
+
+    // ── Help (Alt+h) ──
+    #[test]
+    fn drive_help_opens() {
+        let mut app = App::new(None);
+        press(&mut app, KeyCode::F(1), KeyModifiers::empty());
+        assert!(matches!(app.mode, Mode::Help), "F1 opens Help mode");
+    }
+
+    // ── Remaining Edit / File / Sheet / Insert / Export / Format actions ──
+    #[test]
+    fn drive_copy_action() {
+        let mut app = App::new(None);
+        app.state.grid.set(&main_cell(0, 0), "C".into());
+        set_selection(&mut app, 0, 0);
+        menu(&mut app, 'e', 'c'); // Copy (non-modal)
+        assert!(matches!(app.mode, Mode::Normal), "Copy is non-modal");
+    }
+    #[test]
+    fn drive_copy_paste_action() {
+        let mut app = App::new(None);
+        app.state.grid.set(&main_cell(0, 0), "P".into());
+        set_selection(&mut app, 0, 0);
+        menu(&mut app, 'e', 'c'); // copy A1
+        press(&mut app, KeyCode::Right, KeyModifiers::empty()); // move to B1
+        menu(&mut app, 'e', 'p'); // paste
+        assert_eq!(
+            app.state.grid.get(&main_cell(0, 1)).unwrap_or_default(),
+            "P",
+            "Paste should place the copied value in the destination cell"
+        );
+    }
+    #[test]
+    fn drive_save_as_opens_dialog() {
+        let mut app = App::new(None);
+        menu(&mut app, 'f', 'a');
+        assert!(matches!(app.mode, Mode::SavePath { .. }), "File▸SaveAs opens SavePath mode");
+    }
+    #[test]
+    fn drive_sort_view_opens() {
+        let mut app = App::new(None);
+        menu(&mut app, 'f', 's');
+        assert!(
+            matches!(app.mode, Mode::SortView { persist: false, .. }),
+            "File▸Sort view opens SortView (persist=false)"
+        );
+    }
+    #[test]
+    fn drive_copy_sheet_opens_dialog() {
+        let mut app = App::new(None);
+        menu(&mut app, 's', 'c');
+        assert!(matches!(app.mode, Mode::SheetCopy { .. }), "Sheet▸Copy opens SheetCopy mode");
+    }
+    #[test]
+    fn drive_sheet_prev() {
+        let mut app = App::new(None);
+        menu(&mut app, 's', 'n'); // 2nd sheet
+        menu(&mut app, 's', ']'); // next -> sheet 2
+        let second = app.view_sheet_id;
+        menu(&mut app, 's', '['); // prev -> sheet 1
+        assert_ne!(app.view_sheet_id, second, "Sheet▸Prev should change the active sheet");
+    }
+    #[test]
+    fn drive_move_sheet() {
+        let mut app = App::new(None);
+        menu(&mut app, 's', 'n'); // ensure 2 sheets exist
+        let before = app.workbook.sheets.len();
+        menu(&mut app, 's', 'm'); // Move
+        assert_eq!(app.workbook.sheets.len(), before, "Move sheet must not change sheet count");
+    }
+    #[test]
+    fn drive_insert_special_char() {
+        let mut app = App::new(None);
+        app.cursor = a1();
+        menu(&mut app, 'i', 's'); // Insert special char
+        assert!(
+            !matches!(app.mode, Mode::Normal),
+            "Insert▸Special Char should open a picker/mode"
+        );
+    }
+    #[test]
+    fn drive_insert_hyperlink() {
+        let mut app = App::new(None);
+        app.cursor = a1();
+        // 'h' is a menu-navigation key, so reach Insert▸Hyperlink via arrow navigation.
+        open_menu(&mut app, 'i');
+        for _ in 0..7 {
+            press(&mut app, KeyCode::Down, KeyModifiers::empty());
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        assert!(matches!(app.mode, Mode::Edit { .. }), "Insert▸Hyperlink starts edit mode");
+    }
+    #[test]
+    fn drive_export_all_writes() {
+        let mut app = App::new(None);
+        // 'l' is a menu-navigation key, so reach Export▸All via arrow navigation.
+        open_menu(&mut app, 't');
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down, KeyModifiers::empty());
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        assert!(
+            matches!(app.mode, Mode::ExportAll { .. }),
+            "Export▸All should drive the export (mode={:?})",
+            app.mode
+        );
+    }
+    #[test]
+    fn drive_export_ods_opens_dialog() {
+        let mut app = App::new(None);
+        menu(&mut app, 't', 'd');
+        assert!(matches!(app.mode, Mode::ExportOdt { .. }), "Export▸ODS opens ExportOdt mode");
+    }
+    #[test]
+    fn drive_format_number_decimal() {
+        let mut app = App::new(None);
+        open_menu(&mut app, 'e');
+        menu_right(&mut app, 2); // Edit -> Insert -> Format
+        choose(&mut app, 'n'); // Number submenu
+        choose(&mut app, 'd'); // Decimal (generic)
+        assert!(
+            matches!(app.mode, Mode::FormatDecimals { .. } | Mode::Normal),
+            "Format▸Number▸Decimal should apply or open a mode (mode={:?})",
+            app.mode
+        );
+    }
+    #[test]
+    fn drive_format_align_left() {
+        let mut app = App::new(None);
+        open_menu(&mut app, 'e');
+        menu_right(&mut app, 2); // -> Format
+        choose(&mut app, 'a'); // Align submenu (item 0 = Left)
+        press(&mut app, KeyCode::Enter, KeyModifiers::empty()); // select Left
+        assert!(
+            matches!(app.mode, Mode::Normal),
+            "Format▸Align▸Left should apply and return to Normal (mode={:?})",
+            app.mode
+        );
+    }
+    #[test]
+    fn drive_exit_leaves_normal() {
+        let mut app = App::new(None);
+        menu(&mut app, 'f', 'x'); // Exit
+        assert!(!matches!(app.mode, Mode::Normal), "File▸Exit should leave Normal mode");
+    }
+    #[test]
+    fn drive_format_scope_all() {
+        let mut app = App::new(None);
+        open_menu(&mut app, 'e');
+        menu_right(&mut app, 2); // -> Format
+        choose(&mut app, 's'); // Scope submenu
+        choose(&mut app, 'a'); // All
+        assert!(
+            matches!(app.mode, Mode::Normal | Mode::Menu { .. }),
+            "Format▸Scope▸All should apply (mode={:?})",
+            app.mode
+        );
+    }
+    #[test]
+    fn drive_format_align_center() {
+        let mut app = App::new(None);
+        open_menu(&mut app, 'e');
+        menu_right(&mut app, 2);
+        choose(&mut app, 'a'); // Align
+        choose(&mut app, 'c'); // Center
+        assert!(
+            matches!(app.mode, Mode::Normal),
+            "Format▸Align▸Center should apply (mode={:?})",
+            app.mode
+        );
+    }
+    #[test]
+    fn drive_format_align_right() {
+        let mut app = App::new(None);
+        open_menu(&mut app, 'e');
+        menu_right(&mut app, 2);
+        choose(&mut app, 'a'); // Align
+        choose(&mut app, 'r'); // Right
+        assert!(
+            matches!(app.mode, Mode::Normal),
+            "Format▸Align▸Right should apply (mode={:?})",
+            app.mode
+        );
+    }
+    #[test]
+    fn drive_format_align_default() {
+        let mut app = App::new(None);
+        open_menu(&mut app, 'e');
+        menu_right(&mut app, 2);
+        choose(&mut app, 'a'); // Align
+        choose(&mut app, 'd'); // Default
+        assert!(
+            matches!(app.mode, Mode::Normal),
+            "Format▸Align▸Default should apply (mode={:?})",
+            app.mode
+        );
+    }
+    #[test]
+    fn drive_format_fixed2() {
+        let mut app = App::new(None);
+        open_menu(&mut app, 'e');
+        menu_right(&mut app, 2);
+        choose(&mut app, 'n'); // Number submenu
+        choose(&mut app, '2'); // Fixed 2
+        assert!(
+            matches!(app.mode, Mode::Normal),
+            "Format▸Number▸Fixed2 should apply (mode={:?})",
+            app.mode
+        );
+    }
+    #[test]
+    fn drive_format_currency() {
+        let mut app = App::new(None);
+        open_menu(&mut app, 'e');
+        menu_right(&mut app, 2);
+        choose(&mut app, 'n'); // Number submenu
+        choose(&mut app, '$'); // Currency
+        assert!(
+            matches!(app.mode, Mode::FormatDecimals { .. }),
+            "Format▸Number▸Currency should open the decimals dialog (mode={:?})",
+            app.mode
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
