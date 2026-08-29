@@ -18,14 +18,11 @@ ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
 
 # Optional GUI deps (rustxwidgets) for the `gui` / `pancurses` REPL backends.
-# These are NOT vendored in this repo (they were a 28 MiB+ build-artifact
-# subtree we no longer carry in git). To build with `--features gui` or
-# `--features pancurses`, check rustxWidgets out as a sibling directory
-# (e.g. /root/src/rustxWidgets) or add a `[patch]` entry pointing `path =`
-# at your local checkout. The default `pir` binary never references them, so
-# a plain `cargo build` works with no rustxWidgets present.
-# rustxwidgets = { path = "rustxWidgets/rustxwidgets", version = "0.1.0", default-features = false, optional = true }
-rustxwidgets = { path = "/home/ai_pir/rustxWidgets-canonical/rustxwidgets", version = "0.1.0", default-features = false, optional = true }
+# Vendored in-tree at `vendors/rustxWidgets` (a real directory, shipped in
+# git) so the default `gui` build and a plain `cargo build` both work with no
+# external checkout. The `gui` backend uses rustxwidgets' dlopen'd GTK loader
+# (the `rustxwidgets/gtk` feature); the `pancurses` backend uses ncurses.
+rustxwidgets = { path = "vendors/rustxWidgets/rustxwidgets", version = "0.1.0", default-features = false, optional = true }
 
 
 [features]
@@ -33,14 +30,11 @@ rustxwidgets = { path = "/home/ai_pir/rustxWidgets-canonical/rustxwidgets", vers
 # with a conversation pane + footer pane (thinking + live draft prompt) and
 # in-app scrollback. OFF by default — build/run with `--features tui`; pass
 # `--no-tui` (or just build without the feature) to use the streaming REPL.
-default = ["gui"]
+default = []
 tui = ["dep:ratatui", "dep:crossterm"]
 # Graphical (GTK) REPL via rustxwidgets' dlopen'd GTK backend, and the curses
-# (pancurses) REPL. These require rustxWidgets to be present (see the comment
-# above the [dependencies] block) — they are intentionally NOT in this repo, so
-#`gui` / `pancurses` are opt-in and absent from the default build.
-# gui = ["dep:rustxwidgets", "rustxwidgets/gtk"]
-# pancurses = ["dep:rustxwidgets", "rustxwidgets/pancurses"]
+# (pancurses) REPL. Both are vendored in-tree at `vendors/rustxWidgets`, so the
+# default `cargo build` (which enables `gui`) compiles with no external checkout.
 gui = ["dep:rustxwidgets", "rustxwidgets/gtk"]
 pancurses = ["dep:rustxwidgets", "rustxwidgets/pancurses"]
 
