@@ -18,4 +18,4 @@
 .env.local
 fuzz/fuzz_parser
 fuzz/corpus/
-rustxWidgets.upstream/
+/.rustxWidgets-upstream/
