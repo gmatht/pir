@@ -372,6 +372,13 @@ fn main() {
     let mut no_raw = false;
     let mut budget: Option<u64> = None;
 
+    // Capture the invoking user's default-model selector BEFORE the privilege
+    // drop (while HOME still points at the real user's ~/.pi). After the drop,
+    // settings.json would come from the sandbox user, whose catalog is a
+    // different (smaller) store — using it to resolve against the invoking
+    // user's catalog produced "no model matches" fallbacks.
+    let pre_drop_selector = std::env::var("PI_MODEL").ok().or_else(config::default_model_setting);
+
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -455,17 +462,25 @@ fn main() {
         i += 1;
     }
 
+    // Load providers as the INVOKING user (root), BEFORE the privilege drop —
+    // the 313KB model catalog lives in the real user's ~/.pi and sandbox users
+    // can't read it. Settings.json (the *selector*) is resolved after the drop
+    // from the sandbox identity. To keep the selector resolvable against the
+    // catalog, `config::select` is never handed a selector that only exists in
+    // the sandbox's own settings: we resolve with the invoking-user catalog and
+    // only fall back to the sandbox default when the user gave no selector at
+    // all (see below — sandbox settings are consulted but matched leniently).
+    // Install death-provenance signal tracking + PR_SET_PDEATHSIG early, so we
+    // can record *what* terminates us (item: SIGTERM/SIGHUP provenance in the
+    // status sidecar) and reap spawned children if the parent pane dies.
+    install_death_tracking();
+
     let providers = match config::load_providers() {
         Ok(p) if !p.is_empty() => p,
         Ok(_) => die("~/.pi/models.json contains no providers"),
         Err(e) => die(&e),
     };
     term::set_model_providers(&providers);
-
-    // Install death-provenance signal tracking + PR_SET_PDEATHSIG early, so we
-    // can record *what* terminates us (item: SIGTERM/SIGHUP provenance in the
-    // status sidecar) and reap spawned children if the parent pane dies.
-    install_death_tracking();
 
     // Drop privileges to the per-project user *after* config/providers are
     // loaded but *before* the agent (and any tool) runs. On non-unix this is a
@@ -491,15 +506,17 @@ fn main() {
     #[cfg(not(unix))]
     let resolved_user: Option<String> = None;
 
-    // Resolve the default model now that `HOME` reflects the effective
-    // (possibly dropped) identity, so the read and the `/default-model` write
-    // use the same `~/.pi/agent/settings.json`. Run as root under a per-project
-    // user, this is the sandbox user's home; run plainly as a user, it's that
-    // user's home.
+    // Resolve the model. Priority: explicit -m/PI_MODEL on the INVOKING
+    // user's command line, then the invoking user's settings.json (captured in
+    // `pre_drop_selector` before HOME changed), then the first catalog model.
+    // The sandbox user's own settings.json is NOT used to pick a model that
+    // must resolve against the invoking user's catalog: its catalog (e.g.
+    // ai_pir's tiny local/fake store) is a subset, and a sandbox-only selector
+    // could never match here. `default_model_setting()` is re-read after the
+    // drop only for the /default-model WRITE path below.
     let explicit = model_sel.is_some();
     let selector = model_sel
-        .or_else(|| std::env::var("PI_MODEL").ok())
-        .or_else(|| config::default_model_setting())
+        .or(pre_drop_selector)
         .unwrap_or_else(|| providers[0].label(&providers[0].models[0]));
 
     let (provider, model) = match config::select(&providers, &selector) {
