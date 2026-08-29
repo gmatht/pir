@@ -17,10 +17,14 @@ smol = "2"                                       # async runtime: event-driven s
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
 
-# Optional GUI dep (rustxwidgets), only compiled when `--features gui` (GTK via
-# dlopen) or `--features pancurses` is set. The single crate exposes both
-# backends behind the `gtk`/`pancurses` cargo features.
-rustxwidgets = { path = "rustxWidgets/rustxwidgets", version = "0.1.0", default-features = false, optional = true }
+# Optional GUI deps (rustxwidgets) for the `gui` / `pancurses` REPL backends.
+# These are NOT vendored in this repo (they were a 28 MiB+ build-artifact
+# subtree we no longer carry in git). To build with `--features gui` or
+# `--features pancurses`, check rustxWidgets out as a sibling directory
+# (e.g. /root/src/rustxWidgets) or add a `[patch]` entry pointing `path =`
+# at your local checkout. The default `pir` binary never references them, so
+# a plain `cargo build` works with no rustxWidgets present.
+# rustxwidgets = { path = "rustxWidgets/rustxwidgets", version = "0.1.0", default-features = false, optional = true }
 
 [features]
 # Full-screen TUI REPL: a real layout engine (no hand-rolled ANSI block)
@@ -29,10 +33,12 @@ rustxwidgets = { path = "rustxWidgets/rustxwidgets", version = "0.1.0", default-
 # `--no-tui` (or just build without the feature) to use the streaming REPL.
 default = []
 tui = ["dep:ratatui", "dep:crossterm"]
-# Graphical (GTK) REPL built on rustxwidgets' dlopen'd GTK backend.
-gui = ["dep:rustxwidgets", "rustxwidgets/gtk"]
-# Curses (pancurses) REPL built on rustxwidgets' pancurses backend.
-pancurses = ["dep:rustxwidgets", "rustxwidgets/pancurses"]
+# Graphical (GTK) REPL via rustxwidgets' dlopen'd GTK backend, and the curses
+# (pancurses) REPL. These require rustxWidgets to be present (see the comment
+# above the [dependencies] block) — they are intentionally NOT in this repo, so
+# `gui` / `pancurses` are opt-in and absent from the default build.
+# gui = ["dep:rustxwidgets", "rustxwidgets/gtk"]
+# pancurses = ["dep:rustxwidgets", "rustxwidgets/pancurses"]
 
 [profile.release]
 strip = true

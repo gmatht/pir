@@ -60,7 +60,29 @@
 #   Each top-level phase prints a `step N/8` marker so you can see how far the
 #   deploy got and where it stalled.
 
+# Q: How do we avoid requiring a newer glibc than the target distros ship?
+#    Run build and tests inside an AlmaLinux 8 container (glibc 2.28) via WSL.
+#    The resulting binary only needs glibc >= 2.28, so it also runs on AlmaLinux 9 / RHEL / Rocky and
+#    any modern glibc-based distro — NOT just the build host's newer glibc.
+#    (glibc compatibility is backward-only: a binary built against glibc X runs
+#    on anything with glibc >= X.) TLS is already rustls (via ureq), so there is
+#    no OpenSSL version coupling either.
+#    USE: '/mnt/c/Program Files/WSL/wsl.exe' -d AlmaLinux8
+
 set -euo pipefail
+
+WSL_EXEC='/mnt/c/Program Files/WSL/wsl.exe'
+# We wrap the cargo commands to run in the AlmaLinux8 distro.
+# This assumes the AlmaLinux8 distro is installed and configured in WSL.
+# The cargo commands are executed inside the container while keeping the 
+# current working directory (which is shared/mounted).
+cargo() {
+  "$WSL_EXEC" -d AlmaLinux8 cargo "$@"
+}
+rustc() {
+  "$WSL_EXEC" -d AlmaLinux8 rustc "$@"
+}
+
 
 # --------------------------------------------------------------- args
 PREFIX="${PIR_DEPLOY_PREFIX:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
@@ -202,60 +224,11 @@ dbg "SRC=$SRC  CLEANUP_WORKTREE=$CLEANUP_WORKTREE"
 step_done "source tree resolved -> $SRC"
 
 # --------------------------------------------------------------- external path deps
-# Some `path =` dependencies live OUTSIDE the pir repo (a sibling checkout with
-# its own .git, never tracked — e.g. rustxWidgets). A fresh worktree therefore
-# lacks them, and cargo refuses to resolve the path even when the feature that
-# uses the dep is disabled by default. Materialize any such missing path deps
-# from a sibling checkout (the main pir tree, by default) so the build works.
-step "materialize external path dependencies"
-# Default SHARED_REPO to the main worktree checkout when this is a worktree.
-if [ -z "$SHARED_REPO" ]; then
-  if git -C "$SRC" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    _MAIN="$(git -C "$SRC" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')"
-    # The first listed worktree is the main checkout (the .git dir's tree).
-    if [ -n "$_MAIN" ] && [ "$_MAIN" != "$SRC" ] && [ -d "$_MAIN" ]; then
-      SHARED_REPO="$_MAIN"
-    fi
-  fi
-fi
-dbg "SHARED_REPO='${SHARED_REPO:-<none>}'"
-# Parse `path = "..."` deps out of Cargo.toml (single line entries only).
-_PATHS="$(grep -oE 'path[[:space:]]*=[[:space:]]*"[^"]+"' "$SRC/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/' | sort -u)"
-# For each missing path dep, materialize its TOP-LEVEL component. External
-# path deps are usually a self-contained checkout (e.g. `rustxWidgets/` holds
-# `` plus transitive deps like `gtk_dynamic_loader`), so linking
-# only the leaf crate would leave its inner path deps unresolved.
-_LINKED=""
-for p in $_PATHS; do
-  _top="${p%%/*}"          # first path component (the external repo root)
-  case "$_LINKED" in
-    *"|$_top|"*) continue ;;   # already materialized this top-level dir
-  esac
-  if [ -e "$SRC/$_top" ]; then
-    say "  present: $_top/"
-    _LINKED="$_LINKED|$_top|"
-    continue
-  fi
-  _found=""
-  if [ -n "$SHARED_REPO" ] && [ -e "$SHARED_REPO/$_top" ]; then
-    _found="$SHARED_REPO/$_top"
-  fi
-  if [ -z "$_found" ] && [ -d "$SRC/.." ]; then
-    # Fall back to a sibling directory of the same basename next to SRC.
-    _sib="$SRC/../$(basename "$SRC")"
-    [ -e "$_sib/$_top" ] && _found="$_sib/$_top"
-  fi
-  if [ -z "$_found" ]; then
-    # Don't fail hard: an optional path dep that is genuinely unused may be
-    # tolerable. But a missing required path breaks the build, so surface it.
-    warn "external dep '$_top/' is missing from $SRC and no source found; build may fail"
-    continue
-  fi
-  say "  linking missing dep '$_top/' -> $_found"
-  ln -s "$_found" "$SRC/$_top" || warn "could not link '$_top/'"
-  _LINKED="$_LINKED|$_top|"
-done
-step_done "external path dependencies materialized"
+# (None currently: rustxWidgets was removed from this repo and is an optional,
+# out-of-tree GUI dependency. See Cargo.toml. The default `pir` binary has no
+# `path =` deps, so there is nothing to materialize here.)
+step "external path dependencies"
+step_done "external path dependencies materialized (none required)"
 
 # --------------------------------------------------------------- tests + build
 if [ "$TESTS" -eq 1 ]; then

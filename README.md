@@ -27,9 +27,6 @@ that `pi`'s providers use — the **Anthropic Messages API** and the
   `autocommit` (commit after every prompt) are included.
 - **Resumable sessions** — `pir -r` reloads a past session (by index / time /
   preview) and keeps the conversation going.
-- **rustxWidgets as a git subtree** — the GUI/widgets repo is vendored at
-  `rustxWidgets/` (the optional `gui`/`pancurses` backends); pull/push it with
-  `git subtree`. See [`docs/rustxWidgets-subtree.md`](docs/rustxWidgets-subtree.md).
 - **Goals** — a durable `<session>.goal.json` tracks multi-step objectives;
   `pir -c` resumes a session *and* drives it to the next pending step, surviving
   ctrl-c, crashes, or timeouts. See [`src/goal.rs`](src/goal.rs).
