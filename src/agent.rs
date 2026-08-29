@@ -1180,7 +1180,10 @@ impl Agent {
             // (deferred above) BEFORE the reply text / tool output prints, so
             // reasoning never appears interleaved after the response it
             // preceded — and the buffer can't leak into the next model call.
-            if !think_buf.is_empty() {
+            // Gated on `silent()` so a turn detached to the background (where
+            // `quiet_req` was set mid-stream) doesn't dump its leftover
+            // thinking onto the now-backgrounded terminal.
+            if !self.silent() && !think_buf.is_empty() {
                 term::out(&format!("{}", term::dim(&std::mem::take(&mut think_buf))));
             }
             // Ensure the footer spinner is stopped (covers the no-output case),
