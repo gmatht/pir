@@ -708,21 +708,24 @@ mod accessibility_tests {
     #[test]
     fn traverse_rules() {
         let dir = std::env::temp_dir().join(format!("pir_acl_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir(&dir);
-        let md = std::fs::metadata(&dir).unwrap();
         let me = unsafe { libc::getuid() };
         let my_gid = unsafe { libc::getgid() };
-        // As the owner we can traverse regardless of the exact bits.
-        assert!(can_traverse(&md, me, my_gid));
+        // Owner can traverse regardless of the exact bits.
+        assert!(can_traverse(&std::fs::metadata(&dir).unwrap(), me, my_gid));
+        // Make it private (0700) so a stranger cannot traverse it.
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
+        std::fs::set_permissions(&dir, perms).unwrap();
         // A different user with no other-execute bit must be denied.
-        assert!(!can_traverse(&md, me.wrapping_add(1), my_gid.wrapping_add(1)));
+        assert!(!can_traverse(&std::fs::metadata(&dir).unwrap(), me.wrapping_add(1), my_gid.wrapping_add(1)));
         // Grant 'o+x' and the stranger can now traverse.
         let mut perms = std::fs::metadata(&dir).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o701);
         std::fs::set_permissions(&dir, perms).unwrap();
-        let md2 = std::fs::metadata(&dir).unwrap();
-        assert!(can_traverse(&md2, me.wrapping_add(1), my_gid.wrapping_add(1)));
-        let _ = std::fs::remove_dir(&dir);
+        assert!(can_traverse(&std::fs::metadata(&dir).unwrap(), me.wrapping_add(1), my_gid.wrapping_add(1)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // `traverse_blockers` should find a 0700 parent dir that a *different* user

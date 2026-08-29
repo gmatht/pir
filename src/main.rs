@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Death-provenance + child reaping (items 4, 7).
@@ -152,6 +152,9 @@ CONFIG (reused from pi, never modified)
 PER-PROJECT USERS
   `pir project init` creates a non-login user ai_<project> owning the cwd so
   all commands run as that user. Re-run as root, or `sudo -u ai_<project> pir`.
+  When the sandbox user can't reach the working directory (e.g. a parent dir
+  is another user's 0700 home), pir offers a wizard: move/clone the project
+  into the user's home, or skip the privilege drop entirely (no sandbox).
 
 AGENT USERS RUN UNATTENDED
   When pir is running as an ai_* user (a per-project/agent sandbox), it
