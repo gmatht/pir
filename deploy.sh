@@ -398,9 +398,15 @@ if [ "$PUSH" -eq 1 ] || [ -n "$TAG" ] || [ "$RELEASE" -eq 1 ]; then
       git push "$PUSH_REMOTE" "$PUSH_REF:refs/heads/$PUSH_BRANCH" \
         || die "could not push $PUSH_REF to $PUSH_REMOTE/$PUSH_BRANCH"
     else
-      say "  pushing $PUSH_REF to $PUSH_REMOTE"
-      git push "$PUSH_REMOTE" "$PUSH_REF" \
-        || die "could not push $PUSH_REF to $PUSH_REMOTE"
+      say " pushing $PUSH_REF to $PUSH_REMOTE"
+      # HEAD alone is ambiguous when the src is a commit object (detached HEAD,
+      # jj working copies, throwaway deploy worktrees) — git then can't even
+      # guess a destination. Resolve the current branch name and push to a
+      # fully-qualified ref; fall back to main when detached.
+      _push_branch_name="$(git symbolic-ref --quiet --short HEAD || true)"
+      [ -n "$_push_branch_name" ] || _push_branch_name="main"
+      git push "$PUSH_REMOTE" "$PUSH_REF:refs/heads/$_push_branch_name" \
+        || die "could not push $PUSH_REF to $PUSH_REMOTE/$_push_branch_name"
     fi
   fi
 
