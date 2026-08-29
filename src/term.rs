@@ -273,6 +273,15 @@ pub fn read_answer(prompt: &str) -> String {
 pub fn read_secret(prompt: &str) -> String {
     eprint!("{prompt} ");
     let _ = io::stderr().flush();
+    // No human on the other end (piped / scripted / closed stdin): never block
+    // waiting for a secret that will never arrive. Used by `/login`, which runs
+    // unattended as an agent user — a blocking read_line here would hang the
+    // whole session on a dead input source. Return empty (the caller treats an
+    // empty key as "nothing saved").
+    if !io::stdin().is_terminal() {
+        eprintln!();
+        return String::new();
+    }
     #[cfg(unix)]
     unsafe {
         let fd = libc::STDIN_FILENO;
@@ -615,11 +624,26 @@ pub fn set_history_file(path: &Path) {
 
 /// Build a line editor with `/model` completion enabled.
 fn new_editor() -> Option<Editor<PirHelper, rustyline::history::DefaultHistory>> {
+    // Enable terminal signals so rustyline's raw mode keeps `ISIG` set and
+    // installs a `VSUSP`→`Suspend` binding. Without this (rustyline's default),
+    // Ctrl-Z at the idle `❯` prompt is decoded to a literal `Z` and never
+    // raises SIGTSTP — i.e. Ctrl-Z does nothing, which is the reported bug.
+    // With signals enabled, rustyline itself drops raw mode, raises SIGTSTP,
+    // restores raw mode on SIGCONT, and refreshes the line (see rustyline
+    // lib.rs `Cmd::Suspend` handling).
     let config = Config::builder()
         .completion_type(CompletionType::List)
+        .enable_signals(true)
         .build();
     let mut rl = Editor::<PirHelper, rustyline::history::DefaultHistory>::with_config(config).ok()?;
     rl.set_helper(Some(PirHelper));
+    // Belt-and-braces: explicitly bind Ctrl-Z → Suspend in case a future
+    // rustyline version stops wiring `VSUSP` automatically. (`custom-bindings`
+    // is a default rustyline feature, so `bind_sequence` is always available.)
+    let _ = rl.bind_sequence(
+        rustyline::KeyEvent::ctrl('Z'),
+        rustyline::Cmd::Suspend,
+    );
     Some(rl)
 }
 
@@ -1095,7 +1119,14 @@ pub mod raw {
         smol::block_on(smol::future::or(readable, finished));
         // Either side fired (or stdin closed): drain whatever is buffered.
         let result = read_chunk(buf, typeahead);
-        // Throttle the EOF case. A pipe at EOF is *permanently* readable (a
+        // A genuine EOF (stdin closed) must be returned as-is so the REPL quits
+        // like ctrl-d even while a turn is running — we must NOT throttle or
+        // swallow it (a closed fd that we mistake for idle would hang the
+        // session forever on a dead input source).
+        if matches!(result, RawInput::Eof) {
+            return result;
+        }
+        // Throttle the idle case. A pipe at EOF is *permanently* readable (a
         // closed fd wakes the reactor immediately, forever), and the turn never
         // signals completion while it's parked in a retry backoff — so racing
         // only `readable` against `finished` would busy-spin at ~100% CPU (that
@@ -1132,6 +1163,7 @@ pub mod raw {
         // Crucially, this loop drains the *entire* paste (which the terminal
         // delivers as a single write) in one `read_chunk` call, so the local
         // `pasting` flag below stays valid for the whole wrapper.
+        let mut eof = false;
         loop {
             let r = unsafe {
                 libc::read(
@@ -1140,7 +1172,26 @@ pub mod raw {
                     tmp.len() - nread,
                 )
             };
-            if r <= 0 {
+            if r < 0 {
+                // EAGAIN/EWOULDBLOCK (non-blocking fd, nothing yet) is the only
+                // "no data" signal we should loop on. Anything else — including
+                // EOF (read returns 0) — must break so a closed stdin is
+                // surfaced as a real EOF instead of being mistaken for "idle".
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    break;
+                }
+                // EINTR: a stray signal interrupted the read; retry.
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            if r == 0 {
+                // stdin closed (real EOF, e.g. piped input ended or the parent
+                // pane died). Surface it so the caller quits like ctrl-d rather
+                // than busy-looping forever on a dead fd.
+                eof = true;
                 break;
             }
             nread += r as usize;
@@ -1149,7 +1200,12 @@ pub mod raw {
             }
         }
         if nread == 0 {
-            return RawInput::None;
+            // No bytes were available. If the fd was simply not ready (would
+            // block) this is the normal idle tick and we return `None` — the
+            // caller's throttle keeps the REPL near 0% CPU. If stdin genuinely
+            // closed (the read returned 0), we return `Eof` so the session
+            // exits cleanly instead of hanging on a dead input source.
+            return if eof { RawInput::Eof } else { RawInput::None };
         }
         // A real input event arrived: mark the keyboard active so deferred
         // thinking output keeps waiting (see `note_keypress`).
@@ -1499,6 +1555,15 @@ pub mod raw {
     /// this does NOT enable bracketed-paste and uses a *separate* termios save
     /// slot so the picker's raw session never interacts with the REPL's.
     /// Idempotent; pair with [`disable_raw_picker`].
+    ///
+    /// IMPORTANT: `ISIG` is deliberately *kept* here (so we do NOT clear it like
+    /// the running-turn raw mode does). That means the kernel still honours
+    /// `VSUSP`: when the user presses Ctrl-Z the terminal driver raises SIGTSTP
+    /// for the whole process group and pir is suspended by the shell — which is
+    /// the expected "Ctrl-Z sleeps pir" behaviour. (The running-turn REPL clears
+    /// `ISIG` and handles Ctrl-Z itself because it needs to re-raise SIGTSTP
+    /// *after* dropping raw mode; the picker instead lets the kernel do it, and
+    /// `wait_key` re-establishes raw mode on SIGCONT.)
     pub fn enable_raw_picker() {
         let mut st = PICKER_STATE.lock().unwrap();
         if st.active {
@@ -1510,9 +1575,16 @@ pub mod raw {
             if libc::tcgetattr(fd, &mut tios) == 0 {
                 st.orig_termios = Some(tios);
                 let mut raw = tios;
-                // No ISIG so ctrl-c/ctrl-z arrive as raw bytes (we handle them
-                // ourselves rather than letting them raise a signal).
-                raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+                // Keep `ISIG` here (see the doc comment on `enable_raw_picker`):
+                // we WANT the kernel to deliver SIGTSTP on Ctrl-Z so pir is
+                // suspended by the parent shell, exactly like a normal CLI. We
+                // only strip canonical mode + echo (and IEXTEN for the bracketed-
+                // paste CSI disambiguation). `wait_key` catches the resulting
+                // EINTR/SIGCONT and re-establishes the picker's raw mode on
+                // resume. ctrl-c still arrives as a raw `0x03` byte (and is
+                // mapped to `Key::CtrlC`), so this doesn't change /sh-style
+                // cancellation in the picker.
+                raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::IEXTEN);
                 raw.c_cc[libc::VMIN] = 0;
                 raw.c_cc[libc::VTIME] = 0;
                 libc::tcsetattr(fd, libc::TCSANOW, &raw);

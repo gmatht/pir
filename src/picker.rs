@@ -378,12 +378,17 @@ fn wait_key() -> Key {
         if r < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
-                // EINTR: either SIGWINCH (flag set) or a stray signal.
-                return if RESIZED.swap(false, Ordering::SeqCst) {
-                    Key::Resize
-                } else {
-                    Key::None
-                };
+                // EINTR: most likely SIGWINCH (flag set → resize/redraw) or the
+                // process being resumed after a SIGTSTP (Ctrl-Z) suspension. In
+                // the latter case the kernel restored the *original* (pre-raw)
+                // termios while we were stopped, so we must re-establish the
+                // picker's raw mode before drawing again — otherwise the screen
+                // redraw would be echoed/garbled and arrow keys would misbehave.
+                if RESIZED.swap(false, Ordering::SeqCst) {
+                    return Key::Resize;
+                }
+                term::raw::enable_raw_picker();
+                return Key::Resize; // force a redraw after resume
             }
             // Real poll error: fall back to a redraw-and-retry cycle.
             return Key::None;
@@ -451,7 +456,13 @@ fn translate_result(res: &term::raw::RawInput, buf: &str) -> Key {
         RawInput::Interrupt => Key::CtrlC,
         RawInput::Cancel => Key::Esc,
         RawInput::Eof => Key::CtrlD,
-        RawInput::Suspend => Key::CtrlC, // treat ctrl-z like cancel for the picker
+        // NOTE: `RawInput::Suspend` can no longer be produced here. `translate`
+        // only returns `Suspend` for a `0x1a` byte when its raw termios cleared
+        // `ISIG`; the picker's `enable_raw_picker` now keeps `ISIG` set, so the
+        // kernel delivers SIGTSTP on Ctrl-Z and pir suspended by the parent
+        // shell (handled/re-entered in `wait_key`). If a `Suspend` ever does
+        // arrive we treat it like Esc (cancel) rather than silently swallowing.
+        RawInput::Suspend => Key::Esc,
         RawInput::None => {
             let _ = buf;
             Key::None

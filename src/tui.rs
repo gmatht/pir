@@ -634,8 +634,20 @@ fn read_raw_into(buf: &mut String, typeahead: &Arc<Mutex<String>>) -> RawKey {
         let r = unsafe {
             libc::read(fd, tmp.as_mut_ptr().add(nread) as *mut libc::c_void, tmp.len() - nread)
         };
-        if r <= 0 {
-            break;
+        if r < 0 {
+            // EAGAIN/EWOULDBLOCK (non-blocking fd, nothing yet): stop draining.
+            // EINTR: a stray signal interrupted the read; retry. Any other error
+            // also stops here.
+            let e = std::io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                break;
+            }
+            continue;
+        }
+        if r == 0 {
+            // stdin closed (real EOF). Surface it so the TUI quits cleanly
+            // instead of busy-looping forever on a dead input source.
+            return RawKey::Eof;
         }
         nread += r as usize;
         if nread >= tmp.len() {
@@ -1032,15 +1044,44 @@ fn read_idle_line(
                             update_tui_hint(state, &buf);
                         }
                     }
+                    0x1a => {
+                        // Ctrl-Z: suspend the whole process (the TUI thread +
+                        // any worker turns all stop with it) and hand control
+                        // back to the parent shell — exactly like the running
+                        // turn's `RawKey::Suspend` path. We must drop crossterm's
+                        // raw mode + the alternate screen first (so the shell is
+                        // usable and SIGCONT re-enters cleanly), then raise
+                        // SIGTSTP; on resume we re-establish both. Omitting this
+                        // arm meant Ctrl-Z was silently swallowed at the idle
+                        // prompt (the "Ctrl-Z sometimes doesn't sleep" bug).
+                        state.draft.clear();
+                        let _ = disable_raw_mode();
+                        let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
+                        let _ = io::stdout().flush();
+                        unsafe {
+                            libc::raise(libc::SIGTSTP);
+                        }
+                        let _ = enable_raw_mode();
+                        let _ = crossterm::execute!(io::stdout(), EnterAlternateScreen);
+                        let _ = io::stdout().flush();
+                    }
                     _ => { /* ignore other control bytes */ }
                 }
             }
-        } else if started.elapsed() < Duration::from_millis(30) {
-            // No bytes arrived (EOF pipe or no input) and barely any wall time
-            // elapsed — an EOF pipe makes `readable()` fire immediately forever,
-            // which would otherwise busy-spin at 100% CPU. Sleep the remainder
-            // of the redraw tick so the idle TUI stays near 0% CPU.
+        } else if n < 0 && started.elapsed() < Duration::from_millis(30) {
+            // No bytes arrived because the read would block (idle / EOF pipe) and
+            // barely any wall time elapsed. An EOF pipe makes `readable()` fire
+            // immediately forever, which would otherwise busy-spin at 100% CPU —
+            // sleep the remainder of the redraw tick so the idle TUI stays near
+            // 0% CPU. (A genuine closure — `n == 0` — falls through to the loop
+            // tail and is returned as ctrl-d quit below.)
             std::thread::sleep(Duration::from_millis(30) - started.elapsed());
+        } else if n == 0 {
+            // stdin closed (real EOF). Quit cleanly so the `Cleanup` guard
+            // restores raw mode + the alternate screen, instead of hanging on a
+            // dead input source.
+            state.draft.clear();
+            return None;
         }
     }
 }
