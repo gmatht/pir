@@ -382,6 +382,16 @@ impl Agent {
         self.registry.kill_all_jobs()
     }
 
+    /// Hard-abort the foreground `bash` command *immediately* (without waiting
+    /// for the turn to finish). The `bash` tool polls this flag between waits
+    /// and kills its child process group at once, so an in-flight command dies
+    /// now instead of after it exits on its own. Used by the ctrl-d/ESC-quit
+    /// paths so the session never has to wait on a long-running command to
+    /// leave. Always safe to call (harmless no-op if no command runs).
+    pub fn registry_abort_active_command(&mut self) -> bool {
+        self.registry.abort_active_command()
+    }
+
     /// The path of the session transcript (used to foreground a session).
     pub fn log_path(&self) -> Option<&PathBuf> {
         self.log_path.as_ref()
@@ -1101,8 +1111,17 @@ impl Agent {
             // it keeps indicating "thinking" while tools run / between calls.
             // `self.typeahead` (filled by the REPL) is rendered on the spinner
             // line so the user sees what they're typing while the model thinks.
+            // The spinner shares the agent's `quiet_req` switch, so when the
+            // REPL detaches this turn to the background (sets `quiet_req`) the
+            // spinner also goes silent instead of keeping its "thinking" line on
+            // the now-backgrounded terminal.
             if !self.silent() {
-                *spinner.borrow_mut() = Some(term::Spinner::start("thinking", self.typeahead.clone(), tty));
+                *spinner.borrow_mut() = Some(term::Spinner::start_with(
+                    "thinking",
+                    self.typeahead.clone(),
+                    tty,
+                    self.quiet_req.clone(),
+                ));
             }
             // Stop the footer spinner (if running) the moment the model emits
             // its first token, so the agent's text starts on a clean line.
@@ -1283,7 +1302,12 @@ impl Agent {
             // streamed token erases it in place via `\r`. `self.typeahead` is
             // rendered on the spinner line so typed-ahead input stays visible.
             if !self.silent() {
-                *spinner.borrow_mut() = Some(term::Spinner::start("thinking", self.typeahead.clone(), tty));
+                *spinner.borrow_mut() = Some(term::Spinner::start_with(
+                    "thinking",
+                    self.typeahead.clone(),
+                    tty,
+                    self.quiet_req.clone(),
+                ));
             }
 
             // Cooperative cancellation: stop after this batch of tools

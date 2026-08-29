@@ -33,7 +33,7 @@ rustxwidgets = { path = "/home/ai_pir/rustxWidgets-canonical/rustxwidgets", vers
 # with a conversation pane + footer pane (thinking + live draft prompt) and
 # in-app scrollback. OFF by default — build/run with `--features tui`; pass
 # `--no-tui` (or just build without the feature) to use the streaming REPL.
-default = []
+default = ["gui"]
 tui = ["dep:ratatui", "dep:crossterm"]
 # Graphical (GTK) REPL via rustxwidgets' dlopen'd GTK backend, and the curses
 # (pancurses) REPL. These require rustxWidgets to be present (see the comment

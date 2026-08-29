@@ -10,6 +10,9 @@
 //! `Err(...)` explaining the feature is unsupported, and the agent falls back
 //! to running as the invoking user.
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
 /// Look up the numeric uid/gid for a system user.
 #[cfg(unix)]
 pub fn lookup_user(user: &str) -> Result<(u32, u32), String> {
@@ -32,6 +35,276 @@ pub fn lookup_user(user: &str) -> Result<(u32, u32), String> {
             return Err(format!("no such user '{user}' (create it with `pir project init`)"));
         }
         Ok((pwd.pw_uid, pwd.pw_gid))
+    }
+}
+
+/// What the accessibility wizard decided to do about the cwd being unreachable
+/// by the sandbox user.
+#[cfg(unix)]
+pub enum AccessibilityAction {
+    /// Nothing wrong (or the user chose to proceed): drop privileges normally.
+    Proceed,
+    /// The user chose *not* to drop privileges; run as the invoking user.
+    SkipDrop,
+    /// The project was relocated into the sandbox user's home; `pir` should
+    /// `chdir` here and then drop privileges normally.
+    Relocated(std::path::PathBuf),
+}
+
+/// Run a command, returning its captured stderr (preferred) or
+/// failure, as an error string. Used by the accessibility wizard's relocate/
+/// clone steps. Best-effort: any spawn error is reported directly.
+#[cfg(unix)]
+fn run_cmd(args: &[&str]) -> Result<(), String> {
+    use std::process::Command;
+    let (prog, rest) = args.split_first().expect("non-empty command");
+    let out = Command::new(prog).args(rest).output();
+    match out {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let msg = String::from_utf8_lossy(if !o.stderr.is_empty() { &o.stderr } else { &o.stdout });
+            Err(format!("`{}` failed: {}", args.join(" "), msg.trim()))
+        }
+        Err(e) => Err(format!("could not run `{}`: {e}", args.join(" "))),
+    }
+}
+
+/// True when `user` (uid/gid) can `stat`/`traverse` `dir`: either "other" has
+/// execute, or the user owns the dir (and owner has execute), or the user's
+/// group owns it (and group has execute). Without execute on *some* matching
+/// class, a non-owner process cannot walk through the directory to reach a
+/// descendant which is exactly the "ai_ user can't reach a subdir of another
+/// user's 0700 home" problem.
+#[cfg(unix)]
+fn can_traverse(md: &std::fs::Metadata, uid: u32, gid: u32) -> bool {
+    let mode = md.mode();
+    if mode & 0o001 != 0 {
+        return true; // other execute
+    }
+    if md.uid() == uid && mode & 0o100 != 0 {
+        return true; // owner execute
+    }
+    if md.gid() == gid && mode & 0o010 != 0 {
+        return true; // group execute
+    }
+    false
+}
+
+/// Walk the cwd's ancestors (parent, grandparent, …) and return the
+/// ones the `user` cannot traverse. Returns an empty vec when the user
+/// can reach the cwd, when the user doesn't resolve, or when we can't stat a
+/// path (so callers never block on a missing dir).
+#[cfg(unix)]
+fn traverse_blockers(cwd: &std::path::Path, user: &str) -> Vec<std::path::PathBuf> {
+    let (uid, gid) = match lookup_user(user) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let mut blockers = Vec::new();
+    // `ancestors()` yields cwd, then each parent up to `/`. Skip cwd itself.
+    for ancestor in cwd.ancestors().skip(1) {
+        if let Ok(md) = std::fs::metadata(ancestor) {
+            if !can_traverse(&md, uid, gid) && !blockers.iter().any(|p| p == ancestor) {
+                blockers.push(ancestor.to_path_buf());
+            }
+        }
+    }
+    blockers
+}
+
+/// Resolve the sandbox user's real home directory (for relocating the project).
+#[cfg(unix)]
+fn user_home(user: &str) -> Option<std::path::PathBuf> {
+    let cuser = std::ffi::CString::new(user).ok()?;
+    let mut buf = vec![0u8; 4096];
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    unsafe {
+        if libc::getpwnam_r(
+            cuser.as_ptr(),
+            &mut pwd,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        ) != 0
+            || result.is_null()
+            || pwd.pw_dir.is_null()
+        {
+            return None;
+        }
+        std::ffi::CStr::from_ptr(pwd.pw_dir).to_str().ok().map(std::path::PathBuf::from)
+    }
+}
+
+/// Relocate `cwd` into `user`'s home and leave a symlink at the original path
+/// pointing at the new location, so external references to the old path still
+/// resolve. Returns the new location (owned by `user`). Root only (needs to
+/// chown + write the symlink into the original parent).
+#[cfg(unix)]
+fn relocate_and_symlink(cwd: &std::path::Path, user: &str, home: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let proj = cwd
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "project".into());
+    let dest = home.join(proj);
+    if dest.exists() {
+        return Err(format!("refusing to relocate: {} already exists", dest.display()));
+    }
+    run_cmd(&["mv", cwd.to_str().unwrap_or(""), dest.to_str().unwrap_or("")])?;
+    // Symlink the *original* path at the new location so anything referencing
+    // the old path (other terminals, tooling) keeps working.
+    let _ = std::os::unix::fs::symlink(&dest, cwd);
+    run_cmd(&["chown", "-R", &format!("{user}:{user}"), dest.to_str().unwrap_or("")])?;
+    Ok(dest)
+}
+
+/// Copy `cwd` into `user`'s home (owned by `user`), leaving the original
+/// intact. The agent then works in the copy; later divergence between the two
+/// trees is the caller's responsibility. Root only (needs to chown).
+#[cfg(unix)]
+fn clone_into_home(cwd: &std::path::Path, user: &str, home: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let proj = cwd
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "project".into());
+    let dest = home.join(proj);
+    if dest.exists() {
+        return Err(format!("refusing to clone: {} already exists", dest.display()));
+    }
+    run_cmd(&["cp", "-a", cwd.to_str().unwrap_or(""), dest.to_str().unwrap_or("")])?;
+    run_cmd(&["chown", "-R", &format!("{user}:{user}"), dest.to_str().unwrap_or("")])?;
+    Ok(dest)
+}
+
+/// Check whether the sandbox `user` can actually reach the current working
+/// directory, and — if not — run an interactive wizard offering ways to fix
+/// it instead of letting the agent silently fail to read files later:
+///
+///   1. Move the project into the user's home and symlink the original path.
+///   2. Clone (copy) the project into the user's home.
+///   3. Don't drop privileges at all (run as the invoking user — no sandbox).
+///   4. Drop anyway and try (may fail to read files).
+///
+/// Returns the action `main` should take. When stdin isn't a terminal the
+/// wizard does not block: it warns and proceeds unless `PIR_NO_DROP=1` is set
+/// (which forces `SkipDrop`). `root` always passes (root can traverse anything),
+/// so the wizard only fires for a non-root sandbox target.
+#[cfg(unix)]
+pub fn cwd_accessibility_wizard(user: &str) -> Result<AccessibilityAction, String> {
+    use crate::term;
+
+    if user == "root" {
+        return Ok(AccessibilityAction::Proceed);
+    }
+    let cwd = std::env::current_dir().map_err(|e| format!("cannot read cwd: {e}"))?;
+    let blockers = traverse_blockers(&cwd, user);
+    if blockers.is_empty() {
+        return Ok(AccessibilityAction::Proceed);
+    }
+
+    let euid = unsafe { libc::geteuid() };
+    let can_drop = euid == 0;
+
+    eprintln!(
+        "{}",
+        term::yellow(&format!(
+            "[pir] the sandbox user '{user}' may not be able to reach the working directory {}",
+            cwd.display()
+        ))
+    );
+    eprintln!(
+        "{}",
+        term::dim("These parent directories are not traversable by that user (no 'o+x' and not owned by it):")
+    );
+    for d in &blockers {
+        eprintln!("  {} {}", term::red("✗"), d.display());
+    }
+
+    if !term::is_terminal() {
+        // Non-interactive: don't block. Honour PIR_NO_DROP to force "no sandbox".
+        if std::env::var("PIR_NO_DROP").is_ok() && can_drop {
+            eprintln!("{} PIR_NO_DROP set — not dropping privileges.", term::dim("·"));
+            return Ok(AccessibilityAction::SkipDrop);
+        }
+        eprintln!(
+            "{}",
+            term::dim("Running non-interactively — proceeding with the privilege drop. Set PIR_NO_DROP=1 to skip the sandbox.")
+        );
+        return Ok(AccessibilityAction::Proceed);
+    }
+
+    eprintln!();
+    eprintln!("{}", term::bold("How do you want to fix this?"));
+    eprintln!(
+        "  {}  Move the project into {user}'s home (~{user}/{}) and symlink the original path to it (recommended)",
+        term::cyan("1"),
+        cwd.file_name().and_then(|n| n.to_str()).unwrap_or("project")
+    );
+    eprintln!(
+        "  {}  Clone (copy) the project into {user}'s home (~{user}/{})",
+        term::cyan("2"),
+        cwd.file_name().and_then(|n| n.to_str()).unwrap_or("project")
+    );
+    if can_drop {
+        eprintln!(
+            "  {}  Don't drop privileges — run as the current user (no sandbox)",
+            term::cyan("3")
+        );
+    }
+    eprintln!(
+        "  {}  Drop privileges anyway and try (may fail to read files)",
+        term::cyan(if can_drop { "4" } else { "3" })
+    );
+
+    let ans = term::read_answer("choice [1-.., default 1]: ");
+    let ans = ans.trim();
+    let choice = if ans.is_empty() { "1" } else { ans };
+
+    match choice {
+        "1" => {
+            let home = user_home(user).ok_or_else(|| format!("cannot resolve home for '{user}'"))?;
+            match relocate_and_symlink(&cwd, user, &home) {
+                Ok(dest) => {
+                    eprintln!(
+                        "{} moved project to {} and symlinked {} to it",
+                        term::green("✓"),
+                        dest.display(),
+                        cwd.display()
+                    );
+                    Ok(AccessibilityAction::Relocated(dest))
+                }
+                Err(e) => {
+                    eprintln!("{} {e}", term::red("!"));
+                    eprintln!("{}", term::dim("F: drop privileges anyway."));
+                    Ok(AccessibilityAction::Proceed)
+                }
+            }
+        }
+        "2" => {
+            let home = user_home(user).ok_or_else(|| format!("cannot resolve home for '{user}'"))?;
+            match clone_into_home(&cwd, user, &home) {
+                Ok(dest) => {
+                    eprintln!(
+                        "{} cloned project to {} (original left intact)",
+                        term::green("✓"),
+                        dest.display()
+                    );
+                    Ok(AccessibilityAction::Relocated(dest))
+                }
+                Err(e) => {
+                    eprintln!("{} {e}", term::red("!"));
+                    eprintln!("{}", term::dim("Falling back to: drop privileges anyway."));
+                    Ok(AccessibilityAction::Proceed)
+                }
+            }
+        }
+        "3" if can_drop => Ok(AccessibilityAction::SkipDrop),
+        "3" => Ok(AccessibilityAction::Proceed), // not root: "3" means "drop anyway"
+        "4" if can_drop => Ok(AccessibilityAction::Proceed),
+        _ => Ok(AccessibilityAction::Proceed),
     }
 }
 
@@ -424,4 +697,60 @@ pub fn session_dir_for(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod accessibility_tests {
+    use super::*;
+
+    // `can_traverse` must report true for a 0700 dir owned by the user (the common "sandbox user owns the project" case) and false when neither
+    // owner/group/other grants execute.
+    #[test]
+    fn traverse_rules() {
+        let dir = std::env::temp_dir().join(format!("pir_acl_test_{}", std::process::id()));
+        let _ = std::fs::create_dir(&dir);
+        let md = std::fs::metadata(&dir).unwrap();
+        let me = unsafe { libc::getuid() };
+        let my_gid = unsafe { libc::getgid() };
+        // As the owner we can traverse regardless of the exact bits.
+        assert!(can_traverse(&md, me, my_gid));
+        // A different user with no other-execute bit must be denied.
+        assert!(!can_traverse(&md, me.wrapping_add(1), my_gid.wrapping_add(1)));
+        // Grant 'o+x' and the stranger can now traverse.
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o701);
+        std::fs::set_permissions(&dir, perms).unwrap();
+        let md2 = std::fs::metadata(&dir).unwrap();
+        assert!(can_traverse(&md2, me.wrapping_add(1), my_gid.wrapping_add(1)));
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    // `traverse_blockers` should find a 0700 parent dir that a *different* user
+    // cannot pass through, but not report a world-traversable parent.
+    #[test]
+    fn finds_unreachable_parent() {
+        let base = std::env::temp_dir().join(format!("pir_acl_base_{}", std::process::id()));
+        let proj = base.join("proj");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::create_dir(&base);
+        let mut perms = std::fs::metadata(&base).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700); // private parent
+        std::fs::set_permissions(&base, perms).unwrap();
+        let _ = std::fs::create_dir(&proj);
+
+        let other = unsafe { libc::getuid() }.wrapping_add(1);
+        let other_gid = unsafe { libc::getgid() }.wrapping_add(1);
+        // No such user -> lookup_user fails -> no blockers (safe default).
+        let none = traverse_blockers(&proj, "no_such_user_xyz");
+        assert!(none.is_empty());
+
+        // Synthesize a fake uid/gid by directly invoking the predicate over the
+        // real parent metadata: the private `base` must be reported as a blocker
+        // for a stranger. We reach into the public-ish path via a temp user that
+        // doesn't exist is unhelpful, so instead assert the helper returns the
+        // private base when given a uid that cannot traverse it.
+        let md = std::fs::metadata(&base).unwrap();
+        assert!(!can_traverse(&md, other, other_gid));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

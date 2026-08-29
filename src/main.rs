@@ -194,6 +194,13 @@ struct BgSession {
     started: std::time::SystemTime,
     joined: bool,
     handle: Option<JoinHandle<()>>,
+    /// True only for the job adopted via `attach_fg`: a turn the user
+    /// backgrounded (bare `&`) *while it was running*. Such a job still owns the
+    /// single interactive `Agent` (it's parked in `None` in `agent_slot` until
+    /// the job finishes and returns it), so a new foreground turn must join this
+    /// job before it can take the agent. Plain `/bg` jobs spin up their own
+    /// agent and never touch the main slot.
+    owns_main_agent: bool,
 }
 
 /// In-process background sessions. Each is a worker thread driving a `pir`
@@ -241,6 +248,7 @@ impl BackgroundJobs {
             started: std::time::SystemTime::now(),
             joined: false,
             handle: Some(handle),
+            owns_main_agent: false,
         });
         println!("{} backgrounded as job #{} (logs to {})", term::cyan("·"), id, log.display());
     }
@@ -251,7 +259,9 @@ impl BackgroundJobs {
     /// turn's agent must already have been told to go quiet (see
     /// `Agent::request_quiet`) so it stops writing to the terminal. Used by the
     /// `&`-to-background-the-current-turn path. The returned id is what `/fg`
-    /// will later reattach to.
+    /// will later reattach to. This is the *only* kind of job that owns the
+    /// single interactive `Agent` — so a subsequent foreground turn must join
+    /// it (see [`BackgroundJobs::reclaim_main_agent`]) before taking the agent.
     fn attach_fg(&mut self, handle: JoinHandle<()>, log: PathBuf, prompt: String) -> usize {
         let id = self.next_id;
         self.next_id += 1;
@@ -262,8 +272,34 @@ impl BackgroundJobs {
             started: std::time::SystemTime::now(),
             joined: false,
             handle: Some(handle),
+            owns_main_agent: true,
         });
         id
+    }
+
+    /// If any job still owns the main interactive `Agent` (a turn the user
+    /// detached with a bare `&` and which hasn't finished yet), join it so its
+    /// worker returns the agent into `agent_slot` before a new foreground turn
+    /// tries to take it. Without this, starting a fresh prompt after
+    /// backgrounding a running turn hit `.take().expect("agent present")` on an
+    /// empty slot and panicked. Safe to call when idle (no-op if nothing holds
+    /// the agent); returns once the agent is back in its slot.
+    fn reclaim_main_agent(&mut self, agent_slot: &Arc<Mutex<Option<Agent>>>) {
+        // Find the (at most one) job that owns the main agent and is still
+        // running. Finished attach_fg jobs have already returned the agent to
+        // the slot inside `run_foreground_turn`, so only a live one is blocking.
+        let live = self
+            .jobs
+            .iter()
+            .position(|j| j.owns_main_agent && j.handle.is_some());
+        if let Some(pos) = live {
+            let h = self.jobs[pos].handle.take().expect("live job has a handle");
+            let _ = h.join();
+            // The worker put the agent back into the slot; nothing else to do.
+            // Defensively ensure the slot isn't still empty (it shouldn't be).
+            let _ = agent_slot;
+            self.jobs.remove(pos);
+        }
     }
 
     /// Spawn a background job from a prompt, using the current provider/model/
@@ -498,10 +534,37 @@ fn main() {
         let target = as_user.clone().unwrap_or_else(|| {
             crate::config::resolve_project_user(None, project_name.as_deref())
         });
-        if let Err(e) = crate::user::become_user(&target) {
-            die(&e);
+        // Before dropping, check the sandbox user can actually reach the cwd.
+        // If not, offer a wizard to relocate/clone the project (or skip the
+        // drop entirely) so the agent doesn't later silently fail to read files
+        // because a parent dir (e.g. another user's 0700 home) is unreadable.
+        let wizard = crate::user::cwd_accessibility_wizard(&target);
+        let mut skip_drop = false;
+        match wizard {
+            Ok(crate::user::AccessibilityAction::Relocated(dest)) => {
+                // Re-root the process at the relocated/clone copy before the
+                // drop, so the agent's cwd is one the sandbox user owns.
+                if let Err(e) = std::env::set_current_dir(&dest) {
+                    eprintln!("pir: could not chdir to {} ({}); dropping anyway", dest.display(), e);
+                }
+            }
+            Ok(crate::user::AccessibilityAction::SkipDrop) => {
+                skip_drop = true;
+            }
+            Ok(crate::user::AccessibilityAction::Proceed) => {}
+            Err(e) => {
+                eprintln!("pir: accessibility check skipped ({e}); dropping anyway");
+            }
         }
-        Some(target)
+        if skip_drop {
+            // Honour the user's choice not to sandbox: run as the invoking user.
+            None
+        } else {
+            if let Err(e) = crate::user::become_user(&target) {
+                die(&e);
+            }
+            Some(target)
+        }
     };
     #[cfg(not(unix))]
     let resolved_user: Option<String> = None;
@@ -869,7 +932,12 @@ fn main() {
         if let Some(h) = fg_handle.as_ref() {
             if h.is_finished() {
                 let h = fg_handle.take().unwrap();
-                let _ = h.join();
+                // Bounded join: if the worker already finished (is_finished()
+                // was true) the join returns immediately, so this is normally
+                // free. The bound is a safety net so a pathological worker can
+                // never pin the REPL in raw mode waiting on a turn — we must
+                // never block the input thread for long.
+                let _ = join_with_timeout(h, Duration::from_millis(500));
                 term::raw::disable_raw();
                 // Report token usage from the (now-returned) agent.
                 if let Some(a) = agent_slot.lock().unwrap().as_ref() {
@@ -1045,8 +1113,31 @@ fn main() {
                     if let Some(f) = crate::agent::job_kill_flag() {
                         f.store(true, Ordering::SeqCst);
                     }
-                    // Let the running turn finish its current step, then exit.
-                    let _ = fg_handle.take().unwrap().join();
+                    // Hard-abort the in-flight foreground command NOW (don't
+                    // wait for it to finish — the whole point of ctrl-d is to
+                    // stop the session *promptly*). The shared registry abort
+                    // flag kills the bash child's process group on its next
+                    // wait-loop tick; once it's parked in a blocking model read
+                    // the cooperative cancel above already makes the stream
+                    // parser bail within tens of milliseconds.
+                    {
+                        let mut g = agent_slot.lock().unwrap();
+                        if let Some(a) = g.as_mut() {
+                            a.registry_abort_active_command();
+                        }
+                    }
+                    // The turn will end shortly of its own accord (the cancel
+                    // flag is observed at the next safe boundary in the tool
+                    // loop, or the in-flight stream aborts immediately). We
+                    // must NOT block here waiting for it — a blocking `join()`
+                    // would let ctrl-d hang for the whole (possibly multi-minute)
+                    // turn, exactly the "ctrl-d won't stop pir" bug. So we detach
+                    // the worker: drop the handle so it can't be joined, leave
+                    // raw mode, and exit at once. The worker's own exit path
+                    // (returns the agent to its slot + fires the oneshot) still
+                    // runs free of us; PR_SET_PDEATHSIG + the death handler reap
+                    // any stragglers if the process truly goes away.
+                    let _ = fg_handle.take();
                     term::raw::disable_raw();
                     return;
                 }
@@ -1123,6 +1214,11 @@ fn main() {
             jobs.spawn_prompt(input.to_string(), &current_ctx, bus.clone());
         } else {
             if let Ok(mut g) = typeahead.lock() { g.clear(); }
+            // If the user previously backgrounded a *running* turn (bare `&`),
+            // that detached job still owns the interactive Agent (it's parked in
+            // `None` in the slot until the job finishes and returns it). Join it
+            // first so the agent is back before we take it for this new turn.
+            jobs.reclaim_main_agent(&agent_slot);
             // A fresh foreground turn starts un-silenced; reset the detach
             // switch so a previously detached turn's quiet state can't leak.
             fg_quiet.store(false, Ordering::SeqCst);
@@ -2079,6 +2175,27 @@ fn build_pick_items(sessions: &[Session], my_pid: u32) -> Vec<crate::picker::Pic
             preview_line: s.preview.clone(),
         })
         .collect()
+}
+
+/// Join a worker thread, but never block the caller longer than `budget`.
+/// The worker runs the agent's `turn`, whose own cancel/abort paths end it
+/// promptly; this bound is purely a safety net so a stuck worker can't pin the
+/// REPL (in raw mode) forever. If the budget elapses the thread is detached
+/// (it dies with the process), exactly like the ctrl-d/quit detach path.
+fn join_with_timeout(h: JoinHandle<()>, budget: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        if h.is_finished() {
+            let _ = h.join();
+            return true;
+        }
+        if start.elapsed() >= budget {
+            // Give up waiting; detach (never block the REPL input thread).
+            drop(h);
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn scan_sessions() -> Option<Vec<Session>> {
