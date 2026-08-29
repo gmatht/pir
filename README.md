@@ -257,13 +257,16 @@ prompted yes/no; root-owned wrappers in `/usr/local/sbin/` are the authoritative
 boundary and a `visudo`-validated `/etc/sudoers.d/skynet-ai` is emitted. See
 [`SKYNET-AI-PERMS.md`](SKYNET-AI-PERMS.md) for the design.
 
+This means that the pir can run as skynet and manage various ai projects.
+Skynet does not (yet?) have the ability to delete human users (or their files).
+
 ---
 
 ## Honest caveats
 
 - **Schema tolerance**: the loader accepts `providers` as a list (pi's format)
   or map, camelCase/snake_case keys, and `{env:...}` keys — but it isn't
-  guaranteed against every `pi` version's `models.json`. If yours differs,
+  guaranteed. If yours differs,
   `config.rs` names the exact file in its error.
 - Ctrl-C mid-stream kills the process (no raw-terminal mode); the JSONL log and
   `.goal.json` preserve everything up to the last completed message, and `pir -c`
