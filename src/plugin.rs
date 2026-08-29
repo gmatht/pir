@@ -45,7 +45,10 @@
 
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+#[derive(Clone)]
 pub struct ToolSpec {
     pub name: &'static str,
     pub description: &'static str,
@@ -66,6 +69,57 @@ impl Outcome {
     }
 }
 
+/// Lifecycle events the agent emits to every backend through the event bus
+/// (see [`ToolBackend::on_event`]). Mirrors the subset of `pi`'s extension
+/// event taxonomy that `pir` can surface synchronously. `ToolCall` is special:
+/// it is a *pre-flight* hook the agent calls **before** running a tool, and a
+/// backend may block the call by returning [`HookResult::block`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventKind {
+    /// Fired before a tool runs. `payload` carries `{"toolName", "input"}`.
+    /// Backends may block (e.g. permission gates).
+    ToolCall,
+    /// An assistant turn started (model stream begins).
+    TurnStart,
+    /// A user turn finished (model answered and all tools executed).
+    TurnEnd,
+    /// The agent session started (after all backends are attached).
+    SessionStart,
+    /// The agent loop began an LLM call.
+    AgentStart,
+    /// The whole run settled (`agent_end`).
+    AgentEnd,
+}
+
+/// Result of a pre-flight `ToolCall` hook. Returning `block: true` stops the
+/// tool from executing for this turn; `reason` is shown to the user and fed
+/// back to the model as the tool result.
+#[derive(Debug, Clone)]
+pub struct HookResult {
+    pub block: bool,
+    pub reason: Option<String>,
+    /// When `block` is set, hint that the agent should stop asking for more
+    /// tools this turn (mirrors `pi`'s `terminate`).
+    pub terminate: bool,
+}
+
+impl HookResult {
+    pub fn allow() -> Self {
+        HookResult { block: false, reason: None, terminate: false }
+    }
+    pub fn block(reason: impl Into<String>) -> Self {
+        HookResult { block: true, reason: Some(reason.into()), terminate: false }
+    }
+}
+
+/// A REPL slash command an extension registers (e.g. `/mycommand`). The REPL
+/// dispatches unknown `/name` words to `Registry::run_command`.
+#[derive(Clone)]
+pub struct CommandSpec {
+    pub name: String,
+    pub description: String,
+}
+
 /// A source of one or more tools. Implement this in an extension and register
 /// it via [`Registry::add`] from your `register` entry point.
 pub trait ToolBackend: Send {
@@ -81,6 +135,14 @@ pub trait ToolBackend: Send {
     /// extensions that must anchor state to the project rather than the
     /// current working directory).
     fn on_session_start(&mut self, _launch_cwd: &std::path::Path) {}
+
+    /// Called once, after `on_session_start` and after the agent is fully
+    /// constructed, to let a backend print a status banner at startup. Return
+    /// `Some(text)` and `pir` prints it (dimmed) before the first prompt;
+    /// `None` is silent. Default no-op (silent).
+    fn startup_report(&mut self) -> Option<String> {
+        None
+    }
 
     /// Called once when the agent/REPL is shutting down. Use it to release
     /// resources the backend created (e.g. git worktrees). Returning an error
@@ -98,6 +160,62 @@ pub trait ToolBackend: Send {
     fn on_turn_end(&mut self, _prompt: &str) -> Vec<String> {
         Vec::new()
     }
+
+    /// Pre-flight hook for **every** tool call. The agent invokes this *before*
+    /// `run`. Return [`HookResult::block`] to veto a tool (e.g. a permission
+    /// gate blocking `rm -rf`). The default allows all calls. This is how
+    /// `pi`'s `on("tool_call")` blocking semantics are expressed in `pir`'s
+    /// synchronous ABI.
+    fn on_tool_call(&mut self, _name: &str, _input: &Value) -> HookResult {
+        HookResult::allow()
+    }
+
+    /// Lifecycle event bus. The agent calls this for each [`EventKind`] at the
+    /// matching point. Backends use it for observability / side effects
+    /// (e.g. notify, branch summarization). The default ignores all events.
+    /// `payload` is a JSON object with event-specific fields.
+    fn on_event(&mut self, _kind: EventKind, _payload: &Value) {}
+
+    /// Slash commands this backend contributes to the REPL (e.g. `/mycommand`).
+    /// The REPL dispatches an unrecognized `/name` to [`run_command`]. The
+    /// default contributes none.
+    fn commands(&self) -> Vec<CommandSpec> {
+        Vec::new()
+    }
+
+    /// Run a registered slash command with the rest of the line as `args`.
+    /// Return [`Outcome::err`] for unknown command names. Only called for
+    /// command names this backend advertised via [`commands`].
+    fn run_command(&mut self, _name: &str, _args: &str) -> Outcome {
+        Outcome::err("unknown command".into())
+    }
+
+    /// Share the REPL's "go silent" switch with this backend, replacing its
+    /// private handle. The REPL holds the same `Arc`, so flipping it (to
+    /// background a running turn) silences any in-flight progress output the
+    /// backend emits — e.g. the `bash` tool's live elapsed clock — without the
+    /// REPL owning the worker. Default no-op for backends that don't stream to
+    /// the terminal.
+    fn set_quiet_handle(&mut self, _q: Arc<AtomicBool>) {}
+
+    /// Share the REPL's "kill detached jobs" switch with this backend. The
+    /// REPL flips it when the user presses ESC/ctrl-c (or quits), asking the
+    /// backend to kill every long-running command it detached into a
+    /// background job — the flag exists because the worker thread *takes* the
+    /// agent (and with it the backend) out of the agent slot while a turn
+    /// runs, so the REPL cannot reach the backend directly. Backends may
+    /// either poll the flag or act on it on demand; whoever acts clears it.
+    /// Default no-op for backends that keep no jobs.
+    fn set_job_kill_handle(&mut self, _f: Arc<AtomicBool>) {}
+
+    /// Kill every long-running command this backend has detached into a
+    /// background job (the user pressed ESC/ctrl-c: stop *everything*).
+    /// Implementations must use poll-based, bounded waits — this is
+    /// called from the REPL's input thread and must never block it. Returns
+    /// how many *running* jobs were killed. Default: no jobs kept, kill 0.
+    fn kill_all_jobs(&mut self) -> usize {
+        0
+    }
 }
 
 /// Holds every linked backend. The model only ever sees `specs()`; it never
@@ -106,16 +224,63 @@ pub struct Registry {
     cwd: PathBuf,
     full_auto: bool,
     backends: Vec<Box<dyn ToolBackend>>,
+    /// Hard-abort flag for the foreground `bash` command, set the instant the
+    /// user presses ESC/ctrl-c. The cooperative `cancel` flag only stops a turn
+    /// *after* the current step finishes, but a long-running `bash` command can
+    /// still be executing inside that step — so the `bash` tool polls this and
+    /// kills its child immediately when it flips, aborting the command right
+    /// away (not after it exits on its own). The REPL sets it via
+    /// [`Registry::abort_active_command`]; the `bash` tool clears it on start.
+    pub abort: Arc<AtomicBool>,
 }
 
 impl Registry {
-    pub fn new(cwd: PathBuf, full_auto: bool) -> Self {
-        Registry { cwd, full_auto, backends: Vec::new() }
+    pub fn new(cwd: PathBuf, full_auto: bool, abort: Arc<AtomicBool>) -> Self {
+        Registry { cwd, full_auto, backends: Vec::new(), abort }
+    }
+
+    /// Signal the running foreground `bash` command to abort immediately. The
+    /// `bash` tool checks this between waits and kills its child. The REPL also
+    /// flips the cooperative `cancel` flag, so the turn ends after this step.
+    /// Always returns true (a no-op abort is harmless even if no command runs).
+    pub fn abort_active_command(&mut self) -> bool {
+        self.abort.store(true, Ordering::SeqCst);
+        true
     }
 
     /// Link an extension's backend.
     pub fn add(&mut self, backend: Box<dyn ToolBackend>) {
         self.backends.push(backend);
+    }
+
+    /// Share the REPL's "go silent" switch with every backend, so a turn
+    /// detached to the background (bare `&`) silences their in-flight terminal
+    /// output (e.g. the bash tool's live elapsed clock) without the REPL owning
+    /// the worker. Call once, right after construction (before the first turn).
+    pub fn set_quiet_handle(&mut self, q: Arc<AtomicBool>) {
+        for b in &mut self.backends {
+            b.set_quiet_handle(q.clone());
+        }
+    }
+
+    /// Share the REPL's "kill detached jobs" switch with every backend. The
+    /// REPL flips it when the user presses ESC/ctrl-c (or quits); backends
+    /// with detached long-running commands then kill them promptly (see
+    /// [`ToolBackend::set_job_kill_handle`]). Call once, right after
+    /// construction.
+    pub fn set_job_kill_handle(&mut self, f: Arc<AtomicBool>) {
+        for b in &mut self.backends {
+            b.set_job_kill_handle(f.clone());
+        }
+    }
+
+    /// Kill every long-running command any backend has detached into a
+    /// background job (ESC/ctrl-c semantics: stop *everything* now). Called
+    /// synchronously by the REPL; must never block (backends are required to
+    /// use bounded, poll-based kills). Returns the number of running jobs
+    /// killed, for a status line.
+    pub fn kill_all_jobs(&mut self) -> usize {
+        self.backends.iter_mut().map(|b| b.kill_all_jobs()).sum()
     }
 
     /// Flat list of every tool across all backends — sent to the model.
@@ -152,11 +317,62 @@ impl Registry {
         }
     }
 
+    /// Collect startup-report banners from every backend (e.g. the worktree
+    /// extension reporting the current worktree). Returns the lines for the
+    /// caller to print (dimmed) before the first prompt.
+    pub fn startup_reports(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        for b in &mut self.backends {
+            if let Some(line) = b.startup_report() {
+                out.push(line);
+            }
+        }
+        out
+    }
+
     /// Notify every backend that the agent is shutting down.
     pub fn exited(&mut self) {
         for b in &mut self.backends {
             b.on_exit();
         }
+    }
+
+    /// Run every backend's pre-flight `tool_call` hook for a tool. The first
+    /// backend that returns `block: true` wins; its reason is returned as the
+    /// block. Tool execution is skipped when this returns `Some((reason,
+    /// terminate))`. Returns `None` when no backend objects (tool may run).
+    pub fn preflight_tool(&mut self, name: &str, input: &Value) -> Option<(String, bool)> {
+        for b in &mut self.backends {
+            let res = b.on_tool_call(name, input);
+            if res.block {
+                return Some((res.reason.unwrap_or_else(|| "blocked by extension".into()), res.terminate));
+            }
+        }
+        None
+    }
+
+    /// Emit a lifecycle event to every backend's event bus.
+    pub fn emit(&mut self, kind: EventKind, payload: &Value) {
+        for b in &mut self.backends {
+            b.on_event(kind.clone(), payload);
+        }
+    }
+
+    /// Return every slash command across all backends, keyed by name.
+    pub fn commands(&self) -> Vec<CommandSpec> {
+        self.backends.iter().flat_map(|b| b.commands()).collect()
+    }
+
+    /// Dispatch a slash command (the bare `name` without the leading `/`) to
+    /// the backend that owns it. Returns `None` when no backend registered the
+    /// command (the REPL then treats it as unknown).
+    pub fn run_command(&mut self, name: &str, args: &str) -> Option<Outcome> {
+        for b in &mut self.backends {
+            if b.commands().iter().any(|c| c.name == name) {
+                return Some(b.run_command(name, args));
+            }
+        }
+        None
     }
 
     /// Notify every backend that a user turn just completed. `prompt` is the

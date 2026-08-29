@@ -1,6 +1,8 @@
 //! wt — per-agent git worktrees with idle auto-verify + merge-back.
 //!
-//! Off by default; enable with `PIR_WT=1`. When enabled:
+//! **On by default** — every agent gets its own linked git worktree so its
+//! `bash`/`edit_file`/`read_file` calls never touch the trunk checkout. Disable
+//! with `PIR_WT=0`. When enabled:
 //!
 //! * `wt_create` makes a linked git worktree off the repo's *trunk* branch
 //!   (auto-detected — `origin/HEAD`, else the checked-out branch, else
@@ -25,7 +27,7 @@
 //!   explicit `wt_merge`. This avoids silently merging unverified work.
 //! * `wt_merge` / `wt_verify` / `wt_status` / `wt_remove` are exposed as tools
 //!   for explicit control. `on_turn_end` only auto-merges when `PIR_WT_AUTO=1`
-//!   (default on when `PIR_WT=1`).
+//!   (default on when `PIR_WT` is not `0`).
 //!
 //! Locking
 //! -------
@@ -85,7 +87,10 @@ struct Wt {
 
 impl Wt {
     fn new() -> Self {
-        let enabled = std::env::var_os("PIR_WT").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+        // Enabled by default; only `PIR_WT=0` (or empty) turns it off.
+        let enabled = std::env::var_os("PIR_WT")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true);
         let auto = std::env::var_os("PIR_WT_AUTO")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(enabled);
@@ -305,13 +310,27 @@ impl Wt {
     /// `origin/<trunk>` if a fast-forward is possible (no local-only commits).
     /// Returns Ok(true) if trunk is now up to date (or there's no upstream to ff),
     /// Ok(false) if it couldn't ff (diverged), Err(msg) on an unexpected git failure.
+    ///
+    /// The `git fetch origin` is only attempted when an `origin` remote is
+    /// actually configured — there is no point hitting the network (and no
+    /// reason to fail or hang) on a purely-local repo or when offline. The
+    /// `has_upstream`/`rev-parse` probe below already short-circuits the merge
+    /// when there's nothing to fast-forward against.
     fn ff_main(&self) -> Result<bool, String> {
         let root = self.repo_root();
         let trunk = self.trunk();
-        let _ = Command::new("git")
-            .args(["fetch", "--quiet", "origin"])
+        let has_origin = Command::new("git")
+            .args(["remote", "get-url", "origin"])
             .current_dir(&root)
-            .status();
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if has_origin {
+            let _ = Command::new("git")
+                .args(["fetch", "--quiet", "origin"])
+                .current_dir(&root)
+                .status();
+        }
         // If there's no origin/<trunk> to fast-forward against, just proceed (a
         // purely-local repo, or offline). Never block the merge for that.
         let upstream = format!("origin/{trunk}");
@@ -478,7 +497,7 @@ impl Wt {
     /// agent into it.
     fn create(&mut self, base: &str) -> Outcome {
         if !self.enabled {
-            return Outcome::err("wt is off (set PIR_WT=1 to enable worktree automation)".into());
+            return Outcome::err("wt is off (set PIR_WT=0 to disable worktree automation)".into());
         }
         if !self.is_git() {
             return Outcome::err("wt: not inside a git repository".into());
@@ -760,7 +779,7 @@ impl ToolBackend for Wt {
                      origin/HEAD, then the checked-out branch, else main/master/...) with a fresh \
                      branch, and cd the agent into it so subsequent tools operate there. \
                      Optionally pass a 'base' name to prefix the branch. The trunk checkout is \
-                     remembered and used for merges. Requires PIR_WT=1. With PIR_WT_COW=1 and \
+                     remembered and used for merges. Enabled by default (set PIR_WT=0 to disable). With PIR_WT_COW=1 and \
                      PIR_WT_TEMPLATE=<prebuilt-worktree>, the build dir (target/, or PIR_WT_BUILD_DIR) \
                      is cloned copy-on-write (btrfs/xfs-reflink/apfs) so the agent skips rebuilding.",
                 schema: json!({
@@ -783,7 +802,7 @@ impl ToolBackend for Wt {
                 description:
                     "Merge the current worktree's branch into main from the main checkout, under \
                      the inter-agent merge lock (fast-forward only of main; --no-ff merge of the \
-                     branch). Then removes the worktree. Requires PIR_WT=1.",
+                     branch). Then removes the worktree. Enabled by default (set PIR_WT=0 to disable).",
                 schema: json!({ "type": "object", "properties": {}, "required": [] }),
             },
             ToolSpec {
@@ -872,6 +891,57 @@ impl ToolBackend for Wt {
         self.repo = launch_cwd.to_path_buf();
     }
 
+    /// Startup banner: report the worktree the agent is launching in (or the
+    /// trunk checkout), plus whether per-session worktree automation is on.
+    /// Always printed (even when `wt` is "off") so the operator always knows the
+    /// agent's execution context — this answers "what worktree am I in and why
+    /// wasn't it reported before".
+    fn startup_report(&mut self) -> Option<String> {
+        let root = self.repo_root();
+        // Where are we right now? Prefer the worktree the *process* is in
+        // (current_dir) since `on_session_start` set main_cwd to the launch dir;
+        // if an extension/worktree created one, `self.current` reflects it.
+        let here = self.current.clone().or_else(|| std::env::current_dir().ok());
+        let mut parts: Vec<String> = Vec::new();
+        let state = match &here {
+            Some(d) => {
+                // Is this directory a linked worktree (not the main checkout)?
+                let is_wt = Command::new("git")
+                    .args(["rev-parse", "--show-toplevel"])
+                    .current_dir(d)
+                    .output()
+                    .map(|o| {
+                        let top = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        !top.is_empty() && top != self.repo_root().display().to_string()
+                    })
+                    .unwrap_or(false);
+                if is_wt {
+                    let branch = Command::new("git")
+                        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                        .current_dir(d)
+                        .output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .unwrap_or_default();
+                    format!("in worktree {} on branch {}", d.display(), branch)
+                } else {
+                    let branch = self.trunk();
+                    format!("on trunk checkout {} (branch {})", root.display(), branch)
+                }
+            }
+            None => format!("on trunk checkout {} (branch {})", root.display(), self.trunk()),
+        };
+        parts.push(state);
+        parts.push(format!(
+            "worktree automation: {}",
+            if self.enabled {
+                format!("on (auto-merge {})", if self.auto { "enabled" } else { "disabled" })
+            } else {
+                "off (set PIR_WT=0 to disable worktree automation)".to_string()
+            }
+        ));
+        Some(format!("[wt] {}", parts.join(" · ")))
+    }
+
     fn on_turn_end(&mut self, _prompt: &str) -> Vec<String> {
         if !self.enabled || !self.auto || !self.in_worktree() {
             return Vec::new();
@@ -912,11 +982,46 @@ pub fn register(reg: &mut Registry) {
 mod tests {
     use super::*;
     use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// These tests mutate the process-global `current_dir` (via `Chdir`) and the
+    /// `PIR_WT`/`PIR_WT_CHECK` env vars, which race when cargo runs tests in
+    /// parallel on multiple threads. Serialise them so `repo_root()`/`trunk()`
+    /// always resolve against the right scratch repo and env reads aren't
+    /// clobbered by a concurrent test.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard that `cd`s into `dir` and restores the previous cwd on drop —
+    /// even if the test panics. Without this, a panicking test leaves the
+    /// process in a (possibly already-removed) temp dir, which then breaks
+    /// every later test's `set_current_dir` (git refuses to operate from a
+    /// deleted directory). Each test that changes cwd must bind this guard.
+    struct Chdir {
+        _prev: PathBuf,
+    }
+    impl Chdir {
+        fn new(dir: &Path) -> Self {
+            let prev = std::env::current_dir().expect("cwd readable");
+            std::env::set_current_dir(dir).expect("cd into scratch repo");
+            Chdir { _prev: prev }
+        }
+    }
+    impl Drop for Chdir {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self._prev);
+        }
+    }
 
     /// Build an isolated git repo (no remote) with one baseline commit; return
     /// its path. The `wt` extension operates on linked worktrees under it.
+    /// The path is made unique per call (pid + nanosecond clock) so two tests
+    /// running in the same second never collide on the same temp dir.
     fn scratch_repo() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("pir_wt_test_{}_{}", std::process::id(), chrono_short()));
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("pir_wt_test_{}_{}", std::process::id(), nanos));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let git = |args: &[&str]| {
@@ -931,13 +1036,29 @@ mod tests {
         dir
     }
 
+    /// Current repo's checked-out branch name, for assertions that must not
+    /// assume `main` (modern git may default to `master` or a custom
+    /// init.defaultBranch).
+    fn checked_out_branch(repo: &Path) -> String {
+        String::from_utf8_lossy(
+            &Command::new("git")
+                .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                .current_dir(repo)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string()
+    }
+
     #[test]
     fn creates_branch_and_merges_back_when_checks_pass() {
+        let _lock = TEST_LOCK.lock().unwrap();
         std::env::set_var("PIR_WT", "1");
         std::env::remove_var("PIR_WT_AUTO");
         let repo = scratch_repo();
-        let orig = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&repo).unwrap();
+        let _chdir = Chdir::new(&repo);
 
         let mut wt = Wt::new();
         assert!(wt.enabled, "PIR_WT should enable");
@@ -959,18 +1080,19 @@ mod tests {
         let verdict = wt.verify(&here);
         assert!(matches!(verdict, Verdict::Passed(_)), "verify should pass with PIR_WT_CHECK=true");
 
-        // Merge back into trunk (main here) from the main checkout.
+        // Merge back into trunk from the main checkout; reachability is checked
+        // against the *actual* checked-out branch, not a hard-coded "main".
         let branch = wt.worktree_branch(&here).unwrap();
+        let trunk = checked_out_branch(&repo);
         let merged = wt.merge_into_main(&branch);
         assert!(!merged.is_error, "merge failed: {}", merged.content);
-        // The branch's commit should now be reachable from main.
         let reachable = Command::new("git")
-            .args(["merge-base", "--is-ancestor", &branch, "main"])
+            .args(["merge-base", "--is-ancestor", &branch, &trunk])
             .current_dir(&repo)
             .status()
             .unwrap()
             .success();
-        assert!(reachable, "branch should be merged into main");
+        assert!(reachable, "branch should be merged into {trunk}");
 
         // Remove the worktree and return to main.
         let removed = wt.remove_worktree(&here, &branch);
@@ -978,8 +1100,6 @@ mod tests {
         wt.return_to_main();
         assert!(!wt.in_worktree());
 
-        let _ = fs::remove_dir_all(&repo);
-        let _ = std::env::set_current_dir(&orig);
         std::env::remove_var("PIR_WT");
     }
 
@@ -1015,12 +1135,23 @@ mod tests {
     }
 
     #[test]
-    fn off_by_default_registers_no_tools() {
+    fn on_by_default_registers_tools() {
+        let _lock = TEST_LOCK.lock().unwrap();
         std::env::remove_var("PIR_WT");
         let wt = Wt::new();
-        assert!(!wt.enabled, "wt must be off by default");
+        assert!(wt.enabled, "wt must be on by default");
         assert!(!wt.in_worktree());
+        assert!(!wt.specs().is_empty(), "tools should be registered when enabled");
+    }
+
+    #[test]
+    fn pirt_wt_0_turns_it_off() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        std::env::set_var("PIR_WT", "0");
+        let wt = Wt::new();
+        assert!(!wt.enabled, "PIR_WT=0 must disable wt");
         assert!(wt.specs().is_empty(), "no tools when disabled");
+        std::env::remove_var("PIR_WT");
     }
 
     #[test]
@@ -1038,27 +1169,51 @@ mod tests {
         // A bare repo (no PIR_WT_CHECK, no recognized project type) must report
         // Verdict::NoChecks, never Verdict::Passed — so the extension will NOT
         // silently auto-merge it.
+        let _lock = TEST_LOCK.lock().unwrap();
         std::env::remove_var("PIR_WT_CHECK");
+        std::env::set_var("PIR_WT", "0"); // disable so verify() is exercised standalone
         let repo = scratch_repo();
-        let orig = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&repo).unwrap();
+        let _chdir = Chdir::new(&repo);
         let wt = Wt::new();
         assert!(matches!(wt.verify(&repo), Verdict::NoChecks), "bare repo => NoChecks");
-        let _ = fs::remove_dir_all(&repo);
-        let _ = std::env::set_current_dir(&orig);
+        std::env::remove_var("PIR_WT");
+    }
+
+    #[test]
+    fn startup_report_reports_trunk_when_not_in_worktree() {
+        // On the main checkout (no worktree), startup_report must say we're on
+        // the trunk checkout and report the automation on/off state — this is
+        // the "why wasn't my worktree reported?" fix.
+        let _lock = TEST_LOCK.lock().unwrap();
+        std::env::set_var("PIR_WT", "0"); // for the "off" branch
+        let repo = scratch_repo();
+        let _chdir = Chdir::new(&repo);
+
+        // Off: should still report the execution context.
+        let mut wt_off = Wt::new();
+        wt_off.on_session_start(&repo);
+        let off = wt_off.startup_report().unwrap();
+        assert!(off.contains("trunk checkout"), "off report: {off}");
+        assert!(off.contains("worktree automation: off"), "off report: {off}");
+
+        // On (default): should report automation enabled.
+        std::env::remove_var("PIR_WT");
+        let mut wt_on = Wt::new();
+        wt_on.on_session_start(&repo);
+        let on = wt_on.startup_report().unwrap();
+        assert!(on.contains("worktree automation: on"), "on report: {on}");
     }
 
     #[test]
     fn trunk_detection_prefers_checked_out_branch() {
         // Repo whose default branch is "trunk" (not main). trunk() should pick it
         // up from the checked-out branch.
+        let _lock = TEST_LOCK.lock().unwrap();
         let dir = scratch_repo();
-        let orig = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir).unwrap();
+        let _chdir = Chdir::new(&dir);
         Command::new("git").args(["checkout", "-qb", "trunk"]).current_dir(&dir).status().unwrap();
+        let trunk = checked_out_branch(&dir);
         let wt = Wt::new();
-        assert_eq!(wt.trunk(), "trunk", "trunk() should detect the checked-out branch");
-        let _ = fs::remove_dir_all(&dir);
-        let _ = std::env::set_current_dir(&orig);
+        assert_eq!(wt.trunk(), trunk, "trunk() should detect the checked-out branch");
     }
 }

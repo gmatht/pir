@@ -2,25 +2,121 @@ mod agent;
 mod config;
 mod goal;
 mod notify;
+mod picker;
 mod plugin;
 mod project;
 mod provider;
+mod session;
 mod term;
 mod types;
 mod user;
+#[cfg(feature = "tui")]
+mod tui;
+#[cfg(feature = "gui")]
+mod gui;
 
 // Statically linked extensions, emitted by build.rs (type "a").
 include!(concat!(env!("OUT_DIR"), "/gen_registry.rs"));
 
 use crate::agent::Agent;
 use crate::config::Provider;
+use crate::config::Model;
 use crate::notify::SharedBus;
 use std::io::BufRead;
+use std::io::IsTerminal;
 use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+// ---------------------------------------------------------------------------
+// Death-provenance + child reaping (items 4, 7).
+//
+// Two historical "all pir processes died at once" incidents were caused by an
+// agent running a scoped `pkill`/`kill` (handled now by the bash-tool guard),
+// but there was *no log of what sent the kill*. We install a signal handler
+// that, on SIGTERUP/SIGINT, appends a tiny provenance note (signal
+// number + parent pid + build stamp) to this session's `.status.json` sidecar
+// so the cause is reconstructable from the logs later. We also set
+// PR_SET_PDEATHSIG so a dead parent (e.g. a closed tmux pane) delivers SIGHUP
+// to us, and we reap any spawned command process groups on exit (item 4: a
+// `pir` that dies no longer leaves its `bash` children orphaned to init).
+// ---------------------------------------------------------------------------
+
+/// Path to the active session's `.status.json`, set once `agent` is built.
+/// The signal handler reads it (under the lock) to know where to log.
+static ACTIVE_STATUS: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// Pid of the most recently spawned command's process group, so we can reap it
+/// on exit. Set by the bash tool via [`set_active_child_pgid`]; read on exit.
+static ACTIVE_CHILD_PGID: Mutex<Option<i32>> = Mutex::new(None);
+
+#[cfg(unix)]
+pub fn set_active_child_pgid(pgid: i32) {
+    *ACTIVE_CHILD_PGID.lock().unwrap() = Some(pgid);
+}
+
+/// Install the death-provenance signal handler and PR_SET_PDEATHSIG. Best-
+/// effort: any failure is silently ignored (we must never refuse to start).
+fn install_death_tracking() {
+    #[cfg(unix)]
+    {
+        // If our parent (the tmux pane / shell) dies, ask the kernel to send us
+        // SIGHUP so we tear down cleanly instead of lingering.
+        unsafe {
+            let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGHUP);
+        }
+
+        extern "C" fn handler(signo: libc::c_int) {
+            // Build a one-line provenance note and append it to the status file.
+            let ppid = unsafe { libc::getppid() };
+            let self_pid = std::process::id();
+            let note = format!(
+                "[death] received signal {signo} (SIGHUP={}) at {} from ppid={}; pir pid={}\n",
+                libc::SIGHUP,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                ppid,
+                self_pid,
+            );
+            // Reap any spawned command group so our children don't outlive us.
+            if let Some(pgid) = *ACTIVE_CHILD_PGID.lock().unwrap() {
+                unsafe { let _ = libc::kill(-pgid, libc::SIGKILL); }
+            }
+            // Append to the active status sidecar if there is one. We never
+            // create or truncate it — only append — so a real status write
+            // (which happens via session::write_status) is preserved.
+            if let Some(path) = ACTIVE_STATUS.lock().unwrap().clone() {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                    let _ = f.write_all(note.as_bytes());
+                }
+            }
+            // Default disposition: re-raise so the process actually terminates.
+            unsafe {
+                libc::signal(signo, libc::SIG_DFL);
+                libc::raise(signo);
+            }
+        }
+
+        for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+            unsafe {
+                if libc::signal(sig, handler as libc::sighandler_t) == libc::SIG_ERR {
+                    // ignore — handler install failed for this signal
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ACTIVE_STATUS; // keep the static referenced on non-unix
+    }
+}
 
 const HELP: &str = r#"pir — a featherweight pi-compatible coding agent
 
@@ -38,11 +134,17 @@ OPTIONS
   -r, --resume [token]       resume a session; token selects by index/time/preview
   -c, --continue [token]     resume a session and continue its goal (pir -c)
   -u, --as <user>            run project commands as this user (default ai_<project>)
-  -h, --help  -V, --version
+  --tui                use the full-screen TUI REPL (requires the `tui` feature)
+  --gui                use the graphical GTK REPL (requires the `gui` feature)
+  --no-tui             use the plain streaming REPL (this is the default build)
+  --no-raw             use line-buffered stdin (no raw mode) — for constrained
+                       terminals / screen where raw input misbehaves
+  --budget <tokens>    optional cumulative in+out token cap; turn stops (with a
+                       banner) once exceeded. Off by default. Env: PIR_TOKEN_BUDGET
 
 CONFIG (reused from pi, never modified)
   ~/.pi/models.json          providers, models, api keys ("{env:VAR}" supported)
-  ~/.pi/agent/settings.json  optional default model ("model" key)
+  ~/.pi/agent/settings.json  optional default model ("defaultModel" / "defaultProvider")
   ~/.pi/AGENTS.md, ./AGENTS.md   appended to the system prompt
   ~/.pi/agent/sessions/      pir session transcripts + goal files (pir-*.jsonl/.goal.json)
   ~/.pi/agent/projects.json  project -> execution-user mappings (set by `pir project init`)
@@ -58,18 +160,31 @@ AGENT USERS RUN UNATTENDED
   PIR_CONFIRM=1 to force prompts even as an ai_* user.
 
 COMMANDS
-  /help  /model <sel>  /models  /sessions  /goal [objective]  /continue
+  /help  /model <sel>  /models  /default-model <sel>  /sessions  /goal [objective]  /continue
+  /thinking [<level>] [show|hide]   set the model's thinking level
+                          (off|minimal|low|medium|high|xhigh|max) and/or toggle
+                          whether streamed reasoning is displayed; no arg = status
+  /model* <sel>  /model-all <sel>   broadcast a model switch to ALL your open pir terminals (also sets the new default)
   /bg <text>  /jobs  /fg <id>  /clear  /usage  /exit
+  /undo [all]             revert the last file edit (or all) to its pre-edit state
+  /sh [cmd args]         drop to a shell, or run a command via $SHELL (sh -c)
   /project init            create the ai_<project> user and chown the cwd (root)
+  /su-security <on|off|status>   enable/disable/inspect the su-based permission
+                          model (sudoers.d/skynet-ai + wrappers); reversible (root)
   /fix                     make the .git setup sane for LLM use (install commit
                           guard hook + .gitattributes; jj-aware). Run it if you see
                           the "no commit guard hook" startup warning on an existing repo
+  /rebuild                cargo build + exec the fresh binary (unix)
   /create [name]           scaffold a new project (seeds from clipboard .md spec)
+  /login [provider]        store an API key for a provider in ~/.pi/agent/auth.json
+  /logout [provider]       remove a stored provider credential from auth.json
 
   Lines ending in & run in the background: "fix the parser &"  => /bg fix the parser
 
   While a turn is running you can keep typing: Enter queues the line as the next
-  prompt, /commands still work, and ctrl-c stops the turn after its current step.
+  prompt, /commands still work, and a line ending in & is fired off as a new
+  background job while the current turn keeps streaming; ESC or ctrl-c cancels
+  the running turn instantly (kills any in-flight command right away).
 "#;
 
 struct BgSession {
@@ -128,6 +243,47 @@ impl BackgroundJobs {
             handle: Some(handle),
         });
         println!("{} backgrounded as job #{} (logs to {})", term::cyan("·"), id, log.display());
+    }
+
+    /// Adopt an *already-running* foreground turn as a background job: take over
+    /// its worker handle + its session log so it shows up in `/jobs` and keeps
+    /// running to completion (notifications still fire on the shared bus). The
+    /// turn's agent must already have been told to go quiet (see
+    /// `Agent::request_quiet`) so it stops writing to the terminal. Used by the
+    /// `&`-to-background-the-current-turn path. The returned id is what `/fg`
+    /// will later reattach to.
+    fn attach_fg(&mut self, handle: JoinHandle<()>, log: PathBuf, prompt: String) -> usize {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.jobs.push(BgSession {
+            id,
+            prompt,
+            log,
+            started: std::time::SystemTime::now(),
+            joined: false,
+            handle: Some(handle),
+        });
+        id
+    }
+
+    /// Spawn a background job from a prompt, using the current provider/model/
+    /// full-auto captured in `ctx` (so it works even while the foreground turn
+    /// owns the agent). A fresh session log is used so the background work
+    /// doesn't disturb the interactive history; run with `set_quiet(true)` so
+    /// the streaming output goes nowhere on the terminal (notifications fire on
+    /// completion instead). This is what both the `&`-suffix path and `/bg`
+    /// reach, whether typed at the idle prompt or *mid-turn*.
+    fn spawn_prompt(&mut self, prompt: String, ctx: &Arc<Mutex<(Provider, Model, bool)>>, bus: SharedBus) {
+        let (provider, model, full_auto) = {
+            let g = ctx.lock().unwrap();
+            (g.0.clone(), g.1.clone(), g.2)
+        };
+        let log = session_log_path();
+        let bcancel = Arc::new(AtomicBool::new(false));
+        self.spawn(prompt, log, move || {
+            Agent::new(provider, model, full_auto, true, bus, None, bcancel, Arc::new(Mutex::new(String::new())))
+                .expect("bg agent")
+        });
     }
 
     /// Join any finished worker threads so their handles don't leak; returns
@@ -201,6 +357,27 @@ fn main() {
     let mut as_user: Option<String> = None;
     let mut project_name: Option<String> = None;
     let mut bg_prompt: Option<String> = None;
+    // The full-screen ratatui REPL is used only when the `tui` feature is
+    // compiled in AND `--tui` is passed; otherwise the streaming REPL runs.
+    #[cfg(feature = "tui")]
+    let mut use_tui = false;
+    #[cfg(not(feature = "tui"))]
+    let mut use_tui = false;
+    // The graphical GTK REPL is used only when the `gui` feature is compiled in
+    // AND `--gui` is passed.
+    #[cfg(feature = "gui")]
+    let mut use_gui = false;
+    #[cfg(not(feature = "gui"))]
+    let mut use_gui = false;
+    let mut no_raw = false;
+    let mut budget: Option<u64> = None;
+
+    // Capture the invoking user's default-model selector BEFORE the privilege
+    // drop (while HOME still points at the real user's ~/.pi). After the drop,
+    // settings.json would come from the sandbox user, whose catalog is a
+    // different (smaller) store — using it to resolve against the invoking
+    // user's catalog produced "no model matches" fallbacks.
+    let pre_drop_selector = std::env::var("PI_MODEL").ok().or_else(config::default_model_setting);
 
     let mut i = 0;
     while i < args.len() {
@@ -256,19 +433,47 @@ fn main() {
                     None => die("-bg needs a prompt"),
                 }
             }
+            "--no-raw" => no_raw = true,
+            "--budget" => {
+                i += 1;
+                match args.get(i).and_then(|v| v.parse::<u64>().ok()) {
+                    Some(n) => budget = Some(n),
+                    None => die("--budget needs a positive integer (tokens)"),
+                }
+            }
             "-h" | "--help" => {
                 print!("{HELP}");
+                return;
+            }
+            "--abi" => {
+                print_abi();
                 return;
             }
             "-V" | "--version" => {
                 println!("pir {}", env!("CARGO_PKG_VERSION"));
                 return;
             }
+            "--no-tui" => use_tui = false,
+            "--tui" => use_tui = true,
+            "--gui" => use_gui = true,
             x if x.starts_with('-') => die(&format!("unknown flag {x} — try --help")),
             x => prompt.push(x.to_string()),
         }
         i += 1;
     }
+
+    // Load providers as the INVOKING user (root), BEFORE the privilege drop —
+    // the 313KB model catalog lives in the real user's ~/.pi and sandbox users
+    // can't read it. Settings.json (the *selector*) is resolved after the drop
+    // from the sandbox identity. To keep the selector resolvable against the
+    // catalog, `config::select` is never handed a selector that only exists in
+    // the sandbox's own settings: we resolve with the invoking-user catalog and
+    // only fall back to the sandbox default when the user gave no selector at
+    // all (see below — sandbox settings are consulted but matched leniently).
+    // Install death-provenance signal tracking + PR_SET_PDEATHSIG early, so we
+    // can record *what* terminates us (item: SIGTERM/SIGHUP provenance in the
+    // status sidecar) and reap spawned children if the parent pane dies.
+    install_death_tracking();
 
     let providers = match config::load_providers() {
         Ok(p) if !p.is_empty() => p,
@@ -277,10 +482,41 @@ fn main() {
     };
     term::set_model_providers(&providers);
 
+    // Drop privileges to the per-project user *after* config/providers are
+    // loaded but *before* the agent (and any tool) runs. On non-unix this is a
+    // no-op. All `bash`/file tools then execute as that user automatically.
+    //
+    // IMPORTANT: `become_user` rewrites `HOME` to the target (sandbox) user's
+    // real home, so `config::pi_dir()` now points at `~<user>/.pi`. We therefore
+    // resolve the *default* model **after** this drop (see below): the startup
+    // read and the `/default-model` write must consult the same settings file,
+    // otherwise the choice is silently lost on restart — the early read used to
+    // happen under the invoking user's HOME while the write happened under the
+    // (dropped-to) sandbox user's HOME.
+    #[cfg(unix)]
+    let resolved_user: Option<String> = {
+        let target = as_user.clone().unwrap_or_else(|| {
+            crate::config::resolve_project_user(None, project_name.as_deref())
+        });
+        if let Err(e) = crate::user::become_user(&target) {
+            die(&e);
+        }
+        Some(target)
+    };
+    #[cfg(not(unix))]
+    let resolved_user: Option<String> = None;
+
+    // Resolve the model. Priority: explicit -m/PI_MODEL on the INVOKING
+    // user's command line, then the invoking user's settings.json (captured in
+    // `pre_drop_selector` before HOME changed), then the first catalog model.
+    // The sandbox user's own settings.json is NOT used to pick a model that
+    // must resolve against the invoking user's catalog: its catalog (e.g.
+    // ai_pir's tiny local/fake store) is a subset, and a sandbox-only selector
+    // could never match here. `default_model_setting()` is re-read after the
+    // drop only for the /default-model WRITE path below.
     let explicit = model_sel.is_some();
     let selector = model_sel
-        .or_else(|| std::env::var("PI_MODEL").ok())
-        .or_else(|| config::default_model_setting())
+        .or(pre_drop_selector)
         .unwrap_or_else(|| providers[0].label(&providers[0].models[0]));
 
     let (provider, model) = match config::select(&providers, &selector) {
@@ -295,22 +531,6 @@ fn main() {
             }
         }
     };
-
-    // Drop privileges to the per-project user *after* config/providers are
-    // loaded but *before* the agent (and any tool) runs. On non-unix this is a
-    // no-op. All `bash`/file tools then execute as that user automatically.
-    #[cfg(unix)]
-    let resolved_user: Option<String> = {
-        let target = as_user.clone().unwrap_or_else(|| {
-            crate::config::resolve_project_user(None, project_name.as_deref())
-        });
-        if let Err(e) = crate::user::become_user(&target) {
-            die(&e);
-        }
-        Some(target)
-    };
-    #[cfg(not(unix))]
-    let resolved_user: Option<String> = None;
 
     // Agent users (ai_*) run unattended: the sandbox boundary is the user
     // account itself, so we default to full-auto and suppress per-command
@@ -353,6 +573,12 @@ fn main() {
     // (ctrl-c) to ask a running turn to stop at the next safe boundary.
     let fg_cancel = Arc::new(AtomicBool::new(false));
 
+    // Shared "go silent" switch for the *current* foreground turn: the REPL
+    // flips it (via `Agent::request_quiet`) to *detach* a running turn into the
+    // background. Once set, the worker stops streaming to stdout and the
+    // terminal returns to the idle prompt while the turn keeps running.
+    let fg_quiet: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
     // Live "what the user is typing" buffer shown by the thinking spinner while
     // a turn runs (see `run_foreground_turn` / `term::Spinner`). The REPL thread
     // only writes to it; the spinner thread is the sole stdout writer during a
@@ -373,10 +599,47 @@ fn main() {
         Err(e) => die(&e),
     };
 
-    // Resume prior history if `-r`/`-c` was given.
-    if let Some(session) = &resume {
-        agent.load_session(session);
+    // Point the line editor's history file at the session's `.history` so the
+    // per-session prompt history (and the prompts we seed below when resuming)
+    // is persisted and recalled with arrow-up. Must run before the resume block
+    // so `push_history` during `-r`/`/fg` actually lands in this file.
+    if let Some(p) = &agent.log_path {
+        let hist = p.with_extension("history");
+        term::set_history_file(&hist);
     }
+
+ // Resume prior history if `-r`/`-c` was given.
+    if let Some(session) = &resume {
+        let resumed = agent.load_session(session);
+        if resumed.turns > 0 {
+            println!("{}", resumed.banner(session));
+            // Seed arrow-up history with the session's prior prompts so the user
+            // can scroll back through them at the idle prompt.
+            for p in &resumed.prompts {
+                term::push_history(p);
+            }
+        } else if !resumed.summary.is_empty() {
+            println!("{}", term::dim(&resumed.summary));
+        }
+        // Restore the model + su-security + thinking choice that were active
+        // when this session last ran, so a resumed session doesn't silently
+        // drop back to the global defaults.
+        if agent.apply_persisted_model() {
+            // (model restored silently; the startup banner below shows it)
+        }
+        agent.apply_persisted_su_security();
+        agent.apply_persisted_thinking();
+    }
+
+    // Resolve the token budget (off by default). `--budget N` wins; else the
+    // PIR_TOKEN_BUDGET env var; else None (unbounded).
+    let budget = budget.or_else(|| {
+        std::env::var("PIR_TOKEN_BUDGET")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    agent.set_token_budget(budget);
+    term::raw::set_enabled(!no_raw);
 
     // Continuation mode: attach the goal that lives next to the resumed
     // session and drive it to the next step. The goal file is itself
@@ -414,17 +677,79 @@ fn main() {
         agent.notify_on_exit(agent.idle_event());
         return;
     }
-    if let Some(p) = &agent.log_path {
-        let hist = p.with_extension("history");
-        term::set_history_file(&hist);
-    }
-
     if !prompt.is_empty() {
         match agent.turn(&prompt.join(" ")) {
             Ok(()) => agent.notify_on_exit(agent.turn_done_event()),
             Err(e) => agent.notify_on_exit(agent.error_event(e)),
         }
         return;
+    }
+
+    // Full-screen TUI REPL (only when the `tui` feature AND
+    // `--tui` is passed; otherwise the streaming REPL above runs). It owns the terminal (alternate
+    // screen + raw mode via crossterm) and renders a conversation pane + footer
+    // pane (thinking + live draft prompt) with its own scrollback — no
+    // hand-rolled ANSI block, so the stray-spinner class of bug can't recur.
+    // The agent is switched to `quiet` mode first so its token streaming never
+    // reaches the screen (ratatui owns every cursor); the TUI renders the
+    // conversation by tailing the agent's session log instead.
+    #[cfg(feature = "tui")]
+    if use_tui {
+        agent.set_quiet(true);
+        let agent_slot: Arc<Mutex<Option<Agent>>> = Arc::new(Mutex::new(Some(agent)));
+        let (done_tx, _done_rx) = smol::channel::bounded(1);
+        match crate::tui::run(
+            &agent_slot,
+            &fg_cancel,
+            &fg_quiet,
+            &typeahead,
+            &providers,
+            &bus,
+            &done_tx,
+            full_auto,
+            running_as_agent,
+        ) {
+            Ok(()) => return,
+            Err(e) => {
+                // Fall back to the streaming REPL if the TUI can't start
+                // (e.g. not a tty). Take the agent back out of the slot and
+                // restore its stdout streaming so the fallback works.
+                eprintln!("pir: --tui failed: {e}; falling back to plain REPL");
+                agent = agent_slot.lock().unwrap().take().expect("agent present");
+                agent.set_quiet(false);
+            }
+        }
+    }
+
+    // Graphical GTK REPL (only when the `gui` feature AND `--gui` is passed).
+    // The agent is switched to `quiet` mode (it streams only to its session log)
+    // and the GUI renders the conversation by draining that log — same
+    // separation the TUI uses. Falls back to the streaming REPL if the GTK
+    // backend can't initialise.
+    #[cfg(feature = "gui")]
+    if use_gui {
+        agent.set_quiet(true);
+        let agent_slot: Arc<Mutex<Option<Agent>>> = Arc::new(Mutex::new(Some(agent)));
+        match crate::gui::run(
+            &agent_slot,
+            &fg_cancel,
+            &fg_quiet,
+            &providers,
+            &bus,
+            full_auto,
+        ) {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("pir: --gui failed: {e}; falling back to plain REPL");
+                agent = agent_slot.lock().unwrap().take().expect("agent present");
+                agent.set_quiet(false);
+            }
+        }
+    }
+    #[cfg(not(feature = "gui"))]
+    if use_gui {
+        eprintln!("pir: --gui requires the `gui` feature (build with --features gui)");
+        // fall through to the streaming REPL below
     }
 
     println!("{}", term::bold("pir"));
@@ -445,6 +770,11 @@ fn main() {
             config::pi_dir().display()
         ))
     );
+    // Surface extension startup banners (e.g. the worktree extension reporting
+    // which worktree we launched in) before the first prompt.
+    for line in agent.startup_reports() {
+        println!("{}", term::dim(&line));
+    }
     // Show the execution user when it isn't the invoking root (per-project
     // `ai_X` sandbox), so it's clear commands run as that identity.
     #[cfg(unix)]
@@ -454,7 +784,7 @@ fn main() {
     if let Some(p) = &agent.log_path {
         println!("{}", term::dim(&format!("session log: {}", p.display())));
     }
-    println!("{}", term::dim("/help for commands · ctrl-d to quit · type while a turn runs; ctrl-c cancels it"));
+    println!("{}", term::dim("/help for commands · ctrl-d to quit · type while a turn runs; ESC/ctrl-c cancels it instantly"));
 
     // Warn on existing git projects that lack the LLM-safety guard hook, and
     // point at /fix. Skipped under jj (git hooks don't apply there).
@@ -475,6 +805,32 @@ fn main() {
     // REPL responsive: the model streams on a worker thread while the main
     // thread reads input, drains notifications, and reacts to ctrl-c.
     let agent_slot: Arc<Mutex<Option<Agent>>> = Arc::new(Mutex::new(Some(agent)));
+
+    // Current provider/model/full-auto, mirrored out of the agent so a running
+    // foreground turn (which *takes* the agent out of `agent_slot`) can still
+    // spawn background jobs — `/bg` or a line ending in `&` typed mid-turn must
+    // not panic on a missing agent. Updated on startup, on each `/model`
+    // switch, and just before each foreground turn starts.
+    let current_ctx: Arc<Mutex<(Provider, Model, bool)>> = {
+        let g = agent_slot.lock().unwrap();
+        let a = g.as_ref().expect("agent present before REPL");
+        Arc::new(Mutex::new((a.provider(), a.model(), full_auto)))
+    };
+
+    // Cross-instance model broadcast: `/model*` writes a small file
+    // (~/.pi/agent/model-broadcast.json) that every running pir of this user
+    // polls. We remember the latest generation we've *already* applied so the
+    // watcher doesn't re-apply an old broadcast on startup, and a separate
+    // thread queues newly-seen labels into `pending_model`; the REPL applies
+    // them when idle (or right after a turn ends / errors). `self_pid` is used
+    // so each instance ignores its own broadcast echo.
+    let broadcast_seen = config::read_model_broadcast().map(|b| b.generation).unwrap_or(0);
+    let pending_model: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let _watcher = spawn_model_broadcast_watcher(
+        broadcast_seen,
+        std::process::id(),
+        pending_model.clone(),
+    );
 
     // Running foreground turn state.
     let mut fg_handle: Option<JoinHandle<()>> = None;
@@ -523,11 +879,29 @@ fn main() {
                         fmt_tok(a.usage.output)
                     )));
                 }
+                // Apply any cross-instance model switch queued while this turn
+                // was running (a `/model*` from another terminal). We apply it
+                // the moment the agent is back in the slot (turn done or errored
+                // — both land here), so the next step uses the new model.
+                if let Some(label) = pending_model.lock().unwrap().take() {
+                    match apply_broadcast_model(&agent_slot, &current_ctx, &providers, &label) {
+                        Ok(new_label) => term::out(&term::dim(&format!(
+                            "· model switched to {new_label} (via /model* from another terminal)\n"
+                        ))),
+                        Err(e) => term::out(&term::dim(&format!(
+                            "· ignored model broadcast '{label}': {e}\n"
+                        ))),
+                    }
+                }
                 if let Some(next) = pending.drain(..).next() {
                     if let Ok(mut g) = typeahead.lock() { g.clear(); }
+                    // A prompt the user typed *mid-turn* (raw mode) won't be in
+                    // rustyline's history; record it so arrow-up recalls it later.
+                    term::push_history(&next);
                     fg_handle = Some(run_foreground_turn(
                         &agent_slot,
                         &fg_cancel,
+                        &fg_quiet,
                         next,
                         done_tx.clone(),
                     ));
@@ -546,9 +920,11 @@ fn main() {
                     };
                     if let Some(next) = follow.into_iter().next() {
                         if let Ok(mut g) = typeahead.lock() { g.clear(); }
+                        term::push_history(&next);
                         fg_handle = Some(run_foreground_turn(
                             &agent_slot,
                             &fg_cancel,
+                            &fg_quiet,
                             next,
                             done_tx.clone(),
                         ));
@@ -585,21 +961,90 @@ fn main() {
                             full_auto,
                             &bus,
                             &fg_cancel,
+                            true,
+                            &current_ctx,
                         );
+                    } else if s == "&" {
+                        // A bare `&` typed *while a turn runs* detaches the
+                        // running foreground turn into the background: flip the
+                        // shared "go quiet" switch (the worker stops streaming
+                        // to stdout) and adopt its worker handle as a background
+                        // job, so the REPL returns to the idle prompt while the
+                        // turn keeps running. The only sign of life is
+                        // "#tasks running: N · Idle".
+                        input_buf.clear();
+                        let log = {
+                            let g = agent_slot.lock().unwrap();
+                            g.as_ref().and_then(|a| a.log_path().cloned()).unwrap_or_default()
+                        };
+                        let prompt = {
+                            let g = agent_slot.lock().unwrap();
+                            g.as_ref().map(|a| a.last_prompt.clone()).unwrap_or_default()
+                        };
+                        let h = fg_handle.take().expect("fg running");
+                        let id = jobs.attach_fg(h, log, prompt);
+                        // `h` is now owned by `jobs` (kept alive, never joined/dropped here).
+                        fg_quiet.store(true, Ordering::SeqCst);
+                        term::raw::disable_raw();
+                        term::out(&term::dim(&format!(
+                            "· detached running turn as job #{} — it keeps working in the background",
+                            id
+                        )));
+                    } else if s.ends_with('&') && !s.trim_end_matches('&').trim().is_empty() {
+                        // A prompt line ending in `&` typed *while a turn runs*
+                        // starts a brand-new background job (the foreground keeps
+                        // streaming). The context is read from `current_ctx`, so
+                        // this never panics on the agent being owned by the turn.
+                        input_buf.clear();
+                        let prompt = s.trim_end_matches('&').trim().to_string();
+                        jobs.spawn_prompt(prompt, &current_ctx, bus.clone());
+                        term::out(&term::dim("· backgrounded; current turn continues"));
                     } else {
                         pending.push(s.to_string());
                         input_buf.clear();
                         term::out(&term::dim("· queued; will run when current turn ends"));
                     }
                 }
-                term::raw::RawInput::Interrupt => {
+                term::raw::RawInput::Interrupt | term::raw::RawInput::Cancel => {
                     if let Ok(mut g) = typeahead.lock() { g.clear(); }
                     fg_cancel.store(true, Ordering::SeqCst);
-                    term::out(&term::dim("· cancelling turn (after current step)…"));
+                    // ESC/ctrl-c = stop EVERYTHING, now. The cooperative cancel
+                    // only ends the turn after the current step; hard-abort
+                    // kills the in-flight foreground command — and the sweep
+                    // below also kills every *detached* background job (they
+                    // were otherwise untouchable from the REPL: the agent that
+                    // owns them sits on the turn's worker thread). Two paths:
+                    //  - agent in slot (idle): kill synchronously;
+                    //  - turn running: flip the shared job-kill flag, which the
+                    //    agent's own bash wait loop consumes within 250ms and
+                    //    sweeps on our behalf.
+                    let mut killed = {
+                        let mut g = agent_slot.lock().unwrap();
+                        match g.as_mut() {
+                            Some(a) => a.registry_kill_all_jobs(),
+                            None => 0,
+                        }
+                    };
+                    if let Some(f) = crate::agent::job_kill_flag() {
+                        f.store(true, Ordering::SeqCst);
+                    }
+                    let _ = killed;
+                    term::out(&term::dim("· cancelling turn (ESC/ctrl-c)…"));
                 }
                 term::raw::RawInput::Eof => {
                     if let Ok(mut g) = typeahead.lock() { g.clear(); }
                     fg_cancel.store(true, Ordering::SeqCst);
+                    // Quitting (ctrl-d) also sweeps detached jobs so pir's
+                    // children don't linger holding output pipes after we exit.
+                    {
+                        let mut g = agent_slot.lock().unwrap();
+                        if let Some(a) = g.as_mut() {
+                            let _ = a.registry_kill_all_jobs();
+                        }
+                    }
+                    if let Some(f) = crate::agent::job_kill_flag() {
+                        f.store(true, Ordering::SeqCst);
+                    }
                     // Let the running turn finish its current step, then exit.
                     let _ = fg_handle.take().unwrap().join();
                     term::raw::disable_raw();
@@ -624,7 +1069,34 @@ fn main() {
             continue;
         }
 
-        // Idle: full rustyline editing.
+        // Idle: full rustyline editing. Show a compact tasks indicator so a
+        // backgrounded (detached) turn is visible at a glance — the only sign of
+        // it is "#tasks running: N · Idle", with N > 0 while it works.
+        let tasks_running = jobs.jobs.iter().filter(|j| j.handle.is_some()).count();
+        if tasks_running > 0 {
+            term::out(&term::dim(&format!("#tasks running: {} · Idle\n", tasks_running)));
+        }
+        // Status line under the prompt: current workspace + model in use.
+        let workspace = workspace_label();
+        let model = {
+            let g = agent_slot.lock().unwrap();
+            g.as_ref().map(|a| a.label()).unwrap_or_default()
+        };
+        term::out(&format!("{}\n", term::status_line(&workspace, &model)));
+        // Apply any cross-instance model switch queued by the broadcast watcher
+        // (from a `/model*` in another terminal). We only do this while idle, so
+        // a mid-turn instance defers until it returns here — including after an
+        // error, which lands back at this prompt too.
+        if let Some(label) = pending_model.lock().unwrap().take() {
+            match apply_broadcast_model(&agent_slot, &current_ctx, &providers, &label) {
+                Ok(new_label) => term::out(&term::dim(&format!(
+                    "· model switched to {new_label} (via /model* from another terminal)\n"
+                ))),
+                Err(e) => term::out(&term::dim(&format!(
+                    "· ignored model broadcast '{label}': {e}\n"
+                ))),
+            }
+        }
         match term::read_line(&format!("{} ", term::cyan("❯"))) {
             None => {
                 println!();
@@ -636,31 +1108,28 @@ fn main() {
         if input.is_empty() {
             continue;
         }
-        // `&` suffix => run the rest in the background.
-        let bg = input.ends_with('&') && !input.trim_end_matches('&').is_empty();
+        // A prompt ending in `&` at the idle prompt runs in its OWN session (a
+        // fresh background job that keeps its own session log); the interactive
+        // session is untouched. A bare `&` at idle does nothing (there is no
+        // running turn to detach).
+        let bg = input.ends_with('&') && !input.trim_end_matches('&').trim().is_empty();
         let input = input.trim_end_matches('&').trim();
+        if input.is_empty() {
+            continue;
+        }
         if let Some(cmd) = input.strip_prefix('/') {
-            handle_command(cmd, &agent_slot, &providers, &mut jobs, full_auto, &bus, &fg_cancel);
+            handle_command(cmd, &agent_slot, &providers, &mut jobs, full_auto, &bus, &fg_cancel, false, &current_ctx);
         } else if bg {
-            // Run this prompt as a fresh background job that keeps its own
-            // session log (the foreground session is unaffected).
-            let (provider, model) = {
-                let g = agent_slot.lock().unwrap();
-                let a = g.as_ref().expect("agent present while idle");
-                (a.provider(), a.model())
-            };
-            let log = session_log_path();
-            let bcancel = Arc::new(AtomicBool::new(false));
-            let bus = bus.clone();
-            jobs.spawn(input.to_string(), log, move || {
-                Agent::new(provider, model, full_auto, true, bus, None, bcancel, Arc::new(Mutex::new(String::new())))
-                    .expect("bg agent")
-            });
+            jobs.spawn_prompt(input.to_string(), &current_ctx, bus.clone());
         } else {
             if let Ok(mut g) = typeahead.lock() { g.clear(); }
+            // A fresh foreground turn starts un-silenced; reset the detach
+            // switch so a previously detached turn's quiet state can't leak.
+            fg_quiet.store(false, Ordering::SeqCst);
             fg_handle = Some(run_foreground_turn(
                 &agent_slot,
                 &fg_cancel,
+                &fg_quiet,
                 input.to_string(),
                 done_tx.clone(),
             ));
@@ -676,18 +1145,27 @@ fn main() {
 /// the REPL awaits, so it can wake the moment the turn ends instead of polling.
 /// `typeahead` is not needed here: the agent already holds the shared buffer
 /// (the same Arc the REPL thread writes to), and the thinking spinner reads it
-/// directly from the agent (see [`crate::term::Spinner`]).
-fn run_foreground_turn(
+/// directly from the agent (see [`crate::term::Spinner`]). `quiet_handle` is the
+/// REPL's shared "go silent" switch: the REPL flips it (via `Agent::request_quiet`)
+/// to *detach* a running turn into the background — once set, the worker stops
+/// streaming to stdout and the terminal returns to the idle prompt while the
+/// turn keeps running.
+pub(crate) fn run_foreground_turn(
     agent_slot: &Arc<Mutex<Option<Agent>>>,
     cancel: &Arc<AtomicBool>,
+    quiet_handle: &Arc<AtomicBool>,
     prompt: String,
     done: smol::channel::Sender<()>,
 ) -> JoinHandle<()> {
     let slot = agent_slot.clone();
     let cancel = cancel.clone();
+    let quiet_handle = quiet_handle.clone();
     thread::spawn(move || {
         cancel.store(false, Ordering::SeqCst);
         let mut a = slot.lock().unwrap().take().expect("agent present");
+        // Hand the worker the shared quiet switch so the REPL can detach this
+        // turn to the background mid-flight without owning the agent.
+        a.set_quiet_handle(quiet_handle);
         let ev = match a.turn(&prompt) {
             Ok(()) => a.idle_event(),
             Err(e) => a.error_event(e),
@@ -699,6 +1177,76 @@ fn run_foreground_turn(
     })
 }
 
+/// How often the cross-instance model-broadcast watcher polls
+/// `~/.pi/agent/model-broadcast.json` (a deliberately cheap, cooperative
+/// poll — there is no daemon, so this is as close to "live" as we get across
+/// independent `pir` processes without fs events).
+const BROADCAST_POLL: Duration = Duration::from_secs(2);
+
+/// Apply a `provider/model` label that arrived via the cross-instance model
+/// broadcast (`/model*`), switching the idle agent and syncing the shared
+/// background-job context. Returns the new label on success (for a status
+/// line), or an error string. Must be called only when the agent is idle
+/// (the slot is free), which the watcher/REPL guarantee before calling.
+fn apply_broadcast_model(
+    agent_slot: &AgentSlot,
+    current_ctx: &Arc<Mutex<(Provider, Model, bool)>>,
+    providers: &[Provider],
+    label: &str,
+) -> Result<String, String> {
+    // Re-resolve against *this* instance's providers, since another terminal
+    // may have a different model store. Drop the label if it resolves nowhere.
+    let (p, m) = config::select(providers, label)?;
+    let mut g = agent_slot.lock().unwrap();
+    let agent = g.as_mut().ok_or_else(|| "agent busy (turn running)".to_string())?;
+    agent.switch(p.clone(), m.clone())?;
+    if let Ok(mut ctx) = current_ctx.lock() {
+        ctx.0 = p.clone();
+        ctx.1 = m.clone();
+    }
+    Ok(format!("{}/{}", p.pid(), m.id))
+}
+
+/// Spawn the cross-instance model-broadcast watcher. It polls
+/// `~/.pi/agent/model-broadcast.json` every [`BROADCAST_POLL`]; when a newer
+/// generation (than `last_seen`) appears that *this* process didn't originate,
+/// it records the label in `pending_model` so the REPL applies it as soon as it
+/// is idle (or right after a running turn ends / errors). `self_pid` is used to
+/// ignore our own broadcast. Best-effort: any read/parse error is silently
+/// skipped.
+fn spawn_model_broadcast_watcher(
+    last_seen: u64,
+    self_pid: u32,
+    pending_model: Arc<Mutex<Option<String>>>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut seen = last_seen;
+        loop {
+            thread::sleep(BROADCAST_POLL);
+            let Some(b) = config::read_model_broadcast() else { continue };
+            if b.generation <= seen || b.generation == 0 {
+                continue;
+            }
+            // Ignore broadcasts we ourselves published.
+            if b.by_pid == self_pid as u64 {
+                seen = b.generation;
+                continue;
+            }
+            if b.label.is_empty() {
+                seen = b.generation;
+                continue;
+            }
+            seen = b.generation;
+            // Queue it; the REPL applies it when safe (idle / after turn ends).
+            if let Ok(mut pending) = pending_model.lock() {
+                *pending = Some(b.label);
+            }
+        }
+    })
+}
+
+type AgentSlot = Arc<Mutex<Option<Agent>>>;
+
 /// A fresh session log path for a background job (tagged so it never collides
 /// with the foreground session or another job).
 fn session_log_path() -> PathBuf {
@@ -707,14 +1255,13 @@ fn session_log_path() -> PathBuf {
     dir.join(format!("pir-{}-sh{}-bg{}.jsonl", term::timestamp_compact(), term::parent_shell_pid(), std::process::id()))
 }
 
-type AgentSlot = Arc<Mutex<Option<Agent>>>;
-
 /// Handle a slash command. `agent_slot` holds the interactive agent behind an
 /// `Option` so a running foreground turn can own it on its worker thread;
 /// commands that need the agent take it only briefly. `jobs` surfaces
-/// background work and shows whether the foreground turn is running; `/cancel`
-/// asks the running turn to stop (the REPL owns the cancel flag, set on ctrl-c,
-/// so `/cancel` is advisory — prefer ctrl-c).
+/// background work and shows whether the foreground turn is running. `fg_running`
+/// is the truthful state (the REPL owns it via `fg_handle.is_some()`), so
+/// mid-turn `/cancel`/`/jobs` work even though the agent is *taken* out of the
+/// slot by the running worker.
 fn handle_command(
     cmd: &str,
     agent_slot: &AgentSlot,
@@ -723,6 +1270,8 @@ fn handle_command(
     full_auto: bool,
     bus: &SharedBus,
     cancel: &Arc<AtomicBool>,
+    fg_running: bool,
+    current_ctx: &Arc<Mutex<(Provider, Model, bool)>>,
 ) {
     let mut parts = cmd.split_whitespace();
     let cmd = parts.next().unwrap_or("");
@@ -732,11 +1281,14 @@ fn handle_command(
             // Advisory stop: set the same cooperative cancel flag ctrl-c sets
             // (the REPL owns it). The running worker turn observes it at its
             // next safe boundary and stops after the current step completes.
-            if agent_slot.lock().unwrap().is_some() {
+            // `fg_running` (passed by the REPL) is the source of truth — the
+            // worker *takes* the agent out of `agent_slot` while running, so
+            // inspecting the slot would always report "no turn".
+            if !fg_running {
                 eprintln!("pir: no turn running to cancel (idle)");
             } else {
                 cancel.store(true, Ordering::SeqCst);
-                println!("{} requesting cancel (turn will stop after its current step)", term::dim("·"));
+                println!("{} requesting cancel (turn stops now)", term::dim("·"));
             }
         }
         "h" | "help" => print!("{HELP}"),
@@ -747,40 +1299,241 @@ fn handle_command(
                 return;
             };
             if rest.is_empty() {
-                println!("current model: {}", agent.label());
+                // No argument: show current model and explain how to make a
+                // choice the *default* for future sessions (the first time a
+                // user picks a model, nothing is persisted globally).
+                let label = agent.label();
+                println!("current model: {}", label);
+                println!(
+                    "{}",
+                    term::dim(&format!(
+                        "to use this by default in new sessions, add to {}:\n  {}",
+                        config::pi_dir().join("agent").join("settings.json").display(),
+                        format!("{{ \"defaultModel\": \"{}\" }}", label)
+                    ))
+                );
+                println!(
+                    "{}",
+                    term::dim("(or just run `/model <sel>` again later — it's saved per-session and restored on resume)")
+                );
             } else {
                 match config::select(providers, &rest.join(" ")) {
                     Ok((p, m)) => match agent.switch(p.clone(), m.clone()) {
-                        Ok(()) => println!("→ {}", agent.label()),
+                        Ok(()) => {
+                            // Keep the shared background-job context in sync so
+                            // any `/bg` or `&` fired afterwards uses the new model.
+                            if let Ok(mut ctx) = current_ctx.lock() {
+                                ctx.0 = p.clone();
+                                ctx.1 = m.clone();
+                            }
+                            println!("→ {}", agent.label());
+                            println!("{} (saved for this session; restored on resume)", term::dim("·"));
+                            println!(
+                                "{}",
+                                term::dim(&format!(
+                                    "to use this by default in new sessions, add to {}:\n  {}",
+                                    config::pi_dir().join("agent").join("settings.json").display(),
+                                    format!("{{ \"defaultModel\": \"{}\" }}", agent.label())
+                                ))
+                            );
+                        }
                         Err(e) => eprintln!("{e}"),
                     },
                     Err(e) => eprintln!("{e}"),
                 }
             }
         }
+        "model*" | "model-all" => {
+            // Broadcast a model switch to *every* running pir instance for this
+            // user (each polls ~/.pi/agent/model-broadcast.json). On a match the
+            // other instances apply it the next time they're idle (or as soon as
+            // a running turn ends / errors). Also persists it as the new default
+            // for *future* sessions and switches this instance immediately.
+            if rest.is_empty() {
+                println!("usage: /model* <selector>   (switch the model in all open pir terminals)");
+                println!("{}", term::dim("also sets the new default for future sessions"));
+                return;
+            }
+            match config::select(providers, &rest.join(" ")) {
+                Ok((p, m)) => {
+                    // Switch this instance right now (we already own the agent
+                    // at the idle prompt; mid-turn we'd be in the fg_running arm).
+                    {
+                        let mut g = agent_slot.lock().unwrap();
+                        let Some(agent) = g.as_mut() else {
+                            eprintln!("pir: agent busy (turn running) — try again when idle");
+                            return;
+                        };
+                        match agent.switch(p.clone(), m.clone()) {
+                            Ok(()) => {
+                                if let Ok(mut ctx) = current_ctx.lock() {
+                                    ctx.0 = p.clone();
+                                    ctx.1 = m.clone();
+                                }
+                                println!("→ {} (this instance)", agent.label());
+                            }
+                            Err(e) => eprintln!("{e}"),
+                        }
+                    }
+                    // Persist as the default for new sessions too.
+                    let _ = config::set_default_model(&p.pid(), &m.id);
+                    // Broadcast to other running instances of this user.
+                    match config::publish_model_broadcast(&format!("{}/{}", p.pid(), m.id)) {
+                        Some(gen) => println!(
+                            "{} broadcasting to all your open terminals (generation {gen})",
+                            term::dim("·")
+                        ),
+                        None => eprintln!("pir: could not write broadcast file"),
+                    }
+                }
+                Err(e) => eprintln!("{e}"),
+            }
+        }
         "models" => print!("{}", list_models(providers)),
+        "login" => {
+            // Store an API key for a provider in ~/.pi/agent/auth.json (pi's
+            // `/login`, minus the OAuth/subscription flows). With an argument we
+            // use it as the provider id; with none we list the known providers
+            // (from the catalog) plus any already-stored ones and let the user
+            // pick one. On success the key is saved and — if that provider is
+            // already in the live model catalog — the agent switches to its
+            // first model so the credential is live immediately. Environment
+            // variables (`{env:VAR}` in models.json) take precedence over stored
+            // keys, exactly as at startup.
+            if fg_running {
+                eprintln!("pir: a turn is running — finish or /cancel it first, then /login");
+                return;
+            }
+            let provider_id = match rest.first().copied() {
+                Some(id) => id.trim().to_string(),
+                None => {
+                    if providers.is_empty() {
+                        term::read_answer("provider id: ")
+                    } else {
+                        println!("{}", term::bold("providers (from your model catalog):"));
+                        for p in providers {
+                            println!("  - {}", p.pid());
+                        }
+                        for id in config::stored_auth_providers() {
+                            if !providers.iter().any(|p| p.pid().eq_ignore_ascii_case(&id)) {
+                                println!("  - {}  {}", id, term::dim("(stored, not in catalog)"));
+                            }
+                        }
+                        term::read_answer("provider id: ")
+                    }
+                }
+            };
+            let provider_id = provider_id.trim().to_string();
+            if provider_id.is_empty() {
+                return;
+            }
+            let key = term::read_secret(&format!("API key for {provider_id}: "));
+            if key.is_empty() {
+                eprintln!("pir: empty key — nothing saved");
+                return;
+            }
+            match config::set_auth_key(&provider_id, &key) {
+                Ok(path) => {
+                    println!(
+                        "{} saved API key for '{}' in {}",
+                        term::green("✓"),
+                        provider_id,
+                        path.display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("pir: {e}");
+                    return;
+                }
+            }
+            // If the provider is in the live catalog, switch to its first model
+            // so the credential is usable immediately. Re-resolve the provider
+            // list (it now includes the freshly stored key) so a provider that
+            // was only present via a stored key works without a restart.
+            match config::load_providers() {
+                Ok(fresh) => {
+                    if let Some(p) = fresh.iter().find(|p| p.pid().eq_ignore_ascii_case(&provider_id)) {
+                        if !p.models.is_empty() {
+                            let mut g = agent_slot.lock().unwrap();
+                            let Some(agent) = g.as_mut() else {
+                                println!("{} key saved; it will be available after reload", term::dim("·"));
+                                return;
+                            };
+                            if agent.switch(p.clone(), p.models[0].clone()).is_ok() {
+                                if let Ok(mut ctx) = current_ctx.lock() {
+                                    ctx.0 = p.clone();
+                                    ctx.1 = p.models[0].clone();
+                                }
+                                println!("→ switched to {}", agent.label());
+                            }
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        "logout" => {
+            // Remove a stored credential from ~/.pi/agent/auth.json (pi's
+            // `/logout`, which only touches the auth file — environment-variable
+            // and models.json config are untouched). With no argument we list
+            // what's stored; with one we remove that provider's entry.
+            let stored = config::stored_auth_providers();
+            let provider_id = match rest.first().copied() {
+                Some(id) => id.trim().to_string(),
+                None => {
+                    if stored.is_empty() {
+                        println!("{} no stored credentials in {}", term::dim("·"), config::auth_path().display());
+                        return;
+                    }
+                    println!("{}", term::bold("stored credentials:"));
+                    for id in &stored {
+                        println!("  - {id}");
+                    }
+                    term::read_answer("provider id to log out: ")
+                }
+            };
+            let provider_id = provider_id.trim().to_string();
+            if provider_id.is_empty() {
+                return;
+            }
+            match config::remove_auth_key(&provider_id) {
+                Ok(true) => println!("{} removed stored credential for '{}'", term::green("✓"), provider_id),
+                Ok(false) => eprintln!("pir: no stored credential for '{}'", provider_id),
+                Err(e) => eprintln!("pir: {e}"),
+            }
+        }
+        "dm" | "default-model" | "model-default" => {
+            // Set the default model for *new* sessions by persisting it to
+            // ~/.pi/agent/settings.json. With no argument, just show the
+            // current default (if any).
+            if rest.is_empty() {
+                match config::default_model_setting() {
+                    Some(d) => println!("default model (new sessions): {}", d),
+                    None => println!("{} no default model set", term::dim("·")),
+                }
+                return;
+            }
+            match config::select(providers, &rest.join(" ")) {
+                Ok((p, m)) => match config::set_default_model(&p.pid(), &m.id) {
+                    Ok(path) => println!("→ default model set to {} (saved in {})", p.label(m), path.display()),
+                    Err(e) => eprintln!("pir: {e}"),
+                },
+                Err(e) => eprintln!("{e}"),
+            }
+        }
         "sessions" => print!("{}", list_sessions()),
         "bg" => {
             let prompt: String = rest.join(" ");
             if prompt.trim().is_empty() {
                 eprintln!("usage: /bg <prompt>  (or end a line with &)");
             } else {
-                let (provider, model) = {
-                    let g = agent_slot.lock().unwrap();
-                    let a = g.as_ref().expect("agent present");
-                    (a.provider(), a.model())
-                };
-                let log = session_log_path();
-                let bcancel = Arc::new(AtomicBool::new(false));
-                let bus = bus.clone();
-                jobs.spawn(prompt, log, move || {
-                    Agent::new(provider, model, full_auto, true, bus, None, bcancel, Arc::new(Mutex::new(String::new())))
-                        .expect("bg agent")
-                });
+                jobs.spawn_prompt(prompt, &current_ctx, bus.clone());
             }
         }
         "jobs" | "background" | "running" => {
-            jobs.set_fg_running(agent_slot.lock().unwrap().is_some() == false);
+            // `fg_running` is the real state: the worker *takes* the agent out of
+            // the slot while a turn runs, so the slot alone can't tell us.
+            jobs.set_fg_running(fg_running);
             print!("{}", jobs.list());
         }
         "fg" | "foreground" => {
@@ -804,15 +1557,117 @@ fn handle_command(
                 return;
             };
             agent.clear();
-            agent.load_session(&log);
+            let resumed = agent.load_session(&log);
+            agent.apply_persisted_su_security();
+            agent.apply_persisted_thinking();
             jobs.mark_joined(id);
             println!("{} foregrounded job #{} from {}", term::bold("·"), id, log.display());
+            if resumed.turns > 0 {
+                println!("{}", resumed.banner(&log));
+                for p in &resumed.prompts {
+                    term::push_history(p);
+                }
+            }
+        }
+        "unfin" | "unfinished" => {
+            // Show sessions that were interrupted, crashed (process gone but
+            // turn never finished), or still have a goal in progress — and which
+            // no live process is currently driving.
+            print!("{}", session::list_unfinished());
+        }
+        "resume" | "res" => {
+            // Resume an unfinished session (from `/unfinished`, index 0 = newest)
+            // into the *current* interactive agent and, if a goal is attached,
+            // drive it to the next pending step. Nothing is actively mutating the
+            // chosen session because `scan_unfinished` only returns sessions with
+            // no live client. The current session's history is replaced.
+            let token: String = rest.join(" ");
+            if token.trim().is_empty() {
+                eprintln!("usage: /resume <index|path-fragment>   (see /unfinished)");
+                return;
+            }
+            let Some(path) = session::resolve_unfinished(&token) else {
+                eprintln!("pir: no unfinished session matches '{token}'");
+                return;
+            };
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                eprintln!("pir: agent busy (turn running) — cancel it first");
+                return;
+            };
+            agent.clear();
+            let resumed = agent.load_session(&path);
+            if resumed.turns > 0 {
+                println!("{}", resumed.banner(&path));
+                for p in &resumed.prompts {
+                    term::push_history(p);
+                }
+            } else if !resumed.summary.is_empty() {
+                println!("{}", term::dim(&resumed.summary));
+            }
+            agent.apply_persisted_model();
+            agent.apply_persisted_su_security();
+            agent.apply_persisted_thinking();
+            if agent.goal_snapshot().is_some() {
+                agent.attach_goal(&path);
+                let out = agent.continue_goal();
+                term::out(&out);
+            }
         }
         "project" => {
             if rest.is_empty() || rest[0] == "init" {
                 run_project_subcommand(&rest.iter().map(|s| s.to_string()).collect::<Vec<_>>());
             } else {
                 eprintln!("unknown /project subcommand '{}' — try /project init", rest[0]);
+            }
+        }
+        "su-security" | "susec" => {
+            // Local, per-session authority toggle. When enabled (default) the
+            // agent stays confined to its sandbox identity; when disabled the
+            // agent is authorized to act with the *invoking user's full
+            // authority* for THIS session only. This is a self-imposed, in-
+            // session authorization flag — it never edits any system file
+            // (no sudoers/wrappers are touched) and has no effect on anything
+            // other than this agent's own authorization. Persisted per-session
+            // so a resumed session keeps its choice.
+            let arg = rest.first().copied().unwrap_or("status");
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                eprintln!("pir: agent busy (turn running) — try again when idle");
+                return;
+            };
+            match arg {
+                "on" | "enable" | "1" => {
+                    println!("{}", agent.set_su_security(true, ""));
+                }
+                "off" | "disable" | "0" => {
+                    // Disabling widens this session's authority to the invoking
+                    // user's full authority, so a reason is required. `status`
+                    // (and the lack of an explicit `off`) is non-destructive.
+                    let reason = rest.get(1..).map(|r| r.join(" ")).unwrap_or_default();
+                    if reason.trim().is_empty() {
+                        eprintln!(
+                            "usage: /su-security off <reason>  — disabling requires a reason\n\
+                             \x20\x20e.g. /su-security off need to install system packages"
+                        );
+                        return;
+                    }
+                    println!("{}", agent.set_su_security(false, &reason));
+                }
+                "status" | "state" => {
+                    if agent.su_security_enabled() {
+                        println!("{}", term::bold("su-based security: ENABLED (agent confined to its sandbox identity)"));
+                    } else {
+                        println!(
+                            "{}",
+                            term::bold(" security: DISABLED (agent authorized with the invoking user's full authority, this session only)")
+                        );
+                    }
+                    println!("{}", term::dim("(local per-session flag; no system-wide configuration changed)"));
+                }
+                other => eprintln!(
+                    "usage: /su-security <on|off|status>   (off requires a reason; local to this session)"
+                ),
             }
         }
         "create" => {
@@ -831,6 +1686,54 @@ fn handle_command(
             } else {
                 agent.start_goal(&obj);
                 println!("goal started: {}", obj);
+            }
+        }
+        "thinking" => {
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                eprintln!("pir: agent busy (turn running) — try again when idle");
+                return;
+            };
+            let arg = rest.join(" ");
+            if arg.trim().is_empty() {
+                // No argument: report the current level.
+                println!("thinking level: {}", agent.thinking_level().as_str());
+                println!(
+                    "{}",
+                    term::dim("set it with /thinking <off|minimal|low|medium|high|xhigh|max>; add 'show'/'hide' to toggle display")
+                );
+                return;
+            }
+            // Parse an optional trailing show/hide flag.
+            let mut show: Option<bool> = None;
+            let mut words: Vec<&str> = arg.split_whitespace().collect();
+            if let Some(last) = words.last().copied() {
+                match last {
+                    "show" => {
+                        show = Some(true);
+                        words.pop();
+                    }
+                    "hide" => {
+                        show = Some(false);
+                        words.pop();
+                    }
+                    _ => {}
+                }
+            }
+            let level_arg = words.join(" ");
+            if !level_arg.is_empty() {
+                match crate::config::ThinkingLevel::parse(&level_arg) {
+                    Some(lvl) => println!("{}", agent.set_thinking(lvl)),
+                    None => {
+                        eprintln!(
+                            "usage: /thinking [<off|minimal|low|medium|high|xhigh|max>] [show|hide]  (got '{level_arg}')"
+                        );
+                        return;
+                    }
+                }
+            }
+            if let Some(on) = show {
+                println!("{}", agent.set_show_thinking(on));
             }
         }
         "continue" | "cont" => {
@@ -862,6 +1765,42 @@ fn handle_command(
             }
             println!("{}", crate::project::fix_git_setup(&repo));
         }
+        "rebuild" => {
+            // Recompile from source and, on success, replace this process with the
+            // freshly built binary (so you pick up the new code without leaving a
+            // stale agent running). Build failures print the tail and leave the
+            // current session intact.
+            rebuild_and_exec();
+        }
+        "sh" | "shell" => {
+            // Drop down to an interactive shell (`/sh`), or run a single command
+            // and return (`/sh COMMAND ARG1 ARG2 …`). The shell inherits the
+            // agent's (possibly dropped) identity, cwd, env and stdio, so it runs
+            // exactly as the current `pir` would — just with a human at the keys.
+            // We restore raw mode only if the REPL had it active (mid-turn) so a
+            // child shell isn't left fighting the REPL's terminal attributes; at
+            // the idle prompt raw is already off, so nothing to do.
+            if fg_running {
+                eprintln!("pir: a turn is running — finish or /cancel it first, then /sh");
+                return;
+            }
+            let args: Vec<&str> = rest;
+            let was_raw = term::raw::is_active();
+            if was_raw {
+                term::raw::disable_raw();
+            }
+            let status = run_shell(args);
+            if was_raw {
+                term::raw::enable_raw();
+            }
+            if let Some(code) = status {
+                if code != 0 {
+                    eprintln!("pir: shell exited with status {}", code);
+                }
+            } else {
+                eprintln!("pir: could not start shell");
+            }
+        }
         "usage" => {
             let g = agent_slot.lock().unwrap();
             match g.as_ref() {
@@ -873,25 +1812,120 @@ fn handle_command(
                 None => eprintln!("pir: agent busy (turn running) — try again when idle"),
             }
         }
+        "undo" => {
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                eprintln!("pir: agent busy (turn running) — try again when idle");
+                return;
+            };
+            let all = rest.first().map(|s| *s == "all").unwrap_or(false);
+            println!("{}", agent.undo(all));
+        }
+        "ext" => {
+            // Diagnostic: list tools + slash commands currently provided by
+            // extensions (e.g. the pi-extensions bridge), including ones the
+            // model may call. Quiet when there are none.
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                eprintln!("pir: agent busy (turn running) — try again when idle");
+                return;
+            };
+            let tools = agent.registry_spec_names();
+            let cmds = agent.registry_command_names();
+            println!("{} extension tools ({}):", term::bold("ext"), tools.len());
+            for t in &tools {
+                println!("  - {t}");
+            }
+            println!("{} extension commands ({}):", term::bold("ext"), cmds.len());
+            for (n, d) in &cmds {
+                println!("  - /{n}  {d}");
+            }
+        }
         "q" | "quit" | "exit" => std::process::exit(0),
-        other => eprintln!("unknown command /{other} — try /help"),
+        other => {
+            // Unknown to the built-in set. Try extension-registered slash
+            // commands (e.g. from the `pi-extensions` bridge). The agent owns
+            // the registry; we take it briefly, run the command, and report the
+            // result. Returns None when no extension claimed the name.
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                eprintln!("pir: agent busy (turn running) — try again when idle");
+                return;
+            };
+            match agent.run_registered_command(other, rest.join(" ").trim()) {
+                Some(outcome) => {
+                    if outcome.is_error {
+                        eprintln!("{}", outcome.content);
+                    } else {
+                        println!("{}", outcome.content);
+                    }
+                }
+                None => eprintln!("unknown command /{other} — try /help"),
+            }
+        }
+    }
+}
+
+/// Print the machine-readable extension ABI surface this `pir` build supports
+/// (used by `pir --abi` and by the pre-install analyzer in the `pi-extensions`
+/// host). Keep this in sync with `extensions/pi-extensions/ABI.md`.
+fn print_abi() {
+    println!("pir extension ABI (pi-extensions bridge surface)");
+    println!();
+    println!("events:");
+    for e in [
+        "session_start",
+        "turn_start",
+        "turn_end",
+        "agent_start",
+        "agent_end",
+    ] {
+        println!("  - {e}");
+    }
+    println!("pi.* API:");
+    for a in [
+        "pi.on(event, handler)",
+        "pi.registerTool({name,label,description,parameters,execute})",
+        "pi.registerCommand(name, {description, handler})",
+    ] {
+        println!("  - {a}");
+    }
+    println!("ctx.ui.*:");
+    for a in ["ctx.ui.notify(text, level)", "ctx.ui.confirm(title, body) -> bool"] {
+        println!("  - {a}");
+    }
+    println!("ctx.sessionManager.*:");
+    println!("  - ctx.sessionManager.getSessionFile() -> string");
+    println!("NOT supported (extension may break or be auto-stubbed):");
+    for a in [
+        "ctx.ui.custom() / setStatus / setWidget / input (TUI widgets)",
+        "before_provider_request / before_provider_headers (provider interception)",
+        "ctx.ui.confirm is auto-approved (no blocking UI on the host yet)",
+    ] {
+        println!("  - {a}");
     }
 }
 
 fn list_models(providers: &[Provider]) -> String {
     let mut out = String::new();
+    let mut idx = 0usize;
     for p in providers {
         out.push_str(&format!("{}\n", term::bold(&p.pid())));
         for m in &p.models {
             let ctx = m.context.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
             out.push_str(&format!(
-                "  {:<44} ctx {:>7}  {}\n",
+                "  {:>3}  {:<41} ctx {:>7}  {}\n",
+                format!(":{idx}"),
                 m.id,
                 ctx,
                 m.name.as_deref().unwrap_or("")
             ));
+            idx += 1;
         }
     }
+    out.push_str(&term::dim(
+        "pick with /model <partial|provider/model|:N>  (indices are the :N shown above)\n",
+    ));
     out
 }
 
@@ -935,9 +1969,19 @@ fn list_sessions() -> String {
     out
 }
 
-/// Find the session file for a `-r` token: an index from `/sessions`, a
+/// Find the session file for a `-r` token: an index from the listing, a
 /// fragment of the timestamp, or a fragment of the first-line preview.
 /// With no token, default to the latest session from this shell (bash).
+///
+/// When there is no session from this shell (and no explicit token), instead of
+/// the old line-prompt we launch the interactive arrow-key picker (`picker::
+/// pick_session`): a full-screen two-pane UI that lists every session for this
+/// project (newest first) and shows a live preview of the highlighted session's
+/// first/last prompts and the tail of its last thinking + response. Enter /
+/// Right resumes the highlighted one; `y` resumes the newest; `n`/Esc/ctrl-c/
+/// ctrl-d/`q` start a fresh session. The picker only runs when stdin is a tty —
+/// with piped/scripted stdin we fall back to a simple `read_answer` so we never
+/// block forever.
 fn resolve_resume(token: Option<&str>) -> Option<PathBuf> {
     let mut sessions = scan_sessions()?;
     if sessions.is_empty() {
@@ -964,11 +2008,46 @@ fn resolve_resume(token: Option<&str>) -> Option<PathBuf> {
     match chosen {
         Some(s) => Some(s.path.clone()),
         None => {
-            if token.is_none() {
-                eprintln!("pir: no session from this shell yet; use `pir -r <idx>` — see `pir -r` list");
-                eprintln!("{}", list_sessions());
-            } else {
+            if token.is_some() {
                 eprintln!("pir: no session matches '{token:?}'");
+                return None;
+            }
+            // No session from this shell. Don't dead-end: offer the interactive
+            // picker over every session in this project (they may be from a
+            // different shell/terminal), with a live preview. The picker drives
+            // stdin in raw mode and restores it on exit.
+            eprintln!("pir: no session from this shell yet — pick one to resume:");
+            if std::io::stdin().is_terminal() {
+                let my_pid = term::parent_shell_pid();
+                let items = build_pick_items(&sessions, my_pid);
+                match crate::picker::pick_session(&items) {
+                    crate::picker::PickResult::Resume(idx) => {
+                        if let Some(s) = sessions.get(idx) {
+                            return Some(s.path.clone());
+                        }
+                    }
+                    crate::picker::PickResult::Cancel => {
+                        eprintln!("pir: ok — not resuming (start fresh, or `pir -r <idx>` next time)");
+                        return None;
+                    }
+                }
+            } else {
+                // Non-interactive stdin: fall back to the plain line prompt so a
+                // scripted `pir -r` doesn't block forever.
+                eprintln!("{}", list_sessions());
+                let ans = term::read_answer("resume one? [idx | y=latest | n]");
+                let ans = ans.as_str();
+                let pick = if ans.is_empty() || ans == "n" || ans == "no" {
+                    None
+                } else if ans == "y" || ans == "yes" {
+                    Some(0usize)
+                } else {
+                    ans.parse::<usize>().ok()
+                };
+                match pick.and_then(|n| sessions.get(n)) {
+                    Some(s) => return Some(s.path.clone()),
+                    None => eprintln!("pir: ok — not resuming (start fresh, or `pir -r <idx>` next time)"),
+                }
             }
             None
         }
@@ -981,6 +2060,25 @@ struct Session {
     shell_pid: u32,
     mtime: std::time::SystemTime,
     preview: String,
+}
+
+/// Build the candidate list for the interactive `pir -r` picker from a scanned
+/// session set (already sorted newest-first). Carries the `from_here` flag so
+/// the picker can highlight sessions that came from this shell.
+fn build_pick_items(sessions: &[Session], my_pid: u32) -> Vec<crate::picker::PickItem> {
+    sessions
+        .iter()
+        .enumerate()
+        .map(|(idx, s)| crate::picker::PickItem {
+            index: idx,
+            name: s.name.clone(),
+            shell_pid: s.shell_pid,
+            from_here: s.shell_pid == my_pid,
+            mtime: s.mtime,
+            path: s.path.clone(),
+            preview_line: s.preview.clone(),
+        })
+        .collect()
 }
 
 fn scan_sessions() -> Option<Vec<Session>> {
@@ -1090,6 +2188,95 @@ fn run_project_subcommand(rest: &[String]) {
 #[cfg(not(unix))]
 fn run_project_subcommand(_rest: &[String]) {
     die("per-project users are only supported on unix");
+}
+
+/// `/rebuild` — `cargo build` (debug, honoring the lockfile) and, if it
+/// succeeds, replace this process with the freshly built binary via `exec`. On
+/// a build failure we print the tail of the output and stay in the running
+/// session. Unix-only: `exec` replaces the process image in place, so the new
+/// `pir` inherits the same stdio/terminal and keeps the user's place.
+fn rebuild_and_exec() {
+    eprintln!("{} rebuilding…", term::dim("·"));
+    let output = std::process::Command::new(env!("CARGO"))
+        .args(["build"])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            let bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("./target/debug/pir"));
+            eprintln!("\x1b[32m✓\x1b[0m built {}; restarting…", bin.display());
+            // Re-exec the new binary with the same args the user originally gave.
+            // `exec` does not return on success.
+            let err = std::process::Command::new(&bin).args(std::env::args().skip(1)).exec();
+            // Only reached if exec fails.
+            die(&format!("rebuild: failed to restart {}: {}", bin.display(), err));
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let tail: String = stderr.lines().rev().take(25).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+            eprintln!("{} build failed:\n{}", term::red("error:"), tail);
+        }
+        Err(e) => {
+            eprintln!("{} could not run cargo build: {}", term::red("error:"), e);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn rebuild_and_exec() {
+    eprintln!("pir: /rebuild (exec) is only supported on unix");
+}
+
+/// Collapse `$HOME` to `~` in a path for a compact display, leaving other
+/// absolute paths intact. Used by the REPL status line's "Workspace" field.
+fn home_collapsed(path: &std::path::Path) -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = std::path::Path::new(&home);
+        if let Ok(suffix) = path.strip_prefix(home) {
+            return format!("~{}", suffix.to_string_lossy());
+        }
+    }
+    path.to_string_lossy().to_string()
+}
+
+/// The "Workspace" shown in the status line: the current working directory with
+/// `$HOME` collapsed to `~`. If `pir` was launched inside a git work tree we
+/// show the repo root instead of the cwd so the workspace reads the same from
+/// any subdirectory.
+pub(crate) fn workspace_label() -> String {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    if crate::project::is_git_repo(&cwd) {
+        if let Some(root) = crate::project::repo_root_opt(&cwd) {
+            return home_collapsed(&root);
+        }
+    }
+    home_collapsed(&cwd)
+}
+
+/// `/sh [cmd args]` — drop into an interactive shell, or run a command via the
+/// shell and return. With no args it execs the user's login shell (`$SHELL`,
+/// else `/bin/sh`) so they get a familiar prompt. With args it runs
+/// `cmd arg1 arg2 …` *through* the shell (`sh -c`), so pipes / globs / redirects
+/// / env-expansion behave exactly as at a normal prompt, and reports the exit
+/// status. The child inherits pir's stdio, identity (the possibly-dropped
+/// `ai_*` user), cwd and environment, so it behaves identically to the
+/// surrounding session. Returns the child's exit code, or `None` if the shell
+/// could not be spawned.
+fn run_shell(args: Vec<&str>) -> Option<i32> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let status = if args.is_empty() {
+        // Interactive: hand the terminal straight to the login shell.
+        std::process::Command::new(&shell).status()
+    } else {
+        // Single-shot: run the assembled command line through the shell.
+        std::process::Command::new(&shell)
+            .arg("-c")
+            .arg(args.join(" "))
+            .status()
+    };
+    match status {
+        Ok(s) => Some(s.code().unwrap_or(1)),
+        Err(_) => None,
+    }
 }
 
 /// `/create [name]` — scaffold a new project directory under `PIR_PROJECTS_DIR`

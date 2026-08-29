@@ -1,6 +1,6 @@
 [package]
 name = "pir"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A featherweight pi-compatible terminal coding agent"
 
@@ -11,6 +11,34 @@ ureq = { version = "2", features = ["json"] }   # pinned to 2.x (blocking API)
 rustyline = "14"                                 # line editing: history + cursor nav + completer
 libc = "0.2"                                     # uid/gid drop for per-project users
 smol = "2"                                       # async runtime: event-driven stdin wait while a turn runs
+
+# Optional TUI deps, only built when `--features tui` is set (so the default
+# binary stays lightweight and the locked build cache is unaffected).
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", optional = true }
+
+# Optional GUI deps (rustxwidgets) for the `gui` / `pancurses` REPL backends.
+# These are NOT vendored in this repo (they were a 28 MiB+ build-artifact
+# subtree we no longer carry in git). To build with `--features gui` or
+# `--features pancurses`, check rustxWidgets out as a sibling directory
+# (e.g. /root/src/rustxWidgets) or add a `[patch]` entry pointing `path =`
+# at your local checkout. The default `pir` binary never references them, so
+# a plain `cargo build` works with no rustxWidgets present.
+# rustxwidgets = { path = "rustxWidgets/rustxwidgets", version = "0.1.0", default-features = false, optional = true }
+
+[features]
+# Full-screen TUI REPL: a real layout engine (no hand-rolled ANSI block)
+# with a conversation pane + footer pane (thinking + live draft prompt) and
+# in-app scrollback. OFF by default — build/run with `--features tui`; pass
+# `--no-tui` (or just build without the feature) to use the streaming REPL.
+default = []
+tui = ["dep:ratatui", "dep:crossterm"]
+# Graphical (GTK) REPL via rustxwidgets' dlopen'd GTK backend, and the curses
+# (pancurses) REPL. These require rustxWidgets to be present (see the comment
+# above the [dependencies] block) — they are intentionally NOT in this repo, so
+# `gui` / `pancurses` are opt-in and absent from the default build.
+# gui = ["dep:rustxwidgets", "rustxwidgets/gtk"]
+# pancurses = ["dep:rustxwidgets", "rustxwidgets/pancurses"]
 
 [profile.release]
 strip = true

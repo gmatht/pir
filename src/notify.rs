@@ -488,20 +488,24 @@ fn running_under_wsl() -> bool {
 #[cfg(target_os = "linux")]
 fn notify_via_windows(title: &str, body: &str) -> bool {
     // Preferred: wsl-notify-send — a drop-in libnotify that forwards to the
-    // Windows Action Center. If present, just use it.
+    // Windows Action Center. If present (and it actually succeeds), use it.
     if Command::new("wsl-notify-send")
         .args([title, body])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .is_ok()
+        .map(|s| s.success())
+        .unwrap_or(false)
     {
         return true;
     }
     // Fallback: drive the Windows-side PowerShell host. BurntToast must be
     // installed once on Windows (`Install-Module BurntToast -Force`). Escape
     // double quotes / backticks so the message can't break out of the string.
+    // We check the *exit status* (not just spawn success): a missing BurntToast
+    // exits non-zero, and we must then fall through to notify-send rather than
+    // return `true` and silently skip the Linux fallback.
     let safe = body.replace('`', "``").replace('"', "`\"");
     let script = format!(
         "Import-Module BurntToast -ErrorAction SilentlyContinue; \
@@ -514,7 +518,8 @@ fn notify_via_windows(title: &str, body: &str) -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .is_ok()
+        .map(|s| s.success())
+        .unwrap_or(false)
     {
         return true;
     }

@@ -45,6 +45,7 @@ pub fn become_user(user: &str) -> Result<(), String> {
     // nothing to drop, but still point the agent at its self-owned toolchain
     // dirs so crates / gh don't land in the invoking user's home.
     if euid == uid {
+        ensure_home_dir(user);
         apply_toolchain_env(user);
         return Ok(());
     }
@@ -73,8 +74,72 @@ pub fn become_user(user: &str) -> Result<(), String> {
     }
     // Point the (now unprivileged) agent at its own, self-owned toolchain dirs
     // so it can fetch crates / use gh without touching root's files.
+    ensure_home_dir(user);
     apply_toolchain_env(user);
     Ok(())
+}
+
+/// Idempotently ensure the target user's home directory exists and is owned by
+/// them. Called from `become_user` at every `pir` launch so an `ai_*` agent
+/// always has a usable home — creation paths (e.g. `useradd -M`, or an
+/// `ai_*` account made outside `pir project init`) can otherwise leave the home
+/// absent, which would make the agent write config/cargo/gh into a missing path.
+///
+/// Under root we can both `mkdir` and `chown`/`chmod`; when already running as
+/// the target we can only `mkdir` (best-effort, and only if the parent is
+/// writable), which is intentionally non-fatal.
+#[cfg(unix)]
+fn ensure_home_dir(user: &str) {
+    use std::process::Command;
+
+    let home = {
+        let cuser = match std::ffi::CString::new(user) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let mut buf = vec![0u8; 4096];
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        unsafe {
+            if libc::getpwnam_r(
+                cuser.as_ptr(),
+                &mut pwd,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result,
+            ) != 0
+                || result.is_null()
+                || pwd.pw_dir.is_null()
+            {
+                return; // can't resolve a home to create
+            }
+            match std::ffi::CStr::from_ptr(pwd.pw_dir).to_str() {
+                Ok(s) => s.to_string(),
+                Err(_) => return,
+            }
+        }
+    };
+    if home.is_empty() {
+        return;
+    }
+    let home_p = std::path::Path::new(&home);
+    if home_p.exists() {
+        return; // already present; leave it alone
+    }
+    let euid = unsafe { libc::geteuid() };
+    if euid == 0 {
+        let _ = std::fs::create_dir_all(home_p);
+        let _ = Command::new("chown")
+            .args(["-R", &format!("{user}:{user}"), &home])
+            .status();
+        let _ = Command::new("chmod").args(["700", &home]).status();
+        println!("ensured home {home} owned by {user}");
+    } else {
+        // Best-effort: only works if the parent directory is writable by the
+        // already-target user. Non-fatal — the launch proceeds and the
+        // missing-home case surfaces through normal write failures.
+        let _ = std::fs::create_dir_all(home_p);
+    }
 }
 
 /// Set CARGO_HOME / GH_CONFIG_DIR (if the user was provisioned with self-owned
@@ -133,7 +198,10 @@ pub fn provision(
         return Err("`pir project init` must run as root".into());
     }
 
-    // 1. Create the system user (non-login) if missing.
+    // 1. Create the system user (non-login) if missing. `-M` skips creating a
+    //    home dir (we create it explicitly below so we can chown it), which is
+    //    intentional: a fixed, owned home is what makes the per-project sandbox
+    //    self-contained (see `toolchain_env_for` / `become_user`).
     if lookup_user(user).is_err() {
         let status = Command::new("useradd")
             .args(["-r", "-s", "/usr/sbin/nologin", "-M", user])
@@ -145,6 +213,45 @@ pub fn provision(
         println!("created user {user}");
     } else {
         println!("user {user} already exists");
+    }
+
+    // 1b. Ensure the user's home directory exists and is owned by them. Some
+    //     distros (useradd -M) leave it absent, which would make `HOME` point
+    //     at a missing path once `become_user` fixes HOME to the real home.
+    let home = {
+        let cuser = std::ffi::CString::new(user).map_err(|_| format!("invalid user '{user}'"))?;
+        let mut buf = vec![0u8; 4096];
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        unsafe {
+            if libc::getpwnam_r(
+                cuser.as_ptr(),
+                &mut pwd,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result,
+            ) != 0
+                || result.is_null()
+                || pwd.pw_dir.is_null()
+            {
+                return Err(format!("cannot resolve home for user '{user}'"));
+            }
+            std::ffi::CStr::from_ptr(pwd.pw_dir).to_str().map(|s| s.to_string()).unwrap_or_default()
+        }
+    };
+    if !home.is_empty() {
+        let _ = std::fs::create_dir_all(&home);
+        let status = Command::new("chown")
+            .args(["-R", &format!("{user}:{user}"), &home])
+            .status()
+            .map_err(|e| format!("chown: {e}"))?;
+        if !status.success() {
+            return Err(format!("chown failed for {home} (exit {})", status.code().unwrap_or(-1)));
+        }
+        // Reset permissions to a sane 0700 so the sandbox user owns its home
+        // privately (the dir may have been created by root with 0755).
+        let _ = Command::new("chmod").args(["700", &home]).status();
+        println!("ensured home {home} owned by {user}");
     }
 
     // 2. Chown the project directory (and a .pir metadata dir) to the user.
@@ -168,12 +275,12 @@ pub fn provision(
     crate::config::set_project_user(project, user, &path_s)?;
 
     // 4. Give the agent user its own network-capable toolchain dirs.
-    //    `ai_*` users run as themselves (non-root) but $HOME is usually still
-    //    inherited from root, so the default /root/.cargo and /root/.config/gh
-    //    are unwritable. Create self-owned CARGO_HOME and GH_CONFIG_DIR so the
-    //    agent can fetch crates and use gh without touching root's files.
-    //    `toolchain_env_for` exposes these so a launch as this user picks them
-    //    up.
+    //    `ai_*` users run as themselves (non-root) and `toolchain_env_for`
+    //    derives CARGO_HOME/GH_CONFIG_DIR from the user's *real* home
+    //    (not $HOME), so crates/gh land under ~ai_X (e.g. /home/ai_rpi/.cargo),
+    //    never /root/.cargo. Create + own those dirs so the agent can fetch
+    //    crates and use gh without touching root's files. `become_user` applies
+    //    these env vars at every launch.
     setup_agent_toolchain(user)?;
 
     // 5. Make the `.git` setup sane for LLM use on a fresh project: install the
@@ -289,6 +396,12 @@ pub fn toolchain_env_for(user: &str) -> Vec<(String, String)> {
     let cargo_home = std::path::Path::new(&home).join(".cargo");
     let gh_config = std::path::Path::new(&home).join(".config").join("gh");
     let mut out = Vec::new();
+    // Always point HOME at the agent user's real home directory. Without this,
+    // a launch that inherits a foreign HOME (e.g. root's) would make every tool
+    // (bash, cargo, gh, git) write into the invoking user's home instead of the
+    // sandbox user's own — defeating the per-project sandbox. The home is
+    // resolved from getpwnam, never from the inherited `$HOME`.
+    out.push(("HOME".into(), home.clone()));
     if cargo_home.is_dir() {
         out.push(("CARGO_HOME".into(), cargo_home.to_string_lossy().into_owned()));
     }

@@ -276,6 +276,13 @@ fn git_dir(repo: &Path) -> Option<PathBuf> {
 /// so callers that write `.gitattributes` / hooks land in the right place even
 /// when invoked from a subdirectory. Falls back to `repo` itself.
 fn repo_root(repo: &Path) -> PathBuf {
+    repo_root_opt(repo).unwrap_or_else(|| repo.to_path_buf())
+}
+
+/// Like [`repo_root`] but returns `None` instead of falling back, so callers
+/// that only want the git root (and not the cwd) when not in a repo can tell
+/// the two apart.
+pub fn repo_root_opt(repo: &Path) -> Option<PathBuf> {
     Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(repo)
@@ -283,7 +290,6 @@ fn repo_root(repo: &Path) -> PathBuf {
         .ok()
         .filter(|o| o.status.success())
         .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
-        .unwrap_or_else(|| repo.to_path_buf())
 }
 
 /// True when `repo` is git and has no pir guard hook installed (so the startup

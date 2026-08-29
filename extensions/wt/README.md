@@ -5,7 +5,7 @@ verifies (build + test) the branch on idle and merges it back into the trunk
 when green — with an inter-agent lock so multiple agents never merge
 concurrently.
 
-Off by default. Enable with `PIR_WT=1`.
+**On by default** — every agent gets its own worktree. Disable with `PIR_WT=0`.
 
 ## What it does
 
@@ -59,7 +59,7 @@ Set `PIR_WT_CHECK` to a shell command to pin verification explicitly.
 
 ## Environment
 
-* `PIR_WT=1` — enable the extension.
+* `PIR_WT=0` — disable the extension (it's on by default).
 * `PIR_WT_AUTO=0` — create worktrees but don't auto-verify/merge on idle
   (use the `wt_*` tools manually).
 * `PIR_WT_DIR=<path>` — where worktrees live (default `<repo>/.git/wt`, i.e.

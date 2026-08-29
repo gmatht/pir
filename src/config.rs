@@ -1,5 +1,6 @@
+use crate::types::Usage;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
 
@@ -29,6 +30,120 @@ pub struct Model {
     pub context: Option<u64>,
     #[serde(alias = "maxTokens")]
     pub max_tokens: Option<u64>,
+    /// Optional per-model API override ("openai", "anthropic", "openai-responses",
+    /// "google"). When set it wins over the provider-level `api`; used by the
+    /// built-in OpenCode Zen catalog where the API varies per model.
+    #[serde(default)]
+    #[serde(skip_deserializing)]
+    pub api_override: Option<String>,
+    /// Optional per-model request URL override (full base URL for this model).
+    #[serde(default)]
+    #[serde(skip_deserializing)]
+    pub url_override: Option<String>,
+    /// Whether this model accepts an OpenAI `reasoning_effort` field. `None`
+    /// means "decide from the API kind as before".
+    #[serde(default)]
+    #[serde(skip_deserializing)]
+    pub no_reasoning_effort: bool,
+    /// Optional per-1k-token price (USD) for input/output, used by the
+    /// cost/price tracking in `Usage::cost`. Set via `set_price` after loading
+    /// from a user-supplied price map; not read from the provider config.
+    #[serde(skip)]
+    pub price_per_1k: Option<(f64, f64)>,
+}
+
+impl Model {
+    /// Attach a (input $/1k, output $/1k) price tuple. Returns `&mut Self` so it
+    /// can be chained when building the model list.
+    pub fn with_price(mut self, input: f64, output: f64) -> Self {
+        self.price_per_1k = Some((input, output));
+        self
+    }
+}
+
+/// Reasoning / "extended thinking" level for models that support it (Anthropic
+/// Claude, OpenAI o-series, etc.). `Off` disables thinking entirely; the other
+/// levels scale the reasoning budget (Anthropic) or `reasoning_effort`
+/// (OpenAI). Parsed case-insensitively from `/thinking`, `--thinking`, or
+/// `PIR_THINKING`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThinkingLevel {
+    #[default]
+    Off,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl ThinkingLevel {
+    /// Parse a level name (case-insensitive). Accepts a few synonyms.
+    pub fn parse(s: &str) -> Option<ThinkingLevel> {
+        match s.trim().to_lowercase().as_str() {
+            "off" | "none" | "false" | "0" | "disable" | "disabled" => Some(ThinkingLevel::Off),
+            "min" | "minimal" | "tiny" => Some(ThinkingLevel::Minimal),
+            "low" => Some(ThinkingLevel::Low),
+            "med" | "medium" => Some(ThinkingLevel::Medium),
+            "high" => Some(ThinkingLevel::High),
+            "xhigh" | "x-high" | "extra" => Some(ThinkingLevel::XHigh),
+            "max" | "maximum" => Some(ThinkingLevel::Max),
+            _ => None,
+        }
+    }
+
+    /// The canonical name of this level (used for display + persistence).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ThinkingLevel::Off => "off",
+            ThinkingLevel::Minimal => "minimal",
+            ThinkingLevel::Low => "low",
+            ThinkingLevel::Medium => "medium",
+            ThinkingLevel::High => "high",
+            ThinkingLevel::XHigh => "xhigh",
+            ThinkingLevel::Max => "max",
+        }
+    }
+
+    /// Whether this level enables any extended thinking at all.
+    pub fn enabled(&self) -> bool {
+        !matches!(self, ThinkingLevel::Off)
+    }
+
+    /// Anthropic thinking budget (in tokens) for this level, given the model's
+    /// context window. Returns `None` when thinking is disabled or the context
+    /// is too small to afford a meaningful budget. The caller must ensure the
+    /// budget stays strictly below `max_tokens` (Anthropic requires it).
+    pub fn anthropic_budget(&self, ctx: u64) -> Option<u64> {
+        let c = ctx.max(1);
+        let b = match self {
+            ThinkingLevel::Off => return None,
+            ThinkingLevel::Minimal => return Some(1024),
+            ThinkingLevel::Low => c / 32,
+            ThinkingLevel::Medium => c / 12,
+            ThinkingLevel::High => c / 6,
+            ThinkingLevel::XHigh => c / 3,
+            ThinkingLevel::Max => (c * 2) / 3,
+        };
+        if b < 1024 {
+            None
+        } else {
+            Some(b)
+        }
+    }
+
+    /// OpenAI `reasoning_effort` value for this level, or `None` when thinking
+    /// is disabled. (Anthropic maps the same levels to a token budget instead;
+    /// OpenAI only exposes coarse effort levels.)
+    pub fn oai_effort(&self) -> Option<&'static str> {
+        match self {
+            ThinkingLevel::Off | ThinkingLevel::Minimal => None,
+            ThinkingLevel::Low => Some("low"),
+            ThinkingLevel::Medium => Some("medium"),
+            ThinkingLevel::High | ThinkingLevel::XHigh | ThinkingLevel::Max => Some("high"),
+        }
+    }
 }
 
 impl Provider {
@@ -55,15 +170,48 @@ impl Provider {
     }
 
     pub fn api_key(&self) -> Option<String> {
-        self.api_key.as_ref().map(|k| expand_env(k)).filter(|k| !k.is_empty())
+        self.api_key.as_ref().and_then(|k| expand_env(k))
+    }
+
+    /// The effective API for `model`: the model's own override when present
+    /// (OpenCode Zen's per-model mapping), else the provider-level `api`.
+    pub fn model_api(&self, model: &Model) -> Option<ApiKind> {
+        if let Some(api) = &model.api_override {
+            let a = api.to_lowercase();
+            return if a.contains("anthropic") {
+                Some(ApiKind::Anthropic)
+            } else {
+                Some(ApiKind::OpenAi)
+            };
+        }
+        self.kind()
+    }
+
+    /// The effective request base URL for `model`: the model's own override
+    /// when present, else the provider-level `baseUrl`.
+    pub fn model_base_url<'a>(&'a self, model: &'a Model) -> Option<&'a str> {
+        model
+            .url_override
+            .as_deref()
+            .or(self.base_url.as_deref())
+            .filter(|s| !s.is_empty())
     }
 }
 
-pub fn expand_env(s: &str) -> String {
+/// Expand a `{env:VAR}` reference. Returns `None` when `s` begins with
+/// `{env:` but the named variable is unset/empty, so callers can surface a
+/// clear "missing API key env var" error instead of silently failing later
+/// with an opaque "no API key". Non-`{env:...}` values pass through unchanged.
+pub fn expand_env(s: &str) -> Option<String> {
     if let Some(var) = s.strip_prefix("{env:").and_then(|r| r.strip_suffix('}')) {
-        std::env::var(var).unwrap_or_default()
+        let v = std::env::var(var).unwrap_or_default();
+        if v.is_empty() {
+            None
+        } else {
+            Some(v)
+        }
     } else {
-        s.to_string()
+        Some(s.to_string())
     }
 }
 
@@ -147,6 +295,10 @@ pub fn load_providers() -> Result<Vec<Provider>, String> {
                             name: mv.get("name").and_then(Value::as_str).map(String::from),
                             context: mv.get("context").or(mv.get("contextWindow")).and_then(Value::as_u64),
                             max_tokens: mv.get("maxTokens").or(mv.get("max_tokens")).and_then(Value::as_u64),
+                            api_override: None,
+                            url_override: None,
+                            no_reasoning_effort: false,
+                            price_per_1k: None,
                         });
                     }
                 }
@@ -164,6 +316,10 @@ pub fn load_providers() -> Result<Vec<Provider>, String> {
                         name: mv.get("name").and_then(Value::as_str).map(String::from),
                         context: mv.get("context").or(mv.get("contextWindow")).and_then(Value::as_u64),
                         max_tokens: mv.get("maxTokens").or(mv.get("max_tokens")).and_then(Value::as_u64),
+                        api_override: None,
+                        url_override: None,
+                        no_reasoning_effort: false,
+                        price_per_1k: None,
                     });
                 }
             }
@@ -186,7 +342,74 @@ pub fn load_providers() -> Result<Vec<Provider>, String> {
         return load_from_auth_fallback();
     }
 
+    apply_prices(&mut providers);
     Ok(providers)
+}
+
+/// A small built-in table of per-1k-token USD prices (input, output) for common
+/// models. Used only when the user hasn't supplied their own in
+/// `~/.pi/agent/settings.json` (`prices` key). Prices are approximate reference
+/// values and may be out of date; override them per-model in settings.
+fn default_prices() -> std::collections::BTreeMap<String, (f64, f64)> {
+    let mut m = std::collections::BTreeMap::new();
+    // Anthropic (Claude 4 / 3.5-era list prices, USD per 1M tokens -> per 1k).
+    for (id, p) in [
+        ("claude-opus-4", (15.0, 75.0)),
+        ("claude-sonnet-4", (3.0, 15.0)),
+        ("claude-sonnet-4-5", (3.0, 15.0)),
+        ("claude-3-5-sonnet", (3.0, 15.0)),
+        ("claude-3-5-haiku", (0.80, 4.0)),
+        ("claude-3-haiku", (0.25, 1.25)),
+        ("claude-3-opus", (15.0, 75.0)),
+    ] {
+        m.insert(id.to_string(), (p.0 / 1000.0, p.1 / 1000.0));
+    }
+    // OpenAI.
+    for (id, p) in [
+        ("gpt-4o", (2.5, 10.0)),
+        ("gpt-4o-mini", (0.15, 0.60)),
+        ("gpt-4-turbo", (10.0, 30.0)),
+        ("o1", (15.0, 60.0)),
+        ("o3", (10.0, 40.0)),
+        ("o4-mini", (1.10, 4.40)),
+    ] {
+        m.insert(id.to_string(), (p.0 / 1000.0, p.1 / 1000.0));
+    }
+    m
+}
+
+/// Enrich loaded providers' models with per-1k-token prices. User-supplied
+/// prices from `~/.pi/agent/settings.json` (`prices`: { "provider/model":
+/// [in, out] }) win over the built-in table; matching is by model id (case-
+/// insensitive). Best-effort: any parse failure is silently ignored.
+fn apply_prices(providers: &mut [Provider]) {
+    let mut table = default_prices();
+    // Merge user prices from settings.json.
+    let p = pi_dir().join("agent").join("settings.json");
+    if let Ok(raw) = fs::read_to_string(&p) {
+        if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+            if let Some(prices) = v.get("prices").and_then(Value::as_object) {
+                for (label, pv) in prices {
+                    if let Some(arr) = pv.as_array() {
+                        if let (Some(i), Some(o)) = (arr.first().and_then(Value::as_f64), arr.get(1).and_then(Value::as_f64)) {
+                            table.insert(label.to_lowercase(), (i, o));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for prov in providers.iter_mut() {
+        let pid = prov.pid();
+        for m in prov.models.iter_mut() {
+            let key = format!("{}/{}", pid, m.id).to_lowercase();
+            let by_label = table.get(&key).copied();
+            let by_id = table.get(&m.id.to_lowercase()).copied();
+            if let Some((i, o)) = by_label.or(by_id) {
+                m.price_per_1k = Some((i, o));
+            }
+        }
+    }
 }
 
 fn load_from_auth_fallback() -> Result<Vec<Provider>, String> {
@@ -218,6 +441,10 @@ fn load_from_auth_fallback() -> Result<Vec<Provider>, String> {
                                 name: None,
                                 context: Some(128000),
                                 max_tokens: Some(8192),
+                                api_override: None,
+                                url_override: None,
+                                no_reasoning_effort: false,
+                                price_per_1k: None,
                             }],
                         });
                     }
@@ -274,7 +501,106 @@ pub fn default_model_setting() -> Option<String> {
     Some(format!("{}/{}", provider, model))
 }
 
-/// Path to the projects.json file that maps project names to the per-project
+/// Persist a provider/model as the default for new pir sessions by writing it
+/// into `~/.pi/agent/settings.json` under `defaultProvider`/`defaultModel`
+/// (the keys [`default_model_setting`] reads at startup). Creates the file /
+/// `agent` dir if missing, and preserves any other keys already present.
+pub fn set_default_model(provider: &str, model: &str) -> Result<PathBuf, String> {
+    let p = pi_dir().join("agent").join("settings.json");
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    let mut v: Value = fs::read_to_string(&p)
+        .ok()
+        .and_then(|r| serde_json::from_str(&r).ok())
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    if !v.is_object() {
+        v = Value::Object(serde_json::Map::new());
+    }
+    let obj = v.as_object_mut().unwrap();
+    obj.insert("defaultProvider".into(), Value::String(provider.to_string()));
+    obj.insert("defaultModel".into(), Value::String(model.to_string()));
+    fs::write(&p, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    Ok(p)
+}
+
+/// Path to `auth.json` (credential store). Mirrors the file pi writes;
+/// `load_auth_keys` / `load_from_auth_fallback` already consult it.
+pub fn auth_path() -> PathBuf {
+    pi_dir().join("agent").join("auth.json")
+}
+
+/// Persist an API-key credential for `provider` into `auth.json` as
+/// `{ "type": "api_key", "key": "..." }`, creating/updating the file and
+/// preserving any other entries. Returns the path that was written. Used by
+/// the `/login` command. Best-effort: surfaces an error string on failure.
+pub fn set_auth_key(provider: &str, key: &str) -> Result<PathBuf, String> {
+    let p = auth_path();
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    let mut v: Value = fs::read_to_string(&p)
+        .ok()
+        .and_then(|r| serde_json::from_str(&r).ok())
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    if !v.is_object() {
+        v = Value::Object(serde_json::Map::new());
+    }
+    let obj = v.as_object_mut().unwrap();
+    obj.insert(
+        provider.to_string(),
+        json!({ "type": "api_key", "key": key }),
+    );
+    fs::write(&p, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    Ok(p)
+}
+
+/// Remove the stored credential (API key or OAuth) for `provider` from
+/// `auth.json`. Leaves environment-variable / models.json config untouched
+/// (those are not stored here). Returns `Ok(true)` when an entry was removed,
+/// `Ok(false)` when there was nothing to remove. Used by the `/logout`
+/// command.
+pub fn remove_auth_key(provider: &str) -> Result<bool, String> {
+    let p = auth_path();
+    if !p.exists() {
+        return Ok(false);
+    }
+    let mut v: Value = serde_json::from_str(&fs::read_to_string(&p).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    if !v.is_object() {
+        return Ok(false);
+    }
+    let obj = v.as_object_mut().unwrap();
+    let removed = obj.remove(provider).is_some();
+    if removed {
+        fs::write(&p, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(removed)
+}
+
+/// The provider ids that currently have a stored credential (API key) in
+/// `auth.json`, in file order. Used by `/logout` to list what can be removed.
+pub fn stored_auth_providers() -> Vec<String> {
+    let p = auth_path();
+    let mut out = Vec::new();
+    if let Ok(raw) = fs::read_to_string(&p) {
+        if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+            if let Some(obj) = v.as_object() {
+                for (id, val) in obj {
+                    if val.get("type").and_then(Value::as_str) == Some("api_key")
+                        && val.get("key").and_then(Value::as_str).map(|k| !k.is_empty()).unwrap_or(false)
+                    {
+                        out.push(id.clone());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
 /// execution user and path. Created/updated by `pir project init`.
 pub fn projects_file() -> PathBuf {
     pi_dir().join("agent").join("projects.json")
@@ -395,13 +721,20 @@ pub fn set_project_user(project: &str, user: &str, path: &str) -> Result<(), Str
     }
     let projects = v
         .as_object_mut()
-        .unwrap()
+        .ok_or_else(|| "projects.json is not a JSON object".to_string())?
         .entry("projects")
         .or_insert_with(|| Value::Object(serde_json::Map::new()));
-    let obj = projects.as_object_mut().unwrap();
-    let entry = obj.entry(project.to_string()).or_insert_with(|| Value::Object(serde_json::Map::new()));
-    entry.as_object_mut().unwrap().insert("user".into(), Value::String(user.to_string()));
-    entry.as_object_mut().unwrap().insert("path".into(), Value::String(path.to_string()));
+    let projects_obj = projects
+        .as_object_mut()
+        .ok_or_else(|| "projects.json 'projects' is not a JSON object".to_string())?;
+    let entry = projects_obj
+        .entry(project.to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let entry_obj = entry
+        .as_object_mut()
+        .ok_or_else(|| "projects.json project entry is not a JSON object".to_string())?;
+    entry_obj.insert("user".into(), Value::String(user.to_string()));
+    entry_obj.insert("path".into(), Value::String(path.to_string()));
     if let Some(parent) = path_db.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -470,7 +803,15 @@ pub fn match_models(providers: &[Provider], prefix: &str, limit: usize) -> Vec<S
         }
     }
 
-    out.sort();
+    // Prefix matches are what the user is typing (e.g. `op` -> `opencode/...`);
+    // they must outrank infix/substring matches (e.g. `anthrop**op**ic/...`,
+    // which would otherwise win merely by alphabetical order). Sort is stable,
+    // so ties keep the catalog order.
+    out.sort_by_key(|c| {
+        let hit = c.to_lowercase();
+        // 0 = starts with the prefix (best), 1 = contains it later (fallback).
+        if hit.starts_with(&p) { 0 } else { 1 }
+    });
     out.truncate(limit);
     out
 }
@@ -519,6 +860,26 @@ pub fn select<'a>(
 ) -> Result<(&'a Provider, &'a Model), String> {
     let sel = selector.trim().to_lowercase();
 
+    // `:N` positional selector: pick the Nth model from the same flat
+    // (provider, then model) order `/models` prints, so an index shown by the
+    // listing always resolves. Out-of-range -> a helpful error, never a panic.
+    if let Some(num) = sel.strip_prefix(':') {
+        if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+            let flat: Vec<(&'a Provider, &'a Model)> = providers
+                .iter()
+                .flat_map(|p| p.models.iter().map(move |m| (p, m)))
+                .collect();
+            let n: usize = num.parse().unwrap_or(usize::MAX);
+            return match flat.get(n) {
+                Some((p, m)) => Ok((p, m)),
+                None => Err(format!(
+                    "no model at position {n} — `/models` numbers them 0..{}",
+                    flat.len().saturating_sub(1)
+                )),
+            };
+        }
+    }
+
     if let Some((pid, mid)) = selector.trim().split_once('/') {
         for p in providers {
             if p.pid().eq_ignore_ascii_case(pid) {
@@ -547,17 +908,45 @@ pub fn select<'a>(
             providers_with.iter().map(|p| p.label(m)).collect::<Vec<_>>().join(", ")
         ));
     }
+    // Partial substring match over the `provider/model` label, the model id,
+    // and the display name. If the text before the first `/` names (or
+    // prefixes) a known provider, narrow to that provider and match the
+    // remainder against just its models, so `openai/4.1` stays within openai
+    // (and `:N`-style fragments can't spill across providers). Otherwise fall
+    // back to the whole-label substring behaviour.
+    let (sel_provider, sel_text) = match sel.split_once('/') {
+        Some((pid, rest))
+            if providers.iter().any(|p| p.pid().to_lowercase().starts_with(pid)) =>
+        {
+            (Some(pid.to_string()), rest.trim().to_string())
+        }
+        _ => (None, sel.clone()),
+    };
     let hits: Vec<(&'a Provider, &'a Model)> = providers
         .iter()
         .flat_map(|p| p.models.iter().map(move |m| (p, m)))
         .filter(|(p, m)| {
-            format!("{}/{}", p.pid(), m.id).to_lowercase().contains(&sel)
-                || m.name.as_deref().unwrap_or("").to_lowercase().contains(&sel)
+            let empty = String::new();
+            let mid = m.id.to_lowercase();
+            let name = m.name.as_deref().unwrap_or(&empty).to_lowercase();
+            match &sel_provider {
+                Some(pid) => {
+                    p.pid().to_lowercase().starts_with(pid)
+                        && !sel_text.is_empty()
+                        && (mid.contains(&sel_text) || name.contains(&sel_text))
+                }
+                None => {
+                    format!("{}/{}", p.pid(), m.id).to_lowercase().contains(&sel)
+                        || name.contains(&sel)
+                }
+            }
         })
         .collect();
     match hits.as_slice() {
         [only] => Ok(*only),
-        [] => Err(format!("no model matches '{selector}'")),
+        [] => Err(format!(
+            "no model matches '{selector}' — try a partial match (id, name, provider/model) or `:N` from `/models`"
+        )),
         _ => Err(format!(
             "'{selector}' is ambiguous: {}",
             hits.iter().map(|(p, m)| p.label(m)).collect::<Vec<_>>().join(", ")
@@ -565,3 +954,201 @@ pub fn select<'a>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cross-instance model broadcast
+// ---------------------------------------------------------------------------
+//
+// `pir` is a process-per-terminal app: every open terminal has its own
+// independent `pir` with its own agent/bus, so there is no in-process way to
+// reach "all running instances". To let `/model*` switch the model in *every*
+// open terminal at once, `pir` publishes a tiny broadcast file under the
+// user's `~/.pi/agent/` and a lightweight watcher in each instance polls it.
+//
+// The file is owned by the user (under `~/.pi`), so the blast radius is
+// naturally scoped to that user's own terminals — never other users. Scope is
+// "same user", not "same shell", so a `/model*` from one of your terminals
+// reaches all of your other terminals too.
+
+/// Path of the cross-instance model-broadcast file.
+pub fn model_broadcast_path() -> PathBuf {
+    pi_dir().join("agent").join("model-broadcast.json")
+}
+
+/// The current model broadcast, if any and well-formed.
+pub fn read_model_broadcast() -> Option<ModelBroadcast> {
+    let raw = fs::read_to_string(model_broadcast_path()).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    Some(ModelBroadcast {
+        generation: v.get("generation").and_then(Value::as_u64).unwrap_or(0),
+        label: v.get("label").and_then(Value::as_str).unwrap_or("").to_string(),
+        by_pid: v.get("byPid").and_then(Value::as_u64).unwrap_or(0),
+        ts: v.get("ts").and_then(Value::as_u64).unwrap_or(0),
+    })
+}
+
+/// A single model-broadcast event published by `/model*`.
+#[derive(Clone, Debug)]
+pub struct ModelBroadcast {
+    /// Monotonic counter so watchers can detect "new since I last applied".
+    pub generation: u64,
+    /// The `provider/model` label to switch to.
+    pub label: String,
+    /// PID of the `pir` that originated the broadcast (so it can ignore itself).
+    pub by_pid: u64,
+    /// Epoch seconds when it was published.
+    pub ts: u64,
+}
+
+/// Publish a model-broadcast event for `label`, stamping it with the current
+/// process pid and a `generation` one greater than any previously recorded.
+/// Returns the generation that was written (useful for the originator to ignore
+/// its own echo). Best-effort: a write failure is silently ignored.
+pub fn publish_model_broadcast(label: &str) -> Option<u64> {
+    let p = model_broadcast_path();
+    if let Some(parent) = p.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let prev = read_model_broadcast().map(|b| b.generation).unwrap_or(0);
+    let generation = prev + 1;
+    let payload = json!({
+        "generation": generation,
+        "label": label,
+        "byPid": std::process::id(),
+        "ts": crate::term::epoch(),
+    });
+    if fs::write(&p, serde_json::to_string_pretty(&payload).unwrap_or_default()).is_ok() {
+        Some(generation)
+    } else {
+        None
+    }
+}
+
+
+#[cfg(test)]
+mod select_tests {
+    use super::*;
+
+    fn mk(id: &str, name: &str) -> Model {
+        Model {
+            id: id.into(),
+            name: Some(name.into()),
+            context: Some(1000),
+            max_tokens: None,
+            api_override: None,
+            url_override: None,
+            no_reasoning_effort: false,
+            price_per_1k: None,
+        }
+    }
+
+    fn providers() -> Vec<Provider> {
+        vec![
+            Provider {
+                id: Some("anthropic".into()),
+                name: None,
+                api: Some("anthropic".into()),
+                base_url: Some("https://api.anthropic.com/v1".into()),
+                api_key: None,
+                models: vec![
+                    mk("claude-sonnet-4-5", "Claude Sonnet 4.5"),
+                    mk("claude-haiku-4-5", "Claude Haiku 4.5"),
+                ],
+            },
+            Provider {
+                id: Some("openai".into()),
+                name: None,
+                api: Some("openai".into()),
+                base_url: Some("https://api.openai.com/v1".into()),
+                api_key: None,
+                models: vec![mk("gpt-4.1", "GPT-4.1"), mk("gpt-4.1-mini", "GPT-4.1 mini")],
+            },
+        ]
+    }
+
+    fn pick(provs: &[Provider], sel: &str) -> String {
+        select(provs, sel)
+            .map(|(p, m)| p.label(m))
+            .unwrap_or_else(|e| format!("ERR: {e}"))
+    }
+
+    #[test]
+    fn positional_colon_selects_models_order() {
+        let provs = providers();
+        // The same flat (provider, then model) order `list_models` prints.
+        assert_eq!(pick(&provs, ":0"), "anthropic/claude-sonnet-4-5");
+        assert_eq!(pick(&provs, ":1"), "anthropic/claude-haiku-4-5");
+        assert_eq!(pick(&provs, ":2"), "openai/gpt-4.1");
+        assert_eq!(pick(&provs, ":3"), "openai/gpt-4.1-mini");
+    }
+
+    #[test]
+    fn positional_out_of_range_and_junk() {
+        let provs = providers();
+        let err = pick(&provs, ":9");
+        assert!(err.starts_with("ERR: no model at position 9"), "{err}");
+        // A non-numeric `:` selector is not positional (falls through to the
+        // normal matcher, which errors with the usual message).
+        assert!(pick(&provs, ":x").starts_with("ERR: no model matches ':x'"), "{err}");
+    }
+
+    #[test]
+    fn provider_narrowed_partial_match() {
+        let provs = providers();
+        // `provider/fragment` narrows to that provider's models.
+        assert_eq!(pick(&provs, "anthropic/haiku"), "anthropic/claude-haiku-4-5");
+        // The provider part may be an abbreviated prefix; match on name too.
+        assert_eq!(pick(&provs, "anth/son"), "anthropic/claude-sonnet-4-5");
+        assert_eq!(pick(&provs, "openai/gpt-4.1-mini"), "openai/gpt-4.1-mini");
+        // Fragments matching several models of that provider stay ambiguous,
+        // but only within the named provider.
+        let e = pick(&provs, "openai/gpt");
+        assert!(e.starts_with("ERR: 'openai/gpt' is ambiguous:"), "{e}");
+        assert!(e.contains("openai/gpt-4.1, openai/gpt-4.1-mini"), "{e}");
+    }
+
+    #[test]
+    fn whole_label_substring_fallback_kept() {
+        let provs = providers();
+        // No known provider before the `/`: fall back to a substring match on
+        // the full `provider/model` label (the old behaviour).
+        assert_eq!(pick(&provs, "haiku-4-5"), "anthropic/claude-haiku-4-5");
+        // Bare id substring still resolves.
+        assert_eq!(pick(&provs, "4.1-mi"), "openai/gpt-4.1-mini");
+    }
+
+    #[test]
+    fn ambiguous_and_missing_report_choices() {
+        let provs = providers();
+        let e = pick(&provs, "4.1");
+        assert!(e.starts_with("ERR: '4.1' is ambiguous:"), "{e}");
+        assert!(e.contains("openai/gpt-4.1, openai/gpt-4.1-mini"), "{e}");
+        let e = pick(&provs, "zzz");
+        assert!(e.starts_with("ERR: no model matches 'zzz'"), "{e}");
+        assert!(e.contains(":N"), "error should mention the :N escape hatch: {e}");
+    }
+
+    #[test]
+    fn completion_prefix_matches_rank_above_infix() {
+        // `op` is an infix of "anthropic" but a prefix of "opencode": the
+        // prefix hit must come first so `/model op<Tab>` offers opencode,
+        // not anthropic/... (which previously won via alphabetical sort).
+        let mut provs = providers();
+        provs.insert(
+            0,
+            Provider {
+                id: Some("opencode".into()),
+                name: None,
+                api: Some("openai".into()),
+                base_url: Some("https://opencode.ai/v1".into()),
+                api_key: None,
+                models: vec![mk("opencode-chat", "OpenCode Chat")],
+            },
+        );
+        let ms = match_models(&provs, "op", 10);
+        // Model-id matches return the bare id (documented continuation
+        // behaviour) — it resolves unambiguously to the opencode provider.
+        assert_eq!(ms.first().map(String::as_str), Some("opencode-chat"));
+        // The infix-only matches are still offered as fallbacks, just after.
+        assert!(ms.iter().any(|c| c.starts_with("anthropic/")), "infix matches must remain: {ms:?}");
+    }
+}

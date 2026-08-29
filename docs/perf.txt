@@ -1,0 +1,79 @@
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+  
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+   8542 root      20   0   10.9g 367764  54192 S  95.2   0.7  68:19.98 pi
+    836 root      20   0  107780 102212   3332 S   4.8   0.2   3:57.17 tmux: server
+   4118 root      20   0 2680180  99988  61616 S   0.0   0.2   0:02.63 dockerd
+   3141 root      20   0 2886632  59052  26024 S   2.4   0.1   6:47.13 snapd
+   4217 root      20   0 2265152  55636  30740 S   0.0   0.1   0:06.42 containerd
+   3212 root      20   0  107040  23072  13200 S   0.0   0.0   0:00.06 unattended-upgr
+    260 root      20   0  377228  20864    416 S   0.0   0.0   0:34.70 snapfuse
+    240 root      20   0  302464  20588    448 S   0.0   0.0   0:08.61 snapfuse
+    155 root      20   0  302464  20568    548 S   0.0   0.0   0:03.83 snapfuse
+    204 root      20   0  601520  20452    436 S   0.0   0.0   0:23.78 snapfuse
+    296 root      20   0  526756  20164    548 S   0.0   0.0   0:18.77 snapfuse
+    273 root      20   0  377228  19128    520 S   0.0   0.0   0:25.11 snapfuse
+    197 root      20   0  377228  19104    528 S   0.0   0.0   0:21.83 snapfuse
+ 149133 ai_pir    20   0   26516  18996  10184 S   0.0   0.0   0:00.19 python3
+    264 root      20   0  377228  18920    300 S   0.0   0.0   0:37.25 snapfuse
+    341 root      20   0  601520  18496    328 S   0.0   0.0   0:07.47 snapfuse
+    248 root      20   0  377228  18404    260 S   0.0   0.0   0:34.37 snapfuse
+    359 root      20   0  377228  17440    444 S   0.0   0.0   0:24.31 snapfuse
+   3121 root      20   0  471256  17252  14776 S   0.0   0.0   0:00.02 nix-daemon
+    167 root      20   0  377228  16856    492 S   0.0   0.0   0:23.88 snapfuse
+  76389 ai_pir    20   0  481240  16716   4996 S   0.0   0.0   0:08.17 pir
+    177 root      20   0  302464  16700    528 S   0.0   0.0   0:18.07 snapfuse
+      1 root      20   0   25704  16692   9592 S   0.0   0.0   0:03.07 systemd
+    317 root      20   0  451992  16288    528 S   0.0   0.0   0:08.10 snapfuse
+ 116261 ai_pir    20   0  629788  16236   9064 S   0.8   0.0   0:16.20 pir
+     80 root      19  -1   34644  15452  13716 S   0.0   0.0   0:00.94 systemd-journal
+    281 root      20   0  377228  15012    364 S   0.0   0.0   0:33.53 snapfuse
+    173 root      20   0  377228  14924    528 S   0.0   0.0   0:18.97 snapfuse
+    290 root      20   0  302464  14880    492 S   0.0   0.0   0:17.74 snapfuse
+ 100958 ai_pir    20   0  616416  14824   5124 S   0.0   0.0   0:09.33 pir
+    185 root      20   0  377228  14688    592 S   0.0   0.0   0:26.39 snapfuse
+    221 root      20   0  451992  14664    380 S   0.0   0.0   0:18.56 snapfuse
+    212 root      20   0  302464  14572    436 S   0.0   0.0   0:17.59 snapfuse
+  98704 ai_pir    20   0  483304  14572   5172 S   0.8   0.0   0:09.07 pir
+    194 root      20   0  377228  14568    628 S   0.0   0.0   0:25.65 snapfuse
+    278 root      20   0  377228  14552    444 S   0.0   0.0   0:25.61 snapfuse
+    236 root      20   0  302464  14532    548 S   0.0   0.0   0:08.23 snapfuse
+    308 root      20   0  302464  14504    296 S   0.0   0.0   0:06.16 snapfuse
+    252 root      20   0  377228  14408    264 S   0.0   0.0   0:34.56 snapfuse
+   3149 root      20   0  469596  13652  10980 S   0.0   0.0   0:00.48 udisksd
+  76710 ai_pir    20   0  616416  13484   4876 S   0.0   0.0   0:07.04 pir
+    338 root      20   0  302464  12880    380 S   0.0   0.0   0:06.06 snapfuse
+    302 root      20   0  302464  12564    312 S   0.0   0.0   0:06.06 snapfuse
+    225 root      20   0  227700  12352    480 S   0.0   0.0   0:04.04 snapfuse
+   3089 systemd+  20   0   21336  12116  10044 S   0.0   0.0   0:00.10 systemd-resolve
+    231 root      20   0  227700  11984    208 S   0.0   0.0   0:04.09 snapfuse
+  80562 ai_pir    20   0  548828  11672   5076 S   0.0   0.0   0:14.77 pir
+   3120 root      20   0   17528  11100   7004 S   0.0   0.0   0:00.04 gtlsserver
+   3297 www-data  20   0 1999396  11012   3532 S   0.0   0.0   0:00.00 apache2
+   3298 www-data  20   0 1999396  11012   3532 S   0.0   0.0   0:00.00 apache2
+  67800 ai_lsl-+  20   0  481252  10988   5240 S   0.0   0.0   0:12.16 pir
+    314 root      20   0  302464  10916    528 S   0.0   0.0   0:07.72 snapfuse
+    356 root      20   0  302464  10384    312 S   0.0   0.0   0:00.68 snapfuse
+   6223 root      20   0  227700  10108    404 S   0.0   0.0   0:00.66 snapfuse
+    324 root      20   0  227700  10064    528 S   0.0   0.0   0:01.06 snapfuse
+    330 root      20   0  227700  10036    444 S   0.0   0.0   0:00.94 snapfuse
+   5984 root      20   0  227700   9616    380 S   0.0   0.0   0:00.53 snapfuse
+    152 root      20   0  227700   9276    448 S   0.0   0.0   0:00.55 snapfuse
+   3147 root      20   0   17616   8008   6992 S   0.0   0.0   0:00.16 systemd-logind
+   3501 polkitd   20   0  308164   7640   6868 S   0.0   0.0   0:00.35 polkitd
+    133 root      20   0   25100   6656   4680 S   0.0   0.0   0:00.27 systemd-udevd
+   3090 systemd+  20   0   91052   6656   5748 S   0.0   0.0   0:00.14 systemd-timesyn
+  48884 root      20   0    7064   6212   3540 S   0.0   0.0   0:00.13 bash
+  26675 root      20   0    6984   6172   3576 S   0.0   0.0   0:00.15 bash
+
+
+130 ✗ root@PC ~/src/pir$ ps -gaux | grep '[ /]pi'
+root        8542 32.6  0.7 11430996 368668 pts/4 Rl+  17:20  68:36 pi
+ai_lsl-+   67800  0.1  0.0 481252 11076 pts/7    Sl+  18:43   0:12 ../pir/target/release/pir
+ai_pir     76389  0.1  0.0 481240 16716 pts/5    Sl+  19:07   0:08 target/release/pir
+ai_pir     76710  0.1  0.0 616416 13484 pts/9    Sl+  19:09   0:07 target/release/pir
+ai_pir     80562  0.2  0.0 548828 11672 pts/8    Sl+  19:11   0:14 target/release/pir
+ai_pir     98704  0.1  0.0 483304 14572 pts/2    Sl+  19:24   0:09 target/release/pir
+ai_pir    100958  0.1  0.0 616416 14824 pts/10   Sl+  19:28   0:09 ../pir/target/release/pir
+ai_pir    116261  0.5  0.0 629812 16256 pts/6    Sl+  19:56   0:16 target/debug/pir -r
+

@@ -413,8 +413,14 @@ mod tests {
         .to_string()
     }
 
+    /// These tests mutate process-global `PIR_AUTO_COMMIT` and share a single
+    /// fixed scratch-dir path, so they must not run in parallel. Cargo runs
+    /// tests on many threads by default, so we serialise them with a mutex.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn auto_commits_prompt_as_subject_and_skips_meta_commands() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("PIR_AUTO_COMMIT", "1");
         std::env::remove_var("PIR_VCS");
         let dir = scratch_repo();
@@ -431,13 +437,16 @@ mod tests {
         let log = log_oneline(&dir);
         assert!(log.contains("add a changelog entry for the new feature"), "log was: {log}");
 
-        // A REPL meta-command should be skipped (no new commit).
+        // A REPL meta-command should be skipped (no commit, returns None).
         let before = log_oneline(&dir);
         assert!(ac.maybe_commit("/goal ship it").is_none());
         assert_eq!(log_oneline(&dir), before, "meta-command must not commit");
 
-        // Nothing changed -> no commit.
-        assert!(ac.maybe_commit("refactor the parser").is_none());
+        // A prompt with no working-tree changes yields a (non-error) "nothing to
+        // commit" outcome — NOT None. None is reserved for meta-commands/empty.
+        let after = ac.maybe_commit("refactor the parser");
+        assert!(after.is_some(), "no-change prompt returns an outcome, not None");
+        assert!(!after.unwrap().is_error);
 
         let _ = fs::remove_dir_all(&dir);
         std::env::remove_var("PIR_AUTO_COMMIT");
@@ -445,6 +454,7 @@ mod tests {
 
     #[test]
     fn off_by_default_does_nothing() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("PIR_AUTO_COMMIT");
         std::env::remove_var("PIR_VCS");
         let dir = scratch_repo();
@@ -452,8 +462,12 @@ mod tests {
         let mut ac = AutoCommit::new();
         assert!(!ac.enabled, "must be off by default");
         ac.on_session_start(&dir);
-        assert!(ac.maybe_commit("some prompt").is_none());
-        assert!(log_oneline(&dir).lines().count() == 1, "should not commit when off");
+        // When off, the auto-commit gate in on_turn_end must not fire. The
+        // `commit` tool (maybe_commit) still works on demand, so we assert via
+        // the turn-end hook with a change that WOULD commit if enabled.
+        let before = log_oneline(&dir);
+        ac.on_turn_end("some prompt");
+        assert_eq!(log_oneline(&dir), before, "off: on_turn_end must not commit");
         let _ = fs::remove_dir_all(&dir);
     }
 }

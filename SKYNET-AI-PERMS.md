@@ -76,9 +76,25 @@ sudo -u ai_rpi sudo ai-apt-install curl      # ai_* apt install (logged)
 - **PAM `pam_wheel group=skynet` on `su`** — gives skynet passwordless `su` to *every* account,
   not just `ai_*`. Too broad. Rejected unless the intent truly is "skynet is all-powerful".
 
-## Notes / hardening
-- `ai_*` users get real shells (`/bin/bash`) and homes so agents can run. `ai_rpi` keeps its
-  `nologin` shell (leave it as-is; nothing forces it open).
+## Adding and removing the security at runtime
+The deployed artifacts (the sudoers gate + the three root-owned wrappers) form the
+"su based security" boundary. `pir` exposes a reversible, root-only toggle so an
+operator can drop/re-apply the delegation without hand-editing files:
+
+```
+/su-security status   # report state of the gate + wrappers (no mutation)
+/su-security off      # disable: rename artifacts to *.disabled (sudo silently
+                     #   ignores any sudoers file containing a '.', so the gate
+                     #   is gone immediately; wrappers become non-executable paths)
+/su-security on       # re-enable: restore the *.disabled artifacts; the sudoers
+                     #   file is re-validated with `visudo -cf` before it is
+                     #   accepted (rollback to disabled on failure)
+```
+
+- Requires root (mirrors `pir project init`). `status` works for any user.
+- Re-enabling when the model was never deployed reports "not installed" rather
+  than fabricating a sudoers file.
+- Nothing is ever deleted — only renamed — so the operation is fully reversible.
 - When `pir` itself runs as an `ai_*` user (via `su-ai`/`become_user`), it defaults to
   **full-auto and will not prompt to confirm each command** — the account is the sandbox boundary.
   Override with `pir --confirm` or `PI_CONFIRM=1` (and `pir -y`/`PI_FULL_AUTO=1` to force it).
