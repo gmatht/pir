@@ -23,11 +23,11 @@
 #    with `--in-place`.
 #
 # Q: What tests should it do?
-#      * Build reproducibility: `cargo build --release --locked` (lockfile must
-#        match; fail if it would need to change).
-#      * Unit tests: `cargo test --release --locked` (e.g. goal.rs parsing,
+#      * Build reproducibility: `cargo build --release`(lockfile must
+#        commitied if it would need to change).
+#      * Unit tests: `cargo test --release` (e.g. goal.rs parsing,
 #        next-step selection, goal persistence).
-#      * Lint gate (errors fail, warnings warn): `cargo clippy --locked` —
+#      * Lint gate (errors fail, warnings warn): `cargo clippy` —
 #        correctness/deny lints (e.g. `never_loop`, panic-in-const) block the
 #        deploy; plain warnings are surfaced but non-fatal.
 #      * Binary smoke tests against the freshly built artifact:
@@ -249,16 +249,16 @@ step_done "external path dependencies materialized (none required)"
 
 # --------------------------------------------------------------- tests + build
 if [ "$TESTS" -eq 1 ]; then
-  step "run unit tests (cargo test --release --locked)"
+  step "run unit tests (cargo test --release)"
   # Capture to a log file (not a live `| tail` pipe) so the run can't be
   # starved by an unrelated process holding the pipeline's write end open, and
   # so the output survives for debugging. We tail the file afterwards.
   _TLOG="$(mktemp "${TMPDIR:-/tmp}/pir-deploy-test.XXXXXX.log")"
-  cargo test --release --locked >"$_TLOG" 2>&1 || true
+  cargo test --release >"$_TLOG" 2>&1 || true
   dbg "cargo test log: $_TLOG ($(wc -l < "$_TLOG") lines)"
   tail -25 "$_TLOG"
   # cargo test fails the pipe with set -o pipefail only if it errors; assert exit:
-  cargo test --release --locked >/dev/null || die "unit tests failed"
+  cargo test --release >/dev/null || die "unit tests failed"
   step_done "unit tests passed"
 else
   say "skipping unit tests (--no-tests / --fast)"
@@ -269,7 +269,7 @@ if [ "$CLIPPY" -eq 1 ]; then
     step "lint gate (cargo clippy; deny-level errors fail)"
     # Capture full output; fail only if clippy emitted a hard error (deny lint
     # or compile failure), not on ordinary warnings.
-    CLIPPY_OUT="$(cargo clippy --release --locked 2>&1)"
+    CLIPPY_OUT="$(cargo clippy --release 2>&1)"
     echo "$CLIPPY_OUT" | grep -E '^(warning|warning:|note:|  -->|[0-9]+ \|)' || true
     if echo "$CLIPPY_OUT" | grep -qE '^error(\[|:)'; then
       die "clippy reported one or more errors (deny-level lint or compile failure)"
@@ -281,8 +281,8 @@ if [ "$CLIPPY" -eq 1 ]; then
   fi
 fi
 
-step "build release (cargo build --release --locked)"
-cargo build --release --locked || die "release build failed"
+step "build release (cargo build --release)"
+cargo build --release || die "release build failed"
 BIN="$SRC/target/release/pir"
 [ -x "$BIN" ] || die "binary not produced at $BIN"
 dbg "BIN=$BIN  size=$(stat -c%s "$BIN" 2>/dev/null || echo '?') bytes"
@@ -358,6 +358,11 @@ if [ "$WITH_PROJECT_INIT" -eq 1 ]; then
   say "  ai_$PROJ provisioned"
   step_done "ai_$PROJ provisioned"
 fi
+
+
+jj commit Cargo.lock -m "automatic Cargo.lock update" ||
+	git commit Cargo.lock -m "automatic Cargo.lock update"
+
 
 # --------------------------------------------------------------- publish to GitHub (opt-in)
 if [ "$PUSH" -eq 1 ] || [ -n "$TAG" ] || [ "$RELEASE" -eq 1 ]; then
