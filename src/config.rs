@@ -30,6 +30,21 @@ pub struct Model {
     pub context: Option<u64>,
     #[serde(alias = "maxTokens")]
     pub max_tokens: Option<u64>,
+    /// Optional per-model API override ("openai", "anthropic", "openai-responses",
+    /// "google"). When set it wins over the provider-level `api`; used by the
+    /// built-in OpenCode Zen catalog where the API varies per model.
+    #[serde(default)]
+    #[serde(skip_deserializing)]
+    pub api_override: Option<String>,
+    /// Optional per-model request URL override (full base URL for this model).
+    #[serde(default)]
+    #[serde(skip_deserializing)]
+    pub url_override: Option<String>,
+    /// Whether this model accepts an OpenAI `reasoning_effort` field. `None`
+    /// means "decide from the API kind as before".
+    #[serde(default)]
+    #[serde(skip_deserializing)]
+    pub no_reasoning_effort: bool,
     /// Optional per-1k-token price (USD) for input/output, used by the
     /// cost/price tracking in `Usage::cost`. Set via `set_price` after loading
     /// from a user-supplied price map; not read from the provider config.
@@ -157,6 +172,30 @@ impl Provider {
     pub fn api_key(&self) -> Option<String> {
         self.api_key.as_ref().and_then(|k| expand_env(k))
     }
+
+    /// The effective API for `model`: the model's own override when present
+    /// (OpenCode Zen's per-model mapping), else the provider-level `api`.
+    pub fn model_api(&self, model: &Model) -> Option<ApiKind> {
+        if let Some(api) = &model.api_override {
+            let a = api.to_lowercase();
+            return if a.contains("anthropic") {
+                Some(ApiKind::Anthropic)
+            } else {
+                Some(ApiKind::OpenAi)
+            };
+        }
+        self.kind()
+    }
+
+    /// The effective request base URL for `model`: the model's own override
+    /// when present, else the provider-level `baseUrl`.
+    pub fn model_base_url<'a>(&'a self, model: &'a Model) -> Option<&'a str> {
+        model
+            .url_override
+            .as_deref()
+            .or(self.base_url.as_deref())
+            .filter(|s| !s.is_empty())
+    }
 }
 
 /// Expand a `{env:VAR}` reference. Returns `None` when `s` begins with
@@ -256,6 +295,9 @@ pub fn load_providers() -> Result<Vec<Provider>, String> {
                             name: mv.get("name").and_then(Value::as_str).map(String::from),
                             context: mv.get("context").or(mv.get("contextWindow")).and_then(Value::as_u64),
                             max_tokens: mv.get("maxTokens").or(mv.get("max_tokens")).and_then(Value::as_u64),
+                            api_override: None,
+                            url_override: None,
+                            no_reasoning_effort: false,
                             price_per_1k: None,
                         });
                     }
@@ -274,6 +316,9 @@ pub fn load_providers() -> Result<Vec<Provider>, String> {
                         name: mv.get("name").and_then(Value::as_str).map(String::from),
                         context: mv.get("context").or(mv.get("contextWindow")).and_then(Value::as_u64),
                         max_tokens: mv.get("maxTokens").or(mv.get("max_tokens")).and_then(Value::as_u64),
+                        api_override: None,
+                        url_override: None,
+                        no_reasoning_effort: false,
                         price_per_1k: None,
                     });
                 }
@@ -396,6 +441,9 @@ fn load_from_auth_fallback() -> Result<Vec<Provider>, String> {
                                 name: None,
                                 context: Some(128000),
                                 max_tokens: Some(8192),
+                                api_override: None,
+                                url_override: None,
+                                no_reasoning_effort: false,
                                 price_per_1k: None,
                             }],
                         });
@@ -986,6 +1034,9 @@ mod select_tests {
             name: Some(name.into()),
             context: Some(1000),
             max_tokens: None,
+            api_override: None,
+            url_override: None,
+            no_reasoning_effort: false,
             price_per_1k: None,
         }
     }
