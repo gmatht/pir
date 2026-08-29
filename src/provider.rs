@@ -446,7 +446,16 @@ impl Client {
         if !allow_effort {
             body.as_object_mut().unwrap().remove("reasoning_effort");
         }
-        (url.to_string(), body)
+        // The override is a BASE URL (e.g. "https://api.cerebras.ai" or
+        // ".../v1"), not a full endpoint: POSTing it verbatim hits
+        // "<base>/chat/completions" — a bare-host 404 with an empty body when
+        // the override lacks the "/v1" path segment. Append the endpoint path
+        // unless the caller already supplied it (or a query string).
+        let mut url = url.trim_end_matches('/').to_string();
+        if !url.ends_with("/chat/completions") && !url.contains('?') {
+            url.push_str("/chat/completions");
+        }
+        (url, body)
     }
 
     /// Rough context window for the current request, used to scale the Anthropic
