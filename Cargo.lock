@@ -1335,6 +1335,7 @@ dependencies = [
  "once_cell",
  "pancurses",
  "thiserror",
+ "unicode-width 0.2.0",
  "wasm-bindgen",
  "web-sys",
  "winapi",
