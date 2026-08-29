@@ -11,7 +11,7 @@ use crate::plugin::{Outcome, Registry, ToolBackend, ToolSpec};
 use crate::term;
 use serde_json::json;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 #[cfg(unix)]
@@ -310,7 +310,143 @@ impl Builtin {
                 Decision::Yes => {}
             }
         }
+        // Guard #2: privilege escalation (`sudo`/`su`/...). `sudo` prompts for a
+        // password on `/dev/tty` — NOT on the stdin we hand it (which is
+        // `/dev/null`), so it would block forever until the 10-minute detach,
+        // looking exactly like the "hangs waiting for stdin" bug. We never let a
+        // command silently sit there waiting on a password: we ask the user to
+        // approve the escalation and, unless they already hold a passwordless
+        // sudo rule, we refuse and tell them how to escalate out-of-band
+        // (the rootreq / ai-permctl "request, don't take" model). This makes the
+        // agent prompt before escalating and never blocks on a TTY password.
+        if let Some(esc) = Self::priv_escalation(command) {
+            match self.request_priv_escalation(command, esc) {
+                Ok(()) => {}
+                Err(msg) => return Ok(msg),
+            }
+        }
         run_shell(self, command)
+    }
+
+    /// Detect a command that escalates privilege. We don't try to parse the
+    /// shell — just look for the obvious escalation shapes (`sudo …`, `su …`,
+    /// `doas …`). Returns a short human label of *what* the command escalates to
+    /// when one is found, else `None`. The leading token is checked at a word
+    /// boundary so substrings like `mesudo` don't trigger it.
+    fn priv_escalation(command: &str) -> Option<String> {
+        let c = command.trim();
+        // Whole-word scan: an escalation token is a word boundary on both
+        // sides (start/space/quote/paren/`|`/`;`/`&` on the left, and
+        // whitespace/quote/paren/`|`/`;`/`&`/end on the right). This lets us
+        // catch both leading tokens and inline ones inside `bash -c '…'`
+        // without a real shell parser, while ruling out false hits like
+        // `mesudo`.
+        let word_at = |pat: &str| -> bool {
+            let mut start = 0;
+            while let Some(pos) = c[start..].find(pat) {
+                let idx = start + pos;
+                let before_ok = idx == 0
+                    || c.as_bytes()[idx - 1].is_ascii_whitespace()
+                    || matches!(c.as_bytes()[idx - 1], b'\'' | b'"' | b'(' | b'|' | b';' | b'&');
+                let after = idx + pat.len();
+                let after_ok = after >= c.len()
+                    || c.as_bytes()[after].is_ascii_whitespace()
+                    || matches!(c.as_bytes()[after], b'\'' | b'"' | b')' | b'|' | b';' | b'&');
+                if before_ok && after_ok {
+                    return true;
+                }
+                start = after;
+            }
+            false
+        };
+
+        let sudo_present = word_at("sudo") || word_at("sudoedit");
+        let su_present = word_at("su");
+        let doas_present = word_at("doas");
+
+        if sudo_present {
+            // `sudo -u <user>` => that user; `sudo -i` => root login shell;
+            // bare `sudo` => root.
+            if let Some(rest) = c.find("sudo").and_then(|i| c[i + 4..].trim().strip_prefix("-u ")) {
+                let user = rest.split_whitespace().next().unwrap_or("root");
+                return Some(format!("sudo as {user}"));
+            }
+            let after_sudo = c.find("sudo").map(|i| &c[i + 4..]).unwrap_or("");
+            if after_sudo.trim_start().starts_with("-i") {
+                return Some("sudo as root (login shell)".into());
+            }
+            return Some("sudo as root".into());
+        }
+        if doas_present {
+            return Some("doas (privilege escalation)".into());
+        }
+        if su_present {
+            let after_su = c.find("su").map(|i| &c[i + 2..]).unwrap_or("");
+            let target = after_su.trim_start().split_whitespace().next().unwrap_or("root");
+            return Some(format!("su to {target}"));
+        }
+        None
+    }
+
+    /// Ask the user to approve a privilege-escalating command. Returns `Ok(())`
+    /// if it may run, `Err(msg)` if refused. When stdin is not a terminal (an
+    /// unattended agent, or a piped prompt), there is no human to type a
+    /// password, so we *never* wait: if the calling user already holds a
+    /// passwordless sudo rule for this command we let it run inline (a quick
+    /// non-interactive probe, see `sudo_is_passwordless`), otherwise we refuse
+    /// and point them at the proper escalation path. When a human is present we
+    /// prompt, and still verify the password isn't required so the command
+    /// won't hang on `/dev/tty`.
+    fn request_priv_escalation(&self, command: &str, what: String) -> Result<(), String> {
+        if io::stdin().is_terminal() {
+            let answer = term::read_answer(&format!(
+                "{} escalate privilege ({})? [y]es / [n]o (default no) ",
+                term::yellow("⚠"),
+                what
+            ));
+            match answer.as_str() {
+                "y" | "yes" => {}
+                _ => return Err("[denied] user declined to escalate privilege".into()),
+            }
+        }
+        // Either unattended (no tty, refused-by-default is handled above only
+        // for the prompt; here we must still check passwordless), or approved.
+        // In either case, refuse to run if a password prompt would block us.
+        if self.sudo_is_passwordless(command) {
+            return Ok(());
+        }
+        Err(format!(
+            "[denied] refusing to escalate ({what}): a password would be required and pir has no \
+             TTY to read it, so the command would hang. Escalate out-of-band instead — e.g. via the \
+             rootreq flow (`request_root`), or run the command yourself in a shell where sudo is \
+             passwordless (NOPASSWD in sudoers)."
+        ))
+    }
+
+    /// Non-interactively probe whether `sudo` for this command needs a password.
+    /// `sudo -n` (non-interactive) returns exit status 1 (and a "password
+    /// required" error) when auth is needed, and 0 when the rule already allows
+    /// passwordless execution. We run a harmless `sudo -n true` rather than the
+    /// real command so we don't accidentally execute escalated work just to test
+    /// it; if `-n true` is allowed, the user clearly has *some* passwordless
+    /// sudo and we honour the approved escalation. Returns true when no
+    /// password is required.
+    fn sudo_is_passwordless(&self, _command: &str) -> bool {
+        #[cfg(unix)]
+        {
+            let r = std::process::Command::new("sudo")
+                .arg("-n")
+                .arg("true")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            matches!(r, Ok(code) if code.success())
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
     }
 
     /// Return `Some(reason)` if `command` looks like it would terminate `pir`
@@ -1083,5 +1219,57 @@ mod esc_tests {
             "job_kill took {elapsed:?} — the escaped-grandchild hang is back"
         );
         assert!(out.contains("job#1"), "unexpected job_kill reply: {out}");
+    }
+}
+
+#[cfg(test)]
+mod priv_escalation_tests {
+    use super::*;
+
+    // sudo/su/doas shapes are detected and labelled with the target user.
+    #[test]
+    fn detects_sudo_su_doas_escalation() {
+        assert_eq!(Builtin::priv_escalation("sudo ls"), Some("sudo as root".into()));
+        assert_eq!(
+            Builtin::priv_escalation("sudo -u ai_x id"),
+            Some("sudo as ai_x".into())
+        );
+        assert_eq!(
+            Builtin::priv_escalation("sudo -i"),
+            Some("sudo as root (login shell)".into())
+        );
+        assert_eq!(Builtin::priv_escalation("su"), Some("su to root".into()));
+        assert_eq!(Builtin::priv_escalation("su postgres"), Some("su to postgres".into()));
+        assert_eq!(
+            Builtin::priv_escalation("doas reboot"),
+            Some("doas (privilege escalation)".into())
+        );
+    }
+
+    // Inline escalation buried inside `bash -c '…'` is still caught.
+    #[test]
+    fn detects_inline_sudo_in_bash_c() {
+        assert!(Builtin::priv_escalation("bash -c 'sudo rm -rf /'").is_some());
+        assert!(Builtin::priv_escalation("echo hi && su root").is_some());
+    }
+
+    // Ordinary commands must NOT be mistaken for escalation.
+    #[test]
+    fn no_false_positive_for_plain_commands() {
+        assert_eq!(Builtin::priv_escalation("echo mesudo"), None);
+        assert_eq!(Builtin::priv_escalation("cargo build"), None);
+        assert_eq!(Builtin::priv_escalation("git status"), None);
+        assert_eq!(Builtin::priv_escalation("sudoedit"), Some("sudo as root".into()));
+    }
+
+    // Non-interactive sudo probe must be non-blocking and only true when
+    // passwordless sudo is genuinely available. On a box where it is not, it
+    // returns false (so the escalation is refused rather than hanging).
+    #[test]
+    fn passwordless_probe_does_not_block() {
+        let b = Builtin::new(PathBuf::from("."), true, Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        // Just assert it returns promptly and deterministically; the actual
+        // value depends on the test-runner's sudoers, not the code.
+        let _ = b.sudo_is_passwordless("sudo ls");
     }
 }

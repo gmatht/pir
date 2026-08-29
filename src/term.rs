@@ -250,6 +250,15 @@ pub fn highlight(s: &str) -> String {
 pub fn read_answer(prompt: &str) -> String {
     eprint!("{prompt} ");
     let _ = io::stderr().flush();
+    // No human on the other end (piped / scripted / closed stdin): never block
+    // waiting for an answer that will never arrive. Callers treat the empty
+    // string as their safe default (ask → deny), so this also fixes the old
+    // "waits endlessly for stdin when there is no stdin" hang. While a turn is
+    // running, stdin is in non-blocking raw mode, so `read_line` returns Err
+    // and we fall through to the same default instantly.
+    if !io::stdin().is_terminal() {
+        return String::new();
+    }
     let mut s = String::new();
     let _ = io::stdin().read_line(&mut s);
     s.trim().to_lowercase()
