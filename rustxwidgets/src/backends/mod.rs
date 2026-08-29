@@ -50,6 +50,17 @@ pub mod pancurses;
 #[cfg(feature = "pancurses")]
 pub use self::pancurses::init;
 
+#[cfg(feature = "pancurses")]
+pub mod pancurses_draw;
+
+#[cfg(feature = "ratatui")]
+pub mod ratatui;
+#[cfg(all(feature = "ratatui", not(any(feature = "gtk", feature = "gtk4-rs", target_os = "windows", target_arch = "wasm32", target_os = "android", feature = "pancurses", feature = "zork"))))]
+pub use self::ratatui::init;
+
+#[cfg(feature = "headless")]
+pub mod headless;
+
 #[cfg(feature = "zork")]
 pub mod zork;
 #[cfg(feature = "zork")]

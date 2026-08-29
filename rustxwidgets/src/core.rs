@@ -528,6 +528,15 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
 }
 
 /// Run the backend main loop
+    /// Pump the platform event loop `count` iterations without starting the
+    /// main loop (GTK: g_main_context_iteration).  Used after window setup
+    /// so the first frame is drawn before run() blocks.
+    pub fn pump_events(&self, count: usize) {
+        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        crate::backends_gtk_adapter::pump_main_context(count);
+        let _ = count;
+    }
+
     pub fn run(self) -> Result<(), Error> {
         let boxed = Arc::try_unwrap(self.inner).map_err(|_| Error::Backend("failed to take backend app ownership".into()))?;
         boxed.run().map_err(|e| Error::Backend(format!("{}", e)))
@@ -544,6 +553,100 @@ impl From<Box<dyn crate::backends::BackendApp>> for App {
             action_registry: Rc::new(RefCell::new(HashMap::new())),
             #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
             action_group: Rc::new(RefCell::new(None)),
+        }
+    }
+}
+
+/// Backend-agnostic input event.
+///
+/// Every backend translates its native key/input representation into this enum
+/// before handing it to a widget/model, so input handling is identical across
+/// GTK, ratatui, pancurses and the headless recorder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputEvent {
+    Char(char),
+    Enter,
+    Escape,
+    Tab,
+    Backspace,
+    Delete,
+    ArrowUp,
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    F(u8),
+    /// Quit request (e.g. Ctrl-Q / 'q' in viewers).
+    Quit,
+    Unknown,
+}
+
+impl InputEvent {
+    /// Translate a crossterm key event (used by the ratatui backend) into an `InputEvent`.
+    #[cfg(feature = "ratatui")]
+    pub fn from_crossterm(key: crossterm::event::KeyEvent) -> Self {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('c')) {
+            return InputEvent::Quit;
+        }
+        match key.code {
+            KeyCode::Char(c) => InputEvent::Char(c),
+            KeyCode::Enter => InputEvent::Enter,
+            KeyCode::Esc => InputEvent::Escape,
+            KeyCode::Tab => InputEvent::Tab,
+            KeyCode::Backspace => InputEvent::Backspace,
+            KeyCode::Delete => InputEvent::Delete,
+            KeyCode::Up => InputEvent::ArrowUp,
+            KeyCode::Down => InputEvent::ArrowDown,
+            KeyCode::Left => InputEvent::ArrowLeft,
+            KeyCode::Right => InputEvent::ArrowRight,
+            KeyCode::Home => InputEvent::Home,
+            KeyCode::End => InputEvent::End,
+            KeyCode::PageUp => InputEvent::PageUp,
+            KeyCode::PageDown => InputEvent::PageDown,
+            KeyCode::F(n) => InputEvent::F(n),
+            _ => InputEvent::Unknown,
+        }
+    }
+
+    /// Translate a pancurses `Input` (used by the pancurses backend) into an `InputEvent`.
+    #[cfg(feature = "pancurses")]
+    pub fn from_pancurses(input: pancurses::Input) -> Self {
+        use pancurses::Input::*;
+        match input {
+            Character(c) => InputEvent::Char(c),
+            KeyEnter => InputEvent::Enter,
+            KeyExit | KeyCancel => InputEvent::Escape,
+            KeySTab | KeyCTab | KeyCATab => InputEvent::Tab,
+            KeyBackspace => InputEvent::Backspace,
+            KeyDC => InputEvent::Delete,
+            KeyUp => InputEvent::ArrowUp,
+            KeyDown => InputEvent::ArrowDown,
+            KeyLeft => InputEvent::ArrowLeft,
+            KeyRight => InputEvent::ArrowRight,
+            KeyHome => InputEvent::Home,
+            KeyEnd => InputEvent::End,
+            KeyNPage => InputEvent::PageDown,
+            KeyPPage => InputEvent::PageUp,
+            KeyF1 => InputEvent::F(1),
+            KeyF2 => InputEvent::F(2),
+            KeyF3 => InputEvent::F(3),
+            KeyF4 => InputEvent::F(4),
+            KeyF5 => InputEvent::F(5),
+            KeyF6 => InputEvent::F(6),
+            KeyF7 => InputEvent::F(7),
+            KeyF8 => InputEvent::F(8),
+            KeyF9 => InputEvent::F(9),
+            KeyF10 => InputEvent::F(10),
+            KeyF11 => InputEvent::F(11),
+            KeyF12 => InputEvent::F(12),
+            KeyF13 => InputEvent::F(13),
+            KeyF14 => InputEvent::F(14),
+            KeyF15 => InputEvent::F(15),
+            _ => InputEvent::Unknown,
         }
     }
 }

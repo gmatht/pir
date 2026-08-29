@@ -120,6 +120,10 @@ mod gtk_backend {
         let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
         gtk_dynamic_loader::TextView::new(loader.clone())
     }
+    pub fn create_scrolled_window() -> Result<gtk_dynamic_loader::ScrolledWindow, gtk_dynamic_loader::Error> {
+        let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
+        gtk_dynamic_loader::ScrolledWindow::new(loader.clone())
+    }
 
     pub fn create_drawing_area() -> Result<gtk_dynamic_loader::DrawingArea, gtk_dynamic_loader::Error> {
         let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
@@ -147,4 +151,4 @@ mod gtk_backend {
     }
 }
 
-pub use gtk_backend::{init, create_window, create_button, create_label, create_box, create_grid, create_entry, create_menu, create_simple_action, create_menubar, create_dialog, create_dropdown, create_checkbutton, create_radiobutton, create_textview, create_drawing_area, create_overlay, loader, quit_main_loop};
+pub use gtk_backend::{init, create_window, create_button, create_label, create_box, create_grid, create_entry, create_menu, create_simple_action, create_menubar, create_dialog, create_dropdown, create_checkbutton, create_radiobutton, create_textview, create_scrolled_window, create_drawing_area, create_overlay, loader, quit_main_loop};
