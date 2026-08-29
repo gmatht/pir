@@ -71,17 +71,34 @@
 
 set -euo pipefail
 
+# --------------------------------------------------------------- WSL build (portable glibc)
+# Run cargo/rustc inside a WSL distro so the release binary targets an older
+# glibc (AlmaLinux8 -> glibc 2.28) and runs on any modern distro. wsl.exe
+# emits a stray NUL byte on stdout (a Windows pty quirk); the wrappers strip
+# it so command substitution and the build logs stay clean, while preserving
+# the real cargo/rustc exit code (via PIPESTATUS). Engaged only when wsl.exe
+# is executable AND the distro is actually registered (tolerating the leading
+# "*" default-distro marker in `wsl -l -v`).
 WSL_EXEC='/mnt/c/Program Files/WSL/wsl.exe'
-# We wrap the cargo commands to run in the AlmaLinux8 distro.
-# This assumes the AlmaLinux8 distro is installed and configured in WSL.
-# The cargo commands are executed inside the container while keeping the 
-# current working directory (which is shared/mounted).
-cargo() {
-  "$WSL_EXEC" -d AlmaLinux8 cargo "$@"
-}
-rustc() {
-  "$WSL_EXEC" -d AlmaLinux8 rustc "$@"
-}
+WSL_DISTRO="${WSL_DISTRO:-AlmaLinux8}"
+_use_wsl=0
+if [ "${PIR_NO_WSL:-0}" != "1" ] && [ -x "$WSL_EXEC" ]; then
+  if "$WSL_EXEC" -l -v 2>/dev/null | awk -v d="$WSL_DISTRO" '
+       NR>1 { for (i=1;i<=NF;i++) if (tolower($i)==tolower(d)) f=1 } END{exit f?0:1}'; then
+    _use_wsl=1
+  fi
+fi
+
+if [ "$_use_wsl" -eq 1 ]; then
+  # Build inside the WSL distro; working dir is shared/mounted. Strip the NUL
+  # that wsl.exe injects, and return cargo/rustc's true exit status.
+  cargo() { "$WSL_EXEC" -d "$WSL_DISTRO" cargo "$@" 2>&1 | tr -d '\0'; return "${PIPESTATUS[0]}"; }
+  rustc()  { "$WSL_EXEC" -d "$WSL_DISTRO" rustc "$@" 2>&1 | tr -d '\0'; return "${PIPESTATUS[0]}"; }
+  say "using WSL distro '$WSL_DISTRO' for cargo/rustc builds"
+else
+  cargo() { command cargo "$@"; }
+  rustc()  { command rustc "$@"; }
+fi
 
 
 # --------------------------------------------------------------- args
