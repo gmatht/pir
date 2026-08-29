@@ -175,6 +175,7 @@ step() {
   _step_t0="$(date +%s.%N)"
   printf '\033[1;36m[deploy] \033[1;35mstep %d/%d\033[0m %s\n' \
     "$_step_no" "${_STEP_TOTAL:-?}" "$*"
+  date
 }
 # step_done: print elapsed time for the last step (debug/verbose only).
 step_done() {
