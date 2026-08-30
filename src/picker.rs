@@ -462,3 +462,6 @@ fn translate_result(res: &term::raw::RawInput, buf: &str) -> Key {
         }
     }
 }
+
+#[cfg(not(unix))]
+pub fn pick_session(_items: &[PickItem]) -> PickResult { PickResult::Resume }

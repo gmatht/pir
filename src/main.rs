@@ -1061,9 +1061,9 @@ fn main() {
                     // partial input line is left intact in `input_buf`/`buf`.
                     if let Ok(mut g) = typeahead.lock() { g.clear(); }
                     term::raw::disable_raw();
-                    unsafe {
-                        libc::raise(libc::SIGTSTP);
-                    }
+                    #[cfg(unix)]
+
+                    unsafe { libc::raise(libc::SIGTSTP); }
                     term::raw::enable_raw();
                 }
                 term::raw::RawInput::None => { /* turn finished / no input; re-check loop */ }

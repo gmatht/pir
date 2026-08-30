@@ -314,7 +314,7 @@ pub fn run(
     status.set_xalign(0.0); // left-align
     vbox.append(&status);
 
-    let tabs = app.create_tabview()?;
+    let tabs = app.create_tabview().map_err(|e| format!("tabview: {e}"))?;
     let _tab = tabs.add_tab(&format!("session"))?;
     let panel = tabs.tab_box(0)?;
     panel.append(&vbox);
