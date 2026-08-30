@@ -12,10 +12,11 @@
 //!                  last thinking + response. It updates live as you move.
 //!
 //! Enter / Right resumes the highlighted session; `y` resumes the newest (index
-//! 0) for convenience; `n` / Esc / ctrl-c / ctrl-d / `q` abort (start a fresh
-//! session). This is a hand-rolled raw-mode renderer (no ratatui dependency —
-//! it must work in the default build), drawing into the terminal and restoring
-//! it on exit.
+//! 0) for convenience; `f`/`F` marks the highlighted session finished (so it
+//! drops out of `/unfinished` and the picker itself) without resuming it;
+//! `n` / Esc / ctrl-c / ctrl-d / `q` abort (start a fresh session). This is a
+//! hand-rolled raw-mode renderer (no dependency — it must work in the
+//! default build), drawing into the terminal and restoring it on exit.
 
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
@@ -36,12 +37,19 @@ pub struct PickItem {
     pub mtime: SystemTime,
     pub path: std::path::PathBuf,
     pub preview_line: String,
+    /// Reader-friendly conversation name from the background "light" model
+    /// (e.g. `cerebras/gemma4`). Empty until generated (or when unavailable /
+    /// throttled). The picker shows it when present, else the preview line.
+    pub title: String,
 }
 
 /// Outcome of the picker.
 pub enum PickResult {
     /// Resume the session at this index (into the sorted candidate list).
     Resume(usize),
+    /// Mark the session at this index finished (drop it out of `/unfinished`
+    /// and the picker itself) without resuming it. Used by the `f`/`F` key.
+    Finish(usize),
     /// Don't resume anything — start a fresh session.
     Cancel,
 }
@@ -102,6 +110,7 @@ pub fn pick_session(items: &[PickItem]) -> PickResult {
             Key::PageDown => selected = (selected + page_step(items.len())).min(items.len() - 1),
             Key::Enter | Key::Right => break PickResult::Resume(selected),
             Key::Char('y') => break PickResult::Resume(0), // newest, like the old `y=latest`
+            Key::Char('f') | Key::Char('F') => break PickResult::Finish(selected), // mark finished, don't resume
             Key::Char('n') | Key::Char('q') | Key::Esc | Key::CtrlC | Key::CtrlD => {
                 break PickResult::Cancel;
             }
@@ -160,7 +169,7 @@ fn draw(items: &[PickItem], selected: usize, preview: &SessionPreview, drawn_row
     // Header line.
     buf.extend_from_slice(
         term::bold(
-            "resume a session  ↑/↓ (or j/k) move · enter resume · y=latest · n=skip\n",
+            "resume a session  ↑/↓ (or j/k) move · enter resume · y=latest · f=mark finished · n=skip\n",
         )
         .as_bytes(),
     );
@@ -225,6 +234,12 @@ fn draw(items: &[PickItem], selected: usize, preview: &SessionPreview, drawn_row
     // Right pane: the preview, overlaid at column list_w+1, rows 2.. .
     let mut pcol: Vec<String> = Vec::new();
     pcol.push(term::bold("preview").to_string());
+    // Show the generated conversation title at the top of the preview when the
+    // background "light" model has produced one (empty otherwise); this is the
+    // same title `list_sessions` prints, kept in sync so both views agree.
+    if !items[selected].title.is_empty() {
+        pcol.push(term::green(&items[selected].title));
+    }
     if preview.turns == 0 {
         pcol.push(term::dim("(empty session — no prompts yet)").to_string());
     } else {

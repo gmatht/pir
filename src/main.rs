@@ -8,6 +8,7 @@ mod project;
 mod provider;
 mod session;
 mod term;
+mod titler;
 mod types;
 mod user;
 mod security;
@@ -191,17 +192,20 @@ CONFIG (reused from pi, never modified)
   ~/.pi/agent/projects.json  project -> execution-user mappings (set by `pir project init`)
 
 PER-PROJECT USERS
-  `pir project init` creates a non-login user ai_<project> owning the cwd so
-  all commands run as that user. Re-run as root, or `sudo -u ai_<project> pir`.
-  When the sandbox user can't reach the working directory (e.g. a parent dir
-  is another user's 0700 home), pir offers a wizard: move/clone the project
-  into the user's home, or skip the privilege drop entirely (no sandbox).
+  `pir project init` creates a non-login user ai_<project> owning the cwd. When
+  you run `pir` as root (or `sudo -u ai_<project> pir`), only the model's
+  commands are sandboxed to that user — `pir` itself stays your identity. The
+  sandbox boundary is "drop privs for the agents, not the user": the operator
+  keeps authority (`/sh -u`, legitimate writes) while the agent's `bash` tool
+  is confined to ai_<project>. When the sandbox user can't reach the working
+  directory (e.g. a parent dir is another user's 0700 home), pir offers a wizard:
+  move/clone the project into the user's home, or skip the sandbox entirely.
 
 AGENT USERS RUN UNATTENDED
-  When pir is running as an ai_* user (a per-project/agent sandbox), it
-  defaults to full-auto and will NOT prompt to confirm each command — the
-  sandbox boundary is the user account itself. Use `pir -c`/`--confirm` or set
-  PIR_CONFIRM=1 to force prompts even as an ai_* user.
+  When the agent's commands run as an ai_* user (a per-project/agent sandbox),
+  the model's tool commands default to full-auto and are NOT individually
+  confirmed — the sandbox boundary is the user account itself. Use `pir -c`/
+  `--confirm` or set PIR_CONFIRM=1 to force prompts even with a sandbox user.
 
 COMMANDS
   /help  /model <sel>  /models  /default-model <sel>  /sessions  /goal [objective]  /goal start [objective]  /continue
@@ -211,6 +215,7 @@ COMMANDS
                           whether streamed reasoning is displayed; no arg = status
   /model* <sel>  /model-all <sel>   broadcast a model switch to ALL your open pir terminals (also sets the new default)
   /bg <text>  /jobs  /fg <id>  /clear  /usage  /exit
+  /finished               mark this session done — it drops out of /unfinished (until then, sessions stay open)
   /undo [all]             revert the last file edit (or all) to its pre-edit state
   /sh [cmd args]         drop to a shell, or run a command via $SHELL (sh -c)
                         /sh -u [user] starts the shell as another user
@@ -579,56 +584,82 @@ fn main() {
     };
     term::set_model_providers(&providers);
 
-    // Drop privileges to the per-project user *after* config/providers are
-    // loaded but *before* the agent (and any tool) runs. On non-unix this is a
-    // no-op. All `bash`/file tools then execute as that user automatically.
+    // Configure per-project sandboxing: the *agents'* commands run as the
+    // per-project `ai_X` user, but `pir` itself stays the invoking identity
+    // (the operator, typically root). This is the "drop privs for the agents,
+    // not the user" boundary — the operator keeps their authority (`/sh -u`,
+    // legitimate fs writes, …) and only the untrusted commands the model spawns
+    // (the `bash` tool) are confined to `ai_X`, in their child `before_exec`
+    // (see `user::drop_to_agent_user`). We deliberately do NOT `become_user`
+    // the whole process — that used to sandbox the *operator* instead of the
+    // *agent*.
     //
-    // IMPORTANT: `become_user` rewrites `HOME` to the target (sandbox) user's
-    // real home, so `config::pi_dir()` now points at `~<user>/.pi`. We therefore
-    // resolve the *default* model **after** this drop (see below): the startup
-    // read and the `/default-model` write must consult the same settings file,
-    // otherwise the choice is silently lost on restart — the early read used to
-    // happen under the invoking user's HOME while the write happened under the
-    // (dropped-to) sandbox user's HOME.
-    #[cfg(unix)]
+    // `resolved_user` records the sandbox user purely for status display (the
+    // "running commands as ai_X" line) and does not change `pir`'s own
+    // identity. The bash command performs the actual drop; `pir` must stay
+    // privileged for that child drop to succeed.
     let resolved_user: Option<String> = {
         let target = as_user.clone().unwrap_or_else(|| {
             crate::config::resolve_project_user(None, project_name.as_deref())
         });
-        // Before dropping, check the sandbox user can actually reach the cwd.
-        // If not, offer a wizard to relocate/clone the project (or skip the
-        // drop entirely) so the agent doesn't later silently fail to read files
-        // because a parent dir (e.g. another user's 0700 home) is unreadable.
-        let wizard = crate::user::cwd_accessibility_wizard(&target);
-        let mut skip_drop = false;
-        match wizard {
-            Ok(crate::user::AccessibilityAction::Relocated(dest)) => {
-                // Re-root the process at the relocated/clone copy before the
-                // drop, so the agent's cwd is one the sandbox user owns.
-                if let Err(e) = std::env::set_current_dir(&dest) {
-                    eprintln!("pir: could not chdir to {} ({}); dropping anyway", dest.display(), e);
-                }
-            }
-            Ok(crate::user::AccessibilityAction::SkipDrop) => {
-                skip_drop = true;
-            }
-            Ok(crate::user::AccessibilityAction::Proceed) => {}
-            Err(e) => {
-                eprintln!("pir: accessibility check skipped ({e}); dropping anyway");
-            }
-        }
-        if skip_drop {
-            // Honour the user's choice not to sandbox: run as the invoking user.
+        if target == "root" {
+            // No sandbox requested: agent commands run as the invoking user.
             None
         } else {
-            if let Err(e) = crate::user::become_user(&target) {
-                die(&e);
+            let euid = {
+                #[cfg(unix)]
+                { unsafe { libc::geteuid() } }
+                #[cfg(not(unix))]
+                { 0u32 }
+            };
+            let already_target = {
+                #[cfg(unix)]
+                { euid != 0 && crate::user::name_of_uid(euid).as_deref() == Some(target.as_str()) }
+                #[cfg(not(unix))]
+                { false }
+            };
+            if already_target {
+                // Launched as the sandbox identity (`sudo -u ai_X pir`): no
+                // extra drop needed — the agent's commands already inherit it.
+                None
+            } else if euid == 0 {
+                // Root: confine the agent's commands to `ai_X`. Since we no
+                // longer drop the whole process, the accessibility wizard can
+                // only relocate/clone (which we honour) — it never needs to
+                // "skip" a process-level drop.
+                let wizard = crate::user::cwd_accessibility_wizard(&target);
+                let skip = matches!(wizard, Ok(crate::user::AccessibilityAction::SkipDrop));
+                match wizard {
+                    Ok(crate::user::AccessibilityAction::Relocated(dest)) => {
+                        if let Err(e) = std::env::set_current_dir(&dest) {
+                            eprintln!("pir: could not chdir to {} ({}); continuing", dest.display(), e);
+                        }
+                    }
+                    Ok(crate::user::AccessibilityAction::Proceed) => {}
+                    Ok(crate::user::AccessibilityAction::SkipDrop) => {
+                        // User chose not to sandbox: don't confine the agent.
+                    }
+                    Err(e) => {
+                        eprintln!("pir: accessibility check skipped ({e}); continuing");
+                    }
+                }
+                if skip {
+                    None
+                } else {
+                    crate::user::set_agent_exec_user(&target);
+                    Some(target)
+                }
+            } else {
+                // Not root and not already the target: we can't drop the
+                // agent's commands either, so run as the invoking user.
+                eprintln!(
+                    "pir: not privileged — agent commands will run as the invoking user (re-run as root, \
+                     or `sudo -u {target} pir ...` to sandbox them to {target})"
+                );
+                None
             }
-            Some(target)
         }
     };
-    #[cfg(not(unix))]
-    let resolved_user: Option<String> = None;
 
     // Resolve the model. Priority: explicit -m/PI_MODEL on the INVOKING
     // user's command line, then the default persisted in `~/.pi/agent/
@@ -795,6 +826,7 @@ fn main() {
     // return immediately (notifications fire when it finishes). The closure
     // rebuilds the agent in the background thread so ownership stays simple.
     if let Some(prompt) = bg_prompt.clone() {
+        let bg_log = agent.log_path.clone().unwrap_or_default();
         let mut jobs = BackgroundJobs::new();
         let provider = provider.clone();
         let model = model.clone();
@@ -806,14 +838,19 @@ fn main() {
                     .expect("agent build in background thread")
             }
         });
+        // Name this conversation in the background (cheap light model), throttled.
+        titler::maybe_generate_title(Some(&bg_log));
         agent.notify_on_exit(agent.idle_event());
         return;
     }
     if !prompt.is_empty() {
+        let one_shot_log = agent.log_path.clone();
         match agent.turn(&prompt.join(" ")) {
             Ok(()) => agent.notify_on_exit(agent.turn_done_event()),
             Err(e) => agent.notify_on_exit(agent.error_event(e)),
         }
+        // Name this conversation in the background (cheap light model), throttled.
+        titler::maybe_generate_title(one_shot_log.as_ref());
         return;
     }
 
@@ -968,6 +1005,11 @@ fn main() {
     let mut fg_handle: Option<JoinHandle<()>> = None;
     // Prompts queued by the user while a turn runs (submitted on Enter).
     let mut pending: Vec<String> = Vec::new();
+    // When a foreground turn has just completed and we're back at the idle
+    // prompt, the user hasn't pressed a key yet — show the configurable "done"
+    // placeholder (see `term::done_prompt`) in place of the plain `❯ ` prompt
+    // until they start typing. Reset on the first keypress.
+    let mut awaiting_input = false;
     // Partial line buffer for the raw-mode input while a turn runs.
     let mut input_buf = String::new();
     // `typeahead` (the *same* Arc the agent + spinner thread were built with,
@@ -1008,6 +1050,12 @@ fn main() {
                 // never block the input thread for long.
                 let _ = join_with_timeout(h, Duration::from_millis(500));
                 term::raw::disable_raw();
+                // The turn just finished and control is about to return to the
+                // idle prompt with nothing queued: mark that we're awaiting the
+                // user's first keystroke so the REPL shows the configurable
+                // "done" placeholder (see `term::done_prompt`) instead of the
+                // plain `❯ ` prompt until they start typing.
+                awaiting_input = true;
                 // Report token usage from the (now-returned) agent.
                 if let Some(a) = agent_slot.lock().unwrap().as_ref() {
                     term::out(&term::dim(&format!(
@@ -1257,12 +1305,26 @@ fn main() {
                 ))),
             }
         }
-        match term::read_line(&format!("{} ", term::cyan("❯"))) {
+        // The idle prompt. While we're awaiting the user's first keystroke after
+        // a turn completed (and nothing was queued/continued), show the
+        // configurable "done" placeholder (`✓ DONE :) -- ✓ DONE :) --` in
+        // bright yellow) instead of the plain `❯ ` prompt, so it's obvious the
+        // task is done and pir is waiting for input. The moment the user types
+        // anything (or a slash command), we go back to the normal prompt.
+        let prompt = if awaiting_input {
+            term::done_prompt()
+        } else {
+            format!("{} ", term::cyan("❯"))
+        };
+        match term::read_line(&prompt) {
             None => {
                 println!();
                 break;
             }
-            Some(s) => line = s,
+            Some(s) => {
+                awaiting_input = false;
+                line = s;
+            }
         }
         let input = line.trim();
         if input.is_empty() {
@@ -1336,6 +1398,12 @@ pub(crate) fn run_foreground_turn(
             Err(e) => a.error_event(e),
         };
         a.notify_on_exit(ev);
+        // Ask the cheap "light" model (cerebras/gemma4 by default) to name this
+        // conversation from its last few prompts. Runs on a detached worker,
+        // throttled process-wide, and never touches stdout — so the user's
+        // foreground session is never interrupted, and we within
+        // Cerebras's strict per-minute token limits.
+        titler::maybe_generate_title(a.log_path());
         *slot.lock().unwrap() = Some(a);
         // Wake the REPL's event-driven wait so it joins this handle immediately.
         let _ = done.try_send(());
@@ -1740,6 +1808,25 @@ fn handle_command(
             // no live process is currently driving.
             print!("{}", session::list_unfinished());
         }
+        "finished" => {
+            // Explicitly mark the *current* session finished so it drops out of
+            // /unfinished and the `pir -r` picker. A session is left "unfinished"
+            // after every turn — even a clean completion — until this is run
+            // (or `f`/`F` while browsing in `pir -r`). It stays reopenable with
+            // /fg or `pir -r <token>` if you want it later.
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                eprintln!("pir: agent busy (turn running) — try again when idle");
+                return;
+            };
+            match &agent.log_path {
+                Some(p) => {
+                    crate::session::mark_finished(p);
+                    println!("{} session marked finished — it drops out of /unfinished", term::green("✓"));
+                }
+                None => eprintln!("pir: no session log (one-shot session) — nothing to mark finished"),
+            }
+        }
         "resume" | "res" => {
             // Resume an unfinished session (from `/unfinished`, index 0 = newest)
             // into the *current* interactive agent and, if a goal is attached,
@@ -2141,6 +2228,12 @@ fn list_sessions() -> String {
         );
         out.push_str(&line);
         out.push('\n');
+        // Print the generated conversation title on its own line when the light
+        // model has produced one — otherwise fall back to the first-prompt
+        // preview already shown above (the title is purely cosmetic).
+        if !s.title.is_empty() {
+            out.push_str(&format!("        {}\n", term::green(&s.title)));
+        }
     }
     out.push_str(&term::dim(
         "resume with: pir -r <idx|time|preview>  (omit token => latest from this shell)\n",
@@ -2205,6 +2298,20 @@ fn resolve_resume(token: Option<&str>) -> Option<PathBuf> {
                             return Some(s.path.clone());
                         }
                     }
+                    crate::picker::PickResult::Finish(idx) => {
+                        // Mark the highlighted session finished so it drops out
+                        // of /unfinished (and the picker itself) on the next
+                        // scan. It stays reopenable with /fg or `pir -r <token>`
+                        // if the user wants it later. We don't resume it.
+                        if let Some(s) = sessions.get(idx) {
+                            crate::session::mark_finished(&s.path);
+                            eprintln!(
+                                "pir: marked session {} finished — it drops out of /unfinished",
+                                s.name
+                            );
+                        }
+                        return None;
+                    }
                     crate::picker::PickResult::Cancel => {
                         eprintln!("pir: ok — not resuming (start fresh, or `pir -r <idx>` next time)");
                         return None;
@@ -2239,6 +2346,10 @@ struct Session {
     shell_pid: u32,
     mtime: std::time::SystemTime,
     preview: String,
+    /// A reader-friendly name for the conversation generated in the background
+    /// by the (cheap) "light" model (e.g. `cerebras/gemma4`). Empty until the
+    /// light model has produced one (or when it isn't configured / is throttled).
+    title: String,
 }
 
 /// Build the candidate list for the interactive `pir -r` picker from a scanned
@@ -2256,6 +2367,7 @@ fn build_pick_items(sessions: &[Session], my_pid: u32) -> Vec<crate::picker::Pic
             mtime: s.mtime,
             path: s.path.clone(),
             preview_line: s.preview.clone(),
+            title: String::new(),
         })
         .collect()
 }
@@ -2301,9 +2413,37 @@ fn scan_sessions() -> Option<Vec<Session>> {
             .unwrap_or(0);
         let mtime = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
         let preview = first_user_line(&path);
-        out.push(Session { path, name, shell_pid, mtime, preview });
+        // Skip empty sessions with no prompts: they're noise in `pir -r` (and
+        // `/sessions`) — there's nothing to show or resume. A session only
+        // counts once the user has actually entered at least one prompt.
+        if count_user_turns(&path) == 0 {
+            continue;
+        }
+        // A reader-friendly name for the conversation, generated in the
+        // background by the cheap "light" model (e.g. `cerebras/gemma4`). Empty
+        // until the light model has produced one (or when it isn't configured /
+        // is throttled / hasn't run yet). The UI shows the title when present,
+        // otherwise falls back to the first-prompt preview.
+        let title = titler::display_title(&path);
+        out.push(Session { path, name, shell_pid, mtime, preview, title });
     }
     Some(out)
+}
+
+/// Count the number of user prompts (turns) recorded in a session Used by
+/// [`scan_sessions`] to drop empty sessions that have no prompts yet.
+fn count_user_turns(path: &PathBuf) -> usize {
+    let mut n = 0;
+    if let Ok(f) = std::fs::File::open(path) {
+        for line in std::io::BufReader::new(f).lines().flatten() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                if v.get("role").and_then(|r| r.as_str()) == Some("user") {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
 }
 
 fn first_user_line(path: &PathBuf) -> String {

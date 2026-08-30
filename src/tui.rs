@@ -193,6 +193,11 @@ struct TuiState {
     /// A transient hint/suggestion shown in the footer (e.g. the options for a
     /// typed `/` command, or completions revealed by Tab).
     hint: String,
+    /// True once a turn has finished and we're back at the idle footer with no
+    /// draft typed yet — so the footer shows the configured "done" placeholder
+    /// (`✓ DONE :) -- ✓ DONE :) --`, bright yellow by default) in place of the
+    /// plain `❯ ` prompt until the user starts typing. Reset when they do.
+    awaiting_input: bool,
 }
 
 impl TuiState {
@@ -211,6 +216,7 @@ impl TuiState {
             next_bg_id: 1,
             show_thinking: true,
             hint: String::new(),
+            awaiting_input: false,
         }
     }
 
@@ -305,6 +311,10 @@ fn run_inner(
                     } else {
                         state.running = false;
                         state.status = "idle".into();
+                        // A turn finished and nothing was queued/continued: we're
+                        // awaiting the user's first keystroke, so the footer shows
+                        // the configured "done" placeholder until they type.
+                        state.awaiting_input = true;
                     }
                 }
             }
@@ -564,10 +574,22 @@ fn draw(
             status.to_string(),
             Style::default().fg(if running { Color::Cyan } else { Color::Gray }),
         )));
-        footer_lines.push(Line::from(vec![
-            Span::styled("❯ ", Style::default().fg(Color::Green)),
-            Span::raw(draft.to_string()),
-        ]));
+        // The draft line. While idle and awaiting the user's first keystroke
+        // after a turn completed, show the configured "done" placeholder in
+        // bright yellow (default) instead of the plain `❯ ` prompt, so it's
+        // obvious the task finished and pir is waiting. The moment they type,
+        // `update_tui_hint`/the idle loop clears `awaiting_input`.
+        if !running && state.awaiting_input && draft.is_empty() {
+            footer_lines.push(Line::from(Span::styled(
+                format!("❯ {}", crate::term::DONE_PROMPT_TEXT),
+                Style::default().fg(done_prompt_color()),
+            )));
+        } else {
+            footer_lines.push(Line::from(vec![
+                Span::styled("❯ ", Style::default().fg(Color::Green)),
+                Span::raw(draft.to_string()),
+            ]));
+        }
         // Status line: workspace + model in use (dimmed).
         footer_lines.push(Line::from(Span::styled(
             format!("  workspace: {workspace}   model: {model}"),
@@ -829,7 +851,32 @@ fn complete_idle(buf: &str) -> Option<String> {
     None
 }
 
-/// Longest common prefix of a set of strings (empty when empty/inconsistent).
+/// Map the configured "done" prompt colour token (shared with the streaming
+/// REPL via `term::done_prompt_color_token`) to a ratatui `Color`. Defaults to
+/// bright yellow. Falls back to bright yellow for unknown tokens.
+fn done_prompt_color() -> Color {
+    match crate::term::done_prompt_color_token().as_str() {
+        "yellow" => Color::Yellow,
+        "bright-yellow" => Color::LightYellow,
+        "green" => Color::Green,
+        "bright-green" => Color::LightGreen,
+        "red" => Color::Red,
+        "bright-red" => Color::LightRed,
+        "cyan" => Color::Cyan,
+        "bright-cyan" => Color::LightCyan,
+        "blue" => Color::Blue,
+        "bright-blue" => Color::LightBlue,
+        "magenta" => Color::Magenta,
+        "bright-magenta" => Color::LightMagenta,
+        "white" => Color::White,
+        "bright-white" => Color::White,
+        "gray" => Color::DarkGray,
+        _ => Color::LightYellow,
+    }
+}
+
+/// Longest common prefix of `strs` (used by Tab completion). Returns "" if the
+/// set is empty or has no shared prefix.
 fn longest_common_prefix(strs: &[&str]) -> String {
     if strs.is_empty() {
         return String::new();
@@ -1034,6 +1081,7 @@ fn read_idle_line(
                     }
                     c if c >= 0x20 && c < 0x7f => {
                         buf.push(c as char);
+                        state.awaiting_input = false;
                         update_tui_typeahead(&buf, ctx.typeahead);
                         update_tui_hint(state, &buf);
                     }
@@ -1275,6 +1323,24 @@ fn handle_command(
             state.log_offset = 0;
             state.push(ConvKind::System, "history cleared");
         }
+        "finished" => {
+            // Explicitly mark the *current* session finished so it drops out of
+            // /unfinished and the `pir -r` picker. A session is left "unfinished"
+            // after every turn — even a clean completion — until this is run (or
+            // `f`/`F` while browsing in `pir -r`).
+            let mut g = ctx.agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                state.push(ConvKind::System, "· agent busy (turn running) — try again when idle");
+                return;
+            };
+            match &agent.log_path {
+                Some(p) => {
+                    crate::session::mark_finished(p);
+                    state.push(ConvKind::System, "✓ session marked finished — it drops out of /unfinished");
+                }
+                None => state.push(ConvKind::System, "· no session log (one-shot session) — nothing to mark finished"),
+            }
+        }
         "fix" => {
             let repo = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             if !crate::project::is_git_repo(&repo) && crate::project::detect_vcs(&repo) != crate::project::Vcs::Jj {
@@ -1395,7 +1461,7 @@ fn handle_command(
 }
 
 const HELP_TUI: &str = "\
-commands: /help /model <sel> /models /goal [obj] /continue /clear /fix /undo [all] \
+commands: /help /model <sel> /models /goal [obj] /continue /clear /finished /fix /undo [all] \
 /bg <text> /jobs /cancel
 /sh [cmd args]  drop to a shell, or run a command via $SHELL (sh -c)
                /sh -u [user] starts it as another user (default: the invoking user)

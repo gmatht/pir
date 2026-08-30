@@ -37,6 +37,12 @@ pub enum SessionStatus {
     Active,
     Completed,
     Interrupted,
+    /// The user has explicitly marked the conversation finished (via `/finished`
+    /// or `f`/`F` in the `pir -r` picker). A session stays *unfinished* — shown
+    /// in `/unfinished` and the resume picker — until this is set, even after a
+    /// turn ends cleanly. Finished sessions are excluded from the unfinished
+    /// list; they're still reopenable with `/fg` or `pir -r <token>` if wanted.
+    Finished,
 }
 
 impl SessionStatus {
@@ -45,6 +51,7 @@ impl SessionStatus {
             SessionStatus::Active => "active",
             SessionStatus::Completed => "completed",
             SessionStatus::Interrupted => "interrupted",
+            SessionStatus::Finished => "finished",
         }
     }
 }
@@ -79,6 +86,39 @@ pub struct SessionMeta {
 
 pub fn status_path(log: &Path) -> PathBuf {
     log.with_extension("status.json")
+}
+
+/// Path of the conversation-title sidecar (`<log>.title`). The throttled
+/// "light model" writes a short, human-readable name for the conversation
+/// here so it can be shown in `/sessions` / `/unfinished` without re-reading
+/// and summarizing the whole transcript (and without ever touching stdout —
+/// the light model runs silently in the background).
+pub fn title_path(log: &Path) -> PathBuf {
+    log.with_extension("title")
+}
+
+/// Write a generated conversation title to the `.title` sidecar. Best-effort:
+/// a missing/empty log path (one-shot sessions that opted out of a transcript)
+/// is a no-op. The title is the bare text the light model produced — callers
+/// are responsible for stripping quotes/leading "Title:" prefixes before
+/// passing it here.
+pub fn write_title(log: &Path, title: &str) {
+    if log.as_os_str().is_empty() {
+        return;
+    }
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return;
+    }
+    let _ = fs::write(title_path(log), title);
+}
+
+/// Read the cached conversation title (if any) from the `.title` sidecar.
+/// Returns `None` when no title has been generated yet or the file is absent.
+pub fn read_title(log: &Path) -> Option<String> {
+    let raw = fs::read_to_string(title_path(log)).ok()?;
+    let t = raw.trim().to_string();
+    if t.is_empty() { None } else { Some(t) }
 }
 
 /// Persist a status for `log`. A missing/empty log path is a no-op (one-shot
@@ -132,6 +172,17 @@ pub fn read_status(log: &Path) -> Option<SessionMeta> {
     serde_json::from_str(&raw).ok()
 }
 
+/// Mark `log` as explicitly finished. Used by `/finished` and the `f`/`F` key in
+/// the `pir -r` picker. Sets status to `Finished` (clearing any pending-goal
+/// flag) so the session drops out of `/unfinished` and the resume picker. A
+/// missing/empty log path is a no-op.
+pub fn mark_finished(log: &Path) {
+    if log.as_os_str().is_empty() {
+        return;
+    }
+    write_status(log, SessionStatus::Finished, std::process::id(), "", false, "");
+}
+
 /// Whether `pid` names a process that is currently alive. Used to decide if a
 /// session still has an active client working on it.
 #[cfg(unix)]
@@ -181,10 +232,13 @@ pub fn scan_unfinished() -> Vec<UnfinishedEntry> {
         // with the recorded pid still exists.
         let live_client = meta.pid != 0 && pid_alive(meta.pid);
 
-        let unfinished = !live_client
-            && (meta.status == SessionStatus::Interrupted
-                || meta.status == SessionStatus::Active
-                || meta.goal_pending);
+        // A session stays "unfinished" — shown in `/unfinished` and the `pir -r`
+        // picker — until the user *explicitly* marks it finished (via `/finished`
+        // or `f`/`F` in the picker). A clean `Completed` end-state no longer
+        // removes it: only an explicit `Finished` status does. This way a
+        // conversation that ended at a natural stop is still reopenable/a resumable
+        // until the user decides it's done.
+        let unfinished = !live_client && meta.status != SessionStatus::Finished;
         if !unfinished {
             continue;
         }
@@ -197,8 +251,10 @@ pub fn scan_unfinished() -> Vec<UnfinishedEntry> {
             }
         } else if meta.status == SessionStatus::Active {
             "turn did not finish (crashed / killed / network failure)".to_string()
-        } else {
+        } else if meta.goal_pending {
             "goal still in progress".to_string()
+        } else {
+            "completed — mark finished with /finished or `f` in pir -r".to_string()
         };
 
         let preview = first_user_line(&path);
@@ -263,7 +319,7 @@ pub fn list_unfinished() -> String {
         ));
         out.push('\n');
     }
-    out.push_str(&term::dim("resume with: /resume <index|path-fragment>"));
+    out.push_str(&term::dim("resume with: /resume <index|path-fragment>  ·  mark one done with /finished or `f` in pir -r"));
     out
 }
 
@@ -419,9 +475,20 @@ mod tests {
     }
 
     #[test]
-    fn empty_log_path_is_noop() {
-        // Should not panic; nothing to read back.
-        write_status(Path::new(""), SessionStatus::Active, 1, "", false, "");
-        assert!(read_status(Path::new("")).is_none());
+    fn finished_session_drops_out_via_status() {
+        let dir = std::env::temp_dir().join(format!("pir_fin_tests_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let log = dir.join("fin.jsonl");
+        std::fs::write(&log, "{\"role\":\"user\",\"blocks\":[{\"type\":\"text\",\"text\":\"hi\"}]}\n").unwrap();
+        // A completed session still carries a non-finished status.
+        write_status(&log, SessionStatus::Completed, 1234, "hi", false, "");
+        assert_ne!(read_status(&log).unwrap().status, SessionStatus::Finished);
+        // An explicit finished mark flips the status so downstream scans exclude it.
+        mark_finished(&log);
+        assert_eq!(read_status(&log).unwrap().status, SessionStatus::Finished);
+
+        let _ = std::fs::remove_file(status_path(&log));
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
