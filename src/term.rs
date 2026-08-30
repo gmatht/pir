@@ -1947,6 +1947,11 @@ mod keyboard_idle_tests {
 // compiling on non-Unix with a functional (minimal) terminal layer.
 // ===========================================================================
 #[cfg(not(unix))]
+
+// ===========================================================================
+// Cross-platform (non-Unix) terminal implementation via `crossterm`.
+// ===========================================================================
+#[cfg(not(unix))]
 mod nonunix_term {
     use std::io::{self, Write, BufRead};
     use std::sync::{Arc, Mutex};
@@ -1994,9 +1999,27 @@ mod nonunix_term {
         pub fn disable_raw() { let _ = crossterm::terminal::disable_raw_mode(); }
         pub fn enable_raw_picker() { enable_raw(); }
         pub fn disable_raw_picker() { disable_raw(); }
-        #[derive(Clone, Copy)]
+        #[derive(Clone)]
         pub enum RawInput {
-            Char(char), Enter, Tab, Up, Down, Left, Right, Escape, CtrlC, CtrlD, Resize, Paste(String), Other(u32),
+            None,
+            Line(String),
+            Interrupt,
+            Cancel,
+            Eof,
+            Suspend,
+            Char(char),
+            Enter,
+            Tab,
+            Up,
+            Down,
+            Left,
+            Right,
+            Escape,
+            CtrlC,
+            CtrlD,
+            Resize,
+            Paste(String),
+            Other(u32),
         }
         pub fn wait_input(_done: &smol::channel::Receiver<()>) -> RawInput {
             loop {

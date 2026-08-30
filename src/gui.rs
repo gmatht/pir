@@ -315,8 +315,8 @@ pub fn run(
     vbox.append(&status);
 
     let tabs = app.create_tabview().map_err(|e| format!("tabview: {e}"))?;
-    let _tab = tabs.add_tab(&format!("session"))?;
-    let panel = tabs.tab_box(0)?;
+    let _tab = tabs.add_tab(&format!("session")).map_err(|e| format!("tab: {e}"))?;
+    let panel = tabs.tab_box(0).map_err(|e| format!("tabbox: {e}"))?;
     panel.append(&vbox);
     vbox.set_hexpand(true);
     vbox.set_vexpand(true);
