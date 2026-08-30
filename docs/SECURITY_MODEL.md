@@ -706,6 +706,14 @@ high-blast-radius allow-*deny* list. Sensible defaults:
   the project). A write there is **denied**, so it cannot "fake a passing test"
   by clobbering the oracle. (It can still create new files and edit its own
   source.)
+- **Repository metadata (`.git`)**: the agent **may not write to any `.git`
+  directory** (the repo's refs, objects, hooks, or config) — for the repo it is
+  in or any submodule. A write there is **denied** with a pointer to the right
+  path: commit on a branch and **submit a pull request** (e.g. `git push -u
+  origin <branch>` then `gh pr create`, or `pir submit`). The agent's changes
+  must reach trunk through review/CI, never by mutating `.git` directly. (See
+  also the repo-isolated `worktree` mode, §11, where this is enforced by the
+  filesystem rather than by policy.)
 
 Everything *not* on the list is writable exactly as the invoking user would
 writes — including normal project files, user docs, and `/tmp`. The list is

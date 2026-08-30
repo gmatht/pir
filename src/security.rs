@@ -98,6 +98,11 @@ pub enum Parcel {
     GuardOtherUsers,
     GuardSystem,
     GuardTestOracle,
+    /// A write targeting the repository's `.git` metadata (history, refs,
+    /// hooks, config). The agent must never mutate the real repo directly; it
+    /// works on a branch and submits a pull request instead. The blast radius
+    /// message tells the agent exactly how.
+    GuardRepoGit,
     Custom(String),
 }
 
@@ -124,6 +129,7 @@ impl Parcel {
             Parcel::GuardOtherUsers => "guard-other-users".into(),
             Parcel::GuardSystem => "guard-system".into(),
             Parcel::GuardTestOracle => "guard-test-oracle".into(),
+            Parcel::GuardRepoGit => "guard-repo-git".into(),
             Parcel::Custom(s) => format!("custom:{s}"),
         }
     }
@@ -150,6 +156,9 @@ impl Parcel {
             Parcel::GuardOtherUsers => "touch another user's / ai group tree",
             Parcel::GuardSystem => "mutate boot/system config",
             Parcel::GuardTestOracle => "overwrite its own test oracle",
+            Parcel::GuardRepoGit => {
+                "rewrite repo history/refs/hooks directly — instead commit on a branch and submit a pull request (e.g. `git push -u origin <branch>` then `gh pr create`, or `pir submit`)"
+            }
             Parcel::Custom(_) => "a right we didn't anticipate — review carefully",
         }
     }
@@ -175,7 +184,8 @@ impl Parcel {
             | Parcel::GuardSecrets
             | Parcel::GuardOtherUsers
             | Parcel::GuardSystem
-            | Parcel::GuardTestOracle => Risk::High,
+            | Parcel::GuardTestOracle
+            | Parcel::GuardRepoGit => Risk::High,
             Parcel::Custom(_) => Risk::High,
         }
     }
@@ -504,6 +514,9 @@ impl SecurityPolicy {
         }
         if is_test_oracle(&canon) {
             return Some(Parcel::GuardTestOracle);
+        }
+        if is_repo_git(&canon) {
+            return Some(Parcel::GuardRepoGit);
         }
         if self.extra_guard.iter().any(|p| path_matches(&canon, p)) {
             return Some(Parcel::Custom("operator-guarded".into()));
@@ -897,6 +910,19 @@ pub fn is_test_oracle(p: &Path) -> bool {
         || s.contains("/testdata/expected")
 }
 
+pub fn is_repo_git(p: &Path) -> bool {
+    let s = p.to_string_lossy();
+    let abs = canonicalize_lenient(p).to_string_lossy().to_string();
+    // Any path component named exactly ".git" (the repo metadata dir or a
+    // submodule's metadata), or a path living underneath one, is denied.
+    for comp in abs.split(std::path::is_separator) {
+        if comp == ".git" {
+            return true;
+        }
+    }
+    s.ends_with("/.git") || s.contains("/.git/")
+}
+
 pub fn path_matches(p: &Path, pattern: &str) -> bool {
     let p = p.to_string_lossy();
     let pat = pattern.trim();
@@ -1215,6 +1241,27 @@ mod tests {
         assert!(is_database(Path::new("/data/app.duckdb")));
         assert!(is_database(Path::new("/var/lib/postgresql/14/main/x")));
         assert!(!is_database(Path::new("/home/me/project/x.rs")));
+    }
+
+    #[test]
+    fn repo_git_recognized() {
+        let p = SecurityPolicy::default();
+        assert!(matches!(
+            p.decide(&Ask::write("/home/me/project/.git/HEAD")),
+            Verdict::Deny { parcel: Parcel::GuardRepoGit, .. }
+        ));
+        assert!(matches!(
+            p.decide(&Ask::write("/home/me/project/.git/refs/heads/main")),
+            Verdict::Deny { parcel: Parcel::GuardRepoGit, .. }
+        ));
+        assert!(matches!(
+            p.decide(&Ask::write("/home/me/project/.git")),
+            Verdict::Deny { parcel: Parcel::GuardRepoGit, .. }
+        ));
+        // A normal project file (no .git component) is allowed.
+        assert_eq!(p.decide(&Ask::write("/home/me/project/src/main.rs")), Verdict::Allow);
+        assert!(is_repo_git(Path::new("/home/me/project/.git/hooks/pre-commit")));
+        assert!(!is_repo_git(Path::new("/home/me/project/src/git_util.rs")));
     }
 
     #[test]
