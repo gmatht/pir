@@ -164,6 +164,7 @@ pir/
 ├── build.rs                 # scans extensions/*/src/lib.rs -> generated registry
 ├── deploy.sh                # build + test + install gate (see below)
 ├── install-skynet-ai.sh     # optional: deploy the ai_* permission model (root)
+├── install-rootreq.sh       # optional: deploy rootreq + enforcer + sudoers (root)
 ├── SKYNET-AI-PERMS.md       # design notes for the permission model
 ├── .gitignore               # merged Rust/editor/OS + /.pir ignores
 ├── .gitwhitelist            # source/doc/script patterns always tracked
@@ -269,6 +270,24 @@ boundary and a `visudo`-validated `/etc/sudoers.d/skynet-ai` is emitted. See
 
 This means that the pir can run as skynet and manage various ai projects.
 Skynet does not (yet?) have the ability to delete human users (or their files).
+
+### Agent privilege *requests* (`rootreq`)
+
+`pir` can also **request** (never take) one-shot privilege: the `request_root`
+tool queues an allowlisted, auditable request (`apt-install`, `mk-ai-user`,
+`su-ai`, or a single read-only `command`) for an operator to fulfil out-of-band
+via `rootreq-enforcer`. Queueing is **on by default** (`PIR_ROOTREQ=0` disables
+it). Deploy the whole pipeline with the generic installer:
+
+```sh
+sudo ./install-rootreq.sh --yes     # wrappers + sudoers + enforcer + spool
+# later, as root, apply whatever the agent queued:
+sudo rootreq-enforcer
+```
+
+`install-rootreq.sh` wraps `install-skynet-ai.sh` and additionally installs
+`/usr/local/sbin/rootreq-enforcer`, creates the spool/state dirs, and enables
+`PIR_ROOTREQ=1`. See [`extensions/rootreq/README.md`](extensions/rootreq/README.md).
 
 ---
 

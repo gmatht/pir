@@ -26,29 +26,44 @@ SD=/etc/sudoers.d
 CONF="$SD/skynet-ai"
 
 confirm() {                 # $1 prompt -> 0 if yes, 1 if no
+  # In non-interactive mode (no stdin, or already preselected via env), decline
+  # unless PIPELINE_YES=1 (set by install-rootreq.sh --yes) is in force.
+  if [ ! -t 0 ]; then
+    [ "${PIPELINE_YES:-0}" = "1" ] && return 0
+    return 1
+  fi
   local ans
   read -r -p "$1 [y/N] " ans
   case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
 
 # ---------------------------------------------------------------- prompts
-grant_skynet_su=0
-grant_skynet_mk=0
-grant_underling=0
-grant_ai_apt=0
+# Non-interactive mode: set SKYNET_SU / SKYNET_MK / UNDERLING / AI_APT to 1 or 0
+# to preselect grants (used by install-rootreq.sh). With none set, we prompt.
+grant_skynet_su=${SKYNET_SU:-}
+grant_skynet_mk=${SKYNET_MK:-}
+grant_underling=${UNDERLING:-}
+grant_ai_apt=${AI_APT:-}
 
-if confirm "Grant skynet/skynet_* passwordless su to ai_<alnum>+ users?"; then
-  grant_skynet_su=1
+if [ -z "$grant_skynet_su$grant_skynet_mk$grant_underling$grant_ai_apt" ]; then
+  if confirm "Grant skynet/skynet_* passwordless su to ai_<alnum>+ users?"; then
+    grant_skynet_su=1
+  fi
+  if confirm "Grant skynet/skynet_* creation of new ai_<alnum>+ users (logged)?"; then
+    grant_skynet_mk=1
+  fi
+  if confirm "Grant every user X passwordless su to its own X__<alnum>+ underling accounts?"; then
+    grant_underling=1
+  fi
+  if confirm "Grant ai_* users to run 'apt install <pkgs>' (logged, validated)?"; then
+    grant_ai_apt=1
+  fi
 fi
-if confirm "Grant skynet/skynet_* creation of new ai_<alnum>+ users (logged)?"; then
-  grant_skynet_mk=1
-fi
-if confirm "Grant every user X passwordless su to its own X__<alnum>+ underling accounts?"; then
-  grant_underling=1
-fi
-if confirm "Grant ai_* users to run 'apt install <pkgs>' (logged, validated)?"; then
-  grant_ai_apt=1
-fi
+# Normalize to 0/1 (anything other than exactly "1" => 0).
+grant_skynet_su=$( [ "$grant_skynet_su" = "1" ] && echo 1 || echo 0 )
+grant_skynet_mk=$( [ "$grant_skynet_mk" = "1" ] && echo 1 || echo 0 )
+grant_underling=$( [ "$grant_underling" = "1" ] && echo 1 || echo 0 )
+grant_ai_apt=$( [ "$grant_ai_apt" = "1" ] && echo 1 || echo 0 )
 
 if [ "$grant_skynet_su" -eq 0 ] && [ "$grant_skynet_mk" -eq 0 ] \
    && [ "$grant_underling" -eq 0 ] && [ "$grant_ai_apt" -eq 0 ]; then
