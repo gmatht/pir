@@ -1183,8 +1183,13 @@ fn drain_session_log(log: PathBuf, state: &mut TuiState) -> usize {
                 match b.get("type").and_then(|t| t.as_str()) {
                     Some("text") => {
                         if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
-                            text.push_str(t);
-                            text.push('\n');
+                            // Render the agent's prose as Markdown (collapses
+                            // `**`/headings/code-fences into readable text).
+                            // Colour is off here — ratatui applies its own.
+                            let rendered = crate::md::render(t, false);
+                            for para in rendered.lines() {
+                                state.push(ConvKind::Assistant, para);
+                            }
                         }
                     }
                     Some("thinking") => {

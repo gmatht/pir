@@ -103,6 +103,13 @@ pub struct Agent {
     /// default) sends no thinking control at all — matching the prior behaviour.
     /// Persisted next to the session log so a resumed session keeps the level.
     thinking: config::ThinkingLevel,
+    /// Auto-retry policy. When `Some(n)`, a turn whose last finished turn was
+    /// judged `retry` by the light model is re-run automatically up to `n` times,
+    /// compacting history first when it is near the context cap. `None` (the
+    /// default) means no auto-retry — the verdict is still computed for display,
+    /// but the turn ends at the REPL so the user decides (or types their own
+    /// retry). Set via `--auto-retry N` (0 = observe only).
+    auto_retry: Option<usize>,
     /// Whether the model's reasoning/thinking content is shown on the terminal
     /// as it streams. When false, thinking blocks are still collected + logged
     /// but suppressed from the live output (toggle with `/thinking show`/
@@ -164,7 +171,8 @@ impl SessionResume {
             out.push_str(&term::dim(&rule));
             out.push('\n');
             out.push_str(&term::dim("last output (tail):\n"));
-            out.push_str(&tail_lines(&self.last_output, 40));
+            let rendered = crate::md::render(&self.last_output, false);
+            out.push_str(&tail_lines(&rendered, 40));
             out.push('\n');
             out.push_str(&term::dim(&rule));
         }
@@ -226,7 +234,56 @@ impl Agent {
         let security = {
             let policy = crate::security::load_policy();
             let headless = std::env::var("PIR_HEADLESS").is_ok();
-            Some(crate::security::SecurityContext::new(policy, headless))
+            let ctx = crate::security::SecurityContext::new(policy, headless);
+            // Scope every overlay we mount to THIS agent's private mount namespace
+            // (see enter_private_mount_ns) so we quarantine the agent's writes
+            // only, never the host's. If we can't get a private namespace we must
+            // NOT mount (that would shadow /var, /etc, ... for the whole system); we
+            // fall back to the in-process hard-deny guardrail instead.
+            let private_ns = crate::security::overlay::enter_private_mount_ns().is_ok();
+            // Engage the overlayfs write-quarantine (the default-on safe posture):
+            // if the launcher can mount (root) we stage the agent's writes behind
+            // overlay upperdirs so the real fs is untouched until the operator
+            // reviews + applies them with /quarantine. When mounting is
+            // impossible (the common non-root ai_* case) we gracefully skip it
+            // and rely on the in-process write guardrail instead.
+            if ctx.policy.quarantine {
+                if !private_ns {
+                    eprintln!(
+                        "{}",
+                        crate::term::dim(
+                            "[pir] write-quarantine disabled: private mount namespace unavailable (would shadow the host's /var, /etc); writes guarded in-process only"
+                        )
+                    );
+                    ctx.set_quarantine(false);
+                } else {
+                    let mut q = crate::security::overlay::Quarantine::from_policy(&ctx.policy);
+                    match q.mount() {
+                        Ok(n) => {
+                            crate::security::overlay::set_active(q);
+                            ctx.set_quarantine(true);
+                            if n == 0 {
+                                eprintln!(
+                                    "{}",
+                                    crate::term::dim(
+                                        "[pir] write-quarantine engaged (no existing system trees to overlay yet; writes will stage on demand)"
+                                    )
+                                );
+                            }
+                        }
+                        Err(reason) => {
+                            eprintln!(
+                                "{}",
+                                crate::term::dim(&format!(
+                                    "[pir] write-quarantine not engaged ({reason}); writes are guarded in-process only"
+                                ))
+                            );
+                            ctx.set_quarantine(false);
+                        }
+                    }
+                }
+            }
+            Some(ctx)
         };
         // Emit SessionStart so backends (e.g. the pi-extensions bridge) can
         // spawn their child processes / load resources now that the agent and
@@ -292,6 +349,7 @@ impl Agent {
             security,
             thinking: config::ThinkingLevel::Off,
             show_thinking: true,
+            auto_retry: None,
             cached_providers,
         })
     }
@@ -622,6 +680,21 @@ impl Agent {
             }
         } else {
             "thinking: off".to_string()
+        }
+    }
+
+    /// Set the auto-retry policy for this session. `Some(n)` enables automatic
+    /// re-runs of a turn the light model judges `retry` (compacting history
+    /// first when it is near the context cap). `None` disables auto-retry
+    /// (verdict is still computed for display). Returns a status line.
+    pub fn set_auto_retry(&mut self, n: Option<usize>) -> String {
+        self.auto_retry = n;
+        match n {
+            None => "auto-retry: off (verdict computed, but turns end at the REPL so you decide)".to_string(),
+            Some(0) => "auto-retry: observe only (0 — verdict computed, nothing retried)".to_string(),
+            Some(n) => format!(
+                "auto-retry: on (up to {n} automatic re-run of a 'retry' turn; compacts history when near the context cap)"
+            ),
         }
     }
 
@@ -1199,10 +1272,17 @@ impl Agent {
             // its first token, so the agent's text starts on a clean line.
             // `stopped_here` tracks whether *this* call has already cleared it,
             // so subsequent tokens in the same stream don't touch it again.
+            //
+            // We accumulate the reply into `assistant_text` (rather than
+            // printing each token live) so the whole message can be rendered as
+            // Markdown at the end — headings, **bold**, lists and code fences
+            // come out formatted instead of as raw `**`/`#`/` ``` ` (see the
+            // render pass right after the spinner stops).
+            let mut assistant_text = String::new();
             let mut on_text = |t: &str| {
                 if !self.silent() {
                     stop_spinner();
-                    term::out(t);
+                    assistant_text.push_str(t);
                 }
             };
             // Reasoning/thinking content. When show-thinking is off the thinking
@@ -1284,12 +1364,16 @@ impl Agent {
                 }
                 println!();
             }
-            eprintln!("pir-debug turn: past spinner-stop, before result match (silent={})", self.silent());
+            // Render the assistant's reply as Markdown now that the whole
+            // message is in hand. Streaming tokens live would expose raw
+            // `**`/`#`/` ``` `; rendering once, at the end, lets headings,
+            // emphasis, lists and code fences come out formatted. Colour is
+            // applied only when the terminal supports it.
+            if !self.silent() && !assistant_text.trim().is_empty() {
+                term::out(&crate::md::render(&assistant_text, crate::term::color_enabled()));
+            }
             let (assistant, usage) = match result {
-                Ok(r) => {
-                    eprintln!("pir-debug turn: result Ok");
-                    r
-                }
+                Ok(r) => r,
                 Err(e) => {
                     // Surface the failure visibly in the main stream (red banner)
                     // as well as stderr, so a mid-turn provider error isn't lost
@@ -1336,7 +1420,6 @@ impl Agent {
             self.history.push(assistant);
 
             if calls.is_empty() {
-                eprintln!("pir-debug turn: calls empty, returning Ok");
                 self.registry.emit(EventKind::AgentEnd, &json!({}));
                 self.notify.publish(self.turn_done_event(), false);
                 if !self.silent() {
@@ -1441,6 +1524,144 @@ impl Agent {
                 return Ok(());
             }
         }
+    }
+
+    /// Re-run the agent's most recent user turn automatically (after a `retry`
+    /// verdict). This is the auto-retry continuation: it pops the last
+    /// user/assistant/tool-result tail from `history` so the new attempt starts
+    /// from the same prompt with a clean slate, compacts history first when it
+    /// is near the context cap (so the re-run doesn't blow the model's window),
+    /// and then calls [`turn`]. The user prompt is re-derived from the popped
+    /// user message. Returns the same `Result` as [`turn`].
+    ///
+    /// The verdict *not* being `retry` is the caller's responsibility — this
+    /// fn just performs the re-run. Safe no-op (returns `Ok(())`) if there is no
+    /// prior turn to replay.
+    pub fn retry_last_turn(&mut self) -> Result<(), String> {
+        // Pull the last contiguous (user, assistant, tool-results…) tail off
+        // history so the retry begins at the same prompt. We remove from the
+        // last user message onward; anything before it (prior context) is kept
+        // intact — the model re-derives the situation from the transcript.
+        let pivot = self
+            .history
+            .iter()
+            .rposition(|m| m.role == Role::User)
+            .unwrap_or(0);
+        let tail: Vec<Message> = self.history.split_off(pivot);
+        // The re-prompt is the first user message in the tail we just removed.
+        let reprompt = tail
+            .iter()
+            .find(|m| m.role == Role::User)
+            .map(|m| m.text())
+            .unwrap_or_default();
+        if reprompt.trim().is_empty() {
+            // Nothing to replay: put it back and bail cleanly.
+            self.history.extend(tail);
+            return Ok(());
+        }
+        // Compact *before* the retry when we're within ~20% of the context cap,
+        // so the re-run has room for a full new attempt (and doesn't 400 on the
+        // provider's combined input+output limit).
+        let ctx = self.model.context.unwrap_or(200_000) as usize;
+        if approx_tokens(&self.history) > (ctx * 80 / 100) {
+            self.trim();
+            if !self.silent() {
+                term::out(&term::dim("[pir: compacted history before auto-retry]"));
+            }
+        }
+        if !self.silent() {
+            term::out(&term::dim(&format!("· auto-retry: re-running last turn (\"{}\")", truncate(&reprompt, 80))));
+        }
+        self.turn(&reprompt)
+    }
+
+    /// Decide whether to auto-retry the just-finished turn and, if so, run the
+    /// retry (possibly compacting first). Called by the REPL right after a turn
+    /// completes. Only acts when the user enabled `--auto-retry N` (so
+    /// `self.auto_retry` is `Some(n)` with `n > 0`). On each retry attempt the
+    /// light model re-classifies the new outcome; if it *still* says `retry`,
+    /// we keep going up to `n` times, then stop (the user is handed back the
+    /// final result rather than looping forever). A retry attempt that itself
+    /// errors is surfaced to the REPL like any other turn error. Returns the
+    /// number of retries performed (0 if none / disabled).
+    pub fn maybe_auto_retry(&mut self) -> usize {
+        let Some(max) = self.auto_retry else { return 0 };
+        if max == 0 {
+            return 0;
+        }
+        let Some(log) = self.log_path.clone() else { return 0 };
+        // Synchronous verdict (blocks briefly on the light model). If the light
+        // model is unavailable we can't auto-classify, so we don't retry blind.
+        let Some(verdict) = crate::titler::classify_now(&log) else {
+            return 0;
+        };
+        if verdict != "retry" {
+            return 0;
+        }
+        let mut attempts = 0usize;
+        loop {
+            if attempts >= max {
+                if !self.silent() {
+                    term::out(&term::dim(&format!(
+                        "· auto-retry: gave up after {max} attempt(s) — still 'needs retry'",
+                    )));
+                }
+                break;
+            }
+            attempts += 1;
+            // Offer the big model a chance to *disagree* with the `retry` verdict
+            // before we burn a re-run. If it concurs the task is actually done,
+            // we respect that and stop (no retry). A transient model error is
+            // treated as "no opinion" -> we still retry defensively.
+            if !self.big_model_disagrees_with_retry(&log) {
+                if !self.silent() {
+                    term::out(&term::dim("· big model agrees it's a real retry — re-running"));
+                }
+                if let Err(e) = self.retry_last_turn() {
+                    if !self.silent() {
+                        term::out(&term::red(&format!("✗ auto-retry turn errored: {e}")));
+                    }
+                    break;
+                }
+            } else if !self.silent() {
+                term::out(&term::dim("· big model thinks the task is actually done — skipping auto-retry"));
+            }
+            // Re-classify the fresh outcome. If it's no longer `retry`, we're
+            // done; if it still is, loop (until we hit `max`).
+            let Some(v) = crate::titler::classify_now(&log) else { break };
+            if v != "retry" {
+                if !self.silent() {
+                    term::out(&term::dim(&format!("· auto-retry: attempt #{attempts} settled as '{v}'")));
+                }
+                break;
+            }
+        }
+        attempts
+    }
+
+    /// Ask the *big* (current) model for a one-word second opinion on the light
+    /// model's `retry` verdict: is the task actually complete, or genuinely
+    /// needs a retry? Returns `true` when the big model thinks it is *done*
+    /// (i.e. we should NOT auto-retry) and `false` when it agrees a retry is
+    /// warranted (or when the call fails / the verdict is ambiguous). Kept
+    /// deliberately cheap — a single non-streaming `complete()` with a tiny
+    /// prompt — and never retries itself.
+    fn big_model_disagrees_with_retry(&self, log: &Path) -> bool {
+        let (last_user, last_asst) = match crate::titler::last_exchange(log) {
+            Some((u, a)) => (u.chars().take(200).collect::<String>(), a.chars().take(500).collect::<String>()),
+            None => return false,
+        };
+        let system = "You review a coding-agent turn that a cheap classifier flagged as needing a retry. \
+                      Decide: is the task actually already complete (the failure was incidental / already fixed \
+                      / nothing more to do), or does it genuinely need another attempt? Reply with EXACTLY ONE \
+                      word: 'done' or 'retry'. No other words, no punctuation.";
+        let user = format!(
+            "Last user prompt: {last_user}\nLast assistant output: {last_asst}\nword (done or retry):"
+        );
+        let resp = self.client.complete(&self.model.id, system, &user).unwrap_or_default();
+        let w = resp.trim().to_lowercase();
+        let first = w.split_whitespace().next().unwrap_or("").trim_matches(|c: char| !c.is_alphanumeric());
+        first == "done" || first.contains("done")
     }
 
     pub fn take_continuations(&mut self) -> Vec<String> {
@@ -1774,6 +1995,16 @@ fn first_line(s: &str) -> String {
         out.push_str(" …");
     }
     out
+}
+
+/// Truncate `s` to `n` chars (with a trailing ellipsis) for compact status lines.
+fn truncate(s: &str, n: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(n.saturating_sub(1)).collect::<String>())
+    }
 }
 
 /// Return the last `n` lines of `s`, indented so the block reads as a terminal

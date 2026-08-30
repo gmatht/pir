@@ -7,11 +7,13 @@ description = "A featherweight pi-compatible terminal coding agent"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+comrak = "0.54"                                  # CommonMark/GFM parser used to render agent markdown output
 ureq = { version = "2", default-features = false, features = ["json", "native-tls"] }   # native-tls = (dynamic; drops static ring/rustls); gzip default feature dropped (unused)
 native-tls = "0.2"                               # TLS provider for ureq (must be attached to the AgentBuilder explicitly)
-rustyline = "14"                                 # line editing: history + cursor nav + completer
+rustyline = "14"                               # line editing: history + cursor nav + completer
 libc = "0.2"                                     # uid/gid drop for per-project users
 smol = "2"                                       # async runtime: event-driven stdin wait while a turn runs
+regex = "1"                                      # history recall: regex (and partial) matching of prior prompts
 
 # Optional TUI deps, only built when `--features tui` is set (so the default
 # binary stays lightweight and the locked build cache is unaffected).
