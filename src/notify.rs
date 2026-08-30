@@ -638,7 +638,17 @@ impl Notifier for Webhook {
             "summary": e.summary(),
         });
         std::thread::spawn(move || {
-            let _ = ureq::post(&url).send_json(payload);
+            // The default ureq agent has no TLS backend (we disabled the default
+            // rustls feature in favour of native-tls), so an HTTPS webhook URL
+            // would fail with "no TLS backend configured". Attach the system
+            // OpenSSL connector explicitly.
+            let connector = std::sync::Arc::new(
+                native_tls::TlsConnector::new().expect("native-tls init (system OpenSSL) failed"),
+            );
+            let agent = ureq::AgentBuilder::new()
+                .tls_connector(connector)
+                .build();
+            let _ = agent.post(&url).send_json(payload);
         });
     }
 }

@@ -343,7 +343,120 @@ pub fn load_providers() -> Result<Vec<Provider>, String> {
     }
 
     apply_prices(&mut providers);
+    merge_ollama_cloud(&mut providers);
     Ok(providers)
+}
+
+/// Merge the `ollama-cloud` provider (if not already present) into the catalog.
+///
+/// `pi-ollama-cloud` is a *pi* (TypeScript) extension and cannot run under
+/// pir's compile-time-linked native extension layer. This is the native Rust
+/// equivalent: the `ollama-cloud` provider is synthesized from the package's
+/// baked-in fallback model list (so `/model` shows it on first launch without
+/// any network call — exactly the "generated fallback" the package ships), and
+/// the `extensions/ollama-cloud` backend contributes the matching
+/// `ollama_web_search` / `ollama_web_fetch` tools and slash commands.
+///
+/// We only synthesize the provider when there is *some* way to authenticate
+/// (env key, `auth.json` entry package's own `~/.pi/agent/ollama-cloud.json`), unattended installs without an Ollama Cloud key don't get a provider that
+/// can never complete a request. If the user later adds a key, the next `pir`
+/// launch picks it up. The package itself always registers the provider and
+/// fails only at request time; we're slightly stricter to avoid a dead entry.
+pub fn merge_ollama_cloud(providers: &mut Vec<Provider>) {
+    if providers.iter().any(|p| p.pid() == "ollama-cloud") {
+        return; // user already declared it (e.g. in models-store.json)
+    }
+    let key = ollama_cloud_api_key();
+    let Some(key) = key else { return };
+    if key.is_empty() {
+        return;
+    }
+    let models = ollama_cloud_models();
+    if models.is_empty() {
+        return;
+    }
+    providers.push(Provider {
+        id: Some("ollama-cloud".into()),
+        name: Some("Ollama Cloud".into()),
+        base_url: Some("https://ollama.com/v1".into()),
+        api_key: Some(key),
+        api: Some("openai".into()),
+        models,
+    });
+}
+
+/// Resolve the Ollama Cloud API key from the same sources the pi package and
+/// pir's auth store consult, in priority order:
+///   1. `OLLAMA_API_KEY` env var (the package's documented primary source)
+///   2. an `ollama-cloud` entry in `~/.pi/agent/auth.json`
+///   3. `~/.pi/agent/ollama-cloud.json` (`{ "apiKey": "..." }`, the package's
+///      own per-extension config file)
+/// Returns `None` when nothing is configured.
+pub fn ollama_cloud_api_key() -> Option<String> {
+    if let Ok(v) = std::env::var("OLLAMA_API_KEY") {
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    if let Some(k) = load_auth_keys().get("ollama-cloud") {
+        if !k.is_empty() {
+            return Some(k.clone());
+        }
+    }
+    // Package-style per-extension config: ~/.pi/agent/ollama-cloud.json
+    let cfg = pi_dir().join("agent").join("ollama-cloud.json");
+    if let Ok(raw) = fs::read_to_string(&cfg) {
+        if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+            if let Some(k) = v.get("apiKey").or(v.get("key")).and_then(Value::as_str) {
+                if !k.is_empty() {
+                    return Some(k.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The baked-in Ollama Cloud model catalog (the 18-entry
+/// `models.generated.ts` fallback shipped by `pi-ollama-cloud` 0.9.0). Only
+/// tool-capable models are listed, matching the package's `tools` filter.
+pub fn ollama_cloud_models() -> Vec<Model> {
+    // (id, context_window, max_tokens). Context windows and max output tokens
+    /// are copied verbatim from the package's generated fallback so `/model`
+    /// shows the same catalog.
+    const SPEC: &[(&str, u64, u64)] = &[
+        ("deepseek-v4-flash:0731", 1_048_576, 32768),
+        ("deepseek-v4-flash:preview", 1_048_576, 32768),
+        ("deepseek-v4-pro", 524_288, 32768),
+        ("gemma4:31b", 262_144, 32768),
+        ("glm-5.1", 202_752, 32768),
+        ("glm-5.2", 1_000_000, 32768),
+        ("gpt-oss:120b", 131_072, 32768),
+        ("gpt-oss:20b", 131_072, 32768),
+        ("kimi-k2.6", 262_144, 32768),
+        ("kimi-k2.7-code", 262_144, 32768),
+        ("kimi-k3", 1_048_576, 32768),
+        ("minimax-m2.7", 196_608, 32768),
+        ("minimax-m3", 524_288, 32768),
+        ("mistral-large-3:675b", 262_144, 32768),
+        ("nemotron-3-nano:30b", 262_144, 32768),
+        ("nemotron-3-super", 262_144, 32768),
+        ("nemotron-3-ultra", 262_144, 32768),
+        ("qwen3.5:397b", 262_144, 32768),
+    ];
+    SPEC
+        .iter()
+        .map(|(id, ctx, max)| Model {
+            id: id.to_string(),
+            name: Some(id.to_string()),
+            context: Some(*ctx),
+            max_tokens: Some(*max),
+            api_override: None,
+            url_override: None,
+            no_reasoning_effort: false,
+            price_per_1k: None,
+        })
+        .collect()
 }
 
 /// A small built-in table of per-1k-token USD prices (input, output) for common

@@ -1398,6 +1398,7 @@ const HELP_TUI: &str = "\
 commands: /help /model <sel> /models /goal [obj] /continue /clear /fix /undo [all] \
 /bg <text> /jobs /cancel
 /sh [cmd args]  drop to a shell, or run a command via $SHELL (sh -c)
+               /sh -u [user] starts it as another user (default: the invoking user)
 Esc or ctrl-c cancels the running turn; ctrl-d quits; lines ending in & run in the background";
 
 #[cfg(test)]

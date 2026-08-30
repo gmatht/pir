@@ -1,0 +1,13 @@
+{
+  "name": "pi-extensions-shim",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Node.js host that loads legacy pi extensions and bridges them to PIR over stdio (line-delimited JSON).",
+  "main": "index.js",
+  "bin": { "pi-extensions-shim": "index.js" },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": { "node": ">=16" },
+  "license": "GPL-3.0"
+}

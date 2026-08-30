@@ -3,6 +3,7 @@ use crate::goal::{GoalStatus, GoalStore};
 use crate::notify::{AgentEvent, SharedBus};
 use crate::plugin::{EventKind, Outcome, Registry};
 use crate::provider::Client;
+use crate::security::SecurityContext;
 use crate::term;
 use crate::types::{Block, Message, Role, Usage};
 use crate::session::SessionStatus;
@@ -89,6 +90,13 @@ pub struct Agent {
     /// touched). Persisted next to the session log so a resumed session keeps
     /// its choice.
     su_security_enabled: bool,
+    /// OS-abstracted security guardrail (the `security` module). When `Some`,
+    /// every tool call is pre-checked against it via [`SecurityContext::check`]
+    /// ( default-open / configurable; writes scoped to this project;
+    /// escalation is ask-only). When `None` no guardrail is consulted — the
+    /// legacy per-project-user DAC boundary (if any) still applies. `Arc`
+    /// because the same context may later be shared with background turns.
+    security: Option<Arc<SecurityContext>>,
     /// Reasoning / "extended thinking" level for this session (see
     /// `config::ThinkingLevel`). Threaded through to the provider request
     /// (Anthropic thinking budget / OpenAI reasoning effort). `Off` (the
@@ -210,6 +218,16 @@ impl Agent {
         let _ = JOB_KILL_FLAG.set(job_kill_flag);
         crate::register_all(&mut registry);
         registry.session_started(&cwd);
+        // Build the OS-abstracted security guardrail from `security.toml`
+        // (reads default-open / configurable; writes scoped to this project;
+        // escalation ask-only). `None` -> no guardrail consulted. The context
+        // is built once and shared; its `check` is the single entry point the
+        // tool path calls before each tool runs.
+        let security = {
+            let policy = crate::security::load_policy();
+            let headless = std::env::var("PIR_HEADLESS").is_ok();
+            Some(crate::security::SecurityContext::new(policy, headless))
+        };
         // Emit SessionStart so backends (e.g. the pi-extensions bridge) can
         // spawn their child processes / load resources now that the agent and
         // its cwd are known.
@@ -271,6 +289,7 @@ impl Agent {
             token_budget: None,
             undo_stack: Vec::new(),
             su_security_enabled: true,
+            security,
             thinking: config::ThinkingLevel::Off,
             show_thinking: true,
             cached_providers,
@@ -349,6 +368,59 @@ impl Agent {
     /// it detaches (silences) the running turn without owning the agent.
     pub fn set_quiet_handle(&mut self, handle: Arc<AtomicBool>) {
         self.quiet_req = handle;
+    }
+
+    /// Attach (or replace) the security guardrail context. Called once at
+    /// startup after `Agent::new` builds the default from `security.toml`;
+    /// exposed so a host launcher (e.g. the namespace wrapper) can inject a
+    /// context it constructed (e.g. with the project owner for escalation reaps).
+    pub fn set_security_context(&mut self, ctx: Arc<SecurityContext>) {
+        self.security = Some(ctx);
+    }
+
+    /// Pre-flight guardrail check for a single tool call. Returns `Some((reason,
+    /// terminate))` if the security context denies the op (the operator may
+    /// have granted it via the request sink, in which case the context returns
+    /// `Allow` and we return `None`). This is the bridge between the policy
+    /// layer (`security::decide` -> `SecurityContext::check`) and the tool loop:
+    /// reads are allowed by default, writes scoped to this project are allowed,
+    /// and escalation/`BecomeRoot`/`Apt` become an *ask* surfaced to the
+    /// operator (TTY prompt, or a queued request when headless).
+    fn security_preflight(&self, name: &str, input: &Value) -> Option<(String, bool)> {
+        let ctx = self.security.as_ref()?;
+        use crate::security::{Ask, Op};
+        let ask = match name {
+            "read_file" => Ask::new(Op::Read).with_reason("read a file"),
+            "write_file" | "edit_file" => {
+                let path = input.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+                Ask::write(path).with_reason("write a file")
+            }
+            "list_dir" => Ask::new(Op::Read).with_reason("list a directory"),
+            "bash" => {
+                let cmd = input.get("command").and_then(Value::as_str).unwrap_or("").to_string();
+                // A `bash` tool may read, write, exec, connect, or escalate — the
+                // policy can't see individual syscalls, so we surface it as a
+                // generic `Custom` op whose reason carries the command. The
+                // operator's decision (allow-once / session / deny) applies to
+                // this command; the per-syscall guardrail (secret writes,
+                // critical paths) still holds at the mount layer.
+                Ask::new(Op::Custom(format!("bash: {cmd}")))
+                    .with_reason("run a shell command")
+            }
+            _ => return None,
+        };
+        match ctx.check(&ask) {
+            crate::security::Verdict::Allow => None,
+            crate::security::Verdict::Deny { parcel, risk } => {
+                let reason = format!(
+                    "denied by security policy (parcel {} / risk {}): {}",
+                    parcel.id(),
+                    risk.as_str(),
+                    parcel.blast_radius()
+                );
+                Some((reason, false))
+            }
+        }
     }
 
     /// True when the turn should not write to the terminal, either because the
@@ -1176,6 +1248,7 @@ impl Agent {
                 self.provider.model_base_url(&self.model),
                 !self.model.no_reasoning_effort,
             );
+            eprintln!("pir-debug turn: chat returned (silent={})", self.silent());
             // Flush any thinking that arrived while the user was still typing
             // (deferred above) BEFORE the reply text / tool output prints, so
             // reasoning never appears interleaved after the response it
@@ -1194,8 +1267,12 @@ impl Agent {
                 }
                 println!();
             }
+            eprintln!("pir-debug turn: past spinner-stop, before result match (silent={})", self.silent());
             let (assistant, usage) = match result {
-                Ok(r) => r,
+                Ok(r) => {
+                    eprintln!("pir-debug turn: result Ok");
+                    r
+                }
                 Err(e) => {
                     // Surface the failure visibly in the main stream (red banner)
                     // as well as stderr, so a mid-turn provider error isn't lost
@@ -1242,6 +1319,7 @@ impl Agent {
             self.history.push(assistant);
 
             if calls.is_empty() {
+                eprintln!("pir-debug turn: calls empty, returning Ok");
                 self.registry.emit(EventKind::AgentEnd, &json!({}));
                 self.notify.publish(self.turn_done_event(), false);
                 if !self.silent() {
@@ -1269,6 +1347,24 @@ impl Agent {
                     results.blocks.push(Block::ToolResult {
                         tool_use_id: id.clone(),
                         content: format!("blocked by extension: {reason}"),
+                        is_error: true,
+                    });
+                    if terminate {
+                        break;
+                    }
+                    continue;
+                }
+                // Pre-flight security guardrail (the `security` module): reads
+                // default-open, writes scoped to this project, escalation ask-
+                // only. A `Deny` here means the operator (or the policy) refused;
+                // the model is told why so it can `pir ask` or adapt.
+                if let Some((reason, terminate)) = self.security_preflight(name, input) {
+                    if !self.silent() {
+                        term::out(&term::yellow(&format!("  · blocked: {reason}")));
+                    }
+                    results.blocks.push(Block::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: format!("blocked by security: {reason}"),
                         is_error: true,
                     });
                     if terminate {

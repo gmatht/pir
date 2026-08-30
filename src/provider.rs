@@ -110,7 +110,16 @@ impl Client {
     /// free fn so the retry loop can rebuild the agent with a larger timeout
     /// each attempt without cloning the whole `Client`.
     fn http_agent(read_timeout: Duration) -> ureq::Agent {
+        // ureq 2.x does NOT auto-select a TLS backend: with the `native-tls`
+        // feature enabled we must attach a connector ourselves, or every HTTPS
+        // request fails with "no TLS backend configured". We use the platform
+        // native-tls connector (system OpenSSL), which is dynamically linked and
+        // so stays out of the binary — unlike ureq's default rustls+ring stack.
+        let connector = std::sync::Arc::new(
+            native_tls::TlsConnector::new().expect("native-tls init (system OpenSSL) failed"),
+        );
         ureq::AgentBuilder::new()
+            .tls_connector(connector)
             .timeout_connect(CONNECT_TIMEOUT)
             .timeout_read(read_timeout)
             .timeout_write(WRITE_TIMEOUT)

@@ -15,7 +15,7 @@ use crate::term;
 use rustxwidgets::prelude::*;
 use std::os::raw::c_void;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::run_foreground_turn;
@@ -140,9 +140,13 @@ fn line_markup(line: &ConvLine) -> String {
     )
 }
 
-/// Shared per-UI state, guarded by a Mutex so both the Entry-activate callback
-/// (main thread) and the periodic drain callback (also main thread via glib)
-/// can see it. Since glib callbacks run on the main loop, contention is trivial.
+/// Shared per-UI state for a single tab, guarded by a Mutex so both the
+/// Entry-activate callback (main thread) and the periodic drain callback (also
+/// main thread via glib) can see it. Since glib callbacks run on the main loop,
+/// contention is trivial. Each tab owns its own `GuiState`, including the
+/// per-tab render bookkeeping (`rendered_lines` / `needs_rebuild`) that used to
+/// live in process-wide statics — so switching tabs never desyncs the shared
+/// TextView's buffer.
 struct GuiState {
     /// Conversation lines (the transcript so far), each with a colour kind.
     conv: Vec<ConvLine>,
@@ -161,6 +165,18 @@ struct GuiState {
     /// submitted prompt, so Arrow-Up recalls previous prompts like the
     /// terminal REPLs.
     history: Vec<String>,
+    /// How many conversation lines have already been rendered into the GTK text
+    /// buffer. `sync_textview` is append-only: it appends everything past this
+    /// index, so each line gets its per-kind colour via Pango markup instead of
+    /// one flat `set_text`. Per-tab (was a process-wide static).
+    rendered_lines: usize,
+    /// Set when the text buffer must be rebuilt from scratch (after /clear or a
+    /// scrollback trim dropped lines from the front of the model). Per-tab.
+    needs_rebuild: bool,
+    /// Whether this tab has unread activity (a new message or notification)
+    /// while it is not the active tab. Drives the tab's highlighted state and
+    /// the global "next alert" button.
+    unread: bool,
 }
 
 impl GuiState {
@@ -173,6 +189,9 @@ impl GuiState {
             status: "idle".into(),
             show_thinking: true,
             history: Vec::new(),
+            rendered_lines: 0,
+            needs_rebuild: false,
+            unread: false,
         }
     }
 
@@ -180,7 +199,7 @@ impl GuiState {
     /// scrollback so memory stays bounded. The cap only takes effect on a
     /// `/clear`-style rebuild (see `clear`), because the GTK text buffer is
     /// append-only between syncs — trimming mid-stream would desync
-    /// `RENDERED_LINES`. 4000 lines is a few hundred KB at most.
+    /// `rendered_lines`. 4000 lines is a few hundred KB at most.
     fn push(&mut self, kind: ConvKind, text: &str) {
         for para in text.split('\n') {
             self.conv.push(ConvLine { kind, text: para.to_string() });
@@ -188,29 +207,19 @@ impl GuiState {
         if self.conv.len() > 4000 {
             let drop = self.conv.len() - 4000;
             self.conv.drain(0..drop);
-            RENDERED_LINES.fetch_sub(drop, std::sync::atomic::Ordering::SeqCst);
+            self.rendered_lines = self.rendered_lines.saturating_sub(drop);
             // The buffer now holds fewer lines than were rendered: force a
             // rebuild on the next sync so the pane matches the model.
-            NEEDS_REBUILD.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.needs_rebuild = true;
         }
     }
 
     /// Clear the conversation (e.g. /clear).
     fn clear(&mut self) {
         self.conv.clear();
-        NEEDS_REBUILD.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.needs_rebuild = true;
     }
 }
-
-/// How many conversation lines have already been rendered into the GTK text
-/// buffer. `sync_textview` is append-only: it appends everything past this
-/// index, so each line gets its per-kind colour via Pango markup instead of
-/// one flat `set_text`.
-static RENDERED_LINES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Set when the text buffer must be rebuilt from scratch (after /clear or a
-/// scrollback trim dropped lines from the front of the model).
-static NEEDS_REBUILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Arrow-Up/Down navigation state for the prompt Entry, shared between the key
 /// controller and the activate handler. `pos` indexes `history` (== len means
@@ -274,10 +283,291 @@ struct GuiWidgets {
     status: Label,
 }
 
+/// One browser-style tab. Each tab owns its own conversation state, its own
+/// agent slot (so a turn in one tab never disturbs another), and its own
+/// cooperative-cancel / go-silent switches. The shared `TextView`/`Label` are
+/// swapped (re-rendered) whenever the active tab changes.
+struct GuiTab {
+    /// Stable tab id (shown in the tab strip label).
+    id: usize,
+    /// Per-tab conversation + render bookkeeping.
+    state: Arc<Mutex<GuiState>>,
+    /// The agent for this tab. A running turn *takes* the agent out of here
+    /// onto a worker thread, then returns it — exactly like the single-tab
+    /// REPL, but scoped per tab so turns run concurrently across tabs.
+    agent_slot: AgentSlot,
+    /// Cooperative cancel flag for this tab's turn.
+    fg_cancel: Arc<AtomicBool>,
+    /// "Go silent" switch for this tab's turn (used to background it).
+    fg_quiet: Arc<AtomicBool>,
+    /// Wake channel handed to the worker (mirrors the REPL's `done` oneshot).
+    done_tx: smol::channel::Sender<()>,
+}
+
+/// The whole multi-tab GUI model, shared (behind one `Arc<Mutex>`) across the
+/// main-thread callbacks (the Entry activate handler, the key controller, the
+/// periodic drain, and every tab-strip button). All mutation goes through this
+/// one lock, which is only ever held briefly on the GTK main loop — there is no
+/// cross-thread contention with the worker threads (they only touch their own
+/// `agent_slot`).
+struct TabModel {
+    tabs: Vec<GuiTab>,
+    active: usize,
+    next_id: usize,
+    app: App,
+    /// Shared conversation pane + status line (swapped between tabs).
+    widgets: GuiWidgets,
+    /// The horizontal tab-strip box at the top of the window.
+    tab_bar: BoxWidget,
+    /// The prompt Entry (shared; always routes to the active tab).
+    entry: Entry,
+    providers: Vec<Provider>,
+    bus: SharedBus,
+}
+
+/// GDK keyval for the letter t (used with Ctrl for new-tab).
+const GDK_KEY_T: u32 = 0x74;
+/// GDK keyvals for Shift (GDK_KEY_Shift_L / _R), tracked so Ctrl-Shift-Tab
+/// goes to the previous tab while Ctrl-Tab goes to the next.
+const GDK_KEY_SHIFT_L: u32 = 0xffe1;
+const GDK_KEY_SHIFT_R: u32 = 0xffe2;
+
+/// Rebuild the tab-strip: clear the bar box and re-add one label+close button
+/// pair per tab, plus the `[+]` (new tab) and `»` (next alert) buttons. Every
+/// button closure captures a clone of the `Arc<Mutex<TabModel>>` so a click can
+/// mutate the model and rebuild the strip again.
+fn rebuild_tab_bar(model: &Arc<Mutex<TabModel>>) {
+    let mut m = model.lock().unwrap();
+    // Clear existing children of the bar box.
+    if let Some(loader) = rustxwidgets::backends::gtk::loader() {
+        unsafe {
+            if let (Some(get_first), Some(get_next)) = (
+                loader.symbols.gtk_widget_get_first_child,
+                loader.symbols.gtk_widget_get_next_sibling,
+            ) {
+                let mut child = get_first(*m.tab_bar.as_ref());
+                while !child.is_null() {
+                    let next = get_next(child);
+                    rustxwidgets::gtk_dynamic_loader::remove_from_parent(&loader, child);
+                    child = next;
+                }
+            }
+        }
+    }
+    let n = m.tabs.len();
+    for i in 0..n {
+        let label = {
+            let s = m.tabs[i].state.lock().unwrap();
+            let marker = if i == m.active { "▸ " } else if s.unread { "• " } else { "  " };
+            let agent_label = match m.tabs[i].agent_slot.lock().unwrap().as_ref() {
+                Some(a) => a.label(),
+                None => "…".to_string(),
+            };
+            format!("{}{} {}", marker, m.tabs[i].id, agent_label)
+        };
+        let btn = match m.app.create_button(&label) {
+            Ok(b) => b,
+            Err(_) => break,
+        };
+        btn.set_hexpand(false);
+        let model2 = model.clone();
+        let _ = btn.on_click(move || {
+            tab_select(&model2, i);
+        });
+        let close = match m.app.create_button("×") {
+            Ok(b) => b,
+            Err(_) => break,
+        };
+        close.set_hexpand(false);
+        let model3 = model.clone();
+        let _ = close.on_click(move || {
+            tab_close(&model3, i);
+        });
+        m.tab_bar.append(&btn);
+        m.tab_bar.append(&close);
+    }
+    // [+] add-tab button.
+    if let Ok(add) = m.app.create_button("[+]") {
+        add.set_hexpand(false);
+        let model4 = model.clone();
+        let _ = add.on_click(move || {
+            tab_new(&model4);
+        });
+        m.tab_bar.append(&add);
+    }
+    // » jump-to-next-alert (notification) button.
+    if let Ok(alert) = m.app.create_button("»") {
+        alert.set_hexpand(false);
+        let model5 = model.clone();
+        let _ = alert.on_click(move || {
+            tab_next_unread(&model5);
+        });
+        m.tab_bar.append(&alert);
+    }
+}
+
+/// Select tab `idx` (clamped), mark it read, and repaint the shared pane.
+fn tab_select(model: &Arc<Mutex<TabModel>>, idx: usize) {
+    let mut active = idx;
+    {
+        let mut m = model.lock().unwrap();
+        if idx >= m.tabs.len() {
+            return;
+        }
+        m.active = idx;
+        let mut st = m.tabs[idx].state.lock().unwrap();
+        st.unread = false;
+        st.needs_rebuild = true;
+        sync_textview(&m.widgets, &mut *st);
+    }
+    rebuild_tab_bar(model);
+    let _ = active;
+}
+
+/// Cycle the active tab by `dir` (+1 next, -1 previous) with wrap-around,
+/// repainting the chosen tab.
+fn tab_cycle(model: &Arc<Mutex<TabModel>>, dir: i32) {
+    let mut m = model.lock().unwrap();
+    let n = m.tabs.len();
+    if n == 0 {
+        return;
+    }
+    m.active = ((m.active as i32 + dir).rem_euclid(n as i32)) as usize;
+    let idx = m.active;
+    let mut st = m.tabs[idx].state.lock().unwrap();
+    st.unread = false;
+    st.needs_rebuild = true;
+    sync_textview(&m.widgets, &mut *st);
+    drop(st);
+    drop(m);
+    rebuild_tab_bar(model);
+}
+
+/// Jump to the next tab (after the active one, wrapping) that has an unread
+/// flag; if none, just cycle to the next tab. Used by the `»` button.
+fn tab_next_unread(model: &Arc<Mutex<TabModel>>) {
+    let (start, n) = {
+        let m = model.lock().unwrap();
+        (m.active, m.tabs.len())
+    };
+    for off in 1..=n {
+        let i = (start + off) % n;
+        let unread = { model.lock().unwrap().tabs[i].state.lock().unwrap().unread };
+        if unread {
+            tab_select(model, i);
+            return;
+        }
+    }
+    tab_cycle(model, 1);
+}
+
+/// Close tab `idx`, keeping at least one tab open. The closed tab's turn is
+/// cancelled first a running worker stops; its agent slot is then dropped.
+fn tab_close(model: &Arc<Mutex<TabModel>>, idx: usize) {
+    let new_active = {
+        let mut m = model.lock().unwrap();
+        if m.tabs.len() <= 1 {
+            return; // never close the last tab
+        }
+        if idx >= m.tabs.len() {
+            return;
+        }
+        // Cancel any running turn before dropping the slot.
+        m.tabs[idx].fg_cancel.store(true, Ordering::SeqCst);
+        m.tabs.remove(idx);
+        if idx <= m.active && m.active > 0 {
+            m.active -= 1;
+        } else if m.active >= m.tabs.len() {
+            m.active = m.tabs.len() - 1;
+        }
+        m.active
+    };
+    rebuild_tab_bar(model);
+    let mut m = model.lock().unwrap();
+    let mut st = m.tabs[new_active].state.lock().unwrap();
+    st.needs_rebuild = true;
+    sync_textview(&m.widgets, &mut *st);
+}
+
+/// Open a new tab: build a fresh *quiet* agent for the active tab's current
+/// provider/model, give it its own slot + cancel/quiet switches, and make it
+/// the active tab. Seeded with the session prompt history so Arrow-Up works.
+fn tab_new(model: &Arc<Mutex<TabModel>>) {
+    // Gather the configuration we need to build the new agent (without holding
+    // the model lock across the (potentially slow) Agent::new).
+    let (providers, bus, app, full_auto) = {
+        let m = model.lock().unwrap();
+        (m.providers.clone(), m.bus.clone(), m.app.clone(), false)
+    };
+    let (provider, model_obj) = {
+        let m = model.lock().unwrap();
+        match m.tabs[m.active].agent_slot.lock().unwrap().as_ref() {
+            Some(a) => (a.provider(), a.model()),
+            None => (providers[0].clone(), providers[0].models[0].clone()),
+        }
+    };
+    let agent = match Agent::new(
+        provider,
+        model_obj,
+        full_auto,
+        true, // quiet: the GUI renders from the session log, not stdout
+        bus.clone(),
+        None,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(Mutex::new(String::new())),
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            // Couldn't build an agent for the new tab; surface it on the
+            // active tab and bail out rather than leaving a broken empty tab.
+            let mut m = model.lock().unwrap();
+            m.tabs[m.active].state.lock().unwrap().push(
+                ConvKind::Error,
+                &format!("could not open new tab: {e}"),
+            );
+            return;
+        }
+    };
+    let slot: AgentSlot = Arc::new(Mutex::new(Some(agent)));
+    let fg_cancel = Arc::new(AtomicBool::new(false));
+    let fg_quiet = Arc::new(AtomicBool::new(false));
+    let (done_tx, id) = {
+        let m = model.lock().unwrap();
+        (m.tabs[0].done_tx.clone(), m.next_id)
+    };
+    let _ = id;
+    let state = Arc::new(Mutex::new(GuiState::new()));
+    {
+        let mut s = state.lock().unwrap();
+        s.history = term::load_history_lines();
+        s.push(ConvKind::System, &format!("pir · new tab · GTK GUI  (Ctrl-T new · Ctrl-Tab next · » next alert)"));
+    }
+    let mut m = model.lock().unwrap();
+    let id = m.next_id;
+    m.next_id += 1;
+    let idx = m.tabs.len();
+    m.tabs.push(GuiTab {
+        id,
+        state,
+        agent_slot: slot,
+        fg_cancel,
+        fg_quiet,
+        done_tx,
+    });
+    m.active = idx;
+    drop(m);
+    rebuild_tab_bar(model);
+    let mut m = model.lock().unwrap();
+    let mut st = m.tabs[m.active].state.lock().unwrap();
+    st.needs_rebuild = true;
+    sync_textview(&m.widgets, &mut *st);
+}
+
 /// Run the GTK GUI REPL. Returns `Ok(())` on a clean exit (`/exit` or window
 /// close) or an error if the backend couldn't be initialised. Mirrors the TUI:
 /// the agent is switched to `quiet` mode and turns run on worker threads; the
-/// conversation is rendered by draining the agent's session log.
+/// conversation is rendered by draining the agent's session log. Supports
+/// multiple sessions via a browser-style tab strip (see [`TabModel`]).
 pub fn run(
     agent_slot: &AgentSlot,
     fg_cancel: &Arc<AtomicBool>,

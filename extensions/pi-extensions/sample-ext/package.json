@@ -1,0 +1,13 @@
+{
+  "name": "sample-ext",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sample legacy pi extension bridged to PIR via the Node.js shim. Demonstrates tool + command + event registration.",
+  "main": "index.js",
+  "requires": [
+    "events.session_start",
+    "pi.registerTool",
+    "ctx.ui.notify"
+  ],
+  "license": "GPL-3.0"
+}

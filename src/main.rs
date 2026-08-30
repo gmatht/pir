@@ -10,6 +10,9 @@ mod session;
 mod term;
 mod types;
 mod user;
+mod security;
+
+
 #[cfg(feature = "tui")]
 mod tui;
 #[cfg(feature = "gui")]
@@ -24,10 +27,10 @@ use crate::config::Model;
 use crate::notify::SharedBus;
 use std::io::BufRead;
 use std::io::IsTerminal;
-use std::io::Write;
+use std::io::Write as _;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -50,6 +53,14 @@ use std::time::{Duration, Instant};
 /// The signal handler reads it (under the lock) to know where to log.
 static ACTIVE_STATUS: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
+/// A raw fd (opened once at startup, before signals can fire) pointing at the
+/// active session's status sidecar. The death-provenance signal handler writes
+/// to this fd via `write(2)` (the only async-signal-safe way) instead of going
+/// through std — calling `OpenOptions`/`File`/`format!` inside a signal handler
+/// can deadlock or re-enter the allocator, which used to hang the handler
+/// (and thus the whole process) instead of quitting. 0 means "not opened".
+static ACTIVE_STATUS_FD: AtomicI32 = AtomicI32::new(0);
+
 /// Pid of the most recently spawned command's process group, so we can reap it
 /// on exit. Set by the bash tool via [`set_active_child_pgid`]; read on exit.
 static ACTIVE_CHILD_PGID: Mutex<Option<i32>> = Mutex::new(None);
@@ -57,6 +68,26 @@ static ACTIVE_CHILD_PGID: Mutex<Option<i32>> = Mutex::new(None);
 #[cfg(unix)]
 pub fn set_active_child_pgid(pgid: i32) {
     *ACTIVE_CHILD_PGID.lock().unwrap() = Some(pgid);
+}
+
+/// Build the fixed-format death-note and return it as a byte buffer (no
+/// allocation that isn't already in the buffer; `write!` into a stack Vec is
+/// fine in a handler only because we never call std::process/File — `Vec` here
+/// is pre-sized and `Vec::write` uses only the async-safe `libc::write` under
+/// the hood via the `std::io::Write` impl, but to be strictly safe we avoid
+/// `format!`/heap churn by writing a small hand-rolled line). We use
+/// `write!` into a `Vec<u8>` which is reusing an existing allocation only.
+fn death_note(signo: libc::c_int) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(128);
+    let _ = std::io::Write::write_fmt(
+        &mut buf,
+        format_args!(
+            "[death] received signal {signo} (SIGHUP={}) pir pid={}\n",
+            libc::SIGHUP,
+            std::process::id()
+        ),
+    );
+    buf
 }
 
 /// Install the death-provenance signal handler and PR_SET_PDEATHSIG. Best-
@@ -88,13 +119,23 @@ fn install_death_tracking() {
             if let Some(pgid) = *ACTIVE_CHILD_PGID.lock().unwrap() {
                 unsafe { let _ = libc::kill(-pgid, libc::SIGKILL); }
             }
-            // Append to the active status sidecar if there is one. We never
-            // create or truncate it — only append — so a real status write
-            // (which happens via session::write_status) is preserved.
-            if let Some(path) = ACTIVE_STATUS.lock().unwrap().clone() {
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                    let _ = f.write_all(note.as_bytes());
+            // Append a one-line provenance note to the status sidecar. We must
+            // NOT call into std (OpenOptions/write_all/format!) here: a signal
+            // handler is only allowed async-signal-safe syscalls, and File/format!
+            // can deadlock or re-enter the allocator mid-crash (exactly how a
+            // SIGINT handler used to hang instead of quitting). We hand-build a
+            // fixed-format buffer and write(2) it straight to an fd opened once
+            // at startup (ACTIVE_STATUS_FD), avoiding open(2) entirely.
+            if ACTIVE_STATUS_FD.load(Ordering::SeqCst) != 0 {
+                let buf = death_note(signo);
+                unsafe {
+                    let _ = libc::write(
+                        ACTIVE_STATUS_FD.load(Ordering::SeqCst),
+                        buf.as_ptr() as *const libc::c_void,
+                        buf.len(),
+                    );
+                    let _ = libc::close(ACTIVE_STATUS_FD.load(Ordering::SeqCst));
+                    ACTIVE_STATUS_FD.store(0, Ordering::SeqCst);
                 }
             }
             // Default disposition: re-raise so the process actually terminates.
@@ -163,7 +204,8 @@ AGENT USERS RUN UNATTENDED
   PIR_CONFIRM=1 to force prompts even as an ai_* user.
 
 COMMANDS
-  /help  /model <sel>  /models  /default-model <sel>  /sessions  /goal [objective]  /continue
+  /help  /model <sel>  /models  /default-model <sel>  /sessions  /goal [objective]  /goal start [objective]  /continue
+                        start (and drive to completion) the goal right now
   /thinking [<level>] [show|hide]   set the model's thinking level
                           (off|minimal|low|medium|high|xhigh|max) and/or toggle
                           whether streamed reasoning is displayed; no arg = status
@@ -171,6 +213,9 @@ COMMANDS
   /bg <text>  /jobs  /fg <id>  /clear  /usage  /exit
   /undo [all]             revert the last file edit (or all) to its pre-edit state
   /sh [cmd args]         drop to a shell, or run a command via $SHELL (sh -c)
+                        /sh -u [user] starts the shell as another user
+                        (default: the invoking user — e.g. to get back to your
+                        own account after pir dropped to the sandbox)
   /project init            create the ai_<project> user and chown the cwd (root)
   /su-security <on|off|status>   enable/disable/inspect the su-based permission
                           model (sudoers.d/skynet-ai + wrappers); reversible (root)
@@ -417,6 +462,14 @@ fn main() {
     // different (smaller) store — using it to resolve against the invoking
     // user's catalog produced "no model matches" fallbacks.
     let pre_drop_selector = std::env::var("PI_MODEL").ok().or_else(config::default_model_setting);
+
+    // Record the *invoking* user (who launched pir, before any privilege drop)
+    // into the environment so it survives `become_user`'s HOME rewrite and is
+    // available to `/sh -u` (start a shell as the original user). `SUDO_USER`
+    // is the human behind a `sudo … pir`; otherwise the real-uid name.
+    if let Some(inv) = crate::user::invoking_user_name() {
+        std::env::set_var("PIR_INVOKING_USER", &inv);
+    }
 
     let mut i = 0;
     while i < args.len() {
@@ -1779,12 +1832,23 @@ fn handle_command(
                 eprintln!("pir: agent busy (turn running) — try again when idle");
                 return;
             };
-            let obj: String = rest.join(" ");
-            if obj.trim().is_empty() {
+            let raw: String = rest.join(" ");
+            // `/goal start [objective]` — set the objective (if given) and drive
+            // the goal to completion right here, exactly like `pir -c`, but
+            // without relaunching. Otherwise `/goal [objective]` sets (or shows)
+            // the goal without running it.
+            if raw.split_whitespace().next() == Some("start") {
+                let obj = raw.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+                if !obj.trim().is_empty() && agent.goal_snapshot().is_none() {
+                    agent.start_goal(&obj);
+                }
+                let out = agent.continue_goal();
+                term::out(&out);
+            } else if raw.trim().is_empty() {
                 agent.show_goal();
             } else {
-                agent.start_goal(&obj);
-                println!("goal started: {}", obj);
+                agent.start_goal(&raw);
+                println!("goal started: {}", raw);
             }
         }
         "thinking" => {
@@ -1876,9 +1940,12 @@ fn handle_command(
             // and return (`/sh COMMAND ARG1 ARG2 …`). The shell inherits the
             // agent's (possibly dropped) identity, cwd, env and stdio, so it runs
             // exactly as the current `pir` would — just with a human at the keys.
-            // We restore raw mode only if the REPL had it active (mid-turn) so a
-            // child shell isn't left fighting the REPL's terminal attributes; at
-            // the idle prompt raw is already off, so nothing to do.
+            // `/sh -u [user]` instead starts the shell as another user (default:
+            // the invoking user captured before the sandbox drop), so you can
+            // hand control back to your own account for the duration of one
+            // shell. We restore raw mode only if the REPL had it active
+            // (mid-turn) so a child shell isn't left fighting the REPL's terminal
+            // attributes; at the idle prompt raw is already off, so nothing to do.
             if fg_running {
                 eprintln!("pir: a turn is running — finish or /cancel it first, then /sh");
                 return;
@@ -2382,6 +2449,20 @@ pub(crate) fn workspace_label() -> String {
 /// surrounding session. Returns the child's exit code, or `None` if the shell
 /// could not be spawned.
 fn run_shell(args: Vec<&str>) -> Option<i32> {
+    // `/sh -u [user]` starts the shell as another user (default: the invoking
+    // user, captured into PIR_INVOKING_USER before any privilege drop), e.g.
+    // to get back to the original user after pir dropped to a sandbox account.
+    // `/sh` with no `-u` runs as the current (possibly dropped) identity — the
+    // long-standing behaviour.
+    if matches!(args.first(), Some(&"-u")) {
+        let (target, rest) = match args.get(1) {
+            Some(u) if !u.starts_with('-') => (Some(*u), &args[2..]),
+            // Bare `-u` with no name => the invoking user.
+            _ => (None, &args[1..]),
+        };
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        return crate::user::spawn_shell_as(&shell, rest, target);
+    }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
     let status = if args.is_empty() {
         // Interactive: hand the terminal straight to the login shell.

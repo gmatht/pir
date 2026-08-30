@@ -6,6 +6,18 @@ use std::sync::{atomic::{AtomicBool, Ordering}, Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Print a diagnostic, but only when `PIR_DEBUG` is set in the environment.
+/// Leftover debug `eprintln!`s are hidden from normal user output this way;
+/// set `PIR_DEBUG=1` to surface them again (e.g. when tracing history/line
+/// editing behaviour).
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if std::env::var_os("PIR_DEBUG").is_some() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 use rustyline::completion::Completer;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
@@ -435,7 +447,7 @@ const SLASH_HELP: &[(&str, &str, &str)] = &[
     ("/rebuild", "", "cargo build and exec the fresh binary"),
     ("/resume", "<idx|fragment>", "resume an unfinished session"),
     ("/sessions", "", "list recent sessions"),
-    ("/sh", "[cmd args]", "drop to a shell, or run a command via $SHELL"),
+    ("/sh", "[cmd args]", "drop to a shell, or run a command via $SHELL; -u [user] runs as another user"),
     ("/thinking", "<level> [show|hide]", "set model thinking level / display"),
     ("/undo", "[all]", "revert the last file edit (or all)"),
     ("/unfinished", "", "list interrupted / still-running sessions"),
@@ -485,6 +497,107 @@ fn command_help_hint(line: &str) -> Option<String> {
     Some(s)
 }
 
+/// Case-insensitive substring recall of previous prompts. Returns up to
+/// `limit` distinct history entries (most-recent-first) whose text contains
+/// `query` (case-insensitive). The exact `query` is skipped so we never suggest
+/// retyping what's already on the line. Used for both Tab-completion and the
+/// ghost-hint recall of prior prompts.
+fn history_substring_matches(query: &str, limit: usize) -> Vec<String> {
+    let query_l = query.to_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    // `load_history_lines` returns most-recent-last, so iterating in reverse
+    // yields the most recent matches first.
+    for line in load_history_lines().into_iter().rev() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.to_lowercase().contains(&query_l) && line.trim() != query.trim() {
+            if !out.contains(&line) {
+                out.push(line);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Case-insensitive search for `needle` in `haystack`, returning the byte range
+/// `(start, end)` of the first match. Operates on `char`s (so multibyte is
+/// handled), and the returned indices are always on `char` boundaries of the
+/// original string. Returns `None` when `needle` is empty or not found.
+fn case_insensitive_find(haystack: &str, needle: &str) -> Option<(usize, usize)> {
+    if needle.is_empty() {
+        return None;
+    }
+    let h: Vec<char> = haystack.chars().collect();
+    let n: Vec<char> = needle.chars().collect();
+    if n.len() > h.len() {
+        return None;
+    }
+    let n_low: Vec<char> = n
+        .iter()
+        .map(|c| c.to_lowercase().next().unwrap_or(*c))
+        .collect();
+    for i in 0..=(h.len() - n.len()) {
+        let mut ok = true;
+        for j in 0..n.len() {
+            let hc = h[i + j].to_lowercase().next().unwrap_or(h[i + j]);
+            if hc != n_low[j] {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            let start: usize = h[..i].iter().map(|c| c.len_utf8()).sum();
+            let end = start + h[i..i + n.len()].iter().map(|c| c.len_utf8()).sum::<usize>();
+            return Some((start, end));
+        }
+    }
+    None
+}
+
+/// Build the ghost-hint preview string for a history match. The matched
+/// substring is emphasised with `*…*` emphasis, and any prior context before
+/// the typed fragment is shown dimmed in parentheses (so the user can see the
+/// whole prior prompt without it looking like a literal continuation to the
+/// right of the cursor). `query` is the (trimmed) current input; `matched` is
+/// the prior prompt line. Returns `None` when there's nothing useful to show.
+fn history_hint_preview(query: &str, matched: &str) -> Option<String> {
+    if matched.trim().is_empty() || matched.trim() == query.trim() {
+        return None;
+    }
+    let (start, end) = case_insensitive_find(matched, query)?;
+    let prefix = &matched[..start];
+    let emphasize = &matched[start..end];
+    let suffix = &matched[end..];
+    let mut s = String::new();
+    s.push('*');
+    s.push_str(emphasize);
+    s.push('*');
+    s.push_str(suffix);
+    if !prefix.is_empty() {
+        s.push(' ');
+        s.push_str(&dim(&format!("({prefix})")));
+    }
+    Some(s)
+}
+
+/// Offer fuzzy recall of a previous prompt as Tab-completion candidates: the
+/// most-recent history entries (most-recent-first) containing `query`
+/// (case-insensitive). Returns an empty candidate list when `query` is too
+/// short (we require >= 2 chars so a single keystroke doesn't spam suggestions)
+/// or nothing matches. The candidates replace the typed span from `start_idx`.
+fn history_recall(query: &str, start_idx: usize) -> rustyline::Result<(usize, Vec<String>)> {
+    // Require at least two characters so a single keystroke doesn't spam the
+    // user with history suggestions.
+    if query.trim().chars().count() < 2 {
+        return Ok((start_idx, Vec::new()));
+    }
+    Ok((start_idx, history_substring_matches(query.trim(), 10)))
+}
+
 impl Completer for PirHelper {
     type Candidate = String;
 
@@ -502,7 +615,8 @@ impl Completer for PirHelper {
         let cmd = &rest[..cmd_end];
         // No space yet: the user is still typing the command name itself
         // (e.g. `/def`). Offer any slash command that starts with what they've
-        // typed, so `/default-<Tab>` completes to `/default-model`.
+        // typed, so `/default-<Tab>` completes to `/default-model`. If no
+        // command matches, fall back to fuzzy history recall of a prior prompt.
         if !rest.contains(char::is_whitespace) {
             if let Some(prefix) = cmd.strip_prefix('/') {
                 let matches: Vec<String> = SLASH_COMMANDS
@@ -510,12 +624,15 @@ impl Completer for PirHelper {
                     .filter(|c| c[1..].starts_with(prefix))
                     .map(|c| c.to_string())
                     .collect();
-                if matches.is_empty() {
-                    return Ok((0, Vec::new()));
+                if !matches.is_empty() {
+                    return Ok((start_idx, matches));
                 }
-                return Ok((start_idx, matches));
+                // Unknown `/`-command (or no command-name match): offer the most
+                // recent matching prior prompt as a recall before giving up.
+                return history_recall(rest, start_idx);
             }
-            return Ok((0, Vec::new()));
+            // A plain (non-`/`) lead token: offer a matching previous prompt.
+            return history_recall(rest, start_idx);
         }
         if cmd == "/thinking" {
             let after = &rest[cmd_end..];
@@ -531,10 +648,17 @@ impl Completer for PirHelper {
                 .filter(|o| o.starts_with(prefix))
                 .map(|o| o.to_string())
                 .collect();
+            if matches.is_empty() {
+                // No thinking-level matches: try history recall of a prior prompt.
+                return history_recall(rest, start_idx);
+            }
             return Ok((arg_start, matches));
         }
         if cmd != "/model" && cmd != "/m" && cmd != "/default-model" && cmd != "/dm" {
-            return Ok((0, Vec::new()));
+            // Some other /command with an argument (or plain text after a space):
+            // fall back to fuzzy history recall of a previous prompt, since there
+            // are no command or model autocompletes to offer.
+            return history_recall(rest, start_idx);
         }
         let after = &rest[cmd_end..];
         if after.is_empty() {
@@ -545,6 +669,11 @@ impl Completer for PirHelper {
         let arg_start = start_idx + cmd_end + arg_lead;
         let prefix = &left[arg_start..];
         let matches = crate::config::match_models(providers, prefix, 10);
+        if matches.is_empty() {
+            // No model matched the typed prefix: offer a prior prompt that
+            // contains it (e.g. re-running `/model hy3`).
+            return history_recall(rest, start_idx);
+        }
         Ok((arg_start, matches))
     }
 }
@@ -559,15 +688,28 @@ impl Hinter for PirHelper {
         if let Some(help) = command_help_hint(line) {
             return Some(help);
         }
+        let left = &line[..pos];
+        let start_idx = left.find(|c: char| !c.is_whitespace()).unwrap_or(0);
+        let rest = &left[start_idx..];
+        // Ghost-hint recall of a previous prompt (case-insensitive substring).
+        // Shown whenever there's no command-help hint and no /model preview —
+        // i.e. "there are no other autocompletes" to offer. Typing `hy` recalls
+        // a prior `*hy*3 (/model )` line, for example. Requires >= 2 chars so a
+        // single keystroke doesn't spam the user.
+        let query = rest.trim();
+        if query.chars().count() >= 2 {
+            if let Some(m) = history_substring_matches(query, 1).into_iter().next() {
+                if let Some(preview) = history_hint_preview(query, &m) {
+                    return Some(preview);
+                }
+            }
+        }
         // Show the first matching model as an inline preview while typing a
         // `/model` argument, so the user sees a suggestion to the right.
         let providers = MODEL_PROVIDERS.get().map(|v| v.as_slice()).unwrap_or(&[]);
         if providers.is_empty() {
             return None;
         }
-        let left = &line[..pos];
-        let start_idx = left.find(|c: char| !c.is_whitespace()).unwrap_or(0);
-        let rest = &left[start_idx..];
         let cmd_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
         let cmd = &rest[..cmd_end];
         if cmd != "/model" && cmd != "/m" && cmd != "/default-model" && cmd != "/dm" {
@@ -653,7 +795,18 @@ fn load_history() {
         let Some(rl) = g.as_mut() else { return };
         if let Some(path) = HISTORY_FILE.with(|f| f.borrow().clone()) {
             let r = rl.load_history(&path);
-            eprintln!("pir-debug load_history: path={:?} err={:?}", path, r.err());
+            // A missing expected (fresh session, or `pir` with
+            // no `-r`), so only surface the failure when debugging is on and the
+            // error is something other than "file not found".
+            if let Some(e) = r.err() {
+                let is_not_found = std::error::Error::source(&e)
+                    .and_then(|s| s.downcast_ref::<io::Error>())
+                    .map(|io| io.kind() == io::ErrorKind::NotFound)
+                    .unwrap_or(false);
+                if !is_not_found {
+                    debug_log!("pir load_history: path={:?} err={:?}", path, e);
+                }
+            }
         }
     });
 }
@@ -677,7 +830,7 @@ pub fn load_history_lines() -> Vec<String> {
             None => Vec::new(),
         }
     });
-    eprintln!("pir-debug load_history_lines: {} entries", lines.len());
+    debug_log!("pir load_history_lines: {} entries", lines.len());
     lines
 }
 

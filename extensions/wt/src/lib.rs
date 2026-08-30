@@ -83,6 +83,16 @@ struct Wt {
     /// How many consecutive auto-fix prompts we've queued (reset when checks
     /// pass). Bounded by `max_fix` to avoid an infinite fix loop.
     fix_attempts: u32,
+    /// PR-submission mode (opt-in via `PIR_WT_PR=1`). When on, the agent can't
+    /// write the real trunk directly: after a green verify it pushes the
+    /// worktree branch and opens a PR, then auto-accepts (merges) the PR once it
+    /// is green / mergeable. This is the "agents own a worktree and submit pull
+    /// requests, automatically accepted if tests pass" posture from
+    /// `docs/SECURITY_MODEL.md` §11.
+    pr_mode: bool,
+    /// The PR we opened for the current branch (so we can poll + auto-accept it
+    /// on later idle passes). `None` until `ensure_pr` opens/observes one.
+    pr_number: Option<u64>,
 }
 
 impl Wt {
@@ -105,6 +115,8 @@ impl Wt {
             main_cwd: PathBuf::from("."),
             current: None,
             fix_attempts: 0,
+            pr_mode: std::env::var_os("PIR_WT_PR").map(|v| v != "0" && !v.is_empty()).unwrap_or(false),
+            pr_number: None,
         }
     }
 
@@ -450,19 +462,234 @@ impl Wt {
                 )
             }
             Verdict::Passed(summary) => {
-                // Checks passed: reset the fix counter and merge back.
+                // Checks passed: reset the fix counter.
                 self.fix_attempts = 0;
-                let merge = self.merge_into_main(&branch);
-                if merge.is_error {
-                    (None, merge.content)
+                if self.pr_mode {
+                    // PR-submission posture: the agent can't write trunk directly.
+                    // Push the branch, open a PR, auto-accept it once green.
+                    self.pr_flow(&wt_dir, &branch)
                 } else {
-                    let remove = self.remove_worktree(&wt_dir, &branch);
-                    self.return_to_main();
-                    (None, format!("{}\n{}", merge.content, remove.content))
+                    let merge = self.merge_into_main(&branch);
+                    if merge.is_error {
+                        (None, merge.content)
+                    } else {
+                        let remove = self.remove_worktree(&wt_dir, &branch);
+                        self.return_to_main();
+                        (None, format!("{}\n{}", merge.content, remove.content))
+                    }
                 }
                 // `summary` is intentionally not echoed to the idle line to keep
                 // green merges quiet; it is still available via `wt_verify`.
             }
+        }
+    }
+
+    /// PR-submission flow (active when `PIR_WT_PR=1`). Push the branch, open (or
+    /// reuse) a PR for it, then auto-accept (merge) the PR once it is
+    /// green / mergeable. The agent never writes the trunk directly. Returns the
+    /// `(optional fix prompt, idle line)` pair like `auto_flow`.
+    fn pr_flow(&mut self, wt_dir: &Path, branch: &str) -> (Option<String>, String) {
+        // Ensure the branch is pushed and a PR exists for it.
+        let pr = self.ensure_pr(wt_dir, branch);
+        if pr.is_error {
+            // Couldn't push / open a PR (e.g. no remote, no `gh`). Degrade
+            // gracefully to a direct merge so the work still lands.
+            let merge = self.merge_into_main(branch);
+            if merge.is_error {
+                return (None, format!("wt(PR): could not open PR and direct merge also failed: {}", merge.content));
+            }
+            let remove = self.remove_worktree(wt_dir, branch);
+            self.return_to_main();
+            return (None, format!("wt(PR): no remote/gh — merged directly. {}\n{}", merge.content, remove.content));
+        }
+        // Try to auto-accept the PR (merge it) once it's green / mergeable.
+        let accept = self.autoaccept_pr(branch);
+        if accept.is_error {
+            // Not yet mergeable (remote checks pending, or trunk diverged and
+            // needs a rebase). Leave the PR open; re-check on the next idle pass.
+            let prtag = self.pr_number.map(|n| format!("#{n}")).unwrap_or_default();
+            return (
+                None,
+                format!(
+                    "wt(PR): PR {prtag} opened for {branch}; auto-accept pending (not yet green/mergeable). Re-checks on idle."
+                ),
+            );
+        }
+        let remove = self.remove_worktree(wt_dir, branch);
+        self.return_to_main();
+        (None, format!("{}\n{}", accept.content, remove.content))
+    }
+
+    /// Push the worktree's branch to `origin` and open (or reuse) a PR for it.
+    /// Records the PR number in `self.pr_number`. Returns an error Outcome when
+    /// no remote/`gh` exists, so the caller can fall back to a direct merge.
+    fn ensure_pr(&mut self, wt_dir: &Path, branch: &str) -> Outcome {
+        let root = self.repo_root();
+        let trunk = self.trunk();
+        let has_origin = Command::new("git")
+            .args(["remote", "get-url", "origin"])
+            .current_dir(&root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !has_origin {
+            return Outcome::err("wt(PR): no `origin` remote — cannot push branch or open PR".into());
+        }
+        // Push (or update) the branch. `--force-with-lease` lets a rebase onto a
+        // diverged trunk update the remote branch without clobbering others.
+        let push = Command::new("git")
+            .args(["push", "--force-with-lease", "-u", "origin", &format!("{branch}:{branch}")])
+            .current_dir(wt_dir)
+            .status();
+        if !push.map(|s| s.success()).unwrap_or(false) {
+            return Outcome::err(format!("wt(PR): `git push` of {branch} failed"));
+        }
+        // If we already have a PR number, assume it's still open for this branch.
+        if self.pr_number.is_some() {
+            return Outcome::ok(format!("wt(PR): branch {branch} pushed (PR #{} reused)", self.pr_number.unwrap()));
+        }
+        // Otherwise open a PR via `gh` if available.
+        let gh = Command::new("gh")
+            .args(["pr", "create", "--fill", "--head", branch, "--base", &trunk])
+            .current_dir(&root)
+            .output();
+        match gh {
+            Ok(o) if o.status.success() => {
+                let out = String::from_utf8_lossy(&o.stdout);
+                // Extract a PR number (e.g. "#123") from gh's output.
+                let num = out
+                    .split(|c: char| !c.is_ascii_digit())
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| s.parse::<u64>().ok())
+                    .next();
+                self.pr_number = num;
+                Outcome::ok(format!(
+                    "wt(PR): opened PR {} for {branch} against {trunk}",
+                    num.map(|n| format!("#{n}")).unwrap_or_default()
+                ))
+            }
+            _ => Outcome::err(format!(
+                "wt(PR): branch {branch} pushed but `gh pr create` unavailable — open a PR manually: \
+                 gh pr create --fill --head {branch} --base {trunk}"
+            )),
+        }
+    }
+
+    /// Auto-accept (merge) the PR opened for `branch`, once it is green /
+    /// mergeable. Uses `gh pr merge --auto` when `gh` is present (it waits for
+    /// required checks before merging). If the PR isn't mergeable because the
+    /// trunk diverged, we first rebase the branch onto trunk and re-push (the
+    /// mechanical part of the merge-fixer), then leave the PR open for a later
+    /// idle pass to accept. Returns an error Outcome when the PR can't be merged
+    /// yet, so the caller leaves it open and re-checks on the next idle pass.
+    fn autoaccept_pr(&mut self, branch: &str) -> Outcome {
+        let root = self.repo_root();
+        let has_gh = Command::new("gh")
+            .args(["--version"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !has_gh {
+            // No `gh`: fall back to a direct merge (the agent writes trunk via the
+            // merge lock anyway). Conservative but keeps the work landing.
+            return self.merge_into_main(branch);
+        }
+        // Is the PR mergeable right now? `gh pr view` reports state + mergeable.
+        let view = Command::new("gh")
+            .args([
+                "pr", "view", &branch, "--json", "state,mergeable,number",
+                "--jq", "(.number|tostring) + \" \" + .state + \" \" + (.mergeable|tostring)",
+            ])
+            .current_dir(&root)
+            .output();
+        let (pr_num, mergeable) = match view {
+            Ok(o) if o.status.success() => {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                let mut parts = s.split_whitespace();
+                let num = parts.next().and_then(|n| n.parse::<u64>().ok());
+                let state = parts.next().unwrap_or("");
+                let mergeable = parts.next().unwrap_or("") == "MERGEABLE";
+                if state != "OPEN" {
+                    return Outcome::err(format!("wt(PR): PR for {branch} is {state}, not open — not auto-merging"));
+                }
+                (num, mergeable)
+            }
+            _ => return Outcome::err(format!("wt(PR): could not inspect PR for {branch}")),
+        };
+        if !mergeable {
+            // Trunk diverged and left the PR conflicted: rebase onto the latest
+            // trunk (merge-fixer step) and re-push; the PR re-checks on idle.
+            let rebased = self.rebase_onto_trunk(branch);
+            if rebased.is_error {
+                return Outcome::err(format!(
+                    "wt(PR): PR for {branch} not mergeable and rebase failed: {}",
+                    rebased.content
+                ));
+            }
+            return Outcome::err(format!(
+                "wt(PR): PR for {branch} had conflicts; rebased onto {} and re-pushed — will auto-accept once green",
+                self.trunk()
+            ));
+        }
+        // Mergeable: accept with `gh pr merge --auto` (squash keeps history tidy).
+        let merge = Command::new("gh")
+            .args(["pr", "merge", "--auto", "--squash", branch])
+            .current_dir(&root)
+            .status();
+        match merge {
+            Ok(s) if s.success() => Outcome::ok(format!(
+                "wt(PR): auto-accepted (merged) PR {} for {branch}",
+                pr_num.map(|n| format!("#{n}")).unwrap_or_default()
+            )),
+            Ok(_) => Outcome::err(format!("wt(PR): `gh pr merge` of {branch} failed (checks may still be pending)")),
+            Err(e) => Outcome::err(format!("wt(PR): `gh pr merge` error: {e}")),
+        }
+    }
+
+    /// Rebase the worktree's branch onto the latest trunk (`origin/<trunk>`).
+    /// Used by the PR auto-accept path when the trunk diverged and left the PR
+    /// with merge conflicts — this is the mechanically-automatable part of the
+    /// merge-fixer. Remaining conflicts (after the rebase) are left for the
+    /// model / a dedicated merge-fixer agent to resolve; we just report them.
+    fn rebase_onto_trunk(&self, branch: &str) -> Outcome {
+        let Some(wt_dir) = self.current.clone() else {
+            return Outcome::err("wt: not in a worktree".into());
+        };
+        let root = self.repo_root();
+        // Best-effort fetch so we rebase onto the freshest trunk.
+        let _ = Command::new("git").args(["fetch", "--quiet", "origin"]).current_dir(&root).status();
+        let trunk = self.trunk();
+        let upstream = format!("origin/{trunk}");
+        let has_upstream = Command::new("git")
+            .args(["rev-parse", "--verify", &upstream])
+            .current_dir(&root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        let base = if has_upstream { upstream } else { trunk.to_string() };
+        // `git rebase` only touches the current branch; ensure we're on it.
+        let checkout = Command::new("git").args(["checkout", "--quiet", branch]).current_dir(&wt_dir).status();
+        if !checkout.map(|s| s.success()).unwrap_or(false) {
+            return Outcome::err(format!("wt: could not check out {branch} to rebase"));
+        }
+        let rb = Command::new("git").args(["rebase", &base]).current_dir(&wt_dir).status();
+        match rb {
+            Ok(s) if s.success() => {
+                // Re-push with lease so the remote PR branch tracks the rebased tip.
+                let push = Command::new("git")
+                    .args(["push", "--force-with-lease", "-u", "origin", &format!("{branch}:{branch}")])
+                    .current_dir(&wt_dir)
+                    .status();
+                if push.map(|s| s.success()).unwrap_or(false) {
+                    Outcome::ok(format!("wt: rebased {branch} onto {base} and re-pushed"))
+                } else {
+                    Outcome::err(format!("wt: rebased {branch} onto {base} but push failed"))
+                }
+            }
+            Ok(_) => Outcome::err(format!(
+                "wt: rebase of {branch} onto {base} has conflicts — resolve them, then re-run wt_merge/wt_verify"
+            )),
+            Err(e) => Outcome::err(format!("wt: rebase error: {e}")),
         }
     }
 
@@ -809,7 +1036,29 @@ impl ToolBackend for Wt {
                 name: "wt_status",
                 description:
                     "Report the current worktree (if any), its branch, and whether the agent is \
-                     on the main checkout.",
+                     on the main checkout. In PR mode (PIR_WT_PR=1) also reports the open PR number.",
+                schema: json!({ "type": "object", "properties": {}, "required": [] }),
+            },
+            ToolSpec {
+                name: "wt_pr",
+                description:
+                    "PR-submission control (only meaningful when PIR_WT_PR=1). Opens a PR for the \
+                     current branch if none exists, or reports the current PR's status/mergeability. \
+                     Pass action 'open' to push+open a PR, 'status' to inspect it (default status).",
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "description": "'open' to push+open a PR, 'status' to inspect (default)" }
+                    },
+                    "required": []
+                }),
+            },
+            ToolSpec {
+                name: "wt_rebase",
+                description:
+                    "Rebase the current worktree branch onto the latest trunk (origin/<trunk>) and \
+                     re-push. This is the merge-fixer step for a PR that the diverged trunk left \
+                     conflicted. Run after resolving any conflicts the rebase surfaces.",
                 schema: json!({ "type": "object", "properties": {}, "required": [] }),
             },
             ToolSpec {
@@ -861,8 +1110,12 @@ impl ToolBackend for Wt {
                     Some(wt_dir) => {
                         let branch = self.worktree_branch(wt_dir).unwrap_or_else(|| "(detached)".into());
                         let trunk = self.trunk();
+                        let pr = self
+                            .pr_number
+                            .map(|n| format!(" (PR #{n})"))
+                            .unwrap_or_default();
                         Outcome::ok(format!(
-                            "wt: in worktree {} on branch {branch}; trunk is {trunk} at {}",
+                            "wt: in worktree {} on branch {branch}{pr}; trunk is {trunk} at {}",
                             wt_dir.display(),
                             self.repo_root().display()
                         ))
@@ -872,6 +1125,71 @@ impl ToolBackend for Wt {
                         self.repo_root().display()
                     )),
                 }
+            }
+            "wt_pr" => {
+                if !self.pr_mode {
+                    return Outcome::err(
+                        "wt: PR mode is off; set PIR_WT_PR=1 to submit pull requests instead of merging directly"
+                            .into(),
+                    );
+                }
+                let Some(wt_dir) = self.current.clone() else {
+                    return Outcome::err("wt: not in a worktree".into());
+                };
+                let Some(branch) = self.worktree_branch(&wt_dir) else {
+                    return Outcome::err("wt: worktree branch is detached".into());
+                };
+                let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("status");
+                match action {
+                    "open" => self.ensure_pr(&wt_dir, &branch),
+                    _ => {
+                        // status: report PR number + mergeability if `gh` present.
+                        let root = self.repo_root();
+                        let has_gh = Command::new("gh")
+                            .args(["--version"])
+                            .output()
+                            .map(|o| o.status.success())
+                            .unwrap_or(false);
+                        if !has_gh {
+                            return Outcome::ok(format!(
+                                "wt(PR): branch {branch} pushed; `gh` not available to inspect the PR. \
+                                 Open one with: gh pr create --fill --head {branch} --base {}",
+                                self.trunk()
+                            ));
+                        }
+                        let view = Command::new("gh")
+                            .args([
+                                "pr", "view", &branch, "--json", "state,mergeable,number,statusCheckRollup",
+                                "--jq", "(.number|tostring) + \" \" + .state + \" \" + (.mergeable|tostring)",
+                            ])
+                            .current_dir(&root)
+                            .output();
+                        match view {
+                            Ok(o) if o.status.success() => {
+                                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                let mut parts = s.split_whitespace();
+                                let num = parts.next().and_then(|n| n.parse::<u64>().ok());
+                                let state = parts.next().unwrap_or("?");
+                                let mergeable = parts.next().unwrap_or("?");
+                                self.pr_number = num;
+                                Outcome::ok(format!(
+                                    "wt(PR): PR {} for {branch} — state={state}, mergeable={mergeable}",
+                                    num.map(|n| format!("#{n}")).unwrap_or_default()
+                                ))
+                            }
+                            _ => Outcome::err(format!("wt(PR): could not inspect PR for {branch}")),
+                        }
+                    }
+                }
+            }
+            "wt_rebase" => {
+                let Some(wt_dir) = self.current.clone() else {
+                    return Outcome::err("wt in a worktree".into());
+                };
+                let Some(branch) = self.worktree_branch(&wt_dir) else {
+                    return Outcome::err("wt: worktree branch is detached".into());
+                };
+                self.rebase_onto_trunk(&branch)
             }
             "wt_remove" => {
                 let Some(wt_dir) = self.current.clone() else {

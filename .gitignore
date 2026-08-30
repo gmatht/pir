@@ -20,13 +20,11 @@ fuzz/fuzz_parser
 fuzz/corpus/
 /.rustxWidgets-upstream/
 
-# Optional GUI dependency (rustxwidgets) — NOT vendored in this repo.
-# Check it out as a sibling (/home/ai_pir/rustxWidgets-canonical or /root/src/rustxWidgets)
-# and add a [patch] path entry to build --features gui/pancurses.
-rustxWidgets
-rustxWidgets/
-
-# Local scratch artifacts to sibling worktrees, backups, archives)
+# Optional GUI dependency (rustxwidgets) is now VENDORED in-tree at
+# vendors/rustxWidgets (a real directory shipped in git), so the default
+# `cargo build` (gui feature) works with no external checkout. Only the
+# foreign scratch symlinks are ignored.
+# Local scratch symlinks to sibling worktrees / backups / archives:
 rustxWidgets.bak
 pir_.gz
 build-gui.sh
