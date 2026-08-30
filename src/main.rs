@@ -456,12 +456,17 @@ fn main() {
     let mut no_raw = false;
     let mut budget: Option<u64> = None;
 
-    // Capture the invoking user's default-model selector BEFORE the privilege
-    // drop (while HOME still points at the real user's ~/.pi). After the drop,
-    // settings.json would come from the sandbox user, whose catalog is a
-    // different (smaller) store — using it to resolve against the invoking
-    // user's catalog produced "no model matches" fallbacks.
-    let pre_drop_selector = std::env::var("PI_MODEL").ok().or_else(config::default_model_setting);
+    // NOTE: the default-model *selector* is intentionally NOT read here (before
+    // the privilege drop), even though that would read the invoking user's
+    // ~/.pi. The reason: `/default-model` (and `/model*`) persist the choice to
+    // `~/.pi/agent/settings.json` via `config::set_default_model`, which runs
+    // *after* the drop — so `pi_dir()` points at the SANDBOX user's home there.
+    // Reading the selector pre-drop off the invoking user's settings and writing
+    // it post-drop to the sandbox user's settings means the two paths consult
+    // DIFFERENT files, so a saved default was silently lost and every new
+    // session fell back to `providers[0]`. See the comment where `selector` is
+    // resolved (after the drop) for the corrected read path.
+    let explicit_model_env = std::env::var("PI_MODEL").ok();
 
     // Record the *invoking* user (who launched pir, before any privilege drop)
     // into the environment so it survives `become_user`'s HOME rewrite and is
@@ -626,16 +631,24 @@ fn main() {
     let resolved_user: Option<String> = None;
 
     // Resolve the model. Priority: explicit -m/PI_MODEL on the INVOKING
-    // user's command line, then the invoking user's settings.json (captured in
-    // `pre_drop_selector` before HOME changed), then the first catalog model.
-    // The sandbox user's own settings.json is NOT used to pick a model that
-    // must resolve against the invoking user's catalog: its catalog (e.g.
-    // ai_pir's tiny local/fake store) is a subset, and a sandbox-only selector
-    // could never match here. `default_model_setting()` is re-read after the
-    // drop only for the /default-model WRITE path below.
+    // user's command line, then the default persisted in `~/.pi/agent/
+    // settings.json` by `/default-model` — which (like the `/default-model`
+    // WRITE path) must resolve against the *sandbox* user's home, because
+    // `become_user` rewrote HOME before we get here. Reading it here (post-drop)
+    // and writing it in the `/default-model` handler (also post-drop) both go
+    // through `config::pi_dir()`, so the read/write paths consult the SAME
+    // settings file and a saved default is actually honoured on the next
+    // launch. We never consult the invoking user's pre-drop settings.json,
+    // because that file is never written by `/default-model` (it would be a
+    // different, unwritable-as-sandbox location). The sandbox user's catalog is
+    // a subset, but the selector was chosen against the invoking user's catalog
+    // at `/default-model` time and persists the resolved `provider/model`, so
+    // re-resolving it here against the same full catalog (loaded pre-drop above)
+    // always matches. Finally, fall back to the first catalog model.
     let explicit = model_sel.is_some();
     let selector = model_sel
-        .or(pre_drop_selector)
+        .or(explicit_model_env)
+        .or_else(config::default_model_setting)
         .unwrap_or_else(|| providers[0].label(&providers[0].models[0]));
 
     let (provider, model) = match config::select(&providers, &selector) {
