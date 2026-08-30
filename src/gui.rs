@@ -708,12 +708,12 @@ fn sync_textview(widgets: &GuiWidgets, state: &GuiState) {
     let rendered = RENDERED_LINES.load(Ordering::SeqCst);
     if state.conv.len() > rendered {
         for line in &state.conv[rendered..] {
-            widgets.textview.append_markup(&line_markup(line));
-            widgets.textview.append_text("\n");
+            widgets.textview.set_markup(&line_markup(line));
+            widgets.textview.set_text("\n");
         }
         RENDERED_LINES.store(state.conv.len(), Ordering::SeqCst);
     }
-    widgets.textview.scroll_to_end();
+    widgets.textview.set_text("");
     widgets.status.set_markup(&status_markup(&state.status));
 }
 

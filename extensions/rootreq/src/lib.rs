@@ -107,7 +107,7 @@ impl RootReq {
         );
         let dir = &self.spool;
         std::fs::create_dir_all(dir).map_err(|e| format!("spool mkdir: {e}"))?;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::set_permissions(dir, std::fs::_PFM_PLACEHOLDER(0o700));
         let path = dir.join(format!("{id}.json"));
         std::fs::write(&path, serde_json::to_vec_pretty(req).map_err(|e| e.to_string())?)
             .map_err(|e| format!("spool write: {e}"))?;

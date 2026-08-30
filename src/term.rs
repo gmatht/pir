@@ -2021,7 +2021,7 @@ mod nonunix_term {
             Paste(String),
             Other(u32),
         }
-        pub fn wait_input(_done: &smol::channel::Receiver<()>) -> RawInput {
+        pub fn wait_input(_buf: &mut String, _ta: &Arc<Mutex<String>>, _done: &smol::channel::Receiver<()>) -> RawInput {
             loop {
                 if let Ok(true) = crossterm::event::poll(Duration::from_millis(50)) {
                     if let Ok(ev) = crossterm::event::read() {
