@@ -748,6 +748,20 @@ thread_local! {
         const { RefCell::new(None) };
     // Persisted history store (a .history file next to the session log).
     static HISTORY_FILE: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
+    // A *copy* of the loaded/added history lines, kept OUTSIDE `EDITOR`.
+    //
+    // rustyline fires its `Hinter::hint` / `Completer::complete` callbacks
+    // while it is holding the editor mutably (i.e. inside `read_line`'s
+    // `EDITOR.borrow_mut()`). Those callbacks reach `load_history_lines()` to
+    // offer fuzzy recall of prior prompts. If `load_history_lines` borrowed
+    // `EDITOR` again, that would be a second borrow of the same `RefCell` on
+    // the same thread → `RefCell already mutably borrowed` panic, killing pir
+    // the instant the user typed a multi-character prompt (which made Esc/Ctrl-D
+    // appear to "not work" — the process was already dead). Reading this
+    // separate `RefCell` instead avoids the re-borrow entirely. It is kept in
+    // sync with the editor's own history by `load_history` / `save_history` /
+    // `push_history`.
+    static HISTORY_LINES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Point the line editor at a history file that should be loaded on first
@@ -795,7 +809,7 @@ fn load_history() {
         let Some(rl) = g.as_mut() else { return };
         if let Some(path) = HISTORY_FILE.with(|f| f.borrow().clone()) {
             let r = rl.load_history(&path);
-            // A missing expected (fresh session, or `pir` with
+            // A missing history file on first run is expected (fresh session, or `pir` with
             // no `-r`), so only surface the failure when debugging is on and the
             // error is something other than "file not found".
             if let Some(e) = r.err() {
@@ -808,6 +822,10 @@ fn load_history() {
                 }
             }
         }
+        // Mirror the editor's history into the read-only `HISTORY_LINES` store so
+        // the hint/complete callbacks can read it without re-borrowing `EDITOR`.
+        let lines: Vec<String> = rl.history().iter().cloned().collect();
+        HISTORY_LINES.with(|h| *h.borrow_mut() = lines);
     });
 }
 
@@ -815,23 +833,22 @@ fn save_history(rl: &mut Editor<PirHelper, rustyline::history::DefaultHistory>) 
     if let Some(path) = HISTORY_FILE.with(|f| f.borrow().clone()) {
         let _ = rl.save_history(&path);
     }
+    // Keep the read-only mirror in sync (a freshly added entry, or a save that
+    // may have de-duplicated history).
+    let lines: Vec<String> = rl.history().iter().cloned().collect();
+    HISTORY_LINES.with(|h| *h.borrow_mut() = lines);
 }
 
 /// Return the currently-loaded line-editor history (most-recent-last order),
-/// used by the TUI's idle prompt for arrow-up/down recall. Shares the same
-/// `.history` file the streaming REPL loads into the rustyline editor, so the
-/// TUI shows the exact same previous prompts (including those from before a
-/// `pir -r` resume). Returns an empty vec when no history has been loaded yet.
+/// used by the TUI's idle prompt for arrow-up/down recall AND by the
+/// `Hinter`/`Completer` callbacks for fuzzy recall of prior prompts. It reads
+/// from a *separate* `RefCell` (`HISTORY_LINES`) rather than `EDITOR` itself:
+/// those callbacks run while rustyline is holding `EDITOR` mutably (inside
+/// `read_line`), so borrowing `EDITOR` here would trigger a `RefCell already
+/// mutably borrowed` panic and kill pir. See the doc comment on `HISTORY_LINES`.
+/// Returns an empty vec when no history has been loaded yet.
 pub fn load_history_lines() -> Vec<String> {
-    let lines = EDITOR.with(|e| {
-        let g = e.borrow();
-        match g.as_ref() {
-            Some(rl) => rl.history().iter().cloned().collect(),
-            None => Vec::new(),
-        }
-    });
-    debug_log!("pir load_history_lines: {} entries", lines.len());
-    lines
+    HISTORY_LINES.with(|h| h.borrow().clone())
 }
 
 /// Read a line with full line editing: arrow-up/down history, left/right
@@ -2129,5 +2146,34 @@ mod keyboard_idle_tests {
         assert!(!keyboard_idle_long_enough());
         // Restore global state for other tests (process-wide clock).
         reset_keypress_clock();
+    }
+}
+
+#[cfg(test)]
+mod history_reentrancy_tests {
+    use super::{load_history_lines, new_editor, EDITOR};
+
+    // Regression guard for the bug where typing any multi-character prompt
+    // crashed pir with `RefCell already mutably borrowed` (and so Esc/Ctrl-D
+    // appeared to "not work" — the process was already dead).
+    //
+    // rustyline's `HCompleter` callbacks fire *while* `read_line` is
+    // holding `EDITOR` mutably. Those callbacks reach `load_history_lines()`,
+    // which must therefore read from the separate `HISTORY_LINES` store, NOT
+    // `EDITOR` — otherwise it is a second borrow of the same `RefCell` on the
+    // same thread and panics. This test reproduces that exact reentrancy: we
+    // hold the editor mutably (as `read_line` does) and then call
+    // `load_history_lines()` (as a hint callback does). It must not panic.
+    #[test]
+    fn load_history_lines_is_reentrant_under_editor_borrow() {
+        EDITOR.with(|e| {
+            if e.borrow().is_none() {
+                *e.borrow_mut() = new_editor();
+            }
+            // This is the borrow `read_line` holds across `rl.readline(...)`.
+            let _guard = e.borrow_mut();
+            // A hint/complete callback calls this while `_guard` is alive.
+            let _lines = load_history_lines();
+        });
     }
 }

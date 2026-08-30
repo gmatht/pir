@@ -1233,9 +1233,27 @@ impl Agent {
                     }
                 }
             };
+            // The provider enforces a *combined* context limit: text input +
+            // tool input + requested output must fit in `model.context`. To
+            // avoid a hard HTTP 400 ("maximum context length is N tokens"),
+            // clamp the output budget so the total request provably fits,
+            // leaving a little headroom for the system prompt (which is sent
+            // alongside `history` but not counted in it). This is the belt to
+            // `trim`'s suspenders: `trim` drops old turns from `history`, and
+            // this guarantees the remaining room is never over-committed on the
+            // output side. `approx_tokens` is a cheap `bytes/4` estimate, so a
+            // generous (2k) system headroom guards against tokenizer drift.
+            let ctx = self.model.context.unwrap_or(200_000) as u64;
+            let sys_head = 2_000u64;
+            let est_input = approx_tokens(&self.history) as u64;
+            let out_cap = ctx
+                .saturating_sub(est_input)
+                .saturating_sub(sys_head)
+                .max(1024);
+            let max_tokens = (self.model.max_tokens.unwrap_or(8192) as u64).min(out_cap);
             let result = self.client.chat(
                 &self.model.id,
-                self.model.max_tokens.unwrap_or(8192),
+                max_tokens,
                 &self.system,
                 &self.history,
                 &specs,
@@ -1248,7 +1266,6 @@ impl Agent {
                 self.provider.model_base_url(&self.model),
                 !self.model.no_reasoning_effort,
             );
-            eprintln!("pir-debug turn: chat returned (silent={})", self.silent());
             // Flush any thinking that arrived while the user was still typing
             // (deferred above) BEFORE the reply text / tool output prints, so
             // reasoning never appears interleaved after the response it
@@ -1583,7 +1600,21 @@ impl Agent {
     /// request plus the newest self-consistent tail, eliding the middle.
     fn trim(&mut self) {
         let ctx = self.model.context.unwrap_or(200_000) as usize;
-        let budget = ctx.saturating_sub(8192).max(8192);
+        // The provider enforces a *combined* limit: text input + tool input +
+        // output must fit in `ctx`. So the input budget must reserve room for
+        // the model's actual `max_tokens` output (not a hardcoded 8k) plus a
+        // little headroom for the system prompt (sent alongside history but not
+        // counted in it). Without this, a large output budget (e.g. 64k) pushes
+        // the total request past the model's hard context window and the
+        // provider rejects it with HTTP 400 "maximum context length is N tokens"
+        // — exactly the error this fix addresses. `max_tokens` is the same value
+        // handed to the provider call in `turn()`.
+        let out_reserve = self.model.max_tokens.unwrap_or(8192) as usize;
+        let sys_reserve = 2_000; // rough system-prompt headroom (not in history)
+        let budget = ctx
+            .saturating_sub(out_reserve)
+            .saturating_sub(sys_reserve)
+            .max(8192);
         if approx_tokens(&self.history) <= budget {
             return;
         }
