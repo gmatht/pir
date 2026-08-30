@@ -86,6 +86,7 @@ fn transparent_highlight() -> bool {
 /// mechanism the input path uses) instead of sleeping-and-retrying in a hot
 /// loop. A genuinely broken pipe is ignored silently.
 #[cfg(unix)]
+#[cfg(unix)]
 pub fn out(s: &str) {
     #[cfg(unix)]
     #[cfg(unix)]
@@ -126,12 +127,14 @@ pub fn out(s: &str) {
 }
 
 /// Flush stdout, ignoring any error (so a flush failure can't panic either).
+#[cfg(unix)]
 pub fn out_flush() {
     let _ = io::stdout().flush();
 }
 
 /// Width of the terminal in columns (used to size the REPL hrule). Falls back
 /// to 80 when the size can't be queried (e.g. a pipe or a non-tty).
+#[cfg(unix)]
 #[cfg(unix)]
 pub fn terminal_width() -> usize {
     #[cfg(unix)]
@@ -150,6 +153,7 @@ pub fn terminal_width() -> usize {
 
 /// Height of the terminal in rows (used by the `pir -r` session picker to size
 /// its two panes). Falls back to 24 when the size can't be queried.
+#[cfg(unix)]
 #[cfg(unix)]
 pub fn terminal_height() -> usize {
     #[cfg(unix)]
@@ -253,6 +257,7 @@ pub fn highlight(s: &str) -> String {
 }
 
 #[cfg(unix)]
+#[cfg(unix)]
 pub fn read_answer(prompt: &str) -> String {
     eprint!("{prompt} ");
     let _ = io::stderr().flush();
@@ -267,6 +272,7 @@ pub fn read_answer(prompt: &str) -> String {
 /// the user types; on non-unix, or when the terminal state can't be fetched, it
 /// falls back to a normal line read (which may echo). The prompt is printed to
 /// stderr so it never pollutes piped stdout.
+#[cfg(unix)]
 #[cfg(unix)]
 pub fn read_secret(prompt: &str) -> String {
     eprint!("{prompt} ");
@@ -298,6 +304,7 @@ pub fn epoch() -> u64 {
 /// PID of the shell (bash) that launched pir, taken from the `PIR_PARENT_PID`
 /// env var if present, else the real parent process id. Used to tag sessions
 /// so `pir -r` can group/resume sessions from the same shell.
+#[cfg(unix)]
 #[cfg(unix)]
 pub fn parent_shell_pid() -> u32 {
     if let Ok(v) = std::env::var("PIR_PARENT_PID") {
@@ -601,6 +608,7 @@ thread_local! {
 /// Point the line editor at a history file that should be loaded on first
 /// use and appended to on every line read. Call once after choosing a
 /// session log path.
+#[cfg(unix)]
 pub fn set_history_file(path: &Path) {
     HISTORY_FILE.with(|f| *f.borrow_mut() = Some(path.to_path_buf()));
     // Eagerly create the editor so the file is loaded before the first prompt.
@@ -644,6 +652,7 @@ fn save_history(rl: &mut Editor<PirHelper, rustyline::history::DefaultHistory>) 
 /// `.history` file the streaming REPL loads into the rustyline editor, so the
 /// TUI shows the exact same previous prompts (including those from before a
 /// `pir -r` resume). Returns an empty vec when no history has been loaded yet.
+#[cfg(unix)]
 pub fn load_history_lines() -> Vec<String> {
     let lines = EDITOR.with(|e| {
         let g = e.borrow();
@@ -701,6 +710,7 @@ fn plain_read_line(prompt: &str) -> Option<String> {
 /// Append a line to the per-session history so prompts typed *while a turn was
 /// running* (raw mode, recorded into `typeahead` and queued) show up in the
 /// rustyline prompt's arrow-up history once we return to idle. Best-effort.
+#[cfg(unix)]
 pub fn push_history(line: &str) {
     if line.trim().is_empty() {
         return;
@@ -734,6 +744,7 @@ pub fn push_history(line: &str) {
 /// place each tick and fully erases it on `stop()` — so a replaced spinner can
 /// never leave a stray "thinking…" / "────" line behind (the old 3-line block
 /// drifted on `\x1b[2A` line-arithmetic between tool rounds).
+#[cfg(unix)]
 #[cfg(unix)]
 pub struct Spinner {
     handle: Option<JoinHandle<()>>,
@@ -854,6 +865,7 @@ impl Drop for Spinner {
 /// `wait_input` blocks event-driven (via the smol reactor) until stdin is
 /// readable or the worker signals turn-completion, so the REPL thread sleeps
 /// (0% CPU) instead of polling.
+#[cfg(unix)]
 pub mod raw {
     use std::io::{self, Write};
     #[cfg(unix)]
@@ -1921,10 +1933,23 @@ mod keyboard_idle_tests {
 // intentionally minimal.
 // ===========================================================================
 #[cfg(not(unix))]
+
+// ===========================================================================
+// Cross-platform (non-Unix) terminal implementation via `crossterm`.
+// Windows `--gui` uses the NWG backend; this keeps the streaming REPL + the
+// crate compiling on non-Unix with a functional (minimal) terminal layer.
+// ===========================================================================
+#[cfg(not(unix))]
+
+// ===========================================================================
+// Cross-platform (non-Unix) terminal implementation via `crossterm`.
+// Windows `--gui` uses the NWG backend; this keeps the streaming REPL + crate
+// compiling on non-Unix with a functional (minimal) terminal layer.
+// ===========================================================================
+#[cfg(not(unix))]
 mod nonunix_term {
-    use std::io::{self, Write};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::io::{self, Write, BufRead};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     pub fn out(s: &str) {
@@ -1933,53 +1958,53 @@ mod nonunix_term {
         let _ = o.flush();
     }
     pub fn out_flush() { let _ = io::stdout().flush(); }
-    pub fn terminal_width() -> usize {
-        crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80)
-    }
-    pub fn terminal_height() -> usize {
-        crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24)
-    }
+    pub fn terminal_width() -> usize { crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80) }
+    pub fn terminal_height() -> usize { crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24) }
     pub fn read_answer(prompt: &str) -> String {
         out(prompt);
-        let mut line = String::new();
-        let _ = io::stdin().read_line(&mut line);
-        line.trim_end_matches('\n').trim_end_matches('\r').to_string()
+        let mut l = String::new();
+        let _ = io::stdin().lock().read_line(&mut l);
+        l.trim_end_matches('\n').trim_end_matches('\r').to_string()
     }
-    pub fn read_secret(prompt: &str) -> String {
-        // crossterm has no secure read; read a normal line.
-        read_answer(prompt)
+    pub fn read_secret(prompt: &str) -> String { read_answer(prompt) }
+    pub fn read_line(_p: &str) -> Option<String> {
+        let mut l = String::new();
+        match io::stdin().lock().read_line(&mut l) {
+            Ok(0) => None,
+            Ok(_) => Some(l.trim_end_matches('\n').trim_end_matches('\r').to_string()),
+            Err(_) => None,
+        }
     }
+    pub fn set_history_file(_p: &std::path::Path) {}
+    pub fn load_history_lines() -> Vec<String> { Vec::new() }
+    pub fn push_history(_l: &str) {}
     pub fn parent_shell_pid() -> u32 { 0 }
-    pub fn enable_raw() { let _ = crossterm::terminal::enable_raw_mode(); }
-    pub fn disable_raw() { let _ = crossterm::terminal::disable_raw_mode(); }
-    pub fn enable_raw_picker() { enable_raw(); }
-    pub fn disable_raw_picker() { disable_raw(); }
 
-    #[derive(Clone, Copy)]
-    pub enum RawInput {
-        Char(char),
-        Enter,
-        Tab,
-        Up,
-        Down,
-        Left,
-        Right,
-        Escape,
-        CtrlC,
-        CtrlD,
-        Resize,
-        Paste(String),
-        Other(u32),
+    pub struct Spinner;
+    impl Spinner {
+        pub fn start(_label: &str, _ta: Arc<Mutex<String>>, _e: bool) -> Spinner { Spinner }
+        pub fn start_with(_label: &str, _ta: Arc<Mutex<String>>, _e: bool, _d: smol::channel::Receiver<()>) -> Spinner { Spinner }
+        pub fn stop(&mut self) {}
     }
 
-    pub fn wait_input(done: &smol::channel::Receiver<()>) -> RawInput {
-        loop {
-            match crossterm::event::poll(Duration::from_millis(50)) {
-                Ok(true) => {
+    pub mod raw {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        pub fn enable_raw() { let _ = crossterm::terminal::enable_raw_mode(); }
+        pub fn disable_raw() { let _ = crossterm::terminal::disable_raw_mode(); }
+        pub fn enable_raw_picker() { enable_raw(); }
+        pub fn disable_raw_picker() { disable_raw(); }
+        #[derive(Clone, Copy)]
+        pub enum RawInput {
+            Char(char), Enter, Tab, Up, Down, Left, Right, Escape, CtrlC, CtrlD, Resize, Paste(String), Other(u32),
+        }
+        pub fn wait_input(_done: &smol::channel::Receiver<()>) -> RawInput {
+            loop {
+                if let Ok(true) = crossterm::event::poll(Duration::from_millis(50)) {
                     if let Ok(ev) = crossterm::event::read() {
+                        use crossterm::event::{KeyCode, KeyModifiers};
                         match ev {
                             crossterm::event::Event::Key(k) => {
-                                use crossterm::event::{KeyCode, KeyModifiers};
                                 let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
                                 return match k.code {
                                     KeyCode::Enter => RawInput::Enter,
@@ -2000,21 +2025,23 @@ mod nonunix_term {
                         }
                     }
                 }
-                Ok(false) => {
-                    if done.try_recv().is_ok() { return RawInput::Other(0); }
-                }
-                Err(_) => { if done.try_recv().is_ok() { return RawInput::Other(0); } }
             }
         }
-    }
-
-    pub fn translate(buf: &mut String, _typeahead: &Arc<std::sync::Mutex<String>>, bytes: &[u8]) -> RawInput {
-        for &b in bytes {
-            if let Some(c) = char::from_u32(b as u32) { buf.push(c); return RawInput::Char(c); }
+        pub fn translate(_buf: &mut String, _ta: &Arc<Mutex<String>>, bytes: &[u8]) -> RawInput {
+            if let Some(&b) = bytes.first() {
+                if let Some(c) = char::from_u32(b as u32) { return RawInput::Char(c); }
+            }
+            RawInput::Other(0)
         }
-        RawInput::Other(0)
-    }
-    pub fn translate_picker(buf: &mut String, _typeahead: &Arc<std::sync::Mutex<String>>, bytes: &[u8]) -> RawInput {
-        translate(buf, _typeahead, bytes)
+        pub fn translate_picker(buf: &mut String, ta: &Arc<Mutex<String>>, bytes: &[u8]) -> RawInput { translate(buf, ta, bytes) }
+        pub fn set_enabled(_on: bool) {}
+        pub fn is_active() -> bool { false }
+        pub fn note_keypress() {}
+        pub fn millis_since_keypress() -> u64 { 0 }
+        pub fn keyboard_idle_long_enough() -> bool { true }
     }
 }
+#[cfg(not(unix))]
+pub use nonunix_term::*;
+#[cfg(not(unix))]
+pub use nonunix_term::raw;

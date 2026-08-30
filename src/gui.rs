@@ -288,6 +288,7 @@ pub fn run(
 ) -> Result<(), String> {
     let app = App::init().map_err(|e| format!("rustxwidgets init: {e}"))?;
     let app_quit = app.clone();
+    let app_quit = app.clone();
 
     // -- Build the widget tree --
     let window = app.create_window().map_err(|e| format!("create_window: {e}"))?;
@@ -309,10 +310,17 @@ pub fn run(
 
     let status = app.create_label("pir · idle").map_err(|e| format!("create_label: {e}"))?;
     #[cfg(all(feature = "gtk", target_os = "linux"))]
+    #[cfg(all(feature = "gtk", target_os = "linux"))]
     status.set_xalign(0.0); // left-align
     vbox.append(&status);
 
-    window.set_child(&vbox);
+    let tabs = app.create_tabview()?;
+    let _tab = tabs.add_tab(&format!("session"))?;
+    let panel = tabs.tab_box(0)?;
+    panel.append(&vbox);
+    vbox.set_hexpand(true);
+    vbox.set_vexpand(true);
+    window.set_child(&tabs);
     window.present();
 
     // Keep keyboard focus on the Entry (the REPL prompt). Grab it right after
@@ -421,6 +429,7 @@ pub fn run(
                 &entry_cb_bus,
                 &entry_cb_cancel,
                 &entry_cb_state,
+                &app_quit,
                 &app_quit,
                 &entry_cb_widgets,
             );

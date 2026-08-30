@@ -60,6 +60,7 @@ extern "C" fn on_winch(_sig: i32) {
 /// 0 = newest). Returns `PickResult::Cancel` when stdin is not a terminal or
 /// the user bails out. Blocks in raw mode for the duration; restores the
 /// terminal on return.
+#[cfg(unix)]
 pub fn pick_session(items: &[PickItem]) -> PickResult {
     if items.is_empty() || !io::stdin().is_terminal() {
         return PickResult::Cancel;
@@ -364,6 +365,7 @@ enum Key {
 /// spinning: `poll()` parks the process with zero wakeups until stdin is
 /// readable or SIGWINCH interrupts it (EINTR), so no CPU is burned and no
 /// repaint happens until there is something to show.
+#[cfg(unix)]
 fn wait_key() -> Key {
     let fd = io::stdin().as_raw_fd();
     if RESIZED.swap(false, Ordering::SeqCst) {
