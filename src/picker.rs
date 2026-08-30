@@ -19,6 +19,8 @@
 
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
+#[cfg(unix)]
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

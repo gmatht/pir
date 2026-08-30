@@ -25,6 +25,8 @@ use crate::notify::SharedBus;
 use std::io::BufRead;
 use std::io::IsTerminal;
 use std::io::Write;
+#[cfg(unix)]
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2195,6 +2197,7 @@ fn run_project_subcommand(_rest: &[String]) {
 /// a build failure we print the tail of the output and stay in the running
 /// session. Unix-only: `exec` replaces the process image in place, so the new
 /// `pir` inherits the same stdio/terminal and keeps the user's place.
+#[cfg(unix)]
 fn rebuild_and_exec() {
     eprintln!("{} rebuilding…", term::dim("·"));
     let output = std::process::Command::new(env!("CARGO"))
@@ -2221,6 +2224,7 @@ fn rebuild_and_exec() {
     }
 }
 
+#[cfg(not(unix))]
 #[cfg(not(unix))]
 fn rebuild_and_exec() {
     eprintln!("pir: /rebuild (exec) is only supported on unix");

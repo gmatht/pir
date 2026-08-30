@@ -26,6 +26,8 @@
 
 use crate::plugin::{Outcome, Registry, ToolBackend, ToolSpec};
 use serde_json::json;
+#[cfg(unix)]
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;

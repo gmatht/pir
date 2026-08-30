@@ -287,6 +287,7 @@ pub fn run(
     _full_auto: bool,
 ) -> Result<(), String> {
     let app = App::init().map_err(|e| format!("rustxwidgets init: {e}"))?;
+    let app_quit = app.clone();
 
     // -- Build the widget tree --
     let window = app.create_window().map_err(|e| format!("create_window: {e}"))?;
@@ -307,6 +308,7 @@ pub fn run(
     vbox.append(&entry);
 
     let status = app.create_label("pir · idle").map_err(|e| format!("create_label: {e}"))?;
+    #[cfg(all(feature = "gtk", target_os = "linux"))]
     status.set_xalign(0.0); // left-align
     vbox.append(&status);
 
@@ -349,69 +351,39 @@ pub fn run(
     // Arrow-Up/Down navigation state for the prompt Entry.
     let hist_nav = Arc::new(Mutex::new(HistoryNav::default()));
 
-    let mut _key_controllers: Vec<Box<rustxwidgets::gtk_dynamic_loader::EventControllerKey>> = Vec::new();
-    let entry_comp = entry.clone();
     let entry_comp_cb = entry.clone();
     let nav_for_keys = hist_nav.clone();
     let hist_for_keys = state.clone();
-    {
-        if let Some(loader) = rustxwidgets::backends::gtk::loader() {
-            if let Ok(ctrl) = rustxwidgets::gtk_dynamic_loader::EventControllerKey::new(loader.clone()) {
-                // Ctrl tracking: on GTK4 the controller reports the Ctrl key
-                // itself as its own key event (GDK_KEY_Control_L/R) and the
-                // following `q` arrives as a separate event *without*
-                // modifier info (the connect_key_pressed trampoline only
-                // forwards the keyval), so we remember that Ctrl is held and
-                // treat the next `q` as Ctrl-Q (quit, as the banner
-                // promises). Any other key clears the flag.
-                let ctrl_held = Arc::new(AtomicBool::new(false));
-                let ctrl_held_cb = ctrl_held.clone();
-                let _ = ctrl.connect_key_pressed(move |keyval: u32| -> i32 {
-                    use std::sync::atomic::Ordering as AtomicOrdering;
-                    // Lock order is always nav -> state, and both are only
-                    // ever held briefly inside this callback.
-                    match keyval {
-                        GDK_KEY_CTRL_L | GDK_KEY_CTRL_R => {
-                            ctrl_held_cb.store(true, AtomicOrdering::SeqCst);
-                            1 // swallow the bare modifier press
-                        }
-                        GDK_KEY_Q if ctrl_held_cb.load(AtomicOrdering::SeqCst) => {
-                            ctrl_held_cb.store(false, AtomicOrdering::SeqCst);
-                            let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-                            1 // handled: quit
-                        }
-                        GDK_KEY_TAB => {
-                            ctrl_held_cb.store(false, AtomicOrdering::SeqCst);
-                            let cur = entry_comp_cb.get_text().unwrap_or_default();
-                            if let Some(completed) = complete_idle(&cur) {
-                                entry_comp_cb.set_text(&completed);
-                                entry_comp_cb.set_position(-1); // cursor to end
-                            }
-                            1 // handled: keep focus, don't let Tab traverse
-                        }
-                        GDK_KEY_UP | GDK_KEY_DOWN => {
-                            ctrl_held_cb.store(false, AtomicOrdering::SeqCst);
-                            let dir = if keyval == GDK_KEY_UP { -1 } else { 1 };
-                            let cur = entry_comp_cb.get_text().unwrap_or_default();
-                            let mut nav = nav_for_keys.lock().unwrap();
-                            let history = hist_for_keys.lock().unwrap().history.clone();
-                            if let Some(new_text) = nav.navigate(dir, &cur, &history) {
-                                entry_comp_cb.set_text(&new_text);
-                                entry_comp_cb.set_position(-1);
-                            }
-                            1 // always swallow Up/Down so focus stays in the prompt
-                        }
-                        _ => {
-                            ctrl_held_cb.store(false, AtomicOrdering::SeqCst);
-                            0 // propagate other keys (incl. plain q)
-                        }
-                    }
-                });
-                ctrl.add_to_widget(&entry_comp);
-                _key_controllers.push(Box::new(ctrl));
+    let app_for_keys = app.clone();
+    let _ = entry.on_key_raw(Box::new(move |keyval: u32, state: u32| -> bool {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+        const CONTROL_MASK: u32 = 1 << 2;
+        match keyval {
+            GDK_KEY_Q if (state & CONTROL_MASK) != 0 => {
+                let _ = app_for_keys.clone().quit();
+                true
             }
+            GDK_KEY_TAB => {
+                let cur = entry_comp_cb.get_text().unwrap_or_default();
+                if let Some(completed) = complete_idle(&cur) {
+                    entry_comp_cb.set_text(&completed);
+                }
+                true
+            }
+            GDK_KEY_UP | GDK_KEY_DOWN => {
+                let dir = if keyval == GDK_KEY_UP { -1 } else { 1 };
+                let cur = entry_comp_cb.get_text().unwrap_or_default();
+                let mut nav = nav_for_keys.lock().unwrap();
+                let history = hist_for_keys.lock().unwrap().history.clone();
+                if let Some(new_text) = nav.navigate(dir, &cur, &history) {
+                    entry_comp_cb.set_text(&new_text);
+                }
+                true
+            }
+            _ => false,
         }
-    }
+    }));
+
 
     let (done_tx, _done_rx) = smol::channel::bounded::<()>(1);
 
@@ -449,6 +421,7 @@ pub fn run(
                 &entry_cb_bus,
                 &entry_cb_cancel,
                 &entry_cb_state,
+                &app_quit,
                 &entry_cb_widgets,
             );
             return;
@@ -492,6 +465,7 @@ pub fn run(
     let drain_quiet = fg_quiet.clone();
     let drain_done = done_tx.clone();
     let drain_bus = bus.clone();
+    #[cfg(all(feature = "gtk", target_os = "linux"))]
     unsafe {
         if let Some(loader) = rustxwidgets::backends::gtk::loader() {
             rustxwidgets::gtk_dynamic_loader::timeout_add_recurring(&loader, 150, Box::new(move || {
@@ -509,6 +483,7 @@ pub fn run(
     }
 
     // Window close (destroy signal) -> quit the GTK main loop.
+    #[cfg(all(feature = "gtk", target_os = "linux"))]
     unsafe {
         if let Some(loader) = rustxwidgets::backends::gtk::loader() {
             let _ = rustxwidgets::gtk_dynamic_loader::connect_signal(
@@ -516,7 +491,7 @@ pub fn run(
                 window.raw_handle(),
                 "destroy",
                 Box::new(move || {
-                    let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
+                    app.quit();
                 }),
                 2,
             );
@@ -688,11 +663,14 @@ fn drain_session_log(log: PathBuf, state: &mut GuiState) {
 /// word lands in the text view and the next periodic drain's `set_text` wipes
 /// it ("I typed half a word and it just disappeared").
 fn configure_conversation_textview(tv: &TextView) {
+    #[cfg(all(feature = "gtk", target_os = "linux"))]
     tv.set_hexpand(true);
+    #[cfg(all(feature = "gtk", target_os = "linux"))]
     tv.set_vexpand(true);
     // GTK wrap mode: 2 = GTK_WRAP_WORD_CHAR
     tv.set_wrap_mode(2);
     tv.set_editable(false);
+    #[cfg(all(feature = "gtk", target_os = "linux"))]
     tv.set_can_focus(false);
 }
 
@@ -739,6 +717,7 @@ fn handle_command(
     _bus: &SharedBus,
     cancel: &Arc<AtomicBool>,
     state: &Arc<Mutex<GuiState>>,
+    app: &App,
     widgets: &GuiWidgets,
 ) {
     let mut parts = cmd.split_whitespace();
@@ -755,7 +734,7 @@ fn handle_command(
         "exit" | "quit" | "q" => {
             s.status = "bye".into();
             drop(s);
-            let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
+            app.quit();
             return;
         }
         "cancel" | "c" => {

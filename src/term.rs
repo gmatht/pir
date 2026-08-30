@@ -85,7 +85,10 @@ fn transparent_highlight() -> bool {
 /// wait for it to become writable via the smol reactor (the same event-driven
 /// mechanism the input path uses) instead of sleeping-and-retrying in a hot
 /// loop. A genuinely broken pipe is ignored silently.
+#[cfg(unix)]
 pub fn out(s: &str) {
+    #[cfg(unix)]
+    #[cfg(unix)]
     use std::os::unix::io::{AsRawFd, FromRawFd};
     let bytes = s.as_bytes();
     let mut written = 0usize;
@@ -129,6 +132,7 @@ pub fn out_flush() {
 
 /// Width of the terminal in columns (used to size the REPL hrule). Falls back
 /// to 80 when the size can't be queried (e.g. a pipe or a non-tty).
+#[cfg(unix)]
 pub fn terminal_width() -> usize {
     #[cfg(unix)]
     {
@@ -146,6 +150,7 @@ pub fn terminal_width() -> usize {
 
 /// Height of the terminal in rows (used by the `pir -r` session picker to size
 /// its two panes). Falls back to 24 when the size can't be queried.
+#[cfg(unix)]
 pub fn terminal_height() -> usize {
     #[cfg(unix)]
     {
@@ -247,6 +252,7 @@ pub fn highlight(s: &str) -> String {
     }
 }
 
+#[cfg(unix)]
 pub fn read_answer(prompt: &str) -> String {
     eprint!("{prompt} ");
     let _ = io::stderr().flush();
@@ -261,6 +267,7 @@ pub fn read_answer(prompt: &str) -> String {
 /// the user types; on non-unix, or when the terminal state can't be fetched, it
 /// falls back to a normal line read (which may echo). The prompt is printed to
 /// stderr so it never pollutes piped stdout.
+#[cfg(unix)]
 pub fn read_secret(prompt: &str) -> String {
     eprint!("{prompt} ");
     let _ = io::stderr().flush();
@@ -291,6 +298,7 @@ pub fn epoch() -> u64 {
 /// PID of the shell (bash) that launched pir, taken from the `PIR_PARENT_PID`
 /// env var if present, else the real parent process id. Used to tag sessions
 /// so `pir -r` can group/resume sessions from the same shell.
+#[cfg(unix)]
 pub fn parent_shell_pid() -> u32 {
     if let Ok(v) = std::env::var("PIR_PARENT_PID") {
         if let Ok(n) = v.parse::<u32>() {
@@ -726,6 +734,7 @@ pub fn push_history(line: &str) {
 /// place each tick and fully erases it on `stop()` — so a replaced spinner can
 /// never leave a stray "thinking…" / "────" line behind (the old 3-line block
 /// drifted on `\x1b[2A` line-arithmetic between tool rounds).
+#[cfg(unix)]
 pub struct Spinner {
     handle: Option<JoinHandle<()>>,
     alive: Arc<AtomicBool>,
@@ -750,6 +759,7 @@ impl Spinner {
     /// running turn (bare `&`). When it is set, the spinner stops drawing
     /// (and erases whatever it last drew) so a detached turn doesn't keep
     /// writing its "thinking" block to the terminal behind the user's prompt.
+    #[cfg(unix)]
     pub fn start(label: &str, typeahead: Arc<Mutex<String>>, enabled: bool) -> Spinner {
         Spinner::start_with(label, typeahead, enabled, Arc::new(AtomicBool::new(false)))
     }
@@ -757,6 +767,7 @@ impl Spinner {
     /// Like [`Spinner::start`], but also stops drawing when `quiet` is set (used
     /// by the agent, which passes its shared `quiet_req` so a turn detached
     /// mid-"thinking" silences the spinner immediately).
+    #[cfg(unix)]
     pub fn start_with(
         label: &str,
         typeahead: Arc<Mutex<String>>,
@@ -813,6 +824,7 @@ impl Spinner {
     }
 
     /// Stop the spinner and erase its block. Safe to call multiple times.
+    #[cfg(unix)]
     pub fn stop(&mut self) {
         if self.alive.swap(false, Ordering::SeqCst) {
             if let Some(h) = self.handle.take() {
@@ -844,6 +856,7 @@ impl Drop for Spinner {
 /// (0% CPU) instead of polling.
 pub mod raw {
     use std::io::{self, Write};
+    #[cfg(unix)]
     use std::os::unix::io::AsRawFd;
     use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -871,12 +884,14 @@ pub mod raw {
     }
 
     /// Record a keystroke (called by the raw reader on any input event).
+    #[cfg(unix)]
     pub fn note_keypress() {
         LAST_KEY_MILLIS.store(now_millis(), Ordering::SeqCst);
     }
 
     /// Milliseconds since the last keystroke (u64::MAX if none yet this
     /// process, so "no keys ever" counts as fully idle).
+    #[cfg(unix)]
     pub fn millis_since_keypress() -> u64 {
         let last = LAST_KEY_MILLIS.load(Ordering::SeqCst);
         if last == 0 {
@@ -887,6 +902,7 @@ pub mod raw {
 
     /// True when the keyboard has been idle for at least
     /// [`KEYBOARD_IDLE_BEFORE_THINKING_MS`] (or no key was ever pressed).
+    #[cfg(unix)]
     pub fn keyboard_idle_long_enough() -> bool {
         millis_since_keypress() >= KEYBOARD_IDLE_BEFORE_THINKING_MS
     }
@@ -1895,5 +1911,110 @@ mod keyboard_idle_tests {
         assert!(!keyboard_idle_long_enough());
         // Restore global state for other tests (process-wide clock).
         reset_keypress_clock();
+    }
+}
+
+// ===========================================================================
+// Cross-platform (non-Unix) terminal implementation via `crossterm`.
+// Used on Windows so the crate compiles even though the GUI path (rustxWidgets
+// NWG) is what actually runs there. The streaming REPL here is functional but
+// intentionally minimal.
+// ===========================================================================
+#[cfg(not(unix))]
+mod nonunix_term {
+    use std::io::{self, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    pub fn out(s: &str) {
+        let mut o = io::stdout();
+        let _ = o.write_all(s.as_bytes());
+        let _ = o.flush();
+    }
+    pub fn out_flush() { let _ = io::stdout().flush(); }
+    pub fn terminal_width() -> usize {
+        crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80)
+    }
+    pub fn terminal_height() -> usize {
+        crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24)
+    }
+    pub fn read_answer(prompt: &str) -> String {
+        out(prompt);
+        let mut line = String::new();
+        let _ = io::stdin().read_line(&mut line);
+        line.trim_end_matches('\n').trim_end_matches('\r').to_string()
+    }
+    pub fn read_secret(prompt: &str) -> String {
+        // crossterm has no secure read; read a normal line.
+        read_answer(prompt)
+    }
+    pub fn parent_shell_pid() -> u32 { 0 }
+    pub fn enable_raw() { let _ = crossterm::terminal::enable_raw_mode(); }
+    pub fn disable_raw() { let _ = crossterm::terminal::disable_raw_mode(); }
+    pub fn enable_raw_picker() { enable_raw(); }
+    pub fn disable_raw_picker() { disable_raw(); }
+
+    #[derive(Clone, Copy)]
+    pub enum RawInput {
+        Char(char),
+        Enter,
+        Tab,
+        Up,
+        Down,
+        Left,
+        Right,
+        Escape,
+        CtrlC,
+        CtrlD,
+        Resize,
+        Paste(String),
+        Other(u32),
+    }
+
+    pub fn wait_input(done: &smol::channel::Receiver<()>) -> RawInput {
+        loop {
+            match crossterm::event::poll(Duration::from_millis(50)) {
+                Ok(true) => {
+                    if let Ok(ev) = crossterm::event::read() {
+                        match ev {
+                            crossterm::event::Event::Key(k) => {
+                                use crossterm::event::{KeyCode, KeyModifiers};
+                                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                                return match k.code {
+                                    KeyCode::Enter => RawInput::Enter,
+                                    KeyCode::Tab => RawInput::Tab,
+                                    KeyCode::Up => RawInput::Up,
+                                    KeyCode::Down => RawInput::Down,
+                                    KeyCode::Left => RawInput::Left,
+                                    KeyCode::Right => RawInput::Right,
+                                    KeyCode::Esc => RawInput::Escape,
+                                    KeyCode::Char(c) if ctrl && c == 'c' => RawInput::CtrlC,
+                                    KeyCode::Char(c) if ctrl && c == 'd' => RawInput::CtrlD,
+                                    KeyCode::Char(c) => RawInput::Char(c),
+                                    _ => RawInput::Other(0),
+                                };
+                            }
+                            crossterm::event::Event::Resize(_, _) => return RawInput::Resize,
+                            _ => {}
+                        }
+                    }
+                }
+                Ok(false) => {
+                    if done.try_recv().is_ok() { return RawInput::Other(0); }
+                }
+                Err(_) => { if done.try_recv().is_ok() { return RawInput::Other(0); } }
+            }
+        }
+    }
+
+    pub fn translate(buf: &mut String, _typeahead: &Arc<std::sync::Mutex<String>>, bytes: &[u8]) -> RawInput {
+        for &b in bytes {
+            if let Some(c) = char::from_u32(b as u32) { buf.push(c); return RawInput::Char(c); }
+        }
+        RawInput::Other(0)
+    }
+    pub fn translate_picker(buf: &mut String, _typeahead: &Arc<std::sync::Mutex<String>>, bytes: &[u8]) -> RawInput {
+        translate(buf, _typeahead, bytes)
     }
 }

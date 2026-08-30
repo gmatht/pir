@@ -24,7 +24,7 @@ crossterm = { version = "0.28", optional = true }
 # (e.g. /root/src/rustxWidgets) or add a `[patch]` entry pointing `path =`
 # at your local checkout. The default `pir` binary never references them, so
 # a plain `cargo build` works with no rustxWidgets present.
-# rustxwidgets = { path = "rustxWidgets/rustxwidgets", version = "0.1.0", default-features = false, optional = true }
+rustxwidgets = { path = "rustxWidgets/rustxwidgets", version = "0.1.0", default-features = false, optional = true }
 
 [features]
 # Full-screen TUI REPL: a real layout engine (no hand-rolled ANSI block)
@@ -37,8 +37,8 @@ tui = ["dep:ratatui", "dep:crossterm"]
 # (pancurses) REPL. These require rustxWidgets to be present (see the comment
 # above the [dependencies] block) — they are intentionally NOT in this repo, so
 # `gui` / `pancurses` are opt-in and absent from the default build.
-# gui = ["dep:rustxwidgets", "rustxwidgets/gtk"]
-# pancurses = ["dep:rustxwidgets", "rustxwidgets/pancurses"]
+gui = ["dep:rustxwidgets", "dep:crossterm"]
+pancurses = ["dep:rustxwidgets", "rustxwidgets/pancurses", "dep:crossterm"]
 
 [profile.release]
 strip = true
