@@ -237,6 +237,117 @@ pub fn green(s: &str) -> String { paint("32", s) }
 pub fn yellow(s: &str) -> String { paint("33", s) }
 pub fn cyan(s: &str) -> String { paint("36", s) }
 
+/// The "task done, awaiting input" placeholder rendered after a turn completes
+/// (and the user hasn't pressed a key since) so the idle prompt reads
+/// `❯ ✓ DONE :) -- ✓ DONE :) --`. The colour is configurable; see
+/// [`done_prompt_color`].
+pub const DONE_PROMPT_TEXT: &str = "✓ DONE :) -- ✓ DONE :) --";
+
+/// Resolve the colour for the "done" prompt. Priority:
+///   1. `PIR_DONE_COLOR` env var (highest precedence, so it can be overridden
+///      per-invocation without editing any file),
+///   2. `~/.pi/agent/settings.json` → `donePromptColor`
+///      (e.g. `"yellow"`, `"bright-yellow"`, `"green"`, `"red"`, `"cyan"`,
+///      `"blue"`, `"magenta"`, `"white"`, `"gray"`, or a raw SGR foreground
+///      code like `"93"` / `"38;5;220"`).
+/// Defaults to `"bright-yellow"`. Read fresh on every call so changing it
+/// (env var, or editing settings.json) takes effect without restarting pir.
+pub fn done_prompt_color() -> String {
+    // 1. env var wins.
+    if let Ok(v) = std::env::var("PIR_DONE_COLOR") {
+        if !v.trim().is_empty() {
+            return normalize_color_name(&v);
+        }
+    }
+    // 2. settings.json `donePromptColor`.
+    let p = crate::config::pi_dir().join("agent").join("settings.json");
+    if let Ok(raw) = std::fs::read_to_string(&p) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(s) = v.get("donePromptColor").and_then(|s| s.as_str()) {
+                if !s.trim().is_empty() {
+                    return normalize_color_name(s);
+                }
+            }
+        }
+    }
+    "bright-yellow".to_string()
+}
+
+/// Canonicalise a user-supplied colour name/code to a stable token. Accepts
+/// friendly names (with or without a `bright-` prefix / underscore) and bare
+/// SGR foreground codes, falling back to `bright-yellow` for anything invalid.
+fn normalize_color_name(s: &str) -> String {
+    let t = s.trim().to_ascii_lowercase();
+    let canon = match t.as_str() {
+        "yellow" => "yellow",
+        "brightyellow" | "bright-yellow" | "yellowbright" | "bright_yellow" => "bright-yellow",
+        "green" => "green",
+        "brightgreen" | "bright-green" | "bright_green" => "bright-green",
+        "red" => "red",
+        "brightred" | "bright-red" | "bright_red" => "bright-red",
+        "cyan" => "cyan",
+        "brightcyan" | "bright-cyan" | "bright_cyan" => "bright-cyan",
+        "blue" => "blue",
+        "brightblue" | "bright-blue" | "bright_blue" => "bright-blue",
+        "magenta" => "magenta",
+        "brightmagenta" | "bright-magenta" | "bright_magenta" => "bright-magenta",
+        "white" => "white",
+        "brightwhite" | "bright-white" | "bright_white" => "bright-white",
+        "gray" | "grey" | "brightblack" | "bright-black" => "gray",
+        // Raw SGR foreground code (e.g. "93", "38;5;220") passes through.
+        other if !other.is_empty() && other.chars().all(|c| c.is_ascii_digit() || c == ';') => other,
+        _ => "bright-yellow",
+    };
+    canon.to_string()
+}
+
+/// Map a canonical colour token to its SGR foreground escape parameter (the
+/// digits inside `\x1b[<n>m`). Raw codes are passed through (leaked, transient).
+fn color_sgr(name: &str) -> &'static str {
+    match name {
+        "yellow" => "33",
+        "bright-yellow" => "93",
+        "green" => "32",
+        "bright-green" => "92",
+        "red" => "31",
+        "bright-red" => "91",
+        "cyan" => "36",
+        "bright-cyan" => "96",
+        "blue" => "34",
+        "bright-blue" => "94",
+        "magenta" => "35",
+        "bright-magenta" => "95",
+        "white" => "97",
+        "gray" => "90",
+        // Raw SGR passthrough (e.g. "38;5;220"): leak a 'static copy.
+        s if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == ';') => {
+            Box::leak(s.to_string().into_boxed_str())
+        }
+        _ => "93",
+    }
+}
+
+/// The full idle "done" prompt: a cyan `❯` followed by the bright-yellow (or
+/// configured) [`DONE_PROMPT_TEXT`]. Falls back to plain text when colour is
+/// disabled.
+pub fn done_prompt() -> String {
+    if !color() {
+        return format!("❯ {}", DONE_PROMPT_TEXT);
+    }
+    format!(
+        "{}{}",
+        cyan("❯"),
+        paint(color_sgr(&done_prompt_color()), DONE_PROMPT_TEXT)
+    )
+}
+
+/// Resolve the configured colour for the "done" placeholder as a stable string
+/// token (e.g. `"bright-yellow"`), shared by both the streaming REPL
+/// (`done_prompt`) and the full-screen TUI (`tui::done_prompt_color`).
+pub fn done_prompt_color_token() -> String {
+    done_prompt_color()
+}
+
 /// Render `s` as highlighted text. By default the highlight is an opaque
 /// colour block (bright background, bold text) so it stands out on a plain
 /// terminal. When transparent highlighting is enabled (see
@@ -502,16 +613,96 @@ fn command_help_hint(line: &str) -> Option<String> {
 /// `query` (case-insensitive). The exact `query` is skipped so we never suggest
 /// retyping what's already on the line. Used for both Tab-completion and the
 /// ghost-hint recall of prior prompts.
+///
+/// If `query` parses as a valid regex (case-insensitive), matches are tested
+/// against that regex instead of a plain substring — so e.g. `^/model ` only
+/// recalls commands beginning with `/model `. Non-regex (or invalid) queries use
+/// the fast case-insensitive substring path.
+/// Collect prior prompts from every *other* session in the same project by
+/// reading each sibling `*.history` file next to the current session's history
+/// file (i.e. the project's session directory). Cached on first call for the
+/// life of the process. The current session's own `.history` is excluded (its
+/// live prompts already come from `HISTORY_LINES`); duplicates across files are
+/// de-duplicated by the caller.
+fn load_project_prompts() -> Vec<String> {
+    PROJECT_PROMPTS.with(|c| {
+        if let Some(v) = c.borrow().as_ref() {
+            return v.clone();
+        }
+        let mut all: Vec<String> = Vec::new();
+        let own = HISTORY_FILE.with(|f| f.borrow().clone());
+        if let Some(own_path) = &own {
+            if let Some(dir) = own_path.parent() {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for e in entries.flatten() {
+                        let p = e.path();
+                        if p.extension().and_then(|x| x.to_str()) != Some("history") {
+                            continue;
+                        }
+                        if p == *own_path {
+                            continue;
+                        }
+                        if let Ok(text) = std::fs::read_to_string(&p) {
+                            for line in text.lines() {
+                                if !line.trim().is_empty() {
+                                    all.push(line.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        *c.borrow_mut() = Some(all.clone());
+        all
+    })
+}
+
+/// All prior prompts to search for recall: the current session's live history
+/// (most-recent-last) followed by every prompt from *other* sessions in the
+/// same project (read from their `*.history` files next to the current
+/// session's history file). This is what makes completion recall prompts
+/// *across* sessions in the same project, not just within the current one. The
+/// project-wide corpus is read once and cached; the current session's history
+/// stays live via `HISTORY_LINES`.
+fn recall_corpus() -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    for line in load_history_lines() {
+        if !line.trim().is_empty() {
+            v.push(line);
+        }
+    }
+    for line in load_project_prompts() {
+        if !line.trim().is_empty() {
+            v.push(line);
+        }
+    }
+    v
+}
+
 fn history_substring_matches(query: &str, limit: usize) -> Vec<String> {
-    let query_l = query.to_lowercase();
+    let query_t = query.trim();
+    if query_t.is_empty() {
+        return Vec::new();
+    }
+    let re = regex::RegexBuilder::new(query_t)
+        .case_insensitive(true)
+        .build();
+    let re = re.ok();
     let mut out: Vec<String> = Vec::new();
-    // `load_history_lines` returns most-recent-last, so iterating in reverse
-    // yields the most recent matches first.
-    for line in load_history_lines().into_iter().rev() {
+    // `recall_corpus` returns most-recent-last, so iterating in reverse yields
+    // the most recent matches first. The corpus spans the current session *and*
+    // every other session in the same project (see `load_project_prompts`).
+    for line in recall_corpus().into_iter().rev() {
         if line.trim().is_empty() {
             continue;
         }
-        if line.to_lowercase().contains(&query_l) && line.trim() != query.trim() {
+        let matched = if let Some(re) = &re {
+            re.is_match(&line)
+        } else {
+            line.to_lowercase().contains(&query_t.to_lowercase())
+        };
+        if matched && line.trim() != query_t {
             if !out.contains(&line) {
                 out.push(line);
                 if out.len() >= limit {
@@ -521,6 +712,27 @@ fn history_substring_matches(query: &str, limit: usize) -> Vec<String> {
         }
     }
     out
+}
+
+/// Find the `(start, end)` byte range of the first match of `query` within
+/// `matched`, mirroring what the recall search used: if `query` parses as a
+/// regex (case-insensitive) the first regex capture/whole match range is used,
+/// otherwise a case-insensitive substring search. Returns `None` when empty or
+/// not found. Indices are always on `char` boundaries of the original string.
+fn find_match_range(matched: &str, query: &str) -> Option<(usize, usize)> {
+    let query_t = query.trim();
+    if query_t.is_empty() {
+        return None;
+    }
+    if let Ok(re) = regex::RegexBuilder::new(query_t).case_insensitive(true).build() {
+        if let Some(m) = re.find(matched) {
+            // rustyline's `Context` borrows a `History`; the helper ignores it, so an empty
+            // in-memory history (kept in a static so it outlives the `Context`) is fine.
+            return Some((m.start(), m.end()));
+        }
+        return None;
+    }
+    case_insensitive_find(matched, query)
 }
 
 /// Case-insensitive search for `needle` in `haystack`, returning the byte range
@@ -559,28 +771,37 @@ fn case_insensitive_find(haystack: &str, needle: &str) -> Option<(usize, usize)>
 }
 
 /// Build the ghost-hint preview string for a history match. The matched
-/// substring is emphasised with `*…*` emphasis, and any prior context before
-/// the typed fragment is shown dimmed in parentheses (so the user can see the
-/// whole prior prompt without it looking like a literal continuation to the
-/// right of the cursor). `query` is the (trimmed) current input; `matched` is
-/// the prior prompt line. Returns `None` when there's nothing useful to show.
+/// substring is emphasised with `*…*` emphasis, and the *whole* prior prompt is
+/// shown dimmed in parentheses so the user can see exactly what Tab will recall.
+/// For example, typing `hy` against a prior `/model hy3` renders
+/// `*hy*3 (/model hy3)` — the `*hy*3` tail (match + remainder of the line) is
+/// the part that would continue the cursor, and `(/model hy3)` is the full
+/// command Tab will splice in. `query` is the (trimmed) current input; `matched`
+/// is the prior prompt line. Returns `None` when there's nothing useful to show.
 fn history_hint_preview(query: &str, matched: &str) -> Option<String> {
     if matched.trim().is_empty() || matched.trim() == query.trim() {
         return None;
     }
-    let (start, end) = case_insensitive_find(matched, query)?;
+    let (start, end) = find_match_range(matched, query)?;
     let prefix = &matched[..start];
     let emphasize = &matched[start..end];
     let suffix = &matched[end..];
     let mut s = String::new();
-    s.push('*');
-    s.push_str(emphasize);
-    s.push('*');
-    s.push_str(suffix);
-    if !prefix.is_empty() {
-        s.push(' ');
-        s.push_str(&dim(&format!("({prefix})")));
-    }
+    // Ghost continuation: the text immediately after the match is what would
+    // follow the cursor. Then the full prior prompt in parentheses, with the
+    // matched substring bolded so it stands out. We deliberately do *not* echo
+    // the matched text a second time — the editor already shows what the user
+    // typed — which is what previously produced the doubled `*hy**hy*3`. The
+    // matched part is bolded inside the parentheses (no literal `*` markers),
+    // so it reads as bold `hy` instead of literal asterisks. `bold`/`dim` emit
+    // ANSI only when colour is on, so this degrades to plain text otherwise.
+    s.push_str(&dim(suffix));
+    s.push(' ');
+    s.push_str(&dim("("));
+    s.push_str(&dim(prefix));
+    s.push_str(&bold(emphasize));
+    s.push_str(&dim(suffix));
+    s.push_str(&dim(")"));
     Some(s)
 }
 
@@ -595,7 +816,10 @@ fn history_recall(query: &str, start_idx: usize) -> rustyline::Result<(usize, Ve
     if query.trim().chars().count() < 2 {
         return Ok((start_idx, Vec::new()));
     }
-    Ok((start_idx, history_substring_matches(query.trim(), 10)))
+    // Return only the single most-recent match so one Tab auto-completes to it
+    // (instead of opening a multi-candidate menu that does nothing on the first
+    // Tab). The ghost hint already previews this same match.
+    Ok((start_idx, history_substring_matches(query.trim(), 1)))
 }
 
 impl Completer for PirHelper {
@@ -678,60 +902,144 @@ impl Completer for PirHelper {
     }
 }
 
+/// Truncate `s` (which may contain ANSI SGR escapes) to at most `max` *visible*
+/// columns, appending `...` when cut. The result never ends inside an open SGR
+/// sequence — a reset is inserted before the `...` — and escape sequences are
+/// never split. Used to keep the inline autocomplete hint on a single line.
+fn trunc_hint(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if visible_len(s) <= max {
+        return s.to_string();
+    }
+    // Reserve 3 visible columns for the trailing "...".
+    let keep = max - 3;
+    let mut out = String::new();
+    let mut v = 0usize;
+    let mut in_esc = false;
+    let mut esc = String::new();
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_esc = true;
+            esc.clear();
+            continue;
+        }
+        if in_esc {
+            esc.push(c);
+            if c == 'm' {
+                out.push('\x1b');
+                out.push_str(&esc);
+                in_esc = false;
+            }
+            continue;
+        }
+        if v >= keep {
+            break;
+        }
+        out.push(c);
+        v += 1;
+    }
+    // Close any still-open style, then emit the ellipsis in a neutral style.
+    out.push_str("\x1b[0m");
+    out.push_str("...");
+    out
+}
+
+/// Cap an autocomplete hint so the whole line — the typed text up to the cursor
+/// plus the hint — fits on a single terminal line. rustyline renders the hint
+/// starting at column `pos`, so it may occupy at most `terminal_width() - pos`
+/// visible columns; anything longer is truncated with `...` (see `trunc_hint`).
+/// Returns `None` when there is no room at all (avoids overflowing the line).
+fn fit_one_line(hint: Option<String>, line: &str, pos: usize) -> Option<String> {
+    let hint = hint?;
+    let width = terminal_width();
+    let before = if pos <= line.len() {
+        visible_len(&line[..pos])
+    } else {
+        visible_len(line)
+    };
+    let budget = width
+        .saturating_sub(HINT_PROMPT_VIS.with(|p| *p.borrow()))
+        .saturating_sub(before);
+    eprintln!("DBG w={width} pv={pv} before={before} budget={budget} hintvis={hv}",
+        pv = HINT_PROMPT_VIS.with(|p| *p.borrow()), hv = visible_len(&hint));
+    if budget < 3 {
+        return None;
+    }
+    let out = trunc_hint(&hint, budget);
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 impl Hinter for PirHelper {
     type Hint = String;
     fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<String> {
-        // Brief per-command help: as soon as the user types a `/command` (e.g.
-        // `/login`), show its argument hint + description inline to the right of
-        // the cursor, mirroring pi's autocomplete dropdown. This takes priority
-        // over the model-preview hint, which only applies to /model arguments.
-        if let Some(help) = command_help_hint(line) {
-            return Some(help);
-        }
-        let left = &line[..pos];
-        let start_idx = left.find(|c: char| !c.is_whitespace()).unwrap_or(0);
-        let rest = &left[start_idx..];
-        // Ghost-hint recall of a previous prompt (case-insensitive substring).
-        // Shown whenever there's no command-help hint and no /model preview —
-        // i.e. "there are no other autocompletes" to offer. Typing `hy` recalls
-        // a prior `*hy*3 (/model )` line, for example. Requires >= 2 chars so a
-        // single keystroke doesn't spam the user.
-        let query = rest.trim();
-        if query.chars().count() >= 2 {
-            if let Some(m) = history_substring_matches(query, 1).into_iter().next() {
-                if let Some(preview) = history_hint_preview(query, &m) {
-                    return Some(preview);
+        // Work out the raw hint, then cap it to a single terminal line so a long
+        // recalled command never wraps onto a second line — it is cut off with
+        // `...` instead (see `fit_one_line`).
+        let raw = (|| {
+            // Brief per-command help: as soon as the user types a `/command`
+            // (e.g. `/login`), show its argument hint + description inline to
+            // the right of the cursor, mirroring pi's autocomplete dropdown.
+            // This takes priority over the model-preview hint.
+            if let Some(help) = command_help_hint(line) {
+                return Some(help);
+            }
+            let left = &line[..pos];
+            let start_idx = left.find(|c: char| !c.is_whitespace()).unwrap_or(0);
+            let rest = &left[start_idx..];
+            // Ghost-hint recall of a previous prompt (case-insensitive substring
+            // or regex). Shown whenever there's no command-help hint and no
+            // /model preview — i.e. "there are no other autocompletes" to offer.
+            // Typing `hy` recalls a prior `/model hy3` line, for example.
+            // Requires >= 2 chars so a single keystroke doesn't spam the user.
+            let query = rest.trim();
+            if query.chars().count() >= 2 {
+                if let Some(m) = history_substring_matches(query, 1).into_iter().next() {
+                    if let Some(preview) = history_hint_preview(query, &m) {
+                        return Some(preview);
+                    }
                 }
             }
-        }
-        // Show the first matching model as an inline preview while typing a
-        // `/model` argument, so the user sees a suggestion to the right.
-        let providers = MODEL_PROVIDERS.get().map(|v| v.as_slice()).unwrap_or(&[]);
-        if providers.is_empty() {
-            return None;
-        }
-        let cmd_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        let cmd = &rest[..cmd_end];
-        if cmd != "/model" && cmd != "/m" && cmd != "/default-model" && cmd != "/dm" {
-            return None;
-        }
-        let after = &rest[cmd_end..];
-        if after.is_empty() {
-            return None;
-        }
-        let arg_lead = after.find(|c: char| !c.is_whitespace()).unwrap_or(after.len());
-        let arg_start = start_idx + cmd_end + arg_lead;
-        let prefix = &left[arg_start..];
-        let candidates = crate::config::match_models(providers, prefix, 10);
-        let hint = candidates
-            .into_iter()
-            .find_map(|m| crate::config::hint_remainder(&m, prefix));
-        hint.filter(|h| !h.is_empty())
+            // Show the first matching model as an inline preview while typing a
+            // `/model` argument, so the user sees a suggestion to the right.
+            let providers = MODEL_PROVIDERS.get().map(|v| v.as_slice()).unwrap_or(&[]);
+            if providers.is_empty() {
+                return None;
+            }
+            let cmd_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let cmd = &rest[..cmd_end];
+            if cmd != "/model" && cmd != "/m" && cmd != "/default-model" && cmd != "/dm" {
+                return None;
+            }
+            let after = &rest[cmd_end..];
+            if after.is_empty() {
+                return None;
+            }
+            let arg_lead = after.find(|c: char| !c.is_whitespace()).unwrap_or(after.len());
+            let arg_start = start_idx + cmd_end + arg_lead;
+            let prefix = &left[arg_start..];
+            let candidates = crate::config::match_models(providers, prefix, 10);
+            candidates
+                .into_iter()
+                .find_map(|m| crate::config::hint_remainder(&m, prefix))
+        })();
+        fit_one_line(raw, line, pos)
     }
 }
 
 impl Highlighter for PirHelper {
     fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
+        // History-recall previews carry their own ANSI (bold match + dim frame);
+        // pass them through untouched. Plain hints (command help, model preview)
+        // get dimmed as before so they stay visually secondary.
+        if hint.contains('\x1b') {
+            return std::borrow::Cow::Borrowed(hint);
+        }
         if color() {
             std::borrow::Cow::Owned(format!("\x1b[2m{hint}\x1b[0m"))
         } else {
@@ -762,6 +1070,17 @@ thread_local! {
     // sync with the editor's own history by `load_history` / `save_history` /
     // `push_history`.
     static HISTORY_LINES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    // Cross-session prompt corpus for recall. The current session's own
+    // `.history` is excluded (its live prompts already live in `HISTORY_LINES`);
+    // this caches every *other* session's prompts read from sibling `*.history`
+    // files in the same project directory. Read once and reused for the life of
+    // the process (new sessions don't appear mid-REPL), so per-keystroke hint
+    // lookups stay cheap.
+    static PROJECT_PROMPTS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    // Visible width (ANSI-stripped) of the prompt currently shown by the REPL.
+    // Set once per `read_line` call so the autocomplete hint can budget for the
+    // prompt *and* the typed text when capping itself to a single line.
+    static HINT_PROMPT_VIS: RefCell<usize> = const { RefCell::new(0) };
 }
 
 /// Point the line editor at a history file that should be loaded on first
@@ -868,6 +1187,8 @@ pub fn read_line(prompt: &str) -> Option<String> {
             Some(rl) => rl,
             None => return plain_read_line(prompt),
         };
+        // Record the prompt's visible width so the hint can budget around it.
+        HINT_PROMPT_VIS.with(|p| *p.borrow_mut() = visible_len(prompt));
         match rl.readline(prompt) {
             Ok(line) => {
                 let _ = rl.add_history_entry(line.as_str());
@@ -988,20 +1309,18 @@ impl Spinner {
                 }
                 let frame = if color() { format!("\x1b[36m{}\x1b[0m", frames[i % frames.len()]) } else { frames[i % frames.len()].to_string() };
                 // Render the user's in-progress line (recorded by the REPL thread)
-                // inline after the label, so typing stays visible while the model
-                // thinks — without a fragile multi-line block under the spinner.
-                // The old 3-line block (thinking + hrule + a fake `❯` prompt line)
-                // drifted on \x1b[2A line-arithmetic between tool rounds, leaking
-                // stray "thinking…" / "────" lines and clobbering the REPL prompt.
+                // inline after a live `❯` prompt, so the REPL never vanishes while
+                // the model thinks. The old render dropped the `❯` entirely once a
+                // turn started, leaving the user's keystrokes floating with no
+                // prompt to type into (the "REPL is missing while thinking" bug).
+                // We keep a real prompt — matching the idle `❯` — in front of the
+                // typed text so there's always somewhere to type.
                 let typed = typeahead.lock().map(|g| g.clone()).unwrap_or_default();
+                let prompt = if color() { "\x1b[36m❯\x1b[0m" } else { "❯" };
                 // Single clean line: CR to column 0, erase the whole line, then
                 // rewrite. One line means the erase/redraw can never drift, so no
                 // lines accumulate. `\x1b[2K` clears the entire line.
-                let mut line = format!("\r\x1b[2K{frame} {label}…");
-                if !typed.is_empty() {
-                    line.push_str("  ");
-                    line.push_str(&typed);
-                }
+                let line = format!("\r\x1b[2K{frame} {label}…  {prompt} {typed}");
                 let _ = out.write_all(line.as_bytes());
                 let _ = out.flush();
                 std::thread::sleep(Duration::from_millis(80));
@@ -2070,6 +2389,7 @@ mod highlight_tests {
         let inner = hl.trim_matches(|c: char| c == '\x1b' || c == '[' || c == 'm' || c.is_ascii_digit())
             .to_string();
         assert!(inner.contains("TODO"), "highlight must preserve the text: {hl:?}");
+        set_color_for_test(false);
     }
 
     // Default (opaque) highlight uses an opaque colour block escape, NOT the
@@ -2082,6 +2402,7 @@ mod highlight_tests {
         let hl = highlight("x");
         assert!(hl.contains("44m"), "opaque highlight should set a background colour (44m): {hl:?}");
         assert!(!hl.contains("\x1b[7m"), "opaque highlight must NOT use reverse video: {hl:?}");
+        set_color_for_test(false);
     }
 
     // Transparent highlight uses SGR reverse video (ESC[7m…ESC[27m) whose
@@ -2099,6 +2420,7 @@ mod highlight_tests {
         assert!(!hl.contains("44m"), "transparent highlight must NOT set an opaque background colour: {hl:?}");
         // And it still carries the original text.
         assert!(hl.contains('x'), "transparent highlight must preserve text: {hl:?}");
+        set_color_for_test(false);
     }
 
     // With colour disabled (e.g. piped output), `highlight` must pass the text
@@ -2177,3 +2499,122 @@ mod history_reentrancy_tests {
         });
     }
 }
+
+#[cfg(test)]
+mod project_recall_tests {
+    use super::*;
+    use std::io::Write;
+
+    // Regression guard for "recall prompts from *other* sessions in the same
+    // project": typing `hy` at a fresh REPL must surface a prior `/model hy3`
+    // command even though it lives in a different session's `.history` file,
+    // not the current (empty) one.
+    #[test]
+    fn recalls_prompts_from_other_project_sessions() {
+        let dir = std::env::temp_dir()
+            .join(format!("pir_recall_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Current session's own history file: exists but empty (nothing typed yet).
+        let own = dir.join("pir-current-sh0.history");
+        std::fs::File::create(&own).unwrap();
+        // A sibling session's history file carrying the prior command.
+        let other = dir.join("pir-old-sh0.history");
+        let mut f = std::fs::File::create(&other).unwrap();
+        writeln!(f, "/model hy3").unwrap();
+        writeln!(f, "explain the parser").unwrap();
+        drop(f);
+
+        // Point the line editor's history at the current session path and reset
+        // the cached cross-session corpus + live history for a clean test.
+        HISTORY_FILE.with(|h| *h.borrow_mut() = Some(own.clone()));
+        HISTORY_LINES.with(|h| *h.borrow_mut() = Vec::new());
+        PROJECT_PROMPTS.with(|h| *h.borrow_mut() = None);
+
+        // `hy` must recall `/model hy3` from the *other* session.
+        let matches = history_substring_matches("hy", 10);
+        assert!(
+            matches.iter().any(|m| m.trim() == "/model hy3"),
+            "expected to recall '/model hy3' from another project session, got: {matches:?}"
+        );
+
+        // Tab completion must return the full prior command as a candidate.
+        let (start, candidates) = history_recall("hy", 0).unwrap();
+        assert_eq!(start, 0);
+        assert!(
+            candidates.iter().any(|c| c.trim() == "/model hy3"),
+            "expected '/model hy3' as a Tab-completion candidate, got: {candidates:?}"
+        );
+
+        // The ghost hint must no longer repeat the typed text (no `*hy**hy*3`
+        // doubling) and must not use literal `*` markers — it shows the
+        // continuation after the match plus the full command in parentheses,
+        // with the matched part bolded. After stripping ANSI it reads
+        // `3 (/model hy3)`.
+        let preview = history_hint_preview("hy", "/model hy3").unwrap_or_default();
+        let stripped = strip_ansi(&preview);
+        assert!(
+            !stripped.contains('*'),
+            "ghost hint must not contain literal '*' markers, got: {stripped:?}"
+        );
+        assert_eq!(
+            stripped, "3 (/model hy3)",
+            "ghost hint after stripping ANSI should read '3 (/model hy3)'",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trunc_hint_fits_budget_and_uses_dots() {
+        let s = "a".repeat(20);
+        let out = trunc_hint(&s, 10);
+        assert_eq!(visible_len(&out), 10, "must stay within budget");
+        assert!(out.ends_with("..."), "truncated hint must end with '...'");
+        assert_ne!(out, s, "must actually be cut, not returned whole");
+        assert!(!out.starts_with("a".repeat(11).as_str()), "must not exceed budget");
+        // Short enough -> returned unchanged.
+        assert_eq!(trunc_hint("hello", 10), "hello");
+    }
+
+    #[test]
+    fn trunc_hint_preserves_ansi_and_resets_style() {
+        // Bold "hy" (2 visible cols) + " world"; budget 5 -> keep 2 -> "hy" + reset + "...".
+        let s = "\x1b[1mhy\x1b[0m world";
+        let out = trunc_hint(s, 5);
+        assert_eq!(visible_len(&out), 5);
+        assert!(out.ends_with("..."), "got: {out:?}");
+        // The open bold must be closed before the ellipsis (no leaking style).
+        assert!(out.contains("\x1b[0m"), "open style must be reset: {out:?}");
+    }
+
+    #[test]
+    fn fit_one_line_returns_none_when_no_room() {
+        // A line that already consumes the whole width leaves no room for a hint.
+        let line = "x".repeat(78);
+        assert!(
+            fit_one_line(Some("suggestion".to_string()), &line, 78).is_none(),
+            "must not overflow the line when there is no room"
+        );
+    }
+
+    /// Strip ANSI SGR sequences (`ESC[...m`) from a string, for test assertions.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                // Consume the rest of this SGR sequence up to (and including) 'm'.
+                for n in chars.by_ref() {
+                    if n == 'm' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            out.push(c);
+        }
+        out
+    }
+}
+
