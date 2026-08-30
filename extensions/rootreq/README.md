@@ -1,9 +1,12 @@
-# rootreq — request privilege escalation (off by default)
+# rootreq — request privilege escalation (on by default)
 
 The agent (`ai_*` / `ai_rpi`) can **request** privilege escalation, but never
 escalate itself. This mirrors the `ai-permctl` "request, don't take" model.
+Queueing is **on by default** (`PIR_ROOTREQ=0` disables it). The agent only
+ever *requests* — an operator must still fulfil each request out-of-band via
+`rootreq-enforcer`, so enabling queueing grants no new privilege by itself.
 
-## Tools (enabled with `PIR_ROOTREQ=1`)
+## Tools (enabled by default; `PIR_ROOTREQ=0` to disable `request_root`)
 
 - **`request_root`** — queue an escalation request. Intents (all allowlisted):
   - `apt-install <pkgs>` — install package(s) via the logged `ai-apt-install` wrapper.

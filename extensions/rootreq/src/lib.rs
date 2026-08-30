@@ -21,8 +21,10 @@
 //! * `run_as` — run a command as a user the agent is already permitted to
 //!   (e.g. an `ai_*`), using existing sudoers. No new privilege is granted.
 //!
-//! Enable with `PIR_ROOTREQ=1`. When off, neither tool is offered and nothing
-//! is queued.
+//! Enabled by default (set `PIR_ROOTREQ=0` to disable). When disabled, the
+//! `request_root` tool is not offered and nothing is queued; `run_as` is always
+//! available. Queueing only *requests* — an operator must still fulfil each
+//! request out-of-band via `rootreq-enforcer`, so this grants no privilege.
 
 use crate::plugin::{Outcome, Registry, ToolBackend, ToolSpec};
 use serde_json::json;
@@ -88,7 +90,7 @@ struct RootReq {
 
 impl RootReq {
     fn new() -> Self {
-        let enabled = std::env::var_os("PIR_ROOTREQ").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+        let enabled = std::env::var_os("PIR_ROOTREQ").map(|v| v != "0" && !v.is_empty()).unwrap_or(true);
         let spool = std::env::var_os("AI_PERM_REQUEST_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/tmp/ai-perm-requests"));
@@ -191,7 +193,7 @@ impl ToolBackend for RootReq {
         match name {
             "request_root" => {
                 if !self.enabled {
-                    return Outcome::err(String::from("rootreq is off by default (set PIR_ROOTREQ=1 to enable request queueing)"));
+                    return Outcome::err(String::from("rootreq is disabled (set PIR_ROOTREQ=0 to disable request queueing)"));
                 }
                 let intent_s = input.get("intent").and_then(Value_as_str).unwrap_or("");
                 let arg = input.get("arg").and_then(Value_as_str).unwrap_or("");
