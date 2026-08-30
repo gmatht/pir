@@ -7,7 +7,7 @@ description = "A featherweight pi-compatible terminal coding agent"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ureq = { version = "2", features = ["json"] }   # pinned to 2.x (blocking API)
+ureq = { version = "2", default-features = false, features = ["json", "native-tls"] }   # native-tls = system OpenSSL (no static ring/rustls); gzip dropped (unused)
 rustyline = "14"                                 # line editing: history + cursor nav + completer
 libc = "0.2"                                     # uid/gid drop for per-project users
 smol = "2"                                       # async runtime: event-driven stdin wait while a turn runs
