@@ -2439,6 +2439,23 @@ pub(crate) fn workspace_label() -> String {
     home_collapsed(&cwd)
 }
 
+/// Parse the `/sh` argument vector into a `(user, rest)` decision for the
+/// `spawn_shell_as` path. `None` for the user means "use the default" (the
+/// invoking user for `-u`, the current identity for plain `/sh`). Splitting
+/// this out keeps the `-u` flag + its optional name from leaking into the
+/// command handed to the child shell (see the `bare -u` regression test).
+fn parse_sh_u<'a>(args: &'a [&str]) -> Option<(Option<&'a str>, &'a [&'a str])> {
+    if matches!(args.first(), Some(&"-u")) {
+        return Some(match args.get(1) {
+            // `/sh -u user cmd…` => shell as `user`, rest is the command.
+            Some(u) if !u.starts_with('-') => (Some(*u), &args[2..]),
+            // Bare `/sh -u` (no name) => invoking user, no command args.
+            _ => (None, &[]),
+        });
+    }
+    None
+}
+
 /// `/sh [cmd args]` — drop into an interactive shell, or run a command via the
 /// shell and return. With no args it execs the user's login shell (`$SHELL`,
 /// else `/bin/sh`) so they get a familiar prompt. With args it runs
@@ -2454,12 +2471,7 @@ fn run_shell(args: Vec<&str>) -> Option<i32> {
     // to get back to the original user after pir dropped to a sandbox account.
     // `/sh` with no `-u` runs as the current (possibly dropped) identity — the
     // long-standing behaviour.
-    if matches!(args.first(), Some(&"-u")) {
-        let (target, rest) = match args.get(1) {
-            Some(u) if !u.starts_with('-') => (Some(*u), &args[2..]),
-            // Bare `-u` with no name => the invoking user.
-            _ => (None, &args[1..]),
-        };
+    if let Some((target, rest)) = parse_sh_u(&args) {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         return crate::user::spawn_shell_as(&shell, rest, target);
     }
@@ -2529,4 +2541,43 @@ fn create_project(name: &str) -> Option<std::path::PathBuf> {
 
     println!("open it with:  cd {}", dir.display());
     Some(dir)
+}
+
+#[cfg(test)]
+mod sh_parser_tests {
+    use super::parse_sh_u;
+
+    // Bare `/sh -u` (no name) must mean "default user, no command" — the `-u`
+    // flag itself must NOT be handed to the child shell as a `-c` argument,
+    // which produced `bash: -c: option requires an argument` (the regression
+    // reported by the user).
+    #[test]
+    fn bare_u_has_no_command_and_defaults_to_invoking_user() {
+        let (target, rest) = parse_sh_u(&["-u"]).expect("matched -u");
+        assert!(target.is_none(), "bare -u should default to the invoking user");
+        assert!(rest.is_empty(), "bare -u must not leak '-u' into the command");
+    }
+
+    // `/sh -u alice ls` => shell as `alice`, command is `ls`.
+    #[test]
+    fn u_with_name_and_command() {
+        let (target, rest) = parse_sh_u(&["-u", "alice", "ls"]).expect("matched -u");
+        assert_eq!(target, Some("alice"));
+        assert_eq!(rest, &["ls"]);
+    }
+
+    // `/sh -u alice` => shell as `alice`, no command (interactive).
+    #[test]
+    fn u_with_name_only() {
+        let (target, rest) = parse_sh_u(&["-u", "alice"]).expect("matched -u");
+        assert_eq!(target, Some("alice"));
+        assert!(rest.is_empty());
+    }
+
+    // Plain `/sh` and `/sh cmd…` are not the `-u` path.
+    #[test]
+    fn plain_sh_is_not_u_path() {
+        assert!(parse_sh_u(&[]).is_none());
+        assert!(parse_sh_u(&["echo", "hi"]).is_none());
+    }
 }
