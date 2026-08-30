@@ -1670,11 +1670,16 @@ pub mod raw {
                     }
                     // We're in a CSI sequence; check for the bracketed-paste
                     // wrapper (`ESC[200~` start / `ESC[201~` end) before the
-                    // generic swallow below. NOTE: the loop has already done
-                    // `i += 1` past the 0x1b, so the wrapper starts at `i - 1`.
+                    // generic swallow below. `i` points at the `0x1b`, so the
+                    // wrapper starts at `i`.
                     if let Some(start) = paste_marker_at(bytes, i) {
                         pasting = start; // `200~` = start
-                        i += 6; // skip `ESC [ 2 0 0 ~` / `ESC [ 2 0 1 ~`
+                        // The wrapper is 6 bytes (`ESC [ 2 0 0 ~`) starting at
+                        // `i`. `continue` skips the loop's trailing `i += 1`, so
+                        // advance by 6 to land just past the wrapper. (Matches
+                        // `read_chunk`. The old `i += 5` left the closing `~` in
+                        // the buffer as literal text.)
+                        i += 6; // skip `ESC [ 2 0 0 ~` / `ESC [ 2 0 1 ~` (6 bytes)
                         continue;
                     }
                     i += 1; // skip 0x1b

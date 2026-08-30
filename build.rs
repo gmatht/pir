@@ -9,6 +9,13 @@
 use std::fs;
 use std::path::Path;
 
+/// Paths used in generated `#[path = "..."]` attributes must use `/`
+/// separators: on Windows a raw backslash is an invalid Rust string escape
+/// (`#[path = "C:\temp\..."]` fails to compile).
+fn path_attr(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
 fn main() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let root = Path::new(&manifest);
@@ -39,8 +46,7 @@ fn main() {
             continue; // prep not present in this build -> skip
         }
         let mod_ident = sanitize(name);
-        let abs = ext_dir.join(name).join("src").join("lib.rs");
-        let abs = abs.to_string_lossy().into_owned();
+        let abs = path_attr(&ext_dir.join(name).join("src").join("lib.rs"));
         body.push_str(&format!(
             "    #[path = \"{abs}\"]\n    mod ext_{mod_ident};\n    ext_{mod_ident}::register(reg);\n"
         ));
@@ -58,8 +64,7 @@ fn main() {
             continue;
         }
         let mod_ident = sanitize(name);
-        let abs = ext_dir.join(name).join("src").join("lib.rs");
-        let abs = abs.to_string_lossy().into_owned();
+        let abs = path_attr(&ext_dir.join(name).join("src").join("lib.rs"));
         test_body.push_str(&format!(
             "    #[path = \"{abs}\"]\n    mod test_ext_{mod_ident};\n"
         ));
