@@ -1233,10 +1233,11 @@ pub fn pi_backup_exists() -> bool {
 
 /// Ensure a one-time snapshot of `~/.pi` exists. Called once at startup. If a
 /// snapshot already exists (tgz *or* zip) this is a no-op. Otherwise it creates
-/// `~/.pi_backup.tgz` via the `tar` CLI (the reliable, compression-capable path
-/// on unix) and, only if `tar` is unavailable, a store-only `~/.pi_backup.zip`
-/// written in pure Rust (no external dependency). Best-effort: failures are
-/// swallowed so a missing `tar` never blocks `pir` from starting.
+/// `~/.pi_backup.tgz` via the `tar` CLI (the reliable, compressed path on
+/// unix). If `tar` is unavailable (e.g. stripped/non-unix image), it falls back
+/// to `~/.pi_backup.zip` via the `zip` CLI -- a real compressed archive, so no
+/// hand-rolled zip writer is needed. Best-effort: failures are swallowed so a
+/// missing tool can never block `pir` from starting.
 pub fn ensure_pi_backup() {
     if pi_backup_exists() {
         return;
@@ -1248,9 +1249,9 @@ pub fn ensure_pi_backup() {
     if ensure_pi_backup_tar(&src) {
         return;
     }
-    // Fallback: a dependency-free store-only zip (no compression) so we still
-    // get *a* snapshot even when `tar` is absent (non-unix / stripped image).
-    let _ = ensure_pi_backup_zip_store(&src);
+    // Fallback: `zip` (Info-ZIP), the system compressor on Windows and most
+    // stripped *nix images. Produces a real compressed `.zip` archive.
+    let _ = ensure_pi_backup_zip(&src);
 }
 
 /// Create `~/.pi_backup.tgz` with `tar -czf`. Returns true on success.
@@ -1281,145 +1282,31 @@ fn ensure_pi_backup_tar(src: &Path) -> bool {
     }
 }
 
-/// Minimal dependency-free ZIP writer (store / no compression). Walks `src`
-/// recursively, appending each file as a local entry + a central directory
-/// record, producing a valid uncompressed `.zip`. Used only as a fallback when
-/// `tar` is unavailable. Returns true on success.
-fn ensure_pi_backup_zip_store(src: &Path) -> bool {
-    use std::io::{Read, Write};
+/// Create `~/.pi_backup.zip` with `zip -qr <archive> <dir>` (recursive, quiet).
+/// Returns true on success. Used only as a fallback when `tar` is unavailable.
+fn ensure_pi_backup_zip(src: &Path) -> bool {
     let zip = pi_backup_zip();
-    let Ok(mut file) = std::fs::File::create(&zip) else {
-        return false;
-    };
-    let mut local_entries: Vec<(String, u64, u64)> = Vec::new(); // (name, local_header_off, crc)
-    let mut central: Vec<u8> = Vec::new();
-    let mut entries: Vec<(String, u32)> = Vec::new(); // (name, crc) for central dir
-
-    // Collect files first so we can walk deterministically.
-    let mut stack = vec![src.to_path_buf()];
-    let mut files: Vec<(PathBuf, String)> = Vec::new();
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-        for ent in rd.flatten() {
-            let path = ent.path();
-            let Ok(meta) = ent.metadata() else { continue };
-            if meta.is_dir() {
-                stack.push(path);
-            } else if meta.is_file() {
-                let rel = match path.strip_prefix(src) {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
-                // ZIP uses forward slashes; skip the root component name.
-                let rels = rel
-                    .components()
-                    .map(|c| c.as_os_str().to_string_lossy().replace('\\', "/"))
-                    .collect::<Vec<_>>()
-                    .join("/");
-                files.push((path, format!(".pi/{}", rels)));
-            }
-        }
-    }
-
-    for (path, name) in files {
-        let Ok(mut f) = std::fs::File::open(&path) else { continue };
-        let mut data = Vec::new();
-        if f.read_to_end(&mut data).is_err() {
-            continue;
-        }
-        let crc = crc32(&data);
-        let local_off = local_entries.last().map(|e| e.1 + e.2).unwrap_or(0);
-        // Local file header (signature 0x04034b50), with the name.
-        let mut header = Vec::new();
-        header.extend_from_slice(&0x04034b50u32.to_le_bytes());
-        header.extend_from_slice(&20u16.to_le_bytes()); // version needed
-        header.extend_from_slice(&0u16.to_le_bytes()); // flags
-        header.extend_from_slice(&0u16.to_le_bytes()); // method = store
-        header.extend_from_slice(&0u16.to_le_bytes()); // mod time
-        header.extend_from_slice(&0u16.to_le_bytes()); // mod date
-        header.extend_from_slice(&crc.to_le_bytes());
-        header.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        header.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        header.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        header.extend_from_slice(&0u16.to_le_bytes()); // extra len
-        header.extend_from_slice(name.as_bytes());
-        if file.write_all(&header).is_err() {
+    // `zip` records paths relative to the process cwd, so we chdir into the
+    // *parent* of `.pi` and add the `.pi` entry — that way the archive has a
+    // clean top-level `.pi/` instead of an absolute path. (Info-ZIP `zip` has
+    // no `-C`/chdir flag like tar does.)
+    let parent = src.parent().unwrap_or_else(|| Path::new("."));
+    let name = src.file_name().unwrap_or_else(|| std::ffi::OsStr::new(".pi"));
+    let status = std::process::Command::new("zip")
+        .arg("-qr")
+        .arg(&zip)
+        .arg(name)
+        .current_dir(parent)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match status {
+        Ok(s) if s.success() && zip.exists() => true,
+        _ => {
             let _ = std::fs::remove_file(&zip);
-            return false;
+            false
         }
-        if file.write_all(&data).is_err() {
-            let _ = std::fs::remove_file(&zip);
-            return false;
-        }
-        local_entries.push((name.clone(), local_off, header.len() as u64 + data.len() as u64));
-        entries.push((name, crc));
     }
-
-    let central_start = {
-        // current file position = sum of local entry (off+len)
-        local_entries.last().map(|e| e.1 + e.2).unwrap_or(0)
-    };
-    for (name, crc) in &entries {
-        let mut rec = Vec::new();
-        rec.extend_from_slice(&0x02014b50u32.to_le_bytes());
-        rec.extend_from_slice(&20u16.to_le_bytes()); // version made by
-        rec.extend_from_slice(&20u16.to_le_bytes()); // version needed
-        rec.extend_from_slice(&0u16.to_le_bytes()); // flags
-        rec.extend_from_slice(&0u16.to_le_bytes()); // method = store
-        rec.extend_from_slice(&0u16.to_le_bytes()); // mod time
-        rec.extend_from_slice(&0u16.to_le_bytes()); // mod date
-        rec.extend_from_slice(&crc.to_le_bytes());
-        let len = name.len();
-        rec.extend_from_slice(&(len as u32).to_le_bytes()); // compressed
-        rec.extend_from_slice(&(len as u32).to_le_bytes()); // uncompressed
-        rec.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        rec.extend_from_slice(&0u16.to_le_bytes()); // extra len
-        rec.extend_from_slice(&0u16.to_le_bytes()); // comment len
-        rec.extend_from_slice(&0u16.to_le_bytes()); // disk number
-        rec.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
-        rec.extend_from_slice(&0u32.to_le_bytes()); // external attrs
-        let off = local_entries
-            .iter()
-            .find(|e| &e.0 == name)
-            .map(|e| e.1 as u32)
-            .unwrap_or(0);
-        rec.extend_from_slice(&off.to_le_bytes());
-        rec.extend_from_slice(name.as_bytes());
-        central.extend_from_slice(&rec);
-    }
-    let central_size = central.len() as u32;
-    let mut end = Vec::new();
-    end.extend_from_slice(&0x06054b50u32.to_le_bytes());
-    end.extend_from_slice(&0u16.to_le_bytes()); // disk number
-    end.extend_from_slice(&0u16.to_le_bytes()); // disk with central dir
-    end.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-    end.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-    end.extend_from_slice(&central_size.to_le_bytes());
-    end.extend_from_slice(&(central_start as u32).to_le_bytes());
-    end.extend_from_slice(&0u16.to_le_bytes()); // comment len
-    if file.write_all(&central).is_err() || file.write_all(&end).is_err() {
-        let _ = std::fs::remove_file(&zip);
-        return false;
-    }
-    true
-}
-
-/// Portable CRCIEEE 802.3, the ZIP polynomial) used by the zip fallback.
-/// Small table-based implementation; independent of any external crate.
-fn crc32(data: &[u8]) -> u32 {
-    let mut table = [0u32; 256];
-    for n in 0..256u32 {
-        let mut c = n;
-        for _ in 0..8 {
-            c = if c & 1 != 0 { 0xed_b8_83_20 ^ (c >> 1) } else { c >> 1 };
-        }
-        table[n as usize] = c;
-    }
-    let mut crc: u32 = 0xffff_ffff;
-    for &b in data {
-        crc = table[((crc ^ b as u32) & 0xff) as usize] ^ (crc >> 8);
-    }
-    0xffff_ffff & !crc
 }
 
 #[cfg(test)]
