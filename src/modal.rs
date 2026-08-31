@@ -489,6 +489,33 @@ fn state_color(state: &str) -> String {
     }
 }
 
+/// Show a thinking-level picker on the alternate screen and return the chosen
+/// level. Returns `None` if not a tty or the user cancels.
+pub fn thinking_picker(current: &str) -> Option<String> {
+    let _modal = Modal::enter()?;
+    let levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+    let mut selected = levels.iter().position(|l| *l == current).unwrap_or(0);
+    loop {
+        let lines: Vec<String> = levels
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let marker = if i == selected { "▸" } else { " " };
+                let cur = if *l == current { "  (current)" } else { "" };
+                format!("{marker} {l}{cur}")
+            })
+            .collect();
+        draw_box("pir — thinking level", &lines);
+        match read_key()? {
+            Key::Up | Key::Char('k') => selected = selected.saturating_sub(1),
+            Key::Down | Key::Char('j') => selected = (selected + 1).min(levels.len() - 1),
+            Key::Enter | Key::Right => return Some(levels[selected].to_string()),
+            Key::Esc | Key::CtrlC | Key::CtrlD => return None,
+            _ => {}
+        }
+    }
+}
+
 /// Show a masked secret-entry dialog on the alternate screen and return the
 /// typed value. The key is shown as `••••` and never touches the normal screen
 /// or scrollback. Returns `None` if the terminal isn't a tty (caller falls back

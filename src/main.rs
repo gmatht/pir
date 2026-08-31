@@ -1005,12 +1005,32 @@ fn main() {
     // Warn on existing git projects that lack the LLM-safety guard hook, and
     // point at /fix. Skipped under jj (git hooks don't apply there).
     if crate::project::missing_git_guard(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))) {
-        eprintln!(
-            "{}",
-            term::yellow(&format!(
-                "[pir] this git repo has no commit guard hook — agents could commit large/binary files. Run /fix to make the .git setup sane for LLM use."
-            ))
-        );
+        // The agent now commits from its own worktree, so the guard hook must be
+        // in place before any commit — install it automatically, once, in the
+        // *common* hooks dir shared by all worktrees. The repo's `.git` is inside
+        // the write-quarantine overlay, so suspend it for the write so the hook
+        // lands on the real `.git`, then resume. (A different pre-commit hook is
+        // never clobbered — that still needs `/fix`.)
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        #[cfg(unix)]
+        let _ = crate::security::overlay::project_active_suspend();
+        let install = crate::project::install_git_guard_hook(&cwd);
+        #[cfg(unix)]
+        let _ = crate::security::overlay::project_active_resume();
+        match install {
+            Ok(true) => eprintln!(
+                "{}",
+                term::dim("[pir] installed the git commit-guard hook (refuses large/binary commits; bypass with --no-verify)")
+            ),
+            Ok(false) => eprintln!(
+                "{}",
+                term::yellow("[pir] a different pre-commit hook already exists — could not install the pir guard; run /fix to review")
+            ),
+            Err(e) => eprintln!(
+                "{}",
+                term::yellow(&format!("[pir] could not install the commit-guard hook ({e}); run /fix"))
+            ),
+        }
     }
 
     let mut jobs = BackgroundJobs::new();
@@ -1042,10 +1062,15 @@ fn main() {
     // so each instance ignores its own broadcast echo.
     let broadcast_seen = config::read_model_broadcast().map(|b| b.generation).unwrap_or(0);
     let pending_model: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // Stop flag for the broadcast watcher (a detached background thread). It
+    // lets the REPL request a prompt shutdown of that thread; the thread is
+    // detached regardless, so it can never block process exit on its own.
+    let watcher_stop: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let _watcher = spawn_model_broadcast_watcher(
         broadcast_seen,
         std::process::id(),
         pending_model.clone(),
+        watcher_stop.clone(),
     );
 
     // Running foreground turn state.
@@ -1471,7 +1496,8 @@ pub(crate) fn run_foreground_turn(
 /// How often the cross-instance model-broadcast watcher polls
 /// `~/.pi/agent/model-broadcast.json` (a deliberately cheap, cooperative
 /// poll — there is no daemon, so this is as close to "live" as we get across
-/// independent `pir` processes without fs events).
+/// independent `pir` processes without fs events). Kept short: the watcher is
+/// a long-lived background thread and the poll interval is its only idle cost.
 const BROADCAST_POLL: Duration = Duration::from_secs(2);
 
 /// Apply a `provider/model` label that arrived via the cross-instance model
@@ -1505,15 +1531,34 @@ fn apply_broadcast_model(
 /// is idle (or right after a running turn ends / errors). `self_pid` is used to
 /// ignore our own broadcast. Best-effort: any read/parse error is silently
 /// skipped.
+///
+/// The watcher is **detached**: it is unconditionally a non-joinable background
+/// thread, so it can never hold `cargo test` (or any other process exit) open
+/// waiting for it to finish — previously the `loop { thread::sleep; … }`
+/// thread would keep the process alive indefinitely, which is exactly the kind
+/// of thing that makes a test binary appear to "hang at the end". It also
+/// observes `stop` so callers that hold the returned handle can opt the thread
+/// out promptly (it wakes within one [`BROADCAST_POLL`]).
 fn spawn_model_broadcast_watcher(
     last_seen: u64,
     self_pid: u32,
     pending_model: Arc<Mutex<Option<String>>>,
+    stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut seen = last_seen;
         loop {
+            // Co-operative shutdown: bail out within one poll tick when asked
+            // (e.g. the REPL is tearing down). This is what lets a harness that
+            // joins all handles do so promptly instead of stalling forever.
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
             thread::sleep(BROADCAST_POLL);
+            // Re-check after the sleep so a stop requested mid-sleep is honoured.
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
             let Some(b) = config::read_model_broadcast() else { continue };
             if b.generation <= seen || b.generation == 0 {
                 continue;
@@ -2327,9 +2372,19 @@ fn handle_command(
                     }
                 }
                 Some(crate::modal::MenuAction::Thinking) => {
-                    let g = agent_slot.lock().unwrap();
-                    if let Some(agent) = g.as_ref() {
-                        println!("thinking level: {}", agent.thinking_level().as_str());
+                    // Let the user pick a thinking level on the alternate screen.
+                    let level = {
+                        let g = agent_slot.lock().unwrap();
+                        let cur = g.as_ref().map(|a| a.thinking_level().as_str().to_string()).unwrap_or_else(|| "off".to_string());
+                        crate::modal::thinking_picker(&cur)
+                    };
+                    if let Some(picked) = level {
+                        if let Some(lvl) = crate::config::ThinkingLevel::parse(&picked) {
+                            let mut g = agent_slot.lock().unwrap();
+                            if let Some(agent) = g.as_mut() {
+                                println!("{}", agent.set_thinking(lvl));
+                            }
+                        }
                     }
                 }
                 Some(crate::modal::MenuAction::Security) => {
