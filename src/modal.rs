@@ -184,6 +184,93 @@ pub fn draw_box(title: &str, lines: &[String]) -> usize {
     body_h + 2
 }
 
+/// Draw a centered box showing a *viewport* of `lines`: the first visible
+/// row is `top` and the first visible column is `left`, so callers can scroll
+/// long content with the arrow keys (up/down = vertical, left/right = horizontal).
+/// `footer` is printed on the line directly below the box (use it for control
+/// hints). Returns the number of rows drawn (for cursor restore).
+pub fn draw_box_scrolled(title: &str, lines: &[String], top: usize, left: usize, footer: &str) -> usize {
+    let w = crate::term::terminal_width();
+    let h = crate::term::terminal_height();
+    let body_w = w.saturating_sub(4).max(10);
+    let max_rows = h.saturating_sub(4).max(1);
+    let body_h = lines.len().min(max_rows);
+    let top_row = (h.saturating_sub(body_h + 2)) / 2;
+    let left_col = (w.saturating_sub(body_w + 2)) / 2;
+
+    let mut out = String::new();
+    // Clear the alternate screen.
+    out.push_str("\x1b[2J");
+    // Title bar.
+    let title = truncate(title, body_w);
+    out.push_str(&format!("\x1b[{};{}H┌─ {} ─", top_row, left_col, title));
+    let used = 4 + title.chars().count();
+    for _ in used..body_w + 2 {
+        out.push('─');
+    }
+    out.push_str("┐");
+    // Body: render only the viewport `lines[top .. top+body_h]`.
+    let end = (top + body_h).min(lines.len());
+    for (i, line) in lines.iter().enumerate().take(end).skip(top) {
+        let row = top_row + 1 + (i - top);
+        out.push_str(&format!("\x1b[{};{}H│", row, left_col));
+        // Horizontal viewport: skip `left` cols, take `body_w`.
+        let slice: String = line.chars().skip(left).take(body_w).collect();
+        out.push_str(&slice);
+        let lw = slice.chars().count();
+        for _ in lw..body_w {
+            out.push(' ');
+        }
+        out.push_str("│");
+    }
+    // Bottom border.
+    let bottom = top_row + 1 + body_h;
+    out.push_str(&format!("\x1b[{};{}H└", bottom, left_col));
+    for _ in 0..body_w + 2 {
+        out.push('─');
+    }
+    out.push_str("┘");
+    // Footer (control hints) + cursor to a safe spot.
+    let footer = truncate(footer, body_w);
+    out.push_str(&format!("\x1b[{};{}H{}", bottom + 1, left_col, footer));
+    out.push_str(&format!("\x1b[{};{}H", bottom + 2, left_col));
+    let _ = io::stdout().write_all(out.as_bytes());
+    let _ = io::stdout().flush();
+    body_h + 2
+}
+
+/// Run a simple dismiss-only dialog that also supports scrolling: draw `lines`
+/// in a scrollable box (so long content isn't clipped) and read keys until the
+/// user dismisses with Esc/ctrl-c/ctrl-d/Enter. Used by the help/security/
+/// settings/about dialogs.
+fn scroll_until_dismiss(title: &str, lines: &[String]) -> Option<()> {
+    let mut top = 0usize;
+    let mut left = 0usize;
+    let footer = crate::term::dim("[↑↓] scroll  [←→] sideways  [esc/enter] close").to_string();
+    loop {
+        draw_box_scrolled(title, lines, top, left, &footer);
+        match read_key()? {
+            Key::Up | Key::Char('k') => top = top.saturating_sub(1),
+            Key::Down | Key::Char('j') => {
+                let max = lines.len().saturating_sub(1);
+                if top < max { top += 1; }
+            }
+            Key::Left => left = left.saturating_sub(8),
+            Key::Right => {
+                let max = lines.iter().map(|l| crate::term::visible_len(l)).max().unwrap_or(0).saturating_sub(1);
+                if left < max { left += 8; }
+            }
+            Key::PageUp => top = top.saturating_sub(10),
+            Key::PageDown => {
+                let max = lines.len().saturating_sub(1);
+                if top < max { top = (top + 10).min(max); }
+            }
+            Key::Esc | Key::CtrlC | Key::CtrlD | Key::Enter => return Some(()),
+            _ => {}
+        }
+    }
+}
+
 /// Truncate `s` to at most `n` visible chars, appending `…` when cut.
 fn truncate(s: &str, n: usize) -> String {
     if crate::term::visible_len(s) <= n {
@@ -291,14 +378,7 @@ pub fn security_dialog(
 ) -> Option<()> {
     let _modal = Modal::enter()?;
     let lines = security_lines(policy, su_security);
-    draw_box("pir — security", &lines);
-    // Read keys until the user dismisses (Esc/ctrl-c/Enter).
-    loop {
-        match read_key()? {
-            Key::Esc | Key::CtrlC | Key::CtrlD | Key::Enter => return Some(()),
-            _ => {}
-        }
-    }
+    scroll_until_dismiss("pir — security", &lines)
 }
 
 fn security_lines(policy: &crate::security::SecurityPolicy, su_security: bool) -> Vec<String> {
@@ -343,13 +423,7 @@ pub fn settings_dialog(
 ) -> Option<()> {
     let _modal = Modal::enter()?;
     let lines = settings_lines(model, thinking, show_thinking, incremental, full_auto);
-    draw_box("pir — settings", &lines);
-    loop {
-        match read_key()? {
-            Key::Esc | Key::CtrlC | Key::CtrlD | Key::Enter => return Some(()),
-            _ => {}
-        }
-    }
+    scroll_until_dismiss("pir — settings", &lines)
 }
 
 fn settings_lines(
@@ -378,9 +452,27 @@ fn settings_lines(
 pub fn help_dialog(help_text: &str) -> Option<()> {
     let _modal = Modal::enter()?;
     let lines: Vec<String> = help_text.lines().map(|l| l.to_string()).collect();
-    draw_box("pir — help", &lines);
+    let mut top = 0usize;
+    let mut left = 0usize;
+    let footer = crate::term::dim("[↑↓] scroll  [←→] sideways  [esc/enter] close").to_string();
     loop {
+        draw_box_scrolled("pir — help", &lines, top, left, &footer);
         match read_key()? {
+            Key::Up | Key::Char('k') => top = top.saturating_sub(1),
+            Key::Down | Key::Char('j') => {
+                let max = lines.len().saturating_sub(1);
+                if top < max { top += 1; }
+            }
+            Key::Left => left = left.saturating_sub(8),
+            Key::Right => {
+                let max = lines.iter().map(|l| crate::term::visible_len(l)).max().unwrap_or(0).saturating_sub(1);
+                if left < max { left += 8; }
+            }
+            Key::PageUp => top = top.saturating_sub(10),
+            Key::PageDown => {
+                let max = lines.len().saturating_sub(1);
+                if top < max { top = (top + 10).min(max); }
+            }
             Key::Esc | Key::CtrlC | Key::CtrlD | Key::Enter => return Some(()),
             _ => {}
         }
@@ -405,13 +497,7 @@ pub fn about_dialog() -> Option<()> {
         String::new(),
         term::dim("[esc] close").to_string(),
     ];
-    draw_box("pir — about", &lines);
-    loop {
-        match read_key()? {
-            Key::Esc | Key::CtrlC | Key::CtrlD | Key::Enter => return Some(()),
-            _ => {}
-        }
-    }
+    scroll_until_dismiss("pir — about", &lines)
 }
 
 /// A session row shown in the backgrounded-session selector.
