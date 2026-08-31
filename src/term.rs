@@ -587,11 +587,11 @@ impl Hinter for PirHelper {
 
 impl Highlighter for PirHelper {
     fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
-        if color() {
-            std::borrow::Cow::Owned(format!("\x1b[2m{hint}\x1b[0m"))
-        } else {
-            std::borrow::Cow::Borrowed(hint)
-        }
+        // Plain text on purpose: ANSI-wrapped hints (like the ANSI-wrapped
+        // `❯` prompt) can make the Windows console/pty width accounting drift,
+        // which pushes the caret a few columns right and leaves the next
+        // typed text visibly offset. The hint is cosmetic, so no escapes.
+        std::borrow::Cow::Borrowed(hint)
     }
 }
 impl Validator for PirHelper {}

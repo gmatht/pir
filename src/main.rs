@@ -1103,7 +1103,7 @@ fn main() {
                 ))),
             }
         }
-        match term::read_line(&format!("{} ", term::cyan("❯"))) {
+        match term::read_line("❯ ") {
             None => {
                 println!();
                 break;
