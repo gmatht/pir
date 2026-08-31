@@ -192,15 +192,21 @@ restart. Concretely:
   `<name>.json` — a sibling of `~/.pi/agent/` (the config dir), not inside it, so
   session lists never clash with or pollute the config/agent directory. The user
   can create a new named list or load an existing one.
-- **Save** — write the current active-session list (ids + a short label) to the
-  currently-loaded list's file. **By default, save back to the same list that was
-  loaded** — so if you loaded `work`, saving writes to `work.json`, not a new
-  file. A "save as…" action lets you pick a different name (creating a new list or
-  overwriting another).
-- **Restore** — on startup (or via a menu action), pick a named list to load and
-  re-attach to its sessions, re-classifying their state (running / waiting for
-  input / complete) so the hot-key "next waiting-for-input" flow works again
-  without the user having to re-discover the sessions.
+- **Dialog actions.** The dialog exposes three explicit actions:
+  - **Save** — write the current active-session list (ids + a short label) to the
+    currently-loaded list's file. **By default, save back to the same list that
+    was loaded** — so if you loaded `work`, saving writes to `work.json`, not a
+    new file.
+  - **Save As…** — pick a different name (creating a new list or overwriting
+    another). After a Save As, the new name becomes the loaded list, so a
+    subsequent plain **Save** writes there.
+  - **Load…** — pick a named list to load and re-attach to its sessions,
+    re-classifying their state (running / waiting for input / complete) so the
+    hot-key "next waiting-for-input" flow works again without the user having to
+    re-discover the sessions. Loading replaces the current in-memory list.
+- **Restore on startup** — optionally auto-load a named list at startup (e.g. the
+  last-loaded one, or a configured default), so the "drive the queue" flow resumes
+  without a manual Load.
 - **Why:** backgrounded sessions are currently in-memory (`BackgroundJobs` in
   `main.rs`) and lost on exit. Persisting the active list means a user can quit
   pir, come back later, and immediately jump to the sessions that still need
