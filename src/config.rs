@@ -1,8 +1,9 @@
 use crate::types::Usage;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::ffi::OsStr;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiKind {
@@ -224,6 +225,20 @@ pub fn pi_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(".pi")
+}
+
+/// Convert a config string (possibly with a leading `~/`) into a `PathBuf`.
+/// Expands a leading `~/` to the user's home directory; everything else is taken
+/// literally so absolute and relative paths both work. Used by the security
+/// quarantine config keys (`quarantine-staging`, `overlay`, …).
+pub fn path_from_string(s: &str) -> PathBuf {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(s)
 }
 
 pub fn load_providers() -> Result<Vec<Provider>, String> {
@@ -642,6 +657,43 @@ pub fn set_default_model(provider: &str, model: &str) -> Result<PathBuf, String>
 /// `load_auth_keys` / `load_from_auth_fallback` already consult it.
 pub fn auth_path() -> PathBuf {
     pi_dir().join("agent").join("auth.json")
+}
+
+/// The default selector for the *light* model used to summarize conversations
+/// into a short title in the background. Cheap, fast models (Cerebras) keep
+/// this within the provider's strict per-minute token/request limits; the
+/// user can override it via `PIR_LIGHT_MODEL` or `~/.pi/agent/settings.json`
+/// (`lightModel`).
+pub const DEFAULT_LIGHT_MODEL: &str = "cerebras/gemma4";
+
+/// Resolve the (provider, model) to use for light/background summarization
+/// work (conversation titles). Resolution order:
+///   1. `PIR_LIGHT_MODEL` env var
+///   1. `PIR_LIGHT_MODEL` env var
+///   2. `lightModel` in `~/.pi/agent/settings.json`
+///   3. the built-in [`DEFAULT_LIGHT_MODEL`] (`cerebras/gemma4`)
+///
+/// Returns `None` when the resolved selector names a model that isn't present
+/// in the loaded catalog (e.g. the user hasn't configured Cerebras yet), so the
+/// caller can skip title generation rather than erroring. The returned
+/// `(Provider, Model)` borrows from `providers` and must outlive the call.
+pub fn resolve_light_model<'a>(
+    providers: &'a [Provider],
+) -> Option<(&'a Provider, &'a Model)> {
+    let mut selector = std::env::var("PIR_LIGHT_MODEL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            let p = pi_dir().join("agent").join("settings.json");
+            fs::read_to_string(&p)
+                .ok()
+                .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+                .and_then(|v| v.get("lightModel").and_then(Value::as_str).map(str::to_string))
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_LIGHT_MODEL.to_string())
+        });
+    selector = selector.trim().to_string();
+    select(providers, &selector).ok()
 }
 
 /// Persist an API-key credential for `provider` into `auth.json` as
@@ -1136,6 +1188,239 @@ pub fn publish_model_broadcast(label: &str) -> Option<u64> {
     }
 }
 
+
+/// Default for incremental (in-place) markdown rendering. Enabled unless
+/// explicitly disabled via `PIR_INCREMENTAL_MD=0` (see `Agent::set_incremental_md`).
+pub fn incremental_md_default() -> bool {
+    std::env::var("PIR_INCREMENTAL_MD")
+        .map(|v| v.trim() != "0")
+        .unwrap_or(true)
+}
+
+// ---------------------------------------------------------------------------
+// Startup snapshot of `~/.pi`
+// ---------------------------------------------------------------------------
+//
+// Before doing anything destructive, `pir` snapshots its config/home
+// (`~/.pi`) once, so a future `/quarantine apply` or a bad plugin can be
+// rolled back. The snapshot is created lazily: if *either* `~/.pi_backup.tgz`
+// *or* `~/.pi_backup.zip` already exists we leave it alone (the user may have
+// a fresh, deliberate backup); otherwise we create one of them. Best-effort:
+// any failure is silently ignored so backup creation can never block startup.
+
+/// Home directory of the current user (`$HOME`, else `$USERPROFILE`, else `.`).
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Path of the `.tgz` snapshot we would create.
+pub fn pi_backup_tgz() -> PathBuf {
+    home_dir().join(".pi_backup.tgz")
+}
+
+/// Path of the `.zip` snapshot we would create.
+pub fn pi_backup_zip() -> PathBuf {
+    home_dir().join(".pi_backup.zip")
+}
+
+/// True when a usable snapshot already exists (either archive path).
+pub fn pi_backup_exists() -> bool {
+    pi_backup_tgz().exists() || pi_backup_zip().exists()
+}
+
+/// Ensure a one-time snapshot of `~/.pi` exists. Called once at startup. If a
+/// snapshot already exists (tgz *or* zip) this is a no-op. Otherwise it creates
+/// `~/.pi_backup.tgz` via the `tar` CLI (the reliable, compression-capable path
+/// on unix) and, only if `tar` is unavailable, a store-only `~/.pi_backup.zip`
+/// written in pure Rust (no external dependency). Best-effort: failures are
+/// swallowed so a missing `tar` never blocks `pir` from starting.
+pub fn ensure_pi_backup() {
+    if pi_backup_exists() {
+        return;
+    }
+    let src = pi_dir();
+    if !src.exists() {
+        return; // nothing to snapshot
+    }
+    if ensure_pi_backup_tar(&src) {
+        return;
+    }
+    // Fallback: a dependency-free store-only zip (no compression) so we still
+    // get *a* snapshot even when `tar` is absent (non-unix / stripped image).
+    let _ = ensure_pi_backup_zip_store(&src);
+}
+
+/// Create `~/.pi_backup.tgz` with `tar -czf`. Returns true on success.
+fn ensure_pi_backup_tar(src: &Path) -> bool {
+    let tgz = pi_backup_tgz();
+    // `tar` interprets the archive's contents relative to `-C <dir>`; we cd to
+    // the *parent* of src and add `src.file_name()` so the archive contains a
+    // top-level `.pi/` directory (matching the conventional layout) rather
+    // than an absolute path.
+    let parent = src.parent().unwrap_or_else(|| Path::new("."));
+    let name = src.file_name().unwrap_or_else(|| std::ffi::OsStr::new(".pi"));
+    let status = std::process::Command::new("tar")
+        .arg("-czf")
+        .arg(&tgz)
+        .arg("-C")
+        .arg(parent)
+        .arg(name)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match status {
+        Ok(s) if s.success() && tgz.exists() => true,
+        _ => {
+            // Partial/garbled output: drop it so the next launch retries cleanly.
+            let _ = std::fs::remove_file(&tgz);
+            false
+        }
+    }
+}
+
+/// Minimal dependency-free ZIP writer (store / no compression). Walks `src`
+/// recursively, appending each file as a local entry + a central directory
+/// record, producing a valid uncompressed `.zip`. Used only as a fallback when
+/// `tar` is unavailable. Returns true on success.
+fn ensure_pi_backup_zip_store(src: &Path) -> bool {
+    use std::io::{Read, Write};
+    let zip = pi_backup_zip();
+    let Ok(mut file) = std::fs::File::create(&zip) else {
+        return false;
+    };
+    let mut local_entries: Vec<(String, u64, u64)> = Vec::new(); // (name, local_header_off, crc)
+    let mut central: Vec<u8> = Vec::new();
+    let mut entries: Vec<(String, u32)> = Vec::new(); // (name, crc) for central dir
+
+    // Collect files first so we can walk deterministically.
+    let mut stack = vec![src.to_path_buf()];
+    let mut files: Vec<(PathBuf, String)> = Vec::new();
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for ent in rd.flatten() {
+            let path = ent.path();
+            let Ok(meta) = ent.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(path);
+            } else if meta.is_file() {
+                let rel = match path.strip_prefix(src) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                // ZIP uses forward slashes; skip the root component name.
+                let rels = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().replace('\\', "/"))
+                    .collect::<Vec<_>>()
+                    .join("/");
+                files.push((path, format!(".pi/{}", rels)));
+            }
+        }
+    }
+
+    for (path, name) in files {
+        let Ok(mut f) = std::fs::File::open(&path) else { continue };
+        let mut data = Vec::new();
+        if f.read_to_end(&mut data).is_err() {
+            continue;
+        }
+        let crc = crc32(&data);
+        let local_off = local_entries.last().map(|e| e.1 + e.2).unwrap_or(0);
+        // Local file header (signature 0x04034b50), with the name.
+        let mut header = Vec::new();
+        header.extend_from_slice(&0x04034b50u32.to_le_bytes());
+        header.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        header.extend_from_slice(&0u16.to_le_bytes()); // flags
+        header.extend_from_slice(&0u16.to_le_bytes()); // method = store
+        header.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        header.extend_from_slice(&0u16.to_le_bytes()); // mod date
+        header.extend_from_slice(&crc.to_le_bytes());
+        header.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        header.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        header.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        header.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        header.extend_from_slice(name.as_bytes());
+        if file.write_all(&header).is_err() {
+            let _ = std::fs::remove_file(&zip);
+            return false;
+        }
+        if file.write_all(&data).is_err() {
+            let _ = std::fs::remove_file(&zip);
+            return false;
+        }
+        local_entries.push((name.clone(), local_off, header.len() as u64 + data.len() as u64));
+        entries.push((name, crc));
+    }
+
+    let central_start = {
+        // current file position = sum of local entry (off+len)
+        local_entries.last().map(|e| e.1 + e.2).unwrap_or(0)
+    };
+    for (name, crc) in &entries {
+        let mut rec = Vec::new();
+        rec.extend_from_slice(&0x02014b50u32.to_le_bytes());
+        rec.extend_from_slice(&20u16.to_le_bytes()); // version made by
+        rec.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        rec.extend_from_slice(&0u16.to_le_bytes()); // flags
+        rec.extend_from_slice(&0u16.to_le_bytes()); // method = store
+        rec.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        rec.extend_from_slice(&0u16.to_le_bytes()); // mod date
+        rec.extend_from_slice(&crc.to_le_bytes());
+        let len = name.len();
+        rec.extend_from_slice(&(len as u32).to_le_bytes()); // compressed
+        rec.extend_from_slice(&(len as u32).to_le_bytes()); // uncompressed
+        rec.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        rec.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        rec.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        rec.extend_from_slice(&0u16.to_le_bytes()); // disk number
+        rec.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+        rec.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+        let off = local_entries
+            .iter()
+            .find(|e| &e.0 == name)
+            .map(|e| e.1 as u32)
+            .unwrap_or(0);
+        rec.extend_from_slice(&off.to_le_bytes());
+        rec.extend_from_slice(name.as_bytes());
+        central.extend_from_slice(&rec);
+    }
+    let central_size = central.len() as u32;
+    let mut end = Vec::new();
+    end.extend_from_slice(&0x06054b50u32.to_le_bytes());
+    end.extend_from_slice(&0u16.to_le_bytes()); // disk number
+    end.extend_from_slice(&0u16.to_le_bytes()); // disk with central dir
+    end.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    end.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    end.extend_from_slice(&central_size.to_le_bytes());
+    end.extend_from_slice(&(central_start as u32).to_le_bytes());
+    end.extend_from_slice(&0u16.to_le_bytes()); // comment len
+    if file.write_all(&central).is_err() || file.write_all(&end).is_err() {
+        let _ = std::fs::remove_file(&zip);
+        return false;
+    }
+    true
+}
+
+/// Portable CRCIEEE 802.3, the ZIP polynomial) used by the zip fallback.
+/// Small table-based implementation; independent of any external crate.
+fn crc32(data: &[u8]) -> u32 {
+    let mut table = [0u32; 256];
+    for n in 0..256u32 {
+        let mut c = n;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { 0xed_b8_83_20 ^ (c >> 1) } else { c >> 1 };
+        }
+        table[n as usize] = c;
+    }
+    let mut crc: u32 = 0xffff_ffff;
+    for &b in data {
+        crc = table[((crc ^ b as u32) & 0xff) as usize] ^ (crc >> 8);
+    }
+    0xffff_ffff & !crc
+}
 
 #[cfg(test)]
 mod select_tests {

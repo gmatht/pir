@@ -1,6 +1,7 @@
 mod agent;
 mod config;
 mod goal;
+mod md;
 mod notify;
 mod picker;
 mod plugin;
@@ -173,6 +174,9 @@ OPTIONS
   -y, --full-auto            no confirmation for shell/write tools
   --confirm                  always prompt to confirm shell/write tools
   -n, --no-color             disable ANSI colors
+  --no-incremental         disable in-place streaming markdown (render the reply once at the end)
+                           instead of re-drawing it as it streams). On by default, throttled to 200ms per
+                           redraw. Env: PIR_INCREMENTAL_MD=0
   -r, --resume [token]       resume a session; token selects by index/time/preview
   -c, --continue [token]     resume a session and continue its goal (pir -c)
   -u, --as <user>            run project commands as this user (default ai_<project>)
@@ -183,6 +187,10 @@ OPTIONS
                        terminals / screen where raw input misbehaves
   --budget <tokens>    optional cumulative in+out token cap; turn stops (with a
                        banner) once exceeded. Off by default. Env: PIR_TOKEN_BUDGET
+  --auto-retry <n>     when a turn ends and the light model says 'retry', re-run
+                       it up to n times (compacting history first when near the
+                       cap, after the big model gets a chance to disagree). 0 =
+                       observe only (verdict shown, nothing retried). Off by default.
 
 CONFIG (reused from pi, never modified)
   ~/.pi/models.json          providers, models, api keys ("{env:VAR}" supported)
@@ -446,6 +454,7 @@ fn main() {
     let mut as_user: Option<String> = None;
     let mut project_name: Option<String> = None;
     let mut bg_prompt: Option<String> = None;
+    let mut auto_retry: Option<usize> = None;
     // The full-screen ratatui REPL is used only when the `tui` feature is
     // compiled in AND `--tui` is passed; otherwise the streaming REPL runs.
     #[cfg(feature = "tui")]
@@ -459,6 +468,15 @@ fn main() {
     #[cfg(not(feature = "gui"))]
     let mut use_gui = false;
     let mut no_raw = false;
+    #[cfg(feature = "tui")]
+    let mut use_tui = false;
+    #[cfg(not(feature = "tui"))]
+    let mut use_tui = false;
+    // Incremental (in-place) markdown rendering: on by default; opt out with
+    // `--no-incremental` (or `PIR_INCREMENTAL_MD=0`). The value is captured here
+    // and applied to the agent right after it's built (so it can also be read
+    // off the environment by `incremental_md_default`).
+    let mut no_incremental = false;
     let mut budget: Option<u64> = None;
 
     // NOTE: the default-model *selector* is intentionally NOT read here (before
@@ -536,11 +554,19 @@ fn main() {
                 }
             }
             "--no-raw" => no_raw = true,
+            "--no-incremental" => no_incremental = true,
             "--budget" => {
                 i += 1;
                 match args.get(i).and_then(|v| v.parse::<u64>().ok()) {
                     Some(n) => budget = Some(n),
                     None => die("--budget needs a positive integer (tokens)"),
+                }
+            }
+            "--auto-retry" => {
+                i += 1;
+                match args.get(i).and_then(|v| v.parse::<usize>().ok()) {
+                    Some(n) => auto_retry = Some(n),
+                    None => die("--auto-retry needs a non-negative integer (max retries; 0 = observe only)"),
                 }
             }
             "-h" | "--help" => {
@@ -576,6 +602,10 @@ fn main() {
     // can record *what* terminates us (item: SIGTERM/SIGHUP provenance in the
     // status sidecar) and reap spawned children if the parent pane dies.
     install_death_tracking();
+
+    // One-time snapshot of `~/.pi` so a bad `/quarantine apply` or plugin can
+    // later be rolled back. Best-effort; never blocks startup.
+    crate::config::ensure_pi_backup();
 
     let providers = match config::load_providers() {
         Ok(p) if !p.is_empty() => p,
@@ -792,6 +822,7 @@ fn main() {
         }
         agent.apply_persisted_su_security();
         agent.apply_persisted_thinking();
+        agent.apply_persisted_incremental_md();
     }
 
     // Resolve the token budget (off by default). `--budget N` wins; else the
@@ -802,6 +833,15 @@ fn main() {
             .and_then(|v| v.trim().parse::<u64>().ok())
     });
     agent.set_token_budget(budget);
+    // Honour the `--no-incremental` flag (overrides the env default). When the
+    // flag is absent we still call this with `true` so the session sidecar is
+    // (re)written with the effective choice — harmless when already on.
+    agent.set_incremental_md(!no_incremental);
+    // Auto-retry policy: when the user opted in (--auto-retry N), a turn the
+    // light model judges `retry` is re-run automatically up to N times, after
+    // the big model gets a chance to disagree, and history is compacted first
+    // when near the context cap. None (the default) = no auto-retry.
+    let _ = agent.set_auto_retry(auto_retry);
     term::raw::set_enabled(!no_raw);
 
     // Continuation mode: attach the goal that lives next to the resumed
@@ -840,6 +880,8 @@ fn main() {
         });
         // Name this conversation in the background (cheap light model), throttled.
         titler::maybe_generate_title(Some(&bg_log));
+        // Classify the last finished turn's outcome (also throttled + light model).
+        titler::maybe_generate_verdict(Some(&bg_log));
         agent.notify_on_exit(agent.idle_event());
         return;
     }
@@ -851,6 +893,8 @@ fn main() {
         }
         // Name this conversation in the background (cheap light model), throttled.
         titler::maybe_generate_title(one_shot_log.as_ref());
+        // Classify the last finished turn's outcome (throttled + light model).
+        titler::maybe_generate_verdict(one_shot_log.as_ref());
         return;
     }
 
@@ -1393,7 +1437,16 @@ pub(crate) fn run_foreground_turn(
         // Hand the worker the shared quiet switch so the REPL can detach this
         // turn to the background mid-flight without owning the agent.
         a.set_quiet_handle(quiet_handle);
-        let ev = match a.turn(&prompt) {
+        let res = a.turn(&prompt);
+        // Auto-retry: if the just-finished turn's light-model verdict was
+        // `retry` and the user opted in via `--auto-retry N`, re-run it up to N
+        // times — compacting history first when near the context cap and giving
+        // the big model a chance to disagree (in which case we don't retry).
+        // No-op (returns 0) when auto-retry is off, the verdict isn't `retry`,
+        // or the light model is unavailable. Run before finalizing the exit
+        // event so any re-run's work is already in the transcript/log.
+        let _retries = a.maybe_auto_retry();
+        let ev = match res {
             Ok(()) => a.idle_event(),
             Err(e) => a.error_event(e),
         };
@@ -1404,6 +1457,8 @@ pub(crate) fn run_foreground_turn(
         // foreground session is never interrupted, and we within
         // Cerebras's strict per-minute token limits.
         titler::maybe_generate_title(a.log_path());
+        // Classify the last finished turn's outcome (throttled + light model).
+        titler::maybe_generate_verdict(a.log_path());
         *slot.lock().unwrap() = Some(a);
         // Wake the REPL's event-driven wait so it joins this handle immediately.
         let _ = done.try_send(());
@@ -1793,6 +1848,7 @@ fn handle_command(
             let resumed = agent.load_session(&log);
             agent.apply_persisted_su_security();
             agent.apply_persisted_thinking();
+        agent.apply_persisted_incremental_md();
             jobs.mark_joined(id);
             println!("{} foregrounded job #{} from {}", term::bold("·"), id, log.display());
             if resumed.turns > 0 {
@@ -1860,6 +1916,7 @@ fn handle_command(
             agent.apply_persisted_model();
             agent.apply_persisted_su_security();
             agent.apply_persisted_thinking();
+        agent.apply_persisted_incremental_md();
             if agent.goal_snapshot().is_some() {
                 agent.attach_goal(&path);
                 let out = agent.continue_goal();
@@ -1925,6 +1982,52 @@ fn handle_command(
         "create" => {
             let name: String = rest.join(" ");
             create_project(&name);
+        }
+        "quarantine" | "q" => {
+            // Review / apply / discard the writes the agent staged into the
+            // overlay upper. The agent runs ALL commands, but writes outside its
+            // whitelisted worktree are quarantined (visible only to the agent)
+            // until the operator applies them here. `status` (default) lists the
+            // staged writes; `apply` copies the non-critical ones to the real
+            // filesystem; `discard` throws them away and the agent keeps working.
+            let action = rest.first().copied().unwrap_or("status");
+            match action {
+                "status" | "ls" | "" => {
+                    let m = crate::security::overlay::project_active_manifest();
+                    println!("{}", m);
+                    let sm = crate::security::overlay::manifest_active();
+                    if !sm.starts_with("(write-quarantine not active)") {
+                        println!("{}", sm);
+                    } else if m.starts_with("(no staged") {
+                        println!("(no project write-quarantine active — set PIR_QUARANTINE and run inside a worktree)");
+                    }
+                }
+                "apply" => {
+                    // Flush BOTH staged layers: the agent's project writes (everything
+                    // outside its whitelisted worktree) and any system-tree writes it
+                    // made (/var, /etc, /usr/local, /opt, /srv, /boot). Each is
+                    // reviewed independently; the operator decides per layer.
+                    match crate::security::overlay::project_active_apply() {
+                        Ok(n) => println!("quarantine: applied {n} staged project write(s) to the real filesystem"),
+                        Err(e) => eprintln!("quarantine: project apply failed: {e}"),
+                    }
+                    match crate::security::overlay::apply_active() {
+                        Ok(n) => println!("quarantine: applied {n} staged system write(s) (e.g. /var) to the real filesystem"),
+                        Err(e) => eprintln!("quarantine: system apply failed: {e}"),
+                    }
+                }
+                "discard" | "deny" => {
+                    match crate::security::overlay::project_active_discard() {
+                        Ok(()) => println!("quarantine: discarded staged project writes (agent keeps working)"),
+                        Err(e) => eprintln!("quarantine: discard failed: {e}"),
+                    }
+                    match crate::security::overlay::discard_active() {
+                        Ok(()) => println!("quarantine: discarded staged system writes (e.g. /var) — agent keeps working"),
+                        Err(e) => eprintln!("quarantine: system discard failed: {e}"),
+                    }
+                }
+                other => eprintln!("usage: /quarantine [status|apply|discard]"),
+            }
         }
         "goal" => {
             let mut g = agent_slot.lock().unwrap();
@@ -2234,6 +2337,21 @@ fn list_sessions() -> String {
         if !s.title.is_empty() {
             out.push_str(&format!("        {}\n", term::green(&s.title)));
         }
+        // Print the turn-outcome verdict on its own line when the light model
+        // has classified the last finished turn: green for 'complete', yellow
+        // for 'waiting'/'retry', red for 'blocked'/'error'/'interrupted'. It
+        // tells the user at a glance whether a thread still needs them.
+        let v = titler::verdict_label(&s.verdict);
+        if !v.is_empty() {
+            let v_s = if v == "complete" {
+                term::green(v)
+            } else if v == "waiting for input" || v == "needs retry" {
+                term::yellow(v)
+            } else {
+                term::red(v)
+            };
+            out.push_str(&format!("        [{}]\n", v_s));
+        }
     }
     out.push_str(&term::dim(
         "resume with: pir -r <idx|time|preview>  (omit token => latest from this shell)\n",
@@ -2350,6 +2468,13 @@ struct Session {
     /// by the (cheap) "light" model (e.g. `cerebras/gemma4`). Empty until the
     /// light model has produced one (or when it isn't configured / is throttled).
     title: String,
+    /// Coarse outcome of the last finished turn, classified by the light model
+    /// into a short token (`complete` / `waiting` / `retry` / `blocked` /
+    /// `error`) — see [`titler::verdict_label`]. Empty until generated (or when
+    /// the model is unavailable / throttled). Shown in `/sessions` and the
+    /// resume picker so the user can tell at a glance whether a thread still
+    /// needs them.
+    verdict: String,
 }
 
 /// Build the candidate list for the interactive `pir -r` picker from a scanned
@@ -2368,6 +2493,7 @@ fn build_pick_items(sessions: &[Session], my_pid: u32) -> Vec<crate::picker::Pic
             path: s.path.clone(),
             preview_line: s.preview.clone(),
             title: String::new(),
+            verdict: titler::display_verdict(&s.path),
         })
         .collect()
 }
@@ -2425,7 +2551,10 @@ fn scan_sessions() -> Option<Vec<Session>> {
         // is throttled / hasn't run yet). The UI shows the title when present,
         // otherwise falls back to the first-prompt preview.
         let title = titler::display_title(&path);
-        out.push(Session { path, name, shell_pid, mtime, preview, title });
+        // Coarse outcome of the last finished turn, likewise classified in the
+        // background by the light model (empty until generated).
+        let verdict = titler::display_verdict(&path);
+        out.push(Session { path, name, shell_pid, mtime, preview, title, verdict });
     }
     Some(out)
 }
