@@ -864,8 +864,11 @@ pub struct StreamingRenderer {
     table_rows: Vec<Vec<String>>,
     /// When inside a ```md / ```markdown fence, buffer the lines here and
     /// re-render them as markdown on the closing fence (instead of as literal
-    /// code), so a markdown table shown as `md` source renders.
+    /// code), so a markdown table shown as `md` source renders. Also buffers
+    /// bare fences (empty language) to detect a `markdown`-on-next-line form.
     md_fence: Option<Vec<String>>,
+    /// Whether the current fence's language (on the fence line) is md/markdown.
+    md_fence_is_md: bool,
     out: String,
 }
 
@@ -881,6 +884,7 @@ impl StreamingRenderer {
             in_blockquote: false,
             table_rows: Vec::new(),
             md_fence: None,
+            md_fence_is_md: false,
             out: String::new(),
         }
     }
@@ -964,11 +968,18 @@ impl StreamingRenderer {
                 let lang = language.clone().unwrap_or_default();
                 // A ```md / ```markdown fence (very common from LLMs showing the
                 // markdown *source* of a reply) is meant to be displayed *as*
-                // markdown, not as literal code. We buffer its lines and re-render
-                // them as markdown on CodeBlockEnd (so a table inside renders).
-                let is_md_fence = lang == "md" || lang == "markdown";
-                self.md_fence = if is_md_fence { Some(Vec::new()) } else { None };
-                if !is_md_fence {
+                // markdown, not as literal code. Two forms:
+                //   1. ```markdown  (language on the fence line)
+                //   2. ```\nmarkdown (bare fence, language on the next line)
+                // Both are buffered; the md marker is dropped at the end and the
+                // rest is re-rendered as markdown. Non-md fences (rust, python,
+                // ...) render as literal code with their markers.
+                let is_md_lang = lang == "md" || lang == "markdown";
+                // For a bare fence (empty lang) we buffer anyway and decide on
+                // `md`-marker at CodeBlockEnd, so form #2 works too.
+                self.md_fence = Some(Vec::new());
+                self.md_fence_is_md = is_md_lang;
+                if !is_md_lang && !lang.is_empty() {
                     self.out.push_str(&format!("```{lang}\n"));
                 }
             }
@@ -981,12 +992,29 @@ impl StreamingRenderer {
                 }
             }
             ParseEvent::CodeBlockEnd => {
-                if let Some(buf) = self.md_fence.take() {
+                let Some(mut buf) = self.md_fence.take() else {
+                    self.out.push_str("```\n");
+                    return;
+                };
+                let is_md = self.md_fence_is_md
+                    || matches!(buf.first().map(|s| s.trim()), Some("md") | Some("markdown"));
+                // Drop a leading `md` / `markdown` marker line (form #2).
+                if !self.md_fence_is_md
+                    && matches!(buf.first().map(|s| s.trim()), Some("md") | Some("markdown"))
+                {
+                    buf.remove(0);
+                }
+                if is_md {
                     // Re-render the fenced markdown verbatim (as markdown).
                     for line in buf {
                         self.push_line(&line);
                     }
                 } else {
+                    self.out.push_str("```\n");
+                    for line in buf {
+                        self.out.push_str(&line);
+                        self.out.push('\n');
+                    }
                     self.out.push_str("```\n");
                 }
             }
@@ -1313,6 +1341,24 @@ mod streaming_tests {
         }
         r2.finalize();
         assert!(r2.output().contains("```rust"), "non-md fence should keep markers: {:?}", r2.output());
+    }
+
+    // A bare fence with the `markdown` marker on its own line (``` \nmarkdown)
+    // also renders as markdown, not literal code.
+    #[test]
+    fn streaming_renders_bare_fence_with_markdown_next_line() {
+        let md = "```\nmarkdown\n| Name | Role | Location |\n| :--- | :--- | :--- |\n| Alice | Developer | New York |\n```\n";
+        let mut r = StreamingRenderer::new(false);
+        for line in md.lines() {
+            r.push_line(line);
+        }
+        r.finalize();
+        let out = r.output();
+        assert!(out.contains("| Name  | Role      | Location |"), "table not rendered as aligned grid: {out:?}");
+        assert!(out.contains("Alice"), "got: {out:?}");
+        // The separate `markdown` marker line and fence backticks are dropped.
+        assert!(!out.contains("```"), "fence markers leaked: {out:?}");
+        assert!(!out.contains("\nmarkdown"), "marker line leaked: {out:?}");
     }
 
     // Perf: the streaming path (O(n)) must be dramatically faster than the
