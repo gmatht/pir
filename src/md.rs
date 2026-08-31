@@ -997,8 +997,9 @@ impl StreamingRenderer {
                     return;
                 };
                 let is_md = self.md_fence_is_md
-                    || matches!(buf.first().map(|s| s.trim()), Some("md") | Some("markdown"));
-                // Drop a leading `md` / `markdown` marker line (form #2).
+                    || matches!(buf.first().map(|s| s.trim()), Some("md") | Some("markdown"))
+                    || self.looks_like_table(&buf);
+                // Drop a leading `md` / `markdown` marker line (bare-fence form).
                 if !self.md_fence_is_md
                     && matches!(buf.first().map(|s| s.trim()), Some("md") | Some("markdown"))
                 {
@@ -1174,6 +1175,24 @@ impl StreamingRenderer {
             }
         }
         self.out.push('\n');
+    }
+
+    /// Heuristic: does this bare-fence buffer look like a markdown table? True
+    /// when a later line is a `| --- | --- |` separator row (dashes only between
+    /// pipes), which only appears in a table's header separator. This lets a
+    /// bare ``` ``` fence that contains a table (LLMs often omit the `md`
+    /// marker) render as markdown, while a bare fence with code keeps its
+    /// literal presentation.
+    fn looks_like_table(&self, buf: &[String]) -> bool {
+        buf.iter().any(|l| {
+            let t = l.trim();
+            t.starts_with('|')
+                && t.ends_with('|')
+                && t[1..t.len() - 1].split('|').all(|cell| {
+                    let cell = cell.trim();
+                    !cell.is_empty() && cell.chars().all(|c| c == '-' || c == ':' || c == ' ')
+                })
+        })
     }
 }
 
@@ -1359,6 +1378,32 @@ mod streaming_tests {
         // The separate `markdown` marker line and fence backticks are dropped.
         assert!(!out.contains("```"), "fence markers leaked: {out:?}");
         assert!(!out.contains("\nmarkdown"), "marker line leaked: {out:?}");
+    }
+
+    // A bare fence (no `md` marker at all) containing a table also renders as
+    // markdown — LLMs often omit the language marker. The table's `|---|`
+    // separator row is the heuristic that triggers it. A bare fence with code
+    // still renders as literal code.
+    #[test]
+    fn streaming_renders_bare_fenced_table_without_marker() {
+        let md = "```\n| Name | Role | Location |\n| :--- | :--- | :---: |\n| Alice | Developer | New York |\n| Bob | Designer | London |\n```\n";
+        let mut r = StreamingRenderer::new(false);
+        for line in md.lines() {
+            r.push_line(line);
+        }
+        r.finalize();
+        let out = r.output();
+        assert!(out.contains("| Name  | Role"), "bare-fenced table not rendered: {out:?}");
+        assert!(out.contains("Alice"), "got: {out:?}");
+        assert!(out.contains("Developer"), "got: {out:?}");
+        assert!(!out.contains("```"), "fence markers leaked: {out:?}");
+        // A bare fence with non-table code still renders literally with markers.
+        let mut r2 = StreamingRenderer::new(false);
+        for line in "```\nlet x = 1;\n```\n".lines() {
+            r2.push_line(line);
+        }
+        r2.finalize();
+        assert_eq!(r2.output(), "```\nlet x = 1;\n```\n", "bare code fence changed: {:?}", r2.output());
     }
 
     // Perf: the streaming path (O(n)) must be dramatically faster than the
