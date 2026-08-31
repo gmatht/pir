@@ -7,7 +7,7 @@ description = "A featherweight pi-compatible terminal coding agent"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-comrak = "0.54"                                  # CommonMark/GFM parser used to render agent markdown output
+comrak = { version = "0.54", default-features = false }   # CommonMark/GFM parser used to render agent markdown output (defaults off: no cli / syntax-highlight onig)
 ureq = { version = "2", default-features = false, features = ["json", "native-tls"] }   # native-tls = (dynamic; drops static ring/rustls); gzip default feature dropped (unused)
 native-tls = "0.2"                               # TLS provider for ureq (must be attached to the AgentBuilder explicitly)
 rustyline = "14"                               # line editing: history + cursor nav + completer
