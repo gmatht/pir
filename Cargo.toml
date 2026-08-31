@@ -49,3 +49,4 @@ pancurses = ["dep:rustxwidgets", "rustxwidgets/pancurses"]
 [profile.release]
 strip = true
 lto = true
+opt-level = "z"
