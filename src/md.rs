@@ -862,6 +862,10 @@ pub struct StreamingRenderer {
     /// columns (compute the widest cell per column) before emitting, like the
     /// pulldown backend's `flush_table`. Rows are buffered until `TableEnd`.
     table_rows: Vec<Vec<String>>,
+    /// When inside a ```md / ```markdown fence, buffer the lines here and
+    /// re-render them as markdown on the closing fence (instead of as literal
+    /// code), so a markdown table shown as `md` source renders.
+    md_fence: Option<Vec<String>>,
     out: String,
 }
 
@@ -876,6 +880,7 @@ impl StreamingRenderer {
             list_depth: 0,
             in_blockquote: false,
             table_rows: Vec::new(),
+            md_fence: None,
             out: String::new(),
         }
     }
@@ -956,15 +961,34 @@ impl StreamingRenderer {
                 }
             }
             ParseEvent::CodeBlockStart { language, .. } => {
-                let lang = language.unwrap_or_default();
-                self.out.push_str(&format!("```{lang}\n"));
+                let lang = language.clone().unwrap_or_default();
+                // A ```md / ```markdown fence (very common from LLMs showing the
+                // markdown *source* of a reply) is meant to be displayed *as*
+                // markdown, not as literal code. We buffer its lines and re-render
+                // them as markdown on CodeBlockEnd (so a table inside renders).
+                let is_md_fence = lang == "md" || lang == "markdown";
+                self.md_fence = if is_md_fence { Some(Vec::new()) } else { None };
+                if !is_md_fence {
+                    self.out.push_str(&format!("```{lang}\n"));
+                }
             }
             ParseEvent::CodeBlockLine(l) => {
-                self.out.push_str(&l);
-                self.out.push('\n');
+                if let Some(buf) = self.md_fence.as_mut() {
+                    buf.push(l);
+                } else {
+                    self.out.push_str(&l);
+                    self.out.push('\n');
+                }
             }
             ParseEvent::CodeBlockEnd => {
-                self.out.push_str("```\n");
+                if let Some(buf) = self.md_fence.take() {
+                    // Re-render the fenced markdown verbatim (as markdown).
+                    for line in buf {
+                        self.push_line(&line);
+                    }
+                } else {
+                    self.out.push_str("```\n");
+                }
             }
             ParseEvent::ListItem { indent, bullet, content } => {
                 let marker = match bullet {
@@ -1263,6 +1287,32 @@ mod streaming_tests {
         assert!(out.contains("| Data 6        |"), "last cell not padded: {out:?}");
         // A header underline is present (the separator row becomes `|---|`).
         assert!(out.contains("|---"), "missing underline: {out:?}");
+    }
+
+    // A markdown table in a ```md / ```markdown fence renders as markdown
+    // (aligned grid), not as literal code lines.
+    #[test]
+    fn streaming_renders_md_fenced_table() {
+        let md = "```markdown\n| Name | Role | Location |\n| :--- | :--- | :--- |\n| Alice | Developer | New York |\n| Bob | Designer | London |\n```\n";
+        let mut r = StreamingRenderer::new(false);
+        for line in md.lines() {
+            r.push_line(line);
+        }
+        r.finalize();
+        let out = r.output();
+        assert!(out.contains("| Name  | Role      | Location |"), "table not rendered as aligned grid: {out:?}");
+        assert!(out.contains("Alice"), "got: {out:?}");
+        assert!(out.contains("Designer"), "got: {out:?}");
+        // The ` markdown` fence markers themselves are NOT shown (we re-render
+        // the content as markdown, not as a literal code block).
+        assert!(!out.contains("```markdown"), "fence markers leaked: {out:?}");
+        // A non-md fence still renders as literal code with its markers.
+        let mut r2 = StreamingRenderer::new(false);
+        for line in "```rust\nlet x = 1;\n```\n".lines() {
+            r2.push_line(line);
+        }
+        r2.finalize();
+        assert!(r2.output().contains("```rust"), "non-md fence should keep markers: {:?}", r2.output());
     }
 
     // Perf: the streaming path (O(n)) must be dramatically faster than the
