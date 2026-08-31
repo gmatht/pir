@@ -2215,6 +2215,7 @@ fn open_log(resume_from: Option<&PathBuf>) -> (Option<fs::File>, Option<PathBuf>
 /// `~/.pi/agent/sessions`.
 fn session_dir() -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+#[cfg(unix)]
     if let Some(d) = crate::user::session_dir_for(&cwd) {
         return d;
     }

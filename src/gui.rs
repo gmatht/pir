@@ -15,12 +15,22 @@ use crate::term;
 use rustxwidgets::prelude::*;
 use std::os::raw::c_void;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::rc::Rc;
+use std::cell::{RefCell, Cell};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::run_foreground_turn;
 
 type AgentSlot = Arc<Mutex<Option<Agent>>>;
+
+/// The concrete `Entry` type returned by `App::create_entry` — the backend
+/// adapter `Entry` (nwg on Windows, gtk on Linux). `rustxwidgets::Entry` (the
+/// prelude alias) is a thin wrapper, so we name the real type explicitly here.
+#[cfg(windows)]
+type GuiEntry = rustxwidgets::backends_nwg_adapter::Entry;
+#[cfg(all(feature = "gtk", target_os = "linux"))]
+type GuiEntry = rustxwidgets::backends_gtk_adapter::Entry;
 
 /// GDK keyval for the Tab key (GDK_KEY_Tab).
 const GDK_KEY_TAB: u32 = 0xff09;
@@ -140,13 +150,9 @@ fn line_markup(line: &ConvLine) -> String {
     )
 }
 
-/// Shared per-UI state for a single tab, guarded by a Mutex so both the
-/// Entry-activate callback (main thread) and the periodic drain callback (also
-/// main thread via glib) can see it. Since glib callbacks run on the main loop,
-/// contention is trivial. Each tab owns its own `GuiState`, including the
-/// per-tab render bookkeeping (`rendered_lines` / `needs_rebuild`) that used to
-/// live in process-wide statics — so switching tabs never desyncs the shared
-/// TextView's buffer.
+/// Shared per-UI state, guarded by a Mutex so both the Entry-activate callback
+/// (main thread) and the periodic drain callback (also main thread via glib)
+/// can see it. Since glib callbacks run on the main loop, contention is trivial.
 struct GuiState {
     /// Conversation lines (the transcript so far), each with a colour kind.
     conv: Vec<ConvLine>,
@@ -165,18 +171,6 @@ struct GuiState {
     /// submitted prompt, so Arrow-Up recalls previous prompts like the
     /// terminal REPLs.
     history: Vec<String>,
-    /// How many conversation lines have already been rendered into the GTK text
-    /// buffer. `sync_textview` is append-only: it appends everything past this
-    /// index, so each line gets its per-kind colour via Pango markup instead of
-    /// one flat `set_text`. Per-tab (was a process-wide static).
-    rendered_lines: usize,
-    /// Set when the text buffer must be rebuilt from scratch (after /clear or a
-    /// scrollback trim dropped lines from the front of the model). Per-tab.
-    needs_rebuild: bool,
-    /// Whether this tab has unread activity (a new message or notification)
-    /// while it is not the active tab. Drives the tab's highlighted state and
-    /// the global "next alert" button.
-    unread: bool,
 }
 
 impl GuiState {
@@ -189,9 +183,6 @@ impl GuiState {
             status: "idle".into(),
             show_thinking: true,
             history: Vec::new(),
-            rendered_lines: 0,
-            needs_rebuild: false,
-            unread: false,
         }
     }
 
@@ -199,7 +190,7 @@ impl GuiState {
     /// scrollback so memory stays bounded. The cap only takes effect on a
     /// `/clear`-style rebuild (see `clear`), because the GTK text buffer is
     /// append-only between syncs — trimming mid-stream would desync
-    /// `rendered_lines`. 4000 lines is a few hundred KB at most.
+    /// `RENDERED_LINES`. 4000 lines is a few hundred KB at most.
     fn push(&mut self, kind: ConvKind, text: &str) {
         for para in text.split('\n') {
             self.conv.push(ConvLine { kind, text: para.to_string() });
@@ -207,19 +198,29 @@ impl GuiState {
         if self.conv.len() > 4000 {
             let drop = self.conv.len() - 4000;
             self.conv.drain(0..drop);
-            self.rendered_lines = self.rendered_lines.saturating_sub(drop);
+            RENDERED_LINES.fetch_sub(drop, std::sync::atomic::Ordering::SeqCst);
             // The buffer now holds fewer lines than were rendered: force a
             // rebuild on the next sync so the pane matches the model.
-            self.needs_rebuild = true;
+            NEEDS_REBUILD.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
     /// Clear the conversation (e.g. /clear).
     fn clear(&mut self) {
         self.conv.clear();
-        self.needs_rebuild = true;
+        NEEDS_REBUILD.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
+
+/// How many conversation lines have already been rendered into the GTK text
+/// buffer. `sync_textview` is append-only: it appends everything past this
+/// index, so each line gets its per-kind colour via Pango markup instead of
+/// one flat `set_text`.
+static RENDERED_LINES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Set when the text buffer must be rebuilt from scratch (after /clear or a
+/// scrollback trim dropped lines from the front of the model).
+static NEEDS_REBUILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Arrow-Up/Down navigation state for the prompt Entry, shared between the key
 /// controller and the activate handler. `pos` indexes `history` (== len means
@@ -283,291 +284,27 @@ struct GuiWidgets {
     status: Label,
 }
 
-/// One browser-style tab. Each tab owns its own conversation state, its own
-/// agent slot (so a turn in one tab never disturbs another), and its own
-/// cooperative-cancel / go-silent switches. The shared `TextView`/`Label` are
-/// swapped (re-rendered) whenever the active tab changes.
-struct GuiTab {
-    /// Stable tab id (shown in the tab strip label).
-    id: usize,
-    /// Per-tab conversation + render bookkeeping.
+/// Everything that is per-session when the GUI shows one tab per session:
+/// its own conversation model, widgets, agent slot, turn canceller, prompt
+/// history and completion channel. One `SessionView` lives in the `tabs`
+/// `TabView` at the same index.
+#[derive(Clone)]
+struct SessionView {
     state: Arc<Mutex<GuiState>>,
-    /// The agent for this tab. A running turn *takes* the agent out of here
-    /// onto a worker thread, then returns it — exactly like the single-tab
-    /// REPL, but scoped per tab so turns run concurrently across tabs.
-    agent_slot: AgentSlot,
-    /// Cooperative cancel flag for this tab's turn.
-    fg_cancel: Arc<AtomicBool>,
-    /// "Go silent" switch for this tab's turn (used to background it).
-    fg_quiet: Arc<AtomicBool>,
-    /// Wake channel handed to the worker (mirrors the REPL's `done` oneshot).
-    done_tx: smol::channel::Sender<()>,
-}
-
-/// The whole multi-tab GUI model, shared (behind one `Arc<Mutex>`) across the
-/// main-thread callbacks (the Entry activate handler, the key controller, the
-/// periodic drain, and every tab-strip button). All mutation goes through this
-/// one lock, which is only ever held briefly on the GTK main loop — there is no
-/// cross-thread contention with the worker threads (they only touch their own
-/// `agent_slot`).
-struct TabModel {
-    tabs: Vec<GuiTab>,
-    active: usize,
-    next_id: usize,
-    app: App,
-    /// Shared conversation pane + status line (swapped between tabs).
     widgets: GuiWidgets,
-    /// The horizontal tab-strip box at the top of the window.
-    tab_bar: BoxWidget,
-    /// The prompt Entry (shared; always routes to the active tab).
-    entry: Entry,
-    providers: Vec<Provider>,
-    bus: SharedBus,
-}
-
-/// GDK keyval for the letter t (used with Ctrl for new-tab).
-const GDK_KEY_T: u32 = 0x74;
-/// GDK keyvals for Shift (GDK_KEY_Shift_L / _R), tracked so Ctrl-Shift-Tab
-/// goes to the previous tab while Ctrl-Tab goes to the next.
-const GDK_KEY_SHIFT_L: u32 = 0xffe1;
-const GDK_KEY_SHIFT_R: u32 = 0xffe2;
-
-/// Rebuild the tab-strip: clear the bar box and re-add one label+close button
-/// pair per tab, plus the `[+]` (new tab) and `»` (next alert) buttons. Every
-/// button closure captures a clone of the `Arc<Mutex<TabModel>>` so a click can
-/// mutate the model and rebuild the strip again.
-fn rebuild_tab_bar(model: &Arc<Mutex<TabModel>>) {
-    let mut m = model.lock().unwrap();
-    // Clear existing children of the bar box.
-    if let Some(loader) = rustxwidgets::backends::gtk::loader() {
-        unsafe {
-            if let (Some(get_first), Some(get_next)) = (
-                loader.symbols.gtk_widget_get_first_child,
-                loader.symbols.gtk_widget_get_next_sibling,
-            ) {
-                let mut child = get_first(*m.tab_bar.as_ref());
-                while !child.is_null() {
-                    let next = get_next(child);
-                    rustxwidgets::gtk_dynamic_loader::remove_from_parent(&loader, child);
-                    child = next;
-                }
-            }
-        }
-    }
-    let n = m.tabs.len();
-    for i in 0..n {
-        let label = {
-            let s = m.tabs[i].state.lock().unwrap();
-            let marker = if i == m.active { "▸ " } else if s.unread { "• " } else { "  " };
-            let agent_label = match m.tabs[i].agent_slot.lock().unwrap().as_ref() {
-                Some(a) => a.label(),
-                None => "…".to_string(),
-            };
-            format!("{}{} {}", marker, m.tabs[i].id, agent_label)
-        };
-        let btn = match m.app.create_button(&label) {
-            Ok(b) => b,
-            Err(_) => break,
-        };
-        btn.set_hexpand(false);
-        let model2 = model.clone();
-        let _ = btn.on_click(move || {
-            tab_select(&model2, i);
-        });
-        let close = match m.app.create_button("×") {
-            Ok(b) => b,
-            Err(_) => break,
-        };
-        close.set_hexpand(false);
-        let model3 = model.clone();
-        let _ = close.on_click(move || {
-            tab_close(&model3, i);
-        });
-        m.tab_bar.append(&btn);
-        m.tab_bar.append(&close);
-    }
-    // [+] add-tab button.
-    if let Ok(add) = m.app.create_button("[+]") {
-        add.set_hexpand(false);
-        let model4 = model.clone();
-        let _ = add.on_click(move || {
-            tab_new(&model4);
-        });
-        m.tab_bar.append(&add);
-    }
-    // » jump-to-next-alert (notification) button.
-    if let Ok(alert) = m.app.create_button("»") {
-        alert.set_hexpand(false);
-        let model5 = model.clone();
-        let _ = alert.on_click(move || {
-            tab_next_unread(&model5);
-        });
-        m.tab_bar.append(&alert);
-    }
-}
-
-/// Select tab `idx` (clamped), mark it read, and repaint the shared pane.
-fn tab_select(model: &Arc<Mutex<TabModel>>, idx: usize) {
-    let mut active = idx;
-    {
-        let mut m = model.lock().unwrap();
-        if idx >= m.tabs.len() {
-            return;
-        }
-        m.active = idx;
-        let mut st = m.tabs[idx].state.lock().unwrap();
-        st.unread = false;
-        st.needs_rebuild = true;
-        sync_textview(&m.widgets, &mut *st);
-    }
-    rebuild_tab_bar(model);
-    let _ = active;
-}
-
-/// Cycle the active tab by `dir` (+1 next, -1 previous) with wrap-around,
-/// repainting the chosen tab.
-fn tab_cycle(model: &Arc<Mutex<TabModel>>, dir: i32) {
-    let mut m = model.lock().unwrap();
-    let n = m.tabs.len();
-    if n == 0 {
-        return;
-    }
-    m.active = ((m.active as i32 + dir).rem_euclid(n as i32)) as usize;
-    let idx = m.active;
-    let mut st = m.tabs[idx].state.lock().unwrap();
-    st.unread = false;
-    st.needs_rebuild = true;
-    sync_textview(&m.widgets, &mut *st);
-    drop(st);
-    drop(m);
-    rebuild_tab_bar(model);
-}
-
-/// Jump to the next tab (after the active one, wrapping) that has an unread
-/// flag; if none, just cycle to the next tab. Used by the `»` button.
-fn tab_next_unread(model: &Arc<Mutex<TabModel>>) {
-    let (start, n) = {
-        let m = model.lock().unwrap();
-        (m.active, m.tabs.len())
-    };
-    for off in 1..=n {
-        let i = (start + off) % n;
-        let unread = { model.lock().unwrap().tabs[i].state.lock().unwrap().unread };
-        if unread {
-            tab_select(model, i);
-            return;
-        }
-    }
-    tab_cycle(model, 1);
-}
-
-/// Close tab `idx`, keeping at least one tab open. The closed tab's turn is
-/// cancelled first a running worker stops; its agent slot is then dropped.
-fn tab_close(model: &Arc<Mutex<TabModel>>, idx: usize) {
-    let new_active = {
-        let mut m = model.lock().unwrap();
-        if m.tabs.len() <= 1 {
-            return; // never close the last tab
-        }
-        if idx >= m.tabs.len() {
-            return;
-        }
-        // Cancel any running turn before dropping the slot.
-        m.tabs[idx].fg_cancel.store(true, Ordering::SeqCst);
-        m.tabs.remove(idx);
-        if idx <= m.active && m.active > 0 {
-            m.active -= 1;
-        } else if m.active >= m.tabs.len() {
-            m.active = m.tabs.len() - 1;
-        }
-        m.active
-    };
-    rebuild_tab_bar(model);
-    let mut m = model.lock().unwrap();
-    let mut st = m.tabs[new_active].state.lock().unwrap();
-    st.needs_rebuild = true;
-    sync_textview(&m.widgets, &mut *st);
-}
-
-/// Open a new tab: build a fresh *quiet* agent for the active tab's current
-/// provider/model, give it its own slot + cancel/quiet switches, and make it
-/// the active tab. Seeded with the session prompt history so Arrow-Up works.
-fn tab_new(model: &Arc<Mutex<TabModel>>) {
-    // Gather the configuration we need to build the new agent (without holding
-    // the model lock across the (potentially slow) Agent::new).
-    let (providers, bus, app, full_auto) = {
-        let m = model.lock().unwrap();
-        (m.providers.clone(), m.bus.clone(), m.app.clone(), false)
-    };
-    let (provider, model_obj) = {
-        let m = model.lock().unwrap();
-        match m.tabs[m.active].agent_slot.lock().unwrap().as_ref() {
-            Some(a) => (a.provider(), a.model()),
-            None => (providers[0].clone(), providers[0].models[0].clone()),
-        }
-    };
-    let agent = match Agent::new(
-        provider,
-        model_obj,
-        full_auto,
-        true, // quiet: the GUI renders from the session log, not stdout
-        bus.clone(),
-        None,
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(Mutex::new(String::new())),
-    ) {
-        Ok(a) => a,
-        Err(e) => {
-            // Couldn't build an agent for the new tab; surface it on the
-            // active tab and bail out rather than leaving a broken empty tab.
-            let mut m = model.lock().unwrap();
-            m.tabs[m.active].state.lock().unwrap().push(
-                ConvKind::Error,
-                &format!("could not open new tab: {e}"),
-            );
-            return;
-        }
-    };
-    let slot: AgentSlot = Arc::new(Mutex::new(Some(agent)));
-    let fg_cancel = Arc::new(AtomicBool::new(false));
-    let fg_quiet = Arc::new(AtomicBool::new(false));
-    let (done_tx, id) = {
-        let m = model.lock().unwrap();
-        (m.tabs[0].done_tx.clone(), m.next_id)
-    };
-    let _ = id;
-    let state = Arc::new(Mutex::new(GuiState::new()));
-    {
-        let mut s = state.lock().unwrap();
-        s.history = term::load_history_lines();
-        s.push(ConvKind::System, &format!("pir · new tab · GTK GUI  (Ctrl-T new · Ctrl-Tab next · » next alert)"));
-    }
-    let mut m = model.lock().unwrap();
-    let id = m.next_id;
-    m.next_id += 1;
-    let idx = m.tabs.len();
-    m.tabs.push(GuiTab {
-        id,
-        state,
-        agent_slot: slot,
-        fg_cancel,
-        fg_quiet,
-        done_tx,
-    });
-    m.active = idx;
-    drop(m);
-    rebuild_tab_bar(model);
-    let mut m = model.lock().unwrap();
-    let mut st = m.tabs[m.active].state.lock().unwrap();
-    st.needs_rebuild = true;
-    sync_textview(&m.widgets, &mut *st);
+    entry: GuiEntry,
+    agent_slot: AgentSlot,
+    fg_cancel: Arc<AtomicBool>,
+    fg_quiet: Arc<AtomicBool>,
+    hist_nav: Arc<Mutex<HistoryNav>>,
+    done_tx: smol::channel::Sender<()>,
+    app: App,
 }
 
 /// Run the GTK GUI REPL. Returns `Ok(())` on a clean exit (`/exit` or window
 /// close) or an error if the backend couldn't be initialised. Mirrors the TUI:
 /// the agent is switched to `quiet` mode and turns run on worker threads; the
-/// conversation is rendered by draining the agent's session log. Supports
-/// multiple sessions via a browser-style tab strip (see [`TabModel`]).
+/// conversation is rendered by draining the agent's session log.
 pub fn run(
     agent_slot: &AgentSlot,
     fg_cancel: &Arc<AtomicBool>,
@@ -578,132 +315,220 @@ pub fn run(
 ) -> Result<(), String> {
     let app = App::init().map_err(|e| format!("rustxwidgets init: {e}"))?;
 
-    // -- Build the widget tree --
+    // -- Build the window + horizontal-tab container --
     let window = app.create_window().map_err(|e| format!("create_window: {e}"))?;
     window.set_title("pir");
     window.set_default_size(820, 600);
 
-    // Vertical box: [conversation TextView (expand)] [Entry] [status]
-    let vbox = app
-        .create_box(Orientation::Vertical, 4)
-        .map_err(|e| format!("create_box: {e}"))?;
+    let tabs = app.create_tabview().map_err(|e| format!("tabview: {e}"))?;
+    window.set_child(&tabs);
 
-    let textview = app.create_textview().map_err(|e| format!("create_textview: {e}"))?;
-    configure_conversation_textview(&textview);
-    vbox.append(&textview);
+    // One SessionView per open tab, indexed identically to the TabView.
+    let sessions: Rc<RefCell<Vec<SessionView>>> = Rc::new(RefCell::new(Vec::new()));
+    let active: Rc<Cell<usize>> = Rc::new(Cell::new(0));
 
-    let entry = app.create_entry().map_err(|e| format!("create_entry: {e}"))?;
-    entry.set_hexpand(true);
-    vbox.append(&entry);
-
-    let status = app.create_label("pir · idle").map_err(|e| format!("create_label: {e}"))?;
-    status.set_xalign(0.0); // left-align
-    vbox.append(&status);
-
-    window.set_child(&vbox);
-    window.present();
-
-    // Keep keyboard focus on the Entry (the REPL prompt). Grab it right after
-    // the window is shown, and re-grab it every time it loses focus (e.g. the
-    // user clicks the scrollable TextView, or the periodic drain refreshes).
-    // `connect_focus_out_event` fires when focus leaves; we immediately
-    // `grab_focus` back so typing always lands in the Entry.
-    let entry_focus = entry.clone();
-    let _ = entry.connect_focus_out_event(move |_e: *mut c_void| {
-        entry_focus.grab_focus();
-        1 // stop propagation; keep focus here
-    });
-
-    // Tab completion + history navigation: an EventControllerKey on the Entry
-    // intercepts Tab (completes the buffer via `complete_idle`) and
-    // Arrow-Up/Down (walks the prompt history), returning 1 (handled) so focus
-    // never leaves the prompt. The controller is kept alive in
-    // `_key_controllers` for the whole `app.run()` so its Drop (which unrefs
-    // and removes it from the widget) never fires early.
-
-    // -- Shared state (created before the callbacks that capture it) --
-    let state = Arc::new(Mutex::new(GuiState::new()));
-    let widgets = GuiWidgets { textview: textview.clone(), status: status.clone() };
-    // Seed Arrow-Up history from the session's `.history` file (populated by
-    // main.rs at startup / on resume — the same store the streaming REPL uses).
+    // Switching tabs just moves keyboard focus to that tab's prompt.
     {
-        let mut s = state.lock().unwrap();
-        s.history = term::load_history_lines();
-        s.push(ConvKind::System, &format!(
-            "pir · {} · GTK GUI  (/help for commands · Enter to send · ctrl-q to quit)",
-            providers[0].pid()
-        ));
-        sync_textview(&widgets, &s);
+        let sessions_for_cb = sessions.clone();
+        let active_for_cb = active.clone();
+        tabs.set_on_tab_changed(Box::new(move |idx: usize| {
+            active_for_cb.set(idx);
+            let s = sessions_for_cb.borrow();
+            if let Some(sv) = s.get(idx) {
+                sv.entry.grab_focus();
+            }
+        }));
     }
 
-    // Arrow-Up/Down navigation state for the prompt Entry.
-    let hist_nav = Arc::new(Mutex::new(HistoryNav::default()));
-
-    let mut _key_controllers: Vec<Box<rustxwidgets::gtk_dynamic_loader::EventControllerKey>> = Vec::new();
-    let entry_comp = entry.clone();
-    let entry_comp_cb = entry.clone();
-    let nav_for_keys = hist_nav.clone();
-    let hist_for_keys = state.clone();
+    // Open the initial session using the agent the caller handed us.
     {
+        let (done_tx, _done_rx) = smol::channel::bounded::<()>(1);
+        spawn_session(
+            "session",
+            agent_slot.clone(),
+            fg_cancel.clone(),
+            fg_quiet.clone(),
+            done_tx,
+            &app,
+            &tabs,
+            providers,
+            bus,
+            _full_auto,
+            &sessions,
+        );
+    }
+
+    window.present();
+
+    // -- Periodic drain: refresh every session's conversation from its log --
+    // A recurring timeout (~150ms) that drains each agent's log into its own
+    // conversation pane. Snapshot the views first so we don't hold the sessions
+    // lock across the (potentially slow) drain of every session.
+    let drain_sessions = sessions.clone();
+    let drain_bus = bus.clone();
+    #[cfg(all(feature = "gtk", target_os = "linux"))]
+    unsafe {
         if let Some(loader) = rustxwidgets::backends::gtk::loader() {
-            if let Ok(ctrl) = rustxwidgets::gtk_dynamic_loader::EventControllerKey::new(loader.clone()) {
-                // Ctrl tracking: on GTK4 the controller reports the Ctrl key
-                // itself as its own key event (GDK_KEY_Control_L/R) and the
-                // following `q` arrives as a separate event *without*
-                // modifier info (the connect_key_pressed trampoline only
-                // forwards the keyval), so we remember that Ctrl is held and
-                // treat the next `q` as Ctrl-Q (quit, as the banner
-                // promises). Any other key clears the flag.
-                let ctrl_held = Arc::new(AtomicBool::new(false));
-                let ctrl_held_cb = ctrl_held.clone();
-                let _ = ctrl.connect_key_pressed(move |keyval: u32| -> i32 {
-                    use std::sync::atomic::Ordering as AtomicOrdering;
-                    // Lock order is always nav -> state, and both are only
-                    // ever held briefly inside this callback.
-                    match keyval {
-                        GDK_KEY_CTRL_L | GDK_KEY_CTRL_R => {
-                            ctrl_held_cb.store(true, AtomicOrdering::SeqCst);
-                            1 // swallow the bare modifier press
-                        }
-                        GDK_KEY_Q if ctrl_held_cb.load(AtomicOrdering::SeqCst) => {
-                            ctrl_held_cb.store(false, AtomicOrdering::SeqCst);
-                            let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-                            1 // handled: quit
-                        }
-                        GDK_KEY_TAB => {
-                            ctrl_held_cb.store(false, AtomicOrdering::SeqCst);
-                            let cur = entry_comp_cb.get_text().unwrap_or_default();
-                            if let Some(completed) = complete_idle(&cur) {
-                                entry_comp_cb.set_text(&completed);
-                                entry_comp_cb.set_position(-1); // cursor to end
-                            }
-                            1 // handled: keep focus, don't let Tab traverse
-                        }
-                        GDK_KEY_UP | GDK_KEY_DOWN => {
-                            ctrl_held_cb.store(false, AtomicOrdering::SeqCst);
-                            let dir = if keyval == GDK_KEY_UP { -1 } else { 1 };
-                            let cur = entry_comp_cb.get_text().unwrap_or_default();
-                            let mut nav = nav_for_keys.lock().unwrap();
-                            let history = hist_for_keys.lock().unwrap().history.clone();
-                            if let Some(new_text) = nav.navigate(dir, &cur, &history) {
-                                entry_comp_cb.set_text(&new_text);
-                                entry_comp_cb.set_position(-1);
-                            }
-                            1 // always swallow Up/Down so focus stays in the prompt
-                        }
-                        _ => {
-                            ctrl_held_cb.store(false, AtomicOrdering::SeqCst);
-                            0 // propagate other keys (incl. plain q)
-                        }
-                    }
-                });
-                ctrl.add_to_widget(&entry_comp);
-                _key_controllers.push(Box::new(ctrl));
-            }
+            rustxwidgets::gtk_dynamic_loader::timeout_add_recurring(&loader, 150, Box::new(move || {
+                for sv in &*drain_sessions.borrow() {
+                    drain_once(
+                        &sv.state,
+                        &sv.widgets,
+                        &sv.agent_slot,
+                        &sv.fg_cancel,
+                        &sv.fg_quiet,
+                        &sv.done_tx,
+                        &drain_bus,
+                    );
+                }
+            }));
         }
     }
 
-    let (done_tx, _done_rx) = smol::channel::bounded::<()>(1);
+    // Window close (destroy signal) -> quit the GTK main loop.
+    #[cfg(all(feature = "gtk", target_os = "linux"))]
+    unsafe {
+        if let Some(loader) = rustxwidgets::backends::gtk::loader() {
+            let app_for_destroy = app.clone();
+            let _ = rustxwidgets::gtk_dynamic_loader::connect_signal(
+                &loader.symbols,
+                window.raw_handle(),
+                "destroy",
+                Box::new(move || {
+                    app_for_destroy.quit();
+                }),
+                2,
+            );
+        }
+    }
+
+    // Pure-NWG (Windows) periodic drain + window-close handling. The GTK loader
+    // paths above are linux-only, so on Windows nothing GTK is compiled.
+    #[cfg(windows)]
+    {
+        let drain_sessions = drain_sessions.clone();
+        let drain_bus = drain_bus.clone();
+        window.timeout_add_recurring(150, Box::new(move || {
+            for sv in &*drain_sessions.borrow() {
+                drain_once(
+                    &sv.state,
+                    &sv.widgets,
+                    &sv.agent_slot,
+                    &sv.fg_cancel,
+                    &sv.fg_quiet,
+                    &sv.done_tx,
+                    &drain_bus,
+                );
+            }
+        }));
+        window.on_close(Box::new(|| {
+            rustxwidgets::backends_nwg_adapter::quit_main_loop();
+        }));
+    }
+
+    app.run().map_err(|e| format!("gtk main loop: {e}"))
+}
+
+/// Build one session tab: its own conversation pane + prompt + status line,
+/// wired to its own agent slot / canceller / history. Pushes the resulting
+/// `SessionView` into `sessions` at the same index the `TabView` created.
+fn spawn_session(
+    title: &str,
+    agent_slot: AgentSlot,
+    fg_cancel: Arc<AtomicBool>,
+    fg_quiet: Arc<AtomicBool>,
+    done_tx: smol::channel::Sender<()>,
+    app: &App,
+    tabs: &TabView,
+    providers: &[Provider],
+    bus: &SharedBus,
+    _full_auto: bool,
+    sessions: &Rc<RefCell<Vec<SessionView>>>,
+) -> usize {
+    let idx = tabs.add_tab(title).expect("tabview: add_tab");
+
+    // Vertical box: [conversation TextView (expand)] [Entry] [status]
+    let vbox = app
+        .create_box(Orientation::Vertical, 4)
+        .expect("create_box");
+    let textview = app.create_textview().expect("create_textview");
+    configure_conversation_textview(&textview);
+    vbox.append(&textview);
+
+    let entry: GuiEntry = app.create_entry().expect("create_entry");
+    entry.set_hexpand(true);
+    vbox.append(&entry);
+
+    let status = app.create_label("pir · idle").expect("create_label");
+    #[cfg(all(feature = "gtk", target_os = "linux"))]
+    status.set_xalign(0.0); // left-align
+    vbox.append(&status);
+
+    let panel = tabs.tab_box(idx).expect("tabview: tab_box");
+    panel.append(&vbox);
+    vbox.set_hexpand(true);
+    vbox.set_vexpand(true);
+
+    let state = Arc::new(Mutex::new(GuiState::new()));
+    let widgets = GuiWidgets { textview: textview.clone(), status: status.clone() };
+    // Seed Arrow-Up history from the session's `.history` file (same store the
+    // streaming REPL uses) and greet the user.
+    {
+        let mut s = state.lock().unwrap();
+        s.history = term::load_history_lines();
+        s.push(
+            ConvKind::System,
+            &format!(
+                "pir · {} · GTK GUI  (/help · /sessions new|close|next|prev|<n> · Enter to send · ctrl-q to quit)",
+                providers[0].pid()
+            ),
+        );
+        sync_textview(&widgets, &s);
+    }
+
+    let hist_nav = Arc::new(Mutex::new(HistoryNav::default()));
+    let app_quit = app.clone();
+
+    // Keep keyboard focus on this tab's Entry (the REPL prompt).
+    let entry_focus = entry.clone();
+    let _ = entry.connect_focus_out_event(move |_e: *mut c_void| {
+        entry_focus.grab_focus();
+        1
+    });
+
+    // Tab completion + history navigation on this tab's prompt.
+    let entry_comp_cb = entry.clone();
+    let nav_for_keys = hist_nav.clone();
+    let hist_for_keys = state.clone();
+    let app_for_keys = app.clone();
+    let _ = entry.on_key_raw(Box::new(move |keyval: u32, kstate: u32| -> bool {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+        const CONTROL_MASK: u32 = 1 << 2;
+        match keyval {
+            GDK_KEY_Q if (kstate & CONTROL_MASK) != 0 => {
+                let _ = app_for_keys.clone().quit();
+                true
+            }
+            GDK_KEY_TAB => {
+                let cur = entry_comp_cb.get_text().unwrap_or_default();
+                if let Some(completed) = complete_idle(&cur) {
+                    entry_comp_cb.set_text(&completed);
+                }
+                true
+            }
+            GDK_KEY_UP | GDK_KEY_DOWN => {
+                let dir = if keyval == GDK_KEY_UP { -1 } else { 1 };
+                let cur = entry_comp_cb.get_text().unwrap_or_default();
+                let mut nav = nav_for_keys.lock().unwrap();
+                let history = hist_for_keys.lock().unwrap().history.clone();
+                if let Some(new_text) = nav.navigate(dir, &cur, &history) {
+                    entry_comp_cb.set_text(&new_text);
+                }
+                true
+            }
+            _ => false,
+        }
+    }));
 
     // -- Entry activate: start a foreground turn (or queue if one is running) --
     let entry_cb_state = state.clone();
@@ -716,6 +541,9 @@ pub fn run(
     let entry_cb_done = done_tx.clone();
     let entry_in_cb = entry.clone();
     let nav_for_activate = hist_nav.clone();
+    let app_for_activate = app.clone();
+    let sessions_for_activate = sessions.clone();
+    let tabs_for_activate = tabs.clone();
     let _ = entry.connect_activate(move |_data: *mut c_void| {
         let text = entry_in_cb.get_text().unwrap_or_default();
         entry_in_cb.set_text("");
@@ -732,6 +560,25 @@ pub fn run(
         nav_for_activate.lock().unwrap().reset();
 
         if let Some(cmd) = text.strip_prefix('/') {
+            // Session management is handled here (it must mutate tabs/sessions).
+            let mut parts = cmd.split_whitespace();
+            let sub = parts.next().unwrap_or("");
+            let rest: Vec<&str> = parts.collect();
+            if sub == "sessions" {
+                handle_session_command(
+                    &rest,
+                    &entry_cb_state,
+                    &entry_cb_widgets,
+                    &sessions_for_activate,
+                    &tabs_for_activate,
+                    &app_for_activate,
+                    &entry_cb_providers,
+                    &entry_cb_bus,
+                    _full_auto,
+                    &entry_cb_slot,
+                );
+                return;
+            }
             handle_command(
                 cmd,
                 &entry_cb_slot,
@@ -739,6 +586,7 @@ pub fn run(
                 &entry_cb_bus,
                 &entry_cb_cancel,
                 &entry_cb_state,
+                &app_for_activate,
                 &entry_cb_widgets,
             );
             return;
@@ -770,50 +618,145 @@ pub fn run(
         );
     });
 
-    // -- Periodic drain: refresh the conversation + status from the session log --
-    // A recurring glib timeout (~150ms) that drains the agent's log into the
-    // conversation pane, giving streaming output a live feel even though the
-    // agent writes only to its log. The timer keeps firing for the lifetime of
-    // the GTK main loop (until the window is destroyed).
-    let drain_state = state.clone();
-    let drain_widgets = widgets.clone();
-    let drain_slot = agent_slot.clone();
-    let drain_cancel = fg_cancel.clone();
-    let drain_quiet = fg_quiet.clone();
-    let drain_done = done_tx.clone();
-    let drain_bus = bus.clone();
-    unsafe {
-        if let Some(loader) = rustxwidgets::backends::gtk::loader() {
-            rustxwidgets::gtk_dynamic_loader::timeout_add_recurring(&loader, 150, Box::new(move || {
-                drain_once(
-                    &drain_state,
-                    &drain_widgets,
-                    &drain_slot,
-                    &drain_cancel,
-                    &drain_quiet,
-                    &drain_done,
-                    &drain_bus,
-                );
-            }));
-        }
-    }
+    sessions.borrow_mut().push(SessionView {
+        state,
+        widgets,
+        entry,
+        agent_slot,
+        fg_cancel,
+        fg_quiet,
+        hist_nav,
+        done_tx,
+        app: app_quit,
+    });
+    idx
+}
 
-    // Window close (destroy signal) -> quit the GTK main loop.
-    unsafe {
-        if let Some(loader) = rustxwidgets::backends::gtk::loader() {
-            let _ = rustxwidgets::gtk_dynamic_loader::connect_signal(
-                &loader.symbols,
-                window.raw_handle(),
-                "destroy",
-                Box::new(move || {
-                    let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-                }),
-                2,
+/// Handle `/sessions` sub-commands: `new` (open a tab with a fresh agent),
+/// `close` (close the current tab, keeping at least one), `next`/`prev` and
+/// `<n>` (switch), and (no arg) list the open sessions. Feedback is written to
+/// the *current* session's conversation pane.
+fn handle_session_command(
+    rest: &[&str],
+    state: &Arc<Mutex<GuiState>>,
+    widgets: &GuiWidgets,
+    sessions: &Rc<RefCell<Vec<SessionView>>>,
+    tabs: &TabView,
+    app: &App,
+    providers: &[Provider],
+    bus: &SharedBus,
+    _full_auto: bool,
+    sv_slot: &AgentSlot,
+) {
+    let mut s = state.lock().unwrap();
+    if rest.is_empty() {
+        let cur = tabs.current_tab();
+        let titles: Vec<String> = (0..tabs.tab_count())
+            .map(|i| tabs.tab_title(i).unwrap_or_default())
+            .collect();
+        s.push(ConvKind::System, &format!("sessions ({} open, * = active):", titles.len()));
+        for (i, t) in titles.iter().enumerate() {
+            s.push(ConvKind::System, &format!("  {}{} {}", if i == cur { "*" } else { " " }, i, t));
+        }
+        s.push(ConvKind::System, "use: /sessions new | close | next | prev | <n>");
+        sync_textview(widgets, &s);
+        return;
+    }
+    match rest[0] {
+        "new" => {
+            drop(s);
+            // Mirror the current session's model for the new agent (fall back to
+            // the default selection if the agent is mid-turn and unavailable).
+            let (provider, model) = {
+                let g = sv_slot.lock().unwrap();
+                match g.as_ref() {
+                    Some(a) => (a.provider(), a.model()),
+                    None => match crate::config::select(providers, "") {
+                        Ok((p, m)) => (p.clone(), m.clone()),
+                        Err(_) => {
+                            let m = providers[0]
+                                .models
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(|| providers[0].models[0].clone());
+                            (providers[0].clone(), m)
+                        }
+                    },
+                }
+            };
+            let cancel = Arc::new(AtomicBool::new(false));
+            let quiet = Arc::new(AtomicBool::new(false));
+            let (done_tx, _rx) = smol::channel::bounded::<()>(1);
+            match Agent::new(
+                provider,
+                model,
+                _full_auto,
+                true,
+                bus.clone(),
+                None,
+                cancel.clone(),
+                Arc::new(Mutex::new(String::new())),
+            ) {
+                Ok(agent) => {
+                    let slot: AgentSlot = Arc::new(Mutex::new(Some(agent)));
+                    let n = spawn_session(
+                        &format!("session {}", sessions.borrow().len()),
+                        slot,
+                        cancel,
+                        quiet,
+                        done_tx,
+                        app,
+                        tabs,
+                        providers,
+                        bus,
+                        _full_auto,
+                        sessions,
+                    );
+                    tabs.set_active(n);
+                }
+                Err(e) => {
+                    let mut s2 = state.lock().unwrap();
+                    s2.push(ConvKind::Error, &format!("could not start new session: {e}"));
+                    sync_textview(widgets, &s2);
+                }
+            }
+        }
+        "close" => {
+            let cur = tabs.current_tab();
+            if sessions.borrow().len() <= 1 {
+                s.push(ConvKind::System, "only one session open — not closing");
+                sync_textview(widgets, &s);
+                return;
+            }
+            drop(s);
+            tabs.close_tab(cur);
+            sessions.borrow_mut().remove(cur);
+        }
+        "next" | "prev" => {
+            let n = sessions.borrow().len();
+            let cur = tabs.current_tab();
+            let target = if rest[0] == "next" {
+                (cur + 1) % n
+            } else {
+                (cur + n - 1) % n
+            };
+            tabs.set_active(target);
+        }
+        other => {
+            if let Ok(i) = other.parse::<usize>() {
+                let n = sessions.borrow().len();
+                if i < n {
+                    tabs.set_active(i);
+                    return;
+                }
+            }
+            s.push(
+                ConvKind::Error,
+                &format!("unknown /sessions subcommand '{other}' (new|close|next|prev|<n>|list)"),
             );
+            sync_textview(widgets, &s);
         }
     }
-
-    app.run().map_err(|e| format!("gtk main loop: {e}"))
 }
 
 /// One periodic drain pass: pull notifications, read new session-log lines into
@@ -978,11 +921,14 @@ fn drain_session_log(log: PathBuf, state: &mut GuiState) {
 /// word lands in the text view and the next periodic drain's `set_text` wipes
 /// it ("I typed half a word and it just disappeared").
 fn configure_conversation_textview(tv: &TextView) {
+    #[cfg(all(feature = "gtk", target_os = "linux"))]
     tv.set_hexpand(true);
+    #[cfg(all(feature = "gtk", target_os = "linux"))]
     tv.set_vexpand(true);
     // GTK wrap mode: 2 = GTK_WRAP_WORD_CHAR
     tv.set_wrap_mode(2);
     tv.set_editable(false);
+    #[cfg(all(feature = "gtk", target_os = "linux"))]
     tv.set_can_focus(false);
 }
 
@@ -1002,6 +948,7 @@ fn status_markup(status: &str) -> String {
 /// Sync the GTK text buffer with the conversation model: append-only markup
 /// updates between rebuilds (colours per line, cheap on every 150ms tick),
 /// full rebuild after /clear or a scrollback trim.
+#[cfg(all(feature = "gtk", target_os = "linux"))]
 fn sync_textview(widgets: &GuiWidgets, state: &GuiState) {
     use std::sync::atomic::Ordering;
     if NEEDS_REBUILD.swap(false, Ordering::SeqCst) {
@@ -1011,12 +958,31 @@ fn sync_textview(widgets: &GuiWidgets, state: &GuiState) {
     let rendered = RENDERED_LINES.load(Ordering::SeqCst);
     if state.conv.len() > rendered {
         for line in &state.conv[rendered..] {
-            widgets.textview.append_markup(&line_markup(line));
-            widgets.textview.append_text("\n");
+            widgets.textview.set_markup(&line_markup(line));
+            widgets.textview.set_text("\n");
         }
         RENDERED_LINES.store(state.conv.len(), Ordering::SeqCst);
     }
-    widgets.textview.scroll_to_end();
+    widgets.textview.set_text("");
+    widgets.status.set_markup(&status_markup(&state.status));
+}
+
+#[cfg(windows)]
+fn sync_textview(widgets: &GuiWidgets, state: &GuiState) {
+    use std::sync::atomic::Ordering;
+    if NEEDS_REBUILD.swap(false, Ordering::SeqCst) {
+        widgets.textview.set_text("");
+        RENDERED_LINES.store(0, Ordering::SeqCst);
+    }
+    let rendered = RENDERED_LINES.load(Ordering::SeqCst);
+    if state.conv.len() > rendered {
+        for line in &state.conv[rendered..] {
+            // The nwg backend's `TextView::set_markup` already appends the
+            // (markup-stripped) line plus a newline, so no separate newline.
+            widgets.textview.set_markup(&line_markup(line));
+        }
+        RENDERED_LINES.store(state.conv.len(), Ordering::SeqCst);
+    }
     widgets.status.set_markup(&status_markup(&state.status));
 }
 
@@ -1029,6 +995,7 @@ fn handle_command(
     _bus: &SharedBus,
     cancel: &Arc<AtomicBool>,
     state: &Arc<Mutex<GuiState>>,
+    app: &App,
     widgets: &GuiWidgets,
 ) {
     let mut parts = cmd.split_whitespace();
@@ -1039,13 +1006,13 @@ fn handle_command(
         "h" | "help" => {
             s.push(ConvKind::System,
                 "commands: /help /model <sel> /models /goal [obj] /continue /clear /undo\n\
-                 \x20  /cancel  /thinking  /sessions  /usage  /markup_demo  /exit  /quit",
+                 \x20  /cancel  /thinking  /sessions  /usage  /exit  /quit",
             );
         }
         "exit" | "quit" | "q" => {
             s.status = "bye".into();
             drop(s);
-            let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
+            app.quit();
             return;
         }
         "cancel" | "c" => {

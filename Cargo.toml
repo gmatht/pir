@@ -21,17 +21,16 @@ streamdown-ansi = "0.1.4"                        # ANSI sanitize for link/termin
 # Optional TUI deps, only built when `--features tui` is set (so the default
 # binary stays lightweight and the locked build cache is unaffected).
 ratatui = { version = "0.29", optional = true }
-# crossterm is non-optional: it's already in the tree transitively via
-# streamdown-ansi, and the alternate-screen modal dialogs (docs/DIALOGS.md) use
-# it in the default build. ratatui stays optional (TUI only).
 crossterm = "0.28"
 
 # Optional GUI deps (rustxwidgets) for the `gui` / `pancurses` REPL backends.
-# Vendored in-tree at `vendors/rustxWidgets` (a real directory, shipped in
-# git) so the default `gui` build and a plain `cargo build` both work with no
-# external checkout. The `gui` backend uses rustxwidgets' dlopen'd GTK loader
-# (the `rustxwidgets/gtk` feature); the `pancurses` backend uses ncurses.
-rustxwidgets = { path = "vendors/rustxWidgets/rustxwidgets", version = "0.1.0", default-features = false, optional = true }
+# These are NOT vendored in this repo (they were a 28 MiB+ build-artifact
+# subtree we no longer carry in git). To build with `--features gui` or
+# `--features pancurses`, check rustxWidgets out as a sibling directory
+# (e.g. /root/src/rustxWidgets) or add a `[patch]` entry pointing `path =`
+# at your local checkout. The default `pir` binary never references them, so
+# a plain `cargo build` works with no rustxWidgets present.
+rustxwidgets = { path = "rustxWidgets/rustxwidgets", version = "0.1.0", default-features = false, optional = true }
 synoptic = "2"                                        # regex-based syntax highlighter for fenced code blocks (unicode-aware)
 
 [features]
@@ -47,12 +46,21 @@ tui = ["dep:ratatui"]
 # optional so the default `--release` binary drops its whole dependency tree.
 comrak-backend = ["dep:comrak"]
 # Graphical (GTK) REPL via rustxwidgets' dlopen'd GTK backend, and the curses
-# (pancurses) REPL. Both are vendored in-tree at `vendors/rustxWidgets`, so the
-# default `cargo build` (which enables `gui`) compiles with no external checkout.
-gui = ["dep:rustxwidgets", "rustxwidgets/gtk"]
+# (pancurses) REPL. These require rustxWidgets to be present (see the comment
+# above the [dependencies] block) — they are intentionally NOT in this repo, so
+# `gui` / `pancurses` are opt-in and absent from the default build.
+gui = ["dep:rustxwidgets"]
 pancurses = ["dep:rustxwidgets", "rustxwidgets/pancurses"]
 
 [profile.release]
 strip = true
 lto = true
 opt-level = "z"
+
+[patch.crates-io]
+# native-windows-gui 1.0.13's MSVC path imports `GetWindowSubclass` from
+# comctl32.dll, but that export doesn't exist on Windows 11 24H2 -> every
+# binary fails to load with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139). This
+# vendored copy reimplements it with a private map (the crate's own GNU
+# workaround), so only Set/Remove/DefSubclassProc are imported (those exist).
+native-windows-gui = { path = "vendor/native-windows-gui" }

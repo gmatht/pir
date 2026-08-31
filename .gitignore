@@ -33,3 +33,5 @@ build-gui.sh
 # Vendored rustxWidgets is untracked (not committed); worktrees link it via link_untracked_build_deps.
 # It comes from a shared rustxWidgets source (see docs: git-subtree candidate).
 vendors/
+# rustxWidgets sibling symlink (points at the untracked vendored copy)
+/rustxWidgets

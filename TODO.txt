@@ -21,3 +21,7 @@ Automatically detect SSH and github prompts?
 - Container read-isolation: hide ~/.ssh, gh auth tokens (~/.config/gh), and other
   credential stores from the agent's view (bind empty dirs over them inside the
   container/overlay). LATER.
+- rustxWidgets: make it a git SUBTREE shared with ~/src/main_loop/corro (currently an
+  untracked vendored dir, gitignored; /mnt/c/temp/pir carries a NEWER uncommitted
+  rustxwidgets — subtree it from a canonical rustxWidgets repo so both projects and
+  worktrees get one version). Worktrees already symlink it (link_untracked_build_deps).
