@@ -1,0 +1,63 @@
+[package]
+name = "rustxwidgets"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+once_cell = "1.19"
+thiserror = "1.0"
+libloading = "0.8"
+rustyline = { version = "14", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# Pointed at an absolute path (matching the other vendored gtk deps below)
+# so it still resolves when rustxwidgets is symlinked into a git worktree,
+# whose vendors/rustxWidgets/ only carries the rustxwidgets symlink and not
+# this sibling directory. Relative "../gtk_dynamic_loader" resolves against the
+# worktree's logical path and 404s the build.
+gtk_dynamic_loader = { path = "/home/ai_pir/src/pir/vendors/rustxWidgets/gtk_dynamic_loader", optional = true }
+gtk4 = { path = "/root/tmp/gtk4-rs/gtk4", package = "gtk4", optional = true, features = ["v4_14"] }
+glib-sys = { path = "/root/tmp/gtk4-rs/generated/glib-sys-dlopen", optional = true }
+gio-sys = { path = "/root/tmp/gtk4-rs/generated/gio-sys-dlopen", optional = true }
+gtk4-sys = { path = "/root/tmp/gtk4-rs/generated/gtk4-sys-dlopen", optional = true }
+gdk4-sys = { path = "/root/tmp/gtk4-rs/generated/gdk4-sys-dlopen", optional = true }
+cairo-sys-rs = { path = "/root/tmp/gtk4-rs/generated/cairo-sys-rs-dlopen", optional = true }
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+native-windows-gui = { version = "1.0", features = ["flexbox", "menu", "combobox", "textbox", "scroll-bar"] }
+winapi = { version = "0.3", features = ["winuser", "windef", "processenv", "winbase", "wincon", "handleapi"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.21", default-features = false, features = ["invocation"] }
+ndk = "0.9"
+ndk-context = "0.1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+  "console",
+  "Document", "Element", "HtmlElement", "Node", "EventTarget",
+  "HtmlButtonElement", "HtmlInputElement", "HtmlSelectElement",
+  "HtmlTextAreaElement", "HtmlCanvasElement", "HtmlDialogElement",
+  "HtmlDivElement", "HtmlSpanElement", "HtmlUListElement",   "HtmlLiElement",
+  "HtmlOptionElement", "HtmlFormElement",   "HtmlHeadingElement", "HtmlBrElement",
+  "MouseEvent", "KeyboardEvent", "Event", "FocusEvent",
+  "CanvasRenderingContext2d", "CssStyleDeclaration", "DomTokenList",
+  "HtmlCollection", "Window",
+  "Text",
+  "TextMetrics",
+] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pancurses = { version = "0.17", optional = true, features = ["wide"] }
+
+[features]
+gtk = ["dep:gtk_dynamic_loader"]
+gtk4-rs = ["dep:gtk4", "dep:glib-sys", "dep:gio-sys", "dep:gtk4-sys", "dep:gdk4-sys", "dep:cairo-sys-rs", "dep:gtk_dynamic_loader", "gtk_dynamic_loader/gtk4rs"]
+pancurses = ["dep:pancurses"]
+zork = ["dep:rustyline"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+proptest = "1.6"
