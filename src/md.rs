@@ -1,43 +1,355 @@
 //! Minimal terminal Markdown renderer.
 //!
 //! Agent replies are CommonMark (headings, `**bold**`, lists, fenced code
-//! blocks, lists, fenced code blocks, links, …). The REPL used to dump them verbatim, so the user
-//! saw raw `**`/`#`/` ``` ` instead of formatted text. This module parses the
-//! markdown with comrak and emits a plain-text approximation suitable for a
-//! fixed-width terminal: headings get a marker + bold, emphasis becomes `^`
-//! style emphasis via ANSI, code blocks are fenced and indented, links show
-//! their text with the URL in brackets, and list/quote markers are preserved.
+//! blocks, links, …). The REPL used to dump them verbatim, so the user saw
+//! raw `**`/`#`/` ``` ` instead of formatted text. This module parses the
+//! markdown and emits a plain-text approximation suitable for a fixed-width
+//! terminal: headings get a marker + bold, emphasis becomes ANSI emphasis,
+//! code blocks are fenced and indented, links show their text with the URL in
+//! brackets, and list/quote markers are preserved.
 //!
 //! The output is *not* HTML — it is text with ANSI styling, so it can be
 //! printed by the streaming REPL (`term::out`) and by the TUI (each paragraph
 //! becomes a `Line`). Colour is applied only when the terminal supports it.
+//!
+//! # Backends
+//!
+//! There are two interchangeable parsers, selected at runtime via
+//! `config::markdown_renderer_backend()` (the `PIR_MARKDOWN_RENDERER` env var
+//! or `markdownRenderer` in settings.json):
+//!
+//!   * **pulldown** (default) — `pulldown-cmark`, an event-stream CommonMark
+//!     + GFM parser with a minimal dependency tree; always compiled in.
+//!   * **comrak** (optional) — the heavier AST parser, compiled only when the
+//!     `comrak-backend` cargo feature is enabled.
+//!
+//! Both feed the same small set of terminal ANSI emitters, so flipping the
+//! backend only changes the parser, never the output shape.
 
+#[cfg(feature = "comrak-backend")]
 use comrak::nodes::{AstNode, ListType, NodeValue};
-use comrak::{parse_document, Arena, Options};
+#[cfg(feature = "comrak-backend")]
+use comrak::{parse_document, Arena as ComrakArena, Options as ComrakOptions};
+use pulldown_cmark::{Event as PdEvent, Options as PdOptions, Parser as PdParser, Tag as PdTag, TagEnd as PdTagEnd};
 use std::time::{Duration, Instant};
 
 /// Render `md` to a styled, terminal-width-friendly `String`. Block-level
 /// structure (headings, lists, code fences, blank lines) is preserved; inline
 /// emphasis is rendered with ANSI bold/italic when `color` is true.
+///
+/// The backend is chosen by [`crate::config::markdown_renderer_backend`]. When
+/// the `comrak-backend` feature is *not* compiled in, only the pulldown backend
+/// exists and the configuration is effectively pinned to it (a `comrak` setting
+/// degrades to the default rather than failing — the terminal output is
+/// compatible).
 pub fn render(md: &str, color: bool) -> String {
-    let mut opts = Options::default();
+    #[cfg(feature = "comrak-backend")]
+    if crate::config::markdown_renderer_backend() == "comrak" {
+        return render_comrak(md, color);
+    }
+    render_pulldown(md, color)
+}
+
+/// Default pulldown-cmark backend (always compiled; see [`render`]).
+fn render_pulldown(md: &str, color: bool) -> String {
+    let mut opts = PdOptions::empty();
+    opts.insert(PdOptions::ENABLE_TABLES);
+    opts.insert(PdOptions::ENABLE_STRIKETHROUGH);
+    opts.insert(PdOptions::ENABLE_TASKLISTS);
+    // Smart punctuation is on (matches the comrak backend's `parse.smart`). The
+    // scanned agent output already carries frequent smart quotes / em-dashes;
+    // enabling this keeps straight quotes and `--` typographically consistent.
+    // `autolink` is deliberately NOT enabled: the scanned sessions contain no
+    // bare URLs, so the extra pass buys nothing.
+    opts.insert(PdOptions::ENABLE_SMART_PUNCTUATION);
+
+    let parser = PdParser::new_ext(md, opts);
+    let mut r = PdRenderer { color, ..Default::default() };
+    r.run(parser);
+    let collapsed = collapse_blank(&r.out);
+    collapsed.trim_end().to_string() + "\n"
+}
+
+// ---------------------------------------------------------------------------
+// pulldown-cmark backend (default)
+// ---------------------------------------------------------------------------
+
+/// Holds terminal-emitter state while walking pulldown's event stream.
+#[derive(Default)]
+struct PdRenderer {
+    color: bool,
+    /// Whether we're inside a list item (so paragraph breaks don't add blanks).
+    in_list: bool,
+    /// Whether we're inside a blockquote (SoftBreak becomes a `> ` line).
+    in_blockquote: bool,
+    /// Per-nesting-level ordered/bullet list state: `Some((start, count))` for
+    /// an ordered list (starting at `start`), `None` for a bullet list.
+    list_stack: Vec<Option<(u64, u64)>>,
+    /// Pending link URL (set on Start(Link), appended after text on End).
+    pending_link: Option<String>,
+    /// Table capture state (active only inside a table).
+    table_active: bool,
+    table_in_cell: bool,
+    table_cells: Vec<Vec<String>>,
+    table_cur_cell: String,
+    /// The accumulated output.
+    out: String,
+}
+
+impl PdRenderer {
+    fn run(&mut self, parser: PdParser<'_>) {
+        for ev in parser {
+            match ev {
+                PdEvent::Start(tag) => self.on_start(tag),
+                PdEvent::End(end) => self.on_end(end),
+                PdEvent::Text(t) => self.push_text(&t),
+                PdEvent::Code(t) => {
+                    if self.color {
+                        self.push_text(&format!("\x1b[7m{}\x1b[0m", t));
+                    } else {
+                        self.push_text(&format!("`{}`", t));
+                    }
+                }
+                PdEvent::SoftBreak | PdEvent::HardBreak => {
+                    if self.in_blockquote {
+                        self.out.push('\n');
+                        self.out.push_str("> ");
+                    } else {
+                        self.out.push('\n');
+                    }
+                }
+                PdEvent::Rule => self.push_text("---\n"),
+                PdEvent::Html(t) => {
+                    // Keep literal inline HTML as-is (matches terminal expectations).
+                    self.push_text(&t);
+                }
+                // FootnoteReference / InlineMath / DisplayMath etc. are not used
+                // by the terminal renderer; ignore them.
+                _ => {}
+            }
+        }
+        if self.table_active {
+            self.flush_table();
+        }
+    }
+
+    /// Route a text/plain segment into the current table cell (if any) or the
+    /// main output.
+    fn push_text(&mut self, s: &str) {
+        if self.table_in_cell {
+            self.table_cur_cell.push_str(s);
+        } else {
+            self.out.push_str(s);
+        }
+    }
+
+    fn on_start(&mut self, tag: PdTag<'_>) {
+        match tag {
+            PdTag::Heading { level, .. } => {
+                let n = level as usize;
+                self.out.push_str(&format!("{} ", "#".repeat(n.min(6))));
+                if self.color {
+                    self.out.push_str("\x1b[1m");
+                }
+            }
+            PdTag::Paragraph => {}
+            PdTag::BlockQuote(_) => {
+                self.in_blockquote = true;
+                self.out.push_str("> ");
+            }
+            PdTag::CodeBlock(kind) => {
+                let lang = match kind {
+                    pulldown_cmark::CodeBlockKind::Fenced(info) => info.trim().to_string(),
+                    pulldown_cmark::CodeBlockKind::Indented => String::new(),
+                };
+                self.out.push_str(&format!("```{lang}\n"));
+            }
+            PdTag::List(start) => {
+                // A nested list that opens mid-line must start on a fresh line.
+                if !self.out.is_empty() && !self.out.ends_with('\n') {
+                    self.out.push('\n');
+                }
+                // Track the current nest depth for indentation. Ordered lists
+                // carry their start number; bullet lists are `None`.
+                self.list_stack.push(start.map(|s| (s, 0u64)));
+            }
+            PdTag::Item => {
+                self.in_list = true;
+                let marker = self.item_marker();
+                self.out.push_str(&marker);
+            }
+            PdTag::Table(_) => {
+                if self.table_active {
+                    self.flush_table();
+                }
+                self.table_active = true;
+                self.table_cells.clear();
+            }
+            PdTag::TableHead => self.table_cells.push(Vec::new()),
+            PdTag::TableRow => self.table_cells.push(Vec::new()),
+            PdTag::TableCell => {
+                self.table_in_cell = true;
+                self.table_cur_cell.clear();
+            }
+            PdTag::Emphasis => self.open_style("\x1b[3m"),
+            PdTag::Strong => self.open_style("\x1b[1m"),
+            PdTag::Strikethrough => self.open_style("\x1b[9m"),
+            PdTag::Link { dest_url, .. } => {
+                self.pending_link = Some(dest_url.to_string());
+            }
+            PdTag::Image { title, .. } => {
+                let t = title.trim().to_string();
+                if !t.is_empty() {
+                    self.push_text(&format!("[image: {t}]"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_end(&mut self, end: PdTagEnd) {
+        match end {
+            PdTagEnd::Heading(_) | PdTagEnd::Emphasis | PdTagEnd::Strong | PdTagEnd::Strikethrough => {
+                if self.color {
+                    self.out.push_str("\x1b[0m");
+                }
+                if matches!(end, PdTagEnd::Heading(_)) {
+                    self.out.push('\n');
+                }
+            }
+            PdTagEnd::Paragraph => {
+                // In a tight list the items flow without blank lines.
+                if !self.in_list {
+                    self.out.push('\n');
+                }
+            }
+            PdTagEnd::BlockQuote(_) => {
+                self.in_blockquote = false;
+                self.out.push('\n');
+            }
+            PdTagEnd::CodeBlock => self.out.push_str("```\n"),
+            PdTagEnd::List(_) => {
+                self.list_stack.pop();
+            }
+            PdTagEnd::Item => {
+                self.in_list = false;
+                self.out.push('\n');
+            }
+            PdTagEnd::Table => {                self.flush_table();
+                self.table_active = false;
+            }
+            PdTagEnd::TableHead => {}
+            PdTagEnd::TableRow => {}
+            PdTagEnd::TableCell => {
+                if self.table_active && !self.cell_empty() {
+                    if let Some(row) = self.table_cells.last_mut() {
+                        let cell =
+                            self.table_cur_cell.replace('\n', " ").trim().to_string();
+                        row.push(cell);
+                    }
+                }
+                self.table_in_cell = false;
+            }
+            PdTagEnd::Link => {
+                if let Some(url) = self.pending_link.take() {
+                    self.out.push_str(&format!(" [{url}]"));
+                }
+            }
+            PdTagEnd::Image => {}
+            _ => {}
+        }
+    }
+
+    fn cell_empty(&self) -> bool {
+        self.table_cur_cell.trim().is_empty()
+    }
+
+    fn item_marker(&mut self) -> String {
+        // Top of stack is the innermost list currently being iterated. Nested
+        // lists are indented by two spaces per level so the markers don't jam.
+        let depth = self.list_stack.len();
+        let pad = "  ".repeat(depth.saturating_sub(1));
+        match self.list_stack.last_mut() {
+            Some(Some((base, count))) => {
+                let idx = *count;
+                *count += 1;
+                format!("{pad}{}. ", *base + idx)
+            }
+            // Bullet list (None) or not inside a list.
+            _ => format!("{pad}• "),
+        }
+    }
+
+    fn open_style(&mut self, code: &str) {
+        if self.color {
+            self.out.push_str(code);
+        }
+    }
+
+    /// Emit a collected table as a monospace grid (mirrors the comrak backend).
+    fn flush_table(&mut self) {
+        if self.table_cells.is_empty() {
+            return;
+        }
+        let rows = std::mem::take(&mut self.table_cells);
+        let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        let widths: Vec<usize> = (0..cols)
+            .map(|ci| rows.iter().map(|r| r.get(ci).map_or(0, |s| s.chars().count())).max().unwrap_or(0))
+            .collect();
+        for (ri, row) in rows.iter().enumerate() {
+            for (ci, w) in widths.iter().enumerate() {
+                let cell = row.get(ci).cloned().unwrap_or_default();
+                self.out.push('|');
+                self.out.push(' ');
+                self.out.push_str(&cell);
+                let pad = w.saturating_sub(cell.chars().count());
+                for _ in 0..pad {
+                    self.out.push(' ');
+                }
+                self.out.push(' ');
+            }
+            self.out.push_str("|\n");
+            if ri == 0 {
+                self.out.push('|');
+                for w in &widths {
+                    for _ in 0..w + 2 {
+                        self.out.push('-');
+                    }
+                    self.out.push('|');
+                }
+                self.out.push('\n');
+            }
+        }
+        self.out.push('\n');
+    }
+}
+
+// ---------------------------------------------------------------------------
+// comrak backend (optional — only compiled with `--features comrak-backend`)
+// ---------------------------------------------------------------------------
+
+/// Render `md` using the (optional) comrak parser. Equivalent output shape to
+/// the default pulldown backend; only compiled when the `comrak-backend`
+/// feature is enabled.
+#[cfg(feature = "comrak-backend")]
+fn render_comrak(md: &str, color: bool) -> String {
+    let mut opts = ComrakOptions::default();
     opts.extension.strikethrough = true;
     opts.extension.table = true;
     opts.extension.autolink = true;
     opts.extension.tasklist = true;
     opts.parse.smart = true;
 
-    let arena = Arena::new();
+    let arena = ComrakArena::new();
     let root = parse_document(&arena, md, &opts);
 
     let mut out = String::new();
     render_node(root, &RenderCtx { color, indent: 0, in_list: false }, &mut out);
-    // Collapse the worst of the excess blank lines while keeping paragraph
-    // separation. Comrak emits a newline per leaf; we normalise ≥3 → 2.
     let collapsed = collapse_blank(&out);
     collapsed.trim_end().to_string() + "\n"
 }
 
+#[cfg(feature = "comrak-backend")]
 struct RenderCtx {
     color: bool,
     /// Current block indent (for nested lists).
@@ -46,6 +358,7 @@ struct RenderCtx {
     in_list: bool,
 }
 
+#[cfg(feature = "comrak-backend")]
 fn render_node<'a>(node: &'a AstNode<'a>, ctx: &RenderCtx, out: &mut String) {
     let value = &node.data.borrow().value;
     match value {
@@ -113,7 +426,6 @@ fn render_node<'a>(node: &'a AstNode<'a>, ctx: &RenderCtx, out: &mut String) {
             }
         }
         NodeValue::Item(_) => {
-            // When rendered directly (rare), just recurse as a paragraph.
             for c in node.children() {
                 render_node(c, ctx, out);
             }
@@ -142,7 +454,6 @@ fn render_node<'a>(node: &'a AstNode<'a>, ctx: &RenderCtx, out: &mut String) {
         NodeValue::SoftBreak => out.push('\n'),
         NodeValue::LineBreak => out.push('\n'),
         NodeValue::Code(c) => {
-            // Inline code: reverse video when colour is on, else backticks.
             if ctx.color {
                 out.push_str(&format!("\x1b[7m{}\x1b[0m", c.literal.as_str()));
             } else {
@@ -199,7 +510,6 @@ fn render_node<'a>(node: &'a AstNode<'a>, ctx: &RenderCtx, out: &mut String) {
         NodeValue::Image(i) => {
             out.push_str(&format!("[image: {}]", i.title.as_str()));
         }
-        // Tables, HTML, footnotes, etc. fall back to recursing children.
         _ => {
             for c in node.children() {
                 render_node(c, ctx, out);
@@ -208,9 +518,9 @@ fn render_node<'a>(node: &'a AstNode<'a>, ctx: &RenderCtx, out: &mut String) {
     }
 }
 
-/// Render a list item. The marker is printed once on the first line; the
-/// item's block children are rendered with the deeper indent so wrapped lines
-/// align under the text (not the marker).
+/// Render a list item (comrak backend). The marker is printed once; wrapped
+/// lines align under the text.
+#[cfg(feature = "comrak-backend")]
 fn render_list_item<'a>(node: &'a AstNode<'a>, marker: &str, ctx: &mut RenderCtx, out: &mut String) {
     let mut first = true;
     for c in node.children() {
@@ -233,15 +543,14 @@ fn render_list_item<'a>(node: &'a AstNode<'a>, marker: &str, ctx: &mut RenderCtx
         }
     }
     if first {
-        // Empty item (e.g. a checked task with no text): still show marker.
         out.push_str(marker);
         out.push('\n');
     }
 }
 
-/// Render a GFM table as a simple monospace grid.
+/// Render a GFM table as a simple monospace grid (comrak backend).
+#[cfg(feature = "comrak-backend")]
 fn render_table<'a>(node: &'a AstNode<'a>, ctx: &RenderCtx, out: &mut String) {
-    // Collect rows (header + body) and column count.
     let mut rows: Vec<Vec<String>> = Vec::new();
     for c in node.children() {
         if let NodeValue::TableRow(_) = &c.data.borrow().value {
@@ -715,3 +1024,4 @@ mod incremental_tests {
         assert_eq!(body.matches("• d").count(), 1, "item d missing/duplicated: {body:?}");
     }
 }
+

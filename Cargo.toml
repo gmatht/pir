@@ -7,13 +7,14 @@ description = "A featherweight pi-compatible terminal coding agent"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-comrak = { version = "0.54", default-features = false }   # CommonMark/GFM parser used to render agent markdown output (defaults off: no cli / syntax-highlight onig)
+pulldown-cmark = { version = "0.13", default-features = false }   # default CommonMark/GFM parser used to render agent markdown output (zero heavy deps; no cli/getopts)
+comrak = { version = "0.54", default-features = false, optional = true }   # optional heavier CommonMark/GFM backend (feature `comrak-backend`)
 ureq = { version = "2", default-features = false, features = ["json", "native-tls"] }   # native-tls = (dynamic; drops static ring/rustls); gzip default feature dropped (unused)
 native-tls = "0.2"                               # TLS provider for ureq (must be attached to the AgentBuilder explicitly)
 rustyline = "14"                               # line editing: history + cursor nav + completer
 libc = "0.2"                                     # uid/gid drop for per-project users
 smol = "2"                                       # async runtime: event-driven stdin wait while a turn runs
-regex = "1"                                      # history recall: regex (and partial) matching of prior prompts
+regex-lite = "0.1.9"                             # history recall: lightweight regex (and partial) matching of prior prompts
 
 # Optional TUI deps, only built when `--features tui` is set (so the default
 # binary stays lightweight and the locked build cache is unaffected).
@@ -27,7 +28,6 @@ crossterm = { version = "0.28", optional = true }
 # (the `rustxwidgets/gtk` feature); the `pancurses` backend uses ncurses.
 rustxwidgets = { path = "vendors/rustxWidgets/rustxwidgets", version = "0.1.0", default-features = false, optional = true }
 
-
 [features]
 # Full-screen TUI REPL: a real layout engine (no hand-rolled ANSI block)
 # with a conversation pane + footer pane (thinking + live draft prompt) and
@@ -35,6 +35,11 @@ rustxwidgets = { path = "vendors/rustxWidgets/rustxwidgets", version = "0.1.0", 
 # `--no-tui` (or just build without the feature) to use the streaming REPL.
 default = []
 tui = ["dep:ratatui", "dep:crossterm"]
+# Swap the markdown renderer backend to comrak (a heavier CommonMark/GFM
+# parser). OFF by default: the default backend is pulldown-cmark (smaller
+# binary, same supported GFM subset for our terminal renderer). Keep comrak
+# optional so the default `--release` binary drops its whole dependency tree.
+comrak-backend = ["dep:comrak"]
 # Graphical (GTK) REPL via rustxwidgets' dlopen'd GTK backend, and the curses
 # (pancurses) REPL. Both are vendored in-tree at `vendors/rustxWidgets`, so the
 # default `cargo build` (which enables `gui`) compiles with no external checkout.

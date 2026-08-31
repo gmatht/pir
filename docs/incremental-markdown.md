@@ -30,6 +30,7 @@ once, `pir`:
 | `--no-incremental` | Disable live (in-place) streaming markdown; render once at the end. |
 | `PIR_INCREMENTAL_MD=0` | Same, via environment. |
 | `PIR_INCREMENTAL_MD_THROTTLE_MS` | Override the redraw throttle window in milliseconds (default `200`). The renderer never redraws more often than this; the final state is always flushed at turn boundaries. Values `< 1` or non-numeric fall back to `200`. |
+| `PIR_MARKDOWN_RENDERER` | Choose the markdown backend: `pulldown` (default) or `comrak`. Equivalent to `markdownRenderer` in `~/.pi/agent/settings.json`. |
 | Anything else | Incremental rendering stays on (default). |
 
 The default window (`DEFAULT_THROTTLE_MS = 200`), the env-var override, and the
@@ -37,7 +38,12 @@ The default window (`DEFAULT_THROTTLE_MS = 200`), the env-var override, and the
 
 ## Implementation
 
-- `md::render(md, color)` — stateless comrak → terminal render.
+- `md::render(md, color)` — stateless renderer → styled terminal text. The
+  backend is chosen by `config::markdown_renderer_backend()`: **pulldown** by
+  default (a minimal event-stream CommonMark/GFM parser, always compiled), or
+  **comrak** when the binary is built with `--features comrak-backend` and the
+  config says `comrak`. Both feed identical ANSI emitters, so switching only
+  changes the parser, never the output shape.
 - `md::IncrementalMarkdown` — tracks the accumulated `pending` markdown,
   re-renders whole each time it fires, and emits a frame that starts with
   `\x1b[<n>A\x1b[J` (jump back over the previous block, erase to end of screen)

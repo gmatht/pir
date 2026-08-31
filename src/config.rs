@@ -1197,6 +1197,38 @@ pub fn incremental_md_default() -> bool {
         .unwrap_or(true)
 }
 
+/// Markdown renderer backend used by `md::render` to turn agent replies into
+/// styled terminal text. Resolution order:
+///   1. `PIR_MARKDOWN_RENDERER` env var (`pulldown` | `pulldown-cmark` |
+///      `comrak`)
+///   2. `markdownRenderer` in `~/.pi/agent/settings.json`
+///   3. the built-in default, `pulldown` (the lighter, default-enabled backend)
+///
+/// Returns lowercased, canonical backend name (`pulldown` or `comrak`); an
+/// unknown/empty value falls back to `pulldown`. Note the `comrak` backend is
+/// only compiled into the binary when the `comrak-backend` cargo feature is
+/// enabled; that gate is enforced by the caller.
+pub fn markdown_renderer_backend() -> &'static str {
+    let from_env = std::env::var("PIR_MARKDOWN_RENDERER")
+        .ok()
+        .map(|v| v.trim().to_lowercase())
+        .filter(|s| !s.is_empty());
+    let sel = from_env.unwrap_or_else(|| {
+        let p = pi_dir().join("agent").join("settings.json");
+        fs::read_to_string(&p)
+            .ok()
+            .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+            .and_then(|v| v.get("markdownRenderer").and_then(Value::as_str).map(str::to_lowercase))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "pulldown".into())
+    });
+    match sel.as_str() {
+        "pulldown" | "pulldown-cmark" => "pulldown",
+        "comrak" => "comrak",
+        _ => "pulldown",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Startup snapshot of `~/.pi`
 // ---------------------------------------------------------------------------
