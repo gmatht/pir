@@ -188,8 +188,10 @@ sessions the user is actively tracking, so the "drive the queue" flow survives a
 restart. Concretely:
 
 - **Named lists.** A list has a **name** (e.g. `default`, `work`, `side-project`).
-  Lists live under `~/.pi/agent/active-sessions/` as `<name>.json`. The user can
-  create a new named list or load an existing one.
+  Lists live in their **own dedicated directory**, `~/.pi/active-sessions/`, as
+  `<name>.json` — a sibling of `~/.pi/agent/` (the config dir), not inside it, so
+  session lists never clash with or pollute the config/agent directory. The user
+  can create a new named list or load an existing one.
 - **Save** — write the current active-session list (ids + a short label) to the
   currently-loaded list's file. **By default, save back to the same list that was
   loaded** — so if you loaded `work`, saving writes to `work.json`, not a new
