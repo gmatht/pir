@@ -605,6 +605,12 @@ impl Agent {
         self.su_security_enabled
     }
 
+    /// The active security policy (level, apt, network, ask, read, quarantine).
+    /// Returns `None` when no guardrail is configured.
+    pub fn security_policy(&self) -> Option<crate::security::SecurityPolicy> {
+        self.security.as_ref().map(|c| c.policy.clone())
+    }
+
     /// Set the local su-security authorization for this session. Returns the
     /// reason it was recorded at (for audit). `reason` is required when turning
     /// the boundary OFF, because disabling it lets the agent act with the

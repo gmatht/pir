@@ -21,6 +21,20 @@ fn main() {
     let root = Path::new(&manifest);
     let ext_dir = root.join("extensions");
 
+    // Embed the git commit hash the binary was built from (for the About
+    // dialog). Falls back to "unknown" when not in a git checkout.
+    let git_hash = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(&manifest)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=GIT_HASH={git_hash}");
+    println!("cargo:rerun-if-changed=.git/HEAD");
+
     let mut entries: Vec<String> = Vec::new();
     if let Ok(read) = fs::read_dir(&ext_dir) {
         for e in read.flatten() {

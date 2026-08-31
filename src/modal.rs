@@ -282,6 +282,138 @@ fn action_for(key: &str) -> MenuAction {
     }
 }
 
+/// Show the security dialog on the alternate screen. Displays the current
+/// posture and OS support (needs-root / extra deps / active) for each option.
+/// Returns `None` if not a tty.
+pub fn security_dialog(
+    policy: &crate::security::SecurityPolicy,
+    su_security: bool,
+) -> Option<()> {
+    let _modal = Modal::enter()?;
+    let lines = security_lines(policy, su_security);
+    draw_box("pir — security", &lines);
+    // Read keys until the user dismisses (Esc/ctrl-c/Enter).
+    loop {
+        match read_key()? {
+            Key::Esc | Key::CtrlC | Key::CtrlD | Key::Enter => return Some(()),
+            _ => {}
+        }
+    }
+}
+
+fn security_lines(policy: &crate::security::SecurityPolicy, su_security: bool) -> Vec<String> {
+    use crate::term;
+    let mut lines = Vec::new();
+    lines.push(term::bold("posture").to_string());
+    lines.push(format!("  level: {}", term::cyan(policy.level.as_str())));
+    lines.push(format!("  apt: {}   network: {}   ask: {}   read: {}",
+        policy.apt.as_str(), policy.network.as_str(), policy.ask.as_str(), policy.read.as_str()));
+    lines.push(format!("  quarantine: {}   project-quarantine: {}",
+        if policy.quarantine { "on" } else { "off" },
+        if policy.quarantine_project { "on" } else { "off" }));
+    lines.push(format!("  su-based boundary: {}", if su_security { term::green("ENABLED") } else { term::yellow("disabled") }));
+    lines.push(String::new());
+    lines.push(term::bold("OS support").to_string());
+    // unix vs windows support.
+    #[cfg(unix)]
+    {
+        lines.push("  overlayfs quarantine: needs root + overlayfs in kernel".to_string());
+        lines.push("  su-based boundary: needs root (sudoers.d/skynet-ai + wrappers)".to_string());
+        lines.push("  apt: needs root to install".to_string());
+    }
+    #[cfg(windows)]
+    {
+        lines.push(term::yellow("  Windows security: TODO (Defender/SmartScreen, AppContainer,").to_string());
+        lines.push(term::yellow("  MIC, UAC, WDAC — not yet implemented)").to_string());
+    }
+    lines.push(String::new());
+    lines.push(term::dim("[esc] close").to_string());
+    lines
+}
+
+/// Show the settings dialog on the alternate screen. Displays the current
+/// settings (model, thinking, done-prompt color, markdown backend, incremental,
+/// full-auto). Returns `None` if not a tty.
+pub fn settings_dialog(
+    model: &str,
+    thinking: &str,
+    show_thinking: bool,
+    incremental: bool,
+    full_auto: bool,
+) -> Option<()> {
+    let _modal = Modal::enter()?;
+    let lines = settings_lines(model, thinking, show_thinking, incremental, full_auto);
+    draw_box("pir — settings", &lines);
+    loop {
+        match read_key()? {
+            Key::Esc | Key::CtrlC | Key::CtrlD | Key::Enter => return Some(()),
+            _ => {}
+        }
+    }
+}
+
+fn settings_lines(
+    model: &str,
+    thinking: &str,
+    show_thinking: bool,
+    incremental: bool,
+    full_auto: bool,
+) -> Vec<String> {
+    use crate::term;
+    let mut lines = Vec::new();
+    lines.push(format!("  model: {}", term::cyan(model)));
+    lines.push(format!("  thinking: {}   show: {}", term::cyan(thinking), if show_thinking { "on" } else { "off" }));
+    lines.push(format!("  done-prompt color: {}", term::cyan(&term::done_prompt_color_token())));
+    lines.push(format!("  markdown backend: {}", term::cyan(crate::config::markdown_renderer_backend())));
+    lines.push(format!("  incremental markdown: {}", if incremental { "on" } else { "off" }));
+    lines.push(format!("  full-auto: {}", if full_auto { term::green("on") } else { "off".to_string() }));
+    lines.push(String::new());
+    lines.push(term::dim("change with /model, /thinking, /default-model, /su-security").to_string());
+    lines.push(term::dim("[esc] close").to_string());
+    lines
+}
+
+/// Show the help dialog on the alternate screen. `help_text` is the full `/help`
+/// text (split into lines). Returns `None` if not a tty.
+pub fn help_dialog(help_text: &str) -> Option<()> {
+    let _modal = Modal::enter()?;
+    let lines: Vec<String> = help_text.lines().map(|l| l.to_string()).collect();
+    draw_box("pir — help", &lines);
+    loop {
+        match read_key()? {
+            Key::Esc | Key::CtrlC | Key::CtrlD | Key::Enter => return Some(()),
+            _ => {}
+        }
+    }
+}
+
+/// Show the about dialog on the alternate screen (version + git hash + build
+/// profile + license + deps). Returns `None` if not a tty.
+pub fn about_dialog() -> Option<()> {
+    let _modal = Modal::enter()?;
+    use crate::term;
+    let lines = vec![
+        format!("pir {}", term::bold(env!("CARGO_PKG_VERSION"))),
+        format!("git: {}", term::cyan(env!("GIT_HASH"))),
+        format!("build: {} · opt-level {} · lto {}",
+            if cfg!(debug_assertions) { "debug" } else { "release" },
+            option_env!("OPT_LEVEL").unwrap_or("?"),
+            option_env!("LTO").unwrap_or("?")),
+        format!("license: {}", term::dim("GPL-3.0")),
+        String::new(),
+        term::dim("deps: pulldown-cmark · streamdown-parser · rustyline · ureq · smol · crossterm").to_string(),
+        String::new(),
+        term::dim("[esc] close").to_string(),
+    ];
+    draw_box("pir — about", &lines);
+    loop {
+        match read_key()? {
+            Key::Esc | Key::CtrlC | Key::CtrlD | Key::Enter => return Some(()),
+            _ => {}
+        }
+    }
+}
+
 /// Show a masked secret-entry dialog on the alternate screen and return the
 /// typed value. The key is shown as `••••` and never touches the normal screen
 /// or scrollback. Returns `None` if the terminal isn't a tty (caller falls back

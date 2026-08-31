@@ -223,6 +223,15 @@ impl SecurityLevel {
             SecurityLevel::Guard | SecurityLevel::Sandbox | SecurityLevel::Strict | SecurityLevel::Worktree
         )
     }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SecurityLevel::Sandbox => "sandbox",
+            SecurityLevel::Strict => "strict",
+            SecurityLevel::Worktree => "worktree",
+            SecurityLevel::Guard => "guard",
+            SecurityLevel::Off => "off",
+        }
+    }
     /// True when the agent is repo-isolated: it owns a git worktree + branch
     /// and can only submit PRs (never write trunk directly). In this mode the
     /// existing `wt` extension is driven into PR-submission mode.

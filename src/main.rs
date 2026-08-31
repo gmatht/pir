@@ -2238,22 +2238,34 @@ fn handle_command(
                     }
                 }
                 Some(crate::modal::MenuAction::Security) => {
-                    // Show the current security posture.
+                    // Show the current security posture on the alternate screen.
                     let g = agent_slot.lock().unwrap();
                     if let Some(agent) = g.as_ref() {
-                        println!(
-                            "su-based security: {}",
-                            if agent.su_security_enabled() { "ENABLED" } else { "disabled" }
-                        );
+                        if let Some(policy) = agent.security_policy() {
+                            let _ = crate::modal::security_dialog(&policy, agent.su_security_enabled());
+                        } else {
+                            println!("{}", term::dim("(no security guardrail configured)"));
+                        }
                     }
                 }
                 Some(crate::modal::MenuAction::Settings) => {
-                    println!("settings: see /model, /thinking, /default-model, /su-security");
+                    // Show the current settings on the alternate screen.
+                    let g = agent_slot.lock().unwrap();
+                    if let Some(agent) = g.as_ref() {
+                        let _ = crate::modal::settings_dialog(
+                            &agent.label(),
+                            agent.thinking_level().as_str(),
+                            agent.show_thinking(),
+                            agent.incremental_md(),
+                            full_auto,
+                        );
+                    }
                 }
-                Some(crate::modal::MenuAction::Help) => print!("{HELP}"),
+                Some(crate::modal::MenuAction::Help) => {
+                    let _ = crate::modal::help_dialog(HELP);
+                }
                 Some(crate::modal::MenuAction::About) => {
-                    println!("pir {}", env!("CARGO_PKG_VERSION"));
-                    println!("{}", term::dim("GPL-3.0 · pulldown-cmark · streamdown-parser · rustyline · ureq · smol · crossterm"));
+                    let _ = crate::modal::about_dialog();
                 }
                 Some(crate::modal::MenuAction::Quit) => std::process::exit(0),
                 _ => {}
