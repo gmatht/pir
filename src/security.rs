@@ -296,12 +296,43 @@ pub struct SecurityPolicy {
     /// credential/secret reads require an `ask`.
     pub read: ReadMode,
     pub extra_guard: Vec<String>,
+    /// Overlayfs write-quarantine: when `pir` can mount (root), the agent still
+    /// *all* commands, but writes to the configured system trees are
+    /// redirected into an overlay `upperdir` so the real fs is untouched until
+    /// the operator reviews + applies them (the `/quarantine` command). This is
+    /// the default-on safe posture: run everything, stage the writes. Set
+    /// `quarantine = false` to disable (falls back to the in-process guardrail).
+    pub quarantine: bool,
+    /// Project-scoped write-quarantine: when a worktree is whitelisted (worktree
+    /// mode), overlay the *repo root* with a staging upper and bind-mount the
+    /// agent's own worktree read-write on top, so only the worktree is written
+    /// to the real fs — every other write (central `.git`, trunk, other
+    /// worktrees) is quarantined and visible only to the agent. On by default;
+    /// the `wt` extension engages it the moment a worktree is created. Set
+    /// `quarantine-project = false` (or `PIR_QUARANTINE=0`) to disable.
+    pub quarantine_project: bool,
+    /// Directories to overlay (stage) when quarantine is active. Empty => the
+    /// module default (`/etc`, `/usr/local`, `/opt`, `/srv`, `/var`, `/boot`).
+    pub quarantine_dirs: Vec<String>,
+    /// Where the staging upper/work layers live (must not be inside a staged dir).
+    pub quarantine_staging: PathBuf,
+    /// Paths that must never be staged even under quarantine — they're hard-
+    /// denied by the in-process guardrail instead (critical DBs, secret stores).
+    pub quarantine_critical: Vec<String>,
     /// Worktree-mode idle policy (only meaningful when `level == Worktree`).
     /// What an idle agent auto-tasks itself with when it has no user prompt:
     /// `errors` => fix snuck-in build/test failures first; `warnings` => also
     /// clear compiler warnings/lints once clean; `hygiene` => also low-risk
     /// hygiene (fmt/doc-comments); `off` => stay idle.
     pub idle: IdlePolicy,
+    /// Repo-isolation: the single worktree path the agent is allowed to write
+    /// to directly. When set, any write outside it — including the central
+    /// `.git`, the trunk checkout, or *other* agents' worktrees — is denied (or
+    /// quarantined) rather than applied to the real fs. Each agent gets its own
+    /// whitelisted worktree; everything else is read-only to it. Empty => no
+    /// per-agent worktree whitelist is in force (the §9.3 critical-target
+    /// guardrail still applies globally).
+    pub allow_worktree: Option<PathBuf>,
     /// Max open self-PRs an idle agent keeps in flight (rate-limit the swarm).
     pub idle_max_open_prs: usize,
     /// Whether a dedicated fixer agent owns failing merge requests.
@@ -431,9 +462,15 @@ impl Default for SecurityPolicy {
             ask: AskMode::Ask,
             read: ReadMode::Open,
             extra_guard: Vec::new(),
+            quarantine: true,
+            quarantine_project: true,
+            quarantine_dirs: Vec::new(),
+            quarantine_staging: PathBuf::from(""),
+            quarantine_critical: Vec::new(),
             idle: IdlePolicy::Warnings,
             idle_max_open_prs: 1,
             fixer_agent: true,
+            allow_worktree: None,
             denials: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -455,7 +492,7 @@ impl SecurityPolicy {
             Op::Read => {
                 if self.read == ReadMode::GuardedSecrets {
                     if let Some(path) = &ask.path {
-                        if self.is_secret(path) {
+                        if is_secret(path) {
                             return Verdict::Deny {
                                 parcel: Parcel::GuardSecrets,
                                 risk: Risk::High,
@@ -466,7 +503,33 @@ impl SecurityPolicy {
                 Verdict::Allow
             }
             Op::Write => {
+                // When an overlayfs write-quarantine is mounted (the project
+                // overlay and/or the system-tree overlay over /var, /etc, ...),
+                // the overlay itself intercepts the write and stages it (visible
+                // only to the agent) instead of mutating the real fs. The
+                // in-process guardrail steps aside so the write reaches the
+                // overlay and stages — this is exactly how writes to /var and
+                // friends are *quarantined* (reviewable via /quarantine) rather
+                // than hard-blocked. The in-process hard-deny (is_system_state /
+                // GuardSystem) only fires as a fallback when NO overlay is mounted
+                // (e.g. a non-root `ai_*` agent).
+                if crate::security::overlay::project_quarantine_engaged()
+                    || crate::security::overlay::system_quarantine_engaged()
+                {
+                    return Verdict::Allow;
+                }
                 if let Some(path) = &ask.path {
+                    // Repo-isolation guard: in `worktree` mode (or whenever a
+                    // whitelisted worktree is active) the agent may only write
+                    // inside *its own* worktree. Writes to the central `.git`
+                    // metadata or to other worktrees are denied — they must go
+                    // through a PR, never a direct write.
+                    if let Some(parcel) = self.guard_worktree_write(path) {
+                        return Verdict::Deny {
+                            parcel: parcel.clone(),
+                            risk: parcel.default_risk(),
+                        };
+                    }
                     if let Some(parcel) = self.guard_write_target(path) {
                         return Verdict::Deny { parcel: parcel.clone(), risk: parcel.default_risk() };
                     }
@@ -498,12 +561,33 @@ impl SecurityPolicy {
         }
     }
 
+    /// Repo-isolation guard: returns a `Deny` parcel when a write targets
+    /// anywhere outside the agent's own whitelisted worktree. When
+    /// `allow_worktree` is set, the agent may only write inside it — the
+    /// central `.git`, the trunk checkout, and every *other* agent's worktree
+    /// are off-limits (write-denied; the model is told to submit a PR instead).
+    fn guard_worktree_write(&self, path: &Path) -> Option<Parcel> {
+        let Some(wt) = &self.allow_worktree else {
+            return None;
+        };
+        let canon = canonicalize_lenient(path);
+        // Also deny writes to any `.git` metadata dir regardless of worktree.
+        if is_repo_git(&canon) {
+            return Some(Parcel::GuardRepoGit);
+        }
+        // Allow only paths that live under the whitelisted worktree.
+        if under_dir(&canon, wt) {
+            return None;
+        }
+        Some(Parcel::GuardOtherUsers)
+    }
+
     fn guard_write_target(&self, path: &Path) -> Option<Parcel> {
         let canon = canonicalize_lenient(path);
         if is_database(&canon) {
             return Some(Parcel::GuardDb);
         }
-        if self.is_secret(&canon) {
+        if is_secret(&canon) {
             return Some(Parcel::GuardSecrets);
         }
         if is_other_users(&canon) {
@@ -522,20 +606,6 @@ impl SecurityPolicy {
             return Some(Parcel::Custom("operator-guarded".into()));
         }
         None
-    }
-
-    pub fn is_secret(&self, path: &Path) -> bool {
-        let s = path.to_string_lossy().to_ascii_lowercase();
-        s.contains("/.ssh/")
-            || s.ends_with("/.ssh")
-            || s.contains("/.aws/")
-            || s.contains("/.gnupg/")
-            || s.ends_with(".key")
-            || s.ends_with(".pem")
-            || s.contains("/.config/gh/")
-            || s.contains("/.config/google-chrome/")
-            || s.contains("/.mozilla/")
-            || s.contains("/.config/gcloud/")
     }
 
     pub fn record_denial(&self, d: Denial) {
@@ -663,27 +733,81 @@ impl Platform for GenericPlatform {}
 // Security context — the object the agent actually holds
 // ===========================================================================
 
+/// A live snapshot of the agent's recent activity, shared with the request sink
+/// so an approval dialog can show *context* (the last few prompts and the
+/// agent's recent thinking) — the operator sees *why* the agent is asking.
+pub struct ApprovalContext {
+    inner: Mutex<ApprovalContextInner>,
+}
+
+impl Default for ApprovalContext {
+    fn default() -> Self {
+        ApprovalContext { inner: Mutex::new(ApprovalContextInner::default()) }
+    }
+}
+
+impl ApprovalContext {
+    /// Record a user prompt (keeps the last `n`).
+    pub fn note_prompt(&self, p: &str) {
+        let mut g = self.inner.lock().unwrap();
+        g.recent_prompts.push(p.to_string());
+        let n = g.recent_prompts.len();
+        if n > 8 {
+            g.recent_prompts.drain(0..n - 8);
+        }
+    }
+    /// Record a thinking line (keeps the last `n`).
+    pub fn note_thinking(&self, t: &str) {
+        let mut g = self.inner.lock().unwrap();
+        g.recent_thinking.push(t.to_string());
+        let n = g.recent_thinking.len();
+        if n > 16 {
+            g.recent_thinking.drain(0..n - 16);
+        }
+    }
+    /// Snapshot the recent prompts + thinking for a dialog.
+    pub fn snapshot(&self) -> (Vec<String>, Vec<String>) {
+        let g = self.inner.lock().unwrap();
+        (g.recent_prompts.clone(), g.recent_thinking.clone())
+    }
+}
+
+#[derive(Default)]
+struct ApprovalContextInner {
+    recent_prompts: Vec<String>,
+    recent_thinking: Vec<String>,
+}
+
 /// The live security context threaded through the agent.
 pub struct SecurityContext {
     pub policy: SecurityPolicy,
     pub platform: Box<dyn Platform>,
     pub sink: Box<dyn RequestSink>,
     pub headless: AtomicBool,
+    /// Live overlayfs-quarantine toggle (mirrors `policy.quarantine` at
+    /// construction; flippable at runtime via `set_quarantine`).
+    pub quarantine: AtomicBool,
+    /// Shared approval context (recent prompts + thinking) for the request sink.
+    pub approval: Arc<ApprovalContext>,
 }
 
 impl SecurityContext {
     pub fn new(policy: SecurityPolicy, headless: bool) -> Arc<Self> {
         let platform: Box<dyn Platform> = Box::new(ActivePlatform::default());
+        let approval = Arc::new(ApprovalContext::default());
         let sink: Box<dyn RequestSink> = if headless {
             Box::new(QueuedSink::default())
         } else {
-            Box::new(TtySink::default())
+            Box::new(TtySink { approval: Some(approval.clone()) })
         };
+        let q = policy.quarantine;
         Arc::new(SecurityContext {
             policy,
             platform,
             sink,
             headless: AtomicBool::new(headless),
+            quarantine: AtomicBool::new(q),
+            approval,
         })
     }
 
@@ -716,6 +840,19 @@ impl SecurityContext {
     pub fn can_read(&self, path: &Path) -> bool {
         matches!(self.check(&Ask::read(path.to_path_buf())), Verdict::Allow)
     }
+
+    /// Enable/disable overlayfs write-quarantine on this already-built context
+    /// (the launcher may flip it after probing mount capability, or a user
+    /// command may toggle it). Only flips the in-process flag; the actual
+    /// overlay mounts are set up / torn down by `overlay`.
+    pub fn set_quarantine(&self, enabled: bool) {
+        self.quarantine.store(enabled, Ordering::SeqCst);
+    }
+
+    /// Whether overlayfs write-quarantine is currently active.
+    pub fn is_quarantined(&self) -> bool {
+        self.quarantine.load(Ordering::SeqCst)
+    }
 }
 
 // ===========================================================================
@@ -723,10 +860,28 @@ impl SecurityContext {
 // ===========================================================================
 
 #[derive(Default)]
-pub struct TtySink;
+pub struct TtySink {
+    /// Shared approval context (recent prompts + thinking) for the dialog.
+    pub approval: Option<Arc<ApprovalContext>>,
+}
 impl RequestSink for TtySink {
     fn surface(&self, d: &Denial) -> Decision {
         use crate::term;
+        // Try the alternate-screen dialog first. If the terminal isn't a tty
+        // (piped/scripted) or the dialog can't start, fall back to the plain
+        // line prompt. The dialog reads a key directly (not via `read_answer`),
+        // so it works even while a turn has stdin in raw non-blocking mode —
+        // fixing the mid-turn auto-deny bug.
+        if let Some(approval) = &self.approval {
+            if let Some(decision) = crate::modal::tool_approval(d, approval) {
+                return match decision {
+                    crate::modal::Approval::AllowOnce => Decision::AllowOnce,
+                    crate::modal::Approval::AllowSession => Decision::AllowSession,
+                    crate::modal::Approval::Deny => Decision::Deny,
+                };
+            }
+        }
+        // Fallback: plain line prompt (non-tty or dialog unavailable).
         let what = match &d.ask.path {
             Some(p) => p.display().to_string(),
             None => match &d.ask.target {
@@ -841,7 +996,43 @@ pub fn load_policy() -> SecurityPolicy {
                     policy.extra_guard.push(pat);
                 }
             }
+            "security.quarantine" | "quarantine" => {
+                policy.quarantine = !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no");
+            }
+            "security.quarantine-dirs" | "quarantine-dirs" | "overlay" => {
+                for d in v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                    let p = crate::config::path_from_string(&d);
+                    policy.quarantine_dirs.push(p.to_string_lossy().to_string());
+                }
+            }
+            "security.quarantine-project" | "quarantine-project" => {
+                policy.quarantine_project =
+                    !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no");
+            }
+            "security.allow-worktree" | "allow-worktree" => {
+                let p = crate::config::path_from_string(&v);
+                if !p.as_os_str().is_empty() {
+                    policy.allow_worktree = Some(p);
+                }
+            }
+            "security.quarantine-staging" | "quarantine-staging" => {
+                policy.quarantine_staging = crate::config::path_from_string(&v);
+            }
+            "security.quarantine-critical" | "quarantine-critical" => {
+                for p in v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                    policy.quarantine_critical.push(p);
+                }
+            }
             _ => {}
+        }
+    }
+    // Honour PIR_WT_WHITELIST (set by the `wt` extension when it whitelists the
+    // agent's own worktree) so the in-process guardrail — the fallback used when
+    // the overlay can't mount — also allows writes there and denies the central
+    // `.git` / other worktrees.
+    if let Some(wt) = std::env::var_os("PIR_WT_WHITELIST") {
+        if !wt.is_empty() {
+            policy.allow_worktree = Some(PathBuf::from(wt));
         }
     }
     policy
@@ -860,6 +1051,34 @@ pub fn canonicalize_lenient(p: &Path) -> PathBuf {
     {
         lexical_abs(p)
     }
+}
+
+/// Whether `path` is lexicographically contained within `dir` (after a lenient
+/// canonicalize). Used by the repo-isolation guard to confine an agent's writes
+/// to its own whitelisted worktree. A trailing separator is appended to both
+/// sides so `/a/b` is *not* considered under `/a/bee`, but `/a/b` is under
+/// `/a/b`.
+pub fn under_dir(path: &Path, dir: &Path) -> bool {
+    let p = canonicalize_lenient(path).to_string_lossy().to_string();
+    let d = canonicalize_lenient(dir).to_string_lossy().to_string();
+    let p = if p.ends_with('/') { p } else { format!("{p}/") };
+    let d = if d.ends_with('/') { d } else { format!("{d}/") };
+    p.starts_with(&d)
+}
+
+/// Whether a path looks like a secret/credential store.
+pub fn is_secret(path: &Path) -> bool {
+    let s = path.to_string_lossy().to_ascii_lowercase();
+    s.contains("/.ssh/")
+        || s.ends_with("/.ssh")
+        || s.contains("/.aws/")
+        || s.contains("/.gnupg/")
+        || s.ends_with(".key")
+        || s.ends_with(".pem")
+        || s.contains("/.config/gh/")
+        || s.contains("/.config/google-chrome/")
+        || s.contains("/.mozilla/")
+        || s.contains("/.config/gcloud/")
 }
 
 fn lexical_abs(p: &Path) -> PathBuf {
@@ -895,6 +1114,13 @@ pub fn is_system_state(p: &Path) -> bool {
         || abs.starts_with("/efi")
         || abs.starts_with("/sys/firmware/efi")
         || abs.starts_with("/lib/systemd/system/")
+        // System trees the system-tree overlay quarantines (DEFAULT_OVERLAY_DIRS).
+        // When that overlay can't mount (non-root `ai_*` agents), this hard-denies
+        // writes here as a fallback so they still can't corrupt system state.
+        || abs.starts_with("/var")
+        || abs.starts_with("/usr/local")
+        || abs.starts_with("/opt")
+        || abs.starts_with("/srv")
         || s.starts_with("C:\\Windows\\System32")
         || s.starts_with("C:\\Windows\\boot")
 }
@@ -1172,6 +1398,10 @@ pub mod windows;
 /// escalations are exercised, and where host-root writes are reaped back to the
 /// project owner so files never end up host-root-owned.
 pub mod privilege;
+/// Overlayfs-backed write quarantine: stage the agent's writes into an overlay
+/// `upperdir` so the real filesystem is untouched until the operator reviews +
+/// applies them. On by default when the launcher can mount (root).
+pub mod overlay;
 
 #[cfg(test)]
 mod tests {

@@ -21,7 +21,10 @@ streamdown-ansi = "0.1.4"                        # ANSI sanitize for link/termin
 # Optional TUI deps, only built when `--features tui` is set (so the default
 # binary stays lightweight and the locked build cache is unaffected).
 ratatui = { version = "0.29", optional = true }
-crossterm = { version = "0.28", optional = true }
+# crossterm is non-optional: it's already in the tree transitively via
+# streamdown-ansi, and the alternate-screen modal dialogs (docs/DIALOGS.md) use
+# it in the default build. ratatui stays optional (TUI only).
+crossterm = "0.28"
 
 # Optional GUI deps (rustxwidgets) for the `gui` / `pancurses` REPL backends.
 # Vendored in-tree at `vendors/rustxWidgets` (a real directory, shipped in
@@ -36,7 +39,7 @@ rustxwidgets = { path = "vendors/rustxWidgets/rustxwidgets", version = "0.1.0", 
 # in-app scrollback. OFF by default — build/run with `--features tui`; pass
 # `--no-tui` (or just build without the feature) to use the streaming REPL.
 default = []
-tui = ["dep:ratatui", "dep:crossterm"]
+tui = ["dep:ratatui"]
 # Swap the markdown renderer backend to comrak (a heavier CommonMark/GFM
 # parser). OFF by default: the default backend is pulldown-cmark (smaller
 # binary, same supported GFM subset for our terminal renderer). Keep comrak

@@ -2,6 +2,7 @@ mod agent;
 mod config;
 mod goal;
 mod md;
+mod modal;
 mod notify;
 mod picker;
 mod plugin;

@@ -241,50 +241,58 @@ impl Agent {
             let policy = crate::security::load_policy();
             let headless = std::env::var("PIR_HEADLESS").is_ok();
             let ctx = crate::security::SecurityContext::new(policy, headless);
-            // Scope every overlay we mount to THIS agent's private mount namespace
-            // (see enter_private_mount_ns) so we quarantine the agent's writes
-            // only, never the host's. If we can't get a private namespace we must
-            // NOT mount (that would shadow /var, /etc, ... for the whole system); we
-            // fall back to the in-process hard-deny guardrail instead.
-            let private_ns = crate::security::overlay::enter_private_mount_ns().is_ok();
-            // Engage the overlayfs write-quarantine (the default-on safe posture):
-            // if the launcher can mount (root) we stage the agent's writes behind
-            // overlay upperdirs so the real fs is untouched until the operator
-            // reviews + applies them with /quarantine. When mounting is
-            // impossible (the common non-root ai_* case) we gracefully skip it
-            // and rely on the in-process write guardrail instead.
-            if ctx.policy.quarantine {
-                if !private_ns {
-                    eprintln!(
-                        "{}",
-                        crate::term::dim(
-                            "[pir] write-quarantine disabled: private mount namespace unavailable (would shadow the host's /var, /etc); writes guarded in-process only"
-                        )
-                    );
-                    ctx.set_quarantine(false);
-                } else {
-                    let mut q = crate::security::overlay::Quarantine::from_policy(&ctx.policy);
-                    match q.mount() {
-                        Ok(n) => {
-                            crate::security::overlay::set_active(q);
-                            ctx.set_quarantine(true);
-                            if n == 0 {
+            // Overlayfs write-quarantine is a *launcher* concern: it mounts
+            // overlays over /var, /etc, ... and must never run inside unit tests
+            // (tests construct Agents directly; mounting would shadow the test
+            // host and poison the process-global quarantine flags).
+            #[cfg(not(test))]
+            {
+                // Scope every overlay we mount to THIS agent's private mount
+                // namespace (see enter_private_mount_ns) so we quarantine the
+                // agent's writes only, never the host's. If we can't get a private
+                // namespace we must NOT mount (that would shadow /var, /etc, ...
+                // for the whole system); we fall back to the in-process hard-deny
+                // guardrail instead.
+                let private_ns = crate::security::overlay::enter_private_mount_ns().is_ok();
+                // Engage the overlayfs write-quarantine (the default-on safe
+                // posture): if the launcher can mount (root) we stage the agent's
+                // writes behind overlay upperdirs so the real fs is untouched
+                // until the operator reviews + applies them with /quarantine. When
+                // mounting is impossible (the common non-root ai_* case) we
+                // gracefully skip it and rely on the in-process write guardrail.
+                if ctx.policy.quarantine {
+                    if !private_ns {
+                        eprintln!(
+                            "{}",
+                            crate::term::dim(
+                                "[pir] write-quarantine disabled: private mount namespace unavailable (would shadow the host's /var, /etc); writes guarded in-process only"
+                            )
+                        );
+                        ctx.set_quarantine(false);
+                    } else {
+                        let mut q = crate::security::overlay::Quarantine::from_policy(&ctx.policy);
+                        match q.mount() {
+                            Ok(n) => {
+                                crate::security::overlay::set_active(q);
+                                ctx.set_quarantine(true);
+                                if n == 0 {
+                                    eprintln!(
+                                        "{}",
+                                        crate::term::dim(
+                                            "[pir] write-quarantine engaged (no existing system trees to overlay yet; writes will stage on demand)"
+                                        )
+                                    );
+                                }
+                            }
+                            Err(reason) => {
                                 eprintln!(
                                     "{}",
-                                    crate::term::dim(
-                                        "[pir] write-quarantine engaged (no existing system trees to overlay yet; writes will stage on demand)"
-                                    )
+                                    crate::term::dim(&format!(
+                                        "[pir] write-quarantine not engaged ({reason}); writes are guarded in-process only"
+                                    ))
                                 );
+                                ctx.set_quarantine(false);
                             }
-                        }
-                        Err(reason) => {
-                            eprintln!(
-                                "{}",
-                                crate::term::dim(&format!(
-                                    "[pir] write-quarantine not engaged ({reason}); writes are guarded in-process only"
-                                ))
-                            );
-                            ctx.set_quarantine(false);
                         }
                     }
                 }
@@ -462,15 +470,15 @@ impl Agent {
             }
             "list_dir" => Ask::new(Op::Read).with_reason("list a directory"),
             "bash" => {
-                let cmd = input.get("command").and_then(Value::as_str).unwrap_or("").to_string();
-                // A `bash` tool may read, write, exec, connect, or escalate — the
-                // policy can't see individual syscalls, so we surface it as a
-                // generic `Custom` op whose reason carries the command. The
-                // operator's decision (allow-once / session / deny) applies to
-                // this command; the per-syscall guardrail (secret writes,
-                // critical paths) still holds at the mount layer.
-                Ask::new(Op::Custom(format!("bash: {cmd}")))
-                    .with_reason("run a shell command")
+                // The default posture is "run all commands": the write-quarantine
+                // is enforced by the overlayfs layer (syscall-level), not by this
+                // in-process preflight (which cannot see individual syscalls). So
+                // bash is surfaced as an `Exec` op, which `decide` allows by
+                // default; writes still stage into the overlay upper and are
+                // reviewed via /quarantine. (A stricter posture can gate exec
+                // separately; the per-syscall guardrail for secret/critical
+                // paths holds at the mount layer.)
+                Ask::new(Op::Exec).with_reason("run a shell command")
             }
             _ => return None,
         };
@@ -1217,6 +1225,11 @@ impl Agent {
     /// decision point per context.
     pub fn turn(&mut self, user: &str) -> Result<(), String> {
         self.last_prompt = user.to_string();
+        // Record the prompt in the shared approval context so a mid-turn
+        // tool-approval dialog can show *why* the agent is asking.
+        if let Some(sec) = &self.security {
+            sec.approval.note_prompt(user);
+        }
         let msg = Message::user(user);
         log_line(&mut self.log, &msg);
         self.history.push(msg);
@@ -1376,6 +1389,11 @@ impl Agent {
             let show_thinking = self.show_thinking;
             let mut think_buf = String::new();
             let mut on_think = |t: &str| {
+                // Record thinking in the shared approval context so a tool-
+                // approval dialog can show the agent's recent reasoning.
+                if let Some(sec) = &self.security {
+                    sec.approval.note_thinking(t);
+                }
                 if !self.silent() && show_thinking {
                     stop_spinner();
                     think_buf.push_str(t);
