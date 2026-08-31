@@ -15,12 +15,22 @@ use crate::term;
 use rustxwidgets::prelude::*;
 use std::os::raw::c_void;
 use std::path::PathBuf;
+use std::rc::Rc;
+use std::cell::{RefCell, Cell};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::run_foreground_turn;
 
 type AgentSlot = Arc<Mutex<Option<Agent>>>;
+
+/// The concrete `Entry` type returned by `App::create_entry` — the backend
+/// adapter `Entry` (nwg on Windows, gtk on Linux). `rustxwidgets::Entry` (the
+/// prelude alias) is a thin wrapper, so we name the real type explicitly here.
+#[cfg(windows)]
+type GuiEntry = rustxwidgets::backends_nwg_adapter::Entry;
+#[cfg(all(feature = "gtk", target_os = "linux"))]
+type GuiEntry = rustxwidgets::backends_gtk_adapter::Entry;
 
 /// GDK keyval for the Tab key (GDK_KEY_Tab).
 const GDK_KEY_TAB: u32 = 0xff09;
@@ -274,6 +284,23 @@ struct GuiWidgets {
     status: Label,
 }
 
+/// Everything that is per-session when the GUI shows one tab per session:
+/// its own conversation model, widgets, agent slot, turn canceller, prompt
+/// history and completion channel. One `SessionView` lives in the `tabs`
+/// `TabView` at the same index.
+#[derive(Clone)]
+struct SessionView {
+    state: Arc<Mutex<GuiState>>,
+    widgets: GuiWidgets,
+    entry: GuiEntry,
+    agent_slot: AgentSlot,
+    fg_cancel: Arc<AtomicBool>,
+    fg_quiet: Arc<AtomicBool>,
+    hist_nav: Arc<Mutex<HistoryNav>>,
+    done_tx: smol::channel::Sender<()>,
+    app: App,
+}
+
 /// Run the GTK GUI REPL. Returns `Ok(())` on a clean exit (`/exit` or window
 /// close) or an error if the backend couldn't be initialised. Mirrors the TUI:
 /// the agent is switched to `quiet` mode and turns run on worker threads; the
@@ -287,87 +314,198 @@ pub fn run(
     _full_auto: bool,
 ) -> Result<(), String> {
     let app = App::init().map_err(|e| format!("rustxwidgets init: {e}"))?;
-    let app_quit = app.clone();
-    let app_quit = app.clone();
 
-    // -- Build the widget tree --
+    // -- Build the window + horizontal-tab container --
     let window = app.create_window().map_err(|e| format!("create_window: {e}"))?;
     window.set_title("pir");
     window.set_default_size(820, 600);
 
+    let tabs = app.create_tabview().map_err(|e| format!("tabview: {e}"))?;
+    window.set_child(&tabs);
+
+    // One SessionView per open tab, indexed identically to the TabView.
+    let sessions: Rc<RefCell<Vec<SessionView>>> = Rc::new(RefCell::new(Vec::new()));
+    let active: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+
+    // Switching tabs just moves keyboard focus to that tab's prompt.
+    {
+        let sessions_for_cb = sessions.clone();
+        let active_for_cb = active.clone();
+        tabs.set_on_tab_changed(Box::new(move |idx: usize| {
+            active_for_cb.set(idx);
+            let s = sessions_for_cb.borrow();
+            if let Some(sv) = s.get(idx) {
+                sv.entry.grab_focus();
+            }
+        }));
+    }
+
+    // Open the initial session using the agent the caller handed us.
+    {
+        let (done_tx, _done_rx) = smol::channel::bounded::<()>(1);
+        spawn_session(
+            "session",
+            agent_slot.clone(),
+            fg_cancel.clone(),
+            fg_quiet.clone(),
+            done_tx,
+            &app,
+            &tabs,
+            providers,
+            bus,
+            _full_auto,
+            &sessions,
+        );
+    }
+
+    window.present();
+
+    // -- Periodic drain: refresh every session's conversation from its log --
+    // A recurring timeout (~150ms) that drains each agent's log into its own
+    // conversation pane. Snapshot the views first so we don't hold the sessions
+    // lock across the (potentially slow) drain of every session.
+    let drain_sessions = sessions.clone();
+    let drain_bus = bus.clone();
+    #[cfg(all(feature = "gtk", target_os = "linux"))]
+    unsafe {
+        if let Some(loader) = rustxwidgets::backends::gtk::loader() {
+            rustxwidgets::gtk_dynamic_loader::timeout_add_recurring(&loader, 150, Box::new(move || {
+                for sv in &*drain_sessions.borrow() {
+                    drain_once(
+                        &sv.state,
+                        &sv.widgets,
+                        &sv.agent_slot,
+                        &sv.fg_cancel,
+                        &sv.fg_quiet,
+                        &sv.done_tx,
+                        &drain_bus,
+                    );
+                }
+            }));
+        }
+    }
+
+    // Window close (destroy signal) -> quit the GTK main loop.
+    #[cfg(all(feature = "gtk", target_os = "linux"))]
+    unsafe {
+        if let Some(loader) = rustxwidgets::backends::gtk::loader() {
+            let app_for_destroy = app.clone();
+            let _ = rustxwidgets::gtk_dynamic_loader::connect_signal(
+                &loader.symbols,
+                window.raw_handle(),
+                "destroy",
+                Box::new(move || {
+                    app_for_destroy.quit();
+                }),
+                2,
+            );
+        }
+    }
+
+    // Pure-NWG (Windows) periodic drain + window-close handling. The GTK loader
+    // paths above are linux-only, so on Windows nothing GTK is compiled.
+    #[cfg(windows)]
+    {
+        let drain_sessions = drain_sessions.clone();
+        let drain_bus = drain_bus.clone();
+        window.timeout_add_recurring(150, Box::new(move || {
+            for sv in &*drain_sessions.borrow() {
+                drain_once(
+                    &sv.state,
+                    &sv.widgets,
+                    &sv.agent_slot,
+                    &sv.fg_cancel,
+                    &sv.fg_quiet,
+                    &sv.done_tx,
+                    &drain_bus,
+                );
+            }
+        }));
+        window.on_close(Box::new(|| {
+            rustxwidgets::backends_nwg_adapter::quit_main_loop();
+        }));
+    }
+
+    app.run().map_err(|e| format!("gtk main loop: {e}"))
+}
+
+/// Build one session tab: its own conversation pane + prompt + status line,
+/// wired to its own agent slot / canceller / history. Pushes the resulting
+/// `SessionView` into `sessions` at the same index the `TabView` created.
+fn spawn_session(
+    title: &str,
+    agent_slot: AgentSlot,
+    fg_cancel: Arc<AtomicBool>,
+    fg_quiet: Arc<AtomicBool>,
+    done_tx: smol::channel::Sender<()>,
+    app: &App,
+    tabs: &TabView,
+    providers: &[Provider],
+    bus: &SharedBus,
+    _full_auto: bool,
+    sessions: &Rc<RefCell<Vec<SessionView>>>,
+) -> usize {
+    let idx = tabs.add_tab(title).expect("tabview: add_tab");
+
     // Vertical box: [conversation TextView (expand)] [Entry] [status]
     let vbox = app
         .create_box(Orientation::Vertical, 4)
-        .map_err(|e| format!("create_box: {e}"))?;
-
-    let textview = app.create_textview().map_err(|e| format!("create_textview: {e}"))?;
+        .expect("create_box");
+    let textview = app.create_textview().expect("create_textview");
     configure_conversation_textview(&textview);
     vbox.append(&textview);
 
-    let entry = app.create_entry().map_err(|e| format!("create_entry: {e}"))?;
+    let entry: GuiEntry = app.create_entry().expect("create_entry");
     entry.set_hexpand(true);
     vbox.append(&entry);
 
-    let status = app.create_label("pir · idle").map_err(|e| format!("create_label: {e}"))?;
-    #[cfg(all(feature = "gtk", target_os = "linux"))]
+    let status = app.create_label("pir · idle").expect("create_label");
     #[cfg(all(feature = "gtk", target_os = "linux"))]
     status.set_xalign(0.0); // left-align
     vbox.append(&status);
 
-    let tabs = app.create_tabview().map_err(|e| format!("tabview: {e}"))?;
-    let _tab = tabs.add_tab(&format!("session")).map_err(|e| format!("tab: {e}"))?;
-    let panel = tabs.tab_box(0).map_err(|e| format!("tabbox: {e}"))?;
+    let panel = tabs.tab_box(idx).expect("tabview: tab_box");
     panel.append(&vbox);
     vbox.set_hexpand(true);
     vbox.set_vexpand(true);
-    window.set_child(&tabs);
-    window.present();
 
-    // Keep keyboard focus on the Entry (the REPL prompt). Grab it right after
-    // the window is shown, and re-grab it every time it loses focus (e.g. the
-    // user clicks the scrollable TextView, or the periodic drain refreshes).
-    // `connect_focus_out_event` fires when focus leaves; we immediately
-    // `grab_focus` back so typing always lands in the Entry.
-    let entry_focus = entry.clone();
-    let _ = entry.connect_focus_out_event(move |_e: *mut c_void| {
-        entry_focus.grab_focus();
-        1 // stop propagation; keep focus here
-    });
-
-    // Tab completion + history navigation: an EventControllerKey on the Entry
-    // intercepts Tab (completes the buffer via `complete_idle`) and
-    // Arrow-Up/Down (walks the prompt history), returning 1 (handled) so focus
-    // never leaves the prompt. The controller is kept alive in
-    // `_key_controllers` for the whole `app.run()` so its Drop (which unrefs
-    // and removes it from the widget) never fires early.
-
-    // -- Shared state (created before the callbacks that capture it) --
     let state = Arc::new(Mutex::new(GuiState::new()));
     let widgets = GuiWidgets { textview: textview.clone(), status: status.clone() };
-    // Seed Arrow-Up history from the session's `.history` file (populated by
-    // main.rs at startup / on resume — the same store the streaming REPL uses).
+    // Seed Arrow-Up history from the session's `.history` file (same store the
+    // streaming REPL uses) and greet the user.
     {
         let mut s = state.lock().unwrap();
         s.history = term::load_history_lines();
-        s.push(ConvKind::System, &format!(
-            "pir · {} · GTK GUI  (/help for commands · Enter to send · ctrl-q to quit)",
-            providers[0].pid()
-        ));
+        s.push(
+            ConvKind::System,
+            &format!(
+                "pir · {} · GTK GUI  (/help · /sessions new|close|next|prev|<n> · Enter to send · ctrl-q to quit)",
+                providers[0].pid()
+            ),
+        );
         sync_textview(&widgets, &s);
     }
 
-    // Arrow-Up/Down navigation state for the prompt Entry.
     let hist_nav = Arc::new(Mutex::new(HistoryNav::default()));
+    let app_quit = app.clone();
 
+    // Keep keyboard focus on this tab's Entry (the REPL prompt).
+    let entry_focus = entry.clone();
+    let _ = entry.connect_focus_out_event(move |_e: *mut c_void| {
+        entry_focus.grab_focus();
+        1
+    });
+
+    // Tab completion + history navigation on this tab's prompt.
     let entry_comp_cb = entry.clone();
     let nav_for_keys = hist_nav.clone();
     let hist_for_keys = state.clone();
     let app_for_keys = app.clone();
-    let _ = entry.on_key_raw(Box::new(move |keyval: u32, state: u32| -> bool {
+    let _ = entry.on_key_raw(Box::new(move |keyval: u32, kstate: u32| -> bool {
         use std::sync::atomic::Ordering as AtomicOrdering;
         const CONTROL_MASK: u32 = 1 << 2;
         match keyval {
-            GDK_KEY_Q if (state & CONTROL_MASK) != 0 => {
+            GDK_KEY_Q if (kstate & CONTROL_MASK) != 0 => {
                 let _ = app_for_keys.clone().quit();
                 true
             }
@@ -392,9 +530,6 @@ pub fn run(
         }
     }));
 
-
-    let (done_tx, _done_rx) = smol::channel::bounded::<()>(1);
-
     // -- Entry activate: start a foreground turn (or queue if one is running) --
     let entry_cb_state = state.clone();
     let entry_cb_slot = agent_slot.clone();
@@ -406,6 +541,9 @@ pub fn run(
     let entry_cb_done = done_tx.clone();
     let entry_in_cb = entry.clone();
     let nav_for_activate = hist_nav.clone();
+    let app_for_activate = app.clone();
+    let sessions_for_activate = sessions.clone();
+    let tabs_for_activate = tabs.clone();
     let _ = entry.connect_activate(move |_data: *mut c_void| {
         let text = entry_in_cb.get_text().unwrap_or_default();
         entry_in_cb.set_text("");
@@ -422,6 +560,25 @@ pub fn run(
         nav_for_activate.lock().unwrap().reset();
 
         if let Some(cmd) = text.strip_prefix('/') {
+            // Session management is handled here (it must mutate tabs/sessions).
+            let mut parts = cmd.split_whitespace();
+            let sub = parts.next().unwrap_or("");
+            let rest: Vec<&str> = parts.collect();
+            if sub == "sessions" {
+                handle_session_command(
+                    &rest,
+                    &entry_cb_state,
+                    &entry_cb_widgets,
+                    &sessions_for_activate,
+                    &tabs_for_activate,
+                    &app_for_activate,
+                    &entry_cb_providers,
+                    &entry_cb_bus,
+                    _full_auto,
+                    &entry_cb_slot,
+                );
+                return;
+            }
             handle_command(
                 cmd,
                 &entry_cb_slot,
@@ -429,8 +586,7 @@ pub fn run(
                 &entry_cb_bus,
                 &entry_cb_cancel,
                 &entry_cb_state,
-                &app_quit,
-                &app_quit,
+                &app_for_activate,
                 &entry_cb_widgets,
             );
             return;
@@ -462,52 +618,145 @@ pub fn run(
         );
     });
 
-    // -- Periodic drain: refresh the conversation + status from the session log --
-    // A recurring glib timeout (~150ms) that drains the agent's log into the
-    // conversation pane, giving streaming output a live feel even though the
-    // agent writes only to its log. The timer keeps firing for the lifetime of
-    // the GTK main loop (until the window is destroyed).
-    let drain_state = state.clone();
-    let drain_widgets = widgets.clone();
-    let drain_slot = agent_slot.clone();
-    let drain_cancel = fg_cancel.clone();
-    let drain_quiet = fg_quiet.clone();
-    let drain_done = done_tx.clone();
-    let drain_bus = bus.clone();
-    #[cfg(all(feature = "gtk", target_os = "linux"))]
-    unsafe {
-        if let Some(loader) = rustxwidgets::backends::gtk::loader() {
-            rustxwidgets::gtk_dynamic_loader::timeout_add_recurring(&loader, 150, Box::new(move || {
-                drain_once(
-                    &drain_state,
-                    &drain_widgets,
-                    &drain_slot,
-                    &drain_cancel,
-                    &drain_quiet,
-                    &drain_done,
-                    &drain_bus,
-                );
-            }));
-        }
-    }
+    sessions.borrow_mut().push(SessionView {
+        state,
+        widgets,
+        entry,
+        agent_slot,
+        fg_cancel,
+        fg_quiet,
+        hist_nav,
+        done_tx,
+        app: app_quit,
+    });
+    idx
+}
 
-    // Window close (destroy signal) -> quit the GTK main loop.
-    #[cfg(all(feature = "gtk", target_os = "linux"))]
-    unsafe {
-        if let Some(loader) = rustxwidgets::backends::gtk::loader() {
-            let _ = rustxwidgets::gtk_dynamic_loader::connect_signal(
-                &loader.symbols,
-                window.raw_handle(),
-                "destroy",
-                Box::new(move || {
-                    app.quit();
-                }),
-                2,
+/// Handle `/sessions` sub-commands: `new` (open a tab with a fresh agent),
+/// `close` (close the current tab, keeping at least one), `next`/`prev` and
+/// `<n>` (switch), and (no arg) list the open sessions. Feedback is written to
+/// the *current* session's conversation pane.
+fn handle_session_command(
+    rest: &[&str],
+    state: &Arc<Mutex<GuiState>>,
+    widgets: &GuiWidgets,
+    sessions: &Rc<RefCell<Vec<SessionView>>>,
+    tabs: &TabView,
+    app: &App,
+    providers: &[Provider],
+    bus: &SharedBus,
+    _full_auto: bool,
+    sv_slot: &AgentSlot,
+) {
+    let mut s = state.lock().unwrap();
+    if rest.is_empty() {
+        let cur = tabs.current_tab();
+        let titles: Vec<String> = (0..tabs.tab_count())
+            .map(|i| tabs.tab_title(i).unwrap_or_default())
+            .collect();
+        s.push(ConvKind::System, &format!("sessions ({} open, * = active):", titles.len()));
+        for (i, t) in titles.iter().enumerate() {
+            s.push(ConvKind::System, &format!("  {}{} {}", if i == cur { "*" } else { " " }, i, t));
+        }
+        s.push(ConvKind::System, "use: /sessions new | close | next | prev | <n>");
+        sync_textview(widgets, &s);
+        return;
+    }
+    match rest[0] {
+        "new" => {
+            drop(s);
+            // Mirror the current session's model for the new agent (fall back to
+            // the default selection if the agent is mid-turn and unavailable).
+            let (provider, model) = {
+                let g = sv_slot.lock().unwrap();
+                match g.as_ref() {
+                    Some(a) => (a.provider(), a.model()),
+                    None => match crate::config::select(providers, "") {
+                        Ok((p, m)) => (p.clone(), m.clone()),
+                        Err(_) => {
+                            let m = providers[0]
+                                .models
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(|| providers[0].models[0].clone());
+                            (providers[0].clone(), m)
+                        }
+                    },
+                }
+            };
+            let cancel = Arc::new(AtomicBool::new(false));
+            let quiet = Arc::new(AtomicBool::new(false));
+            let (done_tx, _rx) = smol::channel::bounded::<()>(1);
+            match Agent::new(
+                provider,
+                model,
+                _full_auto,
+                true,
+                bus.clone(),
+                None,
+                cancel.clone(),
+                Arc::new(Mutex::new(String::new())),
+            ) {
+                Ok(agent) => {
+                    let slot: AgentSlot = Arc::new(Mutex::new(Some(agent)));
+                    let n = spawn_session(
+                        &format!("session {}", sessions.borrow().len()),
+                        slot,
+                        cancel,
+                        quiet,
+                        done_tx,
+                        app,
+                        tabs,
+                        providers,
+                        bus,
+                        _full_auto,
+                        sessions,
+                    );
+                    tabs.set_active(n);
+                }
+                Err(e) => {
+                    let mut s2 = state.lock().unwrap();
+                    s2.push(ConvKind::Error, &format!("could not start new session: {e}"));
+                    sync_textview(widgets, &s2);
+                }
+            }
+        }
+        "close" => {
+            let cur = tabs.current_tab();
+            if sessions.borrow().len() <= 1 {
+                s.push(ConvKind::System, "only one session open — not closing");
+                sync_textview(widgets, &s);
+                return;
+            }
+            drop(s);
+            tabs.close_tab(cur);
+            sessions.borrow_mut().remove(cur);
+        }
+        "next" | "prev" => {
+            let n = sessions.borrow().len();
+            let cur = tabs.current_tab();
+            let target = if rest[0] == "next" {
+                (cur + 1) % n
+            } else {
+                (cur + n - 1) % n
+            };
+            tabs.set_active(target);
+        }
+        other => {
+            if let Ok(i) = other.parse::<usize>() {
+                let n = sessions.borrow().len();
+                if i < n {
+                    tabs.set_active(i);
+                    return;
+                }
+            }
+            s.push(
+                ConvKind::Error,
+                &format!("unknown /sessions subcommand '{other}' (new|close|next|prev|<n>|list)"),
             );
+            sync_textview(widgets, &s);
         }
     }
-
-    app.run().map_err(|e| format!("gtk main loop: {e}"))
 }
 
 /// One periodic drain pass: pull notifications, read new session-log lines into
@@ -699,6 +948,7 @@ fn status_markup(status: &str) -> String {
 /// Sync the GTK text buffer with the conversation model: append-only markup
 /// updates between rebuilds (colours per line, cheap on every 150ms tick),
 /// full rebuild after /clear or a scrollback trim.
+#[cfg(all(feature = "gtk", target_os = "linux"))]
 fn sync_textview(widgets: &GuiWidgets, state: &GuiState) {
     use std::sync::atomic::Ordering;
     if NEEDS_REBUILD.swap(false, Ordering::SeqCst) {
@@ -714,6 +964,25 @@ fn sync_textview(widgets: &GuiWidgets, state: &GuiState) {
         RENDERED_LINES.store(state.conv.len(), Ordering::SeqCst);
     }
     widgets.textview.set_text("");
+    widgets.status.set_markup(&status_markup(&state.status));
+}
+
+#[cfg(windows)]
+fn sync_textview(widgets: &GuiWidgets, state: &GuiState) {
+    use std::sync::atomic::Ordering;
+    if NEEDS_REBUILD.swap(false, Ordering::SeqCst) {
+        widgets.textview.set_text("");
+        RENDERED_LINES.store(0, Ordering::SeqCst);
+    }
+    let rendered = RENDERED_LINES.load(Ordering::SeqCst);
+    if state.conv.len() > rendered {
+        for line in &state.conv[rendered..] {
+            // The nwg backend's `TextView::set_markup` already appends the
+            // (markup-stripped) line plus a newline, so no separate newline.
+            widgets.textview.set_markup(&line_markup(line));
+        }
+        RENDERED_LINES.store(state.conv.len(), Ordering::SeqCst);
+    }
     widgets.status.set_markup(&status_markup(&state.status));
 }
 

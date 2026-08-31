@@ -1727,7 +1727,7 @@ mod command_help_hint_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod paste_tests {
     use super::raw::{paste_marker_at, translate, RawInput};
     use std::sync::{Arc, Mutex};
@@ -1891,7 +1891,7 @@ mod highlight_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod keyboard_idle_tests {
     use super::raw::*;
     use std::sync::Mutex;

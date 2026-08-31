@@ -15,7 +15,7 @@ smol = "2"                                       # async runtime: event-driven s
 # Optional TUI deps, only built when `--features tui` is set (so the default
 # binary stays lightweight and the locked build cache is unaffected).
 ratatui = { version = "0.29", optional = true }
-crossterm = { version = "0.28", optional = true }
+crossterm = "0.28"
 
 # Optional GUI deps (rustxwidgets) for the `gui` / `pancurses` REPL backends.
 # These are NOT vendored in this repo (they were a 28 MiB+ build-artifact
@@ -32,14 +32,22 @@ rustxwidgets = { path = "rustxWidgets/rustxwidgets", version = "0.1.0", default-
 # in-app scrollback. OFF by default — build/run with `--features tui`; pass
 # `--no-tui` (or just build without the feature) to use the streaming REPL.
 default = []
-tui = ["dep:ratatui", "dep:crossterm"]
+tui = ["dep:ratatui"]
 # Graphical (GTK) REPL via rustxwidgets' dlopen'd GTK backend, and the curses
 # (pancurses) REPL. These require rustxWidgets to be present (see the comment
 # above the [dependencies] block) — they are intentionally NOT in this repo, so
 # `gui` / `pancurses` are opt-in and absent from the default build.
-gui = ["dep:rustxwidgets", "dep:crossterm"]
-pancurses = ["dep:rustxwidgets", "rustxwidgets/pancurses", "dep:crossterm"]
+gui = ["dep:rustxwidgets"]
+pancurses = ["dep:rustxwidgets", "rustxwidgets/pancurses"]
 
 [profile.release]
 strip = true
 lto = true
+
+[patch.crates-io]
+# native-windows-gui 1.0.13's MSVC path imports `GetWindowSubclass` from
+# comctl32.dll, but that export doesn't exist on Windows 11 24H2 -> every
+# binary fails to load with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139). This
+# vendored copy reimplements it with a private map (the crate's own GNU
+# workaround), so only Set/Remove/DefSubclassProc are imported (those exist).
+native-windows-gui = { path = "vendor/native-windows-gui" }

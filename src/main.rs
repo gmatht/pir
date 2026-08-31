@@ -1067,6 +1067,10 @@ fn main() {
                     term::raw::enable_raw();
                 }
                 term::raw::RawInput::None => { /* turn finished / no input; re-check loop */ }
+                // Any other raw key (typed chars, arrows, tab, etc.) while a turn
+                // runs is ignored here — the REPL records it into `typeahead`
+                // elsewhere and re-checks the loop.
+                _ => {}
             }
             continue;
         }

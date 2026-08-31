@@ -460,8 +460,9 @@ fn translate_result(res: &term::raw::RawInput, buf: &str) -> Key {
             let _ = buf;
             Key::None
         }
+        _ => Key::None,
     }
 }
 
 #[cfg(not(unix))]
-pub fn pick_session(_items: &[PickItem]) -> PickResult { PickResult::Resume }
+pub fn pick_session(_items: &[PickItem]) -> PickResult { PickResult::Resume(0) }
