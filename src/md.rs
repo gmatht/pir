@@ -750,7 +750,11 @@ impl IncrementalMarkdown {
 
     /// Force an immediate redraw (ignoring the throttle). Call at turn
     /// boundaries so the final markdown is always shown exactly, even if the
-    /// last token arrived mid-throttle. No-op when disabled.
+    /// last token arrived mid-throttle. This finalizes the streaming renderer
+    /// (flushing any partial line held for an incomplete chunk and closing open
+    /// blocks) so the tail of the reply always renders — real tokens often
+    /// arrive without a trailing newline, and holding that partial line was
+    /// what made table tails vanish. No-op when disabled.
     pub fn flush(&mut self) {
         if !self.enabled {
             return;
@@ -765,6 +769,14 @@ impl IncrementalMarkdown {
             }
             return;
         }
+        // Finalize the streaming renderer in place so a subsequent `redraw()`
+        // (or the turn-end render) emits the full output including the tail
+        // that was held as a partial line.
+        let stream = self.stream.get_or_insert_with(|| StreamingRenderer::new(self.color));
+        // Feed any remaining tail first so `output()` includes it.
+        stream.push(&self.pending[self.last_rendered..]);
+        self.last_rendered = self.pending.len();
+        stream.finalize();
         self.redraw();
     }
 
@@ -784,9 +796,11 @@ impl IncrementalMarkdown {
             let stream = self.stream.get_or_insert_with(|| StreamingRenderer::new(self.color));
             stream.push(&self.pending[self.last_rendered..]);
             self.last_rendered = self.pending.len();
-            // Flush any trailing partial line so a chunk that didn't end in `\n`
-            // (e.g. the tail of the reply) renders now, not only at finalize.
-            // This keeps the final frame's height consistent across redraws.
+            // Render any trailing partial line (a chunk that didn't end in `\n`).
+            // Safe because each frame overwrites the whole block, so a partial
+            // is replaced by the completed line on the next redraw. This is what
+            // makes the tail of a reply (and a ```md-fenced table) visible before
+            // `flush`.
             stream.flush_pending_line();
             stream.output().to_string()
         };
@@ -934,6 +948,15 @@ impl StreamingRenderer {
     /// Also flushes any trailing partial line.
     pub fn finalize(&mut self) -> String {
         let start = self.out.len();
+        if !self.pending_line.is_empty() {
+            let line = std::mem::take(&mut self.pending_line);
+            self.push_line(line.trim_end_matches('\n'));
+        }
+        // A re-rendered table (e.g. inside an md fence) whose last row isn't
+        // followed by a blank line never gets a `TableEnd` from the parser.
+        if !self.table_rows.is_empty() {
+            self.flush_table();
+        }
         for ev in self.parser.finalize() {
             self.on_event(ev);
         }
@@ -1761,5 +1784,6 @@ mod incremental_tests {
         assert_eq!(body.matches("• d").count(), 1, "item d missing/duplicated: {body:?}");
     }
 }
+
 
 
