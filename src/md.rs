@@ -858,7 +858,10 @@ pub struct StreamingRenderer {
     list_depth: usize,
     /// Whether we're inside a blockquote (for `> ` prefix on continuation lines).
     in_blockquote: bool,
-    /// Whether the last emitted line ended with a newline (for spacing).
+    /// Table buffering: streamdown emits per-row events, but we must align
+    /// columns (compute the widest cell per column) before emitting, like the
+    /// pulldown backend's `flush_table`. Rows are buffered until `TableEnd`.
+    table_rows: Vec<Vec<String>>,
     out: String,
 }
 
@@ -872,6 +875,7 @@ impl StreamingRenderer {
             pending_link: None,
             list_depth: 0,
             in_blockquote: false,
+            table_rows: Vec::new(),
             out: String::new(),
         }
     }
@@ -981,20 +985,18 @@ impl StreamingRenderer {
                 self.list_depth = self.list_depth.saturating_sub(1);
             }
             ParseEvent::TableHeader(cells) => {
-                self.render_table_row(&cells);
+                self.table_rows.push(cells);
             }
             ParseEvent::TableRow(cells) => {
-                self.render_table_row(&cells);
+                self.table_rows.push(cells);
             }
             ParseEvent::TableSeparator => {
-                // Emit a separator line under the header.
-                self.out.push_str("|");
-                for _ in 0..3 {
-                    self.out.push_str("---|");
-                }
-                self.out.push('\n');
+                // The separator is implied by the aligned-grid layout; it's
+                // rendered as the header underline when the table flushes.
             }
-            ParseEvent::TableEnd => {}
+            ParseEvent::TableEnd => {
+                self.flush_table();
+            }
             ParseEvent::BlockquoteStart { .. } => {
                 self.in_blockquote = true;
                 self.out.push_str("> ");
@@ -1077,12 +1079,47 @@ impl StreamingRenderer {
         }
     }
 
-    fn render_table_row(&mut self, cells: &[String]) {
-        self.out.push('|');
-        for c in cells {
-            self.out.push(' ');
-            self.out.push_str(c);
-            self.out.push_str(" |");
+    /// Emit a buffered table as a monospace grid, mirroring the pulldown
+    /// backend's `flush_table`: compute the widest cell per column and pad
+    /// each, with a header underline. Table rows are buffered (in `table_rows`)
+    /// until `TableEnd` so column widths are known.
+    fn flush_table(&mut self) {
+        let rows = std::mem::take(&mut self.table_rows);
+        if rows.is_empty() {
+            return;
+        }
+        let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        let widths: Vec<usize> = (0..cols)
+            .map(|ci| {
+                rows.iter()
+                    .map(|r| r.get(ci).map_or(0, |s| crate::term::visible_len(s)))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect();
+        for (ri, row) in rows.iter().enumerate() {
+            for (ci, w) in widths.iter().enumerate() {
+                let cell = row.get(ci).cloned().unwrap_or_default();
+                self.out.push('|');
+                self.out.push(' ');
+                self.out.push_str(&cell);
+                let pad = w.saturating_sub(crate::term::visible_len(&cell));
+                for _ in 0..pad {
+                    self.out.push(' ');
+                }
+                self.out.push(' ');
+            }
+            self.out.push_str("|\n");
+            if ri == 0 {
+                self.out.push('|');
+                for w in &widths {
+                    for _ in 0..w + 2 {
+                        self.out.push('-');
+                    }
+                    self.out.push('|');
+                }
+                self.out.push('\n');
+            }
         }
         self.out.push('\n');
     }
@@ -1203,14 +1240,38 @@ mod streaming_tests {
         assert!(!out.contains('\x1b'), "escape sequence leaked: {out:?}");
     }
 
+    // A markdown table renders as an aligned monospace grid (padded to the
+    // widest cell per column) with a header underline — not raw `| a | b |`
+    // rows. This is the fix for "why does a table not render as md".
+    #[test]
+    fn streaming_renders_table_as_aligned_grid() {
+        let md = "| Column A | Column B | Column C |\n| :--- | :---: | ---: |\n| Left aligned | Centered | Right aligned |\n| Data 1 | Data 2 | Data 3 |\n| Data 4 | Data 5 | Data 6 |\n";
+        let mut r = StreamingRenderer::new(false);
+        for line in md.lines() {
+            r.push_line(line);
+        }
+        r.finalize();
+        let out = r.output();
+        // All cells present.
+        assert!(out.contains("Column A"), "got: {out:?}");
+        assert!(out.contains("Left aligned"), "got: {out:?}");
+        assert!(out.contains("Data 6"), "got: {out:?}");
+        // Columns are padded to `| cell |`-aligned (widest cell = "Left aligned",
+        // 13 chars, so column A occupies 15 columns between bars).
+        assert!(out.contains("| Left aligned |"), "row not aligned: {out:?}");
+        assert!(out.contains("Data 1       | Data 2"), "cell not padded: {out:?}");
+        assert!(out.contains("| Data 6        |"), "last cell not padded: {out:?}");
+        // A header underline is present (the separator row becomes `|---|`).
+        assert!(out.contains("|---"), "missing underline: {out:?}");
+    }
+
     // Perf: the streaming path (O(n)) must be dramatically faster than the
     // whole-buffer re-render (O(n²)) on a large growing buffer. We simulate the
     // incremental redraw pattern: every 20 tokens, re-render. The streaming
     // renderer only parses the new tail; the whole-buffer `render` re-parses
     // everything. Assert the streaming path is at least 5x faster.
     #[test]
-    fn streaming_is_faster_than_whole_buffer_rerender() {
-        // Build a large reply incrementally.
+    fn streaming_is_faster_than_whole_buffer_rerender() {        // Build a large reply incrementally.
         let mut md = String::new();
         for i in 0..3000 {
             md.push_str(&format!("Token {i} **bold** and `code` with a [link](https://x.com) and _em_.\n"));
