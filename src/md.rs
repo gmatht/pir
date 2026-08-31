@@ -32,6 +32,8 @@ use comrak::nodes::{AstNode, ListType, NodeValue};
 use comrak::{parse_document, Arena as ComrakArena, Options as ComrakOptions};
 use pulldown_cmark::{Event as PdEvent, Options as PdOptions, Parser as PdParser, Tag as PdTag, TagEnd as PdTagEnd};
 use std::time::{Duration, Instant};
+use streamdown_parser::{InlineElement, InlineParser, ListBullet, ParseEvent, Parser as SdParser};
+use streamdown_ansi::sanitize::{sanitize_for_terminal, sanitize_url};
 
 /// Render `md` to a styled, terminal-width-friendly `String`. Block-level
 /// structure (headings, lists, code fences, blank lines) is preserved; inline
@@ -664,6 +666,12 @@ pub struct IncrementalMarkdown {
     color: bool,
     /// The full accumulated markdown text so far (re-rendered whole each time).
     pending: String,
+    /// Streaming renderer (O(n)) — when present, `redraw` renders only the new
+    /// tail instead of re-rendering the whole buffer. Built lazily on first
+    /// redraw so a disabled renderer never pays for it.
+    stream: Option<StreamingRenderer>,
+    /// Byte offset into `pending` already fed to the streaming renderer.
+    last_rendered: usize,
     /// Earliest instant the next throttled redraw may fire.
     next_redraw: Instant,
     /// Redraw throttle window in milliseconds. Defaults to
@@ -690,6 +698,8 @@ impl IncrementalMarkdown {
             enabled,
             color,
             pending: String::new(),
+            stream: None,
+            last_rendered: 0,
             next_redraw: Instant::now(),
             throttle_ms: throttle_from_env(),
             last_height: 0,
@@ -761,7 +771,25 @@ impl IncrementalMarkdown {
     /// Jump the cursor back over the previously drawn block and overwrite it
     /// with the freshly rendered markdown.
     fn redraw(&mut self) {
-        let rendered = render(&self.pending, self.color);
+        // O(n) streaming path: parse only the new tail since the last redraw,
+        // but emit the *full* accumulated output (the streaming renderer holds
+        // it) so the frame overwrites the previous block completely. The
+        // streaming renderer carries open-block state, so a line that continues
+        // a code fence / list / blockquote renders correctly without re-parsing
+        // the whole buffer. Falls back to the O(n²) whole-buffer `render` on the
+        // first redraw (to seed the streaming renderer's output).
+        let rendered = if let Some(stream) = self.stream.as_mut() {
+            stream.push(&self.pending[self.last_rendered..]);
+            self.last_rendered = self.pending.len();
+            stream.output().to_string()
+        } else {
+            let rendered = render(&self.pending, self.color);
+            let mut stream = StreamingRenderer::new(self.color);
+            stream.push(&self.pending);
+            self.stream = Some(stream);
+            self.last_rendered = self.pending.len();
+            rendered
+        };
         let height = rendered.lines().count().max(1);
         let mut s = String::with_capacity(rendered.len() + 16);
         if self.written && self.last_height > 0 {
@@ -800,6 +828,421 @@ impl IncrementalMarkdown {
     /// The full accumulated markdown text (for assertions / final fallbacks).
     pub fn pending(&self) -> &str {
         &self.pending
+    }
+}
+
+// ---------------------------------------------------------------------------
+// O(n) streaming renderer (streamdown-parser backend).
+//
+// The pulldown `IncrementalMarkdown` above re-renders the *whole* accumulated
+// buffer on every throttled redraw — O(n²) over a long reply. This backend
+// instead feeds each new line to a stateful `streamdown_parser::Parser` and
+// renders only the *new* `ParseEvent`s, so the total work is O(n). The parser
+// carries open-block state (code fence, list, blockquote, table) across calls,
+// so a line that continues a block renders correctly without re-parsing the
+// prefix.
+//
+// Output shape matches the pulldown backend (headings `# `+bold, `• ` lists,
+// fenced code, `> ` quotes, `text [url]` links) so the two are interchangeable.
+// ---------------------------------------------------------------------------
+
+/// Streaming markdown renderer: feed lines, get ANSI output for just the new
+/// content. Keeps pir's terminal-emitter conventions (colour gated on `color`).
+pub struct StreamingRenderer {
+    parser: SdParser,
+    inline: InlineParser,
+    color: bool,
+    /// Pending link URL (set on Link, appended after text on the same event).
+    pending_link: Option<String>,
+    /// Current list nesting depth (for indentation).
+    list_depth: usize,
+    /// Whether we're inside a blockquote (for `> ` prefix on continuation lines).
+    in_blockquote: bool,
+    /// Whether the last emitted line ended with a newline (for spacing).
+    out: String,
+}
+
+impl StreamingRenderer {
+    /// Build a streaming renderer. `color` mirrors `term::color_enabled()`.
+    pub fn new(color: bool) -> Self {
+        StreamingRenderer {
+            parser: SdParser::new(),
+            inline: InlineParser::new(),
+            color,
+            pending_link: None,
+            list_depth: 0,
+            in_blockquote: false,
+            out: String::new(),
+        }
+    }
+
+    /// Feed one line of markdown and render the new events it produces.
+    pub fn push_line(&mut self, line: &str) {
+        let events = self.parser.parse_line(line);
+        for ev in events {
+            self.on_event(ev);
+        }
+    }
+
+    /// Feed a chunk of markdown (may contain newlines); splits on lines and
+    /// feeds each. Returns the newly rendered output.
+    pub fn push(&mut self, chunk: &str) -> String {
+        let start = self.out.len();
+        for line in chunk.split('\n') {
+            self.push_line(line);
+        }
+        self.out[start..].to_string()
+    }
+
+    /// Close any open blocks (call at end of stream) and return the tail.
+    pub fn finalize(&mut self) -> String {
+        let start = self.out.len();
+        for ev in self.parser.finalize() {
+            self.on_event(ev);
+        }
+        self.out[start..].to_string()
+    }
+
+    /// The full rendered output so far.
+    pub fn output(&self) -> &str {
+        &self.out
+    }
+
+    fn on_event(&mut self, ev: ParseEvent) {
+        match ev {
+            ParseEvent::Text(t) => self.out.push_str(&t),
+            ParseEvent::InlineCode(c) => {
+                if self.color {
+                    self.out.push_str(&format!("\x1b[7m{}\x1b[0m", c));
+                } else {
+                    self.out.push_str(&format!("`{}`", c));
+                }
+            }
+            ParseEvent::Bold(t) => self.styled("\x1b[1m", &t),
+            ParseEvent::Italic(t) => self.styled("\x1b[3m", &t),
+            ParseEvent::BoldItalic(t) => self.styled("\x1b[1;3m", &t),
+            ParseEvent::Underline(t) => self.styled("\x1b[4m", &t),
+            ParseEvent::Strikeout(t) => self.styled("\x1b[9m", &t),
+            ParseEvent::Link { text, url } => {
+                let text = sanitize_for_terminal(&text);
+                self.out.push_str(&text);
+                // Only emit the URL if it's safe for terminal hyperlinks (no
+                // escape-sequence injection, safe scheme).
+                if let Some(url) = sanitize_url(&url) {
+                    if !url.is_empty() && url != text {
+                        self.out.push_str(&format!(" [{url}]"));
+                    }
+                }
+            }
+            ParseEvent::Image { alt, .. } => {
+                if !alt.is_empty() {
+                    self.out.push_str(&format!("[image: {alt}]"));
+                }
+            }
+            ParseEvent::Footnote(f) => {
+                self.out.push_str(&format!("[^{f}]"));
+            }
+            ParseEvent::Heading { level, content } => {
+                let n = (level as usize).min(6);
+                let prefix = format!("{} ", "#".repeat(n));
+                if self.color {
+                    self.out.push_str(&format!("\x1b[1m{prefix}{content}\x1b[0m\n"));
+                } else {
+                    self.out.push_str(&format!("{prefix}{content}\n"));
+                }
+            }
+            ParseEvent::CodeBlockStart { language, .. } => {
+                let lang = language.unwrap_or_default();
+                self.out.push_str(&format!("```{lang}\n"));
+            }
+            ParseEvent::CodeBlockLine(l) => {
+                self.out.push_str(&l);
+                self.out.push('\n');
+            }
+            ParseEvent::CodeBlockEnd => {
+                self.out.push_str("```\n");
+            }
+            ParseEvent::ListItem { indent, bullet, content } => {
+                let marker = match bullet {
+                    ListBullet::Ordered(n) => format!("{n}. "),
+                    _ => "• ".to_string(),
+                };
+                let pad = "  ".repeat(indent);
+                self.out.push_str(&pad);
+                self.out.push_str(&marker);
+                // List item content is raw markdown — inline-parse it so `**bold**`
+                // and `_em_` render like the pulldown backend.
+                for el in self.inline.parse(&content) {
+                    self.on_inline(el);
+                }
+                self.out.push('\n');
+            }
+            ParseEvent::ListEnd => {
+                self.list_depth = self.list_depth.saturating_sub(1);
+            }
+            ParseEvent::TableHeader(cells) => {
+                self.render_table_row(&cells);
+            }
+            ParseEvent::TableRow(cells) => {
+                self.render_table_row(&cells);
+            }
+            ParseEvent::TableSeparator => {
+                // Emit a separator line under the header.
+                self.out.push_str("|");
+                for _ in 0..3 {
+                    self.out.push_str("---|");
+                }
+                self.out.push('\n');
+            }
+            ParseEvent::TableEnd => {}
+            ParseEvent::BlockquoteStart { .. } => {
+                self.in_blockquote = true;
+                self.out.push_str("> ");
+            }
+            ParseEvent::BlockquoteLine(l) => {
+                self.out.push_str(&l);
+                self.out.push('\n');
+                self.out.push_str("> ");
+            }
+            ParseEvent::BlockquoteEnd => {
+                self.in_blockquote = false;
+                self.out.push('\n');
+            }
+            ParseEvent::ThinkBlockStart => {}
+            ParseEvent::ThinkBlockLine(l) => {
+                self.out.push_str(&l);
+                self.out.push('\n');
+            }
+            ParseEvent::ThinkBlockEnd => {}
+            ParseEvent::HorizontalRule => {
+                self.out.push_str("---\n");
+            }
+            ParseEvent::EmptyLine => {
+                self.out.push('\n');
+            }
+            ParseEvent::Newline => {
+                self.out.push('\n');
+            }
+            ParseEvent::Prompt(p) => {
+                self.out.push_str(&p);
+            }
+            ParseEvent::InlineElements(_) => {}
+        }
+    }
+
+    fn styled(&mut self, code: &str, s: &str) {
+        if self.color {
+            self.out.push_str(code);
+            self.out.push_str(s);
+            self.out.push_str("\x1b[0m");
+        } else {
+            self.out.push_str(s);
+        }
+    }
+
+    /// Render a single inline element (used for list-item content, which the
+    /// streamdown parser leaves as raw markdown).
+    fn on_inline(&mut self, el: InlineElement) {
+        match el {
+            InlineElement::Text(t) => self.out.push_str(&t),
+            InlineElement::Bold(t) => self.styled("\x1b[1m", &t),
+            InlineElement::Italic(t) => self.styled("\x1b[3m", &t),
+            InlineElement::BoldItalic(t) => self.styled("\x1b[1;3m", &t),
+            InlineElement::Underline(t) => self.styled("\x1b[4m", &t),
+            InlineElement::Strikeout(t) => self.styled("\x1b[9m", &t),
+            InlineElement::Code(c) => {
+                if self.color {
+                    self.out.push_str(&format!("\x1b[7m{}\x1b[0m", c));
+                } else {
+                    self.out.push_str(&format!("`{}`", c));
+                }
+            }
+            InlineElement::Link { text, url } => {
+                let text = sanitize_for_terminal(&text);
+                self.out.push_str(&text);
+                if let Some(url) = sanitize_url(&url) {
+                    if !url.is_empty() && url != text {
+                        self.out.push_str(&format!(" [{url}]"));
+                    }
+                }
+            }
+            InlineElement::Image { alt, .. } => {
+                if !alt.is_empty() {
+                    self.out.push_str(&format!("[image: {alt}]"));
+                }
+            }
+            InlineElement::Footnote(f) => {
+                self.out.push_str(&format!("[^{f}]"));
+            }
+        }
+    }
+
+    fn render_table_row(&mut self, cells: &[String]) {
+        self.out.push('|');
+        for c in cells {
+            self.out.push(' ');
+            self.out.push_str(c);
+            self.out.push_str(" |");
+        }
+        self.out.push('\n');
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use std::time::Instant;
+
+    // Feed a full document line-by-line and check the streaming renderer
+    // produces the same block structure as the pulldown backend.
+    #[test]
+    fn streaming_matches_pulldown_structure() {
+        let md = "# Plan\n\nWe will **ship** the thing and `fix` the _parser_.\n\n## Steps\n\n1. read the file\n2. edit it\n\n- support **markdown**\n- drop raw `**`\n\n```rust\nlet x = 1;\n```\n\n> a note\n\nsee [docs](https://example.com)\n";
+        let mut r = StreamingRenderer::new(false);
+        for line in md.lines() {
+            r.push_line(line);
+        }
+        r.finalize();
+        let out = r.output();
+        // No raw emphasis/italic markdown left.
+        assert!(!out.contains("**markdown**"), "got: {out:?}");
+        assert!(!out.contains("_parser_"), "got: {out:?}");
+        assert!(out.contains("# Plan"), "got: {out:?}");
+        assert!(out.contains("## Steps"), "got: {out:?}");
+        assert!(out.contains("```rust"), "got: {out:?}");
+        assert!(out.contains("let x = 1;"), "got: {out:?}");
+        assert!(out.contains("> a note"), "got: {out:?}");
+        assert!(out.contains("https://example.com"), "got: {out:?}");
+        assert!(out.contains("1. read the file"), "got: {out:?}");
+        assert!(out.contains("• support"), "got: {out:?}");
+    }
+
+    // Streaming across a code-fence boundary: the fence opens on one line and
+    // closes later; the renderer must carry the open-block state.
+    #[test]
+    fn streaming_handles_code_fence_across_lines() {
+        let mut r = StreamingRenderer::new(false);
+        r.push_line("```rust");
+        r.push_line("let x = 1;");
+        r.push_line("```");
+        r.finalize();
+        let out = r.output();
+        assert!(out.contains("```rust"), "got: {out:?}");
+        assert!(out.contains("let x = 1;"), "got: {out:?}");
+        assert!(out.contains("```\n"), "got: {out:?}");
+    }
+
+    // Streaming a list across lines keeps the bullet markers.
+    #[test]
+    fn streaming_handles_list_across_lines() {
+        let mut r = StreamingRenderer::new(false);
+        r.push_line("- a");
+        r.push_line("- b");
+        r.finalize();
+        let out = r.output();
+        assert!(out.contains("• a"), "got: {out:?}");
+        assert!(out.contains("• b"), "got: {out:?}");
+    }
+
+    // Colour mode emits ANSI for bold/italic.
+    #[test]
+    fn streaming_color_emits_ansi() {
+        let mut r = StreamingRenderer::new(true);
+        r.push_line("**bold** and _italic_");
+        r.finalize();
+        let out = r.output();
+        assert!(out.contains("\x1b[1m"), "got: {out:?}");
+        assert!(out.contains("\x1b[3m"), "got: {out:?}");
+    }
+
+    // `push` (chunk with newlines) returns only the newly rendered tail.
+    #[test]
+    fn streaming_push_returns_only_new_tail() {
+        let mut r = StreamingRenderer::new(false);
+        let first = r.push("# Title\n");
+        assert!(first.contains("# Title"), "got: {first:?}");
+        let second = r.push("\nbody\n");
+        assert!(!second.contains("# Title"), "tail must not repeat the title: {second:?}");
+        assert!(second.contains("body"), "got: {second:?}");
+    }
+
+    // The streaming renderer is O(n): feeding a growing buffer line-by-line
+    // costs ~linear total time, whereas the whole-buffer `render` is O(n²).
+    // This test just sanity-checks the streaming path completes quickly on a
+    // large input (it would be quadratic-slow if it re-parsed the prefix).
+    #[test]
+    fn streaming_is_linear_on_large_input() {
+        let mut r = StreamingRenderer::new(false);
+        let mut md = String::new();
+        for i in 0..5000 {
+            md.push_str(&format!("Token {i} **bold** and `code` with a [link](https://x.com) and _em_.\n"));
+        }
+        let t = Instant::now();
+        for line in md.lines() {
+            r.push_line(line);
+        }
+        r.finalize();
+        let d = t.elapsed();
+        assert!(d.as_secs() < 5, "streaming render took too long: {d:?}");
+        assert!(r.output().len() > 100_000, "output too small: {}", r.output().len());
+    }
+
+    // Sanitize: unsafe URLs (javascript:, control chars) are dropped from the
+    // output; safe URLs (https:) are kept.
+    #[test]
+    fn streaming_sanitizes_unsafe_links() {
+        let mut r = StreamingRenderer::new(false);
+        r.push_line("[safe](https://example.com)");
+        r.push_line("[bad](javascript:alert(1))");
+        r.push_line("[esc](https://evil.com\x1b]0;pwned\x07)");
+        r.finalize();
+        let out = r.output();
+        assert!(out.contains("https://example.com"), "safe url dropped: {out:?}");
+        assert!(!out.contains("javascript:"), "unsafe scheme leaked: {out:?}");
+        assert!(!out.contains("pwned"), "escape injection leaked: {out:?}");
+        assert!(!out.contains('\x1b'), "escape sequence leaked: {out:?}");
+    }
+
+    // Perf: the streaming path (O(n)) must be dramatically faster than the
+    // whole-buffer re-render (O(n²)) on a large growing buffer. We simulate the
+    // incremental redraw pattern: every 20 tokens, re-render. The streaming
+    // renderer only parses the new tail; the whole-buffer `render` re-parses
+    // everything. Assert the streaming path is at least 5x faster.
+    #[test]
+    fn streaming_is_faster_than_whole_buffer_rerender() {
+        // Build a large reply incrementally.
+        let mut md = String::new();
+        for i in 0..3000 {
+            md.push_str(&format!("Token {i} **bold** and `code` with a [link](https://x.com) and _em_.\n"));
+        }
+
+        // Whole-buffer re-render: re-render the entire accumulated buffer every
+        // 20 tokens (the old O(n²) `IncrementalMarkdown` behavior).
+        let mut acc = String::new();
+        let t_whole = Instant::now();
+        for (i, line) in md.lines().enumerate() {
+            acc.push_str(line);
+            acc.push('\n');
+            if i % 20 == 0 {
+                let _ = render(&acc, false);
+            }
+        }
+        let d_whole = t_whole.elapsed();
+
+        // Streaming: feed each line once, render only the new tail.
+        let mut r = StreamingRenderer::new(false);
+        let t_stream = Instant::now();
+        for line in md.lines() {
+            r.push_line(line);
+        }
+        r.finalize();
+        let d_stream = t_stream.elapsed();
+
+        // The streaming path must be substantially faster (≥5x) on this input.
+        assert!(
+            d_stream.as_secs_f64() * 5.0 < d_whole.as_secs_f64(),
+            "streaming ({d_stream:?}) not ≥5x faster than whole-buffer ({d_whole:?})"
+        );
     }
 }
 

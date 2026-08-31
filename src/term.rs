@@ -685,7 +685,7 @@ fn history_substring_matches(query: &str, limit: usize) -> Vec<String> {
     if query_t.is_empty() {
         return Vec::new();
     }
-    let re = regex_lite::RegexBuilder::new(query_t)
+    let re = regex::RegexBuilder::new(query_t)
         .case_insensitive(true)
         .build();
     let re = re.ok();
@@ -724,7 +724,7 @@ fn find_match_range(matched: &str, query: &str) -> Option<(usize, usize)> {
     if query_t.is_empty() {
         return None;
     }
-    if let Ok(re) = regex_lite::RegexBuilder::new(query_t).case_insensitive(true).build() {
+    if let Ok(re) = regex::RegexBuilder::new(query_t).case_insensitive(true).build() {
         if let Some(m) = re.find(matched) {
             // rustyline's `Context` borrows a `History`; the helper ignores it, so an empty
             // in-memory history (kept in a static so it outlives the `Context`) is fine.
@@ -951,19 +951,18 @@ fn trunc_hint(s: &str, max: usize) -> String {
 /// starting at column `pos`, so it may occupy at most `terminal_width() - pos`
 /// visible columns; anything longer is truncated with `...` (see `trunc_hint`).
 /// Returns `None` when there is no room at all (avoids overflowing the line).
-fn fit_one_line(hint: Option<String>, line: &str, pos: usize) -> Option<String> {
+fn fit_one_line(hint: Option<String>, line: &str) -> Option<String> {
     let hint = hint?;
     let width = terminal_width();
-    let before = if pos <= line.len() {
-        visible_len(&line[..pos])
-    } else {
-        visible_len(line)
-    };
+    // The hint is drawn at the cursor (column `pos`), but the rest of the typed
+    // line still occupies screen space, so budget for the whole line: prompt +
+    // full input + hint must fit. A small safety margin guards against minor
+    // rustyline/cursor overhead so the line never wraps onto a second row.
+    let line_vis = visible_len(line);
     let budget = width
         .saturating_sub(HINT_PROMPT_VIS.with(|p| *p.borrow()))
-        .saturating_sub(before);
-    eprintln!("DBG w={width} pv={pv} before={before} budget={budget} hintvis={hv}",
-        pv = HINT_PROMPT_VIS.with(|p| *p.borrow()), hv = visible_len(&hint));
+        .saturating_sub(line_vis)
+        .saturating_sub(2);
     if budget < 3 {
         return None;
     }
@@ -1028,7 +1027,7 @@ impl Hinter for PirHelper {
                 .into_iter()
                 .find_map(|m| crate::config::hint_remainder(&m, prefix))
         })();
-        fit_one_line(raw, line, pos)
+        fit_one_line(raw, line)
     }
 }
 
@@ -2593,7 +2592,7 @@ mod project_recall_tests {
         // A line that already consumes the whole width leaves no room for a hint.
         let line = "x".repeat(78);
         assert!(
-            fit_one_line(Some("suggestion".to_string()), &line, 78).is_none(),
+            fit_one_line(Some("suggestion".to_string()), &line).is_none(),
             "must not overflow the line when there is no room"
         );
     }

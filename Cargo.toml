@@ -14,7 +14,9 @@ native-tls = "0.2"                               # TLS provider for ureq (must b
 rustyline = "14"                               # line editing: history + cursor nav + completer
 libc = "0.2"                                     # uid/gid drop for per-project users
 smol = "2"                                       # async runtime: event-driven stdin wait while a turn runs
-regex-lite = "0.1.9"                             # history recall: lightweight regex (and partial) matching of prior prompts
+regex = "1"                                      # history recall + streamdown-parser (full regex; replaces regex-lite)
+streamdown-parser = "0.1.4"                      # O(n) streaming markdown parser (stateful, line-oriented)
+streamdown-ansi = "0.1.4"                        # ANSI sanitize for link/terminal safety (pulled in by streamdown-parser)
 
 # Optional TUI deps, only built when `--features tui` is set (so the default
 # binary stays lightweight and the locked build cache is unaffected).
