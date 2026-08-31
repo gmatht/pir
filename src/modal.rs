@@ -414,6 +414,81 @@ pub fn about_dialog() -> Option<()> {
     }
 }
 
+/// A session row shown in the backgrounded-session selector.
+pub struct SessionRow {
+    pub name: String,
+    pub preview: String,
+    /// Coarse state token: `running` / `complete` / `waiting for input` /
+    /// `needs retry` / `blocked` / `error` / `interrupted`.
+    pub state: String,
+    pub from_here: bool,
+}
+
+/// Outcome of the backgrounded-session selector.
+pub enum SessionPick {
+    /// Resume the session at this index.
+    Resume(usize),
+    /// Jump to the next waiting-for-input session (index into the list).
+    NextWaiting(usize),
+    /// Cancel (no action).
+    Cancel,
+}
+
+/// Show the backgrounded-session selector on the alternate screen. Lists
+/// sessions with their state; `n` jumps to the next waiting-for-input session.
+/// Returns `None` if not a tty.
+pub fn session_selector(rows: &[SessionRow]) -> Option<SessionPick> {
+    let _modal = Modal::enter()?;
+    let mut selected = 0usize;
+    loop {
+        let lines: Vec<String> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let marker = if i == selected { "▸" } else { " " };
+                let state = state_color(&r.state);
+                let here = if r.from_here { " (this shell)" } else { "" };
+                format!("{marker} {:<2} {}  {}  {}{here}", i, state, r.name, r.preview)
+            })
+            .collect();
+        draw_box("pir — backgrounded sessions", &lines);
+        match read_key()? {
+            Key::Up | Key::Char('k') => selected = selected.saturating_sub(1),
+            Key::Down | Key::Char('j') => selected = (selected + 1).min(rows.len().saturating_sub(1)),
+            Key::Enter | Key::Right => return Some(SessionPick::Resume(selected)),
+            Key::Char('n') => {
+                // Jump to the next waiting-for-input / needs-retry session.
+                let start = (selected + 1) % rows.len();
+                let mut found = None;
+                for off in 0..rows.len() {
+                    let idx = (start + off) % rows.len();
+                    let s = &rows[idx].state;
+                    if s == "waiting for input" || s == "needs retry" {
+                        found = Some(idx);
+                        break;
+                    }
+                }
+                if let Some(idx) = found {
+                    selected = idx;
+                }
+            }
+            Key::Char('r') => return Some(SessionPick::Resume(selected)),
+            Key::Esc | Key::CtrlC | Key::CtrlD | Key::Char('q') => return Some(SessionPick::Cancel),
+            _ => {}
+        }
+    }
+}
+
+fn state_color(state: &str) -> String {
+    use crate::term;
+    match state {
+        "running" => term::cyan(state),
+        "complete" => term::green(state),
+        "waiting for input" | "needs retry" => term::yellow(state),
+        _ => term::red(state),
+    }
+}
+
 /// Show a masked secret-entry dialog on the alternate screen and return the
 /// typed value. The key is shown as `••••` and never touches the normal screen
 /// or scrollback. Returns `None` if the terminal isn't a tty (caller falls back

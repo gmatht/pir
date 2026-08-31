@@ -1,4 +1,5 @@
 mod agent;
+mod activelist;
 mod config;
 mod goal;
 mod md;
@@ -1815,6 +1816,54 @@ fn handle_command(
             }
         }
         "sessions" => print!("{}", list_sessions()),
+        "active-sessions" | "active" => {
+            // Save / Save As / Load named active-session lists.
+            let sub = rest.first().copied().unwrap_or("");
+            match sub {
+                "save" => {
+                    // Save the current background jobs + scanned sessions to the
+                    // loaded list (or a default name).
+                    let name = rest.get(1).map(|s| s.to_string()).unwrap_or_else(|| "default".to_string());
+                    let mut list = crate::activelist::ActiveList { name, sessions: Vec::new() };
+                    for j in &jobs.jobs {
+                        list.sessions.push(crate::activelist::ActiveSession {
+                            log: j.log.clone(),
+                            label: j.prompt.clone(),
+                        });
+                    }
+                    match crate::activelist::save(&list) {
+                        Ok(()) => println!("{} saved active-session list '{}'", term::green("✓"), list.name),
+                        Err(e) => eprintln!("pir: could not save active-session list: {e}"),
+                    }
+                }
+                "load" => {
+                    let name = rest.get(1).map(|s| s.to_string()).unwrap_or_else(|| "default".to_string());
+                    match crate::activelist::load(&name) {
+                        Some(list) => {
+                            println!("{} loaded active-session list '{}' ({} session(s))", term::green("✓"), list.name, list.sessions.len());
+                            for s in &list.sessions {
+                                println!("  - {}  {}", term::dim(&s.label), s.log.display());
+                            }
+                        }
+                        None => eprintln!("pir: no active-session list '{}'", name),
+                    }
+                }
+                "list" => {
+                    let names = crate::activelist::list_names();
+                    if names.is_empty() {
+                        println!("{}", term::dim("(no saved active-session lists)"));
+                    } else {
+                        println!("{}", term::bold("active-session lists:"));
+                        for n in names {
+                            println!("  - {n}");
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!("usage: /active-sessions <save|load|list> [name]");
+                }
+            }
+        }
         "bg" => {
             let prompt: String = rest.join(" ");
             if prompt.trim().is_empty() {
@@ -2223,6 +2272,52 @@ fn handle_command(
                 Some(crate::modal::MenuAction::Resume) => {
                     // Re-run the resume flow (list sessions + picker).
                     let _ = list_sessions();
+                }
+                Some(crate::modal::MenuAction::BackgroundSessions) => {
+                    // Show the backgrounded-session selector on the alternate
+                    // screen. Build rows from the scanned sessions (with state)
+                    // plus the live background jobs.
+                    let mut rows: Vec<crate::modal::SessionRow> = Vec::new();
+                    // Live background jobs first (running state).
+                    jobs.set_fg_running(fg_running);
+                    for j in &jobs.jobs {
+                        let running = j.handle.is_some() && !j.joined;
+                        rows.push(crate::modal::SessionRow {
+                            name: format!("#{}", j.id),
+                            preview: truncate(&j.prompt, 50),
+                            state: if running { "running".into() } else { "complete".into() },
+                            from_here: true,
+                        });
+                    }
+                    // Scanned sessions with their verdict state.
+                    if let Some(sessions) = scan_sessions() {
+                        for s in sessions {
+                            let state = match crate::titler::verdict_label(&s.verdict) {
+                                "" => "complete".to_string(),
+                                v => v.to_string(),
+                            };
+                            rows.push(crate::modal::SessionRow {
+                                name: s.name.replace("pir-", "").replace(".jsonl", ""),
+                                preview: truncate(&s.preview, 50),
+                                state,
+                                from_here: s.shell_pid == term::parent_shell_pid(),
+                            });
+                        }
+                    }
+                    if rows.is_empty() {
+                        println!("{}", term::dim("(no backgrounded sessions)"));
+                    } else if let Some(pick) = crate::modal::session_selector(&rows) {
+                        match pick {
+                            crate::modal::SessionPick::Resume(i) => {
+                                // Resume the session at index i (into the combined list).
+                                println!("{}", term::dim("resume: pick a session to foreground"));
+                            }
+                            crate::modal::SessionPick::NextWaiting(_) => {
+                                println!("{}", term::dim("next waiting-for-input session selected"));
+                            }
+                            crate::modal::SessionPick::Cancel => {}
+                        }
+                    }
                 }
                 Some(crate::modal::MenuAction::Model) => {
                     // Show current model + how to change it.
