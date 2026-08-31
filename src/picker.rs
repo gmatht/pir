@@ -14,17 +14,18 @@
 //! Enter / Right resumes the highlighted session; `y` resumes the newest (index
 //! 0) for convenience; `f`/`F` marks the highlighted session finished (so it
 //! drops out of `/unfinished` and the picker itself) without resuming it;
-//! `n` / Esc / ctrl-c / ctrl-d / `q` abort (start a fresh session). This is a
-//! hand-rolled raw-mode renderer (no dependency — it must work in the
-//! default build), drawing into the terminal and restoring it on exit.
+//! `n` / Esc / ctrl-c / ctrl-d / `q` abort (start a fresh session).
+//!
+//! The picker runs on the **alternate screen** (via the shared `modal`
+//! infrastructure) so it restores the normal screen's scrollback on exit, and
+//! uses crossterm's event handling for arrows/resize instead of hand-rolled
+//! `libc::poll` + SIGWINCH + escape parsing.
 
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
-use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use crate::modal::{self, Key};
 use crate::session::{read_preview, SessionPreview};
 use crate::term;
 
@@ -41,6 +42,11 @@ pub struct PickItem {
     /// (e.g. `cerebras/gemma4`). Empty until generated (or when unavailable /
     /// throttled). The picker shows it when present, else the preview line.
     pub title: String,
+    /// Coarse outcome of the last finished turn, classified by the light model
+    /// into a short token (`complete` / `waiting` / `retry` / `blocked` /
+    /// `error`). Empty until generated. Shown at the top of the preview so the
+    /// user can tell at a glance whether a thread still needs them.
+    pub verdict: String,
 }
 
 /// Outcome of the picker.
@@ -54,18 +60,10 @@ pub enum PickResult {
     Cancel,
 }
 
-/// Set by the SIGWINCH handler so `wait_key` can wake up (and the loop can
-/// redraw with the new layout) when the terminal is resized while idling.
-static RESIZED: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn on_winch(_sig: i32) {
-    RESIZED.store(true, Ordering::SeqCst);
-}
-
 /// Run the interactive picker over `items` (already sorted newest-first, index
 /// 0 = newest). Returns `PickResult::Cancel` when stdin is not a terminal or
-/// the user bails out. Blocks in raw mode for the duration; restores the
-/// terminal on return.
+/// the user bails out. Runs on the alternate screen; restores the normal screen
+/// (with scrollback) on return.
 pub fn pick_session(items: &[PickItem]) -> PickResult {
     if items.is_empty() || !io::stdin().is_terminal() {
         return PickResult::Cancel;
@@ -74,53 +72,44 @@ pub fn pick_session(items: &[PickItem]) -> PickResult {
     // Previews are a per-file scan; cache them as the user visits rows.
     let mut preview_cache: HashMap<usize, SessionPreview> = HashMap::new();
 
-    // Enter raw mode (separate save slot from the REPL's running-turn raw) and
-    // hide the cursor while we draw.
-    term::raw::enable_raw_picker();
-    RESIZED.store(false, Ordering::SeqCst);
-    // Wake the (blocking) key wait when the terminal is resized so the
-    // layout is redrawn; restore the default (ignore) on exit.
-    unsafe { libc::signal(libc::SIGWINCH, on_winch as *const () as libc::sighandler_t) };
-    let _ = io::stdout().write_all(b"\x1b[?25l");
-    let _ = io::stdout().flush();
-
-    // How many rows we drew so we can erase exactly that block later.
-    let mut drawn_rows: usize = 0;
+    // Enter the alternate screen + raw mode (RAII: restores on drop, even on
+    // panic). Returns None if not a tty — we already checked, so unwrap.
+    let _modal = modal::Modal::enter().expect("stdin is a tty, so modal should enter");
 
     let result = loop {
         let preview = preview_cache
             .entry(selected)
             .or_insert_with(|| read_preview(&items[selected].path));
-        draw(items, selected, preview, &mut drawn_rows);
+        draw(items, selected, preview);
 
-        match wait_key() {
-            Key::Up | Key::Char('k') => {
+        match modal::read_key() {
+            Some(Key::Up) | Some(Key::Char('k')) => {
                 if selected > 0 {
                     selected -= 1;
                 }
             }
-            Key::Down | Key::Char('j') => {
+            Some(Key::Down) | Some(Key::Char('j')) => {
                 if selected + 1 < items.len() {
                     selected += 1;
                 }
             }
-            Key::Char('g') => selected = 0,
-            Key::Char('G') => selected = items.len().saturating_sub(1),
-            Key::PageUp => selected = selected.saturating_sub(page_step(items.len())),
-            Key::PageDown => selected = (selected + page_step(items.len())).min(items.len() - 1),
-            Key::Enter | Key::Right => break PickResult::Resume(selected),
-            Key::Char('y') => break PickResult::Resume(0), // newest, like the old `y=latest`
-            Key::Char('f') | Key::Char('F') => break PickResult::Finish(selected), // mark finished, don't resume
-            Key::Char('n') | Key::Char('q') | Key::Esc | Key::CtrlC | Key::CtrlD => {
+            Some(Key::Char('g')) => selected = 0,
+            Some(Key::Char('G')) => selected = items.len().saturating_sub(1),
+            Some(Key::PageUp) => selected = selected.saturating_sub(page_step(items.len())),
+            Some(Key::PageDown) => selected = (selected + page_step(items.len())).min(items.len() - 1),
+            Some(Key::Enter) | Some(Key::Right) => break PickResult::Resume(selected),
+            Some(Key::Char('y')) => break PickResult::Resume(0), // newest, like the old `y=latest`
+            Some(Key::Char('f')) | Some(Key::Char('F')) => break PickResult::Finish(selected), // mark finished, don't resume
+            Some(Key::Char('n')) | Some(Key::Char('q')) | Some(Key::Esc) | Some(Key::CtrlC) | Some(Key::CtrlD) => {
                 break PickResult::Cancel;
             }
             // keys without a picker action: ignore (Left = "back out" is
             // ambiguous with vim `h`, so keep it a no-op rather than quitting).
-            Key::Left => {}
+            Some(Key::Left) => {}
             // Terminal resized while idling: fall through so the loop redraws
             // with the new layout.
-            Key::Resize => {}
-            Key::Char(c) if c.is_ascii_digit() => {
+            Some(Key::Resize) => {}
+            Some(Key::Char(c)) if c.is_ascii_digit() => {
                 // Jump to the 1-based index if it exists.
                 let n = (c as u32 as usize).saturating_sub(1);
                 if n < items.len() {
@@ -129,17 +118,13 @@ pub fn pick_session(items: &[PickItem]) -> PickResult {
             }
             // Any other character: ignore (the picker only acts on the single
             // keys mapped above; free text is not an action).
-            Key::Char(_) => {}
-            // Spurious wake (e.g. EINTR without a resize flag): just redraw.
-            Key::None => {}
+            Some(Key::Char(_)) => {}
+            // Other keys (Home/End/Tab/ctrl-n/ctrl-m/Other): ignore.
+            Some(_) => {}
+            // EOF / read error: cancel.
+            None => break PickResult::Cancel,
         }
     };
-
-    // Erase the drawn block and restore the cursor.
-    let _ = io::stdout().write_all(format!("\r\x1b[{}A\x1b[J\x1b[?25h", drawn_rows).as_bytes());
-    let _ = io::stdout().flush();
-    term::raw::disable_raw_picker();
-    unsafe { libc::signal(libc::SIGWINCH, libc::SIG_DFL) };
     result
 }
 
@@ -150,8 +135,8 @@ fn page_step(n: usize) -> usize {
 /// Render the two panes for `selected`. The layout is recomputed on each draw
 /// from the current terminal size so it works at any width/height. We draw the
 /// whole block from the cursor, anchoring back to the top line afterward so the
-/// next draw overwrites in place..
-fn draw(items: &[PickItem], selected: usize, preview: &SessionPreview, drawn_rows: &mut usize) {
+/// next draw overwrites in place.
+fn draw(items: &[PickItem], selected: usize, preview: &SessionPreview) {
     let w = term::terminal_width().max(40);
     let h = term::terminal_height().max(12);
     let list_w = (w / 2).min(48).max(20);
@@ -159,12 +144,8 @@ fn draw(items: &[PickItem], selected: usize, preview: &SessionPreview, drawn_row
 
     let mut buf: Vec<u8> = Vec::new();
 
-    // Anchor to the top of the block: move up `drawn_rows` from the previous
-    // tick (0 on the first), then erase the whole block downward.
-    if *drawn_rows > 0 {
-        buf.extend_from_slice(format!("\r\x1b[{}A", *drawn_rows).as_bytes());
-    }
-    buf.extend_from_slice(b"\x1b[J");
+    // Clear the alternate screen and anchor to top-left.
+    buf.extend_from_slice(b"\x1b[2J\x1b[1;1H");
 
     // Header line.
     buf.extend_from_slice(
@@ -239,6 +220,19 @@ fn draw(items: &[PickItem], selected: usize, preview: &SessionPreview, drawn_row
     // same title `list_sessions` prints, kept in sync so both views agree.
     if !items[selected].title.is_empty() {
         pcol.push(term::green(&items[selected].title));
+    }    // Show the turn-outcome verdict (classified by the same light model) on
+    // its own line when present, so the user can tell at a glance whether a
+    // thread still needs them. Same coloring convention as `list_sessions`.
+    let v = crate::titler::verdict_label(&items[selected].verdict);
+    if !v.is_empty() {
+        let v_s = if v == "complete" {
+            term::green(v)
+        } else if v == "waiting for input" || v == "needs retry" {
+            term::yellow(v)
+        } else {
+            term::red(v)
+        };
+        pcol.push(format!("  [{}]", v_s));
     }
     if preview.turns == 0 {
         pcol.push(term::dim("(empty session — no prompts yet)").to_string());
@@ -288,7 +282,6 @@ fn draw(items: &[PickItem], selected: usize, preview: &SessionPreview, drawn_row
 
     let _ = io::stdout().write_all(&buf);
     let _ = io::stdout().flush();
-    *drawn_rows = h; // the whole terminal is ours for the duration
 }
 
 /// First non-empty line of `s`.
@@ -353,134 +346,3 @@ fn rel_time(t: SystemTime) -> String {
     format!("{}d", secs / 86_400)
 }
 
-/// A single keypress (or control key) read in raw mode.
-#[derive(Debug)]
-enum Key {
-    Up,
-    Down,
-    Right,
-    Left,
-    Enter,
-    Esc,
-    CtrlC,
-    CtrlD,
-    PageUp,
-    PageDown,
-    Resize,
-    Char(char),
-    None,
-}
-
-/// Block until a keypress is available (or the terminal is resized),
-/// translating arrow keys / control sequences via the shared CSI-aware
-/// `term::raw::translate_picker`. This is what lets the picker idle instead of
-/// spinning: `poll()` parks the process with zero wakeups until stdin is
-/// readable or SIGWINCH interrupts it (EINTR), so no CPU is burned and no
-/// repaint happens until there is something to show.
-fn wait_key() -> Key {
-    let fd = io::stdin().as_raw_fd();
-    if RESIZED.swap(false, Ordering::SeqCst) {
-        // A resize may have landed while we were processing the last key.
-        return Key::Resize;
-    }
-    loop {
-        let mut pfd = [libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        }];
-        let r = unsafe { libc::poll(pfd.as_mut_ptr(), 1, -1) };
-        if r < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                // EINTR: most likely SIGWINCH (flag set → resize/redraw) or the
-                // process being resumed after a SIGTSTP (Ctrl-Z) suspension. In
-                // the latter case the kernel restored the *original* (pre-raw)
-                // termios while we were stopped, so we must re-establish the
-                // picker's raw mode before drawing again — otherwise the screen
-                // redraw would be echoed/garbled and arrow keys would misbehave.
-                if RESIZED.swap(false, Ordering::SeqCst) {
-                    return Key::Resize;
-                }
-                term::raw::enable_raw_picker();
-                return Key::Resize; // force a redraw after resume
-            }
-            // Real poll error: fall back to a redraw-and-retry cycle.
-            return Key::None;
-        }
-        if r == 0 {
-            continue; // can't happen with an infinite timeout
-        }
-        break; // stdin is readable
-    }
-
-    let mut tmp = [0u8; 64];
-    let r = unsafe { libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
-    if r <= 0 {
-        if r == 0 {
-            return Key::CtrlD; // stdin closed
-        }
-        // Read interrupted (EINTR, e.g. a resize during read): retry loop.
-        return Key::None;
-    }
-    let bytes = &tmp[..r as usize];
-    // The shared `translate` swallows CSI sequences (arrows, Home/End, F-keys)
-    // and reports them as `RawInput::None`, so we detect the movement keys we
-    // care about *here* from the raw bytes before falling back to it. Handles
-    // both the standard `ESC [ <letter>` form and the VT100 `ESC O <letter>`
-    // application-cursor form, plus the page-up/page-down `ESC [ 5~`/`6~`.
-    if bytes.len() >= 3 && (bytes[0] == 0x1b) && (bytes[1] == 0x5b || bytes[1] == 0x4f) {
-        return match bytes[2] {
-            b'A' => Key::Up,
-            b'B' => Key::Down,
-            b'C' => Key::Right,
-            b'D' => Key::Left,
-            _ => Key::None,
-        };
-    }
-    if bytes.len() >= 4 && bytes[0] == 0x1b && bytes[1] == 0x5b && bytes[3] == b'~' {
-        return match bytes[2] {
-            b'5' => Key::PageUp,
-            b'6' => Key::PageDown,
-            _ => Key::None,
-        };
-    }
-    let mut buf = String::new();
-    let ta: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-    let res = term::raw::translate_picker(&mut buf, &ta, bytes);
-    translate_result(&res, &buf)
-}
-
-/// Map a `term::raw::RawInput` outcome (plus the typed line if any) into our
-/// `Key` enum. The picker ignores free text except for the single keys
-/// `y`/`n`/`q`/`g`/`G` and digits, so a finished line is reported via its first
-/// non-whitespace character.
-fn translate_result(res: &term::raw::RawInput, buf: &str) -> Key {
-    use term::raw::RawInput;
-    match res {
-        RawInput::Line(s) => {
-            let s = s.trim();
-            if s.is_empty() {
-                Key::Enter
-            } else if let Some(c) = s.chars().next() {
-                Key::Char(c)
-            } else {
-                Key::None
-            }
-        }
-        RawInput::Interrupt => Key::CtrlC,
-        RawInput::Cancel => Key::Esc,
-        RawInput::Eof => Key::CtrlD,
-        // NOTE: `RawInput::Suspend` can no longer be produced here. `translate`
-        // only returns `Suspend` for a `0x1a` byte when its raw termios cleared
-        // `ISIG`; the picker's `enable_raw_picker` now keeps `ISIG` set, so the
-        // kernel delivers SIGTSTP on Ctrl-Z and pir suspended by the parent
-        // shell (handled/re-entered in `wait_key`). If a `Suspend` ever does
-        // arrive we treat it like Esc (cancel) rather than silently swallowing.
-        RawInput::Suspend => Key::Esc,
-        RawInput::None => {
-            let _ = buf;
-            Key::None
-        }
-    }
-}

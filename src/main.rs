@@ -1717,7 +1717,10 @@ fn handle_command(
             if provider_id.is_empty() {
                 return;
             }
-            let key = term::read_secret(&format!("API key for {provider_id}: "));
+            let key = match crate::modal::secret_entry(&format!("API key for {provider_id}:")) {
+                Some(k) => k,
+                None => term::read_secret(&format!("API key for {provider_id}: ")),
+            };
             if key.is_empty() {
                 eprintln!("pir: empty key — nothing saved");
                 return;
@@ -2213,6 +2216,49 @@ fn handle_command(
             }
         }
         "q" | "quit" | "exit" => std::process::exit(0),
+        "menu" => {
+            // Open the main menu on the alternate screen. The menu returns an
+            // action; dispatch it here (the REPL loop continues after).
+            match crate::modal::main_menu() {
+                Some(crate::modal::MenuAction::Resume) => {
+                    // Re-run the resume flow (list sessions + picker).
+                    let _ = list_sessions();
+                }
+                Some(crate::modal::MenuAction::Model) => {
+                    // Show current model + how to change it.
+                    let g = agent_slot.lock().unwrap();
+                    if let Some(agent) = g.as_ref() {
+                        println!("current model: {}", agent.label());
+                    }
+                }
+                Some(crate::modal::MenuAction::Thinking) => {
+                    let g = agent_slot.lock().unwrap();
+                    if let Some(agent) = g.as_ref() {
+                        println!("thinking level: {}", agent.thinking_level().as_str());
+                    }
+                }
+                Some(crate::modal::MenuAction::Security) => {
+                    // Show the current security posture.
+                    let g = agent_slot.lock().unwrap();
+                    if let Some(agent) = g.as_ref() {
+                        println!(
+                            "su-based security: {}",
+                            if agent.su_security_enabled() { "ENABLED" } else { "disabled" }
+                        );
+                    }
+                }
+                Some(crate::modal::MenuAction::Settings) => {
+                    println!("settings: see /model, /thinking, /default-model, /su-security");
+                }
+                Some(crate::modal::MenuAction::Help) => print!("{HELP}"),
+                Some(crate::modal::MenuAction::About) => {
+                    println!("pir {}", env!("CARGO_PKG_VERSION"));
+                    println!("{}", term::dim("GPL-3.0 · pulldown-cmark · streamdown-parser · rustyline · ureq · smol · crossterm"));
+                }
+                Some(crate::modal::MenuAction::Quit) => std::process::exit(0),
+                _ => {}
+            }
+        }
         other => {
             // Unknown to the built-in set. Try extension-registered slash
             // commands (e.g. from the `pi-extensions` bridge). The agent owns

@@ -210,6 +210,111 @@ pub enum Approval {
     Deny,
 }
 
+/// An action chosen from the main menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuAction {
+    Resume,
+    BackgroundSessions,
+    Model,
+    Thinking,
+    Security,
+    Settings,
+    Help,
+    About,
+    Quit,
+    None,
+}
+
+/// Show the main menu on the alternate screen and return the chosen action.
+/// Returns `None` if the terminal isn't a tty (caller falls back to no-op).
+pub fn main_menu() -> Option<MenuAction> {
+    let _modal = Modal::enter()?;
+    let items = [
+        ("r", "Resume / pick session"),
+        ("b", "Backgrounded sessions"),
+        ("m", "Model"),
+        ("t", "Thinking"),
+        ("s", "Security"),
+        ("e", "Settings"),
+        ("h", "Help"),
+        ("a", "About"),
+        ("q", "Quit"),
+    ];
+    let mut selected = 0usize;
+    loop {
+        let lines: Vec<String> = items
+            .iter()
+            .enumerate()
+            .map(|(i, (key, label))| {
+                let marker = if i == selected { "▸" } else { " " };
+                format!("{marker} [{}] {label}", if i == selected { key } else { key })
+            })
+            .collect();
+        draw_box("pir — main menu", &lines);
+        match read_key()? {
+            Key::Up | Key::Char('k') => selected = selected.saturating_sub(1),
+            Key::Down | Key::Char('j') => selected = (selected + 1).min(items.len() - 1),
+            Key::Enter | Key::Right => return Some(action_for(items[selected].0)),
+            Key::Char(c) => {
+                let c = c.to_ascii_lowercase();
+                if let Some((i, _)) = items.iter().enumerate().find(|(_, (k, _))| k.chars().next() == Some(c)) {
+                    return Some(action_for(items[i].0));
+                }
+            }
+            Key::Esc | Key::CtrlC | Key::CtrlD => return Some(MenuAction::None),
+            _ => {}
+        }
+    }
+}
+
+fn action_for(key: &str) -> MenuAction {
+    match key {
+        "r" => MenuAction::Resume,
+        "b" => MenuAction::BackgroundSessions,
+        "m" => MenuAction::Model,
+        "t" => MenuAction::Thinking,
+        "s" => MenuAction::Security,
+        "e" => MenuAction::Settings,
+        "h" => MenuAction::Help,
+        "a" => MenuAction::About,
+        "q" => MenuAction::Quit,
+        _ => MenuAction::None,
+    }
+}
+
+/// Show a masked secret-entry dialog on the alternate screen and return the
+/// typed value. The key is shown as `••••` and never touches the normal screen
+/// or scrollback. Returns `None` if the terminal isn't a tty (caller falls back
+/// to a plain read) or the user cancels (Esc/ctrl-c).
+pub fn secret_entry(prompt: &str) -> Option<String> {
+    let _modal = Modal::enter()?;
+    let mut buf = String::new();
+    loop {
+        let masked: String = buf.chars().map(|_| '•').collect();
+        let lines = vec![
+            prompt.to_string(),
+            String::new(),
+            format!("  {}", if masked.is_empty() { "(type to enter)" } else { &masked }),
+            String::new(),
+            crate::term::dim("[enter] confirm  [esc] cancel  [backspace] delete").to_string(),
+        ];
+        draw_box("pir — secret entry", &lines);
+        match read_key()? {
+            Key::Enter => {
+                if !buf.is_empty() {
+                    return Some(buf);
+                }
+            }
+            Key::Esc | Key::CtrlC => return None,
+            Key::Char('\u{8}') => {
+                buf.pop();
+            }
+            Key::Char(c) if !c.is_control() => buf.push(c),
+            _ => {}
+        }
+    }
+}
+
 /// Show the tool-approval dialog on the alternate screen and read the operator's
 /// decision. `denial` describes the blocked operation; `approval` carries the
 /// agent's recent prompts + thinking for context. Returns `None` if the terminal
@@ -240,8 +345,7 @@ fn approval_lines(
     prompts: &[String],
     thinking: &[String],
     show_info: bool,
-) -> Vec<String> {
-    use crate::term;
+) -> Vec<String> {    use crate::term;
     let what = match &d.ask.path {
         Some(p) => p.display().to_string(),
         None => match &d.ask.target {
