@@ -187,17 +187,24 @@ Actions per entry: **resume** (`/fg` or `pir -r`), **view log**, **cancel**,
 sessions the user is actively tracking, so the "drive the queue" flow survives a
 restart. Concretely:
 
-- **Save** — write the current active-session list (ids + a short label) to a
-  small file, e.g. `~/.pi/agent/active-sessions.json`. This is the set of
-  backgrounded/queued sessions the user cares about.
-- **Restore** — on startup (or via a menu action), reload that file and re-attach
-  to the listed sessions, re-classifying their state (running / waiting for
+- **Named lists.** A list has a **name** (e.g. `default`, `work`, `side-project`).
+  Lists live under `~/.pi/agent/active-sessions/` as `<name>.json`. The user can
+  create a new named list or load an existing one.
+- **Save** — write the current active-session list (ids + a short label) to the
+  currently-loaded list's file. **By default, save back to the same list that was
+  loaded** — so if you loaded `work`, saving writes to `work.json`, not a new
+  file. A "save as…" action lets you pick a different name (creating a new list or
+  overwriting another).
+- **Restore** — on startup (or via a menu action), pick a named list to load and
+  re-attach to its sessions, re-classifying their state (running / waiting for
   input / complete) so the hot-key "next waiting-for-input" flow works again
   without the user having to re-discover the sessions.
 - **Why:** backgrounded sessions are currently in-memory (`BackgroundJobs` in
   `main.rs`) and lost on exit. Persisting the active list means a user can quit
   pir, come back later, and immediately jump to the sessions that still need
-  them — the whole point of the "drive the queue" hot-key.
+  them — the whole point of the "drive the queue" hot-key. Named lists let the
+  user keep several independent queues (e.g. one per project) and switch between
+  them.
 
 ---
 
