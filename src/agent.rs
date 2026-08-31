@@ -115,6 +115,12 @@ pub struct Agent {
     /// but suppressed from the live output (toggle with `/thinking show`/
     /// `/thinking hide`; persisted per session).
     show_thinking: bool,
+    /// Whether the agent's *text* reply is rendered to Markdown **incrementally**
+    /// (in place, overwriting the previous partial render as tokens arrive)
+    /// rather than as a single dump at the end of the turn. On by default; off
+    /// via `PIR_INCREMENTAL_MD=0` / `--no-incremental`. Quiet (background)
+    /// turns never render incrementally regardless (nothing is drawn).
+    incremental_md: bool,
     /// Cached provider list (loaded once, reused for model switches / resume).
     /// Avoids re-reading and re-parsing `~/.pi/agent/models-store.json` on every
     /// `/model` switch, resume, and `apply_persisted_model` call.
@@ -350,6 +356,7 @@ impl Agent {
             thinking: config::ThinkingLevel::Off,
             show_thinking: true,
             auto_retry: None,
+            incremental_md: config::incremental_md_default(),
             cached_providers,
         })
     }
@@ -712,6 +719,26 @@ impl Agent {
         .to_string()
     }
 
+    /// Whether incremental (in-place) markdown rendering is enabled.
+    pub fn incremental_md(&self) -> bool {
+        self.incremental_md
+    }
+
+    /// Toggle incremental (in-place) markdown rendering for this session. Off
+    /// (`PIR_INCREMENTAL_MD=0` / `--no-incremental`) is useful for terminals or
+    /// logs that mangle cursor-movement escapes (the reply is then drawn once
+    /// at the end). Persisted per session. Returns a status line.
+    pub fn set_incremental_md(&mut self, on: bool) -> String {
+        self.incremental_md = on;
+        self.persist_incremental_md();
+        if on {
+            "markdown: incremental  (re-rendered in place as it streams, throttled to 200ms)"
+        } else {
+            "markdown: simple  (rendered once when the turn completes)"
+        }
+        .to_string()
+    }
+
     /// Persist the thinking level + show-thinking flag next to the session log
     /// (`<log>.thinking`) so a resumed session keeps them. Best-effort; a
     /// missing log (one-shot) is silently skipped.
@@ -722,6 +749,18 @@ impl Agent {
             }
             let body = format!("{}\n{}", self.thinking.as_str(), if self.show_thinking { "1" } else { "0" });
             let _ = std::fs::write(p.with_extension("thinking"), body);
+        }
+    }
+
+    /// Persist the incremental (in-place) markdown choice (to `<log>.incmd`) for
+    /// this session, so a resumed session restores it. Mirrors `persist_su_security`.
+    fn persist_incremental_md(&self) {
+        if let Some(p) = &self.log_path {
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let path = p.with_extension("incmd");
+            let _ = std::fs::write(&path, if self.incremental_md { "1" } else { "0" });
         }
     }
 
@@ -740,6 +779,20 @@ impl Agent {
             self.show_thinking = flag.trim() == "1";
         }
         true
+    }
+
+    /// Load a previously persisted incremental-markdown choice (from
+    /// `<log>.incmd`) for a resumed session. Mirrors `apply_persisted_thinking`.
+    /// Returns true if a value was restored.
+    pub fn apply_persisted_incremental_md(&mut self) -> bool {
+        let Some(p) = self.log_path.as_ref() else { return false };
+        match std::fs::read_to_string(p.with_extension("incmd")) {
+            Ok(s) => {
+                self.incremental_md = s.trim() == "1";
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Begin a new goal for this session, persisting it next to the log.
@@ -1275,14 +1328,32 @@ impl Agent {
             //
             // We accumulate the reply into `assistant_text` (rather than
             // printing each token live) so the whole message can be rendered as
-            // Markdown at the end — headings, **bold**, lists and code fences
-            // come out formatted instead of as raw `**`/`#`/` ``` ` (see the
-            // render pass right after the spinner stops).
+            // Markdown. When incremental (in-place) rendering is enabled *and*
+            // we're on a tty, every streamed token is also pushed to an
+            // `IncrementalMarkdown` renderer that re-draws the partial markdown
+            // *in place* as it grows — jumping the cursor back over its previous
+            // block and overwriting it — so the user watches the formatted reply
+            // appear live instead of a blank spinner. Redraws are throttled to
+            // 200ms by the renderer, so a fast token firehose can't saturate the
+            // terminal. When incremental is off (quiet, not a tty, or opted out
+            // via PIR_INCREMENTAL_MD=0 / --no-incremental) we fall back to a
+            // single render once the message is complete (see the flush block
+            // below). The renderer holds the full accumulated markdown, so the
+            // single-render fallback never needs `assistant_text`.
+            let use_incremental = !self.silent() && tty && self.incremental_md;
+            let mut inc: Option<crate::md::IncrementalMarkdown> = if use_incremental {
+                Some(crate::md::IncrementalMarkdown::new(true, crate::term::color_enabled()))
+            } else {
+                None
+            };
             let mut assistant_text = String::new();
             let mut on_text = |t: &str| {
                 if !self.silent() {
                     stop_spinner();
                     assistant_text.push_str(t);
+                    if let Some(inc) = inc.as_mut() {
+                        inc.push(t);
+                    }
                 }
             };
             // Reasoning/thinking content. When show-thinking is off the thinking
@@ -1362,15 +1433,34 @@ impl Agent {
                 if let Some(mut s) = spinner.borrow_mut().take() {
                     s.stop();
                 }
-                println!();
+                // When incremental (in-place) rendering is active, do NOT print
+                // a blank line before the final flush: the flush jumps the cursor
+                // back `last_height` rows to overwrite the block it drew last,
+                // and an intervening newline would shift the cursor down one row
+                // so the jump-back undershoots and leaves the top row of the old
+                // block (e.g. a `# heading`) duplicated above the fresh render.
+                // The blank-line-only (non-incremental) path prints it below the
+                // single final render instead.
+                if !use_incremental {
+                    println!();
+                }
             }
-            // Render the assistant's reply as Markdown now that the whole
-            // message is in hand. Streaming tokens live would expose raw
-            // `**`/`#`/` ``` `; rendering once, at the end, lets headings,
-            // emphasis, lists and code fences come out formatted. Colour is
-            // applied only when the terminal supports it.
+            // Render the assistant's reply as Markdown. When incremental (in-
+            // place) rendering is active, the reply has *already* been drawn as
+            // partial blocks that grow in place during streaming — here we just
+            // flush the final, complete render over the last partial block (the
+            // renderer jumps the cursor back up and overwrites it, so nothing is
+            // stacked or duplicated). When it's off, we draw the markdown a
+            // single time now that the whole message is in hand. Either way the
+            // result is formatted Markdown (headings, **bold**, lists, code
+            // fences) rather than raw `**`/`#`/` ``` `. Colour is applied only
+            // when the terminal supports it.
             if !self.silent() && !assistant_text.trim().is_empty() {
-                term::out(&crate::md::render(&assistant_text, crate::term::color_enabled()));
+                if let Some(mut inc) = inc.take() {
+                    inc.flush();
+                } else {
+                    term::out(&crate::md::render(&assistant_text, crate::term::color_enabled()));
+                }
             }
             let (assistant, usage) = match result {
                 Ok(r) => r,

@@ -176,7 +176,8 @@ OPTIONS
   -n, --no-color             disable ANSI colors
   --no-incremental         disable in-place streaming markdown (render the reply once at the end)
                            instead of re-drawing it as it streams). On by default, throttled to 200ms per
-                           redraw. Env: PIR_INCREMENTAL_MD=0
+                           redraw. Env: PIR_INCREMENTAL_MD=0 (PIR_INCREMENTAL_MD_THROTTLE_MS overrides the
+                           200ms window)
   -r, --resume [token]       resume a session; token selects by index/time/preview
   -c, --continue [token]     resume a session and continue its goal (pir -c)
   -u, --as <user>            run project commands as this user (default ai_<project>)

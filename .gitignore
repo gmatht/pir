@@ -1,5 +1,6 @@
 # Rust build output
 /target
+/.cargo-target
 
 # Local project metadata / session logs written next to the cwd
 /.pir

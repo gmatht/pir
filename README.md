@@ -18,6 +18,12 @@ that `pi`'s providers use — the **Anthropic Messages API** and the
   `~/.pi/AGENTS.md` and `./AGENTS.md`, and writes transcripts under
   `~/.pi/agent/sessions/`. Your `pi` setup is never modified.
 - **Streaming** token output over SSE for both provider APIs.
+- **Incremental markdown rendering** — agent replies are parsed as CommonMark
+  and rendered formatted (headings, `**bold**`, lists, code fences, links) to
+  the terminal, and re-rendered **in place** as the reply streams (cursor
+  jumps back and overwrites the block, so lines never stack). On by default,
+  throttled to one redraw per 200&nbsp;ms; disable with `--no-incremental` or
+  `PIR_INCREMENTAL_MD=0`. See [`docs/incremental-markdown.md`](docs/incremental-markdown.md).
 - **Five built-in tools**: `bash`, `read_file`, `write_file`, `edit_file`, `list_dir`,
   with `y`/`a`/`n` confirmation prompts (or `-y` full-auto).
 - **Extensions** — drop a folder in `extensions/<name>/src/lib.rs` exporting
@@ -300,8 +306,8 @@ sudo rootreq-enforcer
 - Ctrl-C mid-stream kills the process (no raw-terminal mode); the JSONL log and
   `.goal.json` preserve everything up to the last completed message, and `pir -c`
   can pick up where it left off.
-- No markdown rendering, no parallel in-loop tool execution, no sub-agents, no
-  MCP — that's the "lightweight" deal. Adding a built-in tool is one
+- No parallel in-loop tool execution, no sub-agents, no MCP — that's the
+  "lightweight" deal. Adding a built-in tool is one
   `ToolSpec` + one match arm; adding an extension is one folder.
 - `-y` runs arbitrary shell commands bounded only by a 120s timeout; the default
   confirmation mode is the sane choice. When running as an `ai_*` user, `pir`
