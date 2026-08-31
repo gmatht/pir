@@ -776,19 +776,15 @@ impl IncrementalMarkdown {
         // it) so the frame overwrites the previous block completely. The
         // streaming renderer carries open-block state, so a line that continues
         // a code fence / list / blockquote renders correctly without re-parsing
-        // the whole buffer. Falls back to the O(n²) whole-buffer `render` on the
-        // first redraw (to seed the streaming renderer's output).
-        let rendered = if let Some(stream) = self.stream.as_mut() {
+        // the whole buffer. The FIRST redraw seeds the streaming renderer with
+        // the whole buffer (NOT pulldown `render`, whose literal ```md-fence
+        // output would diverge in height from the streaming renderer and break
+        // the jump-back erase — the "table swallowed" bug).
+        let rendered = {
+            let stream = self.stream.get_or_insert_with(|| StreamingRenderer::new(self.color));
             stream.push(&self.pending[self.last_rendered..]);
             self.last_rendered = self.pending.len();
             stream.output().to_string()
-        } else {
-            let rendered = render(&self.pending, self.color);
-            let mut stream = StreamingRenderer::new(self.color);
-            stream.push(&self.pending);
-            self.stream = Some(stream);
-            self.last_rendered = self.pending.len();
-            rendered
         };
         let height = rendered.lines().count().max(1);
         let mut s = String::with_capacity(rendered.len() + 16);
@@ -1517,6 +1513,31 @@ mod tests {
 mod incremental_tests {
     use super::*;
     use std::time::Duration;
+
+    // Regression: a ```md-fenced table renders as an aligned grid with every
+    // incremental frame showing the SAME aligned content (heights agree, so the
+    // jump-back erase never swallows it). This is the fix for the streaming
+    // renderer diverging from the pulldown seed and erasing the table.
+    #[test]
+    fn md_fenced_table_frames_stay_consistent() {
+        let mut r = IncrementalMarkdown::new(true, false);
+        r.set_throttle(Duration::ZERO);
+        r.push("```md\n| Name | Role | Location |\n| :--- | :--- | :--- |\n| Alice | Developer | New York |\n```\n");
+        r.flush();
+        let last = r.frames().last().unwrap();
+        // The aligned table grid is present in the final frame body.
+        assert!(last.contains("| Name"), "table missing from incremental output: {last:?}");
+        assert!(last.contains("Alice"), "table missing: {last:?}");
+        assert!(last.contains("Developer"), "table missing: {last:?}");
+        // No literal ```md fence markers (it rendered as markdown, not code).
+        assert!(!last.contains("```md"), "md fence markers leaked: {last:?}");
+        // A bare ``` fence containing non-table code still renders literally.
+        let mut r2 = IncrementalMarkdown::new(true, false);
+        r2.set_throttle(Duration::ZERO);
+        r2.push("```\nlet x = 1;\n```\n");
+        r2.flush();
+        assert!(r2.frames().last().unwrap().contains("```\nlet x = 1;"), "bare code fence collapsed: {:?}", r2.frames().last());
+    }
 
     // Default throttle is 200ms (the ceiling requested by the PR: redraw at
     // most once every 200ms so a fast token stream can't flood the terminal).
