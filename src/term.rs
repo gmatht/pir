@@ -1676,9 +1676,37 @@ pub mod raw {
                 break;
             }
             if r == 0 {
-                // stdin closed (real EOF, e.g. piped input ended or the parent
-                // pane died). Surface it so the caller quits like ctrl-d rather
-                // than busy-looping forever on a dead fd.
+                // Distinguish a *real* EOF (stdin closed / parent pane died /
+                // piped input ended) from a *transient* empty read. In
+                // non-canonical raw mode (`VMIN=0, VTIME=0`, see `enable_raw`),
+                // a live PTY whose input queue is momentarily empty makes
+                // `read` return 0 — the same value as a closed pipe. Treating
+                // that transient 0 as hard EOF is what made pir spuriously
+                // `exit(0)` right after a turn finished: `wait_input` woke via
+                // the turn-completion channel, `read_chunk` saw 0 with nothing
+                // buffered, and the REPL quit as if the user had pressed ctrl-d.
+                //
+                // `poll(POLLIN|POLLHUP)` cleanly separates the two cases: only a
+                // genuinely closed fd reports `POLLHUP` (verified empirically
+                // for both a closed pipe and a PTY whose master closed). A live
+                // PTY with an empty queue reports neither event.
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN | libc::POLLHUP,
+                    revents: 0,
+                };
+                let real_eof = unsafe { libc::poll(&mut pfd, 1, 0) > 0 }
+                    && pfd.revents & libc::POLLHUP != 0;
+                if !real_eof {
+                    // Transient empty read on a live raw-mode fd: this is the
+                    // normal idle case, not a closed stdin. Stop draining and
+                    // report no input (treat like EAGAIN) so the REPL stays
+                    // alive and re-loops.
+                    break;
+                }
+                // stdin genuinely closed (real EOF, e.g. piped input ended or
+                // the parent pane died). Surface it so the caller quits like
+                // ctrl-d rather than busy-looping forever on a dead fd.
                 eof = true;
                 break;
             }
