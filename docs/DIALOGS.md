@@ -36,6 +36,11 @@ streaming thoughts are hidden behind it.
 - Reason (if any).
 - Actions: `[o] allow once  [s] allow session  [n] deny  [i] info` (info shows
   the full blast radius and re-prompts).
+- **Context (given space):** the last few user prompts and the agent's recent
+  thinking, so the operator can judge the request in context without leaving the
+  dialog. Show the last ~2-3 prompts and the last ~5-8 lines of thinking, each
+  dimmed and truncated to the dialog width. This is what makes the approval
+  decision trustworthy — the operator sees *why* the agent is asking.
 
 **Behavior:** on close, restore the normal screen. The thoughts that streamed
 *before* the dialog stay in scrollback; the dialog itself vanishes cleanly.
@@ -109,6 +114,25 @@ should show them as disabled with a "not supported on this OS" note. The dialog
 should probe at runtime (e.g. whether overlayfs can mount, whether the current
 user is root) and grey out options that can't work, with a reason.
 
+**Windows TODO:** Windows does have security features worth surfacing, even if
+they differ from the unix ones. Leave these as a TODO for a future pass, but note
+them here so the dialog has a place to grow:
+
+- **Windows Defender / SmartScreen** — whether the agent's spawned processes are
+  subject to it (no direct control, but worth reporting).
+- **AppContainer / sandboxing** — Windows' built-in sandbox mechanism; could
+  confine the agent's child processes (needs investigation; not implemented).
+- **Mandatory Integrity Control (MIC)** — running the agent at a lower integrity
+  level so it can't write to higher-integrity locations (a real, root-free
+  option on Windows).
+- **User Account Control (UAC)** — whether the agent can elevate (mirrors the
+  unix `BecomeRoot`/`Apt` ask flow).
+- **Windows Defender Application Control (WDAC)** — code-integrity policy that
+  could restrict what the agent can execute.
+
+None of these are implemented; the dialog should show a "Windows security: TODO"
+section listing them as future work rather than pretending they don't exist.
+
 ---
 
 ## 6. Settings Dialog
@@ -124,6 +148,18 @@ Editable settings (persisted to `~/.pi/agent/settings.json` where applicable):
 - **Security** (link to #5).
 
 Each row shows the current value and lets the user change it; changes persist.
+
+**Note — compile in only one markdown backend.** pir currently has three markdown
+paths: pulldown (always compiled), comrak (optional `comrak-backend` feature, off
+by default), and the new streamdown streaming renderer. The `markdownRenderer`
+setting is a runtime choice between pulldown and comrak, but comrak is heavy
+(drags in onig) and is off by default. With streamdown-parser now providing the
+O(n) streaming renderer, the sensible consolidation is: **drop the comrak backend
+entirely** (remove the `comrak-backend` feature and `render_comrak`), and keep
+pulldown for the one-shot `render()` path + streamdown for the streaming path.
+That means only one *optional* backend is ever compiled, and the settings dialog
+should not offer comrak as a runtime choice once it's gone. (This is a code
+change, not just a dialog change — flag it as a follow-up.)
 
 ---
 
@@ -146,6 +182,22 @@ flow: backgrounded turns that stalled waiting for input get picked up in one key
 
 Actions per entry: **resume** (`/fg` or `pir -r`), **view log**, **cancel**,
 **mark finished**.
+
+**Save / restore the active session list:** a way to persist and reload the set of
+sessions the user is actively tracking, so the "drive the queue" flow survives a
+restart. Concretely:
+
+- **Save** — write the current active-session list (ids + a short label) to a
+  small file, e.g. `~/.pi/agent/active-sessions.json`. This is the set of
+  backgrounded/queued sessions the user cares about.
+- **Restore** — on startup (or via a menu action), reload that file and re-attach
+  to the listed sessions, re-classifying their state (running / waiting for
+  input / complete) so the hot-key "next waiting-for-input" flow works again
+  without the user having to re-discover the sessions.
+- **Why:** backgrounded sessions are currently in-memory (`BackgroundJobs` in
+  `main.rs`) and lost on exit. Persisting the active list means a user can quit
+  pir, come back later, and immediately jump to the sessions that still need
+  them — the whole point of the "drive the queue" hot-key.
 
 ---
 
