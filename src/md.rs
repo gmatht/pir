@@ -784,6 +784,10 @@ impl IncrementalMarkdown {
             let stream = self.stream.get_or_insert_with(|| StreamingRenderer::new(self.color));
             stream.push(&self.pending[self.last_rendered..]);
             self.last_rendered = self.pending.len();
+            // Flush any trailing partial line so a chunk that didn't end in `\n`
+            // (e.g. the tail of the reply) renders now, not only at finalize.
+            // This keeps the final frame's height consistent across redraws.
+            stream.flush_pending_line();
             stream.output().to_string()
         };
         let height = rendered.lines().count().max(1);
@@ -865,6 +869,11 @@ pub struct StreamingRenderer {
     md_fence: Option<Vec<String>>,
     /// Whether the current fence's language (on the fence line) is md/markdown.
     md_fence_is_md: bool,
+    /// Partial line not yet terminated by a `\n`: real streaming delivers token
+    /// chunks that split lines mid-way, so we must buffer until a newline before
+    /// feeding the (line-oriented) parser. Without this, a ```md-fenced table
+    /// streamed byte-by-byte would be fragmented and the table corrupted.
+    pending_line: String,
     out: String,
 }
 
@@ -881,6 +890,7 @@ impl StreamingRenderer {
             table_rows: Vec::new(),
             md_fence: None,
             md_fence_is_md: false,
+            pending_line: String::new(),
             out: String::new(),
         }
     }
@@ -893,21 +903,58 @@ impl StreamingRenderer {
         }
     }
 
-    /// Feed a chunk of markdown (may contain newlines); splits on lines and
-    /// feeds each. Returns the newly rendered output.
+    /// Feed a chunk of markdown (may be an arbitrary token slice, often without
+    /// line boundaries). Buffers partial lines until a `\n` so the line-oriented
+    /// parser always receives whole lines; returns the newly rendered output.
     pub fn push(&mut self, chunk: &str) -> String {
         let start = self.out.len();
-        for line in chunk.split('\n') {
-            self.push_line(line);
+        // Accumulate the chunk onto the pending partial line, then split the
+        // combined content into complete (newline-terminated) lines plus a
+        // trailing partial. Feed each complete line; keep the partial.
+        self.pending_line.push_str(chunk);
+        let mut content = std::mem::take(&mut self.pending_line);
+        loop {
+            match content.find('\n') {
+                Some(idx) => {
+                    let line = content[..=idx].to_string();
+                    content = content[idx + 1..].to_string();
+                    self.push_line(line.trim_end_matches('\n'));
+                }
+                None => {
+                    // No newline left: this is the partial line for the next call.
+                    self.pending_line = content;
+                    break;
+                }
+            }
         }
         self.out[start..].to_string()
     }
 
     /// Close any open blocks (call at end of stream) and return the tail.
+    /// Also flushes any trailing partial line.
     pub fn finalize(&mut self) -> String {
         let start = self.out.len();
         for ev in self.parser.finalize() {
             self.on_event(ev);
+        }
+        self.out[start..].to_string()
+    }
+
+    /// Flush any trailing partial line (from a chunk that didn't end in `\n`)
+    /// so it renders now rather than waiting for the next newline or `finalize`.
+    /// Idempotent; does NOT close open blocks (unlike `finalize`), so it's safe
+    /// to call on every incremental redraw.
+    pub fn flush_pending_line(&mut self) -> String {
+        let start = self.out.len();
+        if !self.pending_line.is_empty() {
+            let line = std::mem::take(&mut self.pending_line);
+            self.push_line(line.trim_end_matches('\n'));
+        }
+        // A re-rendered table (e.g. inside an md fence) whose last row isn't
+        // followed by a blank line never gets a `TableEnd` from the parser.
+        // Emit any buffered rows so the table renders rather than vanishing.
+        if !self.table_rows.is_empty() {
+            self.flush_table();
         }
         self.out[start..].to_string()
     }
@@ -1275,8 +1322,7 @@ mod streaming_tests {
     // This test just sanity-checks the streaming path completes quickly on a
     // large input (it would be quadratic-slow if it re-parsed the prefix).
     #[test]
-    fn streaming_is_linear_on_large_input() {
-        let mut r = StreamingRenderer::new(false);
+    fn streaming_is_linear_on_large_input() {        let mut r = StreamingRenderer::new(false);
         let mut md = String::new();
         for i in 0..5000 {
             md.push_str(&format!("Token {i} **bold** and `code` with a [link](https://x.com) and _em_.\n"));
@@ -1335,8 +1381,7 @@ mod streaming_tests {
     // A markdown table in a ```md / ```markdown fence renders as markdown
     // (aligned grid), not as literal code lines.
     #[test]
-    fn streaming_renders_md_fenced_table() {
-        let md = "```markdown\n| Name | Role | Location |\n| :--- | :--- | :--- |\n| Alice | Developer | New York |\n| Bob | Designer | London |\n```\n";
+    fn streaming_renders_md_fenced_table() {        let md = "```markdown\n| Name | Role | Location |\n| :--- | :--- | :--- |\n| Alice | Developer | New York |\n| Bob | Designer | London |\n```\n";
         let mut r = StreamingRenderer::new(false);
         for line in md.lines() {
             r.push_line(line);
@@ -1400,6 +1445,32 @@ mod streaming_tests {
         }
         r2.finalize();
         assert_eq!(r2.output(), "```\nlet x = 1;\n```\n", "bare code fence changed: {:?}", r2.output());
+    }
+
+    // Regression: streaming feeds arbitrary byte slices that split lines mid-way
+    // (real LLM token streams). A ```md-fenced table delivered in 8-byte chunks
+    // must still render as a whole aligned grid, not a fragmented one. This is
+    // the bug the fake streaming-model harness caught (header split as `| ` /
+    // `Name | ...`).
+    #[test]
+    fn streaming_renders_fragmented_md_fenced_table() {
+        let md = "```md\n| Name | Role | Location |\n| :--- | :--- | :--- |\n| Alice | Developer | New York |\n| Bob | Designer | London |\n```\n";
+        let mut r = StreamingRenderer::new(false);
+        // Feed in tiny fragments that split lines arbitrarily.
+        for i in (0..md.len()).step_by(8) {
+            let end = (i + 8).min(md.len());
+            r.push(&md[i..end]);
+        }
+        r.finalize();
+        let out = r.output();
+        // The whole table is present and NOT split (no `| \nName` fragments).
+        assert!(out.contains("| Name"), "table missing: {out:?}");
+        assert!(out.contains("| Alice"), "row missing: {out:?}");
+        assert!(out.contains("| Bob"), "row missing: {out:?}");
+        assert!(out.contains("| Developer"), "cell missing: {out:?}");
+        assert!(!out.contains("| \n"), "header line was fragmented: {out:?}");
+        assert!(!out.contains("Name |\n|"), "table was fragmented: {out:?}");
+        assert!(!out.contains("```"), "fence markers leaked: {out:?}");
     }
 
     // Perf: the streaming path (O(n)) must be dramatically faster than the
@@ -1690,4 +1761,5 @@ mod incremental_tests {
         assert_eq!(body.matches("• d").count(), 1, "item d missing/duplicated: {body:?}");
     }
 }
+
 
