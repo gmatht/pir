@@ -685,7 +685,7 @@ fn history_substring_matches(query: &str, limit: usize) -> Vec<String> {
     if query_t.is_empty() {
         return Vec::new();
     }
-    let re = regex::RegexBuilder::new(query_t)
+    let re = regex_lite::RegexBuilder::new(query_t)
         .case_insensitive(true)
         .build();
     let re = re.ok();
@@ -724,7 +724,7 @@ fn find_match_range(matched: &str, query: &str) -> Option<(usize, usize)> {
     if query_t.is_empty() {
         return None;
     }
-    if let Ok(re) = regex::RegexBuilder::new(query_t).case_insensitive(true).build() {
+    if let Ok(re) = regex_lite::RegexBuilder::new(query_t).case_insensitive(true).build() {
         if let Some(m) = re.find(matched) {
             // rustyline's `Context` borrows a `History`; the helper ignores it, so an empty
             // in-memory history (kept in a static so it outlives the `Context`) is fine.
