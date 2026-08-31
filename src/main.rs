@@ -1075,12 +1075,18 @@ fn main() {
 
     // Running foreground turn state.
     let mut fg_handle: Option<JoinHandle<()>> = None;
+    // True while the running foreground turn is automatic post-prompt cleanup
+    // (a wt fix continuation): submitting a normal prompt cancels it so the
+    // user's new prompt runs instead of burning more cleanup turns.
+    let mut cleanup_running = false;
     // Prompts queued by the user while a turn runs (submitted on Enter).
     let mut pending: Vec<String> = Vec::new();
     // When a foreground turn has just completed and we're back at the idle
-    // prompt, the user hasn't pressed a key yet — show the configurable "done"
-    // placeholder (see `term::done_prompt`) in place of the plain `❯ ` prompt
-    // until they start typing. Reset on the first keypress.
+    // prompt, the user hasn't pressed a key yet — print the configurable "done"
+    // banner (see `term::done_prompt`) as a standalone line above the prompt so
+    // it's obvious the task is done and pir is waiting for input. It is cleared
+    // on the first keypress (the banner is printed once, then `awaiting_input`
+    // is reset), so typing happens on a clean `❯ ` line.
     let mut awaiting_input = false;
     // Partial line buffer for the raw-mode input while a turn runs.
     let mut input_buf = String::new();
@@ -1124,9 +1130,9 @@ fn main() {
                 term::raw::disable_raw();
                 // The turn just finished and control is about to return to the
                 // idle prompt with nothing queued: mark that we're awaiting the
-                // user's first keystroke so the REPL shows the configurable
-                // "done" placeholder (see `term::done_prompt`) instead of the
-                // plain `❯ ` prompt until they start typing.
+                // user's first keystroke so the REPL prints the configurable
+                // "done" banner (see `term::done_prompt`) once before the next
+                // prompt, then clears it on the first keypress.
                 awaiting_input = true;
                 // Report token usage from the (now-returned) agent.
                 if let Some(a) = agent_slot.lock().unwrap().as_ref() {
@@ -1155,6 +1161,7 @@ fn main() {
                     // A prompt the user typed *mid-turn* (raw mode) won't be in
                     // rustyline's history; record it so arrow-up recalls it later.
                     term::push_history(&next);
+                    cleanup_running = false;
                     fg_handle = Some(run_foreground_turn(
                         &agent_slot,
                         &fg_cancel,
@@ -1178,6 +1185,7 @@ fn main() {
                     if let Some(next) = follow.into_iter().next() {
                         if let Ok(mut g) = typeahead.lock() { g.clear(); }
                         term::push_history(&next);
+                        cleanup_running = true;
                         fg_handle = Some(run_foreground_turn(
                             &agent_slot,
                             &fg_cancel,
@@ -1257,6 +1265,12 @@ fn main() {
                         jobs.spawn_prompt(prompt, &current_ctx, bus.clone());
                         term::out(&term::dim("· backgrounded; current turn continues"));
                     } else {
+                        if cleanup_running {
+                            // The running turn is automatic post-prompt cleanup;
+                            // the user's submit wins — cancel it now and run
+                            // their prompt instead.
+                            fg_cancel.store(true, Ordering::SeqCst);
+                        }
                         pending.push(s.to_string());
                         input_buf.clear();
                         term::out(&term::dim("· queued; will run when current turn ends"));
@@ -1378,23 +1392,25 @@ fn main() {
             }
         }
         // The idle prompt. While we're awaiting the user's first keystroke after
-        // a turn completed (and nothing was queued/continued), show the
-        // configurable "done" placeholder (`✓ DONE :) -- ✓ DONE :) --` in
-        // bright yellow) instead of the plain `❯ ` prompt, so it's obvious the
-        // task is done and pir is waiting for input. The moment the user types
-        // anything (or a slash command), we go back to the normal prompt.
-        let prompt = if awaiting_input {
-            term::done_prompt()
-        } else {
-            format!("{} ", term::cyan("❯"))
-        };
+        // a turn completed (and nothing was queued/continued), print the
+        // configurable "done" banner (a full-width ✓ DONE line; see
+        // `term::done_prompt`) as a standalone line ABOVE the prompt — NOT as the
+        // rustyline prompt itself. The rustyline prompt is static for the whole
+        // input line, so using it there would leave the placeholder glued in
+        // front of the user's typed text until Enter; rendering it above means
+        // the moment the user starts typing they're on a clean `❯ ` line and the
+        // placeholder is already gone.
+        if awaiting_input {
+            term::out(&term::done_prompt());
+            awaiting_input = false;
+        }
+        let prompt = format!("{} ", term::cyan("❯"));
         match term::read_line(&prompt) {
             None => {
                 println!();
                 break;
             }
             Some(s) => {
-                awaiting_input = false;
                 line = s;
             }
         }
@@ -1425,6 +1441,7 @@ fn main() {
             // A fresh foreground turn starts un-silenced; reset the detach
             // switch so a previously detached turn's quiet state can't leak.
             fg_quiet.store(false, Ordering::SeqCst);
+            cleanup_running = false;
             fg_handle = Some(run_foreground_turn(
                 &agent_slot,
                 &fg_cancel,
@@ -2959,15 +2976,33 @@ fn parse_sh_u<'a>(args: &'a [&str]) -> Option<(Option<&'a str>, &'a [&'a str])> 
 /// could not be spawned.
 fn run_shell(args: Vec<&str>) -> Option<i32> {
     // `/sh -u [user]` starts the shell as another user (default: the invoking
-    // user, captured into PIR_INVOKING_USER before any privilege drop), e.g.
-    // to get back to the original user after pir dropped to a sandbox account.
-    // `/sh` with no `-u` runs as the current (possibly dropped) identity — the
-    // long-standing behaviour.
+    // user, captured into PIR_INVOKING_USER before any privilege drop) — the
+    // operator's escape hatch.
     if let Some((target, rest)) = parse_sh_u(&args) {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         return crate::user::spawn_shell_as(&shell, rest, target);
     }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    // User-level isolation: `/sh` with no `-u` runs as the *agent* execution
+    // user (e.g. `ai_pir`) when one is configured, so the interactive shell —
+    // and any single-shot command — is confined like the agent's tools and
+    // cannot write root-owned paths. `/sh -u` above remains the escape hatch.
+    if let Some(agent) = crate::user::agent_exec_user() {
+        let already = {
+            #[cfg(unix)]
+            {
+                let euid = unsafe { libc::geteuid() };
+                crate::user::name_of_uid(euid).as_deref() == Some(agent.as_str())
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        };
+        if !already {
+            return crate::user::spawn_shell_as(&shell, &args, Some(&agent));
+        }
+    }
     let status = if args.is_empty() {
         // Interactive: hand the terminal straight to the login shell.
         std::process::Command::new(&shell).status()

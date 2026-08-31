@@ -238,9 +238,11 @@ pub fn yellow(s: &str) -> String { paint("33", s) }
 pub fn cyan(s: &str) -> String { paint("36", s) }
 
 /// The "task done, awaiting input" placeholder rendered after a turn completes
-/// (and the user hasn't pressed a key since) so the idle prompt reads
-/// `❯ ✓ DONE :) -- ✓ DONE :) --`. The colour is configurable; see
-/// [`done_prompt_color`].
+/// (and the user hasn't pressed a key since) so the idle prompt shows a solid
+/// "done" banner. [`done_prompt`] prints this token padded out to the full
+/// terminal width in the configured colour (see [`done_prompt_color`]); the REPL
+/// renders it as a standalone banner line above the prompt, which is cleared on
+/// the first keypress so typing happens on a clean `❯ ` line.
 pub const DONE_PROMPT_TEXT: &str = "✓ DONE :) -- ✓ DONE :) --";
 
 /// Resolve the colour for the "done" prompt. Priority:
@@ -328,17 +330,36 @@ fn color_sgr(name: &str) -> &'static str {
 }
 
 /// The full idle "done" prompt: a cyan `❯` followed by the bright-yellow (or
-/// configured) [`DONE_PROMPT_TEXT`]. Falls back to plain text when colour is
-/// disabled.
+/// configured) [`DONE_PROMPT_TEXT`], padded with the same colour out to the
+/// full terminal width so it reads as a solid "task done" bar instead of a
+/// short string floating on the left. Falls back to plain text (space-padded)
+/// when colour is disabled. The REPL renders this as a standalone banner line
+/// above the prompt (not as the rustyline prompt itself), so the moment the
+/// user starts typing they're on a clean `❯ ` line — the placeholder doesn't
+/// stay glued in front of their input.
 pub fn done_prompt() -> String {
+    let token = DONE_PROMPT_TEXT;
+    let lead = if color() {
+        format!("{} ", cyan("❯"))
+    } else {
+        "❯ ".to_string()
+    };
+    let base_vis = visible_len(&lead) + visible_len(token);
+    let width = terminal_width();
     if !color() {
-        return format!("❯ {}", DONE_PROMPT_TEXT);
+        return if width <= base_vis {
+            format!("{lead}{token}")
+        } else {
+            format!("{lead}{token}{}", " ".repeat(width - base_vis))
+        };
     }
-    format!(
-        "{}{}",
-        cyan("❯"),
-        paint(color_sgr(&done_prompt_color()), DONE_PROMPT_TEXT)
-    )
+    let sgr = color_sgr(&done_prompt_color());
+    if width <= base_vis {
+        return format!("{lead}\x1b[{sgr}m{token}\x1b[0m");
+    }
+    // Pad with the SAME colour so the whole line is the configured hue, not
+    // just the leading token — that's what makes it "fill the line".
+    format!("{lead}\x1b[{sgr}m{token}{}\x1b[0m", " ".repeat(width - base_vis))
 }
 
 /// Resolve the configured colour for the "done" placeholder as a stable string
