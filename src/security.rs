@@ -1401,6 +1401,8 @@ pub fn queue_request(d: &Denial) {
 
 #[cfg(unix)]
 pub mod unix;
+/// Auto-approve / auto-deny rules for the `/quarantine` review.
+pub mod rules;
 #[cfg(windows)]
 pub mod windows;
 /// Privilege-escalation contract: the single audited boundary where granted

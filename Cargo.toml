@@ -32,6 +32,7 @@ crossterm = "0.28"
 # external checkout. The `gui` backend uses rustxwidgets' dlopen'd GTK loader
 # (the `rustxwidgets/gtk` feature); the `pancurses` backend uses ncurses.
 rustxwidgets = { path = "vendors/rustxWidgets/rustxwidgets", version = "0.1.0", default-features = false, optional = true }
+synoptic = "2"                                        # regex-based syntax highlighter for fenced code blocks (unicode-aware)
 
 [features]
 # Full-screen TUI REPL: a real layout engine (no hand-rolled ANSI block)

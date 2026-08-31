@@ -1039,7 +1039,7 @@ fn handle_command(
         "h" | "help" => {
             s.push(ConvKind::System,
                 "commands: /help /model <sel> /models /goal [obj] /continue /clear /undo\n\
-                 \x20  /cancel  /thinking  /sessions  /usage  /exit  /quit",
+                 \x20  /cancel  /thinking  /sessions  /usage  /markup_demo  /exit  /quit",
             );
         }
         "exit" | "quit" | "q" => {

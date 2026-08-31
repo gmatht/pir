@@ -17,7 +17,7 @@ use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -749,7 +749,7 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
 
     let abort = b.abort.clone();
     let deadline = Instant::now() + TIMEOUT;
-    let mut next_check_in = Instant::now() + check_in;
+    let next_check_in = Instant::now() + check_in;
     // Kill the whole process group of the child (item: child is in its own
     // group via process_group(0)), so shell pipelines / subcommands die too,
     // and so cancelling a runaway command never takes pir down with it.
@@ -851,6 +851,40 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
         Some(s) => text.push_str(&format!("\n[exit code {}]", s.code().unwrap_or(-1))),
         None if abort.load(Ordering::SeqCst) => text.push_str("\n[pir] command aborted by user (ESC/ctrl-c)"),
         None => text.push_str(&format!("\n[pir] timed out after {}s, killed", TIMEOUT.as_secs())),
+    }
+    // In-process capability-deny detection (the chosen lightweight option;
+    // docs/SECURITY_INTENT.md §6). Runs ONCE per command, after it exits —
+    // ~µs, no per-syscall cost. Flags attempts that visibly needed a (dropped)
+    // capability: a permission/operation denial in the output, or a privileged
+    // tool in the command. Gated to the cap-dropped container context (or an
+    // explicit PIR_DETECT_CAPS=1) so benign "permission denied" elsewhere
+    // doesn't spam. auditd / seccomp RET_LOG|ERRNO|USER_NOTIF are documented
+    // configurable alternatives if in-kernel attempt logging is ever needed.
+    let caps_dropped = crate::security::overlay::container_engaged()
+        || std::env::var_os("PIR_DETECT_CAPS").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+    if caps_dropped {
+        let lower = text.to_ascii_lowercase();
+        let hint: Option<&'static str> = if lower.contains("operation not permitted")
+            || lower.contains("permission denied")
+        {
+            Some("output shows a permission/operation denial")
+        } else {
+            const PRIV_TOOLS: &[&str] = &[
+                "mount ", "umount ", "chroot ", "setcap ", "nsenter ", "capsh ",
+                "iptables ", "nft ", "mknod ", "setuid ", "setgid ", "capset ",
+            ];
+            let cl = command.to_ascii_lowercase();
+            PRIV_TOOLS.iter().find(|t| cl.contains(**t)).copied()
+        };
+        if let Some(hint) = hint {
+            eprintln!(
+                "{}",
+                crate::term::yellow(&format!(
+                    "[pir] possible capability-required operation by the agent: {hint}\n       cmd: {command}\n       (root capabilities are dropped in this container; if legitimate, grant explicitly via /su-security or a parcel rather than letting it be silently denied)"
+                ))
+            );
+            text.push_str(&format!("\n[pir] note: this command appears to need a dropped capability ({hint})"));
+        }
     }
     crate::plugin::truncate(&mut text, 30_000);
     Ok(text)
@@ -1046,6 +1080,14 @@ timeout() { __pir_timeout_default "$@"; }
                 c.env("BASH_ENV", path);
             }
         }
+        // Confine this command to the per-project `ai_X` sandbox user. This is
+        // the "drop privs for the agents, not the user" boundary: `pir` itself
+        // stays the invoking identity (so the operator keeps authority), but
+        // every command the model spawns is confined to the agent exec user in
+        // its child `before_exec`, with the saved uid collapsed so it can never
+        // escalate back. No-op when no agent user is configured (plain `pir`).
+        #[cfg(unix)]
+        c.before_exec(crate::user::drop_to_agent_user);
         c
     };
     let (prog, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("bash", "-c") };

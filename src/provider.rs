@@ -191,6 +191,80 @@ impl Client {
         self.cancel = cancel;
     }
 
+    /// A *single, non-streaming* completion. Used for cheap second-opinion checks
+    /// (e.g. the main model reviewing a light-model "retry" verdict) where we
+    /// only need a word or two back, never tool calls or streaming. No retries,
+    /// no thinking budget — a hard failure is returned as `Err` and treated as
+    /// "no opinion" by the caller. Honours `PIR_STALL_TIMEOUT_SECS`/the cancel
+    /// flag like the streaming path, so a stuck provider can't hang the turn.
+    pub fn complete(&self, model: &str, system: &str, prompt: &str) -> Result<String, String> {
+        let kind = self.kind;
+        let max_key = if model.starts_with("o1")
+            || model.starts_with("o3")
+            || model.starts_with("o4")
+            || model.contains("gpt-5")
+        {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        let (url, body) = match kind {
+            ApiKind::Anthropic => (
+                format!("{}/messages", self.base_url),
+                json!({
+                    "model": model,
+                    "max_tokens": 12,
+                    "stream": false,
+                    "system": system,
+                    "messages": [{ "role": "user", "content": prompt }],
+                }),
+            ),
+            ApiKind::OpenAi => {
+                let mut url = self.base_url.trim_end_matches('/').to_string();
+                if !url.ends_with("/chat/completions") && !url.contains('?') {
+                    url.push_str("/chat/completions");
+                }
+                (
+                    url,
+                    json!({
+                        "model": model,
+                        "stream": false,
+                        max_key: 12,
+                        "messages": [
+                            { "role": "system", "content": system },
+                            { "role": "user", "content": prompt },
+                        ],
+                    }),
+                )
+            }
+        };
+        let http = Self::http_agent(Duration::from_secs(60));
+        let mut req = http.post(&url);
+        req = match kind {
+            ApiKind::Anthropic => req
+                .set("x-api-key", &self.api_key)
+                .set("anthropic-version", "2023-06-01"),
+            ApiKind::OpenAi => req.set("Authorization", &format!("Bearer {}", self.api_key)),
+        };
+        let resp = match req.send_json(body) {
+            Ok(r) => r,
+            Err(e) => return Err(http_error(e)),
+        };
+        let v = serde_json::from_reader::<_, Value>(resp.into_reader())
+            .map_err(|e| format!("complete: {e}"))?;
+        let raw = match kind {
+            ApiKind::Anthropic => v
+                .pointer("/content/0/text")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            ApiKind::OpenAi => v
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        };
+        raw.ok_or_else(|| "complete: empty response".to_string())
+    }
+
     pub fn chat(
         &self,
         model: &str,
@@ -1443,10 +1517,14 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().unwrap().to_string();
         // Accept one connection (so ureq's connect succeeds and it parks in the
-        // status-line read) and just hold it without responding.
+        // status-line read) and just hold it without responding. The hold is
+        // deliberately short: we only need the worker to still be parked on the
+        // status-line read when the test flips the cancel flag ~250ms in — a
+        // 1s hold is plenty and keeps the test fast (the assertion only
+        // requires cancel to win well before the old 5s window).
         thread::spawn(move || {
             let (_sock, _) = listener.accept().expect("accept");
-            thread::sleep(Duration::from_secs(5));
+            thread::sleep(Duration::from_secs(1));
             // socket dropped here: ureq sees EOF/error, but by then the test
             // has already moved on (its worker thread is abandoned).
         });
@@ -1558,11 +1636,14 @@ mod tests {
         });
         let mut client = Client::new(ApiKind::OpenAi, &format!("http://{addr}"), "test-key".to_string());
         let cancel = Arc::new(AtomicBool::new(false));
-        // The server answers at ~150ms; the cancel timer fires at ~1.2s, after
-        // the response has already been returned and streaming has finished.
+        // The server answers at ~150ms and finishes streaming ~350ms; the
+        // cancel timer fires at ~500ms, comfortably after the response already
+        // landed, so the test asserts the real response wins without waiting
+        // the old 1.2s. (The chat() call returns as soon as the stream ends,
+        // so the test's wall time is ~350ms regardless.)
         let cancel2 = cancel.clone();
         thread::spawn(move || {
-            thread::sleep(Duration::from_millis(1200));
+            thread::sleep(Duration::from_millis(500));
             cancel2.store(true, Ordering::SeqCst);
         });
         client.set_cancel(cancel);

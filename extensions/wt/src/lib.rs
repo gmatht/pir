@@ -93,6 +93,95 @@ struct Wt {
     /// The PR we opened for the current branch (so we can poll + auto-accept it
     /// on later idle passes). `None` until `ensure_pr` opens/observes one.
     pr_number: Option<u64>,
+    /// Set after a worktree is merged into main: the idle loop then runs the
+    /// SAME fix cycle (build errors -> warnings -> failing tests) *on main* until
+    /// the trunk is green. Reset once main is clean.
+    healing_main: bool,
+    /// Which tiers the post-prompt auto-fix may touch (from `PIR_WT_AUTOFIX`).
+    autofix: AutoFix,
+}
+
+/// A code-health tier, in priority order (worst first). Mirrors the task:
+/// fix build errors, then warnings, then failing tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tier {
+    Build,
+    Warn,
+    Test,
+}
+
+impl Tier {
+    fn label(&self) -> &'static str {
+        match self {
+            Tier::Build => "build errors",
+            Tier::Warn => "warnings",
+            Tier::Test => "failing tests",
+        }
+    }
+}
+
+/// Parse the creating pid from a `wt-<pid>-<ts>` branch name.
+fn parse_wt_pid(branch: &str) -> Option<u32> {
+    let rest = branch.strip_prefix("wt-")?;
+    rest.split('-').next()?.parse().ok()
+}
+
+/// Run `cmd` (bash -lc) in `dir`, capturing combined output. Returns
+/// (success, truncated log).
+fn sh_capture(dir: &Path, cmd: &str) -> (bool, String) {
+    let out = Command::new("bash").arg("-lc").arg(cmd).current_dir(dir).output();
+    match out {
+        Ok(o) => {
+            let mut log = String::from_utf8_lossy(&o.stdout).into_owned();
+            log.push_str(&String::from_utf8_lossy(&o.stderr));
+            crate::plugin::truncate(&mut log, 4000);
+            (o.status.success(), log)
+        }
+        Err(e) => (false, format!("spawn error: {e}")),
+    }
+}
+
+/// Which tiers the post-prompt auto-fix may touch, from `PIR_WT_AUTOFIX`
+/// (`all` default, `no-warnings`, `errors`, `off`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoFix {
+    /// Build errors + failing tests in the worktree, plus warnings post-merge.
+    All,
+    /// Build errors + failing tests, but never warnings.
+    NoWarnings,
+    /// Only build errors; failing tests are reported (not auto-fixed) and block
+    /// the merge.
+    ErrorsOnly,
+    /// No automatic verify/fix/merge at all (use `wt_verify` / `wt_merge`).
+    Off,
+}
+
+impl AutoFix {
+    fn fix_tests(self) -> bool {
+        !matches!(self, AutoFix::ErrorsOnly | AutoFix::Off)
+    }
+    fn fix_warnings(self) -> bool {
+        matches!(self, AutoFix::All)
+    }
+    fn env_name(self) -> &'static str {
+        match self {
+            AutoFix::All => "all",
+            AutoFix::NoWarnings => "no-warnings",
+            AutoFix::ErrorsOnly => "errors",
+            AutoFix::Off => "off",
+        }
+    }
+}
+
+/// Parse `PIR_WT_AUTOFIX`: `all` (default) | `no-warnings` | `errors` | `off`.
+fn parse_autofix() -> AutoFix {
+    let v = std::env::var("PIR_WT_AUTOFIX").unwrap_or_default().to_ascii_lowercase();
+    match v.trim() {
+        "off" | "none" | "no" | "0" => AutoFix::Off,
+        "errors" | "error" | "build" | "build-errors" => AutoFix::ErrorsOnly,
+        "no-warnings" | "nowarnings" | "nowarn" => AutoFix::NoWarnings,
+        _ => AutoFix::All,
+    }
 }
 
 impl Wt {
@@ -117,6 +206,8 @@ impl Wt {
             fix_attempts: 0,
             pr_mode: std::env::var_os("PIR_WT_PR").map(|v| v != "0" && !v.is_empty()).unwrap_or(false),
             pr_number: None,
+            healing_main: false,
+            autofix: parse_autofix(),
         }
     }
 
@@ -358,6 +449,10 @@ impl Wt {
         let ff = Command::new("git")
             .args(["merge", "--ff-only", &upstream])
             .current_dir(&root)
+            // Diverging-trunk noise ("hint: ... can't be fast-forwarded") is not
+            // actionable here — create()/auto_flow just continue with a worktree
+            // or skip the merge — so keep it off the startup banner.
+            .stderr(std::process::Stdio::null())
             .status();
         match ff {
             Ok(s) if s.success() => Ok(true),
@@ -372,7 +467,20 @@ impl Wt {
         // Serialize merges across the whole repo (other agents / worktrees).
         let _guard = match self.acquire_lock() {
             Some(g) => g,
-            None => return Outcome::err("wt: could not acquire merge lock; skipping auto-merge".into()),
+            None => {
+                // The merge writes the REAL `.git` (refs/objects), so it must run
+                // as a user who owns that repo — the per-project `ai_*` user, or
+                // root. An agent user of a *different* project physically can't
+                // open the lock (EACCES): that's per-project isolation working.
+                let path = self.lock_path();
+                return Outcome::err(format!(
+                    "wt: could not acquire merge lock at {} (permission denied?). \
+                     The merge must write the real .git, so run pir as this repo's owner \
+                     (e.g. the project's ai_* user for {} ) or as root. Skipping auto-merge.",
+                    path.display(),
+                    self.repo_root().display()
+                ));
+            }
         };
         let root = self.repo_root();
 
@@ -407,81 +515,311 @@ impl Wt {
         }
     }
 
-    /// Full idle pipeline: ff trunk, verify, then merge or ask-the-model-to-fix.
-    /// Returns an optional follow-up prompt (to fix) and a human-readable line.
-    fn auto_flow(&mut self) -> (Option<String>, String) {
-        let Some(wt_dir) = self.current.clone() else {
-            return (None, String::new());
+    /// Link untracked build dependencies (e.g. a vendored Cargo path dep like
+    /// `vendors/rustxWidgets`) from the main checkout into the worktree.
+    /// Untracked dirs aren't part of `git worktree add`, so the worktree would
+    /// otherwise miss them and `cargo build` would fail on `path = "..."`.
+    /// Symlinks are used (cheap; vendored deps are read-only build inputs).
+    #[cfg(unix)]
+    fn link_untracked_build_deps(&self, wt_dir: &Path) -> String {
+        use std::os::unix::fs::symlink;
+        let root = self.repo_root();
+        let Ok(toml) = std::fs::read_to_string(root.join("Cargo.toml")) else {
+            return String::new();
         };
-        let Some(branch) = self.worktree_branch(&wt_dir) else {
-            return (None, "wt: worktree branch is detached; skipping auto-merge".into());
+        let mut refs = Vec::new();
+        for line in toml.lines() {
+            let line = line.trim();
+            if let Some(idx) = line.find("path =") {
+                let rest = &line[idx + "path =".len()..];
+                if let Some(q0) = rest.find('"') {
+                    if let Some(q1) = rest[q0 + 1..].find('"').map(|i| i + q0 + 1) {
+                        let v = &rest[q0 + 1..q1];
+                        if !v.is_empty() && !v.starts_with('/') && !refs.contains(&v.to_string()) {
+                            refs.push(v.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        let mut linked = Vec::new();
+        for rel in refs {
+            let src = root.join(&rel);
+            if !src.is_dir() {
+                continue;
+            }
+            let tracked = Command::new("git")
+                .args(["ls-files", "--error-unmatch", &rel])
+                .current_dir(&root)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if tracked {
+                continue;
+            }
+            let dst = wt_dir.join(&rel);
+            if dst.exists() {
+                continue;
+            }
+            if let Some(parent) = dst.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if symlink(&src, &dst).is_ok() {
+                linked.push(rel);
+            }
+        }
+        if linked.is_empty() {
+            String::new()
+        } else {
+            format!("linked untracked build deps into worktree: {}", linked.join(", "))
+        }
+    }
+    #[cfg(not(unix))]
+    fn link_untracked_build_deps(&self, _wt_dir: &Path) -> String {
+        String::new()
+    }
+
+    /// Remove leftover per-agent worktrees from *dead* sessions. Worktree
+    /// branches are `wt-<pid>-<ts>`; when the embedding pid is gone the worktree
+    /// is orphaned (left behind by a killed session whose `on_exit` never ran),
+    /// so remove it and its branch. Called before auto-creating a fresh worktree
+    /// so repeated launches don't accumulate stale worktrees in `.git/wt/`.
+    fn prune_stale_worktrees(&self) {
+        let root = self.repo_root();
+        let out = Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&root)
+            .output();
+        let Ok(out) = out else { return };
+        if !out.status.success() {
+            return;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut path = String::new();
+        let mut branch = String::new();
+        for line in text.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                path = p.to_string();
+            } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
+                branch = b.to_string();
+                let pid = parse_wt_pid(&branch);
+                let stale = matches!(pid, Some(p) if p != std::process::id() && !Path::new(&format!("/proc/{p}")).exists());
+                if stale {
+                    let _ = Command::new("git")
+                        .args(["worktree", "remove", "--force", &path])
+                        .current_dir(&root)
+                        .status();
+                    let _ = Command::new("git")
+                        .args(["branch", "-D"])
+                        .arg(&branch)
+                        .current_dir(&root)
+                        .status();
+                }
+                path.clear();
+                branch.clear();
+            } else if line.is_empty() {
+                path.clear();
+                branch.clear();
+            }
+        }
+    }
+
+    /// True when the worktree has ANY changes: uncommitted edits / untracked
+    /// non-ignored files, or commits ahead of the base branch. A read-only turn
+    /// (quick question, no edits) must NOT kick off the verify/fix/merge
+    /// machinery — that burns tokens for nothing — so `on_turn_end` skips the
+    /// whole auto-flow when this is false. Cheap: two `git` invocations, no build.
+    fn worktree_changed(&self, wt_dir: &Path) -> bool {
+        if let Ok(o) = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(wt_dir)
+            .output()
+        {
+            if o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty() {
+                return true;
+            }
+        }
+        // Committed (e.g. autocommit) changes: HEAD ahead of the base branch.
+        let base = self.trunk();
+        if let Ok(o) = Command::new("git")
+            .args(["rev-list", "--count", &format!("{base}..HEAD")])
+            .current_dir(wt_dir)
+            .output()
+        {
+            if o.status.success() {
+                if let Ok(n) = String::from_utf8_lossy(&o.stdout).trim().parse::<u64>() {
+                    return n > 0;
+                }
+            }
+        }
+        false
+    }
+
+    /// Probe the repo's code health at `dir`, returning the WORST non-clean
+    /// tier (build errors first, then warnings, then failing tests) or `None`
+    /// when the tree is fully green. Mirrors the task: fix build errors, then
+    /// warnings, then failing tests — in that order.
+    /// `check_warnings` is false in the WORKTREE phase: warnings never gate the
+    /// merge there (they're non-blocking; clearing them is deferred to the
+    /// post-merge main-heal phase, per the "warnings only after one full merge"
+    /// rule). `true` only when healing main after a merge.
+    fn health_check(&self, dir: &Path, check_warnings: bool) -> Option<(Tier, String)> {
+        // A user-supplied single check command can't be tiered; treat any
+        // failure as the build tier (we can't classify it further).
+        if let Ok(c) = std::env::var("PIR_WT_CHECK") {
+            if !c.trim().is_empty() {
+                let (ok, log) = sh_capture(dir, &c);
+                return if ok { None } else { Some((Tier::Build, log)) };
+            }
+        }
+        // Rust project (the common case in pir): explicit build -> warnings ->
+        // tests ordering.
+        if dir.join("Cargo.toml").exists() {
+            let build = Command::new("cargo").args(["build", "--locked"]).current_dir(dir).output();
+            match build {
+                Ok(o) => {
+                    if !o.status.success() {
+                        let mut log = String::from_utf8_lossy(&o.stdout).into_owned();
+                        log.push_str(&String::from_utf8_lossy(&o.stderr));
+                        crate::plugin::truncate(&mut log, 4000);
+                        return Some((Tier::Build, log));
+                    }
+                    if check_warnings {
+                        let warn_count = String::from_utf8_lossy(&o.stderr)
+                            .lines()
+                            .filter(|l| l.to_ascii_lowercase().contains("warning:"))
+                            .count();
+                        if warn_count > 0 {
+                            return Some((Tier::Warn, format!("{warn_count} compiler warning(s)")));
+                        }
+                    }
+                }
+                Err(e) => return Some((Tier::Build, format!("build spawn error: {e}"))),
+            }
+            let (ok, log) = sh_capture(dir, "cargo test --locked 2>&1 | tail -n 60");
+            if !ok {
+                return Some((Tier::Test, log));
+            }
+            return None;
+        }
+        // Non-Rust project: fall back to the default verify command (node/
+        // python/make). If none, there's nothing to check -> clean.
+        if let Some(cmd) = self.verify_cmd(dir) {
+            let (ok, log) = sh_capture(dir, &cmd);
+            return if ok { None } else { Some((Tier::Build, log)) };
+        }
+        None
+    }
+
+    /// Full idle pipeline at `dir`. When `is_worktree`, a clean result merges
+    /// into main and arms the SAME fix cycle on main (healing_main). On main, a
+    /// clean result ends the heal. Priority order: build errors -> warnings ->
+    /// failing tests. Returns an optional follow-up prompt (to fix) and a
+    /// human-readable line.
+    fn auto_flow_generic(&mut self, dir: &Path, branch: Option<&str>, is_worktree: bool) -> (Option<String>, String) {
+        // Warnings are only checked+fixed in the post-merge phase (on main), not
+        // in the worktree — so a warning-laden worktree still merges.
+        eprintln!(
+            "{}",
+            crate::term::dim(&format!("[wt] verifying build+tests in {} …", dir.display()))
+        );
+        let tier = self.health_check(dir, !is_worktree);
+        // Respect the configured auto-fix mode (PIR_WT_AUTOFIX). Build errors are
+        // always fixed; tests only when the mode includes them; warnings only
+        // post-merge in `all` mode.
+        if matches!(tier, Some((Tier::Test, _))) && !self.autofix.fix_tests() {
+            return (
+                None,
+                format!(
+                    "wt: tests fail in {} but auto-fix is errors-only (PIR_WT_AUTOFIX=errors); not merging. Set PIR_WT_AUTOFIX=all or resolve manually.",
+                    dir.display()
+                ),
+            );
+        }
+        let fixable = match &tier {
+            Some((Tier::Build, _)) => true,
+            Some((Tier::Test, _)) => true,
+            Some((Tier::Warn, _)) => self.autofix.fix_warnings() && !is_worktree,
+            None => false,
         };
-
-        // Pull any upstream changes into the worktree's branch first (best
-        // effort — if there's no upstream it's a no-op).
-        let _ = Command::new("git")
-            .args(["pull", "--ff-only"])
-            .current_dir(&wt_dir)
-            .status();
-
-        let verdict = self.verify(&wt_dir);
-        match verdict {
-            Verdict::Failed(summary) => {
-                // Checks failed: ask the model to fix, but only up to MAX_FIX_ATTEMPTS
-                // times — beyond that, stop re-queuing so the user can intervene.
+        match tier {
+            Some((t, summary)) if fixable => {
                 if self.fix_attempts >= MAX_FIX_ATTEMPTS {
                     let msg = format!(
-                        "wt: checks STILL FAILED on {branch} after {} fix attempts; \
-                         not re-queueing. Resolve manually or run wt_merge when green.",
-                        MAX_FIX_ATTEMPTS
+                        "wt: {} STILL present on {} after {} fix attempts; not re-queueing. Resolve manually.",
+                        t.label(), dir.display(), MAX_FIX_ATTEMPTS
                     );
                     return (None, msg);
                 }
                 self.fix_attempts += 1;
-                let msg = format!(
-                    "wt: checks FAILED on branch {branch} (attempt {}/{}) — asking the model to fix.\n{summary}",
-                    self.fix_attempts, MAX_FIX_ATTEMPTS
-                );
-                let fix_prompt = format!(
-                    "Verification (build/test) failed in worktree {wt_dir}: {branch}.\n\
-                     Diagnose and fix the failure. Re-run the verification commands to confirm a clean build+test before finishing.",
-                    wt_dir = wt_dir.display()
-                );
-                (Some(fix_prompt), msg)
-            }
-            Verdict::NoChecks => {
-                // No verification command was configured/recognized: do NOT silently
-                // merge. Surface it and require an explicit wt_merge (or a PIR_WT_CHECK).
-                (
-                    None,
-                    format!(
-                        "wt: no build/test checks for {branch} (set PIR_WT_CHECK, or add a \
-                         Cargo.toml/package.json/pyproject.toml/Makefile). Skipping auto-merge; \
-                         run wt_merge to merge manually."
+                let prompt = match t {
+                    Tier::Build => format!(
+                        "cargo build fails in {dir}:\n{summary}\nDiagnose and fix ALL compile errors. Re-run `cargo build` to confirm a clean build before finishing.",
+                        dir = dir.display()
                     ),
-                )
+                    Tier::Warn => format!(
+                        "Compiler warnings are present in {dir}: {summary}\nFix the warnings (unused vars, dead code, clippy, deprecations) WITHOUT changing behaviour. Re-run `cargo build` to confirm zero warnings before finishing.",
+                        dir = dir.display()
+                    ),
+                    Tier::Test => format!(
+                        "Tests fail in {dir}:\n{summary}\nFix the failing tests. Re-run `cargo test` to confirm green before finishing.",
+                        dir = dir.display()
+                    ),
+                };
+                let line = format!(
+                    "cleanup: fixing {} on {} (attempt {}/{}) — automatic post-prompt work; submit a new prompt anytime to stop it (PIR_WT_AUTOFIX={})",
+                    t.label(), dir.display(), self.fix_attempts, MAX_FIX_ATTEMPTS, self.autofix.env_name()
+                );
+                (Some(prompt), line)
             }
-            Verdict::Passed(summary) => {
-                // Checks passed: reset the fix counter.
+            _ => {
+                // Clean (or warnings out of scope this phase/mode).
                 self.fix_attempts = 0;
-                if self.pr_mode {
-                    // PR-submission posture: the agent can't write trunk directly.
-                    // Push the branch, open a PR, auto-accept it once green.
-                    self.pr_flow(&wt_dir, &branch)
-                } else {
-                    let merge = self.merge_into_main(&branch);
-                    if merge.is_error {
-                        (None, merge.content)
+                if is_worktree {
+                    let Some(branch) = branch else {
+                        return (None, "wt: worktree branch is detached; skipping auto-merge".into());
+                    };
+                    if self.pr_mode {
+                        let wt_dir = self.current.clone().unwrap_or_else(|| dir.to_path_buf());
+                        self.healing_main = true;
+                        self.pr_flow(&wt_dir, branch)
                     } else {
-                        let remove = self.remove_worktree(&wt_dir, &branch);
-                        self.return_to_main();
-                        (None, format!("{}\n{}", merge.content, remove.content))
+                        self.merge_and_heal_main(branch)
                     }
+                } else {
+                    self.healing_main = false;
+                    (None, format!("wt: main {} is clean (no build errors, warnings, or failing tests).", dir.display()))
                 }
-                // `summary` is intentionally not echoed to the idle line to keep
-                // green merges quiet; it is still available via `wt_verify`.
             }
         }
+    }
+
+    /// Merge the (green) worktree branch into main, then arm the main-heal loop
+    /// so the SAME fix cycle (errors -> warnings -> tests) runs on the trunk
+    /// checkout. System-level git ops (merge/remove) run against the REAL root by
+    /// suspending the overlay quarantine so the writes land on the real `.git`.
+    fn merge_and_heal_main(&mut self, branch: &str) -> (Option<String>, String) {
+        let wt_dir = self.current.clone();
+        #[cfg(unix)]
+        let _ = crate::security::overlay::project_active_suspend();
+        let merge = self.merge_into_main(branch);
+        let line = if merge.is_error {
+            merge.content
+        } else if let Some(ref d) = wt_dir {
+            let remove = self.remove_worktree(d, branch);
+            format!("{}\n{}", merge.content, remove.content)
+        } else {
+            merge.content
+        };
+        #[cfg(unix)]
+        let _ = crate::security::overlay::project_active_resume();
+        self.return_to_main();
+        self.healing_main = true;
+        let prompt = format!(
+            "Worktree merged into main. Now operating on the main (trunk) checkout {}: fix any cargo build errors first, then warnings, then failing tests — in that order. Re-run the build/test to confirm main is green before finishing.",
+            self.repo_root().display()
+        );
+        (Some(prompt), line)
     }
 
     /// PR-submission flow (active when `PIR_WT_PR=1`). Push the branch, open (or
@@ -489,6 +827,9 @@ impl Wt {
     /// green / mergeable. The agent never writes the trunk directly. Returns the
     /// `(optional fix prompt, idle line)` pair like `auto_flow`.
     fn pr_flow(&mut self, wt_dir: &Path, branch: &str) -> (Option<String>, String) {
+        // Once the PR is accepted/merged the trunk is updated; arm the main heal
+        // loop so the same errors->warnings->tests fix cycle runs on main.
+        self.healing_main = true;
         // Ensure the branch is pushed and a PR exists for it.
         let pr = self.ensure_pr(wt_dir, branch);
         if pr.is_error {
@@ -723,6 +1064,14 @@ impl Wt {
     /// Create a worktree off the current main with a fresh branch, and `cd` the
     /// agent into it.
     fn create(&mut self, base: &str) -> Outcome {
+        self.create_inner(base, true)
+    }
+
+    /// Create a worktree. `fetch` controls whether we hit the network
+    /// (`git fetch origin` to refresh trunk). The startup auto-create passes
+    /// `false` — a fetch on every launch is the main startup latency (and can
+    /// hang offline); explicit `wt_create` and the merge path fetch instead.
+    fn create_inner(&mut self, base: &str, fetch: bool) -> Outcome {
         if !self.enabled {
             return Outcome::err("wt is off (set PIR_WT=0 to disable worktree automation)".into());
         }
@@ -740,9 +1089,11 @@ impl Wt {
         let _ = std::fs::create_dir_all(&parent);
         let wt_dir = parent.join(&name);
 
-        // Always branch from the latest trunk (best-effort fast-forward; if there
-        // is no upstream we just branch from the local trunk).
-        let _ = self.ff_main();
+        // Optionally refresh trunk first (network fetch, slow). Skipped for the
+        // startup auto-create; the merge path refetches when it actually merges.
+        if fetch {
+            let _ = self.ff_main();
+        }
         let start = self.trunk();
         let add = Command::new("git")
             .args(["worktree", "add", "-b", &branch])
@@ -759,17 +1110,48 @@ impl Wt {
         // points at an existing worktree dir. We copy only build artifacts,
         // never the worktree's .git (git owns worktree bookkeeping).
         let cow_note = self.maybe_cow_build_dir(&wt_dir);
+        // Keep untracked-but-needed build deps (vendored Cargo path deps) present
+        // in the worktree, or `cargo build` fails on the missing `path = ...`.
+        let link_note = self.link_untracked_build_deps(&wt_dir);
         // Move the agent into the worktree so bash/edit_file operate there.
         if let Err(e) = std::env::set_current_dir(&wt_dir) {
             return Outcome::err(format!("wt: created {wt_dir} but cd failed: {e}", wt_dir = wt_dir.display()));
         }
         self.current = Some(wt_dir.clone());
+        // Engage the project-scoped overlayfs write-quarantine: the agent's view
+        // of the repo root becomes an overlay with a private staging upper, and
+        // THIS worktree is bind-mounted read-write on top — so only this worktree
+        // is written to the real fs. Every other write (central `.git`, trunk,
+        // other worktrees) is quarantined and visible only to the agent until the
+        // operator reviews it with `/quarantine`. The `wt` extension whitelists
+        // the worktree so the in-process guardrail (used when the overlay can't
+        // mount) also allows writes here and denies the central `.git` / others.
+        // Not compiled in tests, which call `create` directly without a launcher.
+        #[cfg(not(test))]
+        {
+            let root = self.repo_root();
+            if crate::security::overlay::project_quarantine_wanted()
+                && crate::security::overlay::overlay_available()
+            {
+                match crate::security::overlay::mount_project_quarantine(&root, &wt_dir) {
+                    Ok(()) => eprintln!(
+                        "[pir] project write-quarantine engaged: worktree {} whitelisted; all other writes staged (review with /quarantine).",
+                        wt_dir.display()
+                    ),
+                    Err(e) => eprintln!("[pir] project write-quarantine not engaged: {e}"),
+                }
+                std::env::set_var("PIR_WT_WHITELIST", wt_dir.as_os_str());
+            }
+        }
         let mut msg = format!(
             "created worktree {wt_dir} on branch {branch} (from {start}); cd'd into it. Run wt_status to inspect, or finish the turn to auto-verify+merge.",
             wt_dir = wt_dir.display()
         );
         if !cow_note.is_empty() {
             msg.push_str(&format!("\n{cow_note}"));
+        }
+        if !link_note.is_empty() {
+            msg.push_str(&format!("\n{link_note}"));
         }
         Outcome::ok(msg)
     }
@@ -1207,6 +1589,28 @@ impl ToolBackend for Wt {
     fn on_session_start(&mut self, launch_cwd: &Path) {
         self.main_cwd = launch_cwd.to_path_buf();
         self.repo = launch_cwd.to_path_buf();
+        // Every agent gets its own git worktree at launch — the "each agent in
+        // its own work tree" posture. The agent's worktree is the only
+        // whitelisted writable tree; the repo-root write-quarantine is engaged
+        // so the central `.git`, the trunk checkout, and other worktrees stage.
+        // On by default; `PIR_WT_AUTOCREATE=0` disables (stays on the trunk
+        // checkout, or enter a worktree on demand via `wt_create`). Skipped for
+        // non-git repos and when already inside a worktree.
+        #[cfg(not(test))]
+        if self.enabled
+            && std::env::var_os("PIR_WT_AUTOCREATE")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(true)
+        {
+            if self.is_git() && !self.in_worktree() {
+                self.prune_stale_worktrees();
+                eprintln!(
+                    "{}",
+                    crate::term::dim("[wt] setting up worktree + write-quarantine (no network fetch)…")
+                );
+                let _ = self.create_inner("", false);
+            }
+        }
     }
 
     /// Startup banner: report the worktree the agent is launching in (or the
@@ -1261,7 +1665,11 @@ impl ToolBackend for Wt {
     }
 
     fn on_turn_end(&mut self, _prompt: &str) -> Vec<String> {
-        if !self.enabled || !self.auto || !self.in_worktree() {
+        if !self.enabled || !self.auto {
+            return Vec::new();
+        }
+        // PIR_WT_AUTOFIX=off: no automatic verify/fix/merge at all.
+        if matches!(self.autofix, AutoFix::Off) {
             return Vec::new();
         }
         // One auto-flow per process at a time (repo lock handles cross-process).
@@ -1269,19 +1677,49 @@ impl ToolBackend for Wt {
             Ok(g) => g,
             Err(_) => return Vec::new(),
         };
-        let (fix_prompt, line) = self.auto_flow();
-        if !line.is_empty() && self.enabled {
-            // Surface the outcome on the terminal (non-fatal either way).
-            if fix_prompt.is_some() {
-                eprintln!("{}", crate::term::yellow(&format!("[wt] {line}")));
-            } else {
-                eprintln!("{}", crate::term::dim(&format!("[wt] {line}")));
+        // Worktree auto-flow: fix build errors -> tests -> merge. A read-only
+        // turn (quick repo question, no edits) skips the whole machinery — no
+        // build, no tests, no fix prompts, no merge — because there's nothing
+        // this turn introduced (tokens are only spent on changes).
+        if self.in_worktree() {
+            if let Some(wt_dir) = self.current.clone() {
+                if !self.worktree_changed(&wt_dir) {
+                    return Vec::new();
+                }
+                let branch = self.worktree_branch(&wt_dir);
+                let (fix, line) = self.auto_flow_generic(&wt_dir, branch.as_deref(), true);
+                if !line.is_empty() {
+                    if fix.is_some() {
+                        eprintln!("{}", crate::term::yellow(&format!("[wt] {line}")));
+                    } else {
+                        eprintln!("{}", crate::term::dim(&format!("[wt] {line}")));
+                    }
+                }
+                return fix.into_iter().collect();
             }
         }
-        fix_prompt.into_iter().collect()
+        // Main heal flow: after a merge, repeat the same fix cycle on main.
+        if self.healing_main {
+            let root = self.repo_root();
+            let (fix, line) = self.auto_flow_generic(&root, None, false);
+            if !line.is_empty() {
+                if fix.is_some() {
+                    eprintln!("{}", crate::term::yellow(&format!("[wt] {line}")));
+                } else {
+                    eprintln!("{}", crate::term::dim(&format!("[wt] {line}")));
+                }
+            }
+            return fix.into_iter().collect();
+        }
+        Vec::new()
     }
 
     fn on_exit(&mut self) {
+        // Tear down the project write-quarantine overlay first so the worktree
+        // removal below hits the REAL `.git` (otherwise the removal would
+        // itself stage and leave stale worktree metadata behind).
+        #[cfg(unix)]
+        let _ = crate::security::overlay::project_active_suspend();
         // Leave the worktree in place on exit (the user may want to inspect it).
         // Only drop the merge lock; worktree cleanup is manual via wt_remove.
         if let Some(wt_dir) = self.current.clone() {
@@ -1289,6 +1727,8 @@ impl ToolBackend for Wt {
             let _ = self.remove_worktree(&wt_dir, &branch);
             self.current = None;
         }
+        #[cfg(unix)]
+        let _ = crate::security::overlay::project_active_teardown();
     }
 }
 

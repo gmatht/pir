@@ -94,6 +94,14 @@ struct PdRenderer {
     table_in_cell: bool,
     table_cells: Vec<Vec<String>>,
     table_cur_cell: String,
+    /// Code-block capture state: while inside a fenced/indented code block its
+    /// literal source is buffered here so it can be syntax-highlighted as a
+    /// single unit (pulldown streams the code as one or more text events).
+    in_code: bool,
+    /// The fence language (empty for indented / language-less blocks).
+    code_lang: String,
+    /// Accumulated code source, emitted (highlighted) at `CodeBlock` end.
+    code_buf: String,
     /// The accumulated output.
     out: String,
 }
@@ -138,7 +146,9 @@ impl PdRenderer {
     /// Route a text/plain segment into the current table cell (if any) or the
     /// main output.
     fn push_text(&mut self, s: &str) {
-        if self.table_in_cell {
+        if self.in_code {
+            self.code_buf.push_str(s);
+        } else if self.table_in_cell {
             self.table_cur_cell.push_str(s);
         } else {
             self.out.push_str(s);
@@ -164,6 +174,9 @@ impl PdRenderer {
                     pulldown_cmark::CodeBlockKind::Fenced(info) => info.trim().to_string(),
                     pulldown_cmark::CodeBlockKind::Indented => String::new(),
                 };
+                self.in_code = true;
+                self.code_lang = lang.clone();
+                self.code_buf.clear();
                 self.out.push_str(&format!("```{lang}\n"));
             }
             PdTag::List(start) => {
@@ -229,7 +242,28 @@ impl PdRenderer {
                 self.in_blockquote = false;
                 self.out.push('\n');
             }
-            PdTagEnd::CodeBlock => self.out.push_str("```\n"),
+            PdTagEnd::CodeBlock => {
+                if self.in_code {
+                    // Split the buffered source into lines, dropping a trailing
+                    // empty element produced by a trailing newline, then emit it
+                    // syntax-highlighted (colours applied only when enabled and
+                    // the language is known to `synoptic`).
+                    let mut lines: Vec<String> =
+                        self.code_buf.split('\n').map(String::from).collect();
+                    while lines.last().map(|s| s.is_empty()) == Some(true) {
+                        lines.pop();
+                    }
+                    let lang = std::mem::take(&mut self.code_lang);
+                    for line in code_highlight(&lang, &lines, self.color) {
+                        self.out.push_str(&line);
+                        self.out.push('\n');
+                    }
+                    self.out.push_str("```\n");
+                    self.in_code = false;
+                } else {
+                    self.out.push_str("```\n");
+                }
+            }
             PdTagEnd::List(_) => {
                 self.list_stack.pop();
             }
@@ -288,42 +322,170 @@ impl PdRenderer {
         }
     }
 
-    /// Emit a collected table as a monospace grid (mirrors the comrak backend).
+    /// Emit a collected table as a Unicode box-drawing grid (mirrors the
+    /// comrak/streaming backends' shared `table_grid` shape).
     fn flush_table(&mut self) {
         if self.table_cells.is_empty() {
             return;
         }
         let rows = std::mem::take(&mut self.table_cells);
-        let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
-        let widths: Vec<usize> = (0..cols)
-            .map(|ci| rows.iter().map(|r| r.get(ci).map_or(0, |s| s.chars().count())).max().unwrap_or(0))
-            .collect();
-        for (ri, row) in rows.iter().enumerate() {
-            for (ci, w) in widths.iter().enumerate() {
-                let cell = row.get(ci).cloned().unwrap_or_default();
-                self.out.push('|');
-                self.out.push(' ');
-                self.out.push_str(&cell);
-                let pad = w.saturating_sub(cell.chars().count());
-                for _ in 0..pad {
-                    self.out.push(' ');
-                }
-                self.out.push(' ');
+        self.out.push_str(&table_grid(&rows, self.color, |s| s.chars().count()));
+    }
+}
+
+/// Render a set of collected table rows as a Unicode box-drawing grid.
+///
+/// The first row is the header and is rendered **bold** (when `color` is on).
+/// Each column is padded to the width of its widest cell (measured via
+/// `width_of`, which must account for ANSI escapes), leaving a single space of
+/// gutter on either side so cell text never touches the enclosing lines.
+/// Borders use solid box-drawing characters (`┌─┬┐` / `├─┼┤` / `└─┴┘`) instead
+/// of the ASCII `|` / `-` style. Used by all three backends (pulldown, comrak,
+/// streaming) so table output stays consistent regardless of renderer.
+fn table_grid(rows: &[Vec<String>], color: bool, width_of: impl Fn(&str) -> usize) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    let widths: Vec<usize> = (0..cols)
+        .map(|ci| {
+            rows.iter()
+                .map(|r| r.get(ci).map_or(0, |s| width_of(s)))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+
+    let mut out = String::new();
+    // Top border.
+    out.push('┌');
+    for (i, w) in widths.iter().enumerate() {
+        out.push_str(&"─".repeat(w + 2));
+        out.push(if i + 1 == cols { '┐' } else { '┬' });
+    }
+    out.push('\n');
+
+    for (ri, row) in rows.iter().enumerate() {
+        // Cells (header bolded when colour is enabled).
+        out.push('│');
+        for (ci, w) in widths.iter().enumerate() {
+            let cell = row.get(ci).cloned().unwrap_or_default();
+            let pad = w.saturating_sub(width_of(&cell));
+            out.push(' ');
+            if ri == 0 && color {
+                out.push_str("\x1b[1m");
             }
-            self.out.push_str("|\n");
-            if ri == 0 {
-                self.out.push('|');
-                for w in &widths {
-                    for _ in 0..w + 2 {
-                        self.out.push('-');
+            out.push_str(&cell);
+            if ri == 0 && color {
+                out.push_str("\x1b[0m");
+            }
+            out.push_str(&" ".repeat(pad));
+            out.push(' ');
+            out.push('│');
+        }
+        out.push('\n');
+
+        if ri + 1 == rows.len() {
+            // Bottom border.
+            out.push('└');
+            for (i, w) in widths.iter().enumerate() {
+                out.push_str(&"─".repeat(w + 2));
+                out.push(if i + 1 == cols { '┘' } else { '┴' });
+            }
+            out.push('\n');
+        } else {
+            // Row separator (header underline + each body-row boundary).
+            out.push('├');
+            for (i, w) in widths.iter().enumerate() {
+                out.push_str(&"─".repeat(w + 2));
+                out.push(if i + 1 == cols { '┤' } else { '┼' });
+            }
+            out.push('\n');
+        }
+    }
+    out.push('\n');
+    out
+}
+
+/// Map an LLM-emitted fence language *name* onto the file *extension* that
+/// `synoptic::from_extension` keys its built-in rules by (e.g. `rust` → `rs`,
+/// `python` → `py`). Anything already recognisable as an extension is passed
+/// through unchanged; `synoptic` falls back to a no-op (plain) highlighter for
+/// anything else.
+fn normalize_lang(lang: &str) -> String {
+    let l = lang.trim().to_ascii_lowercase();
+    let ext = match l.as_str() {
+        "rust" => "rs",
+        "python" => "py",
+        "javascript" => "js",
+        "typescript" => "ts",
+        "c++" => "cpp",
+        "csharp" | "c#" => "cs",
+        "shell" | "zsh" | "fish" => "sh",
+        _ => l.as_str(),
+    };
+    ext.to_string()
+}
+
+/// ANSI foreground colour for a `synoptic` token kind. Unknown kinds render in
+/// the terminal's default foreground (empty code → no reset emitted).
+fn tok_color(kind: &str) -> &'static str {
+    match kind {
+        // comments / docs stay unobtrusive
+        "comment" => "\x1b[90m",
+        // strings, regexes, interpolation
+        "string" | "regex" | "escape" | "interp" | "char" => "\x1b[32m",
+        // keywords, booleans, types, operators
+        "keyword" | "kw" | "boolean" | "operator" | "type" => "\x1b[33m",
+        // numeric literals
+        "number" | "digit" | "constant" => "\x1b[35m",
+        // calls, macros, methods
+        "function" | "macro" | "method" => "\x1b[36m",
+        // named types / namespaces / tags / attributes
+        "class" | "struct" | "module" | "namespace" | "attribute" | "tag" => "\x1b[34m",
+        // markup-ish tokens & identifiers
+        "header" | "heading" | "bold" | "italic" | "strikethrough" | "link" | "list"
+        | "quote" | "image" | "table" | "linebreak" | "block" | "key" | "variable"
+        | "property" | "deletion" | "insertion" | "math" => "\x1b[36m",
+        _ => "",
+    }
+}
+
+/// Colourise a fenced code block's source lines with the `synoptic` syntax
+/// highlighter, returning the input unchanged when colour is off, the block
+/// declares no language, or the language isn't supported. The returned lines
+/// carry inline ANSI codes (a reset is emitted after every coloured token) so
+/// they can be written directly by any backend.
+fn code_highlight(lang: &str, lines: &[String], color: bool) -> Vec<String> {
+    if !color || lang.trim().is_empty() {
+        return lines.to_vec();
+    }
+    let Some(mut h) = synoptic::from_extension(&normalize_lang(lang), 4) else {
+        return lines.to_vec();
+    };
+    let owned: Vec<String> = lines.to_vec();
+    h.run(&owned);
+    let mut out = Vec::with_capacity(owned.len());
+    for (y, line) in owned.iter().enumerate() {
+        let mut sb = String::new();
+        for tok in h.line(y, line) {
+            match tok {
+                synoptic::TokOpt::Some(text, kind) => {
+                    let c = tok_color(&kind);
+                    if c.is_empty() {
+                        sb.push_str(&text);
+                    } else {
+                        sb.push_str(c);
+                        sb.push_str(&text);
+                        sb.push_str("\x1b[0m");
                     }
-                    self.out.push('|');
                 }
-                self.out.push('\n');
+                synoptic::TokOpt::None(text) => sb.push_str(&text),
             }
         }
-        self.out.push('\n');
+        out.push(sb);
     }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -436,10 +598,10 @@ fn render_node<'a>(node: &'a AstNode<'a>, ctx: &RenderCtx, out: &mut String) {
             let indent = " ".repeat(ctx.indent);
             let lang = cb.info.as_str().trim();
             out.push_str(&format!("{indent}```{lang}\n"));
-            let code = cb.literal.as_str();
-            for l in code.lines() {
+            let lines: Vec<String> = cb.literal.as_str().lines().map(String::from).collect();
+            for l in code_highlight(lang, &lines, ctx.color) {
                 out.push_str(&indent);
-                out.push_str(l);
+                out.push_str(&l);
                 out.push('\n');
             }
             out.push_str(&format!("{indent}```\n"));
@@ -570,32 +732,12 @@ fn render_table<'a>(node: &'a AstNode<'a>, ctx: &RenderCtx, out: &mut String) {
     if rows.is_empty() {
         return;
     }
-    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
-    let widths: Vec<usize> = (0..cols)
-        .map(|i| rows.iter().map(|r| r.get(i).map_or(0, |s| s.chars().count())).max().unwrap_or(0))
-        .collect();
-    for (ri, row) in rows.iter().enumerate() {
-        out.push_str(&" ".repeat(ctx.indent));
-        for (ci, w) in widths.iter().enumerate() {
-            let cell = row.get(ci).cloned().unwrap_or_default();
-            out.push('|');
-            out.push(' ');
-            out.push_str(&cell);
-            let pad = w.saturating_sub(cell.chars().count());
-            out.push_str(&" ".repeat(pad));
-            out.push(' ');
-        }
-        out.push_str("|\n");
-        if ri == 0 {
-            out.push_str(&" ".repeat(ctx.indent));
-            out.push('|');
-            for w in &widths {
-                out.push_str(&"-".repeat(w + 2));
-                out.push('|');
-            }
-            out.push('\n');
-        }
-    }
+    // `table_grid` draws its own borders; indent the finished block by the
+    // current list/quote indent to stay consistent with neighbouring content.
+    let grid = table_grid(&rows, ctx.color, |s| s.chars().count());
+    let grid = grid.trim_end();
+    out.push_str(&indent_lines(grid, ctx.indent));
+    out.push('\n');
 }
 
 /// Prefix every line of `s` with `indent` spaces.
@@ -883,6 +1025,9 @@ pub struct StreamingRenderer {
     md_fence: Option<Vec<String>>,
     /// Whether the current fence's language (on the fence line) is md/markdown.
     md_fence_is_md: bool,
+    /// The current fence's declared language (used to syntax-highlight the
+    /// block once it closes; empty means no language was given).
+    fence_lang: String,
     /// Partial line not yet terminated by a `\n`: real streaming delivers token
     /// chunks that split lines mid-way, so we must buffer until a newline before
     /// feeding the (line-oriented) parser. Without this, a ```md-fenced table
@@ -904,6 +1049,7 @@ impl StreamingRenderer {
             table_rows: Vec::new(),
             md_fence: None,
             md_fence_is_md: false,
+            fence_lang: String::new(),
             pending_line: String::new(),
             out: String::new(),
         }
@@ -1041,6 +1187,7 @@ impl StreamingRenderer {
                 // rest is re-rendered as markdown. Non-md fences (rust, python,
                 // ...) render as literal code with their markers.
                 let is_md_lang = lang == "md" || lang == "markdown";
+                self.fence_lang = lang.clone();
                 // For a bare fence (empty lang) we buffer anyway and decide on
                 // `md`-marker at CodeBlockEnd, so form #2 works too.
                 self.md_fence = Some(Vec::new());
@@ -1077,13 +1224,20 @@ impl StreamingRenderer {
                         self.push_line(&line);
                     }
                 } else {
-                    self.out.push_str("```\n");
-                    for line in buf {
+                    // A language on the fence line already had its opening
+                    // marker emitted in `CodeBlockStart`; a bare (language-less)
+                    // fence gets its opening marker here so the block closes
+                    // cleanly. The buffered source is then syntax-highlighted.
+                    if self.fence_lang.is_empty() {
+                        self.out.push_str("```\n");
+                    }
+                    for line in code_highlight(&self.fence_lang, &buf, self.color) {
                         self.out.push_str(&line);
                         self.out.push('\n');
                     }
                     self.out.push_str("```\n");
                 }
+                self.fence_lang.clear();
             }
             ParseEvent::ListItem { indent, bullet, content } => {
                 let marker = match bullet {
@@ -1198,49 +1352,16 @@ impl StreamingRenderer {
         }
     }
 
-    /// Emit a buffered table as a monospace grid, mirroring the pulldown
-    /// backend's `flush_table`: compute the widest cell per column and pad
-    /// each, with a header underline. Table rows are buffered (in `table_rows`)
-    /// until `TableEnd` so column widths are known.
+    /// Emit a buffered table as a Unicode box-drawing grid, mirroring the
+    /// pulldown backend's `flush_table`: compute the widest cell per column and
+    /// pad each. Table rows are buffered (in `table_rows`) until `TableEnd` so
+    /// column widths are known.
     fn flush_table(&mut self) {
         let rows = std::mem::take(&mut self.table_rows);
         if rows.is_empty() {
             return;
         }
-        let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
-        let widths: Vec<usize> = (0..cols)
-            .map(|ci| {
-                rows.iter()
-                    .map(|r| r.get(ci).map_or(0, |s| crate::term::visible_len(s)))
-                    .max()
-                    .unwrap_or(0)
-            })
-            .collect();
-        for (ri, row) in rows.iter().enumerate() {
-            for (ci, w) in widths.iter().enumerate() {
-                let cell = row.get(ci).cloned().unwrap_or_default();
-                self.out.push('|');
-                self.out.push(' ');
-                self.out.push_str(&cell);
-                let pad = w.saturating_sub(crate::term::visible_len(&cell));
-                for _ in 0..pad {
-                    self.out.push(' ');
-                }
-                self.out.push(' ');
-            }
-            self.out.push_str("|\n");
-            if ri == 0 {
-                self.out.push('|');
-                for w in &widths {
-                    for _ in 0..w + 2 {
-                        self.out.push('-');
-                    }
-                    self.out.push('|');
-                }
-                self.out.push('\n');
-            }
-        }
-        self.out.push('\n');
+        self.out.push_str(&table_grid(&rows, self.color, crate::term::visible_len));
     }
 
     /// Heuristic: does this bare-fence buffer look like a markdown table? True
@@ -1304,6 +1425,31 @@ mod streaming_tests {
         assert!(out.contains("```rust"), "got: {out:?}");
         assert!(out.contains("let x = 1;"), "got: {out:?}");
         assert!(out.contains("```\n"), "got: {out:?}");
+        // Colourless streaming output must NOT duplicate the fence marker: a
+        // language-tagged fence gets its opening marker at `CodeBlockStart`.
+        assert_eq!(out.matches("```").count(), 2, "fence markers duplicated: {out:?}");
+    }
+
+    // `code_highlight` adds ANSI colour for a known language only when colour
+    // is on; unknown / language-less blocks pass through verbatim in both
+    // modes.
+    #[test]
+    fn code_highlight_colours_supported_langs_and_passes_unknown_through() {
+        let lines = vec![
+            "fn main() {".to_string(),
+            "    println!(\"hi\");".to_string(),
+            "}".to_string(),
+        ];
+        // colour off => verbatim.
+        assert_eq!(code_highlight("rust", &lines, false), lines);
+        // unknown language => verbatim even in colour.
+        assert_eq!(code_highlight("nonsense", &lines, true), lines);
+        // known language + colour => ANSI escapes present.
+        let hl = code_highlight("rust", &lines, true);
+        assert_eq!(hl.len(), lines.len());
+        assert!(hl[0].contains("\x1b[") && hl[0].contains("fn"), "rust keyword not coloured: {hl:?}");
+        assert!(hl[1].contains("\x1b[32m"), "string literal not coloured green: {hl:?}");
+        assert!(!hl[2].contains("\x1b["), "closing brace should be plain: {hl:?}");
     }
 
     // Streaming a list across lines keeps the bullet markers.
@@ -1392,13 +1538,14 @@ mod streaming_tests {
         assert!(out.contains("Column A"), "got: {out:?}");
         assert!(out.contains("Left aligned"), "got: {out:?}");
         assert!(out.contains("Data 6"), "got: {out:?}");
-        // Columns are padded to `| cell |`-aligned (widest cell = "Left aligned",
-        // 13 chars, so column A occupies 15 columns between bars).
-        assert!(out.contains("| Left aligned |"), "row not aligned: {out:?}");
-        assert!(out.contains("Data 1       | Data 2"), "cell not padded: {out:?}");
-        assert!(out.contains("| Data 6        |"), "last cell not padded: {out:?}");
-        // A header underline is present (the separator row becomes `|---|`).
-        assert!(out.contains("|---"), "missing underline: {out:?}");
+        // Cells are box-drawing bordered and padded to the widest cell per
+        // column ("Left aligned", 13 chars -> 15 columns between the bars).
+        assert!(out.contains("│ Left aligned │"), "row not aligned: {out:?}");
+        assert!(out.contains("Data 1"), "first cell missing: {out:?}");
+        assert!(out.contains("│ Data 6"), "last cell not padded: {out:?}");
+        // A header underline (box-drawing junction) is present under the header.
+        assert!(out.contains("├─"), "missing header underline: {out:?}");
+        assert!(out.contains("└─"), "missing bottom border: {out:?}");
     }
 
     // A markdown table in a ```md / ```markdown fence renders as markdown
@@ -1411,7 +1558,7 @@ mod streaming_tests {
         }
         r.finalize();
         let out = r.output();
-        assert!(out.contains("| Name  | Role      | Location |"), "table not rendered as aligned grid: {out:?}");
+        assert!(out.contains("│ Name"), "table not rendered as aligned grid: {out:?}");
         assert!(out.contains("Alice"), "got: {out:?}");
         assert!(out.contains("Designer"), "got: {out:?}");
         // The ` markdown` fence markers themselves are NOT shown (we re-render
@@ -1437,7 +1584,7 @@ mod streaming_tests {
         }
         r.finalize();
         let out = r.output();
-        assert!(out.contains("| Name  | Role      | Location |"), "table not rendered as aligned grid: {out:?}");
+        assert!(out.contains("│ Name"), "table not rendered as aligned grid: {out:?}");
         assert!(out.contains("Alice"), "got: {out:?}");
         // The separate `markdown` marker line and fence backticks are dropped.
         assert!(!out.contains("```"), "fence markers leaked: {out:?}");
@@ -1457,7 +1604,7 @@ mod streaming_tests {
         }
         r.finalize();
         let out = r.output();
-        assert!(out.contains("| Name  | Role"), "bare-fenced table not rendered: {out:?}");
+        assert!(out.contains("│ Name"), "bare-fenced table not rendered: {out:?}");
         assert!(out.contains("Alice"), "got: {out:?}");
         assert!(out.contains("Developer"), "got: {out:?}");
         assert!(!out.contains("```"), "fence markers leaked: {out:?}");
@@ -1486,13 +1633,13 @@ mod streaming_tests {
         }
         r.finalize();
         let out = r.output();
-        // The whole table is present and NOT split (no `| \nName` fragments).
-        assert!(out.contains("| Name"), "table missing: {out:?}");
-        assert!(out.contains("| Alice"), "row missing: {out:?}");
-        assert!(out.contains("| Bob"), "row missing: {out:?}");
-        assert!(out.contains("| Developer"), "cell missing: {out:?}");
-        assert!(!out.contains("| \n"), "header line was fragmented: {out:?}");
-        assert!(!out.contains("Name |\n|"), "table was fragmented: {out:?}");
+        // The whole table is present and NOT split (no fragment breaks).
+        assert!(out.contains("│ Name"), "table missing: {out:?}");
+        assert!(out.contains("│ Alice"), "row missing: {out:?}");
+        assert!(out.contains("│ Bob"), "row missing: {out:?}");
+        assert!(out.contains("│ Developer"), "cell missing: {out:?}");
+        assert!(!out.contains("│ \n"), "header line was fragmented: {out:?}");
+        assert!(!out.contains("Name │\n│"), "table was fragmented: {out:?}");
         assert!(!out.contains("```"), "fence markers leaked: {out:?}");
     }
 
@@ -1620,7 +1767,7 @@ mod incremental_tests {
         r.flush();
         let last = r.frames().last().unwrap();
         // The aligned table grid is present in the final frame body.
-        assert!(last.contains("| Name"), "table missing from incremental output: {last:?}");
+        assert!(last.contains("│ Name"), "table missing from incremental output: {last:?}");
         assert!(last.contains("Alice"), "table missing: {last:?}");
         assert!(last.contains("Developer"), "table missing: {last:?}");
         // No literal ```md fence markers (it rendered as markdown, not code).

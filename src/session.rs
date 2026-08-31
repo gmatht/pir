@@ -121,6 +121,36 @@ pub fn read_title(log: &Path) -> Option<String> {
     if t.is_empty() { None } else { Some(t) }
 }
 
+/// Path of the turn-outcome verdict sidecar (`<log>.verdict`). The throttled
+/// "light" model writes a short outcome label (`complete` / `waiting` /
+/// `retry` / `blocked` / `error`) here after each turn, so `/sessions` and the
+/// resume picker can show at a glance how a conversation ended — without
+/// re-summarizing the whole transcript, and without ever touching stdout.
+pub fn verdict_path(log: &Path) -> PathBuf {
+    log.with_extension("verdict")
+}
+
+/// Write a turn-outcome verdict to the `.verdict` sidecar. Best-effort: a
+/// missing/empty log path or empty verdict is a no-op.
+pub fn write_verdict(log: &Path, verdict: &str) {
+    if log.as_os_str().is_empty() {
+        return;
+    }
+    let verdict = verdict.trim().to_string();
+    if verdict.is_empty() {
+        return;
+    }
+    let _ = fs::write(verdict_path(log), verdict);
+}
+
+/// Read the cached turn-outcome verdict (if any) from the `.verdict` sidecar.
+/// Returns `None` when no verdict has been generated yet or the file is absent.
+pub fn read_verdict(log: &Path) -> Option<String> {
+    let raw = fs::read_to_string(verdict_path(log)).ok()?;
+    let v = raw.trim().to_string();
+    if v.is_empty() { None } else { Some(v) }
+}
+
 /// Persist a status for `log`. A missing/empty log path is a no-op (one-shot
 /// sessions that opted out of a transcript never get tracked).
 pub fn write_status(

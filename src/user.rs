@@ -1,17 +1,23 @@
 //! Per-project execution user (`ai_<project>`).
 //!
-//! Every tool — `bash` and the file tools — runs under the *current process
-//! identity*, so the simplest correct sandbox is to make the whole `pir`
-//! process become `ai_X` (via setuid/setgid) after config is loaded. The tool
-//! layer needs no changes; `spawn_shell` and all `fs` calls then run as
-//! `ai_X`.
+//! The security boundary is "drop privs for the *agents*, not the *user*":
+//! `pir` itself stays the invoking identity (the operator, typically root), so
+//! the operator keeps their authority (`/sh -u`, legitimate fs writes, …).
+//! Only the *untrusted commands the model spawns* (the `bash` tool) are
+//! confined to `ai_X`. `set_agent_exec_user` records that user and the bash
+//! tool's `before_exec` drops to it (collapsing the saved uid so it cannot
+//! escalate); the file tools run as the invoking identity. The `become_user`
+//! helper still exists for the `sudo -u ai_X pir` launch shape, where the whole
+//! process is already the sandbox user.
 //!
 //! This module is unix-only. On non-unix targets the functions return
 //! `Err(...)` explaining the feature is unsupported, and the agent falls back
 //! to running as the invoking user.
 
 #[cfg(unix)]
+use std::path::{Path, PathBuf};
 use std::os::unix::fs::MetadataExt;
+use std::sync::Mutex;
 
 /// Name of the user with the given uid, best-effort.
 #[cfg(unix)]
@@ -348,6 +354,27 @@ pub fn cwd_accessibility_wizard(user: &str) -> Result<AccessibilityAction, Strin
     }
 }
 
+/// The per-project `ai_*` user that the agent's *tool commands* (bash) should
+/// run as. `pir` itself stays the invoking identity (the operator, typically
+/// root); only the untrusted commands the model spawns (the `bash` tool) are
+/// confined to this identity — exactly the "drop privs for the agents, not the
+/// user" boundary. Set at startup when `pir` is launched as root; a no-op when
+/// `pir` was launched already as the sandbox user (the child inherits that
+/// identity automatically). `spawn_shell` reads this in the child's
+/// `before_exec` and drops to it.
+static AGENT_EXEC_USER: Mutex<Option<String>> = Mutex::new(None);
+
+/// Record the sandbox user agent bash commands should run as. See
+/// [`AGENT_EXEC_USER`].
+pub fn set_agent_exec_user(user: &str) {
+    *AGENT_EXEC_USER.lock().unwrap() = Some(user.to_string());
+}
+
+/// The `ai_*` user agent bash commands should run as, if one was configured.
+pub fn agent_exec_user() -> Option<String> {
+    AGENT_EXEC_USER.lock().unwrap().clone()
+}
+
 /// Drop privileges to the given user (unix only). Call *after* config and
 /// providers are loaded but *before* the agent is built and any tool runs.
 #[cfg(unix)]
@@ -428,6 +455,147 @@ pub fn drop_to_current_identity() -> Result<(), std::io::Error> {
     }
 }
 
+/// Drop the *current* process (a child about to `exec`) to the configured agent
+/// execution user `ai_X`, collapsing the *saved* uid/gid too so the untrusted
+/// command can never escalate back to the invoking identity (root). This is the
+/// other half of the "drop privs for the agents, not the user" boundary:
+/// `pir` itself stays root (kept able to `/sh -u` elsewhere), but every command
+/// the model spawns via the `bash` tool is confined to `ai_X` in its child
+/// `before_exec`. No-op (returns `Ok`) when no agent exec user is configured, or
+/// when the configured user can't be resolved (run as-is rather than fail the
+/// command). Returns the `io::Error` from the first failing syscall so a
+/// `before_exec` can refuse to exec as root.
+#[cfg(unix)]
+pub fn drop_to_agent_user() -> Result<(), std::io::Error> {
+    // FULL-ROOT / directory-rootfs container mode: the agent IS root inside its
+    // own container/namespace (ai-root), so there is no `ai_X` to drop to —
+    // dropping would hard-stop its writes to the container's own root-owned
+    // files (e.g. the containers copy of /etc/hosts), breaking permit-but-
+    // quarantine.
+    if crate::security::overlay::fullroot_engaged() || crate::security::overlay::container_engaged() {
+        return Ok(());
+    }
+    // The operator disabled su-security for this session (`/su-security off
+    // <reason>`): the agent is authorized to act with the invoking user's full
+    // authority, so bash does NOT drop to `ai_X` — child commands run as the
+    // invoking user (root). This is the deliberate, human-gated escalation path.
+    if std::env::var_os("PIR_AGENT_AS_INVOKER")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let Some(user) = agent_exec_user() else {
+        return Ok(());
+    };
+    let (uid, gid) = match lookup_user(&user) {
+        Ok(v) => v,
+        Err(_) => return Ok(()), // can't resolve: don't fail the command
+    };
+    // Unprivileged quarantine path: when the agent is already running as its
+    // target user and `enter_private_mount_ns` entered a user namespace mapping
+    // the agent's real uid to virtual root (0), this process IS the agent (as
+    // ns-root, host uid = the agent's uid). setresuid to the agent's uid would
+    // fail (it is not mapped in the ns), so treat it as a no-op rather than
+    // breaking every bash command.
+    if in_userns_mapping_agent_to_root(uid) {
+        return Ok(());
+    }
+    unsafe {
+        // BEST-EFFORT confinement: the posture is "permit ALL operations,
+        // quarantine writes" — the overlay is the write gate, NOT this setuid.
+        // So if the drop fails (the child is already an unprivileged identity
+        // like ai_pir and lacks CAP_SETUID/SETGID — setgroups fails EPERM — or
+        // the uid isn't mapped in a user namespace), run the command as the
+        // current identity instead of failing it. A hard failure here turned
+        // every `bash` spawn into "Operation not permitted".
+        let _ = libc::setgroups(0, std::ptr::null());
+        if libc::setresgid(gid, gid, gid) != 0 {
+            return Ok(());
+        }
+        if libc::setresuid(uid, uid, uid) != 0 {
+            return Ok(());
+        }
+    }
+    // Point the confined command at the agent user's own toolchain dirs
+    // (HOME / CARGO_HOME / GH_CONFIG_DIR) so `cargo`/`gh` write into `ai_X`'s
+    // directories, never the invoking user's (root's) home. Mirrors what the
+    // old `become_user` applied to the whole process.
+    for (k, v) in toolchain_env_for(&user) {
+        std::env::set_var(k, v);
+    }
+    Ok(())
+}
+
+/// The home directory of the configured agent execution user (e.g. `ai_pir`),
+/// from `/etc/passwd`. `None` when no agent exec user is configured or it can't
+/// be resolved. Used to place the overlay staging dir where the agent's bash
+/// commands (which run as `ai_X`) can actually reach and write it — when `pir`
+/// runs as root, `$HOME` is root's, which `ai_X` cannot traverse.
+#[cfg(unix)]
+pub fn agent_user_home() -> Option<PathBuf> {
+    let user = agent_exec_user()?;
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    for line in passwd.lines() {
+        let mut f = line.split(':');
+        if f.next()? == user {
+            return f.nth(4).map(PathBuf::from); // field 5 = home dir
+        }
+    }
+    None
+}
+
+/// Best-effort chown of `path` to the configured agent execution user, so the
+/// overlay staging upper/work dirs are writable by the agent's bash commands
+/// (which run as `ai_X`). No-op when no agent exec user is configured or the
+/// chown fails.
+#[cfg(unix)]
+pub fn chown_to_agent_user(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(user) = agent_exec_user() else { return };
+    let Ok((uid, gid)) = lookup_user(&user) else { return };
+    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return };
+    unsafe {
+        libc::chown(cpath.as_ptr(), uid, gid);
+    }
+}
+
+/// True when this process is inside a non-init user namespace whose uid_map
+/// maps ns-uid 0 to the given host uid — i.e. the unprivileged quarantine path
+/// where the agent runs as virtual root representing its own real uid. In that
+/// case `drop_to_agent_user` must NOT setuid (the agent's uid is not mapped in
+/// the ns; virtual root already IS the agent on the host).
+#[cfg(unix)]
+fn in_userns_mapping_agent_to_root(uid: u32) -> bool {
+    let in_userns = match (
+        std::fs::read_link("/proc/self/ns/user").ok(),
+        std::fs::read_link("/proc/1/ns/user").ok(),
+    ) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    };
+    if !in_userns {
+        return false;
+    }
+    let Ok(map) = std::fs::read_to_string("/proc/self/uid_map") else {
+        return false;
+    };
+    map.lines().any(|l| l.trim() == format!("0 {uid} 1"))
+}
+
+/// True when an agent execution user has been configured (i.e. `pir` is
+/// sandboxing only the model's commands, not the operator). Exposed so the
+/// bash tool can report which identity a command will run as.
+#[cfg(unix)]
+pub fn has_agent_exec_user() -> bool {
+    agent_exec_user().is_some()
+}
+
+#[cfg(not(unix))]
+pub fn has_agent_exec_user() -> bool {
+    false
+}
+
 /// Run a shell (interactive, or a single `-c` command) as `target_user`, from
 /// the invoking user's perspective. Used by `/sh -u <user>` so a session that
 /// has dropped to a sandbox identity (`ai_X`) can still hand control to a
@@ -493,27 +661,46 @@ pub fn spawn_shell_as(
         }
     };
     let shell_path = resolve_shell_path(shell);
+    // Unprivileged quarantine path: we may be virtual root in a user namespace
+    // whose uid_map maps ns-0 -> the agent's REAL uid (see enter_private_mount_ns).
+    // The agent's real uid is NOT mapped in that ns, so a setuid to it would
+    // fail — but virtual root already IS the agent on the host. Just exec the
+    // shell as-is (no drop needed).
+    if in_userns_mapping_agent_to_root(uid) {
+        let mut cmd = Command::new(&shell_path);
+        if !args.is_empty() {
+            cmd.arg("-c").arg(args.join(" "));
+        }
+        return cmd
+            .env("HISTFILE", "/dev/null")
+            .current_dir(std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")))
+            .status()
+            .ok()
+            .map(|s| s.code().unwrap_or(1));
+    }
     let mut cmd = Command::new(&shell_path);
     // Build a precise argv so we hand the *exact* command to the child shell.
     if !args.is_empty() {
         cmd.arg("-c").arg(args.join(" "));
     }
     let err = cmd
+        .env("HISTFILE", "/dev/null")
         .current_dir(std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")))
         .before_exec(move || {
             // Inside the child: drop to the target identity before exec. We
             // must not run any code as root in the child shell. Order matters:
             // clear groups, setgid, then setuid (once uid is dropped we can no
-            // longer setgid).
+            // longer setgid). BEST-EFFORT: if the drop fails (the child is
+            // already an unprivileged identity and setgroups EPERMs, or the uid
+            // isn't mapped in this user namespace), run the shell as the current
+            // identity rather than failing it.
             unsafe {
-                if libc::setgroups(0, std::ptr::null()) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
+                let _ = libc::setgroups(0, std::ptr::null());
                 if libc::setgid(gid) != 0 {
-                    return Err(std::io::Error::last_os_error());
+                    return Ok(());
                 }
                 if libc::setuid(uid) != 0 {
-                    return Err(std::io::Error::last_os_error());
+                    return Ok(());
                 }
             }
             Ok(())

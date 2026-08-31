@@ -260,12 +260,37 @@ impl Agent {
                 // until the operator reviews + applies them with /quarantine. When
                 // mounting is impossible (the common non-root ai_* case) we
                 // gracefully skip it and rely on the in-process write guardrail.
-                if ctx.policy.quarantine {
+                // FULL-ROOT / container mode: the whole fs is already handled; the
+                // selective system-tree overlay is redundant (skip it).
+                let fullroot = crate::security::overlay::fullroot_engaged()
+                    || crate::security::overlay::container_engaged();
+                // NON-ROOT auto-writable mode (default for unprivileged): overlay
+                // $HOME with fuse-overlayfs, worktree + ~/.cargo + ~/.pi real.
+                let home_q = crate::security::overlay::home_quarantine_wanted();
+                if home_q && ctx.policy.quarantine {
+                    match crate::security::overlay::mount_home_quarantine() {
+                        Ok(()) => eprintln!(
+                            "{}",
+                            crate::term::dim(
+                                "[pir] HOME write-quarantine engaged: $HOME staged (worktree + ~/.cargo + ~/.pi real; /tmp excluded) — review with /quarantine"
+                            )
+                        ),
+                        Err(e) => {
+                            eprintln!(
+                                "{}",
+                                crate::term::red(&format!(
+                                    "[pir] HOME QUARANTINE UNAVAILABLE ({e}); writes are UNGUARDED except the in-process deny-list"
+                                ))
+                            );
+                            ctx.set_quarantine(false);
+                        }
+                    }
+                } else if ctx.policy.quarantine && !fullroot {
                     if !private_ns {
                         eprintln!(
                             "{}",
-                            crate::term::dim(
-                                "[pir] write-quarantine disabled: private mount namespace unavailable (would shadow the host's /var, /etc); writes guarded in-process only"
+                            crate::term::red(
+                                "[pir] WRITE-QUARANTINE DISABLED: private mount namespace unavailable (would shadow the host's /var, /etc); writes are UNGUARDED except the in-process deny-list"
                             )
                         );
                         ctx.set_quarantine(false);
@@ -617,6 +642,14 @@ impl Agent {
     /// invoking user's full authority for this session.
     pub fn set_su_security(&mut self, enabled: bool, reason: &str) -> String {
         self.su_security_enabled = enabled;
+        // Wire the authority: while su-security is off, bash must NOT drop to
+        // `ai_X` (drop_to_agent_user reads this env) so the agent can act as
+        // the invoking user (root). The reason is recorded in the response.
+        if enabled {
+            std::env::remove_var("PIR_AGENT_AS_INVOKER");
+        } else {
+            std::env::set_var("PIR_AGENT_AS_INVOKER", "1");
+        }
         let note = if reason.trim().is_empty() {
             "(no reason given)".to_string()
         } else {
@@ -654,6 +687,11 @@ impl Agent {
         match std::fs::read_to_string(p.with_extension("susec")) {
             Ok(s) => {
                 self.su_security_enabled = s.trim() == "1";
+                if self.su_security_enabled {
+                    std::env::remove_var("PIR_AGENT_AS_INVOKER");
+                } else {
+                    std::env::set_var("PIR_AGENT_AS_INVOKER", "1");
+                }
                 true
             }
             Err(_) => false,

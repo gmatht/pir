@@ -91,7 +91,7 @@ pub fn scaffold_from_md(dir: &Path, text: &str) -> Result<usize, String> {
     let mut in_block = false;
     let mut written = 0usize;
 
-    let mut flush = |file: &str, body: &str| -> Result<usize, String> {
+    let flush = |file: &str, body: &str| -> Result<usize, String> {
         if !file.is_empty() && !body.is_empty() {
             write_block(dir, file, body)?;
             Ok(1)
@@ -241,7 +241,12 @@ fi
 /// a *different* hook exists we don't clobber it (return Ok(false) so the
 /// caller can warn). Returns Ok(true) when a hook was written.
 pub fn install_git_guard_hook(repo: &Path) -> Result<bool, String> {
-    let hooks_dir = repo.join(".git").join("hooks");
+    let Some(gdir) = git_common_dir(repo) else {
+        return Err("not inside a git repository".into());
+    };
+    // Hooks live in the *common* git dir, shared by the main checkout and every
+    // linked worktree — one install protects all agent worktrees.
+    let hooks_dir = gdir.join("hooks");
     std::fs::create_dir_all(&hooks_dir).map_err(|e| format!("mkdir hooks: {e}"))?;
     let hook = hooks_dir.join("pre-commit");
     let script = guard_hook_script();
@@ -262,14 +267,25 @@ pub fn install_git_guard_hook(repo: &Path) -> Result<bool, String> {
 /// Resolve the absolute `.git` directory for `repo`, working from any
 /// subdirectory of a work tree (via `git rev-parse --absolute-git-dir`). Returns
 /// `None` when `repo` is not inside a git work tree.
-fn git_dir(repo: &Path) -> Option<PathBuf> {
-    Command::new("git")
-        .args(["rev-parse", "--absolute-git-dir"])
+/// Resolve the *common* git directory (`git rev-parse --git-common-dir`) — the
+/// `.git` dir that holds hooks/objects/refs and is SHARED by the main checkout
+/// and every linked worktree. A hook installed there protects all worktrees, so
+/// `/fix` never needs to copy hooks per-worktree. `--git-common-dir` can be
+/// relative to the work-tree root (e.g. in a linked worktree), so relativize it
+/// against the resolved root. Returns `None` outside a git work tree.
+fn git_common_dir(repo: &Path) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
         .current_dir(repo)
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))?;
+    if out.is_absolute() {
+        Some(out)
+    } else {
+        Some(repo_root(repo).join(out))
+    }
 }
 
 /// Resolve the work-tree root for `repo` (via `git rev-parse --show-toplevel`),
@@ -300,7 +316,7 @@ pub fn missing_git_guard(repo: &Path) -> bool {
     if detect_vcs(repo) == Vcs::Jj {
         return false;
     }
-    let Some(gdir) = git_dir(repo) else {
+    let Some(gdir) = git_common_dir(repo) else {
         return false; // not a git repo
     };
     !gdir.join("hooks").join("pre-commit").exists()
@@ -318,6 +334,12 @@ pub fn fix_git_setup(repo: &Path) -> String {
     }
     let root = repo_root(repo);
     let mut lines = Vec::new();
+    // The repo's `.git` sits inside the project write-quarantine overlay when
+    // the agent is in a worktree; suspend it briefly so the hook + git config
+    // land on the *real* `.git` (they must apply to the whole repo and all
+    // worktrees, not to the staging upper).
+    #[cfg(unix)]
+    let _ = crate::security::overlay::project_active_suspend();
     match install_git_guard_hook(&root) {
         Ok(true) => lines.push("✓ installed .git/hooks/pre-commit guard (refuses > {} bytes / binary; bypass with --no-verify)".replace("{}", &commit_max_bytes().to_string())),
         Ok(false) => lines.push("• a pre-commit hook already exists; left it in place (not the pir guard). Run `git commit --no-verify` if needed, or replace it manually.".to_string()),
@@ -330,6 +352,8 @@ pub fn fix_git_setup(repo: &Path) -> String {
             .status();
         lines.push(format!("✓ git config {k}={v}"));
     }
+    #[cfg(unix)]
+    let _ = crate::security::overlay::project_active_resume();
     // .gitattributes: mark obvious binary extensions so `git` treats them as
     // binary (the hook keys off git's binary detection). Written at the work-tree
     // root (not the cwd) so it applies to the whole repo.

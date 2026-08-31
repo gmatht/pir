@@ -2181,15 +2181,23 @@ cargo build --release
             create_project(&name);
         }
         "quarantine" | "q" => {
-            // Review / apply / discard the writes the agent staged into the
-            // overlay upper. The agent runs ALL commands, but writes outside its
-            // whitelisted worktree are quarantined (visible only to the agent)
-            // until the operator applies them here. `status` (default) lists the
-            // staged writes; `apply` copies the non-critical ones to the real
-            // filesystem; `discard` throws them away and the agent keeps working.
+            // Review / apply / discard the writes the agent staged. The agent
+            // runs ALL commands; writes outside the whitelist are quarantined
+            // (visible only to the agent) until the operator approves them here.
+            // Two backends: the overlay uppers (project + system trees), and in
+            // the directory-rootfs container, the container's own files (diffed
+            // against the real host). `status` lists them; `apply [n|all]` copies
+            // the chosen (or all) non-critical writes to the real fs; `discard
+            // [n|all]` throws them away and the agent keeps working.
             let action = rest.first().copied().unwrap_or("status");
+            let idx = rest.get(1).and_then(|s| s.parse::<usize>().ok());
+            let container = crate::security::overlay::container_engaged();
             match action {
                 "status" | "ls" | "" => {
+                    if container {
+                        println!("{}", crate::security::overlay::container_manifest());
+                        return;
+                    }
                     let m = crate::security::overlay::project_active_manifest();
                     println!("{}", m);
                     let sm = crate::security::overlay::manifest_active();
@@ -2200,10 +2208,57 @@ cargo build --release
                     }
                 }
                 "apply" => {
-                    // Flush BOTH staged layers: the agent's project writes (everything
-                    // outside its whitelisted worktree) and any system-tree writes it
-                    // made (/var, /etc, /usr/local, /opt, /srv, /boot). Each is
-                    // reviewed independently; the operator decides per layer.
+                    if container {
+                        // `apply r <idx> <regex>`: build a rule from an entry —
+                        // edit its filename into a regex, confirm the original
+                        // still matches, save, then apply that entry.
+                        if rest.get(1).copied() == Some("r") {
+                            let eidx = rest.get(2).and_then(|s| s.parse::<usize>().ok());
+                            let regex = rest.get(3..).map(|r| r.join(" ")) .unwrap_or_default();
+                            let Some(eidx) = eidx else {
+                                eprintln!("usage: /quarantine apply r <idx> '<regex>'");
+                                return;
+                            };
+                            let Some(real) = crate::security::overlay::container_entry_path(eidx) else {
+                                eprintln!("quarantine: no staged write at index {eidx}");
+                                return;
+                            };
+                            if regex.trim().is_empty() {
+                                eprintln!("usage: /quarantine apply r <idx> '<regex>' (regex must still match {})", real.display());
+                                return;
+                            }
+                            match crate::security::rules::add_rule(
+                                crate::security::rules::RuleVerdict::Approve,
+                                crate::security::rules::ReviewOp::Modify,
+                                &regex,
+                                &real.to_string_lossy(),
+                            ) {
+                                Ok(()) => println!("quarantine: saved rule and applied entry {eidx} ({}; regex matches)", real.display()),
+                                Err(e) => {
+                                    eprintln!("quarantine: {e}");
+                                    return;
+                                }
+                            }
+                            match crate::security::overlay::container_apply(Some(eidx)) {
+                                Ok((a, d)) => println!("quarantine: applied {a} container write(s) (auto-denied {d})"),
+                                Err(e) => eprintln!("quarantine: container apply failed: {e}"),
+                            }
+                            return;
+                        }
+                        match crate::security::overlay::container_apply(idx) {
+                            Ok((a, d)) => {
+                                if d > 0 {
+                                    println!("quarantine: applied {a} container write(s); auto-denied {d} by rules (stays staged — e.g. new cache)");
+                                } else {
+                                    println!("quarantine: applied {a} container write(s) to the real filesystem");
+                                }
+                            }
+                            Err(e) => eprintln!("quarantine: container apply failed: {e}"),
+                        }
+                        return;
+                    }
+                    // Flush BOTH staged layers: project writes (everything outside
+                    // the whitelisted worktree) and system-tree writes.
                     match crate::security::overlay::project_active_apply() {
                         Ok(n) => println!("quarantine: applied {n} staged project write(s) to the real filesystem"),
                         Err(e) => eprintln!("quarantine: project apply failed: {e}"),
@@ -2214,6 +2269,13 @@ cargo build --release
                     }
                 }
                 "discard" | "deny" => {
+                    if container {
+                        match crate::security::overlay::container_discard(idx) {
+                            Ok(_) => println!("quarantine: discarded container staged write(s) (agent keeps working)"),
+                            Err(e) => eprintln!("quarantine: container discard failed: {e}"),
+                        }
+                        return;
+                    }
                     match crate::security::overlay::project_active_discard() {
                         Ok(()) => println!("quarantine: discarded staged project writes (agent keeps working)"),
                         Err(e) => eprintln!("quarantine: discard failed: {e}"),

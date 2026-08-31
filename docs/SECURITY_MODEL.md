@@ -918,3 +918,39 @@ gate              = "ci"         # ci (the host's pipeline) | "pir-merge-gate"
 - [ ] Multiple agents → each owns a distinct worktree/branch; no two write the
       same tree; trunk never receives an un-gated direct write.
 - [ ] Human `pir merge <pr>` / block still works; auto-merge is bypassable.
+
+---
+
+## 12. Implemented default posture (overlayfs write-quarantine + worktree)
+
+The default `pir` posture now combines the §2.3 / §5.1 overlayfs staging trick
+with the §11 worktree isolation so that **the agent may run every command, but
+non-whitelisted writes are intercepted and quarantined** — visible only to the
+agent until the operator reviews and applies (or discards) them:
+
+- **Run everything, quarantine writes.** There is no command allow-list: the
+  agent reads, executes, and uses the network normally. Every *write* is routed
+  through an overlayfs `upperdir` so the real filesystem is untouched until the
+  operator says so. This is the `overlayfs` approach the task asks for.
+- **Per-agent worktree, whitelisted.** Each agent owns a git worktree
+  (`wt_create`; also auto-created at launch by default — `PIR_WT_AUTOCREATE=0`
+disables). The agent's worktree is
+  bind-mounted **read-write on top** of the overlay, so it is the *only* tree
+  the agent can write to the real filesystem through. The central `.git`, the
+  trunk checkout, and every *other* agent's worktree are **not** whitelisted —
+  writes there are quarantined and visible only to this agent.
+- **Review at leisure.** `/quarantine` (alias `/q`) lists the staged writes
+  (`status`), copies the non-critical ones to the real fs (`apply`), or throws
+  them away (`discard`). Nothing reaches the real filesystem without an explicit
+  operator action.
+- **Idle fix loop, tiered.** When a turn finishes (or the agent is waiting for
+  feedback), the `wt` extension drives the worktree to green in priority order:
+  **cargo build errors → compiler warnings/lints → failing tests**. When the
+  worktree is green it **merges into `main`** and then runs the *same* tiered fix
+  loop **on `main`** (errors → warnings → tests) until trunk is clean.
+
+Config knobs (loaded from `~/.pi/agent/security.toml`, or env): `quarantine`
+(default on), `quarantine-project` (default on; `PIR_QUARANTINE=0` disables),
+`security.level`, `security.idle` (`off`/`errors`/`warnings`/`hygiene`),
+worktree auto-create on by default (`PIR_WT_AUTOCREATE=0` disables), and
+`PIR_WT_WHITELIST` (set automatically by `wt` to the agent's worktree).
