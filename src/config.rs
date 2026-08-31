@@ -1,7 +1,5 @@
-use crate::types::Usage;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -143,6 +141,24 @@ impl ThinkingLevel {
             ThinkingLevel::Low => Some("low"),
             ThinkingLevel::Medium => Some("medium"),
             ThinkingLevel::High | ThinkingLevel::XHigh | ThinkingLevel::Max => Some("high"),
+        }
+    }
+
+    /// Whether selecting this level actually takes effect for the given
+    /// provider kind + context window. Some levels have no effect on certain
+    /// providers and would be silently ignored (`minimal` has no OpenAI
+    /// `reasoning_effort`; Anthropic budget levels degrade to nothing when the
+    /// context is too small to afford a budget). Filtering these out of a
+    /// picker (/menu → thinking) avoids offering options that do nothing.
+    /// Unknown provider kinds (`None`) always show every level.
+    pub fn effective(&self, kind: Option<ApiKind>, ctx: u64) -> bool {
+        match self {
+            ThinkingLevel::Off => true,
+            _ => match kind {
+                Some(ApiKind::OpenAi) => self.oai_effort().is_some(),
+                Some(ApiKind::Anthropic) => self.anthropic_budget(ctx).is_some(),
+                None => true,
+            },
         }
     }
 }

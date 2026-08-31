@@ -31,7 +31,6 @@ use crate::config::Model;
 use crate::notify::SharedBus;
 use std::io::BufRead;
 use std::io::IsTerminal;
-use std::io::Write as _;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -109,7 +108,7 @@ fn install_death_tracking() {
             // Build a one-line provenance note and append it to the status file.
             let ppid = unsafe { libc::getppid() };
             let self_pid = std::process::id();
-            let note = format!(
+            let _note = format!(
                 "[death] received signal {signo} (SIGHUP={}) at {} from ppid={}; pir pid={}\n",
                 libc::SIGHUP,
                 std::time::SystemTime::now()
@@ -151,7 +150,7 @@ fn install_death_tracking() {
 
         for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
             unsafe {
-                if libc::signal(sig, handler as libc::sighandler_t) == libc::SIG_ERR {
+                if libc::signal(sig, handler as *const () as libc::sighandler_t) == libc::SIG_ERR {
                     // ignore — handler install failed for this signal
                 }
             }
@@ -219,11 +218,13 @@ AGENT USERS RUN UNATTENDED
   `--confirm` or set PIR_CONFIRM=1 to force prompts even with a sandbox user.
 
 COMMANDS
-  /help  /model <sel>  /models  /default-model <sel>  /sessions  /goal [objective]  /goal start [objective]  /continue
+  /help  /markup_demo  /model <sel>  /models  /default-model <sel>  /sessions  /goal [objective]  /goal start [objective]  /continue
                         start (and drive to completion) the goal right now
   /thinking [<level>] [show|hide]   set the model's thinking level
                           (off|minimal|low|medium|high|xhigh|max) and/or toggle
                           whether streamed reasoning is displayed; no arg = status
+  /markup_demo          show a few types of Markdown rendered as an agent reply
+                          (headings, inline styles, lists, quotes, tables, code fences)
   /model* <sel>  /model-all <sel>   broadcast a model switch to ALL your open pir terminals (also sets the new default)
   /bg <text>  /jobs  /fg <id>  /clear  /usage  /exit
   /finished               mark this session done — it drops out of /unfinished (until then, sessions stay open)
@@ -455,7 +456,7 @@ fn main() {
     let mut resume_token: Option<String> = None;
     let mut continue_token: Option<String> = None;
     let mut as_user: Option<String> = None;
-    let mut project_name: Option<String> = None;
+    let project_name: Option<String> = None;
     let mut bg_prompt: Option<String> = None;
     let mut auto_retry: Option<usize> = None;
     // The full-screen ratatui REPL is used only when the `tui` feature is
@@ -463,7 +464,7 @@ fn main() {
     #[cfg(feature = "tui")]
     let mut use_tui = false;
     #[cfg(not(feature = "tui"))]
-    let mut use_tui = false;
+    let _use_tui = false;
     // The graphical GTK REPL is used only when the `gui` feature is compiled in
     // AND `--gui` is passed.
     #[cfg(feature = "gui")]
@@ -1082,11 +1083,12 @@ fn main() {
     // Prompts queued by the user while a turn runs (submitted on Enter).
     let mut pending: Vec<String> = Vec::new();
     // When a foreground turn has just completed and we're back at the idle
-    // prompt, the user hasn't pressed a key yet — print the configurable "done"
-    // banner (see `term::done_prompt`) as a standalone line above the prompt so
-    // it's obvious the task is done and pir is waiting for input. It is cleared
-    // on the first keypress (the banner is printed once, then `awaiting_input`
-    // is reset), so typing happens on a clean `❯ ` line.
+    // prompt, the user hasn't pressed a key yet — render the configurable
+    // "done" banner (see `term::done_prompt`) as the rustyline *prompt* (via
+    // `set_idle_done_banner`) so it reads as a full-width "task done" bar. The
+    // highlighter swaps it for a clean `❯ ` the moment the user types (see
+    // `PirHelper::highlight_prompt`/`highlight_char`), so it is replaced on the
+    // first keystroke rather than lingering on the line above.
     let mut awaiting_input = false;
     // Partial line buffer for the raw-mode input while a turn runs.
     let mut input_buf = String::new();
@@ -1289,7 +1291,7 @@ fn main() {
                     //  - turn running: flip the shared job-kill flag, which the
                     //    agent's own bash wait loop consumes within 250ms and
                     //    sweeps on our behalf.
-                    let mut killed = {
+                    let killed = {
                         let mut g = agent_slot.lock().unwrap();
                         match g.as_mut() {
                             Some(a) => a.registry_kill_all_jobs(),
@@ -1392,19 +1394,27 @@ fn main() {
             }
         }
         // The idle prompt. While we're awaiting the user's first keystroke after
-        // a turn completed (and nothing was queued/continued), print the
+        // a turn completed (and nothing was queued/continued), show the
         // configurable "done" banner (a full-width ✓ DONE line; see
-        // `term::done_prompt`) as a standalone line ABOVE the prompt — NOT as the
-        // rustyline prompt itself. The rustyline prompt is static for the whole
-        // input line, so using it there would leave the placeholder glued in
-        // front of the user's typed text until Enter; rendering it above means
-        // the moment the user starts typing they're on a clean `❯ ` line and the
-        // placeholder is already gone.
-        if awaiting_input {
-            term::out(&term::done_prompt());
+        // `term::done_prompt`) as the rustyline *prompt* itself. It is rendered
+        // via the highlighter (`PirHelper::highlight_prompt` / `highlight_char`),
+        // which swaps it for a clean `❯ ` the instant the buffer becomes
+        // non-empty — so it is *replaced* on the first keystroke, not glued in
+        // front of the typed text and not lingering on the line above (the old
+        // behaviour, where it was printed as its own line and rustyline's
+        // repaint could never reach it). We stash the banner in the editor's
+        // thread-local state and clear it on every other read so it only appears
+        // when we're genuinely awaiting the user's first keystroke.
+        let prompt = if awaiting_input {
             awaiting_input = false;
-        }
-        let prompt = format!("{} ", term::cyan("❯"));
+            term::set_idle_done_banner(Some(term::done_prompt()));
+            // The banner is drawn *as* the prompt by the highlighter; pass the
+            // normal `❯ ` as the prompt string (used for layout + when typing).
+            format!("{} ", term::cyan("❯"))
+        } else {
+            term::set_idle_done_banner(None);
+            format!("{} ", term::cyan("❯"))
+        };
         match term::read_line(&prompt) {
             None => {
                 println!();
@@ -1645,6 +1655,77 @@ fn handle_command(
             }
         }
         "h" | "help" => print!("{HELP}"),
+        "markup_demo" => {
+            // Render a few CommonMark shapes the same way an agent reply is
+            // rendered, so the user can see (and compare) each markup type.
+            let demo = r##"A demonstration of the Markdown this terminal renders.
+
+## Headings & inline styles
+
+A **bold** run, an _italic_ run, `inline code`, and a [link](https://example.com).
+
+## Lists
+
+- apples
+- oranges
+- bananas
+
+1. first
+2. second
+
+## Blockquote
+
+> This line is a blockquote.
+
+## Table
+
+| Name    | Role      | Location |
+| ------- | --------- | -------- |
+| Alice   | Developer | New York |
+| Bob     | Designer  | London   |
+| Charlie | Manager   | Tokyo    |
+
+## Code (syntax highlighted)
+
+```rust
+fn main() {
+    let count = 42;             // a number
+    println!("hello, {count}"); // string + interpolation
+}
+```
+
+```python
+def greet(name: str) -> str:
+    """Return a greeting."""
+    # keyword, string and number colours
+    return f"Hello, {name}!"
+```
+
+```json
+{
+  "status": "ok",
+  "attempts": 3
+}
+```
+
+```bash
+# build and run
+cargo build --release
+./target/release/pir
+```
+
+## A ```md``` fence renders as markdown
+
+```md
+| Language | Paradigm |
+| -------- | -------- |
+| Rust     | Systems  |
+| Python   | Multi    |
+```
+"##;
+            term::out(&crate::md::render(demo, term::color_enabled()));
+            term::out("\n");
+        }
         "m" | "model" => {
             let mut g = agent_slot.lock().unwrap();
             let Some(agent) = g.as_mut() else {
@@ -2090,7 +2171,7 @@ fn handle_command(
                     }
                     println!("{}", term::dim("(local per-session flag; no system-wide configuration changed)"));
                 }
-                other => eprintln!(
+                _other => eprintln!(
                     "usage: /su-security <on|off|status>   (off requires a reason; local to this session)"
                 ),
             }
@@ -2142,7 +2223,7 @@ fn handle_command(
                         Err(e) => eprintln!("quarantine: system discard failed: {e}"),
                     }
                 }
-                other => eprintln!("usage: /quarantine [status|apply|discard]"),
+                _other => eprintln!("usage: /quarantine [status|apply|discard]"),
             }
         }
         "goal" => {
@@ -2337,40 +2418,34 @@ fn handle_command(
                 }
                 Some(crate::modal::MenuAction::BackgroundSessions) => {
                     // Show the backgrounded-session selector on the alternate
-                    // screen. Build rows from the scanned sessions (with state)
-                    // plus the live background jobs.
+                    // screen. Rows come only from this process's backgrounded
+                    // sessions (`jobs.jobs`) -- not from a scan of every session
+                    // file on disk.
                     let mut rows: Vec<crate::modal::SessionRow> = Vec::new();
-                    // Live background jobs first (running state).
+                    // This process's background sessions that are *still running right
+                    // now* (spawned via `/bg` or a trailing `&`). This is the exact set of
+                    // sessions pir currently has running -- we deliberately do NOT
+                    // enumerate every session file on disk, which would mix in unrelated
+                    // interactive sessions that were never backgrounded.
                     jobs.set_fg_running(fg_running);
                     for j in &jobs.jobs {
-                        let running = j.handle.is_some() && !j.joined;
+                        // Only sessions with a live worker thread count as "running right
+                        // now"; finished background jobs are re-findable via /jobs or /resume.
+                        if !(j.handle.is_some() && !j.joined) {
+                            continue;
+                        }
                         rows.push(crate::modal::SessionRow {
                             name: format!("#{}", j.id),
                             preview: truncate(&j.prompt, 50),
-                            state: if running { "running".into() } else { "complete".into() },
+                            state: "running".into(),
                             from_here: true,
                         });
-                    }
-                    // Scanned sessions with their verdict state.
-                    if let Some(sessions) = scan_sessions() {
-                        for s in sessions {
-                            let state = match crate::titler::verdict_label(&s.verdict) {
-                                "" => "complete".to_string(),
-                                v => v.to_string(),
-                            };
-                            rows.push(crate::modal::SessionRow {
-                                name: s.name.replace("pir-", "").replace(".jsonl", ""),
-                                preview: truncate(&s.preview, 50),
-                                state,
-                                from_here: s.shell_pid == term::parent_shell_pid(),
-                            });
-                        }
                     }
                     if rows.is_empty() {
                         println!("{}", term::dim("(no backgrounded sessions)"));
                     } else if let Some(pick) = crate::modal::session_selector(&rows) {
                         match pick {
-                            crate::modal::SessionPick::Resume(i) => {
+                            crate::modal::SessionPick::Resume(_i) => {
                                 // Resume the session at index i (into the combined list).
                                 println!("{}", term::dim("resume: pick a session to foreground"));
                             }
@@ -2393,7 +2468,10 @@ fn handle_command(
                     let level = {
                         let g = agent_slot.lock().unwrap();
                         let cur = g.as_ref().map(|a| a.thinking_level().as_str().to_string()).unwrap_or_else(|| "off".to_string());
-                        crate::modal::thinking_picker(&cur)
+                        // Offer only levels that take effect for this provider kind + context window.
+                        let kind = g.as_ref().and_then(|a| a.provider().kind());
+                        let ctx = g.as_ref().and_then(|a| a.model().context).unwrap_or(0);
+                        crate::modal::thinking_picker(&cur, kind, ctx)
                     };
                     if let Some(picked) = level {
                         if let Some(lvl) = crate::config::ThinkingLevel::parse(&picked) {
@@ -2987,7 +3065,13 @@ fn run_shell(args: Vec<&str>) -> Option<i32> {
     // user (e.g. `ai_pir`) when one is configured, so the interactive shell —
     // and any single-shot command — is confined like the agent's tools and
     // cannot write root-owned paths. `/sh -u` above remains the escape hatch.
-    if let Some(agent) = crate::user::agent_exec_user() {
+    // Unless the operator granted invoker authority (`/su-security off`): then
+    // `/sh` runs as the current (invoking) identity instead.
+    let as_invoker = std::env::var_os("PIR_AGENT_AS_INVOKER")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+    if !as_invoker {
+        if let Some(agent) = crate::user::agent_exec_user() {
         let already = {
             #[cfg(unix)]
             {
@@ -3002,15 +3086,19 @@ fn run_shell(args: Vec<&str>) -> Option<i32> {
         if !already {
             return crate::user::spawn_shell_as(&shell, &args, Some(&agent));
         }
+        }
     }
     let status = if args.is_empty() {
-        // Interactive: hand the terminal straight to the login shell.
-        std::process::Command::new(&shell).status()
+        // Interactive: hand the terminal straight to the login shell. HISTFILE=/dev/null
+        // so the agent's own commands never persist into the real ~/.bash_history
+        // (the home isn't overlaid in the root-selective posture).
+        std::process::Command::new(&shell).env("HISTFILE", "/dev/null").status()
     } else {
         // Single-shot: run the assembled command line through the shell.
         std::process::Command::new(&shell)
             .arg("-c")
             .arg(args.join(" "))
+            .env("HISTFILE", "/dev/null")
             .status()
     };
     match status {

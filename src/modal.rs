@@ -11,6 +11,7 @@
 //! (alternate screen + raw mode) and a key reader that uses crossterm's
 //! `event::read` so arrows/Enter/Esc work uniformly across dialogs.
 
+use crate::config::ApiKind;
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
@@ -577,9 +578,20 @@ fn state_color(state: &str) -> String {
 
 /// Show a thinking-level picker on the alternate screen and return the chosen
 /// level. Returns `None` if not a tty or the user cancels.
-pub fn thinking_picker(current: &str) -> Option<String> {
+pub fn thinking_picker(current: &str, kind: Option<ApiKind>, ctx: u64) -> Option<String> {
     let _modal = Modal::enter()?;
-    let levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+    // Only offer levels that actually take effect for this provider + context
+    // window. Showing `minimal` on an OpenAI model (no reasoning_effort) or an
+    // under-budget Anthropic level would let the user pick something that is
+    // silently ignored. `off` is always offered as an explicit opt-out.
+    let all: Vec<crate::config::ThinkingLevel> = [
+        "off", "minimal", "low", "medium", "high", "xhigh", "max",
+    ]
+    .iter()
+    .filter_map(|l| crate::config::ThinkingLevel::parse(l))
+    .filter(|l| l.effective(kind, ctx))
+    .collect();
+    let levels: Vec<&'static str> = all.iter().map(|l| l.as_str()).collect();
     let mut selected = levels.iter().position(|l| *l == current).unwrap_or(0);
     loop {
         let lines: Vec<String> = levels
