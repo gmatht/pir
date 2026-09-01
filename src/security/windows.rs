@@ -1060,13 +1060,17 @@ pub fn is_elevated() -> bool {
 // ===========================================================================
 
 /// Detect whether the Projected File System optional feature is available.
-/// Heuristic probe (no elevation needed): `ProjFS.dll` must be present and the
-/// `PrjFlt` filter-driver service must not be disabled. Returns `false` when
-/// unsure — the launcher must gracefully fall back to the in-process guardrail
+/// Heuristic probe (no elevation needed): `ProjectedFSLib.dll` (the real ProjFS API
+/// DLL; `ProjFS.dll` is a non-existent name) must be present and the `PrjFlt`
+/// filter-driver service must not be disabled. Returns `false` when unsure — the launcher must gracefully fall back to the in-process guardrail
 /// and/or the no-driver manifest staging (same degradation as overlayfs).
 pub fn projfs_available() -> bool {
     let system = system_dir();
-    if !system.join("ProjFS.dll").exists() {
+    // The ProjFS user-mode API ships as `ProjectedFSLib.dll`; the literal name
+    // `ProjFS.dll` does not exist on any Windows build, so probing for it is a
+    // guaranteed false negative (the bug behind the bogus "ProjFS not
+    // available" on 26100/24H2 with Client-ProjFS Enabled and PrjFlt running).
+    if !system.join("ProjectedFSLib.dll").exists() {
         return false;
     }
     // HKLM\SYSTEM\CurrentControlSet\Services\PrjFlt\Start == 4 (disabled)?
