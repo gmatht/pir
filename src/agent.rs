@@ -245,7 +245,7 @@ impl Agent {
             // overlays over /var, /etc, ... and must never run inside unit tests
             // (tests construct Agents directly; mounting would shadow the test
             // host and poison the process-global quarantine flags).
-            #[cfg(not(test))]
+            #[cfg(all(not(test), unix))]
             {
                 // Scope every overlay we mount to THIS agent's private mount
                 // namespace (see enter_private_mount_ns) so we quarantine the
@@ -1585,7 +1585,10 @@ impl Agent {
             let mut results = Message { role: Role::User, blocks: Vec::new() };
             for (id, name, input) in &calls {
                 if !self.silent() {
-                    term::out(&format!("{} {}", term::cyan("»"), describe_call(name, input)));
+                    // Trailing `\n` so back-to-back tool calls (and their
+                    // results) each start on their own line instead of running
+                    // together.
+                    term::out(&format!("{} {}\n", term::cyan("»"), describe_call(name, input)));
                 }
                 // Pre-flight extension hook: any backend may block this tool
                 // call (permission gates, protected paths, etc.). When blocked,
@@ -1594,7 +1597,7 @@ impl Agent {
                 // if the hook requested `terminate`.
                 if let Some((reason, terminate)) = self.registry.preflight_tool(name, input) {
                     if !self.silent() {
-                        term::out(&term::yellow(&format!("  · blocked: {reason}")));
+                        term::out(&term::yellow(&format!("  · blocked: {reason}\n")));
                     }
                     results.blocks.push(Block::ToolResult {
                         tool_use_id: id.clone(),
@@ -1612,7 +1615,7 @@ impl Agent {
                 // the model is told why so it can `pir ask` or adapt.
                 if let Some((reason, terminate)) = self.security_preflight(name, input) {
                     if !self.silent() {
-                        term::out(&term::yellow(&format!("  · blocked: {reason}")));
+                        term::out(&term::yellow(&format!("  · blocked: {reason}\n")));
                     }
                     results.blocks.push(Block::ToolResult {
                         tool_use_id: id.clone(),
@@ -1636,7 +1639,7 @@ impl Agent {
                     None => self.registry.execute(name, input),
                 };
                 if !self.silent() {
-                    term::out(&term::dim(&format!("  {}", first_line(&outcome.content))));
+                    term::out(&term::dim(&format!("  {}\n", first_line(&outcome.content))));
                 }
                 results.blocks.push(Block::ToolResult {
                     tool_use_id: id.clone(),

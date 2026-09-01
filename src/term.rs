@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustyline::completion::Completer;
 use rustyline::highlight::Highlighter;
-use rustyline::hint::Hinter;
+use rustyline::hint::{Hinter, HistoryHinter};
 use rustyline::validate::Validator;
 use rustyline::{CompletionType, Config, Context, Editor};
 
@@ -53,27 +53,6 @@ pub fn is_terminal() -> bool {
 /// predicate). Used by the TUI to colour conversation lines.
 pub fn color_enabled() -> bool {
     color()
-}
-
-/// Whether highlighted text is rendered with a *transparent* background instead
-/// of an opaque colour block. Runtime-toggle via [`set_transparent_highlight`];
-/// default is opaque. A transparent highlight uses reverse video (`ESC[7m`),
-/// which paints the current foreground colour as the background — so the
-/// user's terminal theme shows *through* the highlight instead of an opaque
-/// rectangle being drawn over whatever is already on screen (e.g. inside the
-/// REPL's spinner block, or over a themed background). See [`highlight`].
-static TRANSPARENT_HL: Mutex<bool> = Mutex::new(false);
-
-/// Toggle transparent highlighting. Pass `true` for reverse-video (transparent)
-/// highlights, `false` for an opaque colour block. Safe to call any time.
-pub fn set_transparent_highlight(on: bool) {
-    if let Ok(mut g) = TRANSPARENT_HL.lock() {
-        *g = on;
-    }
-}
-
-fn transparent_highlight() -> bool {
-    *TRANSPARENT_HL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Write `s` to stdout, never panicking and never busy-spinning on a slow or
@@ -223,6 +202,14 @@ pub fn status_line(workspace: &str, model: &str) -> String {
     format!("  {ws}   {md}")
 }
 
+/// A horizontal rule spanning the terminal width, used to frame the REPL
+/// prompt area (one above, one below) so the input zone is visually separated
+/// from the conversation. Dimmed so it separates without shouting.
+pub fn hrule() -> String {
+    let w = terminal_width().max(20);
+    dim(&"─".repeat(w))
+}
+
 fn paint(code: &str, s: &str) -> String {
     if color() { format!("\x1b[{code}m{s}\x1b[0m") } else { s.to_string() }
 }
@@ -234,26 +221,16 @@ pub fn green(s: &str) -> String { paint("32", s) }
 pub fn yellow(s: &str) -> String { paint("33", s) }
 pub fn cyan(s: &str) -> String { paint("36", s) }
 
-/// Render `s` as highlighted text. By default the highlight is an opaque
-/// colour block (bright background, bold text) so it stands out on a plain
-/// terminal. When transparent highlighting is enabled (see
-/// [`set_transparent_highlight`]) it instead uses SGR reverse video (`ESC[7m`),
-/// whose background is the terminal's *current* foreground colour — so the
-/// highlight appears as an inverted sliver that lets the underlying theme/REPL
-/// show through rather than an opaque rectangle being painted over whatever is
-/// already on screen (e.g. inside the spinner block while a turn runs, or over
-/// a themed background). With colour disabled both modes fall back to plain
-/// text. The returned string always closes the SGR sequence so the rest of the
-/// line is unaffected.
+/// Render `s` as highlighted text: bright-cyan foreground only, no background
+/// and no reverse video — so it never shows up as a black/white inverse on
+/// emulators that render bold-bright or swap colours. With colour disabled it
+/// falls back to plain text. The returned string always closes the SGR sequence
+/// so the rest of the line is unaffected.
 pub fn highlight(s: &str) -> String {
     if !color() {
         return s.to_string();
     }
-    if transparent_highlight() {
-        format!("\x1b[7m{s}\x1b[27m")
-    } else {
-        format!("\x1b[1;97;44m{s}\x1b[0m")
-    }
+    format!("\x1b[96m{s}\x1b[0m")
 }
 
 #[cfg(unix)]
@@ -369,7 +346,16 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// rustyline helper: offers `/model` argument tab-completion plus
 /// slash-command-name completion (so `/def` → `/default-model`) and a live
 /// preview (up to ten matching `provider/model` labels) of a typed prefix.
-struct PirHelper;
+///
+/// It also carries a [`HistoryHinter`] so that *any* typed text (not just
+/// slash commands or model ids) is matched against the prompt history and the
+/// rest of the most recent matching prior line is suggested inline — mirroring
+/// `pi`'s history-aware autocomplete dropdown (e.g. typing `hy` recalls
+/// `/default-model hy3`). The history hint is the last-resort fallback after
+/// the command-help and `/model` preview hints below.
+struct PirHelper {
+    history_hinter: HistoryHinter,
+}
 
 impl rustyline::Helper for PirHelper {}
 
@@ -482,6 +468,51 @@ fn command_help_hint(line: &str) -> Option<String> {
     Some(s)
 }
 
+/// History recall for the completer: previous lines (most recent first) that
+/// contain the typed text, so typing `hy` can complete to a prior
+/// `/default-model hy3`. Prefix matches are ranked first, then substring
+/// matches; deduped and capped at 10 so the list stays scannable.
+fn history_matches(ctx: &Context<'_>, typed: &str) -> Vec<String> {
+    use rustyline::history::SearchDirection;
+    let typed = typed.trim().to_ascii_lowercase();
+    if typed.is_empty() {
+        return Vec::new();
+    }
+    let hist = ctx.history();
+    let n = hist.len();
+    let mut out: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    // Pass 1: entries that start with the typed text (most recent first).
+    for i in (0..n).rev() {
+        let Some(res) = hist.get(i, SearchDirection::Forward) else { continue };
+        let e = res.entry.as_ref();
+        if e.trim().is_empty() {
+            continue;
+        }
+        if e.to_ascii_lowercase().starts_with(&typed) && seen.insert(e.to_string()) {
+            out.push(e.to_string());
+            if out.len() >= 10 {
+                return out;
+            }
+        }
+    }
+    // Pass 2: entries that merely contain it.
+    for i in (0..n).rev() {
+        let Some(res) = hist.get(i, SearchDirection::Forward) else { continue };
+        let e = res.entry.as_ref();
+        if e.trim().is_empty() {
+            continue;
+        }
+        if e.to_ascii_lowercase().contains(&typed) && seen.insert(e.to_string()) {
+            out.push(e.to_string());
+            if out.len() >= 10 {
+                return out;
+            }
+        }
+    }
+    out
+}
+
 impl Completer for PirHelper {
     type Candidate = String;
 
@@ -489,7 +520,7 @@ impl Completer for PirHelper {
         &self,
         line: &str,
         pos: usize,
-        _ctx: &Context<'_>,
+        ctx: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<String>)> {
         let providers = MODEL_PROVIDERS.get().map(|v| v.as_slice()).unwrap_or(&[]);
         let left = &line[..pos];
@@ -512,7 +543,9 @@ impl Completer for PirHelper {
                 }
                 return Ok((start_idx, matches));
             }
-            return Ok((0, Vec::new()));
+            // Plain text (no slash): recall matching previous lines, so `hy`
+            // can complete to a prior `/default-model hy3`.
+            return Ok((start_idx, history_matches(ctx, &left[..pos])));
         }
         if cmd == "/thinking" {
             let after = &rest[cmd_end..];
@@ -531,7 +564,9 @@ impl Completer for PirHelper {
             return Ok((arg_start, matches));
         }
         if cmd != "/model" && cmd != "/m" && cmd != "/default-model" && cmd != "/dm" {
-            return Ok((0, Vec::new()));
+            // Not a model command: recall matching previous lines (e.g. a
+            // whole `cd /c/temp && …` or `/sh …` from history).
+            return Ok((start_idx, history_matches(ctx, &left[..pos])));
         }
         let after = &rest[cmd_end..];
         if after.is_empty() {
@@ -548,7 +583,7 @@ impl Completer for PirHelper {
 
 impl Hinter for PirHelper {
     type Hint = String;
-    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<String> {
+    fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<String> {
         // Brief per-command help: as soon as the user types a `/command` (e.g.
         // `/login`), show its argument hint + description inline to the right of
         // the cursor, mirroring pi's autocomplete dropdown. This takes priority
@@ -559,30 +594,49 @@ impl Hinter for PirHelper {
         // Show the first matching model as an inline preview while typing a
         // `/model` argument, so the user sees a suggestion to the right.
         let providers = MODEL_PROVIDERS.get().map(|v| v.as_slice()).unwrap_or(&[]);
-        if providers.is_empty() {
-            return None;
+        if !providers.is_empty() {
+            let left = &line[..pos];
+            let start_idx = left.find(|c: char| !c.is_whitespace()).unwrap_or(0);
+            let rest = &left[start_idx..];
+            let cmd_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let cmd = &rest[..cmd_end];
+            if cmd == "/model" || cmd == "/m" || cmd == "/default-model" || cmd == "/dm" {
+                let after = &rest[cmd_end..];
+                if !after.is_empty() {
+                    let arg_lead = after.find(|c: char| !c.is_whitespace()).unwrap_or(after.len());
+                    let arg_start = start_idx + cmd_end + arg_lead;
+                    let prefix = &left[arg_start..];
+                    let candidates = crate::config::match_models(providers, prefix, 10);
+                    let hint = candidates
+                        .into_iter()
+                        .find_map(|m| crate::config::hint_remainder(&m, prefix));
+                    if let Some(h) = hint.filter(|h| !h.is_empty()) {
+                        return Some(h);
+                    }
+                }
+            }
         }
-        let left = &line[..pos];
-        let start_idx = left.find(|c: char| !c.is_whitespace()).unwrap_or(0);
-        let rest = &left[start_idx..];
-        let cmd_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        let cmd = &rest[..cmd_end];
-        if cmd != "/model" && cmd != "/m" && cmd != "/default-model" && cmd != "/dm" {
-            return None;
+        // Last-resort fallback: for free-form text (not a slash command),
+        // suggest the rest of the most recent matching prior line from history
+        // (e.g. typing `hy` recalls `/default-model hy3`).
+        if !is_slash_command_line(line, pos) {
+            if let Some(h) = self.history_hinter.hint(line, pos, ctx) {
+                return Some(h);
+            }
         }
-        let after = &rest[cmd_end..];
-        if after.is_empty() {
-            return None;
-        }
-        let arg_lead = after.find(|c: char| !c.is_whitespace()).unwrap_or(after.len());
-        let arg_start = start_idx + cmd_end + arg_lead;
-        let prefix = &left[arg_start..];
-        let candidates = crate::config::match_models(providers, prefix, 10);
-        let hint = candidates
-            .into_iter()
-            .find_map(|m| crate::config::hint_remainder(&m, prefix));
-        hint.filter(|h| !h.is_empty())
+        None
     }
+}
+
+/// True when `line` up to `pos` is a `/`-command region (a slash command name,
+/// possibly with a typed argument). Used to decide whether the history hint is
+/// appropriate: free-form text such as `hy` should recall prior prompts like
+/// `/default-model hy3`, but inside a slash-command name we let the command
+/// help / model preview hints (which run first) own the line.
+fn is_slash_command_line(line: &str, pos: usize) -> bool {
+    let left = &line[..pos];
+    let trimmed = left.trim_start();
+    trimmed.starts_with('/')
 }
 
 impl Highlighter for PirHelper {
@@ -627,7 +681,7 @@ fn new_editor() -> Option<Editor<PirHelper, rustyline::history::DefaultHistory>>
         .completion_type(CompletionType::List)
         .build();
     let mut rl = Editor::<PirHelper, rustyline::history::DefaultHistory>::with_config(config).ok()?;
-    rl.set_helper(Some(PirHelper));
+    rl.set_helper(Some(PirHelper { history_hinter: HistoryHinter::new() }));
     Some(rl)
 }
 
@@ -1606,16 +1660,41 @@ mod tests {
     // "slash commands don't autocomplete" report.
     #[test]
     fn completes_slash_command_name_without_space() {
-        let h = PirHelper;
+        let h = PirHelper { history_hinter: HistoryHinter::new() };
         let (start, mut matches) = h.complete("/default-", "/default-".len(), &ctx()).unwrap();
         matches.sort();
         assert_eq!(matches, vec!["/default-model"]);
         assert_eq!(start, 0);
     }
 
+    // Typing a plain-text prefix must recall matching previous lines from
+    // history (most recent first), so `hy` completes to a prior
+    // `/default-model hy3` — the "history autocomplete" report.
+    #[test]
+    fn history_recall_completes_previous_lines() {
+        use rustyline::history::{History, MemHistory};
+        let mut hist = MemHistory::new();
+        hist.add("ls").unwrap();
+        hist.add("cd /c/temp/pir && cargo build").unwrap();
+        hist.add("/default-model hy3").unwrap();
+        let ctx = Context::new(&hist);
+        let h = PirHelper { history_hinter: HistoryHinter::new() };
+        // Substring match: `hy` finds the previous `/default-model hy3`.
+        let (start, matches) = h.complete("hy", "hy".len(), &ctx).unwrap();
+        assert!(matches.contains(&"/default-model hy3".to_string()), "got: {matches:?}");
+        assert_eq!(start, 0);
+        // Prefix match: `cd /c` finds the full previous command.
+        let (start, matches) = h.complete("cd /c", "cd /c".len(), &ctx).unwrap();
+        assert!(matches.contains(&"cd /c/temp/pir && cargo build".to_string()), "got: {matches:?}");
+        assert_eq!(start, 0);
+        // Most-recent-first ordering: `/default-model hy3` precedes `ls`.
+        let (_s, matches) = h.complete("l", "l".len(), &ctx).unwrap();
+        assert_eq!(matches.first().map(String::as_str), Some("ls"));
+    }
+
     #[test]
     fn completes_unique_slash_prefix() {
-        let h = PirHelper;
+        let h = PirHelper { history_hinter: HistoryHinter::new() };
         let (_start, matches) = h.complete("/mod", "/mod".len(), &ctx()).unwrap();
         assert!(matches.contains(&"/model".to_string()));
         assert!(matches.contains(&"/models".to_string()));
@@ -1627,7 +1706,7 @@ mod tests {
         // kick in (argument completion takes over). With providers set (by
         // sibling tests) a non-matching argument yields an empty match list
         // rather than any slash-command-name suggestions.
-        let h = PirHelper;
+        let h = PirHelper { history_hinter: HistoryHinter::new() };
         let (_start, matches) = h
             .complete("/default-model zzznomatch ", "/default-model zzznomatch ".len(), &ctx())
             .unwrap();
@@ -1677,7 +1756,7 @@ mod tests {
             },
         ];
         crate::term::set_model_providers(&providers);
-        let h = PirHelper;
+        let h = PirHelper { history_hinter: HistoryHinter::new() };
         let (start, mut matches) = h
             .complete("/default-model claude", "/default-model claude".len(), &ctx())
             .unwrap();
@@ -1848,44 +1927,25 @@ mod highlight_tests {
         assert!(inner.contains("TODO"), "highlight must preserve the text: {hl:?}");
     }
 
-    // Default (opaque) highlight uses an opaque colour block escape, NOT the
-    // reverse-video escape — so a solid rectangle is drawn over whatever is
-    // behind it.
+    // The highlight is bright-cyan foreground only: no background colour and
+    // no reverse video, so it never renders as a black/white inverse on
+    // emulators that swap or bold-bright colours.
     #[test]
-    fn default_highlight_is_opaque_block() {
+    fn highlight_uses_bright_cyan_foreground_only() {
         set_color_for_test(true);
-        set_transparent_highlight(false);
         let hl = highlight("x");
-        assert!(hl.contains("44m"), "opaque highlight should set a background colour (44m): {hl:?}");
-        assert!(!hl.contains("\x1b[7m"), "opaque highlight must NOT use reverse video: {hl:?}");
-    }
-
-    // Transparent highlight uses SGR reverse video (ESC[7m…ESC[27m) whose
-    // background is the terminal's *current* foreground colour — i.e. it lets
-    // whatever is already on screen (the theme / REPL) show through, instead of
-    // painting an opaque rectangle. This is exactly the "transparent highlight"
-    // behaviour: no fixed background colour escape, only the reverse flag.
-    #[test]
-    fn transparent_highlight_uses_reverse_video_not_opaque_block() {
-        set_color_for_test(true);
-        set_transparent_highlight(true);
-        let hl = highlight("x");
-        assert!(hl.contains("\x1b[7m"), "transparent highlight must use reverse video (ESC[7m): {hl:?}");
-        assert!(hl.contains("\x1b[27m"), "transparent highlight must reset reverse video (ESC[27m): {hl:?}");
-        assert!(!hl.contains("44m"), "transparent highlight must NOT set an opaque background colour: {hl:?}");
+        assert!(hl.contains("96m"), "highlight should use bright-cyan foreground (96m): {hl:?}");
+        assert!(!hl.contains("44m"), "highlight must NOT set a background colour: {hl:?}");
+        assert!(!hl.contains("\x1b[7m"), "highlight must NOT use reverse video: {hl:?}");
         // And it still carries the original text.
-        assert!(hl.contains('x'), "transparent highlight must preserve text: {hl:?}");
+        assert!(hl.contains('x'), "highlight must preserve text: {hl:?}");
     }
 
     // With colour disabled (e.g. piped output), `highlight` must pass the text
-    // through untouched sequences), regardless of the transparent
-    // toggles.
+    // through untouched.
     #[test]
     fn highlight_no_color_is_plain() {
         set_color_for_test(false);
-        set_transparent_highlight(true);
-        assert_eq!(highlight("TODO"), "TODO");
-        set_transparent_highlight(false);
         assert_eq!(highlight("TODO"), "TODO");
     }
 }
@@ -2002,9 +2062,6 @@ mod nonunix_term {
             Down,
             Left,
             Right,
-            Escape,
-            CtrlC,
-            CtrlD,
             Resize,
             Paste(String),
             Other(u32),
@@ -2013,9 +2070,15 @@ mod nonunix_term {
             loop {
                 if let Ok(true) = crossterm::event::poll(Duration::from_millis(50)) {
                     if let Ok(ev) = crossterm::event::read() {
-                        use crossterm::event::{KeyCode, KeyModifiers};
+                        use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
                         match ev {
                             crossterm::event::Event::Key(k) => {
+                                // Ignore key-release events (the key-up that
+                                // follows every press) so a release is never
+                                // misread as a fresh press.
+                                if k.kind == KeyEventKind::Release {
+                                    continue;
+                                }
                                 let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
                                 return match k.code {
                                     KeyCode::Enter => RawInput::Enter,
@@ -2024,9 +2087,9 @@ mod nonunix_term {
                                     KeyCode::Down => RawInput::Down,
                                     KeyCode::Left => RawInput::Left,
                                     KeyCode::Right => RawInput::Right,
-                                    KeyCode::Esc => RawInput::Escape,
-                                    KeyCode::Char(c) if ctrl && c == 'c' => RawInput::CtrlC,
-                                    KeyCode::Char(c) if ctrl && c == 'd' => RawInput::CtrlD,
+                                    KeyCode::Esc => RawInput::Cancel,
+                                    KeyCode::Char(c) if ctrl && c == 'c' => RawInput::Interrupt,
+                                    KeyCode::Char(c) if ctrl && c == 'd' => RawInput::Eof,
                                     KeyCode::Char(c) => RawInput::Char(c),
                                     _ => RawInput::Other(0),
                                 };
@@ -2038,9 +2101,41 @@ mod nonunix_term {
                 }
             }
         }
-        pub fn translate(_buf: &mut String, _ta: &Arc<Mutex<String>>, bytes: &[u8]) -> RawInput {
+        pub fn translate(buf: &mut String, _ta: &Arc<Mutex<String>>, bytes: &[u8]) -> RawInput {
             if let Some(&b) = bytes.first() {
-                if let Some(c) = char::from_u32(b as u32) { return RawInput::Char(c); }
+                match b {
+                    0x0a | 0x0d => {
+                        let line = std::mem::take(buf);
+                        return RawInput::Line(line);
+                    }
+                    0x7f | 0x08 => {
+                        buf.pop();
+                        return RawInput::None;
+                    }
+                    0x03 => {
+                        buf.clear();
+                        return RawInput::Interrupt;
+                    }
+                    0x04 => {
+                        buf.clear();
+                        return RawInput::Eof;
+                    }
+                    0x1a => return RawInput::Suspend,
+                    0x1b => {
+                        // Lone Esc = cancel; a CSI lead (arrows etc.) is
+                        // swallowed so it isn't misread as a key.
+                        if bytes.len() > 1 && bytes[1] == 0x5b {
+                            return RawInput::Other(0);
+                        }
+                        buf.clear();
+                        return RawInput::Cancel;
+                    }
+                    _ => {
+                        if let Some(c) = char::from_u32(b as u32) {
+                            return RawInput::Char(c);
+                        }
+                    }
+                }
             }
             RawInput::Other(0)
         }

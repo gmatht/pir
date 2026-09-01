@@ -167,14 +167,16 @@ AGENT USERS RUN UNATTENDED
   PIR_CONFIRM=1 to force prompts even as an ai_* user.
 
 COMMANDS
-  /help  /model <sel>  /models  /default-model <sel>  /sessions  /goal [objective]  /continue
+  /help  /menu  /model <sel>  /models  /default-model <sel>  /sessions  /goal [objective]  /continue
   /thinking [<level>] [show|hide]   set the model's thinking level
                           (off|minimal|low|medium|high|xhigh|max) and/or toggle
                           whether streamed reasoning is displayed; no arg = status
   /model* <sel>  /model-all <sel>   broadcast a model switch to ALL your open pir terminals (also sets the new default)
   /bg <text>  /jobs  /fg <id>  /clear  /usage  /exit
   /undo [all]             revert the last file edit (or all) to its pre-edit state
-  /sh [cmd args]         drop to a shell, or run a command via $SHELL (sh -c)
+  /sh [cmd args]         drop to a shell, or run a command via the shell
+                          (shell = $PIR_SHELL or $SHELL if set, else /bin/sh on
+                          unix, or pwsh/powershell/cmd on Windows)
   /project init            create the ai_<project> user and chown the cwd (root)
   /su-security <on|off|status>   enable/disable/inspect the su-based permission
                           model (sudoers.d/skynet-ai + wrappers); reversible (root)
@@ -185,6 +187,8 @@ COMMANDS
   /create [name]           scaffold a new project (seeds from clipboard .md spec)
   /login [provider]        store an API key for a provider in ~/.pi/agent/auth.json
   /logout [provider]       remove a stored provider credential from auth.json
+  /markup_demo             render a canned reply (markdown + rust/js/json + table)
+                          through the same incremental renderer a model reply uses
 
   Lines ending in & run in the background: "fix the parser &"  => /bg fix the parser
 
@@ -1103,6 +1107,9 @@ fn main() {
             let g = agent_slot.lock().unwrap();
             g.as_ref().map(|a| a.label()).unwrap_or_default()
         };
+        // Frame the prompt area: a dim hrule above (separating the input zone
+        // from the conversation) and one below (printed once the user submits).
+        term::out(&format!("{}\n", term::hrule()));
         term::out(&format!("{}\n", term::status_line(&workspace, &model)));
         // Apply any cross-instance model switch queued by the broadcast watcher
         // (from a `/model*` in another terminal). We only do this while idle, so
@@ -1129,6 +1136,8 @@ fn main() {
         if input.is_empty() {
             continue;
         }
+        // Close the prompt frame below the submitted line.
+        term::out(&format!("{}\n", term::hrule()));
         // A prompt ending in `&` at the idle prompt runs in its OWN session (a
         // fresh background job that keeps its own session log); the interactive
         // session is untouched. A bare `&` at idle does nothing (there is no
@@ -1269,12 +1278,160 @@ fn spawn_model_broadcast_watcher(
 
 type AgentSlot = Arc<Mutex<Option<Agent>>>;
 
+/// A canned sample document used by `/markup_demo`. It exercises every part of
+/// the terminal markdown renderer an agent reply would hit: headings, inline
+/// emphasis, ordered/unordered lists, blockquotes, fenced code blocks in
+/// multiple languages (rust, js, json), an inline-code span, a GFM table, and a
+/// link — i.e. exactly the shapes a model produces.
+const MARKUP_DEMO: &str = r#"# pir markup demo
+
+This **reply** was rendered _just like_ an `agent` response — streamed through
+the same incremental renderer, not a one-shot `md::render`.
+
+## Things it shows
+
+1. **bold** and _italic_ and ~~strikethrough~~ inline emphasis
+2. `inline code` spans
+3. ordered and unordered lists
+
+- bullet one
+- bullet two
+
+> a blockquote, because models love a good aside.
+
+### Rust code
+
+```rust
+fn main() {
+    let xs = vec![1, 2, 3];
+    let sum: i32 = xs.iter().sum();
+    println!("sum = {sum}");
+}
+```
+
+### JS code
+
+```js
+const xs = [1, 2, 3];
+const sum = xs.reduce((a, b) => a + b, 0);
+console.log("sum =", sum);
+```
+
+### JSON
+
+```json
+{ "model": "sonnet", "tokens": 128 }
+```
+
+### A table
+
+| Language | Paradigm | Typed |
+| :--- | :---: | ---: |
+| Rust | multi | static |
+| JS | multi | dynamic |
+
+See [the docs](https://example.com) for more.
+"#;
+
+/// Render the [`MARKUP_DEMO`] sample the same way an agent reply is rendered:
+/// feed it through `md::IncrementalMarkdown` (the in-place streaming renderer),
+/// redrawing a few times as it "streams" so the incremental path is exercised,
+/// then flush the final frame. When incremental rendering is unavailable (not a
+/// tty or disabled) it falls back to a single `md::render` of the whole doc —
+/// again the same fallback the REPL uses. `color` mirrors `term::color_enabled`.
+fn markup_demo(tty: bool, incremental: bool, color: bool) {
+    println!();
+    if tty && incremental {
+        // Simulate the model streaming the reply token-by-token: split into
+        // small chunks and push each into the incremental renderer, flushing
+        // once at the end. The renderer overwrites its prior block in place.
+        let mut inc = crate::md::IncrementalMarkdown::new(true, color);
+        let mut idx = 0;
+        // Feed in ~8-char slices so a few throttled redraws happen; we force a
+        // redraw per chunk for the demo by enabling a 0ms throttle.
+        inc.set_throttle(std::time::Duration::ZERO);
+        let bytes = MARKUP_DEMO.as_bytes();
+        while idx < bytes.len() {
+            let end = (idx + 8).min(bytes.len());
+            // Find a UTF-8 boundary so we never split a char. Use `bytes.get`
+            // so is bounds-safe: on the final chunk `end == len`
+            // and `bytes[len]` would otherwise be a one-past-the-end read that
+            // panics (this is exactly the bug that made `/markup_demo` abort
+            // after rendering its first ~8-char slice).
+            let mut e = end;
+            while e > idx && bytes.get(e).map_or(false, |b| (b & 0xC0) == 0x80) {
+                e -= 1;
+            }
+            let chunk = &MARKUP_DEMO[idx..e];
+            inc.push(chunk);
+            idx = e;
+        }
+        inc.flush();
+    } else {
+        // Non-tty / incremental disabled: same single-render fallback the
+        // streaming REPL uses when it can't draw in place.
+        term::out(&crate::md::render(MARKUP_DEMO, color));
+    }
+    println!();
+}
+
 /// A fresh session log path for a background job (tagged so it never collides
 /// with the foreground session or another job).
 fn session_log_path() -> PathBuf {
     let dir = config::pi_dir().join("agent").join("sessions");
     let _ = std::fs::create_dir_all(&dir);
     dir.join(format!("pir-{}-sh{}-bg{}.jsonl", term::timestamp_compact(), term::parent_shell_pid(), std::process::id()))
+}
+
+/// Resume a session log into the interactive agent (shared by `/resume` and
+/// the `/menu` Resume action): replace the current history, print the banner,
+/// restore persisted model/security/thinking, and drive any attached goal.
+fn resume_into(agent: &mut Agent, path: &PathBuf) {
+    agent.clear();
+    let resumed = agent.load_session(path);
+    if resumed.turns > 0 {
+        println!("{}", resumed.banner(path));
+        for p in &resumed.prompts {
+            term::push_history(p);
+        }
+    } else if !resumed.summary.is_empty() {
+        println!("{}", term::dim(&resumed.summary));
+    }
+    agent.apply_persisted_model();
+    agent.apply_persisted_su_security();
+    agent.apply_persisted_thinking();
+    if agent.goal_snapshot().is_some() {
+        agent.attach_goal(path);
+        let out = agent.continue_goal();
+        term::out(&out);
+    }
+}
+
+/// Build the session rows for the `/menu` session selector (newest first),
+/// paired with each row's log path so a pick can be resumed directly.
+fn menu_session_rows() -> Vec<(modal::SessionRow, PathBuf)> {
+    let my_pid = term::parent_shell_pid();
+    let mut sessions = match scan_sessions() {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    sessions.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    sessions
+        .into_iter()
+        .map(|s| {
+            let state = session::read_verdict(&s.path)
+                .map(|t| titler::verdict_label(&t).to_string())
+                .filter(|l| !l.is_empty())
+                .unwrap_or_else(|| "complete".to_string());
+            let row = modal::SessionRow {
+                name: s.name.replace("pir-", "").replace(".jsonl", ""),
+                preview: s.preview,
+                state,
+                from_here: s.shell_pid == my_pid,
+            };
+            (row, s.path)
+        })
+        .collect()
 }
 
 /// Handle a slash command. `agent_slot` holds the interactive agent behind an
@@ -1314,32 +1471,214 @@ fn handle_command(
             }
         }
         "h" | "help" => print!("{HELP}"),
+        "markup_demo" | "md_demo" | "markdown_demo" => {
+            // Render a canned sample document the way an *agent reply* is
+            // rendered: feed it through the same incremental (in-place)
+            // renderer the streaming REPL uses for model output, then flush the
+            // final frame. Not a single `md::render` call — it exercises the
+            // In-Place redraw path and shows rust/js/etc. code highlighting.
+            let tty = crate::term::is_terminal();
+            let incremental = {
+                let g = agent_slot.lock().unwrap();
+                g.as_ref().map(|a| a.incremental_md()).unwrap_or(true)
+            };
+            markup_demo(tty, incremental, crate::term::color_enabled());
+        }
+        "menu" => {
+            // The alternate-screen menu (modal.rs): pick an action with the
+            // arrow keys / hotkeys, then dispatch it to the same handlers the
+            // slash commands use.
+            use modal::{main_menu, MenuAction, SessionPick};
+            match main_menu() {
+                None => eprintln!("pir: menu needs a tty"),
+                Some(MenuAction::None) => {}
+                Some(MenuAction::Quit) => std::process::exit(0),
+                Some(MenuAction::Help) => {
+                    modal::help_dialog(HELP);
+                }
+                Some(MenuAction::About) => {
+                    modal::about_dialog();
+                }
+                Some(MenuAction::Security) => {
+                    let mut policy = {
+                        let g = agent_slot.lock().unwrap();
+                        g.as_ref().map(|a| a.security_policy()).flatten().unwrap_or_default()
+                    };
+                    modal::security_editor(&mut policy);
+                }
+                Some(MenuAction::Settings) => {
+                    let mut g = agent_slot.lock().unwrap();
+                    let Some(agent) = g.as_mut() else {
+                        eprintln!("pir: agent busy (turn running) — try again when idle");
+                        return;
+                    };
+                    modal::settings_dialog(
+                        &agent.label(),
+                        agent.thinking_level().as_str(),
+                        agent.show_thinking(),
+                        agent.incremental_md(),
+                        full_auto,
+                    );
+                }
+                Some(MenuAction::Thinking) => {
+                    let mut g = agent_slot.lock().unwrap();
+                    let Some(agent) = g.as_mut() else {
+                        eprintln!("pir: agent busy (turn running) — try again when idle");
+                        return;
+                    };
+                    let kind = match agent.provider().api.as_deref() {
+                        Some("anthropic") => Some(config::ApiKind::Anthropic),
+                        Some("openai") => Some(config::ApiKind::OpenAi),
+                        _ => None,
+                    };
+                    let ctx = agent.model().context.unwrap_or(0);
+                    if let Some(level) =
+                        modal::thinking_picker(agent.thinking_level().as_str(), kind, ctx)
+                    {
+                        if let Some(lvl) = config::ThinkingLevel::parse(&level) {
+                            println!("{}", agent.set_thinking(lvl));
+                        }
+                    }
+                }
+                Some(MenuAction::Model) => {
+                    // Open the model picker; Esc cancels. On a pick, switch the
+                    // agent and keep the background-job context in sync.
+                    let current_label = {
+                        let g = agent_slot.lock().unwrap();
+                        g.as_ref().map(|a| a.label()).unwrap_or_default()
+                    };
+                    if let Some(idx) = modal::model_picker(providers, &current_label) {
+                        let flat: Vec<(&Provider, &Model)> = providers
+                            .iter()
+                            .flat_map(|p| p.models.iter().map(move |m| (p, m)))
+                            .collect();
+                        if let Some((p, m)) = flat.get(idx) {
+                            let p2 = (*p).clone();
+                            let m2 = (*m).clone();
+                            let mut g = agent_slot.lock().unwrap();
+                            let Some(agent) = g.as_mut() else {
+                                eprintln!("pir: agent busy (turn running) — try again when idle");
+                                return;
+                            };
+                            match agent.switch(p2.clone(), m2.clone()) {
+                                Ok(()) => {
+                                    if let Ok(mut ctx) = current_ctx.lock() {
+                                        ctx.0 = p2.clone();
+                                        ctx.1 = m2.clone();
+                                    }
+                                    println!("→ {}", agent.label());
+                                }
+                                Err(e) => eprintln!("{e}"),
+                            }
+                        }
+                    }
+                }
+                Some(MenuAction::Worktrees) => {
+                    let on = config::worktrees_default();
+                    match config::set_worktrees_default(!on) {
+                        Ok(p) => println!(
+                            "{}{} worktrees by default (next session). saved to {}",
+                            term::bold("·"),
+                            if !on { term::green("ON") } else { term::yellow("OFF") },
+                            p.display()
+                        ),
+                        Err(e) => eprintln!("pir: could not persist worktree setting: {e}"),
+                    }
+                }
+                Some(action @ (MenuAction::Resume | MenuAction::BackgroundSessions)) => {
+                    let mut rows = menu_session_rows();
+                    if matches!(action, MenuAction::BackgroundSessions) {
+                        // Background jobs are named `pir-<ts>-sh<pid>-bg<pid>`;
+                        // only show those for the "Backgrounded sessions" item.
+                        rows.retain(|(r, _)| r.name.contains("-bg"));
+                    }
+                    if rows.is_empty() {
+                        eprintln!(
+                            "pir: no {}sessions to resume",
+                            if matches!(action, MenuAction::BackgroundSessions) {
+                                "background "
+                            } else {
+                                ""
+                            }
+                        );
+                        return;
+                    }
+                    let pick_rows: Vec<modal::SessionRow> =
+                        rows.iter().map(|(r, _)| r.clone()).collect();
+                    match modal::session_selector(&pick_rows) {
+                        None => {}
+                        Some(SessionPick::Cancel) => {}
+                        Some(SessionPick::Resume(idx)) => {
+                            let Some((_, path)) = rows.get(idx) else { return };
+                            let mut g = agent_slot.lock().unwrap();
+                            let Some(agent) = g.as_mut() else {
+                                eprintln!("pir: agent busy (turn running) — cancel it first");
+                                return;
+                            };
+                            resume_into(agent, path);
+                        }
+                        Some(SessionPick::NextWaiting(_)) => {}
+                    }
+                }
+            }
+        }
         "m" | "model" => {
+            if rest.is_empty() {
+                // No argument: open the interactive model picker (arrow keys /
+                // hotkeys; Enter picks). Esc cancels.
+                let current_label = {
+                    let g = agent_slot.lock().unwrap();
+                    g.as_ref().map(|a| a.label()).unwrap_or_default()
+                };
+                match modal::model_picker(providers, &current_label) {
+                    None => {}
+                    Some(idx) => {
+                        let flat: Vec<(&Provider, &Model)> = providers
+                            .iter()
+                            .flat_map(|p| p.models.iter().map(move |m| (p, m)))
+                            .collect();
+                        let Some((p, m)) = flat.get(idx) else { return };
+                        let p2 = (*p).clone();
+                        let m2 = (*m).clone();
+                        let mut g = agent_slot.lock().unwrap();
+                        let Some(agent) = g.as_mut() else {
+                            eprintln!("pir: agent busy (turn running) — try again when idle");
+                            return;
+                        };
+                        match agent.switch(p2.clone(), m2.clone()) {
+                            Ok(()) => {
+                                // Keep the shared background-job context in sync so
+                                // any `/bg` or `&` fired afterwards uses the new model.
+                                if let Ok(mut ctx) = current_ctx.lock() {
+                                    ctx.0 = p2.clone();
+                                    ctx.1 = m2.clone();
+                                }
+                                println!("→ {}", agent.label());
+                                println!(
+                                    "{} (saved for this session; restored on resume)",
+                                    term::dim("·")
+                                );
+                                println!(
+                                    "{}",
+                                    term::dim(&format!(
+                                        "to use this by default in new sessions, add to {}:\n  {}",
+                                        config::pi_dir().join("agent").join("settings.json").display(),
+                                        format!("{{ \"defaultModel\": \"{}\" }}", agent.label())
+                                    ))
+                                );
+                            }
+                            Err(e) => eprintln!("{e}"),
+                        }
+                    }
+                }
+                return;
+            }
             let mut g = agent_slot.lock().unwrap();
             let Some(agent) = g.as_mut() else {
                 eprintln!("pir: agent busy (turn running) — try again when idle");
                 return;
             };
-            if rest.is_empty() {
-                // No argument: show current model and explain how to make a
-                // choice the *default* for future sessions (the first time a
-                // user picks a model, nothing is persisted globally).
-                let label = agent.label();
-                println!("current model: {}", label);
-                println!(
-                    "{}",
-                    term::dim(&format!(
-                        "to use this by default in new sessions, add to {}:\n  {}",
-                        config::pi_dir().join("agent").join("settings.json").display(),
-                        format!("{{ \"defaultModel\": \"{}\" }}", label)
-                    ))
-                );
-                println!(
-                    "{}",
-                    term::dim("(or just run `/model <sel>` again later — it's saved per-session and restored on resume)")
-                );
-            } else {
-                match config::select(providers, &rest.join(" ")) {
+            match config::select(providers, &rest.join(" ")) {
                     Ok((p, m)) => match agent.switch(p.clone(), m.clone()) {
                         Ok(()) => {
                             // Keep the shared background-job context in sync so
@@ -1363,7 +1702,6 @@ fn handle_command(
                     },
                     Err(e) => eprintln!("{e}"),
                 }
-            }
         }
         "model*" | "model-all" => {
             // Broadcast a model switch to *every* running pir instance for this
@@ -1617,24 +1955,7 @@ fn handle_command(
                 eprintln!("pir: agent busy (turn running) — cancel it first");
                 return;
             };
-            agent.clear();
-            let resumed = agent.load_session(&path);
-            if resumed.turns > 0 {
-                println!("{}", resumed.banner(&path));
-                for p in &resumed.prompts {
-                    term::push_history(p);
-                }
-            } else if !resumed.summary.is_empty() {
-                println!("{}", term::dim(&resumed.summary));
-            }
-            agent.apply_persisted_model();
-            agent.apply_persisted_su_security();
-            agent.apply_persisted_thinking();
-            if agent.goal_snapshot().is_some() {
-                agent.attach_goal(&path);
-                let out = agent.continue_goal();
-                term::out(&out);
-            }
+            resume_into(agent, &path);
         }
         "project" => {
             if rest.is_empty() || rest[0] == "init" {
@@ -1696,6 +2017,7 @@ fn handle_command(
             let name: String = rest.join(" ");
             create_project(&name);
         }
+        #[cfg(unix)]
         "quarantine" | "q" => {
             // Review / apply / discard the writes the agent staged. The agent
             // runs ALL commands; writes outside the whitelist are quarantined
@@ -2404,24 +2726,75 @@ fn parse_sh_u<'a>(args: &'a [&str]) -> Option<(Option<&'a str>, &'a [&'a str])> 
     None
 }
 
+/// Resolve the shell for `/sh`: `PIR_SHELL` (pir-specific override), then
+/// `$SHELL`, then the platform default. On unix the default is `/bin/sh`; on
+/// Windows it is the first *usable* of `pwsh` (PowerShell 7), `powershell`
+/// (Windows PowerShell 5.1) and `cmd` (cmd.exe) — `/bin/sh` does not exist on
+/// native Windows, which is why `/sh` used to report "could not start shell"
+/// there. Each candidate is verified by actually spawning a no-op, so a broken
+/// `$SHELL` falls through to the next instead of failing. Returns the command
+/// and the flag used to run a single-shot command through it (`-c` for
+/// sh-style shells, `-Command` for PowerShell, `/c` for cmd).
+fn resolve_shell() -> Option<(String, &'static str)> {
+    let usable = |cmd: &str, flag: &str| -> bool {
+        std::process::Command::new(cmd)
+            .arg(flag)
+            .arg("exit 0")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    // Explicit overrides are assumed sh-style (`-c`), the universal convention
+    // for `$SHELL` (bash/zsh/fish/… all accept it; cmd.exe even treats `-c`
+    // as `/c`).
+    for var in ["PIR_SHELL", "SHELL"] {
+        if let Some(v) = std::env::var_os(var) {
+            let s = v.to_string_lossy().to_string();
+            if !s.is_empty() && usable(&s, "-c") {
+                return Some((s, "-c"));
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        if usable("/bin/sh", "-c") {
+            return Some(("/bin/sh".to_string(), "-c"));
+        }
+    }
+    #[cfg(windows)]
+    {
+        for (c, flag) in [("pwsh", "-Command"), ("powershell", "-Command"), ("cmd", "/c")] {
+            if usable(c, flag) {
+                return Some((c.to_string(), flag));
+            }
+        }
+    }
+    None
+}
+
 fn run_shell(args: Vec<&str>) -> Option<i32> {
     // `/sh -u [user]` starts the shell as another user (default: the invoking
     // user, captured into PIR_INVOKING_USER before any privilege drop) — the
     // operator's escape hatch.
+    #[cfg(unix)]
     if let Some((target, rest)) = parse_sh_u(&args) {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let (shell, _) = resolve_shell()?;
         return crate::user::spawn_shell_as(&shell, rest, target);
     }
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let (shell, flag) = resolve_shell()?;
     // User-level isolation: `/sh` with no `-u` runs as the *agent* execution
     // user (e.g. `ai_pir`) when one is configured, so the interactive shell —
     // and any single-shot command — is confined like the agent's tools and
     // cannot write root-owned paths. `/sh -u` above remains the escape hatch.
     // Unless the operator granted invoker authority (`/su-security off`): then
     // `/sh` runs as the current (invoking) identity instead.
+    #[cfg(unix)]
     let as_invoker = std::env::var_os("PIR_AGENT_AS_INVOKER")
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false);
+    #[cfg(unix)]
     if !as_invoker {
         if let Some(agent) = crate::user::agent_exec_user() {
         let already = {
@@ -2448,7 +2821,7 @@ fn run_shell(args: Vec<&str>) -> Option<i32> {
     } else {
         // Single-shot: run the assembled command line through the shell.
         std::process::Command::new(&shell)
-            .arg("-c")
+            .arg(flag)
             .arg(args.join(" "))
             .env("HISTFILE", "/dev/null")
             .status()

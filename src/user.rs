@@ -16,6 +16,7 @@
 
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::sync::Mutex;
 
@@ -472,6 +473,7 @@ pub fn drop_to_agent_user() -> Result<(), std::io::Error> {
     // dropping would hard-stop its writes to the container's own root-owned
     // files (e.g. the containers copy of /etc/hosts), breaking permit-but-
     // quarantine.
+    #[cfg(unix)]
     if crate::security::overlay::fullroot_engaged() || crate::security::overlay::container_engaged() {
         return Ok(());
     }
@@ -1102,7 +1104,7 @@ pub fn session_dir_for(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod accessibility_tests {
     use super::*;
 

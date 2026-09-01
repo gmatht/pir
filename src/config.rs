@@ -669,6 +669,39 @@ pub fn set_default_model(provider: &str, model: &str) -> Result<PathBuf, String>
     Ok(p)
 }
 
+/// The persisted "use per-agent worktrees by default" flag (key `worktrees`
+/// in `~/.pi/agent/settings.json`). Default: `false` — the guard posture is
+/// "pi plus a seatbelt" (the in-process guardrail protects `.git` and the test
+/// oracle); per-agent worktrees are the *opt-in* stronger posture
+/// (`security.level = "worktree"`, `PIR_WT=1`, or the `/menu` Worktrees
+/// toggle). `PIR_WT=1` at launch still wins over this for that session.
+pub fn worktrees_default() -> bool {
+    let p = pi_dir().join("agent").join("settings.json");
+    let Some(raw) = fs::read_to_string(p).ok() else { return false };
+    let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    v.get("worktrees").and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// Persist the worktree default flag (writes `worktrees` into
+/// `~/.pi/agent/settings.json`, preserving the other keys).
+pub fn set_worktrees_default(on: bool) -> Result<PathBuf, String> {
+    let p = pi_dir().join("agent").join("settings.json");
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    let mut v: Value = fs::read_to_string(&p)
+        .ok()
+        .and_then(|r| serde_json::from_str(&r).ok())
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    if !v.is_object() {
+        v = Value::Object(serde_json::Map::new());
+    }
+    v.as_object_mut().unwrap().insert("worktrees".into(), Value::Bool(on));
+    fs::write(&p, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    Ok(p)
+}
+
 /// Path to `auth.json` (credential store). Mirrors the file pi writes;
 /// `load_auth_keys` / `load_from_auth_fallback` already consult it.
 pub fn auth_path() -> PathBuf {
@@ -1483,5 +1516,36 @@ mod select_tests {
         assert_eq!(ms.first().map(String::as_str), Some("opencode-chat"));
         // The infix-only matches are still offered as fallbacks, just after.
         assert!(ms.iter().any(|c| c.starts_with("anthropic/")), "infix matches must remain: {ms:?}");
+    }
+}
+
+/// Serializes tests that mutate process-global env (`PI_DIR` / `PIR_WT`) so
+/// they can't race when the test binary runs them in parallel. Acquired by the
+/// config, security, and wt-extension tests that set these vars.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+mod worktree_settings_tests {
+    use super::*;
+
+    // The worktree default is persisted to settings.json via PI_DIR (which
+    // `pi_dir()` honours in tests); verify the roundtrip and the true default.
+    #[test]
+    fn worktrees_default_roundtrip() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("pir_wt_cfg_{}", std::process::id()));
+        let old = std::env::var_os("PI_DIR");
+        std::env::set_var("PI_DIR", &dir);
+        assert!(!worktrees_default(), "default is off (guard posture; worktrees are opt-in)");
+        set_worktrees_default(true).unwrap();
+        assert!(worktrees_default(), "persisted on must read back");
+        set_worktrees_default(false).unwrap();
+        assert!(!worktrees_default(), "persisted off must read back");
+        match old {
+            Some(v) => std::env::set_var("PI_DIR", v),
+            None => std::env::remove_var("PI_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

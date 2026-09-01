@@ -10,8 +10,12 @@
 //! the guardrail decision) live here in plain Rust; the genuinely
 //! platform-specific bits (how a write is intercepted, how a request is
 //! surfaced to the operator) sit behind the `Platform` trait. A `unix` backend
-//! is implemented; a `windows` backend is structurally present (stubbed) so the
-//! abstraction is real.
+//! implements the overlayfs quarantine + per-project UID story; a `windows`
+//! backend implements the Job-Object lifecycle layer, AppContainer
+//! profile/ACL plumbing, low-IL transform, ProjFS detection and the
+//! `ai-perm-request` queue (see `docs/SECURITY_ON_WINDOWS.md`). Every other
+//! `pir` module is platform-independent and only reaches the platform layer
+//! through `SecurityContext` / `Platform`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -346,6 +350,11 @@ pub struct SecurityPolicy {
     pub idle_max_open_prs: usize,
     /// Whether a dedicated fixer agent owns failing merge requests.
     pub fixer_agent: bool,
+    /// Windows-only host-level options (Job Object, AppContainer, low-IL,
+    /// audit). Kept off the shared surface so the rest of `pir` stays
+    /// platform-independent; absent on non-Windows builds.
+    #[cfg(windows)]
+    pub windows: crate::security::windows::WindowsOptions,
     pub denials: Arc<Mutex<Vec<Denial>>>,
 }
 
@@ -480,6 +489,8 @@ impl Default for SecurityPolicy {
             idle_max_open_prs: 1,
             fixer_agent: true,
             allow_worktree: None,
+            #[cfg(windows)]
+            windows: crate::security::windows::WindowsOptions::default(),
             denials: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -522,6 +533,7 @@ impl SecurityPolicy {
                 // than hard-blocked. The in-process hard-deny (is_system_state /
                 // GuardSystem) only fires as a fallback when NO overlay is mounted
                 // (e.g. a non-root `ai_*` agent).
+                #[cfg(unix)]
                 if crate::security::overlay::project_quarantine_engaged()
                     || crate::security::overlay::system_quarantine_engaged()
                 {
@@ -599,6 +611,13 @@ impl SecurityPolicy {
         if is_secret(&canon) {
             return Some(Parcel::GuardSecrets);
         }
+        // Repo metadata is the most specific location class: check it before
+        // the coarse "other users" / "system state" classifications so a
+        // `.git` under another tree (or under a windows-style user path) gets
+        // the actionable "submit a PR" parcel instead of a generic deny.
+        if is_repo_git(&canon) {
+            return Some(Parcel::GuardRepoGit);
+        }
         if is_other_users(&canon) {
             return Some(Parcel::GuardOtherUsers);
         }
@@ -608,9 +627,6 @@ impl SecurityPolicy {
         if is_test_oracle(&canon) {
             return Some(Parcel::GuardTestOracle);
         }
-        if is_repo_git(&canon) {
-            return Some(Parcel::GuardRepoGit);
-        }
         if self.extra_guard.iter().any(|p| path_matches(&canon, p)) {
             return Some(Parcel::Custom("operator-guarded".into()));
         }
@@ -619,7 +635,19 @@ impl SecurityPolicy {
 
     pub fn record_denial(&self, d: Denial) {
         if let Ok(mut v) = self.denials.lock() {
-            v.push(d);
+            v.push(d.clone());
+        }
+        // Windows audit: append the same `{parcel, scope, reason, ttl, who}`
+        // record the Linux/auditd path writes, so operator tooling is
+        // platform-independent (docs/SECURITY_ON_WINDOWS.md §2.6).
+        #[cfg(windows)]
+        if self.windows.audit {
+            crate::security::windows::audit(
+                &d.parcel.id(),
+                "session",
+                if d.ask.reason.is_empty() { "no reason given" } else { &d.ask.reason },
+                d.ask.ttl,
+            );
         }
     }
 }
@@ -725,6 +753,11 @@ pub trait Platform: Send + Sync {
     fn is_system_state(&self, p: &Path) -> bool {
         is_system_state(p)
     }
+    /// Human-readable description of the host-level security posture (e.g.
+    /// "windows job-object=on appcontainer=off projfs=off"). Default: empty.
+    fn describe(&self) -> String {
+        String::new()
+    }
 }
 
 #[cfg(unix)]
@@ -798,6 +831,10 @@ pub struct SecurityContext {
     pub quarantine: AtomicBool,
     /// Shared approval context (recent prompts + thinking) for the request sink.
     pub approval: Arc<ApprovalContext>,
+    /// Windows: the session Job Object (KILL_ON_JOB_CLOSE + limits). Kept
+    /// alive for the life of the context; dropping it reaps the whole tree.
+    #[cfg(windows)]
+    pub windows_job: Option<crate::security::windows::Job>,
 }
 
 impl SecurityContext {
@@ -810,6 +847,60 @@ impl SecurityContext {
             Box::new(TtySink { approval: Some(approval.clone()) })
         };
         let q = policy.quarantine;
+        // Windows host-level layers, engaged once at startup (docs/
+        // SECURITY_ON_WINDOWS.md §5.1). Never engaged inside unit tests — the
+        // test harness process must not be wrapped (mirrors the `not(test)`
+        // gating of the overlay mounts). The `cfg!(test)` guard keeps the code
+        // compiled but inert in the test build.
+        #[cfg(windows)]
+        let windows_job: Option<crate::security::windows::Job> = {
+            use crate::security::windows as win;
+            let w = &policy.windows;
+            let mut job = None;
+            if !cfg!(test) && win::host_layer_enabled() {
+                if w.job {
+                    match win::enable_lifecycle_job(&w.job_limits()) {
+                        Ok(j) => {
+                            job = Some(j);
+                        }
+                        Err(e) => {
+                            // Fall back to the in-process guardrail (Layer 0):
+                            // never fatal, at worst naggy.
+                            eprintln!(
+                                "[pir] windows security: job object not engaged ({e}); falling back to the in-process guardrail"
+                            );
+                        }
+                    }
+                } else {
+                    eprintln!("[pir] windows security: job object disabled (security.windows.job = false)");
+                }
+                if w.low_integrity {
+                    match win::lower_to_low_integrity() {
+                        Ok(()) => eprintln!("[pir] windows security: process lowered to Low Integrity Level"),
+                        Err(e) => eprintln!("[pir] windows security: low-integrity not applied ({e})"),
+                    }
+                }
+                eprintln!("[pir] security: {}", platform.describe());
+                // The Windows write-quarantine (the ProjFS-backed staging layer)
+                // is the analogue of the Linux overlayfs posture. When ProjFS is
+                // absent it cannot engage, so out-of-tree writes are hard-denied
+                // instead of staged for review. Say so loudly (red) so the
+                // operator knows the agent can't stage edits here — and that
+                // enabling the "Windows Projected File System" optional feature
+                // (and rebooting if you only just enabled it) can turn it on.
+                if !crate::security::windows::staging::staging_engaged() {
+                    eprintln!(
+                        "{}",
+                        crate::term::red(
+                            "[pir] warning: write quarantine is OFF (ProjFS not available). \
+                             Out-of-tree writes are NOT staged for review. \
+                             If you only just enabled the \"Windows Projected File System\" feature, try rebooting."
+                        )
+                    );
+                }
+            }
+            job
+        };
         Arc::new(SecurityContext {
             policy,
             platform,
@@ -817,6 +908,8 @@ impl SecurityContext {
             headless: AtomicBool::new(headless),
             quarantine: AtomicBool::new(q),
             approval,
+            #[cfg(windows)]
+            windows_job,
         })
     }
 
@@ -961,6 +1054,12 @@ pub fn load_policy() -> SecurityPolicy {
         let Some((k, v)) = line.split_once('=') else { continue };
         let k = k.trim().to_ascii_lowercase();
         let v = v.trim().trim_matches('"').trim_matches('\'').to_string();
+        // Windows-only keys (`security.windows.*`) are parsed by the windows
+        // backend so the shared loop stays platform-independent.
+        #[cfg(windows)]
+        if crate::security::windows::parse_option(&mut policy.windows, &k, &v) {
+            continue;
+        }
         match k.as_str() {
             "security.level" | "level" => {
                 if let Some(l) = SecurityLevel::parse(&v) {
@@ -1047,6 +1146,35 @@ pub fn load_policy() -> SecurityPolicy {
     policy
 }
 
+/// Persist the operator-tunable fields of `policy` back to
+/// `~/.pi/agent/security.toml` (the file [`load_policy`] reads at startup) in
+/// the same flat `key = value` format. Written from the `/menu` security
+/// editor; takes effect for new sessions (the live context keeps its snapshot).
+pub fn save_policy(policy: &SecurityPolicy) -> Result<PathBuf, String> {
+    let p = crate::config::pi_dir().join("agent").join("security.toml");
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    let mut lines: Vec<String> = vec![
+        format!("security.level = \"{}\"", policy.level.as_str()),
+        format!("security.apt = \"{}\"", policy.apt.as_str()),
+        format!("security.network = \"{}\"", policy.network.as_str()),
+        format!("security.ask = \"{}\"", policy.ask.as_str()),
+        format!("security.read = \"{}\"", policy.read.as_str()),
+        format!("security.quarantine = {}", if policy.quarantine { "true" } else { "false" }),
+        format!(
+            "security.quarantine-project = {}",
+            if policy.quarantine_project { "true" } else { "false" }
+        ),
+    ];
+    if let Some(wt) = &policy.allow_worktree {
+        lines.push(format!("security.allow-worktree = \"{}\"", wt.display()));
+    }
+    std::fs::write(&p, format!("{}\n", lines.join("\n"))).map_err(|e| e.to_string())?;
+    Ok(p)
+}
+
 // ===========================================================================
 // Shared path heuristics (platform-independent core)
 // ===========================================================================
@@ -1075,19 +1203,29 @@ pub fn under_dir(path: &Path, dir: &Path) -> bool {
     p.starts_with(&d)
 }
 
-/// Whether a path looks like a secret/credential store.
+/// Whether a path looks like a secret/credential store (unix and windows
+/// separators both recognised — the guardrail must fire on `C:\Users\me\.ssh\`
+/// exactly as on `/home/me/.ssh/`).
 pub fn is_secret(path: &Path) -> bool {
     let s = path.to_string_lossy().to_ascii_lowercase();
     s.contains("/.ssh/")
+        || s.contains("\\.ssh\\")
         || s.ends_with("/.ssh")
+        || s.ends_with("\\.ssh")
         || s.contains("/.aws/")
+        || s.contains("\\.aws\\")
         || s.contains("/.gnupg/")
+        || s.contains("\\.gnupg\\")
         || s.ends_with(".key")
         || s.ends_with(".pem")
         || s.contains("/.config/gh/")
+        || s.contains("\\.config\\gh\\")
         || s.contains("/.config/google-chrome/")
+        || s.contains("\\.config\\google-chrome\\")
         || s.contains("/.mozilla/")
+        || s.contains("\\.mozilla\\")
         || s.contains("/.config/gcloud/")
+        || s.contains("\\.config\\gcloud\\")
 }
 
 fn lexical_abs(p: &Path) -> PathBuf {
@@ -1107,16 +1245,33 @@ pub fn is_database(p: &Path) -> bool {
         || s.ends_with(".db-shm")
         || s.ends_with(".db-wal")
         || s.contains("/postgresql/")
+        || s.contains("\\postgresql\\")
         || s.contains("/mysql/")
+        || s.contains("\\mysql\\")
         || s.contains("/mongodata/")
+        || s.contains("\\mongodata\\")
         || s.contains("/redis/")
+        || s.contains("\\redis\\")
         || s.contains("/var/lib/mysql/")
         || s.contains("/var/lib/postgresql/")
 }
 
 pub fn is_system_state(p: &Path) -> bool {
-    let s = p.to_string_lossy();
     let abs = canonicalize_lenient(p).to_string_lossy().to_string();
+    // Windows: the OS tree + machine-wide state. The Windows toolchain
+    // (C:\Program Files\...) is deliberately NOT system state — it stays
+    // readable/writable like the unix `/usr` (reads are default-open anyway;
+    // only *writes* to these rows are denied).
+    #[cfg(windows)]
+    let windows_state = {
+        let l = abs.replace('/', "\\").to_ascii_lowercase();
+        win_tree_prefix(&l, "c:\\windows")
+            || win_tree_prefix(&l, "c:\\programdata")
+            || win_tree_prefix(&l, "c:\\recovery")
+            || win_tree_prefix(&l, "c:\\system volume information")
+    };
+    #[cfg(not(windows))]
+    let windows_state = false;
     abs.starts_with("/boot")
         || abs == "/etc"
         || abs.starts_with("/etc/")
@@ -1130,8 +1285,14 @@ pub fn is_system_state(p: &Path) -> bool {
         || abs.starts_with("/usr/local")
         || abs.starts_with("/opt")
         || abs.starts_with("/srv")
-        || s.starts_with("C:\\Windows\\System32")
-        || s.starts_with("C:\\Windows\\boot")
+        || windows_state
+}
+
+/// Case-insensitive windows-style prefix match: `c:\windows` matches the tree
+/// root exactly or anything under it, but not `c:\windowsfoo`.
+#[cfg(windows)]
+fn win_tree_prefix(abs_l: &str, tree: &str) -> bool {
+    abs_l == tree || abs_l.starts_with(&format!("{tree}\\"))
 }
 
 pub fn is_test_oracle(p: &Path) -> bool {
@@ -1150,12 +1311,13 @@ pub fn is_repo_git(p: &Path) -> bool {
     let abs = canonicalize_lenient(p).to_string_lossy().to_string();
     // Any path component named exactly ".git" (the repo metadata dir or a
     // submodule's metadata), or a path living underneath one, is denied.
+    // `is_separator` on Windows accepts both `/` and `\`.
     for comp in abs.split(std::path::is_separator) {
         if comp == ".git" {
             return true;
         }
     }
-    s.ends_with("/.git") || s.contains("/.git/")
+    s.ends_with("/.git") || s.contains("/.git/") || s.ends_with("\\.git") || s.contains("\\.git\\")
 }
 
 pub fn path_matches(p: &Path, pattern: &str) -> bool {
@@ -1199,10 +1361,34 @@ pub fn classify_connect(target: &Option<String>) -> Parcel {
 
 pub fn is_other_users(p: &Path) -> bool {
     let abs = canonicalize_lenient(p).to_string_lossy().to_string();
-    if abs.starts_with("/home/") {
-        return false;
+    #[cfg(windows)]
+    {
+        // Windows: another user's profile is `C:\Users\<other>\...`. Our own
+        // profile (USERPROFILE) is never "other users"; the well-known
+        // shared profiles are never "other users" either. Case-insensitive.
+        let me = std::env::var("USERPROFILE").unwrap_or_default().to_ascii_lowercase();
+        let abs_l = abs.replace('/', "\\").to_ascii_lowercase();
+        let me = me.trim_end_matches('\\');
+        if !me.is_empty() && (abs_l == me || abs_l.starts_with(&format!("{me}\\"))) {
+            return false;
+        }
+        if let Some(rest) = abs_l.split_once("\\users\\") {
+            let user = rest.1.split('\\').next().unwrap_or("");
+            let shared = matches!(
+                user,
+                "public" | "default" | "default user" | "all users" | "shared" | "updatuser"
+            );
+            return !shared && !user.is_empty();
+        }
+        false
     }
-    abs.starts_with("/Users/") && !abs.starts_with("/Users/Shared/")
+    #[cfg(not(windows))]
+    {
+        if abs.starts_with("/home/") {
+            return false;
+        }
+        abs.starts_with("/Users/") && !abs.starts_with("/Users/Shared/")
+    }
 }
 
 fn epoch() -> u64 {
@@ -1379,7 +1565,14 @@ pub fn queue_request(d: &Denial) {
     {
         crate::security::unix::queue_perm_request(d);
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // Windows: queue into the same `ai-perm-request` spool permctl uses on
+        // Linux (docs/SECURITY_ON_WINDOWS.md §4 / §2.6), so the operator-side
+        // enforcer is platform-independent.
+        crate::security::windows::queue_perm_request(d);
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         eprintln!(
             "[pir] security request (deferred): {} {} -> parcel {}",
@@ -1411,7 +1604,9 @@ pub mod windows;
 pub mod privilege;
 /// Overlayfs-backed write quarantine: stage the agent's writes into an overlay
 /// `upperdir` so the real filesystem is untouched until the operator reviews +
-/// applies them. On by default when the launcher can mount (root).
+/// applies them. On by default when the launcher can mount (root). Unix-only
+/// (overlayfs / mount namespaces); not compiled on Windows yet.
+#[cfg(unix)]
 pub mod overlay;
 
 #[cfg(test)]
@@ -1419,8 +1614,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decide_off_allows_everything() {
-        let p = SecurityPolicy { level: SecurityLevel::Off, ..Default::default() };
+    fn decide_off_allows_everything() {        let p = SecurityPolicy { level: SecurityLevel::Off, ..Default::default() };
         assert_eq!(p.decide(&Ask::write("/etc/passwd")), Verdict::Allow);
         assert_eq!(p.decide(&Ask::read("/root/.ssh/id_rsa")), Verdict::Allow);
     }
@@ -1512,5 +1706,91 @@ mod tests {
         assert_eq!(NetworkMode::parse("allowlist"), Some(NetworkMode::AllowList));
         assert_eq!(AskMode::parse("auto-no"), Some(AskMode::AutoNo));
         assert_eq!(SecurityLevel::parse("bogus"), None);
+    }
+
+    // The `/menu` security editor writes security.toml via save_policy; the
+    // next session's load_policy must read back what was saved (verified with a
+    // throwaway PI_DIR so the real config is untouched).
+    #[test]
+    fn save_policy_roundtrips_through_load_policy() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("pir_pol_cfg_{}", std::process::id()));
+        let old = std::env::var_os("PI_DIR");
+        std::env::set_var("PI_DIR", &dir);
+        let mut p = SecurityPolicy::default();
+        p.level = SecurityLevel::Sandbox;
+        p.network = NetworkMode::Off;
+        p.quarantine = false;
+        p.quarantine_project = false;
+        save_policy(&p).expect("save_policy");
+        let loaded = load_policy();
+        assert_eq!(loaded.level, SecurityLevel::Sandbox);
+        assert_eq!(loaded.network, NetworkMode::Off);
+        assert!(!loaded.quarantine);
+        assert!(!loaded.quarantine_project);
+        match old {
+            Some(v) => std::env::set_var("PI_DIR", v),
+            None => std::env::remove_var("PI_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Windows guardrail decisions must fire on native windows paths exactly as
+    /// on unix paths (docs/SECURITY_ON_WINDOWS.md §6 checklist).
+    #[cfg(windows)]
+    mod win_guard {
+        use super::*;
+
+        #[test]
+        fn guard_blocks_windows_targets() {
+            let p = SecurityPolicy::default();
+            // Secrets under the user profile.
+            assert!(matches!(
+                p.decide(&Ask::write(r"C:\Users\me\.ssh\id_ed25519")),
+                Verdict::Deny { parcel: Parcel::GuardSecrets, .. }
+            ));
+            // System state.
+            assert!(matches!(
+                p.decide(&Ask::write(r"C:\Windows\System32\drivers\etc\hosts")),
+                Verdict::Deny { parcel: Parcel::GuardSystem, .. }
+            ));
+            // Repo metadata.
+            assert!(matches!(
+                p.decide(&Ask::write(r"C:\Users\me\project\.git\HEAD")),
+                Verdict::Deny { parcel: Parcel::GuardRepoGit, .. }
+            ));
+            // Databases.
+            assert!(matches!(
+                p.decide(&Ask::write(r"C:\data\app.sqlite3")),
+                Verdict::Deny { parcel: Parcel::GuardDb, .. }
+            ));
+            // Normal project writes stay allowed (inside the *current* user's
+            // profile; `C:\Users\me\...` would rightly be another user's tree).
+            let me = std::env::var("USERPROFILE").unwrap_or_default();
+            let project_root = if me.is_empty() {
+                PathBuf::from(r"C:\code\project")
+            } else {
+                Path::new(&me).join("project")
+            };
+            assert_eq!(p.decide(&Ask::write(project_root.join("src\\main.rs"))), Verdict::Allow);
+            // Reads default-open even for secrets unless guarded mode.
+            assert_eq!(p.decide(&Ask::read(r"C:\Users\me\.ssh\id_ed25519")), Verdict::Allow);
+            let mut g = p.clone();
+            g.read = ReadMode::GuardedSecrets;
+            assert!(matches!(
+                g.decide(&Ask::read(r"C:\Users\me\.ssh\id_ed25519")),
+                Verdict::Deny { parcel: Parcel::GuardSecrets, .. }
+            ));
+        }
+
+        #[test]
+        fn own_profile_is_not_other_users() {
+            // Whatever the host user is, its own profile must never be flagged.
+            let me = std::env::var("USERPROFILE").unwrap_or_default();
+            if !me.is_empty() {
+                assert!(!super::super::is_other_users(Path::new(&me)));
+                assert!(!super::super::is_other_users(&Path::new(&me).join("Documents\\x")));
+            }
+        }
     }
 }

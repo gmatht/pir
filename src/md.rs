@@ -115,7 +115,10 @@ impl PdRenderer {
                 PdEvent::Text(t) => self.push_text(&t),
                 PdEvent::Code(t) => {
                     if self.color {
-                        self.push_text(&format!("\x1b[7m{}\x1b[0m", t));
+                        // Bright-cyan text (no background / reverse video) so
+                        // inline code reads as emphasised rather than as an
+                        // inverse black/white block.
+                        self.push_text(&format!("\x1b[96m{}\x1b[0m", t));
                     } else {
                         self.push_text(&format!("`{}`", t));
                     }
@@ -619,7 +622,8 @@ fn render_node<'a>(node: &'a AstNode<'a>, ctx: &RenderCtx, out: &mut String) {
         NodeValue::LineBreak => out.push('\n'),
         NodeValue::Code(c) => {
             if ctx.color {
-                out.push_str(&format!("\x1b[7m{}\x1b[0m", c.literal.as_str()));
+                // Bright-cyan text (no background / reverse video).
+                out.push_str(&format!("\x1b[96m{}\x1b[0m", c.literal.as_str()));
             } else {
                 out.push_str(&format!("`{}`", c.literal.as_str()));
             }
@@ -1138,7 +1142,8 @@ impl StreamingRenderer {
             ParseEvent::Text(t) => self.out.push_str(&t),
             ParseEvent::InlineCode(c) => {
                 if self.color {
-                    self.out.push_str(&format!("\x1b[7m{}\x1b[0m", c));
+                    // Bright-cyan text (no background / reverse video).
+                    self.out.push_str(&format!("\x1b[96m{}\x1b[0m", c));
                 } else {
                     self.out.push_str(&format!("`{}`", c));
                 }
@@ -1327,7 +1332,8 @@ impl StreamingRenderer {
             InlineElement::Strikeout(t) => self.styled("\x1b[9m", &t),
             InlineElement::Code(c) => {
                 if self.color {
-                    self.out.push_str(&format!("\x1b[7m{}\x1b[0m", c));
+                    // Bright-cyan text (no background / reverse video).
+                    self.out.push_str(&format!("\x1b[96m{}\x1b[0m", c));
                 } else {
                     self.out.push_str(&format!("`{}`", c));
                 }
