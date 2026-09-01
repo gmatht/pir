@@ -912,17 +912,21 @@ impl SecurityContext {
                         // isn't enabled. Correct the prior bad advice: it needs
                         // elevation AND a reboot -- `-NoRestart` leaves the
                         // driver unloaded, which is why a "successful" enable
-                        // did nothing. Home don't offer Client-ProjFS
-                        // at all, so this path is unreachable there without
-                        // upgrading or using WSL2/Linux (overlayfs quarantine).
+                        // did nothing. NOTE: Client-ProjFS IS offered on Windows 11
+                        // Home 24H2 -- it is a Features-on-Demand package, not
+                        // edition-gated -- so "not offered on Home" is a myth.
+                        // Install from an elevated prompt with
+                        // `Enable-WindowsOptionalFeature -Online -FeatureName
+                        // Client-ProjFS` and REBOOT (PrjFlt only loads at boot;
+                        // a `-NoRestart` enable is silent until next reboot).
                         "[pir] warning: write quarantine is OFF (Projected File \
-                         System not available). To enable: run as Administrator \
+                         System not available). Install Client-ProjFS: from an elevated prompt run \
                          `Enable-WindowsOptionalFeature -Online -FeatureName \
-                         Client-ProjFS` and REBOOT -- the PrjFlt driver only \
-                         loads at boot, so omit `-NoRestart`. Note: Client-ProjFS \
-                         is not offered on Windows 11 Home; use Pro/Enterprise/\
-                         Education, or run pir under WSL2/Linux where overlayfs \
-                         quarantine already works."
+                         Client-ProjFS` and REBOOT (PrjFlt only loads at boot); \
+                         if it already shows Enabled, pir's Windows staging \
+                         backend is not yet implemented -- use WSL2/Linux for \
+                         overlayfs quarantine, or enable the no-driver manifest \
+                         staging (FIXME)."
                             .to_string()
                     };
                     eprintln!("{}", crate::term::red(&msg));
