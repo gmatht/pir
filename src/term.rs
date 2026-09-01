@@ -2079,21 +2079,80 @@ mod nonunix_term {
                                     continue;
                                 }
                                 let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-                                return match k.code {
-                                    KeyCode::Enter => RawInput::Enter,
-                                    KeyCode::Tab => RawInput::Tab,
-                                    KeyCode::Up => RawInput::Up,
-                                    KeyCode::Down => RawInput::Down,
-                                    KeyCode::Left => RawInput::Left,
-                                    KeyCode::Right => RawInput::Right,
-                                    KeyCode::Esc => RawInput::Cancel,
-                                    KeyCode::Char(c) if ctrl && c == 'c' => RawInput::Interrupt,
-                                    KeyCode::Char(c) if ctrl && c == 'd' => RawInput::Eof,
-                                    KeyCode::Char(c) => RawInput::Char(c),
-                                    _ => RawInput::Other(0),
-                                };
+                                match k.code {
+                                    // Enter submits the buffered line as ONE
+                                    // prompt (mirrors the Unix newline arm).
+                                    KeyCode::Enter => {
+                                        let line = std::mem::take(_buf);
+                                        if let Ok(mut g) = _ta.lock() { g.clear(); }
+                                        return RawInput::Line(line);
+                                    }
+                                    KeyCode::Backspace | KeyCode::Delete => {
+                                        if !_buf.is_empty() {
+                                            _buf.pop();
+                                            if let Ok(mut g) = _ta.lock() {
+                                                g.clear();
+                                                g.push_str(_buf);
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Tab | KeyCode::Up | KeyCode::Down
+                                    | KeyCode::Left | KeyCode::Right => {
+                                        // Navigation keys: no text, ignore.
+                                    }
+                                    KeyCode::Esc => {
+                                        _buf.clear();
+                                        if let Ok(mut g) = _ta.lock() { g.clear(); }
+                                        return RawInput::Cancel;
+                                    }
+                                    KeyCode::Char(c) if ctrl && c == 'c' => {
+                                        _buf.clear();
+                                        if let Ok(mut g) = _ta.lock() { g.clear(); }
+                                        return RawInput::Interrupt;
+                                    }
+                                    KeyCode::Char(c) if ctrl && c == 'd' => {
+                                        _buf.clear();
+                                        if let Ok(mut g) = _ta.lock() { g.clear(); }
+                                        return RawInput::Eof;
+                                    }
+                                    KeyCode::Char(c) => {
+                                        _buf.push(c);
+                                        if let Ok(mut g) = _ta.lock() {
+                                            g.clear();
+                                            g.push_str(_buf);
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
-                            crossterm::event::Event::Resize(_, _) => return RawInput::Resize,
+                            // Bracketed-paste: crossterm coalesces a multiline
+                            // paste into a single `Event::Paste`. Accumulate it
+                            // into the draft buffer (normalising CRLF->LF) and
+                            // keep going, so the whole block becomes ONE queued
+                            // prompt instead of one prompt per pasted line -- the
+                            // Windows equivalent of the Unix `read_chunk` paste
+                            // handling. The user then presses Enter once to
+                            // submit the multiline block. Without this branch the
+                            // event fell into `_ => {}` and the paste was dropped
+                            // (or, on terminals that don't emit `Event::Paste`,
+                            // arrived as per-line Enters and).
+                            crossterm::event::Event::Paste(text) => {
+                                for ch in text.chars() {
+                                    match ch {
+                                        '\r' => continue, // drop CR; keep LF
+                                        '\n' => _buf.push('\n'),
+                                        c => _buf.push(c),
+                                    }
+                                }
+                                if let Ok(mut g) = _ta.lock() {
+                                    g.clear();
+                                    g.push_str(_buf);
+                                }
+                            }
+                            crossterm::event::Event::Resize(_, _) => {
+                                // Terminal resized; keep looping so following
+                                // keypresses still reach the buffer.
+                            }
                             _ => {}
                         }
                     }
