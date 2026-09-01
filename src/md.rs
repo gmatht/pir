@@ -52,6 +52,48 @@ pub fn render(md: &str, color: bool) -> String {
     render_pulldown(md, color)
 }
 
+/// Render `md` the way `/markup_demo` does: feed it to a fresh incremental
+/// markdown renderer in `chunk_size`-byte slices (UTF-8 safe), so it exercises
+/// the same streaming path a model reply uses. Returns the sequence of frames
+/// (byte strings) handed to the terminal writer, in order, so a caller can
+/// replay them onto a real display and tests can assert the final line shape.
+///
+/// Slicing is still done in `chunk_size`-byte chunks (so the demo really does
+/// stream 8 bytes at a time), but a chunk is only handed to the renderer once it
+/// completes a line: any trailing partial is held back. `IncrementalMarkdown`
+/// force-flushes a partial line on every redraw, so feeding an 8-byte slice
+/// that does not end in `\n` would otherwise be turned into its own completed
+/// line — inserting a newline *between* chunks. Gating on real newlines keeps
+/// the chunks concatenated on the SAME line with no spurious break.
+pub fn stream_markdown(md: &str, color: bool, chunk_size: usize) -> Vec<String> {
+    let mut inc = IncrementalMarkdown::new(true, color);
+    inc.set_throttle(Duration::ZERO);
+    let bytes = md.as_bytes();
+    let mut idx = 0;
+    let chunk = chunk_size.max(1);
+    let mut acc = String::new();
+    while idx < bytes.len() {
+        let end = (idx + chunk).min(bytes.len());
+        // Land on a UTF-8 boundary so we never split a multi-byte char.
+        let mut e = end;
+        while e > idx && bytes.get(e).map_or(false, |b| (b & 0xC0) == 0x80) {
+            e -= 1;
+        }
+        acc.push_str(&md[idx..e]);
+        idx = e;
+        // Hand over only completed lines; keep any trailing partial so it is
+        // rendered on the same line as the next chunk, not as its own line.
+        if let Some(split) = acc.rfind('\n') {
+            let split = split + 1;
+            inc.push(&acc[..split]);
+            acc.replace_range(..split, "");
+        }
+    }
+    inc.push(&acc);
+    inc.flush();
+    inc.frames().to_vec()
+}
+
 /// Default pulldown-cmark backend (always compiled; see [`render`]).
 fn render_pulldown(md: &str, color: bool) -> String {
     let mut opts = PdOptions::empty();
@@ -1935,6 +1977,124 @@ mod incremental_tests {
         let body = last.trim_start_matches('\x1b').trim_start_matches('[').split('A').nth(1).unwrap_or(last.as_str());
         assert_eq!(body.matches("• a").count(), 1, "item a duplicated in final frame: {body:?}");
         assert_eq!(body.matches("• d").count(), 1, "item d missing/duplicated: {body:?}");
+    }
+
+    /// Simulate a cell-based terminal replaying the exact byte frames an
+    /// incremental renderer hands to `term::out`, so a test can assert the
+    /// *visible* result (what a real display shows) rather than the raw escape
+    /// stream. `\x1b[<n>A` moves the cursor up `n` rows (preserving the column,
+    /// like a real CUU), and `\x1b[J` erases from the cursor to the end of the
+    /// screen — keeping the text *before* the cursor on its row. Soft-wrap at
+    /// `width` splits over-long rows onto the next screen line.
+    fn replay_frames_to_lines(frames: &[String], width: usize) -> Vec<String> {
+        let mut screen: Vec<String> = Vec::new();
+        let mut row: usize = 0;
+        let mut col: usize = 0;
+        let mut ensure = |screen: &mut Vec<String>, r: usize| {
+            while screen.len() <= r {
+                screen.push(String::new());
+            }
+        };
+        for frame in frames {
+            let chars: Vec<char> = frame.chars().collect();
+            let mut i = 0;
+            ensure(&mut screen, row);
+            while i < chars.len() {
+                let c = chars[i];
+                if c == '\x1b' {
+                    // Read the CSI parameter + terminating byte.
+                    let mut j = i + 1;
+                    let mut param = String::new();
+                    while j < chars.len() && !matches!(chars[j], 'A' | 'J' | 'm') {
+                        param.push(chars[j]);
+                        j += 1;
+                    }
+                    if j < chars.len() {
+                        match chars[j] {
+                            'm' => {} // colour: ignore
+                            'A' => {
+                                let n: usize = param
+                                    .trim_start_matches('[')
+                                    .trim()
+                                    .parse()
+                                    .unwrap_or(1)
+                                    .max(1);
+                                row = row.saturating_sub(n);
+                                ensure(&mut screen, row);
+                            }
+                            'J' => {
+                                // Erase from cursor to end of screen: keep the
+                                // row prefix up to `col`, drop every row below.
+                                let cur = std::mem::take(&mut screen[row]);
+                                screen[row] = cur.chars().take(col).collect();
+                                screen.truncate(row + 1);
+                            }
+                            _ => {}
+                        }
+                        i = j + 1;
+                        continue;
+                    }
+                    i = j;
+                    continue;
+                }
+                match c {
+                    '\n' => {
+                        row += 1;
+                        col = 0;
+                        ensure(&mut screen, row);
+                    }
+                    '\r' => col = 0,
+                    _ => {
+                        if width > 0 && col >= width {
+                            row += 1;
+                            col = 0;
+                            ensure(&mut screen, row);
+                        }
+                        ensure(&mut screen, row);
+                        let cur_len = screen[row].chars().count();
+                        if col >= cur_len {
+                            for _ in cur_len..col {
+                                screen[row].push(' ');
+                            }
+                            screen[row].push(c);
+                        } else {
+                            let mut new_row = String::new();
+                            for (idx, ch) in screen[row].chars().enumerate() {
+                                new_row.push(if idx == col { c } else { ch });
+                            }
+                            screen[row] = new_row;
+                        }
+                        col += 1;
+                    }
+                }
+                i += 1;
+            }
+        }
+        while screen.last().map_or(false, |l| l.trim().is_empty()) {
+            screen.pop();
+        }
+        screen
+    }
+
+    // Regression: two 8-byte chunks must render as ONE continuous line on the
+    // real display — "1234567887654321" — with the second chunk drawn
+    // immediately after the first on the same line, and NOT duplicated. The old
+    // in-place renderer jumped the cursor back and erased only *from the cursor
+    // column down*, so the previously-drawn prefix survived and the full
+    // re-rendered block got appended after it ("123456781234567887654321").
+    #[test]
+    fn stream_chunks_continue_on_same_line() {
+        let frames = stream_markdown("1234567887654321", false, 8);
+        let screen = replay_frames_to_lines(&frames, 80);
+        assert_eq!(
+            screen.len(),
+            1,
+            "expected a single screen line, got {screen:?}"
+        );
+        assert_eq!(
+            screen[0], "1234567887654321",
+            "chunks must join on the same line without duplication: {screen:?}"
+        );
     }
 }
 

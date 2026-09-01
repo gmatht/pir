@@ -154,7 +154,7 @@ OPTIONS
   -c, --continue [token]     resume a session and continue its goal (pir -c)
   -u, --as <user>            run project commands as this user (default ai_<project>)
   -l, --latest-build         re-exec the most recent successfully built pir
-                             (the dated snapshot from `build-run.bat` / `cargo build`)
+                             (a `build-run.bat` snapshot, or the plain `cargo build` binary)
   --tui                use the full-screen TUI REPL (requires the `tui` feature)
   --gui                use the graphical GTK REPL (requires the `gui` feature)
   --no-tui             use the plain streaming REPL (this is the default build)
@@ -1443,31 +1443,18 @@ See [the docs](https://example.com) for more.
 fn markup_demo(tty: bool, incremental: bool, color: bool) {
     println!();
     if tty && incremental {
-        // Simulate the model streaming the reply token-by-token: split into
-        // small chunks and push each into the incremental renderer, flushing
-        // once at the end. The renderer overwrites its prior block in place.
-        let mut inc = crate::md::IncrementalMarkdown::new(true, color);
-        let mut idx = 0;
-        // Feed in ~8-char slices so a few throttled redraws happen; we force a
-        // redraw per chunk for the demo by enabling a 0ms throttle.
-        inc.set_throttle(std::time::Duration::ZERO);
-        let bytes = MARKUP_DEMO.as_bytes();
-        while idx < bytes.len() {
-            let end = (idx + 8).min(bytes.len());
-            // Find a UTF-8 boundary so we never split a char. Use `bytes.get`
-            // so is bounds-safe: on the final chunk `end == len`
-            // and `bytes[len]` would otherwise be a one-past-the-end read that
-            // panics (this is exactly the bug that made `/markup_demo` abort
-            // after rendering its first ~8-char slice).
-            let mut e = end;
-            while e > idx && bytes.get(e).map_or(false, |b| (b & 0xC0) == 0x80) {
-                e -= 1;
-            }
-            let chunk = &MARKUP_DEMO[idx..e];
-            inc.push(chunk);
-            idx = e;
+        // Simulate the model streaming the reply token-by-token, fed in ~8-byte
+        // slices through the same incremental (in-place) path a real model reply
+        // uses. The streaming renderer force-flushes a partial line on every
+        // redraw, so the 8-byte slices are handed over only once each completes
+        // a line: a slice that is not yet a full line is held back and
+        // concatenated onto the next chunk, so the next chunk is drawn
+        // immediately after the previous one on the SAME line (never on a new
+        // line, never duplicated). `stream_markdown` applies the 0ms throttle
+        // so a redraw happens per completed chunk.
+        for frame in crate::md::stream_markdown(MARKUP_DEMO, color, 8) {
+            crate::term::out(&frame);
         }
-        inc.flush();
     } else {
         // Non-tty / incremental disabled: same single-render fallback the
         // streaming REPL uses when it can't draw in place.
@@ -1487,9 +1474,10 @@ fn session_log_path() -> PathBuf {
 /// Re-exec the most recently built pir binary. `build-run.bat` snapshots each
 /// successful build as a dated copy `pir-YYYYMMDD-HHMMSS(.exe?)` sitting next to
 /// the freshly compiled `target/<profile>/pir(.exe?)`; this finds the newest of
-/// those snapshots across every build profile and execs it, forwarding any
-/// remaining arguments. If no snapshot exists, we error out so the user knows
-/// to build first. Used by the `-l` / `--latest-build` option.
+/// those snapshots across every build profile (falling back to the plain
+/// `pir(.exe?)` produced by a bare `cargo build`) and execs it, forwarding any
+/// remaining arguments. If no built binary exists at all, we error out so the
+/// user knows to build first. Used by the `-l` / `--latest-build` option.
 #[cfg(unix)]
 fn exec_latest_build(rest: &[String]) {
     let bin = latest_built_binary();
@@ -1521,17 +1509,21 @@ fn exec_latest_build(rest: &[String]) {
     }
 }
 
-/// Locate the newest dated build snapshot across all build profiles. Snapshots
-/// match `pir-<digits>-<digits>.exe?` and live under a build profile directory
-/// (e.g. `target/debug/`, `target/release/`, or `target/<triple>/<profile>/`)
-/// neighbouring the freshly compiled `pir(.exe?)`. Returns the path with the
-/// most recent mtime, or `None`.
+/// Locate the most recent successfully built pir binary across all build
+/// profiles. Prefers the newest dated snapshot (`pir-<digits>-<digits>.exe?`,
+/// produced by `build-run.bat`) which lives under a build profile directory
+/// (e.g. `target/debug/`, `target/release/`, or `target/<triple>/<profile>/`),
+/// but falls back to the freshly compiled `pir(.exe?)` itself when no dated
+/// snapshot exists (e.g. after a plain `cargo build`). Because a snapshot is
+/// copied only *after* the compile finishes, its mtime is always >= the plain
+/// binary's, so the snapshot wins when both are present. Returns the path with
+/// the most recent mtime, or `None`.
 fn latest_built_binary() -> Option<PathBuf> {
     let target = PathBuf::from("target");
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     // A build snapshot: `pir-` followed by a digit, ending in `.exe` (Windows)
-    // or a bare `pir` (unix). This deliberately excludes the plain
-    // `pir(.exe?)` produced by `cargo build`, which has no `-<digits>` suffix.
+    // or a bare `pir` (unix). Produced by `build-run.bat`, which copies the
+    // freshly compiled binary to a dated name next to the build output.
     fn is_snapshot(name: &str) -> bool {
         name.starts_with("pir-")
             && name
@@ -1539,6 +1531,15 @@ fn latest_built_binary() -> Option<PathBuf> {
                 .and_then(|s| s.chars().next())
                 .map_or(false, |c| c.is_ascii_digit())
             && (name.ends_with(".exe") || name == "pir")
+    }
+    // The freshly compiled binary `pir(.exe?)` with no `-<digits>` suffix.
+    // Used as a fallback when no dated snapshot was produced (i.e. a plain
+    // `cargo build` rather than `build-run.bat`), so `-l` still "just runs the
+    // most recent successfully built pir" no matter how it was built. Because a
+    // snapshot is copied only *after* the compile finishes, its mtime is always
+    // >= the plain binary's, so the snapshot wins when both are present.
+    fn is_plain(name: &str) -> bool {
+        name == "pir" || name == "pir.exe"
     }
     // Cargo's build cache subdirs are huge and never hold a real snapshot;
     // skip them so we neither walk them nor mistake their binaries for one.
@@ -1550,7 +1551,7 @@ fn latest_built_binary() -> Option<PathBuf> {
         for e in entries.flatten() {
             let p = e.path();
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if is_snapshot(name) {
+            if is_snapshot(name) || is_plain(name) {
                 if let Ok(meta) = std::fs::metadata(&p) {
                     if let Ok(m) = meta.modified() {
                         if best.as_ref().map_or(true, |(bm, _)| m > *bm) {
