@@ -1066,11 +1066,19 @@ pub fn is_elevated() -> bool {
 /// and/or the no-driver manifest staging (same degradation as overlayfs).
 pub fn projfs_available() -> bool {
     let system = system_dir();
-    // The ProjFS user-mode API ships as `ProjectedFSLib.dll`; the literal name
-    // `ProjFS.dll` does not exist on any Windows build, so probing for it is a
-    // guaranteed false negative (the bug behind the bogus "ProjFS not
-    // available" on 26100/24H2 with Client-ProjFS Enabled and PrjFlt running).
-    if !system.join("ProjectedFSLib.dll").exists() {
+    // The ProjFS user-mode API ships as `ProjectedFSLib.dll` (in System32).
+    // The DLL being present is necessary but not sufficient: the real
+    // virtualization comes from the `PrjFlt` minifilter, shipped by the
+    // Client-ProjFS optional feature (absent on Windows 11 Home).
+    // The DLL lives in System32 (never directly under %WINDIR%), and the
+    // literal `ProjFS.dll` does not exist on any Windows build. Check both
+    // spots so we don't return a false negative on a configured host.
+    let dll_present = system
+        .join("System32")
+        .join("ProjectedFSLib.dll")
+        .exists()
+        || system.join("ProjectedFSLib.dll").exists();
+    if !dll_present {
         return false;
     }
     // HKLM\SYSTEM\CurrentControlSet\Services\PrjFlt\Start == 4 (disabled)?
@@ -1190,7 +1198,12 @@ pub mod staging {
     }
 
     pub fn staging_engaged() -> bool {
-        projfs_available() && session_dir().exists()
+        // True only when there is a *real* staging session: the ProjFS DLL
+        // is present AND the (future) ProjFS provider has actually created
+        // a session store with pending writes. Merely the directory existing
+        // (e.g. a leftover from a prior run or a unit test) is NOT enough,
+        // otherwise we falsely report quarantine=ON when nothing stages.
+        projfs_available() && !manifest().map(|v| v.is_empty()).unwrap_or(true)
     }
 
     /// Show the pending staged writes (`/quarantine` status on Windows). The
@@ -1207,11 +1220,22 @@ pub mod staging {
             }
             _ => {
                 if projfs_available() {
-                    out.push_str("ProjFS available: staging layer active, no pending writes.\n");
+                    // The ProjFS DLL + PrjFlt driver are present, but pir has
+                    // no ProjFS provider projecting a filesystem yet, so the
+                    // staging store is never created (nothing to review).
+                    out.push_str(
+                        "ProjFS present, but the Windows staging backend is not initialised \
+                         (no ProjFS provider): out-of-tree writes are denied by the in-process \
+                         guardrail; the manifest staging store is dormant.\n",
+                    );
                 } else {
                     out.push_str(
-                        "ProjFS not available: out-of-tree writes are denied by the in-process \
-                         guardrail (no virtualization); the manifest staging store is dormant.\n",
+                        "Projected File System not available: the Client-ProjFS optional feature \
+                         (which ships the PrjFlt minifilter driver) isn't enabled. Run as \
+                         Administrator `Enable-WindowsOptionalFeature -Online -FeatureName \
+                         Client-ProjFS` and REBOOT to load the driver (note: Client-ProjFS is \
+                         not offered on Windows 11 Home). Until then, out-of-tree writes are \
+                         denied by the in-process guardrail; the staging store is dormant.\n",
                     );
                 }
             }

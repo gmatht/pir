@@ -889,14 +889,43 @@ impl SecurityContext {
                 // enabling the "Windows Projected File System" optional feature
                 // (and rebooting if you only just enabled it) can turn it on.
                 if !crate::security::windows::staging::staging_engaged() {
-                    eprintln!(
-                        "{}",
-                        crate::term::red(
-                            "[pir] warning: write quarantine is OFF (ProjFS not available). \
-                             Out-of-tree writes are NOT staged for review. \
-                             If you only just enabled the \"Windows Projected File System\" feature, try rebooting."
-                        )
-                    );
+                    // Report the *true* reason quarantine is off instead of
+                    // always blaming ProjFS — on many hosts (and every Windows
+                    // 11 Home box) the ProjFS user-mode DLL is present but the
+                    // feature/driver simply isn't wired up, so "ProjFS not
+                    // available" would be a false claim.
+                    let projfs = crate::security::windows::projfs_available();
+                    let msg: String = if projfs {
+                        // The DLL + PrjFlt driver are present, but pir has no
+                        // ProjFS provider projecting a filesystem yet, so the
+                        // staging store is never initialised -> nothing to
+                        // review. Out-of-tree writes are still hard-denied by
+                        // the in-process guardrail.
+                        "[pir] warning: write quarantine is OFF. ProjFS is present, \
+                         but the Windows staging backend is not initialised, so \
+                         out-of-tree writes are denied by the in-process guardrail \
+                         (not staged for review)."
+                            .to_string()
+                    } else {
+                        // ProjFS genuinely absent: the Client-ProjFS optional
+                        // feature (which ships the PrjFlt minifilter driver)
+                        // isn't enabled. Correct the prior bad advice: it needs
+                        // elevation AND a reboot -- `-NoRestart` leaves the
+                        // driver unloaded, which is why a "successful" enable
+                        // did nothing. Home don't offer Client-ProjFS
+                        // at all, so this path is unreachable there without
+                        // upgrading or using WSL2/Linux (overlayfs quarantine).
+                        "[pir] warning: write quarantine is OFF (Projected File \
+                         System not available). To enable: run as Administrator \
+                         `Enable-WindowsOptionalFeature -Online -FeatureName \
+                         Client-ProjFS` and REBOOT -- the PrjFlt driver only \
+                         loads at boot, so omit `-NoRestart`. Note: Client-ProjFS \
+                         is not offered on Windows 11 Home; use Pro/Enterprise/\
+                         Education, or run pir under WSL2/Linux where overlayfs \
+                         quarantine already works."
+                            .to_string()
+                    };
+                    eprintln!("{}", crate::term::red(&msg));
                 }
             }
             job
