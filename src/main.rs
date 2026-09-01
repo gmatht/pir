@@ -33,6 +33,7 @@ use std::io::Write;
 #[cfg(unix)]
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -130,6 +131,7 @@ const HELP: &str = r#"pir — a featherweight pi-compatible coding agent
 USAGE
   pir [options] [prompt]     prompt given => one-shot, else interactive REPL
   pir -r [token] [prompt]    resume a session (latest from this bash by default)
+  pir -l [prompt]            re-exec the most recent successfully built pir
   pir -c [token] [prompt]    continue a goal: resume a session + drive its next step
   pir -bg <prompt>           run a prompt entirely in the background (notifies on done)
 
@@ -141,6 +143,8 @@ OPTIONS
   -r, --resume [token]       resume a session; token selects by index/time/preview
   -c, --continue [token]     resume a session and continue its goal (pir -c)
   -u, --as <user>            run project commands as this user (default ai_<project>)
+  -l, --latest-build         re-exec the most recent successfully built pir
+                             (the dated snapshot from `build-run.bat` / `cargo build`)
   --tui                use the full-screen TUI REPL (requires the `tui` feature)
   --gui                use the graphical GTK REPL (requires the `gui` feature)
   --no-tui             use the plain streaming REPL (this is the default build)
@@ -410,6 +414,15 @@ fn main() {
             "project" => {
                 // `pir project init` — handle in a subcommand branch below.
                 run_project_subcommand(&args[i + 1..]);
+                return;
+            }
+            "-l" | "--latest-build" => {
+                // Re-exec the most recent successfully built pir (the dated
+                // snapshot produced by `build-run.bat` / `cargo build`),
+                // forwarding everything that follows on the command line. Lets
+                // you run `pir -l <args>` to use the freshly built binary
+                // without hunting through target/<profile>/.
+                exec_latest_build(&args[i + 1..]);
                 return;
             }
             "-n" | "--no-color" => term::set_color(false),
@@ -1381,6 +1394,94 @@ fn session_log_path() -> PathBuf {
     let dir = config::pi_dir().join("agent").join("sessions");
     let _ = std::fs::create_dir_all(&dir);
     dir.join(format!("pir-{}-sh{}-bg{}.jsonl", term::timestamp_compact(), term::parent_shell_pid(), std::process::id()))
+}
+
+/// Re-exec the most recently built pir binary. `build-run.bat` snapshots each
+/// successful build as a dated copy `pir-YYYYMMDD-HHMMSS(.exe?)` sitting next to
+/// the freshly compiled `target/<profile>/pir(.exe?)`; this finds the newest of
+/// those snapshots across every build profile and execs it, forwarding any
+/// remaining arguments. If no snapshot exists, we error out so the user knows
+/// to build first. Used by the `-l` / `--latest-build` option.
+#[cfg(unix)]
+fn exec_latest_build(rest: &[String]) {
+    let bin = latest_built_binary();
+    match bin {
+        Some(path) => {
+            use std::os::unix::process::CommandExt;
+            eprintln!("pir: execing most recent build: {}", path.display());
+            let err = std::process::Command::new(&path).args(rest).exec();
+            die(&format!("failed to exec {}: {err}", path.display()));
+        }
+        None => die("no successful build snapshot found (run `build-run.bat` / `cargo build` first)"),
+    }
+}
+
+/// Windows has no `exec(3)`; instead of replacing the process we launch the
+/// latest build and wait for it, forwarding its exit code.
+#[cfg(not(unix))]
+fn exec_latest_build(rest: &[String]) {
+    let bin = latest_built_binary();
+    match bin {
+        Some(path) => {
+            eprintln!("pir: running most recent build: {}", path.display());
+            match std::process::Command::new(&path).args(rest).status() {
+                Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+                Err(e) => die(&format!("failed to run {}: {e}", path.display())),
+            }
+        }
+        None => die("no successful build snapshot found (run build-run.bat / cargo build first)"),
+    }
+}
+
+/// Locate the newest dated build snapshot across all build profiles. Snapshots
+/// match `pir-<digits>-<digits>.exe?` and live under a build profile directory
+/// (e.g. `target/debug/`, `target/release/`, or `target/<triple>/<profile>/`)
+/// neighbouring the freshly compiled `pir(.exe?)`. Returns the path with the
+/// most recent mtime, or `None`.
+fn latest_built_binary() -> Option<PathBuf> {
+    let target = PathBuf::from("target");
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    // A build snapshot: `pir-` followed by a digit, ending in `.exe` (Windows)
+    // or a bare `pir` (unix). This deliberately excludes the plain
+    // `pir(.exe?)` produced by `cargo build`, which has no `-<digits>` suffix.
+    fn is_snapshot(name: &str) -> bool {
+        name.starts_with("pir-")
+            && name
+                .get("pir-".len()..)
+                .and_then(|s| s.chars().next())
+                .map_or(false, |c| c.is_ascii_digit())
+            && (name.ends_with(".exe") || name == "pir")
+    }
+    // Cargo's build cache subdirs are huge and never hold a real snapshot;
+    // skip them so we neither walk them nor mistake their binaries for one.
+    const CACHE_DIRS: &[&str] = &["deps", "build", "incremental", ".fingerprint", "native"];
+    fn visit(dir: &Path, depth: usize, best: &mut Option<(std::time::SystemTime, PathBuf)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if is_snapshot(name) {
+                if let Ok(meta) = std::fs::metadata(&p) {
+                    if let Ok(m) = meta.modified() {
+                        if best.as_ref().map_or(true, |(bm, _)| m > *bm) {
+                            *best = Some((m, p.clone()));
+                        }
+                    }
+                }
+            }
+            // Recurse so triple-target builds (target/<triple>/<profile>/) are
+            // covered, not just target/<profile>/. Don't go deeper than
+            // depth 2 (target/<triple>/<profile>), and never walk Cargo's cache
+            // dirs (deps/build/...) which hold unrelated `pir-*.exe` binaries.
+            if p.is_dir() && depth < 2 && !CACHE_DIRS.contains(&name) {
+                visit(&p, depth + 1, best);
+            }
+        }
+    }
+    visit(&target, 0, &mut best);
+    best.map(|(_, p)| p)
 }
 
 /// Resume a session log into the interactive agent (shared by `/resume` and
