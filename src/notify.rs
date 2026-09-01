@@ -424,8 +424,8 @@ impl Notifier for Desktop {
         "desktop"
     }
     fn notify(&self, e: &AgentEvent) {
-        let title = e.desktop_title();
-        let body = e.desktop_body();
+        let _title = e.desktop_title();
+        let _body = e.desktop_body();
 
         // On macOS, use the native AppleScript notification.
         #[cfg(target_os = "macos")]

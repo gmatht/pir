@@ -706,11 +706,11 @@ pub fn security_editor(policy: &mut crate::security::SecurityPolicy) -> Option<(
     let mut quarantine = policy.quarantine;
     let mut quarantine_project = policy.quarantine_project;
 
-    let levels = ["guard", "off", "sandbox", "strict", "worktree"];
-    let apts = ["auto", "human", "stage", "project"];
-    let networks = ["on", "allowlist", "off"];
-    let asks = ["ask", "auto-yes", "auto-no"];
-    let reads = ["open", "guarded-secrets"];
+    let _levels = ["guard", "off", "sandbox", "strict", "worktree"];
+    let _apts = ["auto", "human", "stage", "project"];
+    let _networks = ["on", "allowlist", "off"];
+    let _asks = ["ask", "auto-yes", "auto-no"];
+    let _reads = ["open", "guarded-secrets"];
 
     let spin = |cur: &str, arr: &[&str], dir: i32| -> String {
         let i = arr.iter().position(|s| *s == cur).unwrap_or(0);

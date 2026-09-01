@@ -2,9 +2,8 @@ use std::cell::RefCell;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc, OnceLock};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustyline::completion::Completer;
 use rustyline::highlight::Highlighter;
@@ -484,7 +483,7 @@ fn history_matches(ctx: &Context<'_>, typed: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     // Pass 1: entries that start with the typed text (most recent first).
     for i in (0..n).rev() {
-        let Some(res) = hist.get(i, SearchDirection::Forward) else { continue };
+        let Ok(Some(res)) = hist.get(i, SearchDirection::Forward) else { continue };
         let e = res.entry.as_ref();
         if e.trim().is_empty() {
             continue;
@@ -498,7 +497,7 @@ fn history_matches(ctx: &Context<'_>, typed: &str) -> Vec<String> {
     }
     // Pass 2: entries that merely contain it.
     for i in (0..n).rev() {
-        let Some(res) = hist.get(i, SearchDirection::Forward) else { continue };
+        let Ok(Some(res)) = hist.get(i, SearchDirection::Forward) else { continue };
         let e = res.entry.as_ref();
         if e.trim().is_empty() {
             continue;
@@ -2014,7 +2013,7 @@ mod keyboard_idle_tests {
 mod nonunix_term {
     use std::io::{self, Write, BufRead};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    
 
     pub fn out(s: &str) {
         let mut o = io::stdout();

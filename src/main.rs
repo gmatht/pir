@@ -29,7 +29,6 @@ use crate::config::Model;
 use crate::notify::SharedBus;
 use std::io::BufRead;
 use std::io::IsTerminal;
-use std::io::Write;
 #[cfg(unix)]
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -60,6 +59,9 @@ static ACTIVE_STATUS: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
 /// Pid of the most recently spawned command's process group, so we can reap it
 /// on exit. Set by the bash tool via [`set_active_child_pgid`]; read on exit.
+/// (On non-unix builds the unix signal handler that reads it is compiled out,
+/// hence the allow.)
+#[allow(dead_code)]
 static ACTIVE_CHILD_PGID: Mutex<Option<i32>> = Mutex::new(None);
 
 #[cfg(unix)]
@@ -188,6 +190,9 @@ COMMANDS
                           guard hook + .gitattributes; jj-aware). Run it if you see
                           the "no commit guard hook" startup warning on an existing repo
   /rebuild                cargo build + exec the fresh binary (unix)
+  /autoclean [on|off|status]   fix all errors/warnings/failing tests; with no arg
+                          run one cleanup pass now, `on`/`off` toggle cleaning
+                          automatically after every prompt
   /create [name]           scaffold a new project (seeds from clipboard .md spec)
   /login [provider]        store an API key for a provider in ~/.pi/agent/auth.json
   /logout [provider]       remove a stored provider credential from auth.json
@@ -206,7 +211,7 @@ struct BgSession {
     id: usize,
     prompt: String,
     log: PathBuf,
-    started: std::time::SystemTime,
+    _started: std::time::SystemTime,
     joined: bool,
     handle: Option<JoinHandle<()>>,
 }
@@ -253,7 +258,7 @@ impl BackgroundJobs {
             id,
             prompt,
             log: log.clone(),
-            started: std::time::SystemTime::now(),
+            _started: std::time::SystemTime::now(),
             joined: false,
             handle: Some(handle),
         });
@@ -274,7 +279,7 @@ impl BackgroundJobs {
             id,
             prompt,
             log,
-            started: std::time::SystemTime::now(),
+            _started: std::time::SystemTime::now(),
             joined: false,
             handle: Some(handle),
         });
@@ -369,20 +374,25 @@ fn main() {
     let mut prompt: Vec<String> = Vec::new();
     let mut resume_token: Option<String> = None;
     let mut continue_token: Option<String> = None;
+    // `as_user` is consumed only on unix (in the privilege-drop block below);
+    // on non-unix builds it is assigned but never read, hence the allow.
+    #[allow(unused_variables, unused_assignments)]
     let mut as_user: Option<String> = None;
-    let mut project_name: Option<String> = None;
+    let _project_name: Option<String> = None;
     let mut bg_prompt: Option<String> = None;
     // The full-screen ratatui REPL is used only when the `tui` feature is
     // compiled in AND `--tui` is passed; otherwise the streaming REPL runs.
     #[cfg(feature = "tui")]
     let mut use_tui = false;
     #[cfg(not(feature = "tui"))]
+    #[allow(unused_assignments, unused_variables)]
     let mut use_tui = false;
     // The graphical GTK REPL is used only when the `gui` feature is compiled in
     // AND `--gui` is passed.
     #[cfg(feature = "gui")]
     let mut use_gui = false;
     #[cfg(not(feature = "gui"))]
+    #[allow(unused_assignments, unused_variables)]
     let mut use_gui = false;
     let mut no_raw = false;
     let mut budget: Option<u64> = None;
@@ -925,6 +935,9 @@ fn main() {
                     // A prompt the user typed *mid-turn* (raw mode) won't be in
                     // rustyline's history; record it so arrow-up recalls it later.
                     term::push_history(&next);
+                    // A user prompt is never a cleanup pass: clear the flag so a
+                    // later autoclean (when enabled) can still trigger after it.
+                    cleanup_running = false;
                     fg_handle = Some(run_foreground_turn(
                         &agent_slot,
                         &fg_cancel,
@@ -934,29 +947,54 @@ fn main() {
                     ));
                     term::raw::enable_raw();
                 } else {
-                    // No user-queued prompt: drain any follow-up prompts the
-                    // extension backends queued during on_turn_end (e.g. the
-                    // worktree extension asking the model to fix failing tests)
-                    // and run them before returning to the idle prompt.
-                    let follow = {
-                        let mut g = agent_slot.lock().unwrap();
-                        match g.as_mut() {
-                            Some(a) => a.take_continuations(),
-                            None => Vec::new(),
-                        }
-                    };
-                    if let Some(next) = follow.into_iter().next() {
+                    // No user-queued prompt. If the turn that just finished was
+                    // itself an autoclean pass, do NOT chain another one (that
+                    // would loop forever) — reset the flag and fall through to
+                    // continuations/idle. Otherwise, honour a one-shot
+                    // `/autoclean` request or the persistent autoclean-after-
+                    // every-prompt flag by running a single cleanup pass.
+                    let was_cleanup = cleanup_running;
+                    cleanup_running = false;
+                    let run_clean = !was_cleanup
+                        && (AUTOCLEAN_RUN_ONCE.swap(false, Ordering::SeqCst)
+                            || AUTOCLEAN_ENABLED.load(Ordering::SeqCst));
+                    if run_clean {
                         if let Ok(mut g) = typeahead.lock() { g.clear(); }
-                        term::push_history(&next);
                         cleanup_running = true;
+                        println!("{} autoclean: fixing all errors/warnings/failing tests", term::bold("·"));
                         fg_handle = Some(run_foreground_turn(
                             &agent_slot,
                             &fg_cancel,
                             &fg_quiet,
-                            next,
+                            autoclean_prompt(),
                             done_tx.clone(),
                         ));
                         term::raw::enable_raw();
+                    } else {
+                        // No user-queued prompt: drain any follow-up prompts the
+                        // extension backends queued during on_turn_end (e.g. the
+                        // worktree extension asking the model to fix failing tests)
+                        // and run them before returning to the idle prompt.
+                        let follow = {
+                            let mut g = agent_slot.lock().unwrap();
+                            match g.as_mut() {
+                                Some(a) => a.take_continuations(),
+                                None => Vec::new(),
+                            }
+                        };
+                        if let Some(next) = follow.into_iter().next() {
+                            if let Ok(mut g) = typeahead.lock() { g.clear(); }
+                            term::push_history(&next);
+                            cleanup_running = true;
+                            fg_handle = Some(run_foreground_turn(
+                                &agent_slot,
+                                &fg_cancel,
+                                &fg_quiet,
+                                next,
+                                done_tx.clone(),
+                            ));
+                            term::raw::enable_raw();
+                        }
                     }
                 }
             }
@@ -1052,7 +1090,7 @@ fn main() {
                     //  - turn running: flip the shared job-kill flag, which the
                     //    agent's own bash wait loop consumes within 250ms and
                     //    sweeps on our behalf.
-                    let mut killed = {
+                    let killed = {
                         let mut g = agent_slot.lock().unwrap();
                         match g.as_mut() {
                             Some(a) => a.registry_kill_all_jobs(),
@@ -1179,6 +1217,25 @@ fn main() {
             ));
             term::raw::enable_raw();
         }
+        // After the user's prompt has launched (or right after a bare
+        // `/autoclean` with no prompt), run a cleanup pass if requested. A bare
+        // `/autoclean` without a preceding prompt leaves `fg_handle` None, so we
+        // start the cleanup turn directly; otherwise we queue the
+        // user's prompt (it runs once that turn finishes via the block below).
+        if AUTOCLEAN_RUN_ONCE.swap(false, Ordering::SeqCst) && fg_handle.is_none() {
+            if let Ok(mut g) = typeahead.lock() { g.clear(); }
+            fg_quiet.store(false, Ordering::SeqCst);
+            cleanup_running = true;
+            println!("{} autoclean: fixing all errors/warnings/failing tests", term::bold("·"));
+            fg_handle = Some(run_foreground_turn(
+                &agent_slot,
+                &fg_cancel,
+                &fg_quiet,
+                autoclean_prompt(),
+                done_tx.clone(),
+            ));
+            term::raw::enable_raw();
+        }
     }
 }
 
@@ -1290,6 +1347,25 @@ fn spawn_model_broadcast_watcher(
 }
 
 type AgentSlot = Arc<Mutex<Option<Agent>>>;
+
+/// Persistent "autoclean after every prompt" toggle, flipped by `/autoclean on|off`.
+static AUTOCLEAN_ENABLED: AtomicBool = AtomicBool::new(false);
+/// One-shot request (set by a bare `/autoclean`) to run a cleanup turn immediately.
+static AUTOCLEAN_RUN_ONCE: AtomicBool = AtomicBool::new(false);
+
+/// Prompt that drives the agent to fix every compiler error, every warning, and
+/// every failing test, then re-run build/test and repeat until the project is
+/// fully green. The loop runs *inside* the agent's turn (it has the bash tool),
+/// so this returns once the project is clean.
+fn autoclean_prompt() -> String {
+    "Autoclean this project: run its build and test suite and keep fixing issues until \
+everything is green. Concretely: 1) run `cargo build` (or the project's configured build \
+command) and fix ALL errors and ALL warnings; 2) run `cargo test` (and any other project \
+test commands) and fix every failing test; 3) re-run the build and the tests and repeat \
+until there are zero errors, zero warnings, and all tests pass. Do not stop early and do not \
+commit anything — keep iterating until the project is completely clean."
+        .to_string()
+}
 
 /// A canned sample document used by `/markup_demo`. It exercises every part of
 /// the terminal markdown renderer an agent reply would hit: headings, inline
@@ -2109,7 +2185,7 @@ fn handle_command(
                     }
                     println!("{}", term::dim("(local per-session flag; no system-wide configuration changed)"));
                 }
-                other => eprintln!(
+                _other => eprintln!(
                     "usage: /su-security <on|off|status>   (off requires a reason; local to this session)"
                 ),
             }
@@ -2316,6 +2392,38 @@ fn handle_command(
                 return;
             }
             println!("{}", crate::project::fix_git_setup(&repo));
+        }
+        "autoclean" => {
+            // `/autoclean` (no arg): run one cleanup turn now — drive the agent to
+            // fix every build error, every warning, and every failing test until
+            // the project is clean. `/autoclean on` enables cleaning automatically
+            // after every subsequent prompt (and runs one pass immediately);
+            // `/autoclean off` disables that. The flag is a process-global static,
+            // so it applies for the rest of this interactive session.
+            let arg = rest.first().copied().unwrap_or("");
+            match arg {
+                "" => {
+                    AUTOCLEAN_RUN_ONCE.store(true, Ordering::SeqCst);
+                    println!("{} queuing an autoclean pass after this prompt", term::dim("·"));
+                }
+                "on" | "enable" | "1" => {
+                    AUTOCLEAN_ENABLED.store(true, Ordering::SeqCst);
+                    AUTOCLEAN_RUN_ONCE.store(true, Ordering::SeqCst);
+                    println!("{} autoclean ON — will fix all errors/warnings/failing tests after every prompt", term::green("·"));
+                }
+                "off" | "disable" | "0" => {
+                    AUTOCLEAN_ENABLED.store(false, Ordering::SeqCst);
+                    println!("{} autoclean OFF", term::yellow("·"));
+                }
+                "status" | "state" => {
+                    println!(
+                        "{} autoclean is {}",
+                        term::dim("·"),
+                        if AUTOCLEAN_ENABLED.load(Ordering::SeqCst) { term::green("ON") } else { term::yellow("OFF") }
+                    );
+                }
+                _other => eprintln!("usage: /autoclean [on|off|status]   (no arg = run one cleanup pass now)"),
+            }
         }
         "rebuild" => {
             // Recompile from source and, on success, replace this process with the

@@ -923,8 +923,8 @@ gate              = "ci"         # ci (the host's pipeline) | "pir-merge-gate"
 
 ## 12. Implemented default posture (overlayfs write-quarantine + worktree)
 
-The default `pir` posture now combines the §2.3 / §5.1 overlayfs staging trick
-with the §11 worktree isolation so that **the agent may run every command, but
+The default `pir` posture combines the §2.3 / §5.1 overlayfs staging trick with
+the §11 worktree isolation so that **the agent may run every command, but
 non-whitelisted writes are intercepted and quarantined** — visible only to the
 agent until the operator reviews and applies (or discards) them:
 
@@ -932,9 +932,12 @@ agent until the operator reviews and applies (or discards) them:
   agent reads, executes, and uses the network normally. Every *write* is routed
   through an overlayfs `upperdir` so the real filesystem is untouched until the
   operator says so. This is the `overlayfs` approach the task asks for.
-- **Per-agent worktree, whitelisted.** Each agent owns a git worktree
-  (`wt_create`; also auto-created at launch by default — `PIR_WT_AUTOCREATE=0`
-disables). The agent's worktree is
+- **Per-agent worktree, whitelisted — opt-in.** Each agent owns a git worktree
+  (`wt_create`; auto-created at launch only when worktrees are enabled).
+  Worktrees are **off by default** (the guard posture is "pi plus a seatbelt":
+  the in-process guardrail protects `.git` and the test oracle); enable them
+  with `security.level = "worktree"`, `PIR_WT=1`, or the `/menu` Worktrees
+  toggle. When enabled, the agent's worktree is
   bind-mounted **read-write on top** of the overlay, so it is the *only* tree
   the agent can write to the real filesystem through. The central `.git`, the
   trunk checkout, and every *other* agent's worktree are **not** whitelisted —
@@ -952,5 +955,6 @@ disables). The agent's worktree is
 Config knobs (loaded from `~/.pi/agent/security.toml`, or env): `quarantine`
 (default on), `quarantine-project` (default on; `PIR_QUARANTINE=0` disables),
 `security.level`, `security.idle` (`off`/`errors`/`warnings`/`hygiene`),
-worktree auto-create on by default (`PIR_WT_AUTOCREATE=0` disables), and
+worktrees **off by default** (opt in with `PIR_WT=1`, `security.level =
+"worktree"`, or the `/menu` Worktrees toggle), and
 `PIR_WT_WHITELIST` (set automatically by `wt` to the agent's worktree).

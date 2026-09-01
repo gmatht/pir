@@ -17,6 +17,21 @@ smol = "2"                                       # async runtime: event-driven s
 regex = "1"                                      # history recall + streamdown-parser (full regex; replaces regex-lite)
 streamdown-parser = "0.1.4"                      # O(n) streaming markdown parser (stateful, line-oriented)
 streamdown-ansi = "0.1.4"                        # ANSI sanitize for link/terminal safety (pulled in by streamdown-parser)
+# Minimal Win32 FFI bindings for the Windows security backend only
+# (src/security/windows.rs, docs/SECURITY_ON_WINDOWS.md): Job Objects,
+# AppContainer profiles/ACLs, token integrity + elevation, ProjFS feature
+# probe, registry. Zero runtime deps; the unix build just links nothing.
+# Features are kept narrow to what the backend actually calls.
+windows-sys = { version = "0.61", default-features = false, features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Security_Isolation",
+  "Win32_System_JobObjects",
+  "Win32_System_Registry",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+] }
 
 # Optional TUI deps, only built when `--features tui` is set (so the default
 # binary stays lightweight and the locked build cache is unaffected).

@@ -2,9 +2,14 @@
 //! other extension. This is the reference implementation of the
 //! [`pir::plugin::ToolBackend`] trait.
 //!
-//! It implements the confirm-before-acting UX (y/a/n) that the core wants for
-//! tools that touch the filesystem or shell, but every other extension is free
-//! to implement its own policy (or set `full_auto` in the registry to skip
+//! Tool gating is the *security module's* job now: the agent's tool loop runs
+//! `SecurityContext::check` before every tool (reads/exec default-open, writes
+//! scoped to the project, critical targets denied + ask-gated). This extension
+//! therefore no longer prompts y/a/n per command — it keeps only the two
+//! *targeted* guards that are not expressible as path policy: refusing
+//! self-targeting kill commands, and routing `sudo`/`su` through the
+//! request-don't-take escalation path. Every other extension is free to
+//! implement its own policy (or set `full_auto` in the registry to skip
 //! prompts).
 
 use crate::plugin::{Outcome, Registry, ToolBackend, ToolSpec};
@@ -25,7 +30,6 @@ pub fn register(reg: &mut Registry) {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     reg.add(Box::new(Builtin::new(
         cwd,
-        reg.full_auto(),
         reg.abort.clone(),
         Arc::new(AtomicBool::new(false)),
     )));
@@ -33,9 +37,6 @@ pub fn register(reg: &mut Registry) {
 
 struct Builtin {
     cwd: PathBuf,
-    full_auto: bool,
-    bash_ok: bool,
-    write_ok: bool,
     // Long-running commands detached mid-flight (see run_shell's
     // 10-minute check-in) live here so the model can poll/kill them with the
     // job_status / job_kill tools instead of us blocking the turn forever.
@@ -64,12 +65,9 @@ struct Builtin {
 }
 
 impl Builtin {
-    fn new(cwd: PathBuf, full_auto: bool, abort: Arc<AtomicBool>, quiet: Arc<AtomicBool>) -> Self {
+    fn new(cwd: PathBuf, abort: Arc<AtomicBool>, quiet: Arc<AtomicBool>) -> Self {
         Builtin {
             cwd,
-            full_auto,
-            bash_ok: false,
-            write_ok: false,
             jobs: Vec::new(),
             next_job: 1,
             abort,
@@ -268,21 +266,6 @@ impl ToolBackend for Builtin {
     }
 }
 
-enum Decision {
-    Yes,
-    Always,
-    No,
-}
-
-fn ask(what: &str) -> Decision {
-    let answer = term::read_answer(&format!("Allow {what}? [y]es / [a]lways / [n]o (default no)"));
-    match answer.as_str() {
-        "y" | "yes" => Decision::Yes,
-        "a" | "always" => Decision::Always,
-        _ => Decision::No,
-    }
-}
-
 impl Builtin {
     fn do_bash(&mut self, input: &serde_json::Value) -> Result<String, String> {
         let command = input["command"].as_str().ok_or("bash: missing 'command'")?;
@@ -301,13 +284,6 @@ impl Builtin {
             match answer.as_str() {
                 "y" | "yes" => {}
                 _ => return Ok("[denied] refusing to run a self-targeting kill command".into()),
-            }
-        }
-        if !self.full_auto && !self.bash_ok {
-            match ask(&format!("run {}", term::yellow(&format!("`{command}`")))) {
-                Decision::No => return Ok("[denied] user declined to run this command".into()),
-                Decision::Always => self.bash_ok = true,
-                Decision::Yes => {}
             }
         }
         // Guard #2: privilege escalation (`sudo`/`su`/...). `sudo` prompts for a
@@ -475,14 +451,6 @@ impl Builtin {
     fn write_file(&mut self, input: &serde_json::Value) -> Result<String, String> {
         let path = input["path"].as_str().ok_or("write_file: missing 'path'")?;
         let content = input["content"].as_str().ok_or("write_file: missing 'content'")?;
-        if !self.full_auto && !self.write_ok {
-            let verb = if Path::new(path).exists() { "overwrite" } else { "create" };
-            match ask(&format!("{verb} {}", term::yellow(path))) {
-                Decision::No => return Ok("[denied] user declined this write".into()),
-                Decision::Always => self.write_ok = true,
-                Decision::Yes => {}
-            }
-        }
         if let Some(parent) = Path::new(path).parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).map_err(|e| format!("write_file {path}: {e}"))?;
@@ -505,13 +473,6 @@ impl Builtin {
             return Err(format!(
                 "edit_file {path}: old_string appears {hits}x — add surrounding lines to make it unique"
             ));
-        }
-        if !self.full_auto && !self.write_ok {
-            match ask(&format!("edit {}", term::yellow(path))) {
-                Decision::No => return Ok("[denied] user declined this edit".into()),
-                Decision::Always => self.write_ok = true,
-                Decision::Yes => {}
-            }
         }
         let updated = src.replacen(old, new, 1);
         fs::write(path, updated).map_err(|e| format!("edit_file {path}: {e}"))?;
@@ -860,8 +821,11 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
     // explicit PIR_DETECT_CAPS=1) so benign "permission denied" elsewhere
     // doesn't spam. auditd / seccomp RET_LOG|ERRNO|USER_NOTIF are documented
     // configurable alternatives if in-kernel attempt logging is ever needed.
+    #[cfg(unix)]
     let caps_dropped = crate::security::overlay::container_engaged()
         || std::env::var_os("PIR_DETECT_CAPS").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+    #[cfg(not(unix))]
+    let caps_dropped = std::env::var_os("PIR_DETECT_CAPS").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
     if caps_dropped {
         let lower = text.to_ascii_lowercase();
         let hint: Option<&'static str> = if lower.contains("operation not permitted")
@@ -1100,7 +1064,12 @@ timeout() { __pir_timeout_default "$@"; }
     }
 }
 
-#[cfg(test)]
+// These tests exercise the unix process-tree kill semantics (`sleep`,
+// `/dev/null`, background `&`, process groups) with unix shell commands; on
+// Windows the commands don't exist / parse differently, so they're compiled
+// and run on unix only. On Windows the abort/job-kill behavior is covered by
+// the smoke tests and the `job_kill` tool path.
+#[cfg(all(test, unix))]
 mod esc_tests {
     use super::*;
     use std::sync::atomic::Ordering;
@@ -1111,7 +1080,7 @@ mod esc_tests {
         // A slow command (`sleep 30`). Flipping the abort flag must kill it
         // almost immediately (well under a second), not wait for it to exit.
         let abort = Arc::new(AtomicBool::new(false));
-        let mut b = Builtin::new(PathBuf::from("."), true, abort.clone(), Arc::new(AtomicBool::new(false)));
+        let mut b = Builtin::new(PathBuf::from("."), abort.clone(), Arc::new(AtomicBool::new(false)));
         let start = Instant::now();
         let handle = std::thread::spawn(move || run_shell(&mut b, "sleep 30"));
         std::thread::sleep(Duration::from_millis(200));
@@ -1129,7 +1098,7 @@ mod esc_tests {
     fn no_abort_completes() {
         // Without abort, a fast command runs to completion and reports success.
         let abort = Arc::new(AtomicBool::new(false));
-        let mut b = Builtin::new(PathBuf::from("."), true, abort.clone(), Arc::new(AtomicBool::new(false)));
+        let mut b = Builtin::new(PathBuf::from("."), abort.clone(), Arc::new(AtomicBool::new(false)));
         let out = run_shell(&mut b, "echo hello-from-pir").expect("run_shell result");
         assert!(out.contains("hello-from-pir"), "got: {out}");
     }
@@ -1140,7 +1109,7 @@ mod esc_tests {
         let abort = Arc::new(AtomicBool::new(false));
         abort.store(true, Ordering::SeqCst);
         abort.store(false, Ordering::SeqCst);
-        let mut b = Builtin::new(PathBuf::from("."), true, abort.clone(), Arc::new(AtomicBool::new(false)));
+        let mut b = Builtin::new(PathBuf::from("."), abort.clone(), Arc::new(AtomicBool::new(false)));
         let out = run_shell(&mut b, "echo still-ran").expect("run_shell result");
         assert!(out.contains("still-ran"), "got: {out}");
     }
@@ -1155,7 +1124,7 @@ mod esc_tests {
         // never came back. Regression: the group kill + bounded joins must
         // make job_kill return promptly.
         std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1");
-        let mut b = Builtin::new(PathBuf::from("."), true, Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let mut b = Builtin::new(PathBuf::from("."), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         let start = Instant::now();
         let detached = run_shell(&mut b, "sleep 60 > /dev/null 2>&1 & echo detached-ok; sleep 60").expect("run_shell result");
         assert!(detached.contains("[detached]"), "expected detachment, got: {detached}");
@@ -1174,7 +1143,7 @@ mod esc_tests {
         // a success exit code (previously `s.code()` on a signal death was
         // surfaced as -1, reading like a normal failure).
         std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1");
-        let mut b = Builtin::new(PathBuf::from("."), true, Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let mut b = Builtin::new(PathBuf::from("."), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         let detached = run_shell(&mut b, "sleep 60").expect("run_shell result");
         assert!(detached.contains("[detached]"), "expected detachment, got: {detached}");
         let out = b.job_kill(&json!({ "id": 1 })).expect("job_kill must return");
@@ -1189,7 +1158,7 @@ mod esc_tests {
     fn esc_flag_sweep_kills_detached_jobs() {
         std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1");
         let job_kill = Arc::new(AtomicBool::new(false));
-        let mut b = Builtin::new(PathBuf::from("."), true, Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let mut b = Builtin::new(PathBuf::from("."), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         b.set_job_kill_handle(job_kill.clone());
         // Detach job #1 (a long command), then job #2 (its parent also hangs).
         let d1 = run_shell(&mut b, "sleep 60").expect("detach 1");
@@ -1210,7 +1179,7 @@ mod esc_tests {
     #[test]
     fn kill_all_jobs_via_trait_kills_running_children() {
         std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1");
-        let mut b = Builtin::new(PathBuf::from("."), true, Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let mut b = Builtin::new(PathBuf::from("."), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         let d = run_shell(&mut b, "sleep 60").expect("detach");
         assert!(d.contains("[detached]"), "got: {d}");
         let killed = ToolBackend::kill_all_jobs(&mut b);
@@ -1221,7 +1190,7 @@ mod esc_tests {
     #[test]
     fn job_kill_after_finish_reports_already_finished() {
         std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1");
-        let mut b = Builtin::new(PathBuf::from("."), true, Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let mut b = Builtin::new(PathBuf::from("."), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         // 2s command, 1s check-in: guaranteed to detach before it can finish.
         let detached = run_shell(&mut b, "sleep 2").expect("run_shell result");
         assert!(detached.contains("[detached]"), "expected detachment, got: {detached}");
@@ -1245,7 +1214,7 @@ mod esc_tests {
         // must stay poll-based and bounded, so job_kill returns promptly even
         // when a child won't die on the first KILL.
         std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1");
-        let mut b = Builtin::new(PathBuf::from("."), true, Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let mut b = Builtin::new(PathBuf::from("."), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         let start = Instant::now();
         // `setsid` escapes the group AND inherits (holds) stdout/stderr.
         let detached = run_shell(
@@ -1309,7 +1278,7 @@ mod priv_escalation_tests {
     // returns false (so the escalation is refused rather than hanging).
     #[test]
     fn passwordless_probe_does_not_block() {
-        let b = Builtin::new(PathBuf::from("."), true, Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let b = Builtin::new(PathBuf::from("."), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         // Just assert it returns promptly and deterministically; the actual
         // value depends on the test-runner's sudoers, not the code.
         let _ = b.sudo_is_passwordless("sudo ls");
