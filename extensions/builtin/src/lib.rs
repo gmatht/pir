@@ -270,7 +270,7 @@ impl Builtin {
     fn do_bash(&mut self, input: &serde_json::Value) -> Result<String, String> {
         let command = input["command"].as_str().ok_or("bash: missing 'command'")?;
         // Guard #1 (item: stop agents killing their peers). A `pkill`/`kill`
-        ///`killall` aimed at `pir` (or scoped to the running user) is almost
+        // `killall` aimed at `pir` (or scoped to the running user) is almost
         // always a mass-extinction trigger — both historical mass deaths here
         // were exactly an agent running `pkill -f target/.../pir` / `pkill -u
         // ai_pir`. Always require an explicit human confirm before such a
@@ -857,7 +857,6 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
 /// Drain `r` into the shared buffer, stopping once it exceeds 4 MB (enough for
 /// any realistic agent command; older output is dropped from the head).
 fn copy_capped(r: &mut impl Read, buf: &Arc<Mutex<Vec<u8>>>) {
-    use std::io::Read as _;
     let mut tmp = [0u8; 8192];
     loop {
         match r.read(&mut tmp) {

@@ -198,9 +198,9 @@ impl ToolBackend for RootReq {
                 if !self.enabled {
                     return Outcome::err(String::from("rootreq is disabled (set PIR_ROOTREQ=0 to disable request queueing)"));
                 }
-                let intent_s = input.get("intent").and_then(Value_as_str).unwrap_or("");
-                let arg = input.get("arg").and_then(Value_as_str).unwrap_or("");
-                let reason = input.get("reason").and_then(Value_as_str).unwrap_or("(no reason)");
+                let intent_s = input.get("intent").and_then(value_as_str).unwrap_or("");
+                let arg = input.get("arg").and_then(value_as_str).unwrap_or("");
+                let reason = input.get("reason").and_then(value_as_str).unwrap_or("(no reason)");
                 let intent = match intent_s {
                     "apt-install" => Intent::AptInstall,
                     "mk-ai-user" => Intent::MkAiUser,
@@ -247,8 +247,8 @@ impl ToolBackend for RootReq {
                 }
             }
             "run_as" => {
-                let user = input.get("user").and_then(Value_as_str).unwrap_or("");
-                let command = input.get("command").and_then(Value_as_str).unwrap_or("");
+                let user = input.get("user").and_then(value_as_str).unwrap_or("");
+                let command = input.get("command").and_then(value_as_str).unwrap_or("");
                 if user.is_empty() || command.is_empty() {
                     return Outcome::err(String::from("run_as requires 'user' and 'command'"));
                 }
@@ -284,7 +284,7 @@ impl ToolBackend for RootReq {
 }
 
 // Small helpers (avoid pulling serde_json Value::as_str everywhere).
-fn Value_as_str(v: &serde_json::Value) -> Option<&str> {
+fn value_as_str(v: &serde_json::Value) -> Option<&str> {
     v.as_str()
 }
 

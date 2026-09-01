@@ -1,3 +1,11 @@
+// This is a binary crate with a large *intentional* internal API surface: the
+// modules below expose many `pub` items that the binary itself does not call
+// directly (they are reached via the tool `Registry`/dynamic dispatch at
+// runtime, or are part of the extension contract). The crate already annotates
+// individual items with `#[allow(dead_code)]`; we lift that to crate level so
+// the build stays warning-free without pruning deliberately-exposed helpers.
+#![allow(dead_code)]
+
 mod agent;
 mod config;
 mod goal;
@@ -538,7 +546,7 @@ fn main() {
         Some(target)
     };
     #[cfg(not(unix))]
-    let resolved_user: Option<String> = None;
+    let resolved_user: Option<String> = as_user.clone();
 
     // Resolve the model. Priority: explicit -m/PI_MODEL on the INVOKING
     // user's command line, then the invoking user's settings.json (captured in
@@ -784,6 +792,10 @@ fn main() {
     if use_gui {
         eprintln!("pir: --gui requires the `gui` feature (build with --features gui)");
         // fall through to the streaming REPL below
+    }
+    #[cfg(not(feature = "tui"))]
+    if use_tui {
+        eprintln!("pir: --tui requires the `tui` feature (build with --features tui)");
     }
 
     println!("{}", term::bold("pir"));
