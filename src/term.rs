@@ -747,6 +747,75 @@ pub fn read_line(prompt: &str) -> Option<String> {
             Err(_) => None,
         }
     })
+    // A pasted multiline block is delivered line-by-line; coalesce a fast
+    // burst into a single prompt instead of one prompt per pasted line
+    // (see `coalesce_paste`). On Unix rustyline's bracketed-paste handling
+    // already coalesces, so there it is a no-op.
+    .map(coalesce_paste)
+}
+
+/// How long to wait after a finished line for *more* input before treating the
+/// line as a submitted prompt. A human pressing Enter types far slower than
+/// this; a terminal delivering a pasted block emits the buffered lines almost
+/// instantly. So sitting here for ~99ms lets remaining lines arrive
+/// and be folded into the same prompt, while a single typed line still submits
+/// after a barely-noticeable pause.
+const PASTE_DEBOUNCE_MS: u64 = 99;
+
+/// Pure, platform-independent core of the "paste debounce": after the first
+/// line (`acc`) has been read, keep appending further lines (joined by `\'\n\'`)
+/// while more input keeps arriving within the debounce window.
+///
+/// The two closures abstract the input source so the logic is fully unit-testable
+/// without a real terminal:
+///   * `has_more` -- returns `true` when another input event is already buffered
+///     (the rest of a paste). A person pressing Enter at human speed returns
+///     `false`, ending the burst.
+///   * `read_more` -- reads line and returns `Some(line)`;
+///     `None` (or an empty line) ends the burst.
+fn coalesce<F, G>(mut acc: String, mut has_more: F, mut read_more: G) -> String
+where
+    F: FnMut() -> bool,
+    G: FnMut() -> Option<String>,
+{
+    loop {
+        if !has_more() {
+            break;
+        }
+        match read_more() {
+            Some(extra) if !extra.is_empty() => {
+                acc.push('\n');
+                acc.push_str(&extra);
+            }
+            _ => break,
+        }
+    }
+    acc
+}
+
+/// Windows only: after the first line, wait up to PASTE_DEBOUNCE_MS for more
+/// input. If another line arrives within that window (the signature of a paste,
+/// as opposed to a person pressing Enter at human speed), keep appending it
+/// (joined by a newline) so a pasted block becomes one prompt. Implemented via
+/// crossterm's event poll + rustyline's own buffered reader, so it does not
+/// matter whether the terminal emits a single `Event::Paste` or one `Enter` per
+/// pasted line. (rustyline already owns the stdin reader, so we continue reading
+/// from it rather than re-entering crossterm -- re-entering would re-enable
+/// bracketed paste and block waiting for a real Enter that isn't coming.)
+#[cfg(not(unix))]
+fn coalesce_paste(acc: String) -> String {
+    use std::time::Duration;
+    coalesce(
+        acc,
+        || matches!(crossterm::event::poll(Duration::from_millis(PASTE_DEBOUNCE_MS)), Ok(true)),
+        || EDITOR.with(|e| e.borrow_mut().as_mut().and_then(|rl| rl.readline("").ok())),
+    )
+}
+
+/// Unix: rustyline handles bracketed paste natively, so no coalescing needed.
+#[cfg(unix)]
+fn coalesce_paste(line: String) -> String {
+    line
 }
 
 fn plain_read_line(prompt: &str) -> Option<String> {
@@ -1984,6 +2053,78 @@ mod keyboard_idle_tests {
     }
 }
 
+#[cfg(test)]
+mod coalesce_paste_tests {
+    use super::*;
+
+    // A paste delivers several lines with no delay between them. `coalesce`
+    // should fold the whole burst into ONE prompt (joined by `\n`), not one
+    // prompt per line. This is the regression guard for "multiline paste still
+    // appears as multiple prompts" -- the 99ms debounce lets the rest of a fast
+    // paste arrive and be folded in before we hand the text to the agent.
+    #[test]
+    fn paste_burst_becomes_single_prompt() {
+        let lines = vec!["line one", "line two", "line three"];
+        let mut it = lines.into_iter();
+        let first = it.next().unwrap().to_string();
+        // `seen` is an immutable snapshot used by has_more; `it` is consumed by read_more.
+        let seen = it.clone().collect::<Vec<_>>();
+        let acc = coalesce(
+            first,
+            || !seen.is_empty(),
+            || it.next().map(|s| s.to_string()),
+        );
+        assert_eq!(acc, "line one\nline two\nline three");
+    }
+
+    // A single typed line (no further input arriving) must submit exactly
+    // as typed -- no extra wait, no spurious merging, and read_more must not
+    // even be consulted when has_more is false.
+    #[test]
+    fn single_line_submits_immediately() {
+        let acc = coalesce(
+            "just one line".to_string(),
+            || false,
+            || panic!("read_more must not be called when has_more is false"),
+        );
+        assert_eq!(acc, "just one line");
+    }
+
+    // If read_more returns None, the burst stops (we never append an empty
+    // trailing segment). Mirrors the `extra.is_empty() => break` guard in the
+    // real coalesce_paste.
+    #[test]
+    fn none_continuation_ends_burst() {
+        let mut calls = 0usize;
+        let acc = coalesce(
+            "head".to_string(),
+            || true,
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Some("tail".to_string())
+                } else {
+                    None
+                }
+            },
+        );
+        assert_eq!(acc, "head\ntail");
+    }
+
+    // A human presses Enter far slower than the ~99ms debounce, so each
+    // submitted line arrives with has_more == false. Two separate user
+    // entries must NOT be merged into one prompt.
+    #[test]
+    fn separate_human_entries_not_merged() {
+        let acc = coalesce(
+            "first".to_string(),
+            || false,
+            || Some("second".to_string()), // never consulted
+        );
+        assert_eq!(acc, "first");
+    }
+}
+
 // ===========================================================================
 // Cross-platform (non-Unix) terminal implementation via `crossterm`.
 // Used on Windows so the crate compiles even though the GUI path (rustxWidgets
@@ -2042,6 +2183,14 @@ mod nonunix_term {
     pub mod raw {
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
+        /// How long to wait after the user (or a paste) finishes a line before
+        /// treating it as a submitted prompt. A human pressing Enter types far
+        /// slower than this; a terminal delivering a pasted multiline block emits
+        /// the buffered lines almost instantly. So one line we wait up to
+        /// this window for the rest of the paste to arrive and fold it into the
+        /// same prompt, instead of queueing one prompt per pasted line. Mirrors
+        /// the Unix `read_chunk` bracketed-paste handling.
+        const PASTE_DEBOUNCE_MS: u64 = 99;
         pub fn enable_raw() { let _ = crossterm::terminal::enable_raw_mode(); }
         pub fn disable_raw() { let _ = crossterm::terminal::disable_raw_mode(); }
         pub fn enable_raw_picker() { enable_raw(); }
@@ -2065,8 +2214,28 @@ mod nonunix_term {
             Paste(String),
             Other(u32),
         }
-        pub fn wait_input(_buf: &mut String, _ta: &Arc<Mutex<String>>, _done: &smol::channel::Receiver<()>) -> RawInput {
+        pub fn wait_input(buf: &mut String, ta: &Arc<Mutex<String>>, done: &smol::channel::Receiver<()>) -> RawInput {
             loop {
+                // Wake the moment the foreground turn finishes, even when no key
+                // is pressed. Without this the REPL stays parked inside this call
+                // and the idle prompt never reappears until the user hits a key
+                // (which makes crossterm emit *some* event). The Unix path races
+                // `done.recv()` against stdin via the smol reactor; here we poll
+                // the done channel each tick. `Ok(())` OR a closed channel both
+                // mean the turn is finished, so we return `None` and let the REPL
+                // loop re-check the finished worker and show the prompt. The
+                // shared `typeahead`/`buf` mirror is kept in sync so a half-typed
+                // line is preserved across the wake-up.
+                match done.try_recv() {
+                    Ok(()) | Err(smol::channel::TryRecvError::Closed) => {
+                        if let Ok(mut g) = ta.lock() {
+                            g.clear();
+                            g.push_str(buf);
+                        }
+                        return RawInput::None;
+                    }
+                    Err(smol::channel::TryRecvError::Empty) => {}
+                }
                 if let Ok(true) = crossterm::event::poll(Duration::from_millis(50)) {
                     if let Ok(ev) = crossterm::event::read() {
                         use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
@@ -2083,16 +2252,77 @@ mod nonunix_term {
                                     // Enter submits the buffered line as ONE
                                     // prompt (mirrors the Unix newline arm).
                                     KeyCode::Enter => {
-                                        let line = std::mem::take(_buf);
-                                        if let Ok(mut g) = _ta.lock() { g.clear(); }
+                                        let mut line = std::mem::take(buf);
+                                        if let Ok(mut g) = ta.lock() { g.clear(); }
+                                        // Coalesce a fast burst (e.g. a pasted
+                                        // multiline block delivered as one Enter
+                                        // per line) into a single prompt. A human
+                                        // typing Enter is far slower than
+                                        // PASTE_DEBOUNCE_MS; a paste is nearly
+                                        // instant. So wait briefly for more input
+                                        // before submitting.
+                                        loop {
+                                            let more = matches!(
+                                                crossterm::event::poll(Duration::from_millis(PASTE_DEBOUNCE_MS)),
+                                                Ok(true)
+                                            );
+                                            if !more {
+                                                break;
+                                            }
+                                            if let Ok(ev2) = crossterm::event::read() {
+                                                match ev2 {
+                                                    crossterm::event::Event::Key(k2) => {
+                                                        if k2.kind == KeyEventKind::Release {
+                                                            continue;
+                                                        }
+                                                        let ctrl = k2.modifiers.contains(KeyModifiers::CONTROL);
+                                                        match k2.code {
+                                                            KeyCode::Enter => {
+                                                                line.push('\n');
+                                                            }
+                                                            KeyCode::Char(c) if ctrl && c == 'c' => {
+                                                                buf.clear();
+                                                                if let Ok(mut g) = ta.lock() { g.clear(); }
+                                                                return RawInput::Interrupt;
+                                                            }
+                                                            KeyCode::Char(c) if ctrl && c == 'd' => {
+                                                                buf.clear();
+                                                                if let Ok(mut g) = ta.lock() { g.clear(); }
+                                                                return RawInput::Eof;
+                                                            }
+                                                            KeyCode::Char(c) => {
+                                                                line.push(c);
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                    crossterm::event::Event::Paste(text) => {
+                                                        for ch in text.chars() {
+                                                            match ch {
+                                                                '\r' => continue,
+                                                                '\n' => line.push('\n'),
+                                                                c => line.push(c),
+                                                            }
+                                                        }
+                                                    }
+                                                    _ => {}
+                                                }
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                        if let Ok(mut g) = ta.lock() {
+                                            g.clear();
+                                            g.push_str(&line);
+                                        }
                                         return RawInput::Line(line);
                                     }
                                     KeyCode::Backspace | KeyCode::Delete => {
-                                        if !_buf.is_empty() {
-                                            _buf.pop();
-                                            if let Ok(mut g) = _ta.lock() {
+                                        if !buf.is_empty() {
+                                            buf.pop();
+                                            if let Ok(mut g) = ta.lock() {
                                                 g.clear();
-                                                g.push_str(_buf);
+                                                g.push_str(buf);
                                             }
                                         }
                                     }
@@ -2101,25 +2331,25 @@ mod nonunix_term {
                                         // Navigation keys: no text, ignore.
                                     }
                                     KeyCode::Esc => {
-                                        _buf.clear();
-                                        if let Ok(mut g) = _ta.lock() { g.clear(); }
+                                        buf.clear();
+                                        if let Ok(mut g) = ta.lock() { g.clear(); }
                                         return RawInput::Cancel;
                                     }
                                     KeyCode::Char(c) if ctrl && c == 'c' => {
-                                        _buf.clear();
-                                        if let Ok(mut g) = _ta.lock() { g.clear(); }
+                                        buf.clear();
+                                        if let Ok(mut g) = ta.lock() { g.clear(); }
                                         return RawInput::Interrupt;
                                     }
                                     KeyCode::Char(c) if ctrl && c == 'd' => {
-                                        _buf.clear();
-                                        if let Ok(mut g) = _ta.lock() { g.clear(); }
+                                        buf.clear();
+                                        if let Ok(mut g) = ta.lock() { g.clear(); }
                                         return RawInput::Eof;
                                     }
                                     KeyCode::Char(c) => {
-                                        _buf.push(c);
-                                        if let Ok(mut g) = _ta.lock() {
+                                        buf.push(c);
+                                        if let Ok(mut g) = ta.lock() {
                                             g.clear();
-                                            g.push_str(_buf);
+                                            g.push_str(buf);
                                         }
                                     }
                                     _ => {}
@@ -2140,13 +2370,13 @@ mod nonunix_term {
                                 for ch in text.chars() {
                                     match ch {
                                         '\r' => continue, // drop CR; keep LF
-                                        '\n' => _buf.push('\n'),
-                                        c => _buf.push(c),
+                                        '\n' => buf.push('\n'),
+                                        c => buf.push(c),
                                     }
                                 }
-                                if let Ok(mut g) = _ta.lock() {
+                                if let Ok(mut g) = ta.lock() {
                                     g.clear();
-                                    g.push_str(_buf);
+                                    g.push_str(buf);
                                 }
                             }
                             crossterm::event::Event::Resize(_, _) => {
