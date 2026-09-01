@@ -1159,17 +1159,21 @@ impl StreamingRenderer {
     /// so it renders now rather than waiting for the next newline or `finalize`.
     /// Idempotent; does NOT close open blocks (unlike `finalize`), so it's safe
     /// to call on every incremental redraw.
+    ///
+    /// Crucially this must NOT flush a table that is still being streamed: the
+    /// streamdown parser only emits `TableEnd` once the whole table block has
+    /// been seen, so a partially-received table still has rows buffered with no
+    /// `TableEnd`. Flushing those (incomplete) rows here would render a
+    /// half-built table and then clear the buffer — and the *next* row would be
+    /// flushed as a second tiny table, fragmenting the whole thing into one
+    /// table per row (the "three single-column tables" bug). An incomplete
+    /// table is instead flushed exactly once, intact, by `finalize()` at the
+    /// turn boundary.
     pub fn flush_pending_line(&mut self) -> String {
         let start = self.out.len();
         if !self.pending_line.is_empty() {
             let line = std::mem::take(&mut self.pending_line);
             self.push_line(line.trim_end_matches('\n'));
-        }
-        // A re-rendered table (e.g. inside an md fence) whose last row isn't
-        // followed by a blank line never gets a `TableEnd` from the parser.
-        // Emit any buffered rows so the table renders rather than vanishing.
-        if !self.table_rows.is_empty() {
-            self.flush_table();
         }
         self.out[start..].to_string()
     }
@@ -2074,6 +2078,33 @@ mod incremental_tests {
             screen.pop();
         }
         screen
+    }
+
+    // Regression: a table streamed incrementally (the path `/markup_demo` and
+    // the TTY REPL use) must render as ONE aligned grid, not one tiny table per
+    // row. The streamdown parser only emits `TableEnd` once the whole table has
+    // been seen; `flush_pending_line` (called on every incremental redraw) must
+    // NOT flush/empty the still-buffered rows, or each arriving row becomes its
+    // own 1-row table ("three single-column tables"). The incomplete table is
+    // flushed exactly once, intact, by `finalize()` at the turn boundary.
+    #[test]
+    fn incremental_table_not_fragmented_into_per_row_tables() {
+        // The exact table from `/markup_demo`.
+        let md = "### A table\n\n| Language | Paradigm | Typed |\n| :--- | :---: | ---: |\n| Rust | multi | static |\n| JS | multi | dynamic |\n\nSee [the docs](https://example.com) for more.\n";
+        // Drive it exactly like the TTY `markup_demo` does: 8-byte slices,
+        // replayed onto a fake cell-terminal so we assert what's *visible*.
+        let frames = stream_markdown(md, false, 8);
+        let screen = replay_frames_to_lines(&frames, 80);
+        let rendered = screen.join("\n");
+        // One table only: a single top border, a single bottom border.
+        assert_eq!(rendered.matches("┌─").count(), 1, "expected one table, got:\n{rendered}");
+        assert_eq!(rendered.matches("└─").count(), 1, "expected one table, got:\n{rendered}");
+        // Header + both body rows present, merged into that one table.
+        assert!(rendered.contains("Language"), "header missing: {rendered}");
+        assert!(rendered.contains("Rust"), "row 1 missing: {rendered}");
+        assert!(rendered.contains("JS"), "row 2 missing: {rendered}");
+        // No per-row table fragments (each would have its own `┌─`).
+        assert!(!rendered.contains("│ Rust │"), "Rust row rendered as its own table: {rendered}");
     }
 
     // Regression: two 8-byte chunks must render as ONE continuous line on the

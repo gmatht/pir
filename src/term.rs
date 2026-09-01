@@ -376,6 +376,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "/jobs",
     "/login",
     "/logout",
+    "/markup_demo",
     "/model",
     "/model*",
     "/models",
@@ -410,6 +411,7 @@ const SLASH_HELP: &[(&str, &str, &str)] = &[
     ("/jobs", "", "list background jobs"),
     ("/login", "<provider>", "store an API key for a provider"),
     ("/logout", "<provider>", "remove a stored provider credential"),
+    ("/markup_demo", "", "render a canned markdown + code demo reply"),
     ("/model", "<sel>", "switch the model for this session"),
     ("/model*", "<sel>", "switch model in all open pir terminals"),
     ("/models", "", "list available models"),
@@ -748,10 +750,10 @@ pub fn read_line(prompt: &str) -> Option<String> {
         }
     })
     // A pasted multiline block is delivered line-by-line; coalesce a fast
-    // burst into a single prompt instead of one prompt per pasted line
-    // (see `coalesce_paste`). On Unix rustyline's bracketed-paste handling
+    // burst into a single editable prompt instead of one prompt per pasted
+    // line (see `coalesce_paste`). On Unix rustyline's bracketed-paste handling
     // already coalesces, so there it is a no-op.
-    .map(coalesce_paste)
+    .map(|acc| coalesce_paste(prompt, acc))
 }
 
 /// How long to wait after a finished line for *more* input before treating the
@@ -793,28 +795,84 @@ where
     acc
 }
 
+/// Like [`coalesce`] but also reports whether the debounce window fired and
+/// extra lines were folded in. The `bool` (`true` when a burst was merged) lets
+/// `coalesce_paste` distinguish a pasted multiline block from a single typed
+/// line, so it knows whether to re-present the buffer in one multi-line
+/// editing session (vs. submitting the one line as-is).
+fn coalesce_with_more<F, G>(mut acc: String, mut has_more: F, mut read_more: G) -> (String, bool)
+where
+    F: FnMut() -> bool,
+    G: FnMut() -> Option<String>,
+{
+    let mut burst = false;
+    loop {
+        if !has_more() {
+            break;
+        }
+        match read_more() {
+            Some(extra) if !extra.is_empty() => {
+                burst = true;
+                acc.push('\n');
+                acc.push_str(&extra);
+            }
+            _ => break,
+        }
+    }
+    (acc, burst)
+}
+
 /// Windows only: after the first line, wait up to PASTE_DEBOUNCE_MS for more
 /// input. If another line arrives within that window (the signature of a paste,
 /// as opposed to a person pressing Enter at human speed), keep appending it
-/// (joined by a newline) so a pasted block becomes one prompt. Implemented via
-/// crossterm's event poll + rustyline's own buffered reader, so it does not
-/// matter whether the terminal emits a single `Event::Paste` or one `Enter` per
-/// pasted line. (rustyline already owns the stdin reader, so we continue reading
-/// from it rather than re-entering crossterm -- re-entering would re-enable
-/// bracketed paste and block waiting for a real Enter that isn't coming.)
+/// (joined by a newline) so a pasted block is gathered as one buffer.
+///
+/// Crucially, we do NOT read each extra line with its own `readline("")` call.
+/// rustyline's idle editor is single-line: a standalone `readline` call only
+/// lets the cursor travel within the *last* visual line, so backspacing past
+/// the start of the last line (into the earlier pasted lines) silently stops —
+/// the exact bug this fixes. Instead we collect the whole pasted block into one
+/// string and re-present it in a single editing session via
+/// `readline_with_initial`, where the cursor and backspace can cross every line
+/// boundary just like normal typing. Implemented via crossterm's event poll +
+/// rustyline's own buffered reader, so it does not matter whether the terminal
+/// emits a single `Event::Paste` or one `Enter` per pasted line. (rustyline
+/// already owns the stdin reader, so we continue reading from it rather than
+/// re-entering crossterm -- re-entering would re-enable bracketed paste and
+/// block waiting for a real Enter that isn't coming.)
 #[cfg(not(unix))]
-fn coalesce_paste(acc: String) -> String {
+fn coalesce_paste(prompt: &str, acc: String) -> String {
     use std::time::Duration;
-    coalesce(
+    let (merged, more) = coalesce_with_more(
         acc,
         || matches!(crossterm::event::poll(Duration::from_millis(PASTE_DEBOUNCE_MS)), Ok(true)),
         || EDITOR.with(|e| e.borrow_mut().as_mut().and_then(|rl| rl.readline("").ok())),
-    )
+    );
+    if !more {
+        // Nothing more arrived within the debounce window: this is a normal
+        // (single or pasted) entry. Hand it back as-is so it submits through the
+        // original `readline` session (which already owns the cursor/history).
+        return merged;
+    }
+    // The rest of a paste arrived. Re-present the whole block in ONE editing
+    // session so the cursor can move/backspace across all lines. `readline`
+    // would append it to history with no chance to edit; `readline_with_initial`
+    // keeps it editable. The prompt is echoed (alongside the buffer) and the
+    // caret is placed at the end so the user can keep typing or press Enter.
+    EDITOR.with(|e| {
+        let mut g = e.borrow_mut();
+        match g.as_mut() {
+            Some(rl) => rl
+                .readline_with_initial(prompt, (&merged, ""))
+                .unwrap_or(merged),
+            None => merged,
+        }
+    })
 }
 
 /// Unix: rustyline handles bracketed paste natively, so no coalescing needed.
 #[cfg(unix)]
-fn coalesce_paste(line: String) -> String {
+fn coalesce_paste(_prompt: &str, line: String) -> String {
     line
 }
 
