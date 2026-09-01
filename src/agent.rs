@@ -1200,6 +1200,24 @@ impl Agent {
                 break;
             }
 
+            // Light-model completion backstop: the big model sometimes ends a
+            // turn with a summary but forgets to mark the goal complete (or
+            // keeps answering without tool calls). Before running another step,
+            // ask the cheap model whether the objective is actually met. If it
+            // says complete, mark the goal done and stop; if it says incomplete,
+            // keep driving. A `None` (light model unavailable) means we trust
+            // the big model's own `update_goal` status and just continue.
+            let maybe_done = self.evaluate_goal_complete();
+            if maybe_done == Some(true) {
+                if let Some(s) = self.goal_store.as_mut() {
+                    s.goal.status = crate::goal::GoalStatus::Complete;
+                    s.save();
+                }
+                self.refresh_system();
+                out.push_str("light model confirms the goal is complete — marking done and stopping\n");
+                break;
+            }
+
             let prompt = format!(
                 "[continue goal] Next step: {pending}\n\
                  Work on it now. If the plan changed, revise the goal with update_goal, \
@@ -1215,8 +1233,27 @@ impl Agent {
             }
             let delta = self.usage.output - before;
             if delta == 0 {
-                // Model produced no tool calls and nothing progressed.
-                out.push_str("model yielded without further progress; stopping\n");
+                // Model produced no tool calls and nothing progressed. Ask the
+                // light model whether the goal is nonetheless complete; if so,
+                // mark it done and stop. Otherwise the goal is genuinely stuck
+                // (e.g. the model is waiting or looping), so we stop rather than
+                // spinning forever.
+                match self.evaluate_goal_complete() {
+                    Some(true) => {
+                        if let Some(s) = self.goal_store.as_mut() {
+                            s.goal.status = crate::goal::GoalStatus::Complete;
+                            s.save();
+                        }
+                        self.refresh_system();
+                        out.push_str("light model confirms the goal is complete — marking done\n");
+                    }
+                    Some(false) => {
+                        out.push_str("model yielded without progress and goal not complete; stopping\n");
+                    }
+                    None => {
+                        out.push_str("model yielded without further progress; stopping\n");
+                    }
+                }
                 break;
             }
         }
@@ -1240,6 +1277,19 @@ impl Agent {
             }
         }
         out
+    }
+
+    /// Ask the cheap light model whether the active goal is complete yet, as a
+    /// backstop for `drive_goal`. Returns `Some(true)` when the light model
+    /// judges the objective met, `Some(false)` when not, and `None` when the
+    /// light model is unavailable or there's no transcript to judge. The result
+    /// is never authoritative on its own — `drive_goal` still trusts the big
+    /// model's `update_goal` status when the light model can't be reached.
+    fn evaluate_goal_complete(&self) -> Option<bool> {
+        let store = self.goal_store.as_ref()?;
+        let summary = store.goal.summary();
+        let log = store.path().clone();
+        crate::titler::goal_complete_now(&log, &summary)
     }
 
     /// Return a plaintext snapshot of the active goal (used by `/goal` and the

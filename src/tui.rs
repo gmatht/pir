@@ -1303,6 +1303,11 @@ fn handle_command(
             } else {
                 agent.start_goal(&obj);
                 state.push(ConvKind::System, &format!("goal started: {obj}"));
+                // Drive the goal to completion on the foreground worker (same as
+                // /continue), the light model as a completion backstop. The
+                // worker returns the agent when the goal is terminal, so control
+                // comes back here once it's done/blocked.
+                state.push(ConvKind::System, &agent.continue_goal());
             }
         }
         "continue" | "cont" => {

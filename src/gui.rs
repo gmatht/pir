@@ -1129,6 +1129,11 @@ fn handle_command(
             } else {
                 agent.start_goal(&obj);
                 s.push(ConvKind::System, &format!("goal started: {obj}"));
+                // Drive the goal to completion (same as /continue); the cheap
+                // light model is a completion backstop. Blocks the GUI main
+                // thread for the duration, like /continue.
+                let out = agent.continue_goal();
+                s.push(ConvKind::System, &out);
             }
         }
         "continue" | "cont" => {

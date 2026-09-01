@@ -343,22 +343,17 @@ fn block_text(v: &Value) -> String {
 /// "error:<msg>") into a canonical verdict from [`VERDICTS`], given the last
 /// exchange. Returns `None` on any failure — callers treat that as "skip",
 /// never as a hard error (the structural status is still available).
-fn classify_verdict(
-    log: &Path,
-    outcome: &str,
-    api_kind: config::ApiKind,
-    base_url: &str,
-    api_key: &str,
-    model_id: &str,
-) -> Option<String> {
-    let (last_user, last_asst) = last_exchange(log)?;
-    let u = last_user.chars().take(300).collect::<String>();
-    let a = last_asst.chars().take(600).collect::<String>();
-
-    let system = "You classify how a coding-agent turn ended. Reply with EXACTLY ONE word from this list: complete, waiting, retry, blocked, error.\n- complete: the task was finished and a result/summary was given.\n- waiting: the assistant ended by asking the user a question or explicitly needs more input from them.\n- retry: something failed and the user should retry or fix it.\n- blocked: a tool call, permission, or security policy blocked the action.\n- error: a tool or the model returned an error.\nNo other words, no quotes, no punctuation.";
-    let user = format!(
-        "Turn outcome hint: {outcome}\nLast user prompt: {u}\nLast assistant message: {a}\n\nVerdict:"
-    );
+/// POST `system`+`user` to the light model and return its raw first word
+/// (lower-cased, trimmed of punctuation/quotes), or `None` on any failure.
+/// Shared by the light-model classifiers so they never duplicate the HTTP
+/// boilerplate.
+fn call_light(system: &str, user: &str) -> Option<String> {
+    let providers = config::load_providers().unwrap_or_default();
+    let (prov, model) = config::resolve_light_model(&providers)?;
+    let base_url = prov.model_base_url(&model).unwrap_or("").to_string();
+    let api_kind = prov.model_api(&model).unwrap_or(config::ApiKind::OpenAi);
+    let api_key = prov.api_key()?;
+    let model_id = model.id.clone();
 
     let body = json!({
         "model": model_id,
@@ -389,7 +384,7 @@ fn classify_verdict(
     let mut req = agent.post(&url);
     req = match api_kind {
         config::ApiKind::Anthropic => req
-            .set("x-api-key", api_key)
+            .set("x-api-key", &api_key)
             .set("anthropic-version", "2023-06-01"),
         config::ApiKind::OpenAi => req.set("Authorization", &format!("Bearer {api_key}")),
     };
@@ -411,7 +406,59 @@ fn classify_verdict(
             .map(str::to_string),
     };
     let raw = raw?;
-    Some(clean_verdict(&raw, outcome))
+    let t = raw.trim().to_lowercase();
+    Some(
+        t.split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_string(),
+    )
+}
+
+fn classify_verdict(
+    log: &Path,
+    outcome: &str,
+    _api_kind: config::ApiKind,
+    _base_url: &str,
+    _api_key: &str,
+    _model_id: &str,
+) -> Option<String> {
+    let (last_user, last_asst) = last_exchange(log)?;
+    let u = last_user.chars().take(300).collect::<String>();
+    let a = last_asst.chars().take(600).collect::<String>();
+
+    let system = "You classify how a coding-agent turn ended. Reply with EXACTLY ONE word from this list: complete, waiting, retry, blocked, error.\n- complete: the task was finished and a result/summary was given.\n- waiting: the assistant ended by asking the user a question or explicitly needs more input from them.\n- retry: something failed and the user should retry or fix it.\n- blocked: a tool call, permission, or security policy blocked the action.\n- error: a tool or the model returned an error.\nNo other words, no quotes, no punctuation.";
+    let user = format!(
+        "Turn outcome hint: {outcome}\nLast user prompt: {u}\nLast assistant message: {a}\n\nVerdict:"
+    );
+
+    let first = call_light(system, &user)?;
+    Some(clean_verdict(&first, outcome))
+}
+
+/// Decide (with the cheap light model) whether the active goal is actually
+/// complete yet, independent of whatever status the big model last set. Used by
+/// `drive_goal` as a backstop so a goal keeps running until it's genuinely done
+/// (the big model sometimes stops with a summary but forgets to mark the goal
+/// complete). Returns `Some(true)` when the light model judges the objective
+/// met, `Some(false)` when not, and `None` when the light model is unavailable
+/// or errors (callers then trust the big `update_goal` status).
+///
+/// Synchronous (blocks briefly on the light model) like [`classify_now`], so the
+/// driver can act on the result immediately before deciding to loop again.
+pub fn goal_complete_now(log: &Path, goal_summary: &str) -> Option<bool> {
+    let (last_user, last_asst) = last_exchange(log)?;
+    let u = last_user.chars().take(300).collect::<String>();
+    let a = last_asst.chars().take(1000).collect::<String>();
+
+    let system = "You judge whether a coding-agent's GOAL is complete. You are given the goal plan/status and the last assistant message. Reply with EXACTLY ONE word: 'complete' or 'incomplete'.\n- complete: every step is done and the objective is satisfied (or nothing remains to do).\n- incomplete: steps are undone, the objective isn't met, or the assistant is still mid-work / waiting.\nNo other words, no quotes, no punctuation.";
+    let user = format!(
+        "GOAL PLAN / STATUS:\n{goal_summary}\n\nLast user prompt: {u}\nLast assistant message: {a}\n\nIs the goal complete? (complete or incomplete):"
+    );
+
+    let first = call_light(system, &user)?;
+    Some(first == "complete" || first.starts_with("complet"))
 }
 
 /// Normalize a light-model verdict into a canonical token, falling back to the

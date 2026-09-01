@@ -2326,6 +2326,13 @@ fn handle_command(
             } else {
                 agent.start_goal(&obj);
                 println!("goal started: {}", obj);
+                // Keep running until the goal reaches a terminal state. The
+                // driver loops, prompting the model with the next pending step
+                // (and using the cheap light model as a completion backstop), so
+                // `/goal <objective>` drives the work to done/blocked on its own.
+                // Each `update_goal` persists, so it is also resumable with
+                // `pir -c` if interrupted.
+                println!("{}", agent.continue_goal());
             }
         }
         "thinking" => {
