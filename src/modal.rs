@@ -12,13 +12,28 @@
 //! `event::read` so arrows/Enter/Esc work uniformly across dialogs.
 
 use crate::config::ApiKind;
+use crate::term;
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use std::io::{self, Write};
+use std::sync::Mutex;
+use std::time::Duration;
+
+/// The previously drawn modal frame (its vertical extent + exact bytes sent).
+/// Used to repaint only when the frame actually changed: clearing just the
+/// previous/current box rectangle (not the whole screen) and skipping identical
+/// frames is what stops the menu/list flicker when you move the selection
+/// within a non-scrolling list.
+struct PrevFrame {
+    top: usize,
+    bottom: usize,
+    out: String,
+}
+static PREV_FRAME: Mutex<Option<PrevFrame>> = Mutex::new(None);
 
 /// A key the user pressed in a modal dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,9 +80,24 @@ impl Modal {
         if execute!(stdout, EnterAlternateScreen, Hide).is_err() {
             return None;
         }
+        // Blank the alternate screen *once*, now, so the first frame starts from
+        // a clean slate. A per-frame `ESC[2J` is what caused the menu flicker
+        // (every keypress cleared + repainted the whole screen), so the draw
+        // functions never do that — they only clear the small box region. Also
+        // drop any frame cached from a previous modal so the first repaint
+        // compares against nothing.
+        let _ = stdout.write_all(b"\x1b[2J\x1b[H");
+        let _ = stdout.flush();
+        *PREV_FRAME.lock().unwrap() = None;
         if enable_raw_mode().is_err() {
             let _ = execute!(stdout, LeaveAlternateScreen, Show);
             return None;
+        }
+        // Drain any keypresses that were queued *before* the modal opened — e.g.
+        // the Enter that submitted `/menu` — so they can't be misread as a menu
+        // selection (which made `/menu` skip straight to the first item).
+        while event::poll(Duration::ZERO).unwrap_or(false) {
+            let _ = event::read();
         }
         Some(Modal { active: true })
     }
@@ -91,7 +121,14 @@ impl Drop for Modal {
 pub fn read_key() -> Option<Key> {
     loop {
         match event::read() {
-            Ok(Event::Key(KeyEvent { code, modifiers, .. })) => {
+            Ok(Event::Key(KeyEvent { code, modifiers, kind, .. })) => {
+                // Ignore key-release events: a release (e.g. the Enter key-up
+                // that follows submitting `/menu`) must never be treated as a
+                // press — that made the menu skip straight to the first item.
+                // Press and Repeat are both accepted (holding a key repeats).
+                if kind == KeyEventKind::Release {
+                    continue;
+                }
                 return Some(translate_key(code, modifiers));
             }
             Ok(Event::Resize(_, _)) => return Some(Key::Resize),
@@ -139,6 +176,11 @@ fn translate_key(code: KeyCode, mods: KeyModifiers) -> Key {
 /// Draw a simple centered box with a title and body lines on the alternate
 /// screen. `lines` are written verbatim (callers apply their own styling).
 /// Returns the number of rows drawn (for cursor restore).
+///
+/// Repaints only when the frame changed: it clears just the union of the
+/// previous and current box rectangles (not the whole screen), so moving the
+/// selection within a list that fits without scrolling no longer flashes the
+/// entire screen on every keypress. An identical frame is skipped entirely.
 pub fn draw_box(title: &str, lines: &[String]) -> usize {
     let w = crate::term::terminal_width();
     let h = crate::term::terminal_height();
@@ -146,10 +188,9 @@ pub fn draw_box(title: &str, lines: &[String]) -> usize {
     let body_h = lines.len().min(h.saturating_sub(4).max(1));
     let top = (h.saturating_sub(body_h + 2)) / 2;
     let left = (w.saturating_sub(body_w + 2)) / 2;
+    let bottom = top + 1 + body_h;
 
     let mut out = String::new();
-    // Clear the alternate screen.
-    out.push_str("\x1b[2J");
     // Title bar.
     let title = truncate(title, body_w);
     out.push_str(&format!("\x1b[{};{}H┌─ {} ─", top, left, title));
@@ -172,7 +213,6 @@ pub fn draw_box(title: &str, lines: &[String]) -> usize {
         out.push_str("│");
     }
     // Bottom border.
-    let bottom = top + 1 + body_h;
     out.push_str(&format!("\x1b[{};{}H└", bottom, left));
     for _ in 0..body_w + 2 {
         out.push('─');
@@ -180,9 +220,8 @@ pub fn draw_box(title: &str, lines: &[String]) -> usize {
     out.push_str("┘");
     // Move cursor to a safe spot.
     out.push_str(&format!("\x1b[{};{}H", bottom + 1, left));
-    let _ = io::stdout().write_all(out.as_bytes());
-    let _ = io::stdout().flush();
-    body_h + 2
+
+    paint_frame(top, bottom, &out)
 }
 
 /// Draw a centered box showing a *viewport* of `lines`: the first visible
@@ -190,6 +229,10 @@ pub fn draw_box(title: &str, lines: &[String]) -> usize {
 /// long content with the arrow keys (up/down = vertical, left/right = horizontal).
 /// `footer` is printed on the line directly below the box (use it for control
 /// hints). Returns the number of rows drawn (for cursor restore).
+///
+/// Repaints only when the frame changed (see [`draw_box`]): it clears just the
+/// union of the previous and current box rectangles, so the menu/list no longer
+/// flickers when you move the selection or scroll within a viewport.
 pub fn draw_box_scrolled(title: &str, lines: &[String], top: usize, left: usize, footer: &str) -> usize {
     let w = crate::term::terminal_width();
     let h = crate::term::terminal_height();
@@ -198,10 +241,9 @@ pub fn draw_box_scrolled(title: &str, lines: &[String], top: usize, left: usize,
     let body_h = lines.len().min(max_rows);
     let top_row = (h.saturating_sub(body_h + 2)) / 2;
     let left_col = (w.saturating_sub(body_w + 2)) / 2;
+    let bottom = top_row + 1 + body_h;
 
     let mut out = String::new();
-    // Clear the alternate screen.
-    out.push_str("\x1b[2J");
     // Title bar.
     let title = truncate(title, body_w);
     out.push_str(&format!("\x1b[{};{}H┌─ {} ─", top_row, left_col, title));
@@ -225,7 +267,6 @@ pub fn draw_box_scrolled(title: &str, lines: &[String], top: usize, left: usize,
         out.push_str("│");
     }
     // Bottom border.
-    let bottom = top_row + 1 + body_h;
     out.push_str(&format!("\x1b[{};{}H└", bottom, left_col));
     for _ in 0..body_w + 2 {
         out.push('─');
@@ -234,10 +275,46 @@ pub fn draw_box_scrolled(title: &str, lines: &[String], top: usize, left: usize,
     // Footer (control hints) + cursor to a safe spot.
     let footer = truncate(footer, body_w);
     out.push_str(&format!("\x1b[{};{}H{}", bottom + 1, left_col, footer));
-    out.push_str(&format!("\x1b[{};{}H", bottom + 2, left_col));
-    let _ = io::stdout().write_all(out.as_bytes());
+    out.push_str(&format!("\x1b[{};{}H", bottom, left_col));
+
+    paint_frame(top_row, bottom, &out)
+}
+
+/// Emit a freshly built box `out` for the vertical span `[top, bottom]`, but
+/// only when it differs from the previous frame. We clear the *union* of the
+/// previous and current box rectangles (rewriting each row of that span from
+/// column 1 to the right edge with spaces) instead of `ESC[2J`, which blanks
+/// the entire alternate screen and is what caused the flicker: a no-op
+/// keypress (e.g. Up at the top of a list) used to clear+repaint the whole
+/// screen, whereas now only the small box region is touched — and when the
+/// frame is byte-for-byte identical (the common "I pressed a key but nothing
+/// moved" case) we skip writing anything at all.
+fn paint_frame(top: usize, bottom: usize, out: &str) -> usize {
+    let mut prev = PREV_FRAME.lock().unwrap();
+    if let Some(p) = prev.as_ref() {
+        if p.out == out {
+            // Unchanged frame: nothing to do. Return the previous extents so the
+            // caller's cursor math stays consistent.
+            return p.bottom.saturating_sub(p.top);
+        }
+    }
+    let w = crate::term::terminal_width().max(2);
+    let clear_top = prev.as_ref().map(|p| p.top).unwrap_or(top).min(top);
+    let clear_bottom = prev.as_ref().map(|p| p.bottom).unwrap_or(bottom).max(bottom);
+    let mut buf = String::new();
+    buf.push_str("\x1b[?25l"); // hide cursor during repaint
+    for row in clear_top..=clear_bottom {
+        buf.push_str(&format!("\x1b[{};1H", row));
+        for _ in 0..w {
+            buf.push(' ');
+        }
+    }
+    buf.push_str(out);
+    buf.push_str("\x1b[?25h"); // restore cursor
+    let _ = io::stdout().write_all(buf.as_bytes());
     let _ = io::stdout().flush();
-    body_h + 2
+    *prev = Some(PrevFrame { top, bottom, out: out.to_string() });
+    bottom.saturating_sub(top)
 }
 
 /// Run a simple dismiss-only dialog that also supports scrolling: draw `lines`
@@ -307,6 +384,7 @@ pub enum MenuAction {
     Thinking,
     Security,
     Settings,
+    Worktrees,
     Help,
     About,
     Quit,
@@ -324,6 +402,7 @@ pub fn main_menu() -> Option<MenuAction> {
         ("t", "Thinking"),
         ("s", "Security"),
         ("e", "Settings"),
+        ("w", "Worktrees by default"),
         ("h", "Help"),
         ("a", "About"),
         ("q", "Quit"),
@@ -363,6 +442,7 @@ fn action_for(key: &str) -> MenuAction {
         "t" => MenuAction::Thinking,
         "s" => MenuAction::Security,
         "e" => MenuAction::Settings,
+        "w" => MenuAction::Worktrees,
         "h" => MenuAction::Help,
         "a" => MenuAction::About,
         "q" => MenuAction::Quit,
@@ -502,6 +582,7 @@ pub fn about_dialog() -> Option<()> {
 }
 
 /// A session row shown in the backgrounded-session selector.
+#[derive(Debug, Clone)]
 pub struct SessionRow {
     pub name: String,
     pub preview: String,
@@ -561,6 +642,160 @@ pub fn session_selector(rows: &[SessionRow]) -> Option<SessionPick> {
             }
             Key::Char('r') => return Some(SessionPick::Resume(selected)),
             Key::Esc | Key::CtrlC | Key::CtrlD | Key::Char('q') => return Some(SessionPick::Cancel),
+            _ => {}
+        }
+    }
+}
+
+/// Show a model picker on the alternate screen. `providers` is the catalog in
+/// `/models` order; `current` is the active `provider/model` label (e.g.
+/// `openai/gpt-fake`) to highlight, or `""` for none. Returns the chosen flat
+/// index into the provider→model list (matches `config::select(":N")`), or
+/// `None` if not a tty / the list is empty / cancelled.
+pub fn model_picker(providers: &[crate::config::Provider], current: &str) -> Option<usize> {
+    let _modal = Modal::enter()?;
+    let mut rows: Vec<(usize, String, String, bool)> = Vec::new();
+    let mut idx = 0usize;
+    for p in providers {
+        for m in &p.models {
+            let label = m.name.clone().unwrap_or_else(|| m.id.clone());
+            rows.push((idx, p.pid(), label, format!("{}/{}", p.pid(), m.id) == current));
+            idx += 1;
+        }
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    let mut selected = rows.iter().position(|r| r.3).unwrap_or(0);
+    loop {
+        let w = rows.iter().map(|r| r.1.chars().count()).max().unwrap_or(8).min(24);
+        let lines: Vec<String> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (ix, pid, label, cur))| {
+                let marker = if i == selected { "▸" } else { " " };
+                let cur_mark = if *cur { term::green("  •current") } else { String::new() };
+                format!("{marker} {:>3}  {:<w$}  {}{}  ", ix, term::cyan(&**pid), label, cur_mark)
+            })
+            .collect();
+        draw_box("pir — choose model", &lines);
+        match read_key()? {
+            Key::Up | Key::Char('k') => selected = selected.saturating_sub(1),
+            Key::Down | Key::Char('j') => selected = (selected + 1).min(rows.len() - 1),
+            Key::Home => selected = 0,
+            Key::End => selected = rows.len() - 1,
+            Key::Enter | Key::Right => return Some(rows[selected].0),
+            Key::Esc | Key::CtrlC | Key::CtrlD => return None,
+            _ => {}
+        }
+    }
+}
+
+/// The editable security-options dialog (opened from the menu's Security
+/// item). Arrow through the rows, `←/→` (or `h`/`l`) cycles the value, `s` or
+/// Enter saves to `security.toml` (takes effect for new sessions), `q`/Esc
+/// discards. Mutates `policy` only when the user saves.
+pub fn security_editor(policy: &mut crate::security::SecurityPolicy) -> Option<()> {
+    let _modal = Modal::enter()?;
+
+    let mut level = policy.level;
+    let mut apt = policy.apt;
+    let mut network = policy.network;
+    let mut ask = policy.ask;
+    let mut read = policy.read;
+    let mut quarantine = policy.quarantine;
+    let mut quarantine_project = policy.quarantine_project;
+
+    let levels = ["guard", "off", "sandbox", "strict", "worktree"];
+    let apts = ["auto", "human", "stage", "project"];
+    let networks = ["on", "allowlist", "off"];
+    let asks = ["ask", "auto-yes", "auto-no"];
+    let reads = ["open", "guarded-secrets"];
+
+    let spin = |cur: &str, arr: &[&str], dir: i32| -> String {
+        let i = arr.iter().position(|s| *s == cur).unwrap_or(0);
+        let n = arr.len();
+        arr[((i as i32 + dir).rem_euclid(n as i32)) as usize].to_string()
+    };
+    let yn = |b: bool| -> String { if b { term::green("on") } else { term::yellow("off") } };
+
+    let mut selected = 0usize; // 0 level, 1 quarantine, 2 quarantine-project, 3 apt, 4 network, 5 ask, 6 read
+    loop {
+        let marker = |i: usize| if i == selected { "▸" } else { " " };
+        let lines: Vec<String> = vec![
+            format!("{} level             {}", marker(0), term::cyan(level.as_str())),
+            format!("{} write-quarantine   {}", marker(1), yn(quarantine)),
+            format!("{} project-quarantine {}", marker(2), yn(quarantine_project)),
+            format!("{} apt                {}", marker(3), term::cyan(apt.as_str())),
+            format!("{} network            {}", marker(4), term::cyan(network.as_str())),
+            format!("{} ask                {}", marker(5), term::cyan(ask.as_str())),
+            format!("{} read               {}", marker(6), term::cyan(read.as_str())),
+            String::new(),
+            term::dim("[↑/↓] move  [←/→] change  [s] save  [q] discard").into(),
+        ];
+        draw_box("pir — security options", &lines);
+        #[allow(clippy::too_many_arguments)]
+        fn apply_spin(
+            selected: usize,
+            dir: i32,
+            spin: &dyn Fn(&str, &[&str], i32) -> String,
+            level: &mut crate::security::SecurityLevel,
+            apt: &mut crate::security::AptMode,
+            network: &mut crate::security::NetworkMode,
+            ask: &mut crate::security::AskMode,
+            read: &mut crate::security::ReadMode,
+            quarantine: &mut bool,
+            quarantine_project: &mut bool,
+        ) {
+            use crate::security::{AptMode, AskMode, NetworkMode, ReadMode, SecurityLevel};
+            match selected {
+                0 => {
+                    if let Some(l) = SecurityLevel::parse(&spin(level.as_str(), &["guard", "off", "sandbox", "strict", "worktree"], dir)) {
+                        *level = l;
+                    }
+                }
+                1 => *quarantine = !*quarantine,
+                2 => *quarantine_project = !*quarantine_project,
+                3 => {
+                    if let Some(a) = AptMode::parse(&spin(apt.as_str(), &["auto", "human", "stage", "project"], dir)) {
+                        *apt = a;
+                    }
+                }
+                4 => {
+                    if let Some(n) = NetworkMode::parse(&spin(network.as_str(), &["on", "allowlist", "off"], dir)) {
+                        *network = n;
+                    }
+                }
+                5 => {
+                    if let Some(a) = AskMode::parse(&spin(ask.as_str(), &["ask", "auto-yes", "auto-no"], dir)) {
+                        *ask = a;
+                    }
+                }
+                6 => {
+                    if let Some(r) = ReadMode::parse(&spin(read.as_str(), &["open", "guarded-secrets"], dir)) {
+                        *read = r;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match read_key()? {
+            Key::Up | Key::Char('k') => selected = selected.saturating_sub(1),
+            Key::Down | Key::Char('j') => selected = (selected + 1).min(6),
+            Key::Left | Key::Char('h') => apply_spin(selected, -1, &spin, &mut level, &mut apt, &mut network, &mut ask, &mut read, &mut quarantine, &mut quarantine_project),
+            Key::Right | Key::Char('l') => apply_spin(selected, 1, &spin, &mut level, &mut apt, &mut network, &mut ask, &mut read, &mut quarantine, &mut quarantine_project),
+            Key::Char('s') | Key::Enter => {
+                policy.level = level;
+                policy.apt = apt;
+                policy.network = network;
+                policy.ask = ask;
+                policy.read = read;
+                policy.quarantine = quarantine;
+                policy.quarantine_project = quarantine_project;
+                let _ = crate::security::save_policy(policy);
+                return Some(());
+            }
+            Key::Esc | Key::CtrlC | Key::CtrlD | Key::Char('q') => return Some(()),
             _ => {}
         }
     }
