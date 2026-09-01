@@ -607,8 +607,9 @@ thread_local! {
 
 /// Point the line editor at a history file that should be loaded on first
 /// use and appended to on every line read. Call once after choosing a
-/// session log path.
-#[cfg(unix)]
+/// session log path. Cross-platform: the rustyline editor (and its
+/// bracketed-paste-aware multiline input) is the single idle reader on every
+/// target, so Windows pastes behave exactly like Unix.
 pub fn set_history_file(path: &Path) {
     HISTORY_FILE.with(|f| *f.borrow_mut() = Some(path.to_path_buf()));
     // Eagerly create the editor so the file is loaded before the first prompt.
@@ -651,8 +652,7 @@ fn save_history(rl: &mut Editor<PirHelper, rustyline::history::DefaultHistory>) 
 /// used by the TUI's idle prompt for arrow-up/down recall. Shares the same
 /// `.history` file the streaming REPL loads into the rustyline editor, so the
 /// TUI shows the exact same previous prompts (including those from before a
-/// `pir -r` resume). Returns an empty vec when no history has been loaded yet.
-#[cfg(unix)]
+/// `pir -r` resume an empty vec when no history has been loaded yet.
 pub fn load_history_lines() -> Vec<String> {
     let lines = EDITOR.with(|e| {
         let g = e.borrow();
@@ -710,7 +710,6 @@ fn plain_read_line(prompt: &str) -> Option<String> {
 /// Append a line to the per-session history so prompts typed *while a turn was
 /// running* (raw mode, recorded into `typeahead` and queued) show up in the
 /// rustyline prompt's arrow-up history once we return to idle. Best-effort.
-#[cfg(unix)]
 pub fn push_history(line: &str) {
     if line.trim().is_empty() {
         return;
@@ -1972,23 +1971,12 @@ mod nonunix_term {
         l.trim_end_matches('\n').trim_end_matches('\r').to_string()
     }
     pub fn read_secret(prompt: &str) -> String { read_answer(prompt) }
-    pub fn read_line(_p: &str) -> Option<String> {
-        let mut l = String::new();
-        match io::stdin().lock().read_line(&mut l) {
-            Ok(0) => None,
-            Ok(_) => Some(l.trim_end_matches('\n').trim_end_matches('\r').to_string()),
-            Err(_) => None,
-        }
-    }
-    pub fn set_history_file(_p: &std::path::Path) {}
-    pub fn load_history_lines() -> Vec<String> { Vec::new() }
-    pub fn push_history(_l: &str) {}
     pub fn parent_shell_pid() -> u32 { 0 }
 
     pub struct Spinner;
     impl Spinner {
         pub fn start(_label: &str, _ta: Arc<Mutex<String>>, _e: bool) -> Spinner { Spinner }
-        pub fn start_with(_label: &str, _ta: Arc<Mutex<String>>, _e: bool, _d: smol::channel::Receiver<()>) -> Spinner { Spinner }
+        pub fn start_with(_label: &str, _ta: Arc<Mutex<String>>, _e: bool, _q: Arc<std::sync::atomic::AtomicBool>) -> Spinner { Spinner }
         pub fn stop(&mut self) {}
     }
 
