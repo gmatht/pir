@@ -1624,8 +1624,17 @@ lone typed Enter leaves only its key-*up* (filtered out), so the burst ends
 immediately — which is what keeps it from regressing into the old "press Enter
 twice" bug (the previous `coalesce_paste` polled via crossterm and saw the
 buffered key-up, spinning up a nested `readline("")` that waited for a second
-Enter). Once more than one line is folded in, the whole block is re-presented
-via `readline_with_initial` so the cursor/backspace can cross line boundaries.
+Enter).
+
+The rest of the paste is then drained directly from the console input buffer
+(`windows_drain_paste_tail`, via `ReadConsoleInputW`) rather than with a
+per-line `readline("")`. That matters: a pasted block whose final line has no
+trailing newline would make a blocking `readline("")` hang waiting for an
+Enter that never comes, leaving the user stuck editing only the last line
+(backspace could never reach the lines above). Draining the buffer captures
+the whole block, trailing newline or not. Once more than one line has been
+folded in, the whole block is re-presented via `readline_with_initial` so the
+cursor/backspace can cross every line boundary.
 
 **Known fragility (acknowledged):** a sufficiently fast typist who presses a
 second key within the peek window of a submitted line, or an extremely slow /

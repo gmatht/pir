@@ -878,13 +878,21 @@ fn coalesce_paste(_prompt: &str, line: String) -> String {
 /// Detection uses `PeekConsoleInputW` — non-destructive, so it never consumes
 /// the events rustyline is about to read. After the first `readline` returns,
 /// if a real key press (`KEY_EVENT` with `bKeyDown` set) is still pending, the
-/// paste is ongoing: pull the next line with a fresh `readline("")` and append
-/// it, joined by `\n`. Pasted characters are themselves key-down events, so a
-/// pending key-down reliably means "more of the paste is buffered", while a
-/// lone typed Enter leaves only its key-*up* (filtered out) — so the burst ends
-/// immediately. That is exactly what kept the earlier `coalesce_paste` (which
-/// polled via crossterm and saw the buffered key-up) from mis-firing into a
-/// nested `readline("")` that waited for a second Enter.
+/// paste is ongoing: drain the remaining events directly from the console
+/// input buffer (`ReadConsoleInputW`) and fold them into the first line.
+/// Pasted characters are themselves key-down events, so a pending key-down
+/// reliably means "more of the paste is buffered", while a lone typed Enter
+/// leaves only its key-*up* (filtered out) — so the burst ends immediately.
+/// That is exactly what kept the earlier `coalesce_paste` (which polled via
+/// crossterm and saw the buffered key-up) from mis-firing into a nested
+/// `readline("")` that waited for a second Enter.
+///
+/// The tail is drained with a raw console read rather than a per-line
+/// `readline("")`: a pasted block whose final line has no trailing newline
+/// would make a blocking `readline("")` hang waiting for an Enter that never
+/// comes, leaving the user stuck editing only the last line (backspace could
+/// never reach the lines above). Draining the buffer directly captures the
+/// whole block, trailing newline or not.
 ///
 /// Once more than one line has been folded in, re-present the whole block in a
 /// single `readline_with_initial` session so the cursor and backspace can cross
@@ -892,11 +900,16 @@ fn coalesce_paste(_prompt: &str, line: String) -> String {
 /// `readline("")` cannot travel above the last visual line).
 #[cfg(not(unix))]
 fn coalesce_paste(prompt: &str, acc: String) -> String {
-    let merged = coalesce(
-        acc,
-        || windows_pending_keydown(),
-        || EDITOR.with(|e| e.borrow_mut().as_mut().and_then(|rl| rl.readline("").ok())),
-    );
+    if !windows_pending_keydown() {
+        return acc;
+    }
+    let tail = windows_drain_paste_tail();
+    let mut merged = acc;
+    if !tail.is_empty() {
+        merged.push('\n');
+        merged.push_str(&tail);
+    }
+    let merged = merged.trim_end_matches('\n').to_string();
     if !merged.contains('\n') {
         return merged;
     }
@@ -971,6 +984,74 @@ fn peek_keydown() -> bool {
         }
     }
     false
+}
+
+/// Windows: drain the rest of a pasted block from the console input buffer,
+/// returning the text (newlines included) that follows the first line. Reads
+/// key events directly via `ReadConsoleInputW` — bounded by a short settle
+/// window, never blocking — so a final line without a trailing newline is
+/// still captured (a `readline("")` would block waiting for an Enter that
+/// never comes). Non-BMP characters (surrogate pairs) are reassembled.
+#[cfg(not(unix))]
+fn windows_drain_paste_tail() -> String {
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, INPUT_RECORD, KEY_EVENT, ReadConsoleInputW, STD_INPUT_HANDLE,
+    };
+    const BATCH: u32 = 64;
+    const SETTLE_MS: u64 = 15;
+    // SAFETY: `GetStdHandle` is a plain Win32 call with no preconditions.
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    let mut out = String::new();
+    let mut high: Option<u16> = None;
+    let mut last_activity = Instant::now();
+    loop {
+        if !peek_keydown() {
+            // No key press pending: wait out the settle window (a slow/clipped
+            // paste may deliver the next line a few ms later) and then stop.
+            if last_activity.elapsed() >= Duration::from_millis(SETTLE_MS) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+        let mut recs: [INPUT_RECORD; 64] = unsafe { std::mem::zeroed() };
+        let mut read = 0u32;
+        // SAFETY: `recs` is a valid slice of `BATCH` records and `read` is a
+        // valid out-pointer. `ReadConsoleInputW` consumes the events.
+        let ok = unsafe { ReadConsoleInputW(handle, recs.as_mut_ptr(), BATCH, &mut read) };
+        if ok == 0 || read == 0 {
+            break;
+        }
+        for j in 0..read as usize {
+            if recs[j].EventType != KEY_EVENT as u16 {
+                continue;
+            }
+            // SAFETY: guarded by the `EventType == KEY_EVENT` check above.
+            let ke = unsafe { &recs[j].Event.KeyEvent };
+            if ke.bKeyDown == 0 {
+                continue;
+            }
+            // SAFETY: `uChar` is a union; reading `UnicodeChar` is valid for a
+            // key event.
+            let ch = unsafe { ke.uChar.UnicodeChar };
+            if ke.wVirtualKeyCode == 0x0D || ch == 0x0D {
+                // VK_RETURN (Enter): line break.
+                out.push('\n');
+            } else if (0xD800..=0xDBFF).contains(&ch) {
+                high = Some(ch);
+            } else if (0xDC00..=0xDFFF).contains(&ch) {
+                if let Some(h) = high.take() {
+                    let cp = 0x10000 + (((h as u32 - 0xD800) << 10) | (ch as u32 - 0xDC00));
+                    out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                }
+            } else if ch != 0 {
+                out.push(char::from_u32(ch as u32).unwrap_or('\u{FFFD}'));
+            }
+        }
+        last_activity = Instant::now();
+    }
+    out
 }
 
 /// Append a line to the per-session history so prompts typed *while a turn was
@@ -2244,18 +2325,19 @@ mod keyboard_idle_tests {
     }
 }
 
-/// Fold a burst of lines (a multiline paste, or fast consecutive input) into a
-/// single prompt. The caller supplies `first` (the line already read), a
-/// `has_more` predicate (true while more lines of the burst are pending), and a
-/// `read_more` closure that returns the next line or `None` when the burst is
-/// exhausted. Each appended line is joined with `\n`. A `read_more` that yields
-/// an empty string ends the burst immediately (mirrors the `extra.is_empty()
-/// => break` guard in the historical `coalesce_paste`). When `has_more` is false
-/// up front, `read_more` is never consulted and `first` is returned verbatim —
-/// so a single typed line submits with no extra wait. This is the regression
-/// guard for "multiline paste still appears as multiple prompts": the ~99ms
-/// debounce means the rest of a fast paste arrives and is folded in before the
-/// text is handed to the agent.
+/// Test-only: fold a burst of lines (a multiline paste, or fast consecutive
+/// input) into a single prompt. The caller supplies `first` (the line already
+/// read), a `has_more` predicate (true while more lines of the burst are
+/// pending), and a `read_more` closure that returns the next line or `None`
+/// when the burst is exhausted. Each appended line is joined with `\n`. A
+/// `read_more` that yields an empty string ends the burst immediately. When
+/// `has_more` is false up front, `read_more` is never consulted and `first` is
+/// returned verbatim — so a single typed line submits with no extra wait. This
+/// is the regression guard for "multiline paste still appears as multiple
+/// prompts". (The production Windows path drains the console buffer directly
+/// via `windows_drain_paste_tail` instead of per-line `readline("")` calls,
+/// which would block on a final line with no trailing newline.)
+#[cfg(test)]
 fn coalesce<F, G>(first: String, mut has_more: F, mut read_more: G) -> String
 where
     F: FnMut() -> bool,
