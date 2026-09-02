@@ -94,6 +94,16 @@ pub fn stream_markdown(md: &str, color: bool, chunk_size: usize) -> Vec<String> 
     inc.frames().to_vec()
 }
 
+/// Wrap `text` in an OSC 8 terminal hyperlink to `url` (the `OSC 8` sequence is
+/// `ESC ] 8 ; ; <url> ESC \ <text> ESC ] 8 ; ; ESC \`). Terminals that support
+/// it render `text` as a clickable link exposing the hidden `url`; terminals
+/// that don't simply show `text`. Only emitted when the terminal is colour/
+/// hyperlink capable (the caller's `color` gate), with the non-capable
+/// fallback being `text [url]`.
+fn osc8_link(text: &str, url: &str) -> String {
+    format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
+}
+
 /// Default pulldown-cmark backend (always compiled; see [`render`]).
 fn render_pulldown(md: &str, color: bool) -> String {
     let mut opts = PdOptions::empty();
@@ -131,6 +141,10 @@ struct PdRenderer {
     list_stack: Vec<Option<(u64, u64)>>,
     /// Pending link URL (set on Start(Link), appended after text on End).
     pending_link: Option<String>,
+    /// Buffered inline text inside the current link, so the whole link can be
+    /// wrapped in an OSC 8 hyperlink on `End(Link)` instead of having already
+    /// been flushed to `out` piecemeal.
+    link_text: Option<String>,
     /// Table capture state (active only inside a table).
     table_active: bool,
     table_in_cell: bool,
@@ -188,13 +202,15 @@ impl PdRenderer {
         }
     }
 
-    /// Route a text/plain segment into the current table cell (if any) or the
-    /// main output.
+    /// Route a text/plain segment into the current table cell (if any), the
+    /// current link buffer (if any), or the main output.
     fn push_text(&mut self, s: &str) {
         if self.in_code {
             self.code_buf.push_str(s);
         } else if self.table_in_cell {
             self.table_cur_cell.push_str(s);
+        } else if let Some(buf) = self.link_text.as_mut() {
+            buf.push_str(s);
         } else {
             self.out.push_str(s);
         }
@@ -256,6 +272,7 @@ impl PdRenderer {
             PdTag::Strikethrough => self.open_style("\x1b[9m"),
             PdTag::Link { dest_url, .. } => {
                 self.pending_link = Some(dest_url.to_string());
+                self.link_text = Some(String::new());
             }
             PdTag::Image { title, .. } => {
                 let t = title.trim().to_string();
@@ -271,7 +288,7 @@ impl PdRenderer {
         match end {
             PdTagEnd::Heading(_) | PdTagEnd::Emphasis | PdTagEnd::Strong | PdTagEnd::Strikethrough => {
                 if self.color {
-                    self.out.push_str("\x1b[0m");
+                    self.emit("\x1b[0m");
                 }
                 if matches!(end, PdTagEnd::Heading(_)) {
                     self.out.push('\n');
@@ -333,7 +350,13 @@ impl PdRenderer {
             }
             PdTagEnd::Link => {
                 if let Some(url) = self.pending_link.take() {
-                    self.out.push_str(&format!(" [{url}]"));
+                    let text = self.link_text.take().unwrap_or_default();
+                    let text = text.trim().to_string();
+                    if self.color {
+                        self.out.push_str(&osc8_link(&text, &url));
+                    } else {
+                        self.out.push_str(&format!("{text} [{url}]"));
+                    }
                 }
             }
             PdTagEnd::Image => {}
@@ -363,7 +386,18 @@ impl PdRenderer {
 
     fn open_style(&mut self, code: &str) {
         if self.color {
-            self.out.push_str(code);
+            self.emit(code);
+        }
+    }
+
+    /// Emit `s`, routing it into the current link buffer (when inside a link,
+    /// so the whole link — including any inline emphasis — can be wrapped in a
+    /// single OSC 8 hyperlink) otherwise into the main output.
+    fn emit(&mut self, s: &str) {
+        if let Some(buf) = self.link_text.as_mut() {
+            buf.push_str(s);
+        } else {
+            self.out.push_str(s);
         }
     }
 
@@ -713,6 +747,8 @@ fn render_node<'a>(node: &'a AstNode<'a>, ctx: &RenderCtx, out: &mut String) {
                 out.push_str(url);
             } else if url == body {
                 out.push_str(&body);
+            } else if ctx.color {
+                out.push_str(&osc8_link(&body, url));
             } else {
                 out.push_str(&format!("{body} [{url}]"));
             }
@@ -1201,13 +1237,23 @@ impl StreamingRenderer {
             ParseEvent::Strikeout(t) => self.styled("\x1b[9m", &t),
             ParseEvent::Link { text, url } => {
                 let text = sanitize_for_terminal(&text);
-                self.out.push_str(&text);
                 // Only emit the URL if it's safe for terminal hyperlinks (no
-                // escape-sequence injection, safe scheme).
+                // escape-sequence injection, safe scheme). When colour is on and
+                // the URL is safe and differs from the text, wrap the text in an
+                // OSC 8 hyperlink so the terminal shows it as a clickable link;
+                // otherwise fall back to `text [url]`.
                 if let Some(url) = sanitize_url(&url) {
                     if !url.is_empty() && url != text {
-                        self.out.push_str(&format!(" [{url}]"));
+                        if self.color {
+                            self.out.push_str(&osc8_link(&text, &url));
+                        } else {
+                            self.out.push_str(&format!("{text} [{url}]"));
+                        }
+                    } else {
+                        self.out.push_str(&text);
                     }
+                } else {
+                    self.out.push_str(&text);
                 }
             }
             ParseEvent::Image { alt, .. } => {
@@ -1386,11 +1432,18 @@ impl StreamingRenderer {
             }
             InlineElement::Link { text, url } => {
                 let text = sanitize_for_terminal(&text);
-                self.out.push_str(&text);
                 if let Some(url) = sanitize_url(&url) {
                     if !url.is_empty() && url != text {
-                        self.out.push_str(&format!(" [{url}]"));
+                        if self.color {
+                            self.out.push_str(&osc8_link(&text, &url));
+                        } else {
+                            self.out.push_str(&format!("{text} [{url}]"));
+                        }
+                    } else {
+                        self.out.push_str(&text);
                     }
+                } else {
+                    self.out.push_str(&text);
                 }
             }
             InlineElement::Image { alt, .. } => {
@@ -1558,10 +1611,32 @@ mod streaming_tests {
         assert!(r.output().len() > 100_000, "output too small: {}", r.output().len());
     }
 
-    // Sanitize: unsafe URLs (javascript:, control chars) are dropped from the
-    // output; safe URLs (https:) are kept.
+    // A safe link with colour on is wrapped in an OSC 8 hyperlink (clickable in
+    // supporting terminals); the URL and text are both present, and the sequence
+    // is closed.
     #[test]
-    fn streaming_sanitizes_unsafe_links() {
+    fn streaming_link_is_osc8_hyperlink_when_coloured() {
+        let mut r = StreamingRenderer::new(true);
+        r.push_line("[GitHub page](https://example.com/x)");
+        r.finalize();
+        let out = r.output();
+        assert!(out.contains("\x1b]8;;https://example.com/x\x1b\\GitHub page\x1b]8;;\x1b\\"), "got: {out:?}");
+        assert!(!out.contains("GitHub page [https://example.com/x]"), "got: {out:?}");
+    }
+
+    // Colour off falls back to `text [url]`.
+    #[test]
+    fn streaming_link_falls_back_to_text_url_when_plain() {
+        let mut r = StreamingRenderer::new(false);
+        r.push_line("[GitHub page](https://example.com/x)");
+        r.finalize();
+        let out = r.output();
+        assert!(out.contains("GitHub page [https://example.com/x]"), "got: {out:?}");
+        assert!(!out.contains("\x1b]8"), "got: {out:?}");
+    }
+
+    #[test]
+    fn streaming_sanitizes_links() {
         let mut r = StreamingRenderer::new(false);
         r.push_line("[safe](https://example.com)");
         r.push_line("[bad](javascript:alert(1))");
@@ -1773,6 +1848,41 @@ mod tests {
     fn link_shows_url() {
         let r = render("[pir](https://example.com)", false);
         assert!(r.contains("https://example.com"), "got: {r:?}");
+    }
+
+    // With colour on, an inline link is wrapped in an OSC 8 terminal hyperlink
+    // (`ESC ] 8 ; ; <url> ESC \ <text> ESC ] 8 ; ; ESC \`) so a supporting
+    // terminal shows it as a clickable link. The URL and text survive inside the
+    // sequence and the sequence is closed at the end.
+    #[test]
+    fn link_is_osc8_hyperlink_when_coloured() {
+        let r = render("[GitHub page](https://example.com/x)", true);
+        assert!(r.contains("\x1b]8;;https://example.com/x\x1b\\GitHub page\x1b]8;;\x1b\\"), "got: {r:?}");
+        // No `text [url]` fallback when coloured.
+        assert!(!r.contains("GitHub page [https://example.com/x]"), "got: {r:?}");
+    }
+
+    // With colour off, the link falls back to the `text [url]` plain form.
+    #[test]
+    fn link_falls_back_to_text_url_when_plain() {
+        let r = render("[GitHub page](https://example.com/x)", false);
+        assert!(r.contains("GitHub page [https://example.com/x]"), "got: {r:?}");
+        assert!(!r.contains("\x1b]8"), "no OSC 8 escape when colour is off: {r:?}");
+    }
+
+    // Inline emphasis inside a link is rendered as part of the link text and the
+    // whole thing is wrapped in a single OSC 8 hyperlink (the pulldown backend
+    // buffers link text so the emphasis doesn't leak to the main output).
+    #[test]
+    fn link_with_inline_emphasis_is_single_osc8() {
+        let r = render("[**bold link**](https://example.com/x)", true);
+        // A single OSC 8 hyperlink spans the whole link; the inner emphasis is
+        // rendered (bold) as part of the linked text, wrapped in one sequence.
+        assert!(r.contains("\x1b]8;;https://example.com/x\x1b\\"), "got: {r:?}");
+        assert!(r.contains("bold link"), "got: {r:?}");
+        // Exactly one OSC 8 open and one close (no fragmenting into pieces).
+        assert_eq!(r.matches("\x1b]8;;").count(), 1, "got: {r:?}");
+        assert_eq!(r.matches("\x1b]8;;\x1b\\").count(), 1, "got: {r:?}");
     }
 
     #[test]

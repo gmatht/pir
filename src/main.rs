@@ -837,7 +837,7 @@ fn main() {
     if let Some(p) = &agent.log_path {
         println!("{}", term::dim(&format!("session log: {}", p.display())));
     }
-    println!("{}", term::dim("/help for commands · ctrl-d to quit · type while a turn runs; ESC/ctrl-c cancels it instantly"));
+    println!("{}", term::dim("/help for commands · ctrl-d quit · ctrl-q quit now (x2 to force) · type while a turn runs; ESC/ctrl-c cancels it instantly"));
 
     // Warn on existing git projects that lack the LLM-safety guard hook, and
     // point at /fix. Skipped under jj (git hooks don't apply there).
@@ -1138,6 +1138,37 @@ fn main() {
                     }
                     // Let the running turn finish its current step, then exit.
                     let _ = fg_handle.take().unwrap().join();
+                    term::raw::disable_raw();
+                    return;
+                }
+                term::raw::RawInput::Quit => {
+                    if let Ok(mut g) = typeahead.lock() { g.clear(); }
+                    fg_cancel.store(true, Ordering::SeqCst);
+                    // First Ctrl-Q: begin a *graceful* quit. Sweep detached
+                    // background jobs so they don't linger holding output
+                    // pipes, then let the running turn finish its current step
+                    // and exit. A *second* Ctrl-Q spawns a watchdog that
+                    // force-exits immediately if this shutdown hangs (frozen
+                    // worker or a stuck detached job).
+                    term::out(&term::dim(
+                        "· quitting… press Ctrl-Q again to FORCE-QUIT now if it hangs",
+                    ));
+                    {
+                        let mut g = agent_slot.lock().unwrap();
+                        if let Some(a) = g.as_mut() {
+                            let _ = a.registry_kill_all_jobs();
+                        }
+                    }
+                    if let Some(f) = crate::agent::job_kill_flag() {
+                        f.store(true, Ordering::SeqCst);
+                    }
+                    term::spawn_force_quit_watchdog();
+                    // Graceful cleanup: join the worker, then exit. If this
+                    // `join` never returns, the watchdog above has already
+                    // called `process::exit(1)`.
+                    if let Some(h) = fg_handle.take() {
+                        let _ = h.join();
+                    }
                     term::raw::disable_raw();
                     return;
                 }

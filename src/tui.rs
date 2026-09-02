@@ -246,7 +246,7 @@ fn run_inner(
     state.push(
         ConvKind::System,
         &format!(
-            "pir · {} · full-screen TUI (/help for commands · Esc/ctrl-c cancel · ctrl-d quit)",
+            "pir · {} · full-screen TUI (/help for commands · Esc/ctrl-c cancel · ctrl-d quit · ctrl-q quit now (x2 to force))",
             ctx.providers[0].pid()
         ),
     );
@@ -398,6 +398,34 @@ fn run_inner(
                 }
                 RawKey::Eof => {
                     ctx.fg_cancel.store(true, Ordering::SeqCst);
+                    if let Some(h) = fg_handle.take() {
+                        let _ = h.join();
+                    }
+                    break;
+                }
+                RawKey::Quit => {
+                    if let Ok(mut g) = ctx.typeahead.lock() {
+                        g.clear();
+                    }
+                    ctx.fg_cancel.store(true, Ordering::SeqCst);
+                    // First Ctrl-Q: begin graceful quit (sweep detached jobs,
+                    // let the turn finish, then restore the terminal via the
+                    // Cleanup guard). A *second* Ctrl-Q force-exits immediately
+                    // if this shutdown hangs.
+                    state.push(
+                        ConvKind::System,
+                        "· quitting… press Ctrl-Q again to FORCE-QUIT now if it hangs",
+                    );
+                    {
+                        let mut g = ctx.agent_slot.lock().unwrap();
+                        if let Some(a) = g.as_mut() {
+                            let _ = a.registry_kill_all_jobs();
+                        }
+                    }
+                    if let Some(f) = crate::agent::job_kill_flag() {
+                        f.store(true, Ordering::SeqCst);
+                    }
+                    term::spawn_force_quit_watchdog();
                     if let Some(h) = fg_handle.take() {
                         let _ = h.join();
                     }
@@ -718,6 +746,14 @@ fn read_raw_into(buf: &mut String, typeahead: &Arc<Mutex<String>>) -> RawKey {
                 }
                 return RawKey::Eof;
             }
+            0x11 => {
+                // ctrl-q: begin quitting; a second ctrl-q force-exits.
+                buf.clear();
+                if let Ok(mut g) = typeahead.lock() {
+                    g.clear();
+                }
+                return RawKey::Quit;
+            }
             0x1b => {
                 // Esc is ambiguous: a lone Esc cancels the turn; it's also the
                 // lead byte of a CSI sequence (arrows, Home/End, F-keys:
@@ -904,6 +940,9 @@ enum RawKey {
     Cancel,
     Eof,
     Suspend,
+    /// ctrl-q: begin quitting; a second ctrl-q force-exits (see
+    /// `term::spawn_force_quit_watchdog`).
+    Quit,
 }
 
 /// Read a single byte from `fd` (non-blocking) with a short timeout; returns

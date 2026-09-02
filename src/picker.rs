@@ -454,6 +454,7 @@ fn translate_result(res: &term::raw::RawInput, buf: &str) -> Key {
         RawInput::Cancel => Key::Esc,
         RawInput::Eof => Key::CtrlD,
         RawInput::Suspend => Key::CtrlC, // treat ctrl-z like cancel for the picker
+        RawInput::Quit => Key::CtrlD,    // ctrl-q: leave the picker (quit the app from the REPL)
         RawInput::None => {
             let _ = buf;
             Key::None

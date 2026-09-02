@@ -209,10 +209,17 @@ impl ToolBackend for OllamaCloud {
 // Web tools
 // ---------------------------------------------------------------------------
 
-/// POST `body` to `OLLAMA_BASE/endpoint` with the bearer key, with a hard
-/// timeout. Returns the parsed JSON response. Errors are mapped to readable
-/// strings (terminal-safe; no HTML dumped).
-fn ollama_post(endpoint: &str, key: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
+/// Issue a request to `OLLAMA_BASE/endpoint` with the bearer key, with a hard
+/// timeout. `body` is sent as JSON for POST; for GET it is ignored (the usage
+/// endpoint rejects POST with HTTP 405, so it must be a GET). Returns the
+/// parsed JSON response. Errors are mapped to readable strings (terminal-safe;
+/// no HTML dumped).
+fn ollama_request(
+    method: &str,
+    endpoint: &str,
+    key: &str,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
     let url = format!("{}{}", OLLAMA_BASE, endpoint);
     // ureq 2.x: attach native-tls explicitly (mirrors crate::provider).
     let connector = std::sync::Arc::new(
@@ -222,15 +229,31 @@ fn ollama_post(endpoint: &str, key: &str, body: serde_json::Value) -> Result<ser
         .tls_connector(connector)
         .timeout(WEB_TOOLS_TIMEOUT)
         .build();
-    let resp = agent
-        .post(&url)
+    let req = agent
+        .request(method, &url)
         .set("Authorization", &format!("Bearer {key}"))
-        .set("Content-Type", "application/json")
-        .send_json(body);
+        .set("Content-Type", "application/json");
+    let resp = if method.eq_ignore_ascii_case("POST") {
+        req.send_json(body)
+    } else {
+        req.call()
+    };
     match resp {
         Ok(r) => r
             .into_json::<serde_json::Value>()
-            .map_err(|e| format!("ollama_cloud: bad JSON from {endpoint}: {e}")),
+            .map_err(|e| format!("ollama_cloud: bad JSON from {endpoint}: {e}"))
+            .or_else(|e| {
+                // Some endpoints (e.g. /api/usage) return a 200 with no body or a
+                // non-JSON body; tolerate that and return an empty object so the
+                // caller's shape check can decide.
+                if e.to_string().contains("empty body")
+                    || e.to_string().contains("empty response")
+                {
+                    Ok(json!({}))
+                } else {
+                    Err(e)
+                }
+            }),
         Err(ureq::Error::Status(code, r)) => {
             let mut b = String::new();
             let _ = r.into_reader().take(1024).read_to_string(&mut b);
@@ -239,6 +262,17 @@ fn ollama_post(endpoint: &str, key: &str, body: serde_json::Value) -> Result<ser
         }
         Err(e) => Err(format!("ollama_cloud {endpoint}: {e}")),
     }
+}
+
+/// POST `body` to `OLLAMA_BASE/endpoint` with the bearer key.
+fn ollama_post(endpoint: &str, key: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
+    ollama_request("POST", endpoint, key, body)
+}
+
+/// GET `OLLAMA_BASE/endpoint` with the bearer key (no body). Used by the usage
+/// endpoint, which rejects POST with HTTP 405 Method Not Allowed.
+fn ollama_get(endpoint: &str, key: &str) -> Result<serde_json::Value, String> {
+    ollama_request("GET", endpoint, key, json!({}))
 }
 
 fn require_key() -> Result<String, String> {
@@ -361,15 +395,16 @@ fn show_usage() -> Outcome {
         Ok(k) => k,
         Err(e) => return Outcome::err(e),
     };
-    let resp = match ollama_post("/api/usage", &key, json!({})) {
+    let resp = match ollama_get("/api/usage", &key) {
         Ok(v) => v,
         Err(e) => return Outcome::err(e),
     };
-    // Expect { session: {usage, limit}, weekly: {usage, limit} } (fractions 0..1).
-    let session = resp.get("session");
-    let weekly = resp.get("weekly");
-    if session.is_none() && weekly.is_none() {
-        return Outcome::err("ollama_cloud usage: unexpected response shape from the API.".into());
+    // Expect { session: {usage, limit}, weekly: {usage, limit} }. Ollama
+    // Cloud's usage API does not document a fixed shape, so be tolerant: any
+    // JSON object is accepted and fields that are present are shown, missing
+    // fields render as n/a rather than a hard error.
+    if !resp.is_object() || resp.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+        return Outcome::err("ollama_cloud usage: empty or non-object response from the API.".into());
     }
     let pct = |f: f64| -> u32 {
         if !f.is_finite() {
@@ -382,17 +417,34 @@ fn show_usage() -> Outcome {
         match node {
             None => format!("{label}: n/a"),
             Some(n) => {
+                // Usage/limit may be fractions (0..1) OR raw counts; if >1 treat
+                // as raw counts and show them directly instead of as a percent.
                 let usage = n.get("usage").and_then(Value::as_f64).unwrap_or(0.0);
                 let limit = n.get("limit").and_then(Value::as_f64).unwrap_or(0.0);
-                format!("{label}: {}% ({:.2}/{:.2})", pct(usage), usage, limit)
+                if usage > 1.0 || limit > 1.0 {
+                    format!("{label}: {:.0}/{:.0}", usage, limit)
+                } else {
+                    format!("{label}: {}% ({:.2}/{:.2})", pct(usage), usage, limit)
+                }
             }
         }
     };
+    let session = resp.get("session");
+    let weekly = resp.get("weekly");
     let mut out = String::from("Ollama Cloud usage (subscription-billed; estimates):\n");
     out.push_str(&fmt("  session", session));
     out.push('\n');
     out.push_str(&fmt("  weekly", weekly));
-    Outcome::ok(out)
+    // Surface any other top-level fields verbatim (undocumented shape safety).
+    if let Some(obj) = resp.as_object() {
+        for (k, v) in obj {
+            if k == "session" || k == "weekly" {
+                continue;
+            }
+            out.push_str(&format!("\n  {}: {}", k, v));
+        }
+    }
+    Outcome::ok(out.trim_end().to_string())
 }
 
 #[cfg(test)]

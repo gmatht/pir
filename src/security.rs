@@ -835,6 +835,13 @@ pub struct SecurityContext {
     /// alive for the life of the context; dropping it reaps the whole tree.
     #[cfg(windows)]
     pub windows_job: Option<crate::security::windows::Job>,
+    /// Windows: the no-driver manifest write-quarantine staging session
+    /// (kept alive for the process lifetime so the quarantine posture reports
+    /// as engaged). `None` when initialisation failed, quarantine was disabled,
+    /// or the host layer is off — in which case the in-process guardrail
+    /// hard-denies out-of-tree writes.
+    #[cfg(windows)]
+    pub windows_staging: Option<crate::security::windows::staging::StagingSession>,
 }
 
 impl SecurityContext {
@@ -847,6 +854,12 @@ impl SecurityContext {
             Box::new(TtySink { approval: Some(approval.clone()) })
         };
         let q = policy.quarantine;
+        // Windows: the no-driver manifest write-quarantine staging session,
+        // kept alive for the process lifetime so the quarantine posture reports
+        // as engaged. Declared here (function scope, windows-only) so the value
+        // survives into the `SecurityContext` we build below.
+        #[cfg(windows)]
+        let mut staging: Option<crate::security::windows::staging::StagingSession> = None;
         // Windows host-level layers, engaged once at startup (docs/
         // SECURITY_ON_WINDOWS.md §5.1). Never engaged inside unit tests — the
         // test harness process must not be wrapped (mirrors the `not(test)`
@@ -880,56 +893,50 @@ impl SecurityContext {
                         Err(e) => eprintln!("[pir] windows security: low-integrity not applied ({e})"),
                     }
                 }
+                // Initialise the Windows write-quarantine staging backend (the
+                // analogue of the Linux overlayfs posture). This seeds the
+                // per-session manifest store so the in-process guardrail has
+                // somewhere to record denied out-of-tree writes for later
+                // `/quarantine` review, even though the real ProjFS provider
+                // that would project those writes isn't driving it. Idempotent;
+                // on failure we fall back to the in-process guardrail and warn.
+                staging = if policy.quarantine {
+                    match win::staging::init() {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            eprintln!(
+                                "{}",
+                                crate::term::red(&format!(
+                                    "[pir] warning: write quarantine staging backend could not be \
+                                     initialised ({e}); out-of-tree writes are denied by the \
+                                     in-process guardrail (not staged for review)."
+                                ))
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    eprintln!("[pir] windows security: write quarantine disabled (security.quarantine = false)");
+                    None
+                };
                 eprintln!("[pir] security: {}", platform.describe());
-                // The Windows write-quarantine (the ProjFS-backed staging layer)
-                // is the analogue of the Linux overlayfs posture. When ProjFS is
-                // absent it cannot engage, so out-of-tree writes are hard-denied
-                // instead of staged for review. Say so loudly (red) so the
-                // operator knows the agent can't stage edits here — and that
-                // enabling the "Windows Projected File System" optional feature
-                // (and rebooting if you only just enabled it) can turn it on.
-                if !crate::security::windows::staging::staging_engaged() {
-                    // Report the *true* reason quarantine is off instead of
-                    // always blaming ProjFS — on many hosts (and every Windows
-                    // 11 Home box) the ProjFS user-mode DLL is present but the
-                    // feature/driver simply isn't wired up, so "ProjFS not
-                    // available" would be a false claim.
-                    let projfs = crate::security::windows::projfs_available();
-                    let msg: String = if projfs {
-                        // The DLL + PrjFlt driver are present, but pir has no
-                        // ProjFS provider projecting a filesystem yet, so the
-                        // staging store is never initialised -> nothing to
-                        // review. Out-of-tree writes are still hard-denied by
-                        // the in-process guardrail.
-                        "[pir] warning: write quarantine is OFF. ProjFS is present, \
-                         but the Windows staging backend is not initialised, so \
-                         out-of-tree writes are denied by the in-process guardrail \
-                         (not staged for review)."
-                            .to_string()
-                    } else {
-                        // ProjFS genuinely absent: the Client-ProjFS optional
-                        // feature (which ships the PrjFlt minifilter driver)
-                        // isn't enabled. Correct the prior bad advice: it needs
-                        // elevation AND a reboot -- `-NoRestart` leaves the
-                        // driver unloaded, which is why a "successful" enable
-                        // did nothing. NOTE: Client-ProjFS IS offered on Windows 11
-                        // Home 24H2 -- it is a Features-on-Demand package, not
-                        // edition-gated -- so "not offered on Home" is a myth.
-                        // Install from an elevated prompt with
-                        // `Enable-WindowsOptionalFeature -Online -FeatureName
-                        // Client-ProjFS` and REBOOT (PrjFlt only loads at boot;
-                        // a `-NoRestart` enable is silent until next reboot).
-                        "[pir] warning: write quarantine is OFF (Projected File \
-                         System not available). Install Client-ProjFS: from an elevated prompt run \
-                         `Enable-WindowsOptionalFeature -Online -FeatureName \
-                         Client-ProjFS` and REBOOT (PrjFlt only loads at boot); \
-                         if it already shows Enabled, pir's Windows staging \
-                         backend is not yet implemented -- use WSL2/Linux for \
-                         overlayfs quarantine, or enable the no-driver manifest \
-                         staging (FIXME)."
-                            .to_string()
-                    };
-                    eprintln!("{}", crate::term::red(&msg));
+                // The Windows staging backend is now engaged (a real manifest
+                // store exists). If ProjFS itself is still unavailable, say so
+                // loudly (red) so the operator knows the real virtualization
+                // driver that would *project* staged writes isn't wired up —
+                // but the no-driver manifest staging is live and functional.
+                if staging.is_some() && !crate::security::windows::projfs_available() {
+                    eprintln!(
+                        "{}",
+                        crate::term::red(
+                            "[pir] security: Windows staging backend engaged (manifest mode). \
+                             Projected File System (Client-ProjFS) is not available, so writes are \
+                             recorded for `/quarantine` review rather than virtualized live. To \
+                             enable live ProjFS: from an elevated prompt run \
+                             `Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS` and \
+                             REBOOT (PrjFlt only loads at boot)."
+                        )
+                    );
                 }
             }
             job
@@ -943,6 +950,8 @@ impl SecurityContext {
             approval,
             #[cfg(windows)]
             windows_job,
+            #[cfg(windows)]
+            windows_staging: staging,
         })
     }
 
@@ -957,6 +966,20 @@ impl SecurityContext {
                 ts: epoch(),
             };
             self.policy.record_denial(denial.clone());
+            // Windows: when the in-process guardrail denies a write and the
+            // write-quarantine staging backend was initialised at startup,
+            // record the *intent* so the operator can review it via
+            // `/quarantine`. The real write was hard-refused, so this only
+            // appends the intended target to the manifest — never mutates the
+            // real fs (see `windows::staging::stage_denied`).
+            #[cfg(windows)]
+            if self.windows_staging.map(|s| s.engaged).unwrap_or(false)
+                && matches!(ask.op, Op::Write)
+            {
+                if let Some(p) = &ask.path {
+                    crate::security::windows::staging::stage_denied(p);
+                }
+            }
             match self.sink.surface(&denial) {
                 Decision::AllowOnce | Decision::AllowSession => Verdict::Allow,
                 Decision::Deny | Decision::Defer => Verdict::Deny {

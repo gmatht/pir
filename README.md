@@ -3,7 +3,7 @@
 <img src="docs/pir.png" align="left" width="99">
 
 `pir` ("**p**i in **R**ust") is a minimal, fully-synchronous terminal coding
-agent that reuses your existing [`~/.pi`](https://github.com/) setup
+agent that reuses your existing [`~/.pi`](https://github.com/gmatht/pir) setup
 **read-only** and adds a few power-user features: persistent goals, resumable
 sessions, background jobs, and per-project sandbox users.
 
