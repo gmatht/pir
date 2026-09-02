@@ -1597,3 +1597,72 @@ Fixed the off-by-one in Parser::next_token; all 3 tests pass.
 - No markdown rendering, no parallel tool execution, no sub-agents, no MCP — that's the "lightweight" deal. Adding a tool = one `ToolSpec` + one match arm in `tools.rs`.
 - `-y` runs arbitrary shell commands with only a 120s timeout as a guardrail; the default confirmation mode is the sane choice.
 - Needs rustc ≥ 1.70 (`IsTerminal`); Windows works but ANSI support depends on your terminal.
+
+## TODO: reliable Windows multiline-paste detection (Option B)
+
+**Status:** Option A is implemented (see `src/term.rs::coalesce_paste` /
+`windows_pending_keydown`). Option B is the more robust future upgrade.
+
+### Background / root cause
+
+On Windows, rustyline's console reader (`ConsoleRawReader` in
+`rustyline`'s `tty/windows.rs`) reads input via `ReadConsoleInputW` and maps
+each `KEY_EVENT` to a `KeyEvent`. It **never** emits an `Event::Paste` and does
+**not** parse the `ESC[200~ … ESC[201~` bracketed-paste wrapper, so enabling
+`bracketed_paste(true)` is a **no-op** there. Conhost injects a pasted block
+directly into the console input buffer as one `VK_RETURN` key-down per line,
+which is why a multiline paste otherwise becomes one prompt per line.
+
+### Option A (current): peek-based coalesce — fragile but good enough
+
+After the first `readline` returns, `windows_pending_keydown()` calls
+`PeekConsoleInputW` (non-destructive — it never consumes the events rustyline
+is about to read) and checks whether a real key press (`KEY_EVENT` with
+`bKeyDown != 0`) is still buffered. Pasted characters are themselves key-down
+events, so a pending key-down reliably means "more of the paste is buffered"; a
+lone typed Enter leaves only its key-*up* (filtered out), so the burst ends
+immediately — which is what keeps it from regressing into the old "press Enter
+twice" bug (the previous `coalesce_paste` polled via crossterm and saw the
+buffered key-up, spinning up a nested `readline("")` that waited for a second
+Enter). Once more than one line is folded in, the whole block is re-presented
+via `readline_with_initial` so the cursor/backspace can cross line boundaries.
+
+**Known fragility (acknowledged):** a sufficiently fast typist who presses a
+second key within the peek window of a submitted line, or an extremely slow /
+streamed clipboard that hasn't flushed the next line's key-down by the time we
+peek, can blur the line. Acceptable for now; Option B removes the ambiguity.
+
+### Option B (TODO): low-level keyboard hook — the reliable fix
+
+Install `SetWindowsHookExW(WH_KEYBOARD_LL, …, GetCurrentThreadId())` on a
+dedicated thread that runs a `GetMessage`/`DispatchMessage` pump (a low-level
+hook only fires while the installing thread pumps messages). The hook records
+`WM_KEYDOWN` (or `WM_CHAR`) events into a small ring / shared `Arc<Atomic…>`
+structure. Separately, as each character is *read* from the console input
+buffer (`conin`), compare it against the hook's recent keydown stream:
+
+- Typed character → it appears in **both** the hook and `conin` → normal input.
+- Pasted character → it appears in `conin` **only** (conhost injects paste
+directly and bypasses the keyboard message path) → flag it as pasted.
+
+A pasted run is therefore "consecutive characters in `conin` with no matching
+`WM_KEYDOWN`". Maintain an `is_pasting` flag that flips true on the first such
+character and clears after a short idle (e.g. ~16 ms with no further pasted
+char), and expose it so `coalesce_paste` can decide "keep reading" with
+certainty instead of peeking for a key-down.
+
+**Why this is the most reliable approach short of terminal-level support:** it
+does not depend on timing heuristics or on the terminal honoring bracketed
+paste; it detects paste from the structural fact that injected console input
+never traverses the keyboard message path.
+
+**Tradeoffs / edge cases to handle before adopting:**
+- The hook thread must own a message loop or the hook never fires.
+- Dead keys, IME composition, and non-Latin keyboard layouts mean a single
+displayed character can map to multiple `WM_KEYDOWN`s or none (composition);
+match on the *character* (`WM_CHAR` / the `uChar` rustyline sees), not raw
+virtual-key codes.
+- Coordinate the flag with the existing `coalesce`/`readline_with_initial`
+re-presentation so a large paste is still gathered as one editable buffer.
+- Keep the `#[cfg(not(unix))]` gating; Unix continues to rely on rustyline's
+native bracketed paste.

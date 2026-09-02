@@ -24,6 +24,7 @@ streamdown-ansi = "0.1.4"                        # ANSI sanitize for link/termin
 # Features are kept narrow to what the backend actually calls.
 windows-sys = { version = "0.61", default-features = false, features = [
   "Win32_Foundation",
+  "Win32_System_Console",
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_Security_Isolation",

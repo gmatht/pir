@@ -9,7 +9,7 @@ use rustyline::completion::Completer;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::{Hinter, HistoryHinter};
 use rustyline::validate::Validator;
-use rustyline::{CompletionType, Config, Context, Editor};
+use rustyline::{At, Cmd, CompletionType, Config, Context, Editor, Event, KeyCode, KeyEvent, Modifiers, Movement, Word};
 
 static COLOR_OVERRIDE: Mutex<Option<bool>> = Mutex::new(None);
 
@@ -21,6 +21,54 @@ static MODEL_PROVIDERS: OnceLock<Vec<crate::config::Provider>> = OnceLock::new()
 /// models.json has been loaded.
 pub fn set_model_providers(providers: &[crate::config::Provider]) {
     let _ = MODEL_PROVIDERS.set(providers.to_vec());
+}
+
+/// Extension-registered slash commands (e.g. `ollama-webtools`,
+/// `ollama-cloud-usage`, `wt_create`, `request_root`, `commit`…), supplied by
+/// dispatch in `handle_command` (they fall through to
+/// `agent.run_registered_command`), so `build.rs` cannot discover them the way
+/// it discovers the built-in commands — which is why tab-completion and the
+/// inline help hint used to miss them. We register them here at runtime so they
+/// complete and hint exactly like built-ins. Each entry is `(name, description)`
+/// where `name` is the bare command (no leading `/`).
+static EXT_COMMANDS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// Register extension slash commands for completion + inline help. Call once
+/// after the agent (and its `Registry`) is built. `commands` is the vector of
+/// `(name, description)` pairs returned by `Agent::registry_command_names`. The
+/// setter overwrites any prior registration (so tests can re-seed it).
+pub fn set_extension_commands(commands: Vec<(String, String)>) {
+    if let Ok(mut g) = EXT_COMMANDS.lock() {
+        *g = commands;
+    }
+}
+
+/// All slash commands known to completion, built-in (`SLASH_COMMANDS`) plus any
+/// extension-registered ones (prefixed with `/`). Deduped (built-ins win on
+/// name collision) and sorted for stable, scannable completion lists.
+fn all_slash_commands() -> Vec<String> {
+    let mut out: Vec<String> = SLASH_COMMANDS.iter().map(|c| c.to_string()).collect();
+    if let Ok(ext) = EXT_COMMANDS.lock() {
+        let mut known: std::collections::HashSet<String> = out.iter().cloned().collect();
+        for (name, _desc) in ext.iter() {
+            let full = format!("/{name}");
+            if known.insert(full.clone()) {
+                out.push(full);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Inline-help lookup for an extension-registered command (`/name`). Returns its
+/// description, or `None` when it isn't a known extension command.
+fn ext_command_help(cmd: &str) -> Option<String> {
+    let name = cmd.strip_prefix('/')?;
+    EXT_COMMANDS
+        .lock()
+        .ok()
+        .and_then(|ext| ext.iter().find(|(n, _)| n == name).map(|(_, d)| d.clone()))
 }
 
 /// Force colour on (`true`) or off (`false`). When unset (the default), colour
@@ -361,35 +409,8 @@ impl rustyline::Helper for PirHelper {}
 /// The known slash commands, used for command-name completion (the user can
 /// type a `/`-prefix and Tab to complete it). Keeping this as the single source
 /// of truth means new commands are auto-discoverable via completion.
-const SLASH_COMMANDS: &[&str] = &[
-    "/bg",
-    "/cancel",
-    "/clear",
-    "/continue",
-    "/create",
-    "/default-model",
-    "/exit",
-    "/fix",
-    "/fg",
-    "/goal",
-    "/help",
-    "/jobs",
-    "/login",
-    "/logout",
-    "/markup_demo",
-    "/model",
-    "/model*",
-    "/models",
-    "/project",
-    "/rebuild",
-    "/resume",
-    "/sessions",
-    "/sh",
-    "/thinking",
-    "/undo",
-    "/unfinished",
-    "/usage",
-];
+const SLASH_COMMANDS: &[&str] = crate::commands::SLASH_COMMANDS;
+
 
 /// Brief per-command help, shown inline (as a hint to the right of the cursor)
 /// the moment the user types a `/command` — mirroring pi's autocomplete
@@ -445,7 +466,25 @@ fn command_help_hint(line: &str) -> Option<String> {
         .iter()
         .find(|(name, _, _)| *name == cmd)
         .or_else(|| SLASH_HELP.iter().find(|(name, _, _)| name.starts_with(cmd)));
-    let (name, arg, desc) = entry?;
+    let (name, arg, desc) = match entry {
+        Some(e) => e,
+        // Extension-registered commands (e.g. `/ollama-webtools`) aren't in
+        // `SLASH_HELP` — fall back to their registry-supplied description.
+        None => {
+            if let Some(d) = ext_command_help(cmd) {
+                // No argument hint recorded for extension commands; show the
+                // description inline as guidance (and suppress the hint only for
+                // `/help` itself, handled below).
+                if has_arg {
+                    return Some(d);
+                }
+                let mut s = String::from("— ");
+                s.push_str(&d);
+                return Some(s);
+            }
+            return None;
+        }
+    };
     if has_arg {
         // Once an argument exists, pi stops showing command help; keep it quiet
         // so the argument preview (e.g. a typed model prefix) is free to show.
@@ -534,10 +573,12 @@ impl Completer for PirHelper {
         // typed, so `/default-<Tab>` completes to `/default-model`.
         if !rest.contains(char::is_whitespace) {
             if let Some(prefix) = cmd.strip_prefix('/') {
-                let matches: Vec<String> = SLASH_COMMANDS
-                    .iter()
+                // Offer any slash command (built-in *or* extension-registered)
+                // that starts with what they've typed, so `/def<Tab>` completes
+                // to `/default-model` and `/ollama<Tab>` to the `ollama-*` tools.
+                let matches: Vec<String> = all_slash_commands()
+                    .into_iter()
                     .filter(|c| c[1..].starts_with(prefix))
-                    .map(|c| c.to_string())
                     .collect();
                 if matches.is_empty() {
                     return Ok((0, Vec::new()));
@@ -680,9 +721,65 @@ pub fn set_history_file(path: &Path) {
 fn new_editor() -> Option<Editor<PirHelper, rustyline::history::DefaultHistory>> {
     let config = Config::builder()
         .completion_type(CompletionType::List)
+        // On Unix, rustyline reads raw VT bytes and coalesces a bracketed paste
+        // (`ESC[200~…ESC[201~`) into a single editable buffer natively, so a
+        // multiline paste submits with one Enter. On Windows rustyline's console
+        // reader (`ReadConsoleInputW`) never emits a paste event — a pasted
+        // block arrives as one `VK_RETURN` key-down per line — so this flag is a
+        // no-op there and `coalesce_paste` (cfg(not(unix))) merges the block
+        // manually via `PeekConsoleInputW`. Keeping the flag on is required on
+        // Unix and harmless on Windows.
+        .bracketed_paste(true)
         .build();
     let mut rl = Editor::<PirHelper, rustyline::history::DefaultHistory>::with_config(config).ok()?;
     rl.set_helper(Some(PirHelper { history_hinter: HistoryHinter::new() }));
+    // Ctrl-Backspace / Ctrl-Del delete a word at a time, mirroring the
+    // Ctrl-Left / Ctrl-Right word-motion that rustyline already binds by
+    // default. `custom-bindings` is a rustyline default feature, so
+    // `bind_sequence` is always available here.
+    //
+    // Terminals send different bytes for these (xterm: ESC [ 3 ; 5 ~ for
+    // Ctrl-Del, a bare Ctrl-H, or a Ctrl-modified Backspace/Delete key code),
+    // so we bind every known form to the same word-delete. `Bindings` defaults
+    // to Emacs word semantics (alphanumeric), matching the Ctrl-arrow movement.
+    // NB: we do NOT rebind a plain `Delete` (that stays char-delete).
+    let kill_word_back = || Cmd::Kill(Movement::BackwardWord(1, Word::Emacs));
+    let kill_word_fwd = || Cmd::Kill(Movement::ForwardWord(1, At::AfterEnd, Word::Emacs));
+    let _ = rl.bind_sequence(KeyEvent::ctrl('H'), kill_word_back());
+    let _ = rl.bind_sequence(
+        KeyEvent(KeyCode::Backspace, Modifiers::CTRL),
+        kill_word_back(),
+    );
+    // xterm-style CSI sequence for Ctrl-Backspace: ESC [ 3 ; 5 ~
+    let _ = rl.bind_sequence(
+        Event::KeySeq(vec![
+            KeyEvent(KeyCode::Esc, Modifiers::NONE),
+            KeyEvent::new('[', Modifiers::NONE),
+            KeyEvent::new('3', Modifiers::NONE),
+            KeyEvent::new(';', Modifiers::NONE),
+            KeyEvent::new('5', Modifiers::NONE),
+            KeyEvent::new('~', Modifiers::NONE),
+        ]),
+        kill_word_back(),
+    );
+    // Ctrl-Del: a Ctrl-modified Delete key code, plus the xterm CSI form
+    // ESC [ 3 ; 5 ~ (used for the forward kill so Delete deletes the word
+    // *after* the cursor).
+    let _ = rl.bind_sequence(
+        KeyEvent(KeyCode::Delete, Modifiers::CTRL),
+        kill_word_fwd(),
+    );
+    let _ = rl.bind_sequence(
+        Event::KeySeq(vec![
+            KeyEvent(KeyCode::Esc, Modifiers::NONE),
+            KeyEvent::new('[', Modifiers::NONE),
+            KeyEvent::new('3', Modifiers::NONE),
+            KeyEvent::new(';', Modifiers::NONE),
+            KeyEvent::new('5', Modifiers::NONE),
+            KeyEvent::new('~', Modifiers::NONE),
+        ]),
+        kill_word_fwd(),
+    );
     Some(rl)
 }
 
@@ -749,131 +846,11 @@ pub fn read_line(prompt: &str) -> Option<String> {
             Err(_) => None,
         }
     })
-    // A pasted multiline block is delivered line-by-line; coalesce a fast
-    // burst into a single editable prompt instead of one prompt per pasted
-    // line (see `coalesce_paste`). On Unix rustyline's bracketed-paste handling
-    // already coalesces, so there it is a no-op.
+    // Merge a pasted multiline block into one prompt. On Unix rustyline does
+    // this natively (bracketed paste); on Windows we detect the rest of the
+    // paste in the console input buffer and coalesce it ourselves — see
+    // `coalesce_paste`.
     .map(|acc| coalesce_paste(prompt, acc))
-}
-
-/// How long to wait after a finished line for *more* input before treating the
-/// line as a submitted prompt. A human pressing Enter types far slower than
-/// this; a terminal delivering a pasted block emits the buffered lines almost
-/// instantly. So sitting here for ~99ms lets remaining lines arrive
-/// and be folded into the same prompt, while a single typed line still submits
-/// after a barely-noticeable pause.
-const PASTE_DEBOUNCE_MS: u64 = 99;
-
-/// Pure, platform-independent core of the "paste debounce": after the first
-/// line (`acc`) has been read, keep appending further lines (joined by `\'\n\'`)
-/// while more input keeps arriving within the debounce window.
-///
-/// The two closures abstract the input source so the logic is fully unit-testable
-/// without a real terminal:
-///   * `has_more` -- returns `true` when another input event is already buffered
-///     (the rest of a paste). A person pressing Enter at human speed returns
-///     `false`, ending the burst.
-///   * `read_more` -- reads line and returns `Some(line)`;
-///     `None` (or an empty line) ends the burst.
-fn coalesce<F, G>(mut acc: String, mut has_more: F, mut read_more: G) -> String
-where
-    F: FnMut() -> bool,
-    G: FnMut() -> Option<String>,
-{
-    loop {
-        if !has_more() {
-            break;
-        }
-        match read_more() {
-            Some(extra) if !extra.is_empty() => {
-                acc.push('\n');
-                acc.push_str(&extra);
-            }
-            _ => break,
-        }
-    }
-    acc
-}
-
-/// Like [`coalesce`] but also reports whether the debounce window fired and
-/// extra lines were folded in. The `bool` (`true` when a burst was merged) lets
-/// `coalesce_paste` distinguish a pasted multiline block from a single typed
-/// line, so it knows whether to re-present the buffer in one multi-line
-/// editing session (vs. submitting the one line as-is).
-fn coalesce_with_more<F, G>(mut acc: String, mut has_more: F, mut read_more: G) -> (String, bool)
-where
-    F: FnMut() -> bool,
-    G: FnMut() -> Option<String>,
-{
-    let mut burst = false;
-    loop {
-        if !has_more() {
-            break;
-        }
-        match read_more() {
-            Some(extra) if !extra.is_empty() => {
-                burst = true;
-                acc.push('\n');
-                acc.push_str(&extra);
-            }
-            _ => break,
-        }
-    }
-    (acc, burst)
-}
-
-/// Windows only: after the first line, wait up to PASTE_DEBOUNCE_MS for more
-/// input. If another line arrives within that window (the signature of a paste,
-/// as opposed to a person pressing Enter at human speed), keep appending it
-/// (joined by a newline) so a pasted block is gathered as one buffer.
-///
-/// Crucially, we do NOT read each extra line with its own `readline("")` call.
-/// rustyline's idle editor is single-line: a standalone `readline` call only
-/// lets the cursor travel within the *last* visual line, so backspacing past
-/// the start of the last line (into the earlier pasted lines) silently stops —
-/// the exact bug this fixes. Instead we collect the whole pasted block into one
-/// string and re-present it in a single editing session via
-/// `readline_with_initial`, where the cursor and backspace can cross every line
-/// boundary just like normal typing. Implemented via crossterm's event poll +
-/// rustyline's own buffered reader, so it does not matter whether the terminal
-/// emits a single `Event::Paste` or one `Enter` per pasted line. (rustyline
-/// already owns the stdin reader, so we continue reading from it rather than
-/// re-entering crossterm -- re-entering would re-enable bracketed paste and
-/// block waiting for a real Enter that isn't coming.)
-#[cfg(not(unix))]
-fn coalesce_paste(prompt: &str, acc: String) -> String {
-    use std::time::Duration;
-    let (merged, more) = coalesce_with_more(
-        acc,
-        || matches!(crossterm::event::poll(Duration::from_millis(PASTE_DEBOUNCE_MS)), Ok(true)),
-        || EDITOR.with(|e| e.borrow_mut().as_mut().and_then(|rl| rl.readline("").ok())),
-    );
-    if !more {
-        // Nothing more arrived within the debounce window: this is a normal
-        // (single or pasted) entry. Hand it back as-is so it submits through the
-        // original `readline` session (which already owns the cursor/history).
-        return merged;
-    }
-    // The rest of a paste arrived. Re-present the whole block in ONE editing
-    // session so the cursor can move/backspace across all lines. `readline`
-    // would append it to history with no chance to edit; `readline_with_initial`
-    // keeps it editable. The prompt is echoed (alongside the buffer) and the
-    // caret is placed at the end so the user can keep typing or press Enter.
-    EDITOR.with(|e| {
-        let mut g = e.borrow_mut();
-        match g.as_mut() {
-            Some(rl) => rl
-                .readline_with_initial(prompt, (&merged, ""))
-                .unwrap_or(merged),
-            None => merged,
-        }
-    })
-}
-
-/// Unix: rustyline handles bracketed paste natively, so no coalescing needed.
-#[cfg(unix)]
-fn coalesce_paste(_prompt: &str, line: String) -> String {
-    line
 }
 
 fn plain_read_line(prompt: &str) -> Option<String> {
@@ -885,6 +862,115 @@ fn plain_read_line(prompt: &str) -> Option<String> {
         Ok(_) => Some(s),
         Err(_) => None,
     }
+}
+
+/// Unix: rustyline handles bracketed paste natively, so no coalescing needed.
+#[cfg(unix)]
+fn coalesce_paste(_prompt: &str, line: String) -> String {
+    line
+}
+
+/// Windows: rustyline's console reader delivers a pasted block as one
+/// `VK_RETURN` key-down per line, so `readline` ends the line on each and we'd
+/// otherwise hand the agent one prompt per pasted line. Detect the *rest* of a
+/// paste still buffered in the console input and fold it into the first line.
+///
+/// Detection uses `PeekConsoleInputW` — non-destructive, so it never consumes
+/// the events rustyline is about to read. After the first `readline` returns,
+/// if a real key press (`KEY_EVENT` with `bKeyDown` set) is still pending, the
+/// paste is ongoing: pull the next line with a fresh `readline("")` and append
+/// it, joined by `\n`. Pasted characters are themselves key-down events, so a
+/// pending key-down reliably means "more of the paste is buffered", while a
+/// lone typed Enter leaves only its key-*up* (filtered out) — so the burst ends
+/// immediately. That is exactly what kept the earlier `coalesce_paste` (which
+/// polled via crossterm and saw the buffered key-up) from mis-firing into a
+/// nested `readline("")` that waited for a second Enter.
+///
+/// Once more than one line has been folded in, re-present the whole block in a
+/// single `readline_with_initial` session so the cursor and backspace can cross
+/// every line boundary (rustyline's idle editor is single-line: a bare
+/// `readline("")` cannot travel above the last visual line).
+#[cfg(not(unix))]
+fn coalesce_paste(prompt: &str, acc: String) -> String {
+    let merged = coalesce(
+        acc,
+        || windows_pending_keydown(),
+        || EDITOR.with(|e| e.borrow_mut().as_mut().and_then(|rl| rl.readline("").ok())),
+    );
+    if !merged.contains('\n') {
+        return merged;
+    }
+    EDITOR.with(|e| {
+        let mut g = e.borrow_mut();
+        match g.as_mut() {
+            Some(rl) => rl
+                .readline_with_initial(prompt, (merged.as_str(), ""))
+                .unwrap_or(merged),
+            None => merged,
+        }
+    })
+}
+
+/// Windows: is there a real key press (not a key release) still in the console
+/// input buffer? Used by `coalesce_paste` to tell a pasted multiline block
+/// (many buffered key-downs) apart from a single typed line (only the Enter's
+/// key-up remains). Peeked, never consumed, so rustyline's next `readline`
+/// sees exactly the same events. Returns `false` on any error (not a console,
+/// redirected stdin, …) so a non-paste path never blocks or merges.
+///
+/// A short settle window is included: a slow/clipped paste may deliver the
+/// next line a few ms after the previous one was consumed, so we peek once
+/// more after ~12 ms before concluding the burst is over. A lone typed Enter
+/// leaves only its key-up (filtered out), so this adds a barely-perceptible
+/// ~12 ms to a normal submit and never re-opens the "press Enter twice"
+/// regression.
+#[cfg(not(unix))]
+fn windows_pending_keydown() -> bool {
+    use std::time::Duration;
+    const SETTLE_MS: u64 = 12;
+    if peek_keydown() {
+        return true;
+    }
+    std::thread::sleep(Duration::from_millis(SETTLE_MS));
+    peek_keydown()
+}
+
+/// Windows: non-destructive peek for a pending key *press* in the console
+/// input buffer. See [`windows_pending_keydown`].
+#[cfg(not(unix))]
+fn peek_keydown() -> bool {
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, INPUT_RECORD, KEY_EVENT, PeekConsoleInputW, STD_INPUT_HANDLE,
+    };
+    const PEEK: u32 = 256;
+    let mut buf: [INPUT_RECORD; 256] = unsafe { std::mem::zeroed() };
+    let mut read = 0u32;
+    // SAFETY: `buf` is a valid slice of `PEEK` records and `read` is a valid
+    // out-pointer. `PeekConsoleInputW` only inspects the buffer; it frees
+    // nothing and never consumes the events.
+    let ok = unsafe {
+        PeekConsoleInputW(
+            GetStdHandle(STD_INPUT_HANDLE),
+            buf.as_mut_ptr(),
+            PEEK,
+            &mut read,
+        )
+    };
+    if ok == 0 {
+        return false; // not a console / invalid handle → never merge
+    }
+    for i in 0..read as usize {
+        // `EventType == KEY_EVENT` means `Event.KeyEvent` is the active union
+        // member, so reading its `bKeyDown` is valid.
+        if buf[i].EventType == KEY_EVENT as u16 {
+            // SAFETY: guarded by the `EventType == KEY_EVENT` check above.
+            let down = unsafe { buf[i].Event.KeyEvent.bKeyDown };
+            if down != 0 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Append a line to the per-session history so prompts typed *while a turn was
@@ -930,6 +1016,7 @@ pub struct Spinner {
     alive: Arc<AtomicBool>,
 }
 
+#[cfg(unix)]
 impl Spinner {
     /// Start spinning with the given leading label (e.g. "thinking"). Returns a
     /// `Spinner` whose `stop()` clears the block. Pass `false` for `enabled` to
@@ -1024,6 +1111,7 @@ impl Spinner {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Spinner {
     fn drop(&mut self) {
         self.stop();
@@ -1244,6 +1332,10 @@ pub mod raw {
         /// on resume. The partial input line is preserved across the suspend —
         /// unlike `Interrupt`/`Eof`, which clear it.
         Suspend,
+        /// ctrl-q: caller should *begin* quitting. A second ctrl-q while the
+        /// shutdown is still in progress means something is frozen, so the
+        /// caller may force-exit immediately (see `spawn_force_quit_watchdog`).
+        Quit,
     }
 
     /// Wait for input (or turn completion) and consume any available bytes,
@@ -1417,6 +1509,15 @@ pub mod raw {
                         g.clear();
                     }
                     return RawInput::Eof;
+                }
+                0x11 => {
+                    // ctrl-q: begin quitting. A *second* ctrl-q (while still
+                    // shutting down) force-exits — see `spawn_force_quit_watchdog`.
+                    buf.clear();
+                    if let Ok(mut g) = typeahead.lock() {
+                        g.clear();
+                    }
+                    return RawInput::Quit;
                 }
                 0x1a => {
                     // ctrl-z: suspend. Do NOT clear `buf` — the partial line
@@ -1643,6 +1744,14 @@ pub mod raw {
                     }
                     return RawInput::Eof;
                 }
+                0x11 => {
+                    // ctrl-q: begin quitting; a second ctrl-q force-exits.
+                    buf.clear();
+                    if let Ok(mut g) = typeahead.lock() {
+                        g.clear();
+                    }
+                    return RawInput::Quit;
+                }
                 0x1a => return RawInput::Suspend,
                 0x1b => {
                     let next_is_csi = if i + 1 < bytes.len() {
@@ -1820,10 +1929,19 @@ mod tests {
 
     #[test]
     fn completes_unique_slash_prefix() {
+        use crate::term::set_extension_commands;
+        // Extension commands (e.g. the `ollama-*` tools, `wt_create`,
+        // `request_root`, `commit`) are not in the `match cmd` dispatch, so they
+        // used to be invisible to completion. They must now complete like
+        // built-ins once registered.
+        set_extension_commands(vec![
+            ("ollama-webtools".to_string(), "search the web".to_string()),
+            ("ollama-cloud-usage".to_string(), "show cloud usage".to_string()),
+        ]);
         let h = PirHelper { history_hinter: HistoryHinter::new() };
-        let (_start, matches) = h.complete("/mod", "/mod".len(), &ctx()).unwrap();
-        assert!(matches.contains(&"/model".to_string()));
-        assert!(matches.contains(&"/models".to_string()));
+        let (_start, matches) = h.complete("/ollama", "/ollama".len(), &ctx()).unwrap();
+        assert!(matches.contains(&"/ollama-webtools".to_string()));
+        assert!(matches.contains(&"/ollama-cloud-usage".to_string()));
     }
 
     #[test]
@@ -1919,6 +2037,21 @@ mod command_help_hint_tests {
     fn no_help_for_plain_text() {
         assert!(command_help_hint("fix the parser").is_none());
         assert!(command_help_hint("").is_none());
+    }
+
+    // Extension-registered commands (e.g. `/ollama-webtools`) aren't in
+    // `SLASH_HELP`; their registry-supplied description must still surface as an
+    // inline hint — this is what used to be missing (the command ran but gave no
+    // hint and didn't autocomplete).
+    #[test]
+    fn shows_help_for_extension_command() {
+        use crate::term::set_extension_commands;
+        set_extension_commands(vec![(
+            "ollama-webtools".to_string(),
+            "search the web via Ollama".to_string(),
+        )]);
+        let hint = command_help_hint("/ollama-webtools").expect("expected a hint");
+        assert!(hint.contains("search the web via Ollama"), "got: {hint:?}");
     }
 
     // `/help` itself is suppressed (its description is the command list); an
@@ -2111,6 +2244,39 @@ mod keyboard_idle_tests {
     }
 }
 
+/// Fold a burst of lines (a multiline paste, or fast consecutive input) into a
+/// single prompt. The caller supplies `first` (the line already read), a
+/// `has_more` predicate (true while more lines of the burst are pending), and a
+/// `read_more` closure that returns the next line or `None` when the burst is
+/// exhausted. Each appended line is joined with `\n`. A `read_more` that yields
+/// an empty string ends the burst immediately (mirrors the `extra.is_empty()
+/// => break` guard in the historical `coalesce_paste`). When `has_more` is false
+/// up front, `read_more` is never consulted and `first` is returned verbatim —
+/// so a single typed line submits with no extra wait. This is the regression
+/// guard for "multiline paste still appears as multiple prompts": the ~99ms
+/// debounce means the rest of a fast paste arrives and is folded in before the
+/// text is handed to the agent.
+fn coalesce<F, G>(first: String, mut has_more: F, mut read_more: G) -> String
+where
+    F: FnMut() -> bool,
+    G: FnMut() -> Option<String>,
+{
+    let mut acc = first;
+    while has_more() {
+        match read_more() {
+            Some(extra) => {
+                if extra.is_empty() {
+                    break;
+                }
+                acc.push('\n');
+                acc.push_str(&extra);
+            }
+            None => break,
+        }
+    }
+    acc
+}
+
 #[cfg(test)]
 mod coalesce_paste_tests {
     use super::*;
@@ -2212,6 +2378,9 @@ mod coalesce_paste_tests {
 mod nonunix_term {
     use std::io::{self, Write, BufRead};
     use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Duration;
     
 
     pub fn out(s: &str) {
@@ -2231,11 +2400,89 @@ mod nonunix_term {
     pub fn read_secret(prompt: &str) -> String { read_answer(prompt) }
     pub fn parent_shell_pid() -> u32 { 0 }
 
-    pub struct Spinner;
+    /// Windows spinner. Mirrors the Unix implementation: it animates on a
+    /// background thread, redrawing a *single* line in place (`\r\x1b[2K`) so it
+    /// can never drift or leave a stray "thinking…" line behind, and it renders
+    /// the user's live typeahead inline. The Unix build used `smol`/fd tricks
+    /// for stdout; here we just write directly to `io::stdout()` — crossterm is
+    /// already driving the terminal on this platform, and the spinner is the
+    /// sole stdout writer while it's alive (the REPL thread does not echo while
+    /// the spinner runs), so there's no writer race. The previous Windows stub
+    /// was a no-op `struct Spinner` with empty methods, which is exactly why the
+    /// "Thinking…" text and spinner never appeared on Windows.
+    pub struct Spinner {
+        handle: Option<thread::JoinHandle<()>>,
+        alive: Arc<AtomicBool>,
+    }
+
     impl Spinner {
-        pub fn start(_label: &str, _ta: Arc<Mutex<String>>, _e: bool) -> Spinner { Spinner }
-        pub fn start_with(_label: &str, _ta: Arc<Mutex<String>>, _e: bool, _q: Arc<std::sync::atomic::AtomicBool>) -> Spinner { Spinner }
-        pub fn stop(&mut self) {}
+        pub fn start(label: &str, ta: Arc<Mutex<String>>, enabled: bool) -> Spinner {
+            Spinner::start_with(label, ta, enabled, Arc::new(AtomicBool::new(false)))
+        }
+
+        pub fn start_with(
+            label: &str,
+            ta: Arc<Mutex<String>>,
+            enabled: bool,
+            quiet: Arc<AtomicBool>,
+        ) -> Spinner {
+            if !enabled {
+                return Spinner { handle: None, alive: Arc::new(AtomicBool::new(false)) };
+            }
+            let alive = Arc::new(AtomicBool::new(true));
+            let a = alive.clone();
+            let q = quiet.clone();
+            let label = label.to_string();
+            let handle = thread::spawn(move || {
+                let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+                let mut i = 0usize;
+                let mut out = io::stdout();
+                while a.load(Ordering::SeqCst) {
+                    // Detached turn: erase the spinner and go silent so a
+                    // backgrounded turn leaves a clean terminal behind it.
+                    if q.load(Ordering::SeqCst) {
+                        let _ = out.write_all(b"\r\x1b[2K");
+                        let _ = out.flush();
+                        std::thread::sleep(Duration::from_millis(80));
+                        continue;
+                    }
+                    let frame = if super::color_enabled() {
+                        format!("\x1b[36m{}\x1b[0m", frames[i % frames.len()])
+                    } else {
+                        frames[i % frames.len()].to_string()
+                    };
+                    let typed = ta.lock().map(|g| g.clone()).unwrap_or_default();
+                    let mut line = format!("\r\x1b[2K{frame} {label}…");
+                    if !typed.is_empty() {
+                        line.push_str("  ");
+                        line.push_str(&typed);
+                    }
+                    let _ = out.write_all(line.as_bytes());
+                    let _ = out.flush();
+                    std::thread::sleep(Duration::from_millis(80));
+                    i = i.wrapping_add(1);
+                }
+                // On stop, erase the spinner line and leave the cursor at column 0
+                // so the next output (streamed model text) starts cleanly.
+                let _ = out.write_all(b"\r\x1b[2K");
+                let _ = out.flush();
+            });
+            Spinner { handle: Some(handle), alive }
+        }
+
+        pub fn stop(&mut self) {
+            if self.alive.swap(false, Ordering::SeqCst) {
+                if let Some(h) = self.handle.take() {
+                    let _ = h.join();
+                }
+            }
+        }
+    }
+
+    impl Drop for Spinner {
+        fn drop(&mut self) {
+            self.stop();
+        }
     }
 
     pub mod raw {
@@ -2261,6 +2508,8 @@ mod nonunix_term {
             Cancel,
             Eof,
             Suspend,
+            /// ctrl-q: caller should *begin* quitting; a second ctrl-q force-exits.
+            Quit,
             Char(char),
             Enter,
             Tab,
@@ -2348,6 +2597,11 @@ mod nonunix_term {
                                                                 if let Ok(mut g) = ta.lock() { g.clear(); }
                                                                 return RawInput::Eof;
                                                             }
+                                                            KeyCode::Char(c) if ctrl && c == 'q' => {
+                                                                buf.clear();
+                                                                if let Ok(mut g) = ta.lock() { g.clear(); }
+                                                                return RawInput::Quit;
+                                                            }
                                                             KeyCode::Char(c) => {
                                                                 line.push(c);
                                                             }
@@ -2402,6 +2656,11 @@ mod nonunix_term {
                                         buf.clear();
                                         if let Ok(mut g) = ta.lock() { g.clear(); }
                                         return RawInput::Eof;
+                                    }
+                                    KeyCode::Char(c) if ctrl && c == 'q' => {
+                                        buf.clear();
+                                        if let Ok(mut g) = ta.lock() { g.clear(); }
+                                        return RawInput::Quit;
                                     }
                                     KeyCode::Char(c) => {
                                         buf.push(c);
@@ -2493,6 +2752,60 @@ mod nonunix_term {
         pub fn keyboard_idle_long_enough() -> bool { true }
     }
 }
+
+/// Spawn a background thread that force-exits the whole process the instant
+/// a *second* `Ctrl-Q` (`0x11`) arrives on stdin. Implements the two-stage
+/// quit: the first `Ctrl-Q` begins a graceful shutdown (the caller sweeps
+/// jobs and joins the worker); if that hangs because something is frozen,
+/// the second `Ctrl-Q` bypasses *all* cleanup and terminates immediately.
+///
+/// If the graceful shutdown completes normally the caller exits on its own
+/// thread and this watchdog is reaped with the process. It never returns.
+pub fn spawn_force_quit_watchdog() {
+    std::thread::spawn(|| {
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            let fd = unsafe { libc::STDIN_FILENO };
+            let mut tmp = [0u8; 64];
+            loop {
+                let r = unsafe {
+                    libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len())
+                };
+                if r > 0 && tmp[..r as usize].contains(&0x11) {
+                    let _ = std::io::stdout()
+                        .write_all(b"\r\n>> force-quitting NOW (Ctrl-Q x2)\r\n");
+                    std::process::exit(1);
+                }
+                if r <= 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::Write;
+            use crossterm::event::{self as ce, Event, KeyCode, KeyEventKind, KeyModifiers};
+            loop {
+                if ce::poll(std::time::Duration::from_millis(50)).unwrap_or(false) {
+                    if let Ok(Event::Key(k)) = ce::read() {
+                        if k.kind == KeyEventKind::Release {
+                            continue;
+                        }
+                        if k.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(k.code, KeyCode::Char('q'))
+                        {
+                            let _ = std::io::stdout()
+                                .write_all(b"\r\n>> force-quitting NOW (Ctrl-Q x2)\r\n");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
 #[cfg(not(unix))]
 pub use nonunix_term::*;
 #[cfg(not(unix))]
