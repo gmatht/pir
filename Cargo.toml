@@ -9,8 +9,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 pulldown-cmark = { version = "0.13", default-features = false }   # default CommonMark/GFM parser used to render agent markdown output (zero heavy deps; no cli/getopts)
 comrak = { version = "0.54", default-features = false, optional = true }   # optional heavier CommonMark/GFM backend (feature `comrak-backend`)
-ureq = { version = "2", default-features = false, features = ["json", "native-tls"] }   # native-tls = (dynamic; drops static ring/rustls); gzip default feature dropped (unused)
-native-tls = "0.2"                               # TLS provider for ureq (must be attached to the AgentBuilder explicitly)
+isahc = { version = "2", default-features = false, features = ["static-curl", "native-tls"] }  # async HTTP client (smol-driven); vendored curl + system OpenSSL via native-tls
+ureq = { version = "2", default-features = false, features = ["json", "native-tls"] }   # retained: used by notify/titler/ollama-cloud (not the streaming worker loop)
+native-tls = "0.2"                               # TLS provider for ureq in those modules
 rustyline = "14"                               # line editing: history + cursor nav + completer
 libc = "0.2"                                     # uid/gid drop for per-project users
 smol = "2"                                       # async runtime: event-driven stdin wait while a turn runs
@@ -29,9 +30,12 @@ windows-sys = { version = "0.61", default-features = false, features = [
   "Win32_Security_Authorization",
   "Win32_Security_Isolation",
   "Win32_System_JobObjects",
+  "Win32_System_Ole",            # clipboard data formats (CF_UNICODETEXT) for wininfo
+  "Win32_System_DataExchange",   # clipboard API (OpenClipboard/CloseClipboard/GetClipboardData) for wininfo
   "Win32_System_Registry",
   "Win32_System_SystemInformation",
   "Win32_System_Threading",
+  "Win32_UI_WindowsAndMessaging", # EnumWindows / GetWindowTextW for wininfo (/l)
 ] }
 
 # Optional TUI deps, only built when `--features tui` is set (so the default

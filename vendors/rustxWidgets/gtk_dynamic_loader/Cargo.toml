@@ -1,0 +1,25 @@
+[package]
+name = "gtk_dynamic_loader"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"
+thiserror = "1.0"
+
+[target.'cfg(unix)'.dependencies]
+libloading = "0.8"
+
+[target.'cfg(unix)'.dependencies.gtk4]
+optional = true
+package = "gtk4"
+path = "/root/tmp/gtk4-rs/gtk4"
+features = ["v4_14"]
+
+[features]
+gtk4rs = ["dep:gtk4"]
+
+[lib]
+name = "gtk_dynamic_loader"
+path = "src/lib.rs"
+

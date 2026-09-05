@@ -23,11 +23,11 @@
 #    with `--in-place`.
 #
 # Q: What tests should it do?
-#      * Build reproducibility: `cargo build --release`(lockfile must
-#        commitied if it would need to change).
-#      * Unit tests: `cargo test --release` (e.g. goal.rs parsing,
+#      * Build reproducibility: `cargo build --release --locked` (lockfile must
+#        match; fail if it would need to change).
+#      * Unit tests: `cargo test --release --locked` (e.g. goal.rs parsing,
 #        next-step selection, goal persistence).
-#      * Lint gate (errors fail, warnings warn): `cargo clippy` —
+#      * Lint gate (errors fail, warnings warn): `cargo clippy --locked` —
 #        correctness/deny lints (e.g. `never_loop`, panic-in-const) block the
 #        deploy; plain warnings are surfaced but non-fatal.
 #      * Binary smoke tests against the freshly built artifact:
@@ -71,34 +71,17 @@
 
 set -euo pipefail
 
-# --------------------------------------------------------------- WSL build (portable glibc)
-# Run cargo/rustc inside a WSL distro so the release binary targets an older
-# glibc (AlmaLinux8 -> glibc 2.28) and runs on any modern distro. wsl.exe
-# emits a stray NUL byte on stdout (a Windows pty quirk); the wrappers strip
-# it so command substitution and the build logs stay clean, while preserving
-# the real cargo/rustc exit code (via PIPESTATUS). Engaged only when wsl.exe
-# is executable AND the distro is actually registered (tolerating the leading
-# "*" default-distro marker in `wsl -l -v`).
 WSL_EXEC='/mnt/c/Program Files/WSL/wsl.exe'
-WSL_DISTRO="${WSL_DISTRO:-AlmaLinux8}"
-_use_wsl=0
-if [ "${PIR_NO_WSL:-0}" != "1" ] && [ -x "$WSL_EXEC" ]; then
-  if "$WSL_EXEC" -l -v 2>/dev/null | awk -v d="$WSL_DISTRO" '
-       NR>1 { for (i=1;i<=NF;i++) if (tolower($i)==tolower(d)) f=1 } END{exit f?0:1}'; then
-    _use_wsl=1
-  fi
-fi
-
-if [ "$_use_wsl" -eq 1 ]; then
-  # Build inside the WSL distro; working dir is shared/mounted. Strip the NUL
-  # that wsl.exe injects, and return cargo/rustc's true exit status.
-  cargo() { "$WSL_EXEC" -d "$WSL_DISTRO" cargo "$@" 2>&1 | tr -d '\0'; return "${PIPESTATUS[0]}"; }
-  rustc()  { "$WSL_EXEC" -d "$WSL_DISTRO" rustc "$@" 2>&1 | tr -d '\0'; return "${PIPESTATUS[0]}"; }
-  say "using WSL distro '$WSL_DISTRO' for cargo/rustc builds"
-else
-  cargo() { command cargo "$@"; }
-  rustc()  { command rustc "$@"; }
-fi
+# We wrap the cargo commands to run in the AlmaLinux8 distro.
+# This assumes the AlmaLinux8 distro is installed and configured in WSL.
+# The cargo commands are executed inside the container while keeping the 
+# current working directory (which is shared/mounted).
+cargo() {
+  "$WSL_EXEC" -d AlmaLinux8 cargo "$@"
+}
+rustc() {
+  "$WSL_EXEC" -d AlmaLinux8 rustc "$@"
+}
 
 
 # --------------------------------------------------------------- args
@@ -175,7 +158,6 @@ step() {
   _step_t0="$(date +%s.%N)"
   printf '\033[1;36m[deploy] \033[1;35mstep %d/%d\033[0m %s\n' \
     "$_step_no" "${_STEP_TOTAL:-?}" "$*"
-  date
 }
 # step_done: print elapsed time for the last step (debug/verbose only).
 step_done() {
@@ -250,16 +232,16 @@ step_done "external path dependencies materialized (none required)"
 
 # --------------------------------------------------------------- tests + build
 if [ "$TESTS" -eq 1 ]; then
-  step "run unit tests (cargo test --release)"
+  step "run unit tests (cargo test --release --locked)"
   # Capture to a log file (not a live `| tail` pipe) so the run can't be
   # starved by an unrelated process holding the pipeline's write end open, and
   # so the output survives for debugging. We tail the file afterwards.
   _TLOG="$(mktemp "${TMPDIR:-/tmp}/pir-deploy-test.XXXXXX.log")"
-  cargo test --release >"$_TLOG" 2>&1 || true
+  cargo test --release --locked >"$_TLOG" 2>&1 || true
   dbg "cargo test log: $_TLOG ($(wc -l < "$_TLOG") lines)"
   tail -25 "$_TLOG"
   # cargo test fails the pipe with set -o pipefail only if it errors; assert exit:
-  cargo test --release >/dev/null || die "unit tests failed"
+  cargo test --release --locked >/dev/null || die "unit tests failed"
   step_done "unit tests passed"
 else
   say "skipping unit tests (--no-tests / --fast)"
@@ -270,7 +252,7 @@ if [ "$CLIPPY" -eq 1 ]; then
     step "lint gate (cargo clippy; deny-level errors fail)"
     # Capture full output; fail only if clippy emitted a hard error (deny lint
     # or compile failure), not on ordinary warnings.
-    CLIPPY_OUT="$(cargo clippy --release 2>&1)"
+    CLIPPY_OUT="$(cargo clippy --release --locked 2>&1)"
     echo "$CLIPPY_OUT" | grep -E '^(warning|warning:|note:|  -->|[0-9]+ \|)' || true
     if echo "$CLIPPY_OUT" | grep -qE '^error(\[|:)'; then
       die "clippy reported one or more errors (deny-level lint or compile failure)"
@@ -282,8 +264,8 @@ if [ "$CLIPPY" -eq 1 ]; then
   fi
 fi
 
-step "build release (cargo build --release)"
-cargo build --release || die "release build failed"
+step "build release (cargo build --release --locked)"
+cargo build --release --locked || die "release build failed"
 BIN="$SRC/target/release/pir"
 [ -x "$BIN" ] || die "binary not produced at $BIN"
 dbg "BIN=$BIN  size=$(stat -c%s "$BIN" 2>/dev/null || echo '?') bytes"
@@ -359,11 +341,6 @@ if [ "$WITH_PROJECT_INIT" -eq 1 ]; then
   say "  ai_$PROJ provisioned"
   step_done "ai_$PROJ provisioned"
 fi
-
-
-jj commit Cargo.lock -m "automatic Cargo.lock update" ||
-	git commit Cargo.lock -m "automatic Cargo.lock update"
-
 
 # --------------------------------------------------------------- publish to GitHub (opt-in)
 if [ "$PUSH" -eq 1 ] || [ -n "$TAG" ] || [ "$RELEASE" -eq 1 ]; then

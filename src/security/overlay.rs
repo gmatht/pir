@@ -404,6 +404,88 @@ pub fn teardown_active() -> Result<(), OverlayError> {
     r
 }
 
+// ===========================================================================
+// Truthful engagement status (the /quarantine + security banner authority)
+// ===========================================================================
+
+/// A snapshot of which write-quarantine backend is *actually* engaged right
+/// now — the source of truth for the `/quarantine` + security-banner state.
+/// A `true` field means a real overlay/staging mount (or container rootfs /
+/// manifest store) is live and physically intercepting writes; a `false` field
+/// means the backend was never mounted, so the in-process guardrail and the
+/// mitigation engine are the only enforcement for writes outside those trees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuarantineEngagement {
+    /// The selective system-tree overlay (`/etc`, `/usr/local`, `/opt`, `/srv`,
+    /// `/var`, `/boot`) is mounted and staging writes to those trees.
+    pub system: bool,
+    /// The project-scoped overlay over the repo root (with a whitelisted
+    /// worktree bound real) is mounted and staging non-whitelisted writes.
+    pub project: bool,
+    /// The NON-ROOT `$HOME` quarantine (fuse-overlay of `$HOME` + whitelists)
+    /// is live.
+    pub home: bool,
+    /// The directory-rootfs container (root default: the agent chrooted into
+    /// its own rootfs dir) is live — every write lands in the rootfs.
+    pub container: bool,
+    /// The FULL-ROOT overlay container (the whole `/` overlaid) is live.
+    pub fullroot: bool,
+    /// (Windows) the no-driver manifest staging store was initialised.
+    pub staging: bool,
+}
+
+impl QuarantineEngagement {
+    /// Is ANY physical quarantine backend actually mounted/live right now?
+    pub fn any(&self) -> bool {
+        self.system || self.project || self.home || self.container || self.fullroot || self.staging
+    }
+
+    /// A comma-separated list of the engaged backends, or "(none)".
+    pub fn engaged_list(&self) -> String {
+        let mut v: Vec<&str> = Vec::new();
+        if self.system { v.push("system"); }
+        if self.project { v.push("project"); }
+        if self.home { v.push("home"); }
+        if self.container { v.push("container"); }
+        if self.fullroot { v.push("fullroot"); }
+        if self.staging { v.push("staging"); }
+        if v.is_empty() { "(none)".into() } else { v.join("+") }
+    }
+}
+
+/// The live engagement state across every write-quarantine backend, queried
+/// from the real process-global flags / env (not the policy config flag).
+pub fn quarantine_engagement() -> QuarantineEngagement {
+    QuarantineEngagement {
+        system: system_quarantine_engaged(),
+        project: project_quarantine_engaged(),
+        home: home_quarantine_engaged(),
+        container: container_engaged(),
+        fullroot: fullroot_engaged(),
+        #[cfg(windows)]
+        staging: crate::security::windows::staging::staging_engaged(),
+        #[cfg(not(windows))]
+        staging: false,
+    }
+}
+
+/// A human-readable, honest quarantine status line. Reports which backend is
+/// actually engaged, and — when none is — states plainly that writes outside
+/// the configured trees are NOT physically staged and are enforced by the
+/// in-process guardrail + mitigation ask-gate instead (never a silent claim of
+/// "quarantine on").
+pub fn quarantine_status() -> String {
+    let e = quarantine_engagement();
+    if e.any() {
+        format!("write-quarantine engaged: {}", e.engaged_list())
+    } else {
+        format!(
+            "write-quarantine NOT physically engaged — out-of-tree writes are guarded in-process (Yellow/ask), not staged; \
+             engage via a whitelisted worktree (`wt`), or set PIR_QUARANTINE_MODE and run as root to mount the overlay"
+        )
+    }
+}
+
 /// Turn an absolute path into a filesystem-safe token (`/etc` -> `etc`).
 fn safe_name(tree: &Path) -> String {
     tree.to_string_lossy()

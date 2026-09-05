@@ -1,37 +1,3 @@
-# Rust build output
 /target
-/.cargo-target
-
-# Local project metadata / session logs written next to the cwd
+/build
 /.pir
-
-# Editor / OS noise
-*.swp
-*.swo
-*~
-.DS_Store
-.idea/
-.vscode/
-*.iml
-
-# Local env overrides
-.env
-.env.local
-fuzz/fuzz_parser
-fuzz/corpus/
-/.rustxWidgets-upstream/
-
-# Optional GUI dependency (rustxwidgets) is now VENDORED in-tree at
-# vendors/rustxWidgets (a real directory shipped in git), so the default
-# `cargo build` (gui feature) works with no external checkout. Only the
-# foreign scratch symlinks are ignored.
-# Local scratch symlinks to sibling worktrees / backups / archives:
-rustxWidgets.bak
-pir_.gz
-build-gui.sh
-
-# Vendored rustxWidgets is untracked (not committed); worktrees link it via link_untracked_build_deps.
-# It comes from a shared rustxWidgets source (see docs: git-subtree candidate).
-vendors/
-# rustxWidgets sibling symlink (points at the untracked vendored copy)
-/rustxWidgets

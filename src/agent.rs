@@ -237,8 +237,25 @@ impl Agent {
         // escalation ask-only). `None` -> no guardrail consulted. The context
         // is built once and shared; its `check` is the single entry point the
         // tool path calls before each tool runs.
+        let policy = crate::security::load_policy();
+        // The "user-security" policy IS the per-project user boundary: when it
+        // is OFF the agent must not be confined to the sandbox user, so its
+        // commands run as the *invoking* user (mirrors `/su-security off`).
+        // Capture it here before `policy` is moved into the context, and use it
+        // to seed the session's su-security authority below.
+        let user_security = policy.user_security;
+        // When user-security is OFF the agent must not be confined to its
+        // sandbox user: mirror `/su-security off` so commands run as the
+        // invoking user (drop_to_agent_user / /sh read this env).
+        if !user_security {
+            std::env::set_var("PIR_AGENT_AS_INVOKER", "1");
+        }
+        // Mitigation-level security (docs/MITIGATION_LEVEL_SECURITY.md) is
+        // active when the policy level is `mitigation` (or the default
+        // guard posture, which also runs the safety pre-filter). The builtin
+        // `bash` tool reads this flag to decide whether to run the analyzer.
+        crate::security::set_mitigation_active(policy.level.is_mitigation() || policy.level == crate::security::SecurityLevel::Guard);
         let security = {
-            let policy = crate::security::load_policy();
             let headless = std::env::var("PIR_HEADLESS").is_ok();
             let ctx = crate::security::SecurityContext::new(policy, headless);
             // Overlayfs write-quarantine is a *launcher* concern: it mounts
@@ -384,7 +401,7 @@ impl Agent {
             continuations: Vec::new(),
             token_budget: None,
             undo_stack: Vec::new(),
-            su_security_enabled: true,
+            su_security_enabled: user_security,
             security,
             thinking: config::ThinkingLevel::Off,
             show_thinking: true,

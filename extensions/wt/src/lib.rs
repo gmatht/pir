@@ -48,6 +48,8 @@ use crate::plugin::{Outcome, Registry, ToolBackend, ToolSpec};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::sync::Mutex;
 
 /// One process-wide guard so a single agent process never auto-merges two
@@ -1914,14 +1916,26 @@ mod tests {
         let repo = scratch_repo();
         let lock = repo.join(".git").join("wt-merge.lock");
 
-        // Holder A (kept alive for the duration of the test).
-        let mut a = Command::new("flock")
-            .args(["-x", "-w", "0"])
-            .arg(&lock)
-            .arg("sleep")
-            .arg("1000")
-            .spawn()
-            .unwrap();
+        // Holder A (kept alive for the duration of the test). Run it in its
+        // own session (setsid) so the whole group (flock + the `sleep` it
+        // spawns) can be killed at the end — this flock forks the command, so
+        // killing only the flock pid would orphan the `sleep 1000`, which then
+        // holds the test harness's stdout pipe open and wedges the whole suite.
+        let mut a = unsafe {
+            Command::new("flock")
+                .args(["-x", "-w", "0"])
+                .arg(&lock)
+                .arg("sleep")
+                .arg("1000")
+                .pre_exec(|| {
+                    unsafe {
+                        libc::setsid();
+                    }
+                    Ok(())
+                })
+                .spawn()
+                .unwrap()
+        };
         std::thread::sleep(std::time::Duration::from_millis(150));
 
         // Holder B should be refused immediately (-w 0 => no wait).
@@ -1934,7 +1948,9 @@ mod tests {
             .unwrap();
         assert!(!b.success(), "second flock holder must be blocked");
 
-        let _ = a.kill();
+        // Kill the whole session (flock + its forked `sleep`), not just the
+        // flock pid, so no orphan survives to hold the harness pipe.
+        let _ = unsafe { libc::kill(-(a.id() as i32), libc::SIGKILL) };
         let _ = a.wait();
         let _ = fs::remove_dir_all(&repo);
     }

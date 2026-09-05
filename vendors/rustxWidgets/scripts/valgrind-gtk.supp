@@ -1,0 +1,324 @@
+# Suppress common GTK3/fontconfig/pango/GLX process-exit leak noise that shows
+# up in the stress and example binaries on Ubuntu's system libraries.
+#
+# Keep this file focused on external-library shutdown noise. Do not add broad
+# suppressions for Rust-side allocations unless they have been investigated and
+# confirmed to be harmless third-party behavior.
+
+{
+   gtk3_pango_entry_fontconfig_value_save_indirect
+   Memcheck:Leak
+   match-leak-kinds: indirect
+   fun:malloc
+   fun:strdup
+   fun:FcValueSave
+   ...
+   fun:pango_layout_get_unknown_glyphs_count
+   ...
+   fun:g_type_create_instance
+   fun:g_object_new_with_properties
+   fun:g_object_new
+   fun:_ZN18gtk_dynamic_loader8wrappers5Entry3new*
+}
+
+{
+   gtk3_pango_entry_fontconfig_render_prepare_indirect
+   Memcheck:Leak
+   match-leak-kinds: indirect
+   fun:calloc
+   ...
+   fun:FcFontRenderPrepare
+   fun:FcFontSetMatch
+   ...
+   fun:start_thread
+   fun:clone
+}
+
+{
+   gtk3_pango_entry_fontconfig_substitute_indirect
+   Memcheck:Leak
+   match-leak-kinds: indirect
+   fun:malloc
+   ...
+   fun:FcConfigSubstituteWithPat
+   ...
+   fun:pango_layout_get_unknown_glyphs_count
+   ...
+   fun:g_type_create_instance
+   fun:g_object_new_with_properties
+   fun:g_object_new
+   fun:_ZN18gtk_dynamic_loader8wrappers5Entry3new*
+}
+
+{
+   gtk3_pango_entry_fontconfig_realloc_definite
+   Memcheck:Leak
+   match-leak-kinds: definite
+   fun:realloc
+   ...
+   fun:pango_layout_get_unknown_glyphs_count
+   ...
+   fun:g_type_create_instance
+   fun:g_object_new_with_properties
+   fun:g_object_new
+   fun:_ZN18gtk_dynamic_loader8wrappers5Entry3new*
+}
+
+{
+   gtk3_fontconfig_fcinit_expat_definite
+   Memcheck:Leak
+   match-leak-kinds: definite
+   fun:malloc
+   ...
+   fun:XML_ParseBuffer
+   ...
+   fun:FcInit
+   ...
+   fun:start_thread
+   fun:clone
+}
+
+{
+   gtk3_fontconfig_fcinit_expat_indirect_malloc
+   Memcheck:Leak
+   match-leak-kinds: indirect
+   fun:malloc
+   ...
+   fun:XML_ParseBuffer
+   ...
+   fun:FcInit
+   ...
+   fun:start_thread
+   fun:clone
+}
+
+{
+   gtk3_fontconfig_fcinit_expat_indirect_calloc
+   Memcheck:Leak
+   match-leak-kinds: indirect
+   fun:calloc
+   ...
+   fun:XML_ParseBuffer
+   ...
+   fun:FcInit
+   ...
+   fun:start_thread
+   fun:clone
+}
+
+{
+   gtk3_fontconfig_fcinit_value_save_indirect
+   Memcheck:Leak
+   match-leak-kinds: indirect
+   fun:malloc
+   fun:strdup
+   fun:FcValueSave
+   ...
+   fun:XML_ParseBuffer
+   ...
+   fun:FcInit
+   ...
+   fun:start_thread
+   fun:clone
+}
+
+{
+   gtk3_fontconfig_render_prepare_value_save_indirect
+   Memcheck:Leak
+   match-leak-kinds: indirect
+   fun:malloc
+   fun:strdup
+   fun:FcValueSave
+   ...
+   fun:FcFontRenderPrepare
+   fun:FcFontSetMatch
+   ...
+   fun:start_thread
+   fun:clone
+}
+
+{
+   gtk3_glib_thread_tls_possible
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:calloc
+   fun:calloc
+   fun:allocate_dtv
+   fun:_dl_allocate_tls
+   fun:allocate_stack
+   fun:pthread_create@@GLIBC_2.34
+   ...
+   fun:start_thread
+   fun:clone
+}
+
+{
+   gtk3_glib_thread_tls_gvfs_css_possible
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:calloc
+   fun:calloc
+   fun:allocate_dtv
+   fun:_dl_allocate_tls
+   fun:allocate_stack
+   fun:pthread_create@@GLIBC_2.34
+   obj:/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0.8000.0
+   fun:g_thread_new
+   obj:/usr/lib/x86_64-linux-gnu/libgio-2.0.so.0.8000.0
+   fun:g_bus_get_sync
+   obj:/usr/lib/x86_64-linux-gnu/gio/modules/libgvfsdbus.so
+   ...
+   fun:gtk_css_provider_load_from_resource
+   ...
+   fun:_ZN18gtk_dynamic_loader8wrappers6Window3new*
+}
+
+{
+   gtk3_glib_thread_tls_pango_entry_possible
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:calloc
+   fun:calloc
+   fun:allocate_dtv
+   fun:_dl_allocate_tls
+   fun:allocate_stack
+   fun:pthread_create@@GLIBC_2.34
+   obj:/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0.8000.0
+   fun:g_thread_new
+   obj:/usr/lib/x86_64-linux-gnu/libpangoft2-1.0.so.0.5200.1
+   fun:g_type_create_instance
+   obj:/usr/lib/x86_64-linux-gnu/libgobject-2.0.so.0.8000.0
+   fun:g_object_new_with_properties
+   fun:g_object_new
+   fun:pango_cairo_font_map_get_default
+   fun:gdk_pango_context_get_for_screen
+   fun:gtk_widget_create_pango_context
+   fun:gtk_widget_get_pango_context
+   fun:gtk_widget_create_pango_layout
+   ...
+   fun:_ZN18gtk_dynamic_loader8wrappers5Entry3new*
+}
+
+{
+   gtk3_pango_entry_fontconfig_substitute_sized_indirect
+   Memcheck:Leak
+   match-leak-kinds: indirect
+   fun:malloc
+   obj:/usr/lib/x86_64-linux-gnu/libfontconfig.so.1.12.1
+   fun:FcConfigSubstituteWithPat
+   ...
+   fun:pango_layout_get_size
+   ...
+   fun:pango_layout_get_unknown_glyphs_count
+   ...
+   fun:_ZN18gtk_dynamic_loader8wrappers5Entry3new*
+}
+
+{
+   gtk3_fontconfig_strdup_chain_indirect
+   Memcheck:Leak
+   match-leak-kinds: indirect
+   fun:malloc
+   fun:strdup
+   obj:/usr/lib/x86_64-linux-gnu/libfontconfig.so.1.12.1
+   ...
+   obj:/usr/lib/x86_64-linux-gnu/libfontconfig.so.1.12.1
+}
+
+{
+   gtk3_glx_gallium_display_possible
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:malloc
+   ...
+   fun:driCreateNewScreen3
+   ...
+   fun:epoxy_glx_version
+   ...
+   fun:gdk_display_manager_open_display
+   fun:gtk_init_check
+   fun:gtk_init
+}
+
+{
+   gtk3_gallium_display_init_possible
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:malloc
+   obj:*libgallium*
+   ...
+   fun:driCreateNewScreen3
+   ...
+}
+
+{
+   gtk3_fontconfig_fcrenderprepare_realloc_definite
+   Memcheck:Leak
+   match-leak-kinds: definite
+   fun:realloc
+   obj:*libfontconfig*
+   obj:*libfontconfig*
+   fun:FcFontRenderPrepare
+   fun:FcFontSetMatch
+   ...
+   fun:start_thread
+   fun:clone
+}
+
+{
+   gtk3_fontconfig_pango_unknown_glyph_realloc_definite
+   Memcheck:Leak
+   match-leak-kinds: definite
+   fun:realloc
+   obj:*libfontconfig*
+   obj:*libfontconfig*
+   obj:*libcairo*
+   obj:*libpangocairo*
+   ...
+   fun:pango_layout_get_unknown_glyphs_count
+   ...
+}
+
+{
+   gtk3_fontconfig_expat_parse_definite
+   Memcheck:Leak
+   match-leak-kinds: definite
+   fun:malloc
+   obj:*libfontconfig*
+   obj:*libfontconfig*
+   obj:*libfontconfig*
+   obj:*libexpat*
+   ...
+   fun:XML_ParseBuffer
+   ...
+}
+
+{
+   gtk3_fontconfig_internal_indirect
+   Memcheck:Leak
+   match-leak-kinds: indirect
+   fun:malloc
+   obj:*libfontconfig*
+   obj:*libfontconfig*
+   obj:*libfontconfig*
+   obj:*libfontconfig*
+   obj:*libfontconfig*
+   obj:*libfontconfig*
+   obj:*libfontconfig*
+   obj:*libfontconfig*
+   obj:*libfontconfig*
+   obj:*libfontconfig*
+   obj:*libfontconfig*
+}
+
+{
+   gtk3_fontconfig_pangocairo_realloc_definite
+   Memcheck:Leak
+   match-leak-kinds: definite
+   fun:realloc
+   obj:*libfontconfig*
+   obj:*libfontconfig*
+   obj:*libcairo*
+   obj:*libpangocairo*
+   ...
+}

@@ -467,11 +467,20 @@ fn security_lines(policy: &crate::security::SecurityPolicy, su_security: bool) -
     let mut lines = Vec::new();
     lines.push(term::bold("posture").to_string());
     lines.push(format!("  level: {}", term::cyan(policy.level.as_str())));
+    lines.push(format!("  mitigation engine: {}",
+        if crate::security::mitigation_active() { term::green("on") } else { term::yellow("off") }));
     lines.push(format!("  apt: {}   network: {}   ask: {}   read: {}",
         policy.apt.as_str(), policy.network.as_str(), policy.ask.as_str(), policy.read.as_str()));
+    let (q_on, q_backend) = crate::security::quarantine_engaged_surface();
+    let qp_on = {
+        #[cfg(unix)]
+        { crate::security::overlay::project_quarantine_engaged() }
+        #[cfg(not(unix))]
+        { false }
+    };
     lines.push(format!("  quarantine: {}   project-quarantine: {}",
-        if policy.quarantine { "on" } else { "off" },
-        if policy.quarantine_project { "on" } else { "off" }));
+        if q_on { format!("on (engaged: {q_backend})") } else { "CONFIG on, NOT mounted".to_string() },
+        if qp_on { "on (engaged)".to_string() } else { "off (no worktree overlay)".to_string() }));
     lines.push(format!("  su-based boundary: {}", if su_security { term::green("ENABLED") } else { term::yellow("disabled") }));
     lines.push(String::new());
     lines.push(term::bold("OS support").to_string());
@@ -703,10 +712,11 @@ pub fn security_editor(policy: &mut crate::security::SecurityPolicy) -> Option<(
     let mut network = policy.network;
     let mut ask = policy.ask;
     let mut read = policy.read;
+    let mut user_security = policy.user_security;
     let mut quarantine = policy.quarantine;
     let mut quarantine_project = policy.quarantine_project;
 
-    let _levels = ["guard", "off", "sandbox", "strict", "worktree"];
+    let _levels = ["guard", "off", "sandbox", "strict", "worktree", "mitigation"];
     let _apts = ["auto", "human", "stage", "project"];
     let _networks = ["on", "allowlist", "off"];
     let _asks = ["ask", "auto-yes", "auto-no"];
@@ -719,7 +729,7 @@ pub fn security_editor(policy: &mut crate::security::SecurityPolicy) -> Option<(
     };
     let yn = |b: bool| -> String { if b { term::green("on") } else { term::yellow("off") } };
 
-    let mut selected = 0usize; // 0 level, 1 quarantine, 2 quarantine-project, 3 apt, 4 network, 5 ask, 6 read
+    let mut selected = 0usize; // 0 level, 1 quarantine, 2 quarantine-project, 3 apt, 4 network, 5 ask, 6 read, 7 user-security
     loop {
         let marker = |i: usize| if i == selected { "▸" } else { " " };
         let lines: Vec<String> = vec![
@@ -730,6 +740,7 @@ pub fn security_editor(policy: &mut crate::security::SecurityPolicy) -> Option<(
             format!("{} network            {}", marker(4), term::cyan(network.as_str())),
             format!("{} ask                {}", marker(5), term::cyan(ask.as_str())),
             format!("{} read               {}", marker(6), term::cyan(read.as_str())),
+            format!("{} user-security     {}", marker(7), yn(user_security)),
             String::new(),
             term::dim("[↑/↓] move  [←/→] change  [s] save  [q] discard").into(),
         ];
@@ -746,11 +757,12 @@ pub fn security_editor(policy: &mut crate::security::SecurityPolicy) -> Option<(
             read: &mut crate::security::ReadMode,
             quarantine: &mut bool,
             quarantine_project: &mut bool,
+            user_security: &mut bool,
         ) {
             use crate::security::{AptMode, AskMode, NetworkMode, ReadMode, SecurityLevel};
             match selected {
                 0 => {
-                    if let Some(l) = SecurityLevel::parse(&spin(level.as_str(), &["guard", "off", "sandbox", "strict", "worktree"], dir)) {
+                    if let Some(l) = SecurityLevel::parse(&spin(level.as_str(), &["guard", "off", "sandbox", "strict", "worktree", "mitigation"], dir)) {
                         *level = l;
                     }
                 }
@@ -776,14 +788,15 @@ pub fn security_editor(policy: &mut crate::security::SecurityPolicy) -> Option<(
                         *read = r;
                     }
                 }
+                7 => *user_security = !*user_security,
                 _ => {}
             }
         }
         match read_key()? {
             Key::Up | Key::Char('k') => selected = selected.saturating_sub(1),
-            Key::Down | Key::Char('j') => selected = (selected + 1).min(6),
-            Key::Left | Key::Char('h') => apply_spin(selected, -1, &spin, &mut level, &mut apt, &mut network, &mut ask, &mut read, &mut quarantine, &mut quarantine_project),
-            Key::Right | Key::Char('l') => apply_spin(selected, 1, &spin, &mut level, &mut apt, &mut network, &mut ask, &mut read, &mut quarantine, &mut quarantine_project),
+            Key::Down | Key::Char('j') => selected = (selected + 1).min(7),
+            Key::Left | Key::Char('h') => apply_spin(selected, -1, &spin, &mut level, &mut apt, &mut network, &mut ask, &mut read, &mut quarantine, &mut quarantine_project, &mut user_security),
+            Key::Right | Key::Char('l') => apply_spin(selected, 1, &spin, &mut level, &mut apt, &mut network, &mut ask, &mut read, &mut quarantine, &mut quarantine_project, &mut user_security),
             Key::Char('s') | Key::Enter => {
                 policy.level = level;
                 policy.apt = apt;
@@ -792,6 +805,7 @@ pub fn security_editor(policy: &mut crate::security::SecurityPolicy) -> Option<(
                 policy.read = read;
                 policy.quarantine = quarantine;
                 policy.quarantine_project = quarantine_project;
+                policy.user_security = user_security;
                 let _ = crate::security::save_policy(policy);
                 return Some(());
             }

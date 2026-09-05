@@ -21,6 +21,24 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Process-wide "is mitigation-level security active" flag. Set once at agent
+/// construction from the loaded policy; read by the builtin `bash` tool to
+/// decide whether to run the mitigation engine (docs/MITIGATION_LEVEL_SECURITY.md).
+/// Defaults to true so the safety pre-filter is on even before an agent is
+/// built (defence in depth).
+static MITIGATION_ACTIVE: AtomicBool = AtomicBool::new(true);
+
+/// Enable/disable the mitigation engine process-wide (called at agent
+/// construction from the active policy level).
+pub fn set_mitigation_active(on: bool) {
+    MITIGATION_ACTIVE.store(on, Ordering::SeqCst);
+}
+
+/// Whether the mitigation engine is currently active.
+pub fn mitigation_active() -> bool {
+    MITIGATION_ACTIVE.load(Ordering::SeqCst)
+}
+
 // ===========================================================================
 // Core vocabulary
 // ===========================================================================
@@ -205,6 +223,13 @@ pub enum SecurityLevel {
     Sandbox,
     Strict,
     Worktree,
+    /// Mitigation-level security (docs/MITIGATION_LEVEL_SECURITY.md): the
+    /// command analyzer rewrites dangerous-but-legitimate commands into
+    /// reversible / narrower / two-phase / race-safe equivalents, denies RED
+    /// (raw-device / irreversible) with a prescriptive message, and emits an
+    /// in-band receipt. Sits between the in-process guardrail and the OS
+    /// boundary.
+    Mitigation,
     #[default]
     Guard,
     Off,
@@ -216,6 +241,7 @@ impl SecurityLevel {
             "sandbox" => Some(SecurityLevel::Sandbox),
             "strict" => Some(SecurityLevel::Strict),
             "worktree" => Some(SecurityLevel::Worktree),
+            "mitigation" | "mitigate" | "mitigating" => Some(SecurityLevel::Mitigation),
             "guard" => Some(SecurityLevel::Guard),
             "off" | "none" | "disabled" => Some(SecurityLevel::Off),
             _ => None,
@@ -224,7 +250,11 @@ impl SecurityLevel {
     pub fn guards_writes(self) -> bool {
         matches!(
             self,
-            SecurityLevel::Guard | SecurityLevel::Sandbox | SecurityLevel::Strict | SecurityLevel::Worktree
+            SecurityLevel::Guard
+                | SecurityLevel::Sandbox
+                | SecurityLevel::Strict
+                | SecurityLevel::Worktree
+                | SecurityLevel::Mitigation
         )
     }
     pub fn as_str(self) -> &'static str {
@@ -232,6 +262,7 @@ impl SecurityLevel {
             SecurityLevel::Sandbox => "sandbox",
             SecurityLevel::Strict => "strict",
             SecurityLevel::Worktree => "worktree",
+            SecurityLevel::Mitigation => "mitigation",
             SecurityLevel::Guard => "guard",
             SecurityLevel::Off => "off",
         }
@@ -241,6 +272,11 @@ impl SecurityLevel {
     /// existing `wt` extension is driven into PR-submission mode.
     pub fn is_worktree(self) -> bool {
         matches!(self, SecurityLevel::Worktree)
+    }
+    /// True when mitigation-level security is active (the command analyzer
+    /// rewrites dangerous commands and denies RED).
+    pub fn is_mitigation(self) -> bool {
+        matches!(self, SecurityLevel::Mitigation)
     }
 }
 
@@ -308,6 +344,13 @@ pub struct SecurityPolicy {
     /// Read posture: reads allowed by default; `GuardedSecrets` makes
     /// credential/secret reads require an `ask`.
     pub read: ReadMode,
+    /// User-based security: when on (the default), writes into another user's
+    /// home or `ai`-group tree are denied (`GuardOtherUsers`). Set
+    /// `user-security = false` to disable this protection — useful on a
+    /// single-user host where the "other users" classification is only noise.
+    /// Disabling it does *not* weaken the repo-isolation, system-state,
+    /// secret, DB, or test-oracle guards.
+    pub user_security: bool,
     pub extra_guard: Vec<String>,
     /// Overlayfs write-quarantine: when `pir` can mount (root), the agent still
     /// *all* commands, but writes to the configured system trees are
@@ -480,6 +523,7 @@ impl Default for SecurityPolicy {
             ask: AskMode::Ask,
             read: ReadMode::Open,
             extra_guard: Vec::new(),
+            user_security: true,
             quarantine: true,
             quarantine_project: true,
             quarantine_dirs: Vec::new(),
@@ -618,7 +662,7 @@ impl SecurityPolicy {
         if is_repo_git(&canon) {
             return Some(Parcel::GuardRepoGit);
         }
-        if is_other_users(&canon) {
+        if self.user_security && is_other_users(&canon) {
             return Some(Parcel::GuardOtherUsers);
         }
         if is_system_state(&canon) {
@@ -1155,6 +1199,10 @@ pub fn load_policy() -> SecurityPolicy {
             "security.fixer-agent" | "fixer-agent" | "fixer_agent" => {
                 policy.fixer_agent = !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no");
             }
+            "security.user-security" | "user-security" => {
+                policy.user_security =
+                    !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no");
+            }
             "security.guard" | "guard" => {
                 for pat in v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
                     policy.extra_guard.push(pat);
@@ -1218,6 +1266,7 @@ pub fn save_policy(policy: &SecurityPolicy) -> Result<PathBuf, String> {
         format!("security.network = \"{}\"", policy.network.as_str()),
         format!("security.ask = \"{}\"", policy.ask.as_str()),
         format!("security.read = \"{}\"", policy.read.as_str()),
+        format!("security.user-security = {}", if policy.user_security { "true" } else { "false" }),
         format!("security.quarantine = {}", if policy.quarantine { "true" } else { "false" }),
         format!(
             "security.quarantine-project = {}",
@@ -1665,6 +1714,50 @@ pub mod privilege;
 #[cfg(unix)]
 pub mod overlay;
 
+/// Cross-platform, truthful summary of whether a physical write-quarantine
+/// backend is engaged right now. Returns `(engaged: bool, backend: &str)`.
+/// On unix this is the real overlay/container mount state; on Windows it is
+/// the no-driver staging manifest store. Used by the security banner so it
+/// never claims "quarantine on" merely because the config flag is set.
+pub fn quarantine_engaged_surface() -> (bool, String) {
+    #[cfg(unix)]
+    {
+        let e = overlay::quarantine_engagement();
+        if e.any() {
+            (true, e.engaged_list())
+        } else {
+            (false, "none".into())
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let on = crate::security::windows::staging::staging_engaged();
+        if on { (true, "staging".into()) } else { (false, "none".into()) }
+    }
+}
+
+/// Human-readable, honest quarantine status for the banner/status surface
+/// (cross-platform). Never claims engagement from the config flag alone.
+pub fn quarantine_status_surface() -> String {
+    let (on, backend) = quarantine_engaged_surface();
+    if on {
+        format!("write-quarantine engaged: {backend}")
+    } else {
+        format!(
+            "write-quarantine NOT physically engaged — out-of-tree writes are guarded in-process (Yellow/ask), not staged; engage via a whitelisted worktree (`wt`) or run as root to mount the overlay"
+        )
+    }
+}
+/// Mitigation-level security engine (docs/MITIGATION_LEVEL_SECURITY.md): a
+/// command analyzer + severity classifier + the four mitigation moves
+/// (reversible / narrower / two-phase / race-safe) + receipt emission. Pure
+/// (no I/O); the builtin `bash` tool executes the returned plan.
+pub mod mitigate;
+/// Cross-platform "move to trash / Recycle Bin" used by the mitigation engine
+/// to make `rm`/`del` deletions *reversible* (and to count how many files the
+/// agent has moved this session so the operator can be told).
+pub mod trash;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1789,6 +1882,44 @@ mod tests {
             None => std::env::remove_var("PI_DIR"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `/menu` security editor's `user-security` toggle must survive a
+    /// save→load roundtrip (verified with a throwaway PI_DIR).
+    #[test]
+    fn user_security_roundtrips_through_load_policy() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("pir_pol_user_{}", std::process::id()));
+        let old = std::env::var_os("PI_DIR");
+        std::env::set_var("PI_DIR", &dir);
+        let mut p = SecurityPolicy::default();
+        assert!(p.user_security, "user-security defaults on");
+        p.user_security = false;
+        save_policy(&p).expect("save_policy");
+        let loaded = load_policy();
+        assert!(!loaded.user_security, "user-security = false is read back");
+        match old {
+            Some(v) => std::env::set_var("PI_DIR", v),
+            None => std::env::remove_var("PI_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With `user-security` on, a write into another user's tree is denied
+    /// (`GuardOtherUsers`); with it off the same write is allowed. Gated to
+    /// macOS because the unix `is_other_users` heuristic only flags `/Users/<other>`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn user_security_toggle_gates_other_users_write() {
+        let mut on = SecurityPolicy::default();
+        on.user_security = true;
+        assert!(matches!(
+            on.decide(&Ask::write("/Users/someone-else/.bashrc")),
+            Verdict::Deny { parcel: Parcel::GuardOtherUsers, .. }
+        ));
+        let mut off = SecurityPolicy::default();
+        off.user_security = false;
+        assert_eq!(off.decide(&Ask::write("/Users/someone-else/.bashrc")), Verdict::Allow);
     }
 
     /// Windows guardrail decisions must fire on native windows paths exactly as

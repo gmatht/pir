@@ -2,7 +2,13 @@ use crate::config::ApiKind;
 use crate::plugin::ToolSpec;
 use crate::types::{Block, Message, Role, Usage};
 use serde_json::{json, Map, Value};
-use std::io::{BufRead, BufReader, Error, ErrorKind, Read};
+use smol::channel::{bounded as smol_channel, Receiver as SmolRx};
+use smol::future;
+use smol::io::AsyncBufRead;
+use smol::io::AsyncBufReadExt;
+use smol::io::AsyncReadExt;
+use smol::Timer;
+use std::io::{Error, ErrorKind, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -106,72 +112,32 @@ pub struct Client {
 }
 
 impl Client {
-    /// Build a ureq agent with the given per-attempt read timeout. Kept as a
-    /// free fn so the retry loop can rebuild the agent with a larger timeout
-    /// each attempt without cloning the whole `Client`.
-    fn http_agent(read_timeout: Duration) -> ureq::Agent {
-        // ureq 2.x does NOT auto-select a TLS backend: with the `native-tls`
-        // feature enabled we must attach a connector ourselves, or every HTTPS
-        // request fails with "no TLS backend configured". We use the platform
-        // native-tls connector (system OpenSSL), which is dynamically linked and
-        // so stays out of the binary — unlike ureq's default rustls+ring stack.
-        let connector = std::sync::Arc::new(
-            native_tls::TlsConnector::new().expect("native-tls init (system OpenSSL) failed"),
-        );
-        ureq::AgentBuilder::new()
-            .tls_connector(connector)
-            .timeout_connect(CONNECT_TIMEOUT)
-            .timeout_read(read_timeout)
-            .timeout_write(WRITE_TIMEOUT)
+    /// Build an async `isahc` client with the given per-attempt read timeout.
+    /// Kept as a free fn so the retry loop can rebuild the client with a larger
+    /// timeout each attempt without cloning the whole `Client`.
+    fn isahc_client(_read_timeout: Duration) -> isahc::HttpClient {
+        isahc::HttpClient::builder()
             .build()
+            .expect("isahc client build failed")
     }
 
-    /// Run `ureq`'s blocking `send_json` (the connect + status-line read) on a
-    /// worker thread, raced against the cooperative `cancel` flag.
-    ///
-    /// `ureq`'s connect + status-line read is a *single* blocking call: it only
-    /// honours `timeout_read` at the `SO_RCVTIMEO` boundary and never observes
-    /// the `cancel` flag at all. So pressing ESC/ctrl-c while we are still
-    /// waiting on a slow provider for the first byte would otherwise do nothing
-    /// until the whole read timeout (`READ_TIMEOUT_INIT`, now 120s) had elapsed
-    /// — and even then only re-check `cancel` at the *next* retry boundary.
-    /// That is exactly why "cancelling turn…" could appear to hang for minutes
-    /// while the socket was still connecting. Running the call on a thread lets
-    /// us observe `cancel` promptly: the instant it is set we abandon the
-    /// attempt (detaching the worker and its socket) and return `Err`, so
-    /// `chat` reports cancellation within tens of milliseconds. If the real
-    /// response arrives first we hand its reader back and streaming proceeds
-    /// (the stream itself is cancelable via the fast `CancelableReader`).
-    fn send_cancelable(
-        req: ureq::Request,
-        body: &Value,
-        cancel: &Arc<AtomicBool>,
-    ) -> Result<ureq::Response, String> {
-        // Clone the body (ureq borrows it) so the worker owns its own copy, and
-        // share the cancel flag by Arc. We poll the join handle cheaply (10ms
-        // slices) so the blocking `join` only runs once the response is actually
-        // ready — or once cancel is set, in which case we bail out immediately.
-        let body = body.clone();
-        let cancel = cancel.clone();
-        let handle = std::thread::spawn(move || req.send_json(body));
-        while !cancel.load(Ordering::SeqCst) {
-            if handle.is_finished() {
-                break;
+    /// Bridge the shared `cancel` `AtomicBool` (set by the REPL on ESC/ctrl-c)
+    /// into a `smol` channel the streaming loop can `or()` against, so cancel is
+    /// observed at the reactor level (instant) rather than only at the next
+    /// `AtomicBool` poll. A tiny task watches the flag and signals the channel
+    /// the moment it flips; polling every few ms keeps latency well under the
+    /// 50ms target while leaving every cancel site (REPL/agent/tests) untouched.
+    fn start_cancel_forwarder(&self) -> SmolRx<()> {
+        let (tx, rx) = smol_channel::<()>(1);
+        let flag = self.cancel.clone();
+        smol::spawn(async move {
+            while !flag.load(Ordering::SeqCst) {
+                Timer::after(Duration::from_millis(5)).await;
             }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        if cancel.load(Ordering::SeqCst) {
-            // Abandon the in-flight connect/status-line read. The underlying
-            // socket is dropped with the detached worker; the OS reclaims it. We
-            // do NOT flip `cancel` here (it's owned by the REPL/agent and is the
-            // source of truth) — just abandon this attempt.
-            drop(handle);
-            return Err("request cancelled".to_string());
-        }
-        match handle.join() {
-            Ok(res) => res.map_err(http_error),
-            Err(_) => Err("request cancelled".to_string()),
-        }
+            let _ = tx.send(()).await;
+        })
+        .detach();
+        rx
     }
 
     pub fn new(kind: ApiKind, base_url: &str, api_key: String) -> Self {
@@ -238,31 +204,42 @@ impl Client {
                 )
             }
         };
-        let http = Self::http_agent(Duration::from_secs(60));
-        let mut req = http.post(&url);
-        req = match kind {
-            ApiKind::Anthropic => req
-                .set("x-api-key", &self.api_key)
-                .set("anthropic-version", "2023-06-01"),
-            ApiKind::OpenAi => req.set("Authorization", &format!("Bearer {}", self.api_key)),
-        };
-        let resp = match req.send_json(body) {
-            Ok(r) => r,
-            Err(e) => return Err(http_error(e)),
-        };
-        let v = serde_json::from_reader::<_, Value>(resp.into_reader())
-            .map_err(|e| format!("complete: {e}"))?;
-        let raw = match kind {
-            ApiKind::Anthropic => v
-                .pointer("/content/0/text")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            ApiKind::OpenAi => v
-                .pointer("/choices/0/message/content")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        };
-        raw.ok_or_else(|| "complete: empty response".to_string())
+        smol::block_on(async {
+            let client = Self::isahc_client(Duration::from_secs(60));
+            let builder = isahc::Request::builder()
+                .method("POST")
+                .uri(&url)
+                .header("content-type", "application/json");
+            let builder = match kind {
+                ApiKind::Anthropic => builder
+                    .header("x-api-key", &self.api_key)
+                    .header("anthropic-version", "2023-06-01"),
+                ApiKind::OpenAi => builder.header("Authorization", &format!("Bearer {}", self.api_key)),
+            };
+            let req = builder.body(body.to_string()).map_err(|e| format!("complete: {e}"))?;
+            let resp = client.send_async(req).await.map_err(http_error)?;
+            let status = resp.status();
+            if !status.is_success() {
+                let code = status.as_u16();
+                let mut b = String::new();
+                let _ = resp.into_body().read_to_string(&mut b).await;
+                return Err(http_status_detail(code, &b));
+            }
+            let mut b = String::new();
+            let _ = resp.into_body().read_to_string(&mut b).await;
+            let v: Value = serde_json::from_str(&b).map_err(|e| format!("complete: {e}"))?;
+            let raw = match kind {
+                ApiKind::Anthropic => v
+                    .pointer("/content/0/text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                ApiKind::OpenAi => v
+                    .pointer("/choices/0/message/content")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            };
+            raw.ok_or_else(|| "complete: empty response".to_string())
+        })
     }
 
     pub fn chat(
@@ -283,6 +260,7 @@ impl Client {
         // `false` when the model rejects OpenAI `reasoning_effort`.
         allow_reasoning_effort: bool,
     ) -> Result<(Message, Usage), String> {
+        smol::block_on(async {
         let kind = api_override.unwrap_or(self.kind);
         let (url, body) = match kind {
             ApiKind::Anthropic => self.anthropic_request(model, max_tokens, system, history, tools, thinking, model_ctx),
@@ -307,6 +285,7 @@ impl Client {
         // a mid-stream failure is surfaced as a hard error instead. A cancel
         // request aborts the whole loop immediately (no retry) via `self.cancel`.
         let cancel = self.cancel.clone();
+        let cancel_rx = self.start_cancel_forwarder();
         let mut emitted_text = false;
         // True once the stream has delivered at least one tool_use block. A
         // mid-stream crash after partial tool output is *not* safe to transparently
@@ -325,51 +304,82 @@ impl Client {
             // attempts get proportionally more time. Rebuild the ureq agent so
             // the new timeout takes effect (it's baked in at build time).
             let read_timeout = READ_TIMEOUT_INIT * READ_TIMEOUT_GROWTH.saturating_pow(attempt as u32);
-            let http = Self::http_agent(read_timeout);
-            let mut req = http.post(&url);
-            req = match kind {
-                ApiKind::Anthropic => req
-                    .set("x-api-key", &self.api_key)
-                    .set("anthropic-version", "2023-06-01"),
-                ApiKind::OpenAi => req.set("Authorization", &format!("Bearer {}", self.api_key)),
+            let client = Self::isahc_client(read_timeout);
+            // Build the request (isahc async; JSON body serialised directly).
+            let mut builder = isahc::Request::builder()
+                .method("POST")
+                .uri(&url)
+                .header("content-type", "application/json");
+            builder = match kind {
+                ApiKind::Anthropic => builder
+                    .header("x-api-key", &self.api_key)
+                    .header("anthropic-version", "2023-06-01"),
+                ApiKind::OpenAi => builder.header("Authorization", &format!("Bearer {}", self.api_key)),
             };
-            // `send_json` is the connect + status-line read; run it on a worker
-            // thread so a cancel pressed *during* the request-setup wait is
-            // honoured promptly (see `send_cancelable`) instead of only at the
-            // next retry boundary. A cancel here surfaces as an `Err` that the
-            // loop returns immediately ("request cancelled"). `send_cancelable`
-            // already returns our `String` error type ( `ureq::Error`).
-            let result: Result<(Message, Usage), String> = Self::send_cancelable(req, &body, &cancel)
-                .and_then(|resp| {
-                    // Wrap the blocking response body in a cancelable reader so
-                    // a Ctrl-C is honoured within tens of milliseconds even
-                    // while `ureq` is blocked in its network `recv` (waiting on
-                    // a slow / "thinking" provider or between SSE events). The
-                    // status-line read itself is left untouched (it stays
-                    // generous so slow providers don't fail on connect), and the
-                    // cancelable reader only governs the streaming body — which
-                    // is where the wait actually happens during a turn.
-                    let body_reader = CancelableReader::new(resp.into_reader(), cancel.clone());
-                    let mut reader = BufReader::new(body_reader);
-                    match kind {
-                        ApiKind::Anthropic => stream_anthropic(
-                            &mut reader,
-                            on_text,
-                            &mut emitted_text,
-                            &mut saw_tool_calls,
-                            &cancel,
-                            on_think,
-                        ),
-                        ApiKind::OpenAi => stream_openai(
-                            &mut reader,
-                            on_text,
-                            &mut emitted_text,
-                            &mut saw_tool_calls,
-                            &cancel,
-                            on_think,
-                        ),
+            let req = match builder.body(body.to_string()) {
+                Ok(r) => r,
+                Err(e) => return Err(format!("http body: {e}")),
+            };
+            // Race the connect/status-line against the cancel channel so a cancel
+            // pressed while still waiting on the socket is honoured instantly:
+            // the smol reactor wakes the moment `cancel_tx` fires, no polling.
+            enum ConnectOutcome {
+                Resp(isahc::Response<isahc::AsyncBody>),
+                Cancelled,
+                Err(String),
+            }
+            let outcome = future::or(
+                async {
+                    match client.send_async(req).await {
+                        Ok(r) => ConnectOutcome::Resp(r),
+                        Err(e) => ConnectOutcome::Err(http_error(e)),
                     }
-                });
+                },
+                async {
+                    let _ = cancel_rx.recv().await;
+                    ConnectOutcome::Cancelled
+                },
+            )
+            .await;
+            let resp = match outcome {
+                ConnectOutcome::Cancelled => return Err("request cancelled".to_string()),
+                ConnectOutcome::Err(e) => return Err(e),
+                ConnectOutcome::Resp(r) => r,
+            };
+            // isahc returns Ok for any HTTP status; surface non-2xx as an error.
+            if !resp.status().is_success() {
+                let code = resp.status().as_u16();
+                let mut body_txt = String::new();
+                let _ = resp.into_body().read_to_string(&mut body_txt).await;
+                return Err(http_status_detail(code, &body_txt));
+            }
+            let mut reader = smol::io::BufReader::new(Box::pin(resp.into_body()));
+            let result: Result<(Message, Usage), String> = match kind {
+                ApiKind::Anthropic => {
+                    stream_anthropic(
+                        &mut reader,
+                        on_text,
+                        &mut emitted_text,
+                        &mut saw_tool_calls,
+                        &cancel,
+                        &cancel_rx,
+                        on_think,
+                    )
+                    .await
+                }
+                ApiKind::OpenAi => {
+                    stream_openai(
+                        &mut reader,
+                        on_text,
+                        &mut emitted_text,
+                        &mut saw_tool_calls,
+                        &cancel,
+                        &cancel_rx,
+                        on_think,
+                    )
+                    .await
+                }
+            };
             match result {
                 Ok(r) => return Ok(r),
                 Err(e) => {
@@ -406,20 +416,26 @@ impl Client {
                         "\n\u{26a0} request failed (attempt {}), retrying in {:.0?} (timeout was {:.0?}): {}\n",
                         attempt + 1, backoff, read_timeout, e
                     ));
-                    // Sleep in short slices so a cancel mid-backoff is honoured.
+                    // Await the backoff in slices, raced against the cancel
+                    // channel so a cancel mid-backoff is honoured instantly.
                     let mut waited = Duration::ZERO;
                     while waited < backoff {
                         if cancel.load(Ordering::SeqCst) {
                             return Err("request cancelled".to_string());
                         }
-                        let step = Duration::from_millis(100).min(backoff - waited);
-                        std::thread::sleep(step);
-                        waited += step;
+                        let slice = Duration::from_millis(100).min(backoff - waited);
+                        future::or(
+                            async { let _ = Timer::after(slice).await; },
+                            async { let _ = cancel_rx.recv().await; },
+                        )
+                        .await;
+                        waited += slice;
                     }
                 }
             }
         }
         unreachable!()
+        })
     }
 
     fn anthropic_request(
@@ -821,15 +837,8 @@ pub(crate) fn http_status_detail(code: u16, body: &str) -> String {
     format!("HTTP {code}: {collapsed}")
 }
 
-fn http_error(e: ureq::Error) -> String {
-    match e {
-        ureq::Error::Status(code, resp) => {
-            let mut body = String::new();
-            let _ = resp.into_reader().take(8192).read_to_string(&mut body);
-            http_status_detail(code, &body)
-        }
-        other => other.to_string(),
-    }
+fn http_error(e: isahc::Error) -> String {
+    e.to_string()
 }
 
 /// True when an error represents a network timeout (read/connect). Used to
@@ -915,15 +924,15 @@ fn openai_message(m: &Message) -> Vec<Value> {
     out
 }
 
-fn stream_anthropic<R: Read>(
-    r: R,
+async fn stream_anthropic<R: AsyncBufRead + Unpin>(
+    r: &mut R,
     on_text: &mut dyn FnMut(&str),
     emitted_text: &mut bool,
     saw_tool_calls: &mut bool,
     cancel: &Arc<AtomicBool>,
+    cancel_rx: &SmolRx<()>,
     on_think: &mut dyn FnMut(&str),
 ) -> Result<(Message, Usage), String> {
-    let mut reader = BufReader::new(r);
     let mut blocks: Vec<Block> = Vec::new();
     let mut usage = Usage::default();
     let mut text = String::new();
@@ -948,21 +957,34 @@ fn stream_anthropic<R: Read>(
             return Err("stream: stalled (no data for 180s)".to_string());
         }
         line.clear();
-        let n = match reader.read_line(&mut line) {
-            Ok(n) => n,
-            Err(e) if is_read_timeout(&e) => {
-                // No bytes yet within the poll window: loop back to re-check
-                // cancellation / stall without consuming any input; on Linux the
-                // socket timeout surfaces as WouldBlock, not TimedOut.
-                continue;
-            }
-            Err(e) => {
-                // The cancelable body reader interrupts with `ErrorKind::Interrupted`
-                // (message "request cancelled") the instant the cooperative flag
-                // is set. Surface that as the canonical cancellation error so the
-                // chat loop stops immediately (no retry/backoff), instead of being
-                // wrapped into a non-matching "stream: request cancelled".
-                if cancel.load(Ordering::SeqCst) || e.kind() == std::io::ErrorKind::Interrupted {
+        // Race the next SSE line against cancel + the stall watchdog. The smol
+        // reactor wakes the instant `cancel_tx` fires, so a cancel is observed
+        // without waiting for the next network byte.
+        enum Step {
+            Line(std::io::Result<usize>),
+            Cancel,
+            Stall,
+        }
+        let step = future::or(
+            async { Step::Line(r.read_line(&mut line).await) },
+            future::or(
+                async {
+                    let _ = cancel_rx.recv().await;
+                    Step::Cancel
+                },
+                async {
+                    Timer::after(stall_timeout()).await;
+                    Step::Stall
+                },
+            ),
+        )
+        .await;
+        let n = match step {
+            Step::Cancel => return Err("request cancelled".to_string()),
+            Step::Stall => return Err("stream: stalled (no data for 180s)".to_string()),
+            Step::Line(Ok(n)) => n,
+            Step::Line(Err(e)) => {
+                if cancel.load(Ordering::SeqCst) {
                     return Err("request cancelled".to_string());
                 }
                 return Err(format!("stream: {e}"));
@@ -1072,15 +1094,15 @@ fn stream_anthropic<R: Read>(
     Ok((Message { role: Role::Assistant, blocks }, usage))
 }
 
-fn stream_openai<R: Read>(
-    r: R,
+async fn stream_openai<R: AsyncBufRead + Unpin>(
+    r: &mut R,
     on_text: &mut dyn FnMut(&str),
     emitted_text: &mut bool,
     saw_tool_calls: &mut bool,
     cancel: &Arc<AtomicBool>,
+    cancel_rx: &SmolRx<()>,
     on_think: &mut dyn FnMut(&str),
 ) -> Result<(Message, Usage), String> {
-    let mut reader = BufReader::new(r);
     let mut usage = Usage::default();
     let mut text = String::new();
     let mut thinking = String::new();
@@ -1096,11 +1118,34 @@ fn stream_openai<R: Read>(
             return Err("stream: stalled (no data for 180s)".to_string());
         }
         line.clear();
-        let n = match reader.read_line(&mut line) {
-            Ok(n) => n,
-            Err(e) if is_read_timeout(&e) => continue,
-            Err(e) => {
-                if cancel.load(Ordering::SeqCst) || e.kind() == std::io::ErrorKind::Interrupted {
+        // Race the next SSE line against cancel + the stall watchdog. The smol
+        // reactor wakes the instant `cancel_tx` fires, so a cancel is observed
+        // without waiting for the next network byte.
+        enum Step {
+            Line(std::io::Result<usize>),
+            Cancel,
+            Stall,
+        }
+        let step = future::or(
+            async { Step::Line(r.read_line(&mut line).await) },
+            future::or(
+                async {
+                    let _ = cancel_rx.recv().await;
+                    Step::Cancel
+                },
+                async {
+                    Timer::after(stall_timeout()).await;
+                    Step::Stall
+                },
+            ),
+        )
+        .await;
+        let n = match step {
+            Step::Cancel => return Err("request cancelled".to_string()),
+            Step::Stall => return Err("stream: stalled (no data for 180s)".to_string()),
+            Step::Line(Ok(n)) => n,
+            Step::Line(Err(e)) => {
+                if cancel.load(Ordering::SeqCst) {
                     return Err("request cancelled".to_string());
                 }
                 return Err(format!("stream: {e}"));
@@ -1188,26 +1233,29 @@ mod tests {
     /// then went silent (the "model thinking forever" / stalled-stream case).
     /// This lets us exercise the parser's cancel/stall logic deterministically
     /// without a live socket (which is flaky in CI/sandboxes): the parser must
-    /// detect cancellation / a stall at its pre-read check rather than waiting
-    /// for EOF. On Linux the timeout surfaces as `WouldBlock`, which is why the
-    /// parser accepts both `TimedOut` and `WouldBlock`.
-    struct BlockAfter {
-        sent: bool,
-        data: &'static [u8],
-    }
-    impl std::io::Read for BlockAfter {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            if !self.sent {
-                self.sent = true;
-                let n = self.data.len().min(buf.len());
-                buf[..n].copy_from_slice(&self.data[..n]);
-                return Ok(n);
-            }
-            Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "simulated timeout",
-            ))
+    /// detect cancellation / a stall rather than waiting for EOF. Replaces the
+    /// old `WouldBlock`-returning sync `Read`: with the async `or`-based loop
+    /// the stall watchdog is a `smol::Timer` raced against the read, so a
+    /// permanently-`Pending` source is the faithful way to simulate a silent
+    /// socket (never EOF, never data, never an error).
+    struct Silent;
+    impl smol::io::AsyncRead for Silent {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut [u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
         }
+    }
+    impl smol::io::AsyncBufRead for Silent {
+        fn poll_fill_buf(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<&[u8]>> {
+            std::task::Poll::Pending
+        }
+        fn consume(self: std::pin::Pin<&mut Self>, _amt: usize) {}
     }
 
     #[test]
@@ -1216,12 +1264,18 @@ mod tests {
         // check instead of polling forever on the silent socket (proving the
         // cancel path is honoured at a read boundary, not just via EOF).
         let cancel = Arc::new(AtomicBool::new(true));
-        let mut reader = BlockAfter {
-            sent: false,
-            data: b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
-        };
+        let (_tx, rx) = smol_channel::<()>(1);
+        let mut reader = Silent;
         let started = std::time::Instant::now();
-        let res = stream_openai(&mut reader, &mut |_s: &str| {}, &mut false, &mut false, &cancel, &mut |_s: &str| {});
+        let res = smol::block_on(stream_openai(
+            &mut reader,
+            &mut |_s: &str| {},
+            &mut false,
+            &mut false,
+            &cancel,
+            &rx,
+            &mut |_s: &str| {},
+        ));
         let elapsed = started.elapsed();
         assert!(res.is_err(), "expected an error after cancel");
         assert_eq!(res.unwrap_err(), "request cancelled");
@@ -1230,17 +1284,25 @@ mod tests {
 
     #[test]
     fn stall_watchdog_trips() {
-        // Point the stall watchdog low so it trips quickly. With a silent socket
-        // (WouldBlock on every read), the parser must detect the stall at its
-        // pre-read check rather than waiting indefinitely.
+        // Point the stall watchdog low so it trips quickly. With a silent,
+        // never-completing reader the parser must detect the stall via the
+        // `smol::Timer` raced against the read (rather than waiting for EOF).
         std::env::set_var("PIR_STALL_TIMEOUT_SECS", "1");
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut reader = BlockAfter {
-            sent: false,
-            data: b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
-        };
+        // Keep the sender alive so the cancel arm of the `or` stays pending and
+        // the stall timer (not a closed channel) is what fires.
+        let (_tx, rx) = smol_channel::<()>(1);
+        let mut reader = Silent;
         let started = std::time::Instant::now();
-        let res = stream_openai(&mut reader, &mut |_s: &str| {}, &mut false, &mut false, &cancel, &mut |_s: &str| {});
+        let res = smol::block_on(stream_openai(
+            &mut reader,
+            &mut |_s: &str| {},
+            &mut false,
+            &mut false,
+            &cancel,
+            &rx,
+            &mut |_s: &str| {},
+        ));
         let elapsed = started.elapsed();
         std::env::remove_var("PIR_STALL_TIMEOUT_SECS");
         assert!(res.is_err(), "expected a stall error");

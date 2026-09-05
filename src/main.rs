@@ -16,6 +16,7 @@ mod plugin;
 mod project;
 mod provider;
 mod session;
+mod sixel;
 mod term;
 mod types;
 mod user;
@@ -23,6 +24,7 @@ mod activelist;
 mod modal;
 mod security;
 mod titler;
+mod wininfo;
 #[cfg(feature = "tui")]
 mod tui;
 #[cfg(feature = "gui")]
@@ -131,7 +133,7 @@ fn install_death_tracking() {
 
         for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
             unsafe {
-                if libc::signal(sig, handler as libc::sighandler_t) == libc::SIG_ERR {
+                if libc::signal(sig, handler as *const () as libc::sighandler_t) == libc::SIG_ERR {
                     // ignore — handler install failed for this signal
                 }
             }
@@ -211,6 +213,9 @@ COMMANDS
   /create [name]           scaffold a new project (seeds from clipboard .md spec)
   /login [provider]        store an API key for a provider in ~/.pi/agent/auth.json
   /logout [provider]       remove a stored provider credential from auth.json
+  /l                      show desktop window titles + clipboard; if the clipboard
+                          looks like an API key, pre-fill the next prompt with a
+                          ready-to-run /login <provider> <key> line
   /markup_demo             render a canned reply (markdown + rust/js/json + table)
                           through the same incremental renderer a model reply uses
 
@@ -393,7 +398,7 @@ fn main() {
     // on non-unix builds it is assigned but never read, hence the allow.
     #[allow(unused_variables, unused_assignments)]
     let mut as_user: Option<String> = None;
-    let _project_name: Option<String> = None;
+    let project_name: Option<String> = None;
     let mut bg_prompt: Option<String> = None;
     // The full-screen ratatui REPL is used only when the `tui` feature is
     // compiled in AND `--tui` is passed; otherwise the streaming REPL runs.
@@ -547,10 +552,44 @@ fn main() {
         let target = as_user.clone().unwrap_or_else(|| {
             crate::config::resolve_project_user(None, project_name.as_deref())
         });
-        if let Err(e) = crate::user::become_user(&target) {
-            die(&e);
+        // Decide confinement from the *target* (sandbox) user's policy: the
+        // operator edits `security.toml` as that user (via `/menu`), so we must
+        // read it from their home, not the invoking user's. When user-security
+        // is OFF we must NOT confine the process (or its commands) to the
+        // per-project user — run as the *invoking* user instead (mirrors
+        // `/su-security off`). This is the same authority `/su-security off`
+        // grants; here it is honoured at startup so a session started with
+        // user-security disabled never drops to `ai_X`/`nobody` in the first
+        // place.
+        let target_home = crate::user::home_of(&target);
+        let policy = match &target_home {
+            Some(h) => {
+                let prev = std::env::var_os("HOME");
+                std::env::set_var("HOME", h);
+                let p = crate::security::load_policy();
+                match prev {
+                    Some(p) => std::env::set_var("HOME", p),
+                    None => std::env::remove_var("HOME"),
+                }
+                p
+            }
+            None => crate::security::load_policy(),
+        };
+        if !policy.user_security {
+            std::env::set_var("PIR_AGENT_AS_INVOKER", "1");
+            // Keep the sandbox user's HOME so config (security.toml, models)
+            // stays consistent with the operator's /menu edits; the process
+            // itself stays the invoking identity (no `become_user` drop).
+            if let Some(h) = &target_home {
+                std::env::set_var("HOME", h);
+            }
+            None
+        } else {
+            if let Err(e) = crate::user::become_user(&target) {
+                die(&e);
+            }
+            Some(target)
         }
-        Some(target)
     };
     #[cfg(not(unix))]
     let resolved_user: Option<String> = as_user.clone();
@@ -837,7 +876,23 @@ fn main() {
     if let Some(p) = &agent.log_path {
         println!("{}", term::dim(&format!("session log: {}", p.display())));
     }
-    println!("{}", term::dim("/help for commands · ctrl-d quit · ctrl-q quit now (x2 to force) · type while a turn runs; ESC/ctrl-c cancels it instantly"));
+    // Render the pir logo as sixels with the help text beside it, when the
+    // terminal supports sixel (Windows Terminal 1.22+ with "Enable Sixel
+    // graphics" on, or any sixel-capable emulator). Falls back to the plain
+    // help line below when sixel isn't available.
+    let help_line = "/help for commands · ctrl-d quit · ctrl-q quit now (x2 to force) · type while a turn runs; ESC/ctrl-c cancels it instantly";
+    if let Some(banner) = crate::sixel::render_banner(&[help_line.to_string()]) {
+        term::out(&banner);
+        println!();
+    } else {
+        println!("{}", term::dim(help_line));
+    }
+    // Flush any leftover bytes the startup terminal queries (DA1 / XTV) left in
+    // the tty buffer -- otherwise the reply (a `\x1b[?61;4;...c` style string
+    // with no trailing newline) surfaces as the user's first REPL prompt. The
+    // banner query already reads in non-canonical mode (see `sixel::query_terminal`);
+    // this drains any late stragglers before rustyline takes over stdin.
+    crate::sixel::drain_input();
 
     // Warn on existing git projects that lack the LLM-safety guard hook, and
     // point at /fix. Skipped under jj (git hooks don't apply there).
@@ -1035,6 +1090,35 @@ fn main() {
                     if let Ok(mut g) = typeahead.lock() { g.clear(); }
                     if s.is_empty() {
                         input_buf.clear();
+                    } else if s.starts_with('!') {
+                        // pi-style shell command, typed mid-turn (just like at
+                        // the idle prompt). Route to the /sh handler: a bare `!`
+                        // drops to an interactive shell, `! cmd args` runs a
+                        // single-shot command. The run-state guard (reject while
+                        // a turn is running) lives in the /sh handler itself.
+                        let shell_cmd = if let Some(rest) = s.strip_prefix('!') {
+                            if rest.is_empty() {
+                                "/sh".to_string()
+                            } else {
+                                format!("/sh {}", rest.trim_start())
+                            }
+                        } else {
+                            unreachable!()
+                        };
+                        input_buf.clear();
+                        if let Some(cmd) = shell_cmd.strip_prefix('/') {
+                            handle_command(
+                                cmd,
+                                &agent_slot,
+                                &providers,
+                                &mut jobs,
+                                full_auto,
+                                &bus,
+                                &fg_cancel,
+                                true,
+                                &current_ctx,
+                            );
+                        }
                     } else if s.starts_with('/') {
                         // Slash commands are handled immediately, even mid-turn.
                         input_buf.clear();
@@ -1136,8 +1220,12 @@ fn main() {
                     if let Some(f) = crate::agent::job_kill_flag() {
                         f.store(true, Ordering::SeqCst);
                     }
-                    // Let the running turn finish its current step, then exit.
-                    let _ = fg_handle.take().unwrap().join();
+                    // Let the running turn finish its current step, then exit —
+                    // but don't block forever if the worker is stuck.
+                    wait_worker_finish(&done_rx, std::time::Duration::from_secs(5));
+                    if let Some(h) = fg_handle.take() {
+                        let _ = h.join();
+                    }
                     term::raw::disable_raw();
                     return;
                 }
@@ -1163,9 +1251,10 @@ fn main() {
                         f.store(true, Ordering::SeqCst);
                     }
                     term::spawn_force_quit_watchdog();
-                    // Graceful cleanup: join the worker, then exit. If this
-                    // `join` never returns, the watchdog above has already
-                    // called `process::exit(1)`.
+                    // Graceful cleanup: let the turn finish its current step,
+                    // then exit — but don't block forever if the worker is
+                    // stuck (the watchdog force-quits on a second Ctrl-Q).
+                    wait_worker_finish(&done_rx, std::time::Duration::from_secs(5));
                     if let Some(h) = fg_handle.take() {
                         let _ = h.join();
                     }
@@ -1187,10 +1276,6 @@ fn main() {
                     term::raw::enable_raw();
                 }
                 term::raw::RawInput::None => { /* turn finished / no input; re-check loop */ }
-                // Any other raw key (typed chars, arrows, tab, etc.) while a turn
-                // runs is ignored here — the REPL records it into `typeahead`
-                // elsewhere and re-checks the loop.
-                _ => {}
             }
             continue;
         }
@@ -1202,16 +1287,6 @@ fn main() {
         if tasks_running > 0 {
             term::out(&term::dim(&format!("#tasks running: {} · Idle\n", tasks_running)));
         }
-        // Status line under the prompt: current workspace + model in use.
-        let workspace = workspace_label();
-        let model = {
-            let g = agent_slot.lock().unwrap();
-            g.as_ref().map(|a| a.label()).unwrap_or_default()
-        };
-        // Frame the prompt area: a dim hrule above (separating the input zone
-        // from the conversation) and one below (printed once the user submits).
-        term::out(&format!("{}\n", term::hrule()));
-        term::out(&format!("{}\n", term::status_line(&workspace, &model)));
         // Apply any cross-instance model switch queued by the broadcast watcher
         // (from a `/model*` in another terminal). We only do this while idle, so
         // a mid-turn instance defers until it returns here — including after an
@@ -1226,6 +1301,25 @@ fn main() {
                 ))),
             }
         }
+        // Persistent footer: the ─── status section lives at the BOTTOM row of
+        // the screen, below everything else (workspace + model while idle;
+        // "thinking" + live typeahead while a turn runs — the spinner draws into
+        // the same line). If the prompt would land on the last row (or the row
+        // above it), scroll the conversation up one line first so the footer is
+        // never overlapped. The DSR query is best-effort: a terminal that
+        // doesn't answer just skips the push-up and the footer is drawn anyway.
+        let workspace = workspace_label();
+        let model = {
+            let g = agent_slot.lock().unwrap();
+            g.as_ref().map(|a| a.label()).unwrap_or_default()
+        };
+        let h = term::terminal_height();
+        if let Some(row) = term::cursor_row() {
+            if row >= h.saturating_sub(1) {
+                term::out(&format!("\x1b[{h};1H\n\x1b[1A"));
+            }
+        }
+        term::draw_footer(&term::status_line(&workspace, &model));
         match term::read_line("❯ ") {
             None => {
                 println!();
@@ -1233,12 +1327,44 @@ fn main() {
             }
             Some(s) => line = s,
         }
+        // Redraw the footer after the line was read: typing may have scrolled
+        // the screen or the terminal may have been resized, and the footer must
+        // always be the bottom-most line.
+        term::draw_footer(&term::status_line(&workspace, &model));
         let input = line.trim();
         if input.is_empty() {
             continue;
         }
-        // Close the prompt frame below the submitted line.
-        term::out(&format!("{}\n", term::hrule()));
+        // pi-style shell command: `!` drops to a shell (or `! cmd args` runs
+        // the command via the shell). Aliased to /sh so it shares the exact
+        // same handler, identity, and run-state guard.
+        if input.starts_with('!') {
+            let shell_cmd = if let Some(rest) = input.strip_prefix('!') {
+                if rest.is_empty() {
+                    "/sh".to_string()
+                } else {
+                    format!("/sh {}", rest.trim_start())
+                }
+            } else {
+                unreachable!()
+            };
+            if let Some(cmd) = shell_cmd.strip_prefix('/') {
+                handle_command(
+                    cmd,
+                    &agent_slot,
+                    &providers,
+                    &mut jobs,
+                    full_auto,
+                    &bus,
+                    &fg_cancel,
+                    false,
+                    &current_ctx,
+                );
+            }
+            continue;
+        }
+        // The persistent footer (drawn above) is the bottom border of the input
+        // zone; the submitted line needs no closing hrule of its own.
         // A prompt ending in `&` at the idle prompt runs in its OWN session (a
         // fresh background job that keeps its own session log); the interactive
         // session is untouched. A bare `&` at idle does nothing (there is no
@@ -1285,6 +1411,26 @@ fn main() {
                 done_tx.clone(),
             ));
             term::raw::enable_raw();
+        }
+    }
+}
+
+/// Wait for the foreground worker to signal completion (via `done_rx`), but
+/// don't block forever: if the worker is stuck (frozen network call, hung
+/// child, etc.) we give up after `timeout` so the REPL can still exit. The
+/// caller then joins the (possibly still-running) worker handle — if it's
+/// still alive, the process exit reaps it.
+fn wait_worker_finish(done_rx: &smol::channel::Receiver<()>, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match done_rx.try_recv() {
+            Ok(()) | Err(smol::channel::TryRecvError::Closed) => return,
+            Err(smol::channel::TryRecvError::Empty) => {
+                if std::time::Instant::now() >= deadline {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         }
     }
 }
@@ -1699,7 +1845,7 @@ fn handle_command(
             }
         }
         "h" | "help" => print!("{HELP}"),
-        "markup_demo" | "md_demo" | "markdown_demo" => {
+        "markup_demo" | "md_demo" => {
             // Render a canned sample document the way an *agent reply* is
             // rendered: feed it through the same incremental (in-place)
             // renderer the streaming REPL uses for model output, then flush the
@@ -1732,7 +1878,31 @@ fn handle_command(
                         let g = agent_slot.lock().unwrap();
                         g.as_ref().map(|a| a.security_policy()).flatten().unwrap_or_default()
                     };
+                    let orig_su = {
+                        let g = agent_slot.lock().unwrap();
+                        g.as_ref().map(|a| a.su_security_enabled()).unwrap_or(true)
+                    };
                     modal::security_editor(&mut policy);
+                    // The "user-security" toggle is the UI for the per-project user
+                    // boundary. Disabling it must stop confining the agent's
+                    // commands to the sandbox user (the `nobody`/ai_X drop) so
+                    // `!`/`/sh` and the bash tool run as the *invoking* user —
+                    // exactly the authority `/su-security off` grants. Apply it to
+                    // the live session (and persist via the per-session `.susec`),
+                    // so flipping it in /menu takes effect immediately.
+                    if policy.user_security != orig_su {
+                        let mut g = agent_slot.lock().unwrap();
+                        if let Some(agent) = g.as_mut() {
+                            let reason = if policy.user_security {
+                                String::new()
+                            } else {
+                                "disabled via /menu security — agent authorized to act as the \
+                                 invoking user for this session"
+                                    .to_string()
+                            };
+                            println!("{}", agent.set_su_security(policy.user_security, &reason));
+                        }
+                    }
                 }
                 Some(MenuAction::Settings) => {
                     let mut g = agent_slot.lock().unwrap();
@@ -1978,6 +2148,48 @@ fn handle_command(
             }
         }
         "models" => print!("{}", list_models(providers)),
+        "l" => {
+            // List desktop window titles + the clipboard, then guess a provider
+            // from the clipboard and pre-fill the next prompt with a ready-to-run
+            // `/login <provider> <key>` line (the user can just press Enter to
+            // save it, or edit it first). Best-effort: if nothing is enumerable
+            // we say so rather than erroring. Mirrors the convenience flow
+            // described when the wininfo module was added. Runs only when idle
+            // (it touches the prompt pre-fill + may read a secret next).
+            if fg_running {
+                eprintln!("pir: a turn is running — finish or /cancel it first, then /l");
+                return;
+            }
+            use crate::wininfo::impls::window_titles;
+            use crate::wininfo::impls::clipboard_text;
+            use crate::wininfo::guess_provider_from_key;
+            let titles = window_titles();
+            if titles.is_empty() {
+                println!("{} no visible window titles found (not attached to a desktop session?)", term::dim("·"));
+            } else {
+                println!("{} visible windows:", term::bold("window titles"));
+                for t in &titles {
+                    println!("  [{}] {}", term::dim(&t.pid.to_string()), t.title);
+                }
+            }
+            let clip = clipboard_text();
+            if clip.is_empty() {
+                println!("{} clipboard is empty", term::dim("·"));
+            } else {
+                // Show only the first line / a trimmed preview so a long
+                // multi-line clipboard (e.g. a .md spec) doesn't flood the screen.
+                let first = clip.lines().next().unwrap_or("").trim();
+                let preview = if first.len() > 80 { &first[..80] } else { first };
+                println!("{} clipboard: {}", term::bold("clipboard"), term::dim(preview));
+                if let Some(provider) = guess_provider_from_key(&clip) {
+                    let suggested = format!("/login {provider} {clip}");
+                    println!("{} guessed provider '{}' from clipboard — pre-filling next prompt:", term::green("✓"), provider);
+                    term::set_prefill(&suggested);
+                } else {
+                    println!("{} clipboard doesn't look like an API key (no provider guessed)", term::dim("·"));
+                }
+            }
+        }
         "login" => {
             // Store an API key for a provider in ~/.pi/agent/auth.json (pi's
             // `/login`, minus the OAuth/subscription flows). With an argument we
@@ -2260,6 +2472,9 @@ fn handle_command(
             let container = crate::security::overlay::container_engaged();
             match action {
                 "status" | "ls" | "" => {
+                    // Print the honest engagement state FIRST so the banner never
+                    // silently claims "quarantine on" when nothing is mounted.
+                    println!("{}", crate::security::overlay::quarantine_status());
                     if container {
                         println!("{}", crate::security::overlay::container_manifest());
                         return;
@@ -2559,7 +2774,9 @@ fn handle_command(
                 println!("  - /{n}  {d}");
             }
         }
-        "q" | "quit" | "exit" => std::process::exit(0),
+        "quit" | "exit" => std::process::exit(0),
+        #[cfg(not(unix))]
+        "q" => std::process::exit(0),
         other => {
             // Unknown to the built-in set. Try extension-registered slash
             // commands (e.g. from the `pi-extensions` bridge). The agent owns

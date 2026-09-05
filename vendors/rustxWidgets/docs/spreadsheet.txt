@@ -1,0 +1,6 @@
+* Click on a cell to edit contents as text.
+* Abililty to resize columns
+* Set Cell/Row headers as inverse (Black text on White backround) widget should be able to report click events, and example should log the Row, Col header clicked to console.
+* faint grey lines between cells.
+* ability to set alignment, bold, highlght and text colour (and add relevant buttons to example)
+* Able to move around and edit cells using just keyboard.

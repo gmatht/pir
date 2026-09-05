@@ -547,6 +547,23 @@ pub fn agent_user_home() -> Option<PathBuf> {
     None
 }
 
+/// The home directory of an arbitrary user (e.g. the resolved per-project
+/// `ai_*` user), from `/etc/passwd`. `None` when the user can't be resolved.
+/// Used at startup to read the *target* (sandbox) user's `security.toml` so the
+/// `user-security` decision is made against the policy the operator actually
+/// edited (via `/menu`), not the invoking user's.
+#[cfg(unix)]
+pub fn home_of(user: &str) -> Option<PathBuf> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    for line in passwd.lines() {
+        let mut f = line.split(':');
+        if f.next()? == user {
+            return f.nth(4).map(PathBuf::from); // field 5 = home dir
+        }
+    }
+    None
+}
+
 /// Best-effort chown of `path` to the configured agent execution user, so the
 /// overlay staging upper/work dirs are writable by the agent's bash commands
 /// (which run as `ai_X`). No-op when no agent exec user is configured or the
@@ -687,8 +704,9 @@ pub fn spawn_shell_as(
     }
     let err = cmd
         .env("HISTFILE", "/dev/null")
-        .current_dir(std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")))
-        .before_exec(move || {
+        .current_dir(std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+    let err = unsafe {
+        err.pre_exec(move || {
             // Inside the child: drop to the target identity before exec. We
             // must not run any code as root in the child shell. Order matters:
             // clear groups, setgid, then setuid (once uid is dropped we can no
@@ -696,18 +714,17 @@ pub fn spawn_shell_as(
             // already an unprivileged identity and setgroups EPERMs, or the uid
             // isn't mapped in this user namespace), run the shell as the current
             // identity rather than failing it.
-            unsafe {
-                let _ = libc::setgroups(0, std::ptr::null());
-                if libc::setgid(gid) != 0 {
-                    return Ok(());
-                }
-                if libc::setuid(uid) != 0 {
-                    return Ok(());
-                }
+            let _ = libc::setgroups(0, std::ptr::null());
+            if libc::setgid(gid) != 0 {
+                return Ok(());
+            }
+            if libc::setuid(uid) != 0 {
+                return Ok(());
             }
             Ok(())
         })
-        .status();
+    }
+    .status();
     match err {
         Ok(s) => Some(s.code().unwrap_or(1)),
         Err(_) => None,

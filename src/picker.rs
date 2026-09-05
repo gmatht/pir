@@ -17,14 +17,15 @@
 //! it must work in the default build), drawing into the terminal and restoring
 //! it on exit.
 
-use std::io::{self, Write};
-#[cfg(unix)]
+use std::collections::HashMap;
+use std::io::{self, IsTerminal, Write};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use crate::session::SessionPreview;
+use crate::session::{read_preview, SessionPreview};
 use crate::term;
 
 /// A candidate row shown in the left pane.
@@ -459,7 +460,6 @@ fn translate_result(res: &term::raw::RawInput, buf: &str) -> Key {
             let _ = buf;
             Key::None
         }
-        _ => Key::None,
     }
 }
 

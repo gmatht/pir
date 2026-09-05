@@ -1,0 +1,1 @@
+* Add screenshot tests that ensure changing bold etc in the example app change the screenshot for GUI back ends.

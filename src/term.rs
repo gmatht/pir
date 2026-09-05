@@ -1,13 +1,17 @@
 use std::cell::RefCell;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::thread::JoinHandle;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustyline::completion::Completer;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::{Hinter, HistoryHinter};
+use rustyline::history::History;
 use rustyline::validate::Validator;
 use rustyline::{At, Cmd, CompletionType, Config, Context, Editor, Event, KeyCode, KeyEvent, Modifiers, Movement, Word};
 
@@ -71,12 +75,18 @@ fn ext_command_help(cmd: &str) -> Option<String> {
         .and_then(|ext| ext.iter().find(|(n, _)| n == name).map(|(_, d)| d.clone()))
 }
 
-/// Force colour on (`true`) or off (`false`). When unset (the default), colour
-/// is decided automatically from the terminal and `NO_COLOR`. An explicit call
-/// always overrides, so `--no-color` / forced colour win over the auto check.
-pub fn set_color(on: bool) {
-    if let Ok(mut g) = COLOR_OVERRIDE.lock() {
-        *g = Some(on);
+/// One-shot pre-fill text for the next `read_line` prompt. Commands like `/l`
+/// (which guesses a provider/key from the clipboard) set this so the user's
+/// next prompt opens already populated with a suggested `/login …` line; they
+/// can edit or just press Enter. Cleared after it is consumed once.
+static PREFILL: Mutex<Option<String>> = Mutex::new(None);
+
+/// Suggest text to pre-fill the next idle prompt (e.g. a `/login <provider> <key>`
+/// line guessed from the clipboard by `/l`). Best-effort; overwrites any
+/// pending prefill. Consumed (and cleared) by the next `read_line`.
+pub fn set_prefill(text: &str) {
+    if let Ok(mut g) = PREFILL.lock() {
+        *g = Some(text.to_string());
     }
 }
 
@@ -88,6 +98,15 @@ fn color() -> bool {
     }
     // Auto: colour only when stdout is a terminal and NO_COLOR is unset.
     io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+/// Override the colour enable/disable decision at runtime (used by the
+/// `-n`/`--no-color` CLI flag). Passing `false` forces colour off; `true`
+/// forces; the value is consulted by [`color()`] for every paint call.
+pub fn set_color(enabled: bool) {
+    if let Ok(mut g) = COLOR_OVERRIDE.lock() {
+        *g = Some(enabled);
+    }
 }
 
 /// Whether stdout is attached to an interactive terminal (used by the
@@ -112,13 +131,11 @@ pub fn color_enabled() -> bool {
 /// mechanism the input path uses) instead of sleeping-and-retrying in a hot
 /// loop. A genuinely broken pipe is ignored silently.
 #[cfg(unix)]
-#[cfg(unix)]
 pub fn out(s: &str) {
-    #[cfg(unix)]
     #[cfg(unix)]
     use std::os::unix::io::{AsRawFd, FromRawFd};
     let bytes = s.as_bytes();
-    let mut written = 0usize;
+    let written = 0usize;
     // Bound the total work so a persistent stall can't spin forever.
     for _ in 0..1024 {
         let mut stdout = io::stdout();
@@ -255,6 +272,131 @@ pub fn status_line(workspace: &str, model: &str) -> String {
 pub fn hrule() -> String {
     let w = terminal_width().max(20);
     dim(&"─".repeat(w))
+}
+
+/// A single full-width footer line: `── <status> ──…──`. The status text
+/// (which may carry its own ANSI colour) sits *inside* the rule, so the footer
+/// doubles as the bottom border of the input zone. This is the persistent
+/// bottom section the REPL keeps at the bottom row of the screen (idle status
+/// and the "thinking" spinner both render into it).
+pub fn footer_line(status: &str) -> String {
+    let w = terminal_width().max(20);
+    let head = format!("{} {status} ", dim("──"));
+    let used = visible_len(&head);
+    format!("{head}{}", dim(&"─".repeat(w.saturating_sub(used))))
+}
+
+/// Draw the persistent footer at the bottom row of the terminal, leaving the
+/// cursor exactly where it was (save/restore). No-op when stdout isn't a tty.
+pub fn draw_footer(status: &str) {
+    if !is_terminal() {
+        return;
+    }
+    let h = terminal_height();
+    let line = footer_line(status);
+    let mut out = io::stdout();
+    let _ = out.write_all(format!("\x1b[s\x1b[{h};1H\x1b[2K{line}\x1b[u").as_bytes());
+    let _ = out.flush();
+}
+
+/// Erase the footer line at the bottom row, restoring the cursor. No-op when
+/// stdout isn't a tty.
+pub fn erase_footer() {
+    if !is_terminal() {
+        return;
+    }
+    let h = terminal_height();
+    let mut out = io::stdout();
+    let _ = out.write_all(format!("\x1b[s\x1b[{h};1H\x1b[2K\x1b[u").as_bytes());
+    let _ = out.flush();
+}
+
+/// Query the current cursor row (1-based) via DSR `\x1b[6n`. Returns `None`
+/// when the terminal doesn't answer within a short window (or stdin isn't a
+/// tty). Used by the REPL to decide whether the prompt needs pushing up so the
+/// persistent footer at the bottom row isn't overlapped. The reply
+/// (`\x1b[<row>;<col>R`) is consumed here; a non-answering terminal is rare and
+/// the caller falls back to drawing the footer anyway.
+pub fn cursor_row() -> Option<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let mut out = io::stdout();
+        let _ = out.write_all(b"\x1b[6n");
+        let _ = out.flush();
+        let mut s = String::new();
+        let mut buf = [0u8; 1];
+        let deadline = std::time::Instant::now() + Duration::from_millis(40);
+        let _guard = crate::sixel::RawStdinGuard::enable();
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let wait_ms = remaining.as_millis().min(20) as i32;
+            let fd = io::stdin().as_raw_fd();
+            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            let r = unsafe { libc::poll(&mut pfd, 1, wait_ms) };
+            if r > 0 && (pfd.revents & libc::POLLIN) != 0 {
+                let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
+                if n == 1 {
+                    s.push(buf[0] as char);
+                    if buf[0] == b'R' {
+                        break;
+                    }
+                } else if n == 0 {
+                    break;
+                }
+            }
+        }
+        // Reply looks like "\x1b[<row>;<col>R".
+        let s = s.trim_start_matches('\x1b').trim_start_matches('[');
+        let row = s.split(';').next()?;
+        row.parse::<usize>().ok()
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Cursor-movement + erase sequence that removes the 3-line "working" panel and
+/// leaves the cursor at column 0 of its top line, so the next output (streamed
+/// model text, or the idle prompt on detach) starts cleanly there. The panel is
+/// Build the single-line "thinking" footer the spinner draws at the bottom row
+/// of the terminal: `── ⠋ thinking · <cwd> · <typed> ──…──`. The typeahead is
+/// truncated so the whole line stays within `w` columns and never wraps (the
+/// footer is redrawn in place each tick, so a wrapped line would drift).
+fn thinking_footer_line(
+    frame: &str,
+    label: &str,
+    cwd: &str,
+    typed: &str,
+    w: usize,
+    colored: bool,
+) -> String {
+    let frame_s = if colored {
+        format!("\x1b[36m{frame}\x1b[0m")
+    } else {
+        frame.to_string()
+    };
+    let mut status = format!("{frame_s} {label} · {cwd}");
+    if !typed.is_empty() {
+        let sep = " · ";
+        // Room left on the line after the fixed head (── prefix, frame, label,
+        // cwd and the trailing space) — the typeahead is clipped to fit.
+        let head = format!("── {frame_s} {label} · {cwd} ");
+        let avail = w.saturating_sub(visible_len(&head) + sep.chars().count());
+        let taken: String = typed.chars().take(avail).collect();
+        if !taken.is_empty() {
+            status.push_str(sep);
+            status.push_str(&taken);
+        }
+    }
+    // Build the whole line at exactly `w` columns so it can never wrap.
+    let head = format!("{} {status} ", dim("──"));
+    let used = visible_len(&head);
+    format!("{head}{}", dim(&"─".repeat(w.saturating_sub(used))))
 }
 
 fn paint(code: &str, s: &str) -> String {
@@ -432,6 +574,7 @@ const SLASH_HELP: &[(&str, &str, &str)] = &[
     ("/jobs", "", "list background jobs"),
     ("/login", "<provider>", "store an API key for a provider"),
     ("/logout", "<provider>", "remove a stored provider credential"),
+    ("/l", "", "show window titles + clipboard; guess a provider and pre-fill /login"),
     ("/markup_demo", "", "render a canned markdown + code demo reply"),
     ("/model", "<sel>", "switch the model for this session"),
     ("/model*", "<sel>", "switch model in all open pir terminals"),
@@ -510,25 +653,38 @@ fn command_help_hint(line: &str) -> Option<String> {
 
 /// History recall for the completer: previous lines (most recent first) that
 /// contain the typed text, so typing `hy` can complete to a prior
-/// `/default-model hy3`. Prefix matches are ranked first, then substring
-/// matches; deduped and capped at 10 so the list stays scannable.
+/// `/default-model hy3`. The search spans *every* session's history in this
+/// working directory (not just the live one) — see [`build_dir_history`].
+/// Prefix matches are ranked first, then substring matches; deduped and capped
+/// at 10 so the list stays scannable.
 fn history_matches(ctx: &Context<'_>, typed: &str) -> Vec<String> {
     use rustyline::history::SearchDirection;
     let typed = typed.trim().to_ascii_lowercase();
     if typed.is_empty() {
         return Vec::new();
     }
-    let hist = ctx.history();
-    let n = hist.len();
+    // Combined candidate stream: live session history first (most recent
+    // first), then the directory-wide index of every prior prompt in this
+    // directory's sessions. Most-recent-first overall so newer prompts rank
+    // higher; `seen` dedupes prompts present in both.
+    let mut combined: Vec<String> = Vec::new();
+    {
+        let hist = ctx.history();
+        let n = hist.len();
+        for i in (0..n).rev() {
+            let Ok(Some(res)) = hist.get(i, SearchDirection::Forward) else { continue };
+            let e = res.entry.as_ref();
+            if !e.trim().is_empty() {
+                combined.push(e.to_string());
+            }
+        }
+    }
+    load_dir_history_once();
+    extend_with_dir_history(&mut combined);
     let mut out: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     // Pass 1: entries that start with the typed text (most recent first).
-    for i in (0..n).rev() {
-        let Ok(Some(res)) = hist.get(i, SearchDirection::Forward) else { continue };
-        let e = res.entry.as_ref();
-        if e.trim().is_empty() {
-            continue;
-        }
+    for e in &combined {
         if e.to_ascii_lowercase().starts_with(&typed) && seen.insert(e.to_string()) {
             out.push(e.to_string());
             if out.len() >= 10 {
@@ -537,12 +693,7 @@ fn history_matches(ctx: &Context<'_>, typed: &str) -> Vec<String> {
         }
     }
     // Pass 2: entries that merely contain it.
-    for i in (0..n).rev() {
-        let Ok(Some(res)) = hist.get(i, SearchDirection::Forward) else { continue };
-        let e = res.entry.as_ref();
-        if e.trim().is_empty() {
-            continue;
-        }
+    for e in &combined {
         if e.to_ascii_lowercase().contains(&typed) && seen.insert(e.to_string()) {
             out.push(e.to_string());
             if out.len() >= 10 {
@@ -551,6 +702,59 @@ fn history_matches(ctx: &Context<'_>, typed: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Inline-hint history recall: find the most recent prior line that *contains*
+/// the typed text (a substring / "needle" search, not prefix-only) and return
+/// the remainder of that line *after the match position*, so the user sees the
+/// rest of the recalled command suggested to the right of the caret. Returns
+/// `None` when nothing matches or the match consumes the whole line.
+///
+/// The search spans every session's history in this working directory (see
+/// [`build_dir_history`]), and the remainder is computed from the *actual* match
+/// position — not from the line start — so typing `hy` against a prior
+/// `/model hy3` suggests `3` (completing to `/model hy3`), instead of the
+/// previously-broken `el hy3`.
+fn history_hint(ctx: &Context<'_>, typed: &str) -> Option<String> {
+    use rustyline::history::SearchDirection;
+    let typed = typed.trim();
+    if typed.is_empty() {
+        return None;
+    }
+    let needle = typed.to_ascii_lowercase();
+    // Combined most-recent-first stream (live first, then directory-wide).
+    let mut combined: Vec<String> = Vec::new();
+    {
+        let hist = ctx.history();
+        let n = hist.len();
+        for i in (0..n).rev() {
+            let Ok(Some(res)) = hist.get(i, SearchDirection::Forward) else { continue };
+            let e = res.entry.as_ref();
+            if !e.trim().is_empty() {
+                combined.push(e.to_string());
+            }
+        }
+    }
+    load_dir_history_once();
+    extend_with_dir_history(&mut combined);
+    // Most recent first.
+    for e in &combined {
+        if e.trim().is_empty() {
+            continue;
+        }
+        // Find the *first* occurrence of the needle anywhere in the line, then
+        // suggest the remainder *after that match* — not after the line start.
+        if let Some(pos) = e.to_ascii_lowercase().find(&needle) {
+            if let Some(rest) = e.get(pos + typed.len()..) {
+                if !rest.is_empty() {
+                    return Some(rest.to_string());
+                }
+            }
+            // The match consumes the rest of the line: nothing left to suggest.
+            return None;
+        }
+    }
+    None
 }
 
 impl Completer for PirHelper {
@@ -659,10 +863,12 @@ impl Hinter for PirHelper {
             }
         }
         // Last-resort fallback: for free-form text (not a slash command),
-        // suggest the rest of the most recent matching prior line from history
-        // (e.g. typing `hy` recalls `/default-model hy3`).
+        // suggest the rest of the most recent matching prior line from history.
+        // This is a substring ("needle") search, not a prefix-only match, so a
+        // typed fragment anywhere in a prior line is recalled (e.g. typing
+        // `dee` recalls `/model ollama-cloud:deepseek…`).
         if !is_slash_command_line(line, pos) {
-            if let Some(h) = self.history_hinter.hint(line, pos, ctx) {
+            if let Some(h) = history_hint(ctx, &line[..pos]) {
                 return Some(h);
             }
         }
@@ -683,11 +889,18 @@ fn is_slash_command_line(line: &str, pos: usize) -> bool {
 
 impl Highlighter for PirHelper {
     fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
-        // Plain text on purpose: ANSI-wrapped hints (like the ANSI-wrapped
-        // `❯` prompt) can make the Windows console/pty width accounting drift,
-        // which pushes the caret a few columns right and leaves the next
-        // typed text visibly offset. The hint is cosmetic, so no escapes.
-        std::borrow::Cow::Borrowed(hint)
+        // Dim the hint so it's visually distinct from the typed line (grey),
+        // and lead with a space so it doesn't glue onto the prompt/command or
+        // the typed argument. `highlight_hint` is only invoked when rustyline's
+        // `colors_enabled()` is true (see `edit.rs` `refresh`), so ANSI here is
+        // only emitted on terminals that actually support it — the manual
+        // correction for the Windows console/pty width drift that plain-ANSI
+        // hints used to cause. When colour is off we fall back to plain text.
+        if color() {
+            std::borrow::Cow::Owned(dim(&format!(" {hint}")))
+        } else {
+            std::borrow::Cow::Borrowed(hint)
+        }
     }
 }
 impl Validator for PirHelper {}
@@ -699,6 +912,15 @@ thread_local! {
         const { RefCell::new(None) };
     // Persisted history store (a .history file next to the session log).
     static HISTORY_FILE: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
+    // Directory of the active session's `.history` file — i.e. this working
+    // directory's sessions folder. Used to build a directory-wide prompt
+    // index so history recall reaches *every* session in the directory, not
+    // just the live one (the "previous prompts in the current directory"
+    // feature from the session logs).
+    static DIR_HISTORY_DIR: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
+    // Lazily-built, most-recent-first, deduped index of every prior prompt from
+    // every `*.history` file in `DIR_HISTORY_DIR`. Empty until first used.
+    static DIR_HISTORY: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
 }
 
 /// Point the line editor at a history file that should be loaded on first
@@ -708,6 +930,14 @@ thread_local! {
 /// target, so Windows pastes behave exactly like Unix.
 pub fn set_history_file(path: &Path) {
     HISTORY_FILE.with(|f| *f.borrow_mut() = Some(path.to_path_buf()));
+    // Remember the sessions directory so history recall can span every
+    // session's `.history` file in this working directory, not just this one.
+    if let Some(parent) = path.parent() {
+        DIR_HISTORY_DIR.with(|d| *d.borrow_mut() = Some(parent.to_path_buf()));
+    }
+    // Reset the cached directory index: a new session means a (possibly)
+    // different sessions directory, so the index must be rebuilt on demand.
+    DIR_HISTORY.with(|c| *c.borrow_mut() = None);
     // Eagerly create the editor so the file is loaded before the first prompt.
     EDITOR.with(|e| {
         if e.borrow().is_none() {
@@ -780,6 +1010,23 @@ fn new_editor() -> Option<Editor<PirHelper, rustyline::history::DefaultHistory>>
         ]),
         kill_word_fwd(),
     );
+    // Ctrl-Q: quit the REPL at the idle prompt, *unconditionally* (even with
+    // text in the buffer). Bound to `Cmd::Interrupt` because rustyline only
+    // special-cases `Cmd::EndOfFile` (which fires only on an empty buffer);
+    // `Interrupt` returns `ReadlineError::Interrupted` regardless of buffer
+    // content, which `read_line` maps to `None` (quit). During a running turn
+    // Ctrl-Q is handled by the raw reader as a two-stage graceful-then-force
+    // quit.
+    //
+    // NB: the key must be UPPERCASE — rustyline's `KeyEvent::new` normalizes
+    // control chars to uppercase letters with CTRL (`'\x11'` -> `Char('Q')`),
+    // so `KeyEvent::ctrl('q')` (lowercase) would never match.
+    let _ = rl.bind_sequence(KeyEvent::ctrl('Q'), Cmd::Interrupt);
+    // Ctrl-C: clear the current line and stay in the editor. rustyline's
+    // default Ctrl-C is `Cmd::Interrupt`, which we now reserve for Ctrl-Q's
+    // quit signal — so rebind it to a whole-line kill to preserve the
+    // "clear the line" behavior.
+    let _ = rl.bind_sequence(KeyEvent::ctrl('C'), Cmd::Kill(Movement::WholeLine));
     Some(rl)
 }
 
@@ -790,6 +1037,83 @@ fn load_history() {
         if let Some(path) = HISTORY_FILE.with(|f| f.borrow().clone()) {
             let r = rl.load_history(&path);
             eprintln!("pir-debug load_history: path={:?} err={:?}", path, r.err());
+        }
+    });
+}
+
+/// Build the directory-wide prompt index: every prompt from every `*.history`
+/// file in this working directory's sessions folder, most-recent-first (newest
+/// session, and within it the newest prompt, first) and deduped. This is what
+/// lets history recall reach *previous prompts made in the current directory*
+/// (e.g. typing `hy` completes to a `/model hy3` run in an earlier session),
+/// instead of only the prompts typed in the live session. The index is rebuilt
+/// from scratch on each call; callers cache it via [`load_dir_history_once`].
+fn build_dir_history() -> Vec<String> {
+    let dir = match DIR_HISTORY_DIR.with(|d| d.borrow().clone()) {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+    // Newest session file first (by modification time); within a file entries
+    // are oldest→newest, so we reverse each file for most-recent-first.
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for ent in rd.flatten() {
+            let p = ent.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("history") {
+                let mtime = ent
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                files.push((mtime, p));
+            }
+        }
+    }
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut combined: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (_mtime, p) in files {
+        // Load each session file with rustyline's own parser (handles the `#V2`
+        // multiline-escaped format) rather than re-implementing it.
+        let mut h = rustyline::history::DefaultHistory::new();
+        if h.load(&p).is_err() {
+            continue;
+        }
+        let n = h.len();
+        for i in (0..n).rev() {
+            let Ok(Some(res)) = h.get(i, rustyline::history::SearchDirection::Forward) else {
+                continue;
+            };
+            let s = res.entry.as_ref().trim();
+            if s.is_empty() {
+                continue;
+            }
+            // Keep the first (most recent) occurrence; older dupes ignored.
+            if seen.insert(s.to_string()) {
+                combined.push(s.to_string());
+            }
+        }
+    }
+    combined
+}
+
+/// Lazily build the directory-wide prompt index once and cache it. Subsequent
+/// calls are free until [`set_history_file`] resets the cache for a new
+/// session.
+fn load_dir_history_once() {
+    DIR_HISTORY.with(|c| {
+        if c.borrow().is_none() {
+            *c.borrow_mut() = Some(build_dir_history());
+        }
+    });
+}
+
+/// Append the directory-wide prompt index (every prior prompt in this
+/// directory's sessions, most-recent-first) to `out`. No-op until the index has
+/// been built by [`load_dir_history_once`].
+fn extend_with_dir_history(out: &mut Vec<String>) {
+    DIR_HISTORY.with(|c| {
+        if let Some(dir) = c.borrow().as_ref() {
+            out.extend(dir.iter().cloned());
         }
     });
 }
@@ -820,7 +1144,9 @@ pub fn load_history_lines() -> Vec<String> {
 /// Read a line with full line editing: arrow-up/down history, left/right
 /// cursor movement, home/end, word motion, etc. (provided by rustyline).
 ///
-/// Returns `None` on EOF (e.g. ctrl-d) so the caller can quit cleanly.
+/// Returns `None` on EOF (ctrl-d) or Ctrl-Q (bound to `Cmd::Interrupt` in
+/// `new_editor`) so the caller can quit cleanly — Ctrl-Q quits even with
+/// text in the buffer.
 pub fn read_line(prompt: &str) -> Option<String> {
     use rustyline::error::ReadlineError;
 
@@ -834,14 +1160,23 @@ pub fn read_line(prompt: &str) -> Option<String> {
             Some(rl) => rl,
             None => return plain_read_line(prompt),
         };
-        match rl.readline(prompt) {
+        // If a command (e.g. `/l`) pre-filled a suggested line, start the
+        // prompt already populated with it and place the cursor at the end, so
+        // the user can edit or just press Enter. Consumed once.
+        let prefill = PREFILL.lock().ok().and_then(|mut g| g.take());
+        let res = match prefill {
+            Some(init) => rl.readline_with_initial(prompt, (init.as_str(), "")),
+            None => rl.readline(prompt),
+        };
+        match res {
             Ok(line) => {
                 let _ = rl.add_history_entry(line.as_str());
                 save_history(rl);
                 Some(line)
             }
-            // Ctrl-C: stay in the REPL instead of dying.
-            Err(ReadlineError::Interrupted) => Some(String::new()),
+            // Ctrl-Q (bound to `Cmd::Interrupt` in `new_editor`): quit. Ctrl-C
+            // is rebound to a whole-line kill, so it never reaches here.
+            Err(ReadlineError::Interrupted) => None,
             Err(ReadlineError::Eof) => None,
             Err(_) => None,
         }
@@ -1143,40 +1478,42 @@ impl Spinner {
             let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
             let mut i = 0usize;
             let mut out = io::stdout();
+            // The working directory shown in the footer's status. Captured once:
+            // it can't change while a turn is running.
+            let cwd = crate::workspace_label();
+            let w = terminal_width().max(20);
+            let mut erased = false;
             while a.load(Ordering::SeqCst) {
-                // Detached turn: erase the spinner and go silent so a backgrounded
-                // turn leaves a clean terminal behind it.
+                // Detached turn: erase the footer once and go silent so a
+                // backgrounded turn leaves a clean terminal behind it.
                 if q.load(Ordering::SeqCst) {
-                    let _ = out.write_all(b"\r\x1b[2K");
-                    let _ = out.flush();
+                    if !erased {
+                        erase_footer();
+                        erased = true;
+                    }
                     std::thread::sleep(Duration::from_millis(80));
                     continue;
                 }
-                let frame = if color() { format!("\x1b[36m{}\x1b[0m", frames[i % frames.len()]) } else { frames[i % frames.len()].to_string() };
-                // Render the user's in-progress line (recorded by the REPL thread)
-                // inline after the label, so typing stays visible while the model
-                // thinks — without a fragile multi-line block under the spinner.
-                // The old 3-line block (thinking + hrule + a fake `❯` prompt line)
-                // drifted on \x1b[2A line-arithmetic between tool rounds, leaking
-                // stray "thinking…" / "────" lines and clobbering the REPL prompt.
+                erased = false;
+                let frame = frames[i % frames.len()];
                 let typed = typeahead.lock().map(|g| g.clone()).unwrap_or_default();
-                // Single clean line: CR to column 0, erase the whole line, then
-                // rewrite. One line means the erase/redraw can never drift, so no
-                // lines accumulate. `\x1b[2K` clears the entire line.
-                let mut line = format!("\r\x1b[2K{frame} {label}…");
-                if !typed.is_empty() {
-                    line.push_str("  ");
-                    line.push_str(&typed);
-                }
-                let _ = out.write_all(line.as_bytes());
+                let line = thinking_footer_line(&frame.to_string(), &label, &cwd, &typed, w, color());
+                // Rewrite the footer in place at the bottom row each tick. The
+                // cursor is saved/restored around the draw, so the position the
+                // next streamed token will write from never moves — unlike the
+                // old 3-line block, this can never drift or leave a stray line.
+                let h = terminal_height();
+                let mut buf = String::new();
+                buf.push_str(&format!("\x1b[s\x1b[{h};1H\x1b[2K{line}\x1b[u"));
+                let _ = out.write_all(buf.as_bytes());
                 let _ = out.flush();
                 std::thread::sleep(Duration::from_millis(80));
                 i = i.wrapping_add(1);
             }
-            // On stop, erase the spinner line and leave the cursor at column 0 so
-            // the next output (streamed model text) starts cleanly on that line.
-            let _ = out.write_all(b"\r\x1b[2K");
-            let _ = out.flush();
+            // On stop, erase the footer and leave the cursor where it was so
+            // the next output (streamed model text, or the idle prompt on
+            // detach) starts cleanly there.
+            erase_footer();
         });
         Spinner { handle: Some(handle), alive }
     }
@@ -2008,6 +2345,69 @@ mod tests {
         assert_eq!(matches.first().map(String::as_str), Some("ls"));
     }
 
+    // History recall must reach *prior prompts from other sessions in this
+    // directory*, not just the live session's history — the "previous prompts
+    // in the current directory" feature. And the inline hint must return the
+    // remainder after the *match position* (e.g. `3` for `/model hy3`), not a
+    // garbage slice from the line start (`el hy3`).
+    #[test]
+    fn thinking_footer_line_size_and_fit() {
+        // The line is exactly `w` columns (── prefix + spinner + label + cwd +
+        // dashes) — it must never wrap, since the spinner redraws it in place.
+        let line = thinking_footer_line("⠧", "thinking", "~/src/pir", "", 40, false);
+        assert_eq!(visible_len(&line), 40, "footer must be exactly width: {line:?}");
+        assert!(line.contains("⠧ thinking"), "footer should carry spinner+label: {line:?}");
+        assert!(line.contains("~/src/pir"), "footer should show cwd: {line:?}");
+        // Typeahead longer than the line is truncated so it never wraps.
+        let long = "x".repeat(200);
+        let l2 = thinking_footer_line("⠋", "thinking", "~/x", &long, 40, false);
+        assert!(
+            visible_len(&l2) <= 40,
+            "footer must not exceed width: {} > 40 ({l2:?})",
+            visible_len(&l2)
+        );
+        // The typeahead is visible when it fits.
+        let l3 = thinking_footer_line("⠋", "thinking", "~/x", "hi", 40, false);
+        assert!(l3.contains("hi"), "footer should show typeahead: {l3:?}");
+    }
+
+    #[test]
+    fn dir_history_recalls_prior_session_prompt() {
+        use rustyline::history::{DefaultHistory, History, MemHistory};
+        let tag = format!("pir_dh_{:?}", std::thread::current().id());
+        let tmp = std::env::temp_dir().join(tag);
+        let _ = std::fs::create_dir_all(&tmp);
+        let a = tmp.join("sess_a.history");
+        let b = tmp.join("sess_b.history");
+        std::fs::write(&a, "#V2\n/model hy3\nls\n").unwrap();
+        std::fs::write(&b, "#V2\ncd /x\n/model hy3\n").unwrap();
+        // Point the directory-wide index at the temp dir and force a rebuild.
+        super::DIR_HISTORY_DIR.with(|d| *d.borrow_mut() = Some(tmp.clone()));
+        super::DIR_HISTORY.with(|c| *c.borrow_mut() = None);
+        // A live context whose own history does NOT contain the target prompt.
+        let mut hist = MemHistory::new();
+        hist.add("unrelated prompt").unwrap();
+        let ctx = Context::new(&hist);
+        let h = PirHelper { history_hinter: HistoryHinter::new() };
+        // Tab completion: bare `hy3` recalls the prior `/model hy3` command,
+        // even though it lives in another session's `.history` file.
+        let (_s, matches) = h.complete("hy3", "hy3".len(), &ctx).unwrap();
+        assert!(
+            matches.contains(&"/model hy3".to_string()),
+            "expected /model hy3 in completions, got: {matches:?}"
+        );
+        // Inline hint: typing `hy` should suggest `3` (remainder after the
+        // match inside `/model hy3`), not `el hy3`.
+        let hint = h.hint("hy", "hy".len(), &ctx);
+        assert_eq!(hint.as_deref(), Some("3"), "got hint: {hint:?}");
+        // Cleanup: reset global state and remove temp files.
+        super::DIR_HISTORY_DIR.with(|d| *d.borrow_mut() = None);
+        super::DIR_HISTORY.with(|c| *c.borrow_mut() = None);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+        let _ = std::fs::remove_dir(&tmp);
+    }
+
     #[test]
     fn completes_unique_slash_prefix() {
         use crate::term::set_extension_commands;
@@ -2438,25 +2838,6 @@ mod coalesce_paste_tests {
 // intentionally minimal.
 // ===========================================================================
 #[cfg(not(unix))]
-
-// ===========================================================================
-// Cross-platform (non-Unix) terminal implementation via `crossterm`.
-// Windows `--gui` uses the NWG backend; this keeps the streaming REPL + the
-// crate compiling on non-Unix with a functional (minimal) terminal layer.
-// ===========================================================================
-#[cfg(not(unix))]
-
-// ===========================================================================
-// Cross-platform (non-Unix) terminal implementation via `crossterm`.
-// Windows `--gui` uses the NWG backend; this keeps the streaming REPL + crate
-// compiling on non-Unix with a functional (minimal) terminal layer.
-// ===========================================================================
-#[cfg(not(unix))]
-
-// ===========================================================================
-// Cross-platform (non-Unix) terminal implementation via `crossterm`.
-// ===========================================================================
-#[cfg(not(unix))]
 mod nonunix_term {
     use std::io::{self, Write, BufRead};
     use std::sync::{Arc, Mutex};
@@ -2473,6 +2854,32 @@ mod nonunix_term {
     pub fn out_flush() { let _ = io::stdout().flush(); }
     pub fn terminal_width() -> usize { crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80) }
     pub fn terminal_height() -> usize { crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24) }
+    pub fn footer_line(status: &str) -> String {
+        let w = terminal_width().max(20);
+        let head = format!("{} {status} ", super::dim("──"));
+        let used = super::visible_len(&head);
+        format!("{head}{}", super::dim(&"─".repeat(w.saturating_sub(used))))
+    }
+    pub fn draw_footer(status: &str) {
+        if !super::is_terminal() {
+            return;
+        }
+        let h = terminal_height();
+        let line = footer_line(status);
+        let mut out = io::stdout();
+        let _ = out.write_all(format!("\x1b[s\x1b[{h};1H\x1b[2K{line}\x1b[u").as_bytes());
+        let _ = out.flush();
+    }
+    pub fn erase_footer() {
+        if !super::is_terminal() {
+            return;
+        }
+        let h = terminal_height();
+        let mut out = io::stdout();
+        let _ = out.write_all(format!("\x1b[s\x1b[{h};1H\x1b[2K\x1b[u").as_bytes());
+        let _ = out.flush();
+    }
+    pub fn cursor_row() -> Option<usize> { None }
     pub fn read_answer(prompt: &str) -> String {
         out(prompt);
         let mut l = String::new();
@@ -2519,35 +2926,39 @@ mod nonunix_term {
                 let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
                 let mut i = 0usize;
                 let mut out = io::stdout();
+                let cwd = crate::workspace_label();
+                let w = terminal_width().max(20);
+                let mut erased = false;
                 while a.load(Ordering::SeqCst) {
-                    // Detached turn: erase the spinner and go silent so a
+                    // Detached turn: erase the footer and go silent so a
                     // backgrounded turn leaves a clean terminal behind it.
                     if q.load(Ordering::SeqCst) {
-                        let _ = out.write_all(b"\r\x1b[2K");
-                        let _ = out.flush();
+                        if !erased {
+                            erase_footer();
+                            erased = true;
+                        }
                         std::thread::sleep(Duration::from_millis(80));
                         continue;
                     }
+                    erased = false;
                     let frame = if super::color_enabled() {
                         format!("\x1b[36m{}\x1b[0m", frames[i % frames.len()])
                     } else {
                         frames[i % frames.len()].to_string()
                     };
                     let typed = ta.lock().map(|g| g.clone()).unwrap_or_default();
-                    let mut line = format!("\r\x1b[2K{frame} {label}…");
-                    if !typed.is_empty() {
-                        line.push_str("  ");
-                        line.push_str(&typed);
-                    }
-                    let _ = out.write_all(line.as_bytes());
+                    let line = super::thinking_footer_line(&frame, &label, &cwd, &typed, w, super::color_enabled());
+                    // Rewrite the footer in place at the bottom row each tick
+                    // (save/restore cursor), so it can never drift.
+                    let h = terminal_height();
+                    let _ = out.write_all(format!("\x1b[s\x1b[{h};1H\x1b[2K{line}\x1b[u").as_bytes());
                     let _ = out.flush();
                     std::thread::sleep(Duration::from_millis(80));
                     i = i.wrapping_add(1);
                 }
-                // On stop, erase the spinner line and leave the cursor at column 0
+                // On stop, erase the footer and leave the cursor where it was
                 // so the next output (streamed model text) starts cleanly.
-                let _ = out.write_all(b"\r\x1b[2K");
-                let _ = out.flush();
+                erase_footer();
             });
             Spinner { handle: Some(handle), alive }
         }
@@ -2848,7 +3259,7 @@ pub fn spawn_force_quit_watchdog() {
         #[cfg(unix)]
         {
             use std::io::Write;
-            let fd = unsafe { libc::STDIN_FILENO };
+            let fd = libc::STDIN_FILENO;
             let mut tmp = [0u8; 64];
             loop {
                 let r = unsafe {
@@ -2892,6 +3303,11 @@ pub fn spawn_force_quit_watchdog() {
 pub use nonunix_term::*;
 #[cfg(not(unix))]
 pub use nonunix_term::raw;
+
+/// The idle "task done" placeholder shown by the full-screen TUI (and the
+/// streaming REPL) while awaiting the user's first keystroke after a turn
+/// completes. See [`done_prompt_color`].
+pub const DONE_PROMPT_TEXT: &str = "✓ DONE :) -- ✓ DONE :) --";
 
 pub fn done_prompt_color() -> String {
     // 1. env var wins.

@@ -637,7 +637,7 @@ fn render_node<'a>(node: &'a AstNode<'a>, ctx: &RenderCtx, out: &mut String) {
             }
         }
         NodeValue::BlockQuote => {
-            let mut inner = RenderCtx { color: ctx.color, indent: ctx.indent, in_list: false };
+            let inner = RenderCtx { color: ctx.color, indent: ctx.indent, in_list: false };
             let mut body = String::new();
             for c in node.children() {
                 render_node(c, &inner, &mut body);
@@ -1881,7 +1881,10 @@ mod tests {
         assert!(r.contains("\x1b]8;;https://example.com/x\x1b\\"), "got: {r:?}");
         assert!(r.contains("bold link"), "got: {r:?}");
         // Exactly one OSC 8 open and one close (no fragmenting into pieces).
-        assert_eq!(r.matches("\x1b]8;;").count(), 1, "got: {r:?}");
+        // Note the open (`\x1b]8;;url`) and close (`\x1b]8;;`) sequences both
+        // contain `\x1b]8;;`, so a working hyperlink necessarily yields 2
+        // matches for the bare opener, 1 for the full close sequence.
+        assert_eq!(r.matches("\x1b]8;;").count(), 2, "got: {r:?}");
         assert_eq!(r.matches("\x1b]8;;\x1b\\").count(), 1, "got: {r:?}");
     }
 
@@ -2104,7 +2107,7 @@ mod incremental_tests {
         let mut screen: Vec<String> = Vec::new();
         let mut row: usize = 0;
         let mut col: usize = 0;
-        let mut ensure = |screen: &mut Vec<String>, r: usize| {
+        let ensure = |screen: &mut Vec<String>, r: usize| {
             while screen.len() <= r {
                 screen.push(String::new());
             }

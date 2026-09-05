@@ -54,7 +54,7 @@ pub fn run(
     typeahead: &Arc<Mutex<String>>,
     providers: &[Provider],
     bus: &SharedBus,
-    done_tx: &smol::channel::Sender<()>,
+    _done_tx: &smol::channel::Sender<()>,
     full_auto: bool,
     running_as_agent: bool,
 ) -> Result<(), String> {
@@ -367,14 +367,6 @@ fn run_inner(
                         // handle as a background job, so the TUI returns to idle
                         // while the turn keeps working. The footer shows
                         // "#tasks running: N" as the only sign of life.
-                        let log = {
-                            let g = ctx.agent_slot.lock().unwrap();
-                            g.as_ref().and_then(|a| a.log_path().cloned()).unwrap_or_default()
-                        };
-                        let prompt = {
-                            let g = ctx.agent_slot.lock().unwrap();
-                            g.as_ref().map(|a| a.last_prompt.clone()).unwrap_or_default()
-                        };
                         let h = fg_handle.take().expect("fg running");
                         let id = state.detach(h);
                         ctx.fg_quiet.store(true, Ordering::SeqCst);
@@ -1205,7 +1197,7 @@ fn drain_session_log(log: PathBuf, state: &mut TuiState) -> usize {
         let role = v.get("role").and_then(|r| r.as_str()).unwrap_or("");
         let blocks = v.get("blocks").and_then(|b| b.as_array());
         let mut text = String::new();
-        let mut kind = ConvKind::System;
+        let kind;
         if role == "user" {
             kind = ConvKind::User;
             for b in blocks.into_iter().flatten() {
@@ -1286,7 +1278,7 @@ fn handle_command(
     state: &mut TuiState,
     cmd: &str,
     fg_handle: &mut Option<JoinHandle<()>>,
-    pending: &mut Vec<String>,
+    _pending: &mut Vec<String>,
 ) {
     let mut parts = cmd.split_whitespace();
     let cmd = parts.next().unwrap_or("");

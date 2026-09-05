@@ -1,8 +1,0 @@
-# On Windows (MSVC target) the binary was failing to start with
-# STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139): the linker imports
-# vcruntime140_1.dll (used by newer MSVC codegen), which the host's installed
-# Visual C++ Redistributable doesn't provide. Statically linking the CRT makes
-# the executable self-contained (no external VC++ runtime DLLs), which sidesteps
-# the missing-entry-point failure. Only affects the windows-msvc target.
-[target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
