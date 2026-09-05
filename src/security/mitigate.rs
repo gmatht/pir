@@ -339,6 +339,48 @@ fn split_pipeline(command: &str) -> Vec<String> {
 
 /// Extract redirects (`>` / `>>`) from a command, returning the redirects and
 /// the command with the redirect tokens removed (so the head verb is clean).
+/// A redirect target is "benign" — i.e. not a real on-disk file write that
+/// warrants a journal-copy / severity bump — when it is:
+/// - a file-descriptor duplication (`2>&1`, `1>&2`, `3>&4`, `2>&-` to close an
+///   fd), i.e. a target that begins with `&`; or
+/// - a discarding / pseudo `/dev` node (`/dev/null`, `/dev/zero`, `/dev/full`,
+///   `/dev/stdout|in|err`, `/dev/fd/*`, `/dev/tty*`, `/dev/pts/*`,
+///   `/dev/console*`, `/dev/random`/`/dev/urandom`).
+///
+/// Redirects to these are no-ops or already-trivially-irreversible. Treating
+/// them as destructive writes was a false positive: `grep ... 2>/dev/null`
+/// tripped the `>`-onto-existing path and produced `cp -a /dev/null
+/// /dev/null.bak`, which then failed with `Permission denied` and aborted the
+/// whole command. We strip them from the command (so the head verb stays
+/// clean) but never record them as write targets.
+fn is_benign_redirect_target(target: &str) -> bool {
+    let t = target.trim();
+    if t.is_empty() {
+        return false;
+    }
+    // File-descriptor duplication (incl. `&-` to close the fd).
+    if t.starts_with('&') {
+        return true;
+    }
+    // `/dev` discarding / pseudo nodes (case-insensitive on the base).
+    if t.starts_with("/dev/") {
+        let base = t.trim_start_matches("/dev/").to_ascii_lowercase();
+        return matches!(
+            base.as_str(),
+            "null" | "zero" | "full" | "stdout" | "stderr" | "stdin" | "random" | "urandom"
+        ) || base.starts_with("tty")
+            || base.starts_with("pts/")
+            || base.starts_with("fd/")
+            || base.starts_with("console");
+    }
+    false
+}
+
+/// Extract redirects (`>` / `>>`) from a command, returning the redirects and
+/// the command with the redirect tokens removed (so the head verb is clean).
+///
+/// Benign redirects (fd dups, `/dev/null`, ...) are stripped from the command
+/// but are NOT recorded as write targets — see [`is_benign_redirect_target`].
 fn extract_redirects(command: &str) -> (Vec<Redirect>, String) {
     let mut redirects = Vec::new();
     let mut out = String::new();
@@ -376,7 +418,12 @@ fn extract_redirects(command: &str) -> (Vec<Redirect>, String) {
                         target.push(t);
                         chars.next();
                     }
-                    redirects.push(Redirect { append, target });
+                    // Benign redirects (fd dups, /dev/null, ...) are stripped
+                    // from the command but are NOT real write targets, so they
+                    // never trigger journal-copy / denial / severity bumps.
+                    if !is_benign_redirect_target(&target) {
+                        redirects.push(Redirect { append, target });
+                    }
                 }
                 c => out.push(c),
             },
@@ -914,9 +961,6 @@ pub fn plan(command: &str, project_root: Option<&Path>) -> Option<Verdict> {
     let mut effective = command.to_string();
     let mut deviations: Vec<String> = Vec::new();
     let mut restore = String::new();
-    // How many files the agent will have moved to trash after this command
-    // runs (None unless a trash move is the mitigation).
-    let mut trash_moved: Option<usize> = None;
 
     // Any `rm`/`del`/`rmdir`/`rmrf`/`del /q`/`rm -fr` anywhere in the command
     // (compound commands joined by `&&`, `;`, `|`, newlines) is mitigated to a
@@ -1234,6 +1278,66 @@ mod tests {
             }
         }
         assert!(missed.is_empty(), "dangerous commands not denied: {missed:?}");
+    }
+
+    #[test]
+    fn dev_null_stderr_redirect_is_allowed() {
+        // `grep ... 2>/dev/null` must NOT be rewritten into a journal-copy of
+        // /dev/null (the original false positive that aborted legitimate reads).
+        let v = plan("grep -rn foo . 2>/dev/null", None);
+        assert!(v.is_none(), "2>/dev/null must not trigger mitigation, got {:?}", v);
+    }
+
+    #[test]
+    fn dev_null_truncate_redirect_is_allowed() {
+        // `> /dev/null` is a discard, not a write to a real file.
+        let v = plan("echo noise > /dev/null", None);
+        assert!(v.is_none(), "> /dev/null must not trigger mitigation, got {:?}", v);
+    }
+
+    #[test]
+    fn dev_null_append_redirect_is_allowed() {
+        let v = plan("echo noise >> /dev/null", None);
+        assert!(v.is_none(), ">> /dev/null must not trigger mitigation, got {:?}", v);
+    }
+
+    #[test]
+    fn dev_zero_redirect_is_allowed() {
+        let v = plan("head -c 1M /dev/zero > /dev/null", None);
+        assert!(v.is_none(), "/dev/zero redirect must not trigger mitigation, got {:?}", v);
+    }
+
+    #[test]
+    fn fd_dup_redirect_is_allowed() {
+        // `2>&1` duplicates a file descriptor — not a file write at all.
+        let v = plan("cargo build 2>&1", None);
+        assert!(v.is_none(), "2>&1 must not trigger mitigation, got {:?}", v);
+    }
+
+    #[test]
+    fn fd_close_redirect_is_allowed() {
+        // `2>&-` closes stderr — not a destructive file write.
+        let v = plan("some_cmd 2>&-", None);
+        assert!(v.is_none(), "2>&- must not trigger mitigation, got {:?}", v);
+    }
+
+    #[test]
+    fn benign_redirect_leaves_no_write_capability() {
+        let a = analyze("grep -rn foo . 2>/dev/null", None);
+        assert!(!a.has(Capability::Write), "benign redirect must not add Write capability");
+        assert!(a.redirects.is_empty(), "benign redirect must not be recorded");
+    }
+
+    #[test]
+    fn benign_redirect_still_strips_from_head() {
+        // The benign redirect text is removed from the analyzed head so it
+        // doesn't pollute verb/arg parsing (the residual `2` is the fd prefix,
+        // which the fast pre-filter leaves behind — harmless, since the
+        // effective command is the verbatim original when no move applies).
+        let (redirects, head) = extract_redirects("grep -rn foo . 2>/dev/null");
+        assert!(redirects.is_empty());
+        assert!(head.contains("grep"), "head must still contain the verb: {head:?}");
+        assert!(!head.contains("/dev/null"), "head must drop the benign target: {head:?}");
     }
 
     #[test]

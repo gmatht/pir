@@ -416,6 +416,9 @@ fn main() {
     let mut use_gui = false;
     let mut no_raw = false;
     let mut budget: Option<u64> = None;
+    // `--no-incremental` disables in-place incremental markdown rendering
+    // (same as `PIR_INCREMENTAL_MD=0`; see `Agent::set_incremental_md`).
+    let mut no_incremental = false;
 
     // Capture the invoking user's default-model selector BEFORE the privilege
     // drop (while HOME still points at the real user's ~/.pi). After the drop,
@@ -488,6 +491,7 @@ fn main() {
                 }
             }
             "--no-raw" => no_raw = true,
+            "--no-incremental" => no_incremental = true,
             "--budget" => {
                 i += 1;
                 match args.get(i).and_then(|v| v.parse::<u64>().ok()) {
@@ -727,6 +731,9 @@ fn main() {
             .and_then(|v| v.trim().parse::<u64>().ok())
     });
     agent.set_token_budget(budget);
+    if no_incremental {
+        agent.set_incremental_md(false);
+    }
     term::raw::set_enabled(!no_raw);
 
     // Continuation mode: attach the goal that lives next to the resumed

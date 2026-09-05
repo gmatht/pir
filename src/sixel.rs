@@ -7,7 +7,7 @@
 //! detected via the DA1 query (`ESC [ c`), which Windows Terminal answers with
 //! capability `4` only when sixel is enabled.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -515,5 +515,70 @@ mod tests {
         let junk = "some text with a 4 in it";
         let body = junk.strip_prefix("\x1b[?").and_then(|s| s.strip_suffix('c')).unwrap_or_default();
         assert!(!body.split(';').any(|t| t.trim() == "4"));
+    }
+}
+
+/// A terminal replies to DA1 (`\x1b[c`) with `\x1b[?61;4;22;24c`. That reply
+/// must be fully consumed by the startup queries + drain (`query_terminal` /
+/// `drain_input`) and never leak back into stdin, where it would surface as the
+/// user's first REPL prompt. Regression for the `RawStdinGuard` machinery: once
+/// the non-canonical read guard drops and restores the terminal, the reply
+/// bytes must not be re-delivered to a later reader.
+#[cfg(all(test, unix))]
+mod leak_tests {
+    use super::*;
+
+    /// Restores stdin to its original fd after the test, even on panic.
+    struct RestoreStdin(libc::c_int);
+    impl Drop for RestoreStdin {
+        fn drop(&mut self) {
+            unsafe {
+                libc::dup2(self.0, 0);
+                libc::close(self.0);
+            }
+        }
+    }
+
+    #[test]
+    fn da1_reply_consumed_not_leaked() {
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        let opened = unsafe {
+            libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), std::ptr::null())
+        };
+        if opened != 0 {
+            eprintln!("SKIP da1_reply_consumed_not_leaked: openpty unavailable");
+            return;
+        }
+        unsafe {
+            // Point stdin at the pty slave for the duration of the test.
+            let saved_stdin = libc::dup(0);
+            let _restore = RestoreStdin(saved_stdin);
+            libc::dup2(slave, 0);
+            // Non-blocking read-side so the "nothing left" assertion can't hang.
+            let flags = libc::fcntl(slave, libc::F_GETFL);
+            libc::fcntl(slave, libc::F_SETFL, flags | libc::O_NONBLOCK);
+
+            // The emulated terminal answers the DA1 query; write the reply to
+            // the master side up front (it is buffered and read via the slave).
+            let reply = b"\x1b[?61;4;22;24c";
+            assert_eq!(
+                libc::write(master, reply.as_ptr() as *const libc::c_void, reply.len()),
+                reply.len() as isize
+            );
+
+            // Issues `\x1b[c` and reads the reply through the RawStdinGuard.
+            drain_input();
+
+            // After the drain, nothing may remain for a later consumer: reading
+            // the slave returns 0 (EOF) or -1/EAGAIN (non-blocking, no data) —
+            // the DA1 reply was consumed, never leaked.
+            let mut buf = [0u8; 8];
+            let n = libc::read(slave, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+            assert!(n <= 0, "DA1 reply leaked into stdin after drain_input (read {n} bytes)");
+
+            libc::close(master);
+            libc::close(slave);
+        }
     }
 }

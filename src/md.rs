@@ -1001,7 +1001,16 @@ impl IncrementalMarkdown {
         stream.push(&self.pending[self.last_rendered..]);
         self.last_rendered = self.pending.len();
         stream.finalize();
-        self.redraw();
+        // The final frame must be EXACT, so re-render the whole accumulated
+        // buffer from scratch (O(n), once per turn) instead of trusting the
+        // streaming state: mid-line `flush_pending_line` redraws commit block
+        // state (a bullet marker, a paragraph line) that the completed line
+        // then continues wrongly — e.g. `- support incremental` flushed as a
+        // bullet, then ` markdown` rendered as a stray continuation line. The
+        // intermediate frames are overwritten by this one, so only the final
+        // frame needs to be pristine.
+        let rendered = render_whole(&self.pending, self.color);
+        self.emit_frame(&rendered);
     }
 
     /// Jump the cursor back over the previously drawn block and overwrite it
@@ -1028,6 +1037,12 @@ impl IncrementalMarkdown {
             stream.flush_pending_line();
             stream.output().to_string()
         };
+        self.emit_frame(&rendered);
+    }
+
+    /// Jump the cursor back over the previously drawn block and overwrite it
+    /// with `rendered` (the freshly rendered markdown), recording the frame.
+    fn emit_frame(&mut self, rendered: &str) {
         let height = rendered.lines().count().max(1);
         let mut s = String::with_capacity(rendered.len() + 16);
         if self.written && self.last_height > 0 {
@@ -1037,7 +1052,7 @@ impl IncrementalMarkdown {
             // top of it.
             s.push_str(&format!("\x1b[{}A\x1b[J", self.last_height));
         }
-        s.push_str(&rendered);
+        s.push_str(rendered);
         self.frames.push(s);
         self.write_frames();
         self.last_height = height;
@@ -1067,6 +1082,37 @@ impl IncrementalMarkdown {
     pub fn pending(&self) -> &str {
         &self.pending
     }
+}
+
+/// Render the whole accumulated markdown from scratch with a fresh streaming
+/// renderer (O(n), once per turn). Used for the final frame so mid-line
+/// incremental redraws can never corrupt the turn-end output: a partial line
+/// flushed by `flush_pending_line` commits block state (bullet marker,
+/// paragraph line) that the completed line then continues wrongly, so the
+/// streaming renderer's own state is not a trustworthy source for the final
+/// frame. Feeding every complete line (plus the trailing partial) to a fresh
+/// renderer reproduces the exact same output shape as the streaming path for
+/// well-formed input.
+fn render_whole(md: &str, color: bool) -> String {
+    let mut r = StreamingRenderer::new(color);
+    let mut content = md.to_string();
+    loop {
+        match content.find('\n') {
+            Some(idx) => {
+                let line = content[..=idx].to_string();
+                content = content[idx + 1..].to_string();
+                r.push_line(line.trim_end_matches('\n'));
+            }
+            None => {
+                if !content.is_empty() {
+                    r.push_line(content.trim_end_matches('\n'));
+                }
+                break;
+            }
+        }
+    }
+    r.finalize();
+    r.output().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -2191,6 +2237,33 @@ mod incremental_tests {
             screen.pop();
         }
         screen
+    }
+
+    // Regression: a mid-line incremental redraw (a token chunk that ends
+    // without a newline, flushed by `flush_pending_line`) must NOT corrupt the
+    // final frame. The old behaviour committed block state for the partial line
+    // (a bullet marker, a paragraph line) and the completed line then continued
+    // wrongly — `- support incremental` flushed as a bullet, then ` markdown`
+    // rendered as a stray continuation line. The final frame is re-rendered
+    // from scratch, so the completed lines must appear whole, exactly once.
+    #[test]
+    fn mid_line_flush_does_not_corrupt_final_frame() {
+        let mut r = IncrementalMarkdown::new(true, false);
+        r.set_throttle(Duration::ZERO);
+        // Token chunks exactly as a real stream delivers them: the list line
+        // and the paragraph line are each split mid-line.
+        r.push("# Plan\n\nWe will **ship** the");
+        r.push(" thing.\n\n- support incremental");
+        r.push(" markdown\n- never stack\n");
+        r.flush();
+        let last = r.frames().last().unwrap();
+        let body = last.trim_start_matches('\x1b').trim_start_matches('[').split('A').nth(1).unwrap_or(last.as_str());
+        // The paragraph is one line, not split into `We will ship the` + ` thing.`.
+        assert!(body.contains("We will ship the thing."), "paragraph split by mid-line flush: {body:?}");
+        // The list item is one bullet, not `• support incremental` + ` markdown`.
+        assert!(body.contains("• support incremental markdown"), "list item split by mid-line flush: {body:?}");
+        assert_eq!(body.matches("• support incremental").count(), 1, "bullet duplicated: {body:?}");
+        assert_eq!(body.matches("• never stack").count(), 1, "bullet missing/duplicated: {body:?}");
     }
 
     // Regression: a table streamed incrementally (the path `/markup_demo` and

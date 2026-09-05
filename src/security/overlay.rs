@@ -1936,3 +1936,227 @@ fn overlay_supported() -> bool {
 pub fn can_mount() -> bool {
     false
 }
+
+
+// ===========================================================================
+// Tests: root-only `/var/cache` canary (overlayfs write quarantine)
+// ===========================================================================
+//
+// Two end-to-end checks of the system write-quarantine against the REAL `/var`
+// tree, as required for a pir that runs as root:
+//
+//   * `root_agent_can_write_var_cache_canary` — the agent (euid 0) can write
+//     `/var/cache/canary.txt`; the write is physically redirected into the
+//     overlay `upperdir`, the agent sees it immediately, and the real fs is
+//     untouched.
+//
+//   * `var_cache_write_stays_staged_until_apply` — a staged write to
+//     `/var/cache` does NOT land in the real `/var/cache` directory until the
+//     operator explicitly authorises it (`Quarantine::apply`).
+//
+// Both need euid 0 + a working overlay backend; otherwise they print SKIP and
+// return (they must never fail on unprivileged/CI builds). They mount and
+// unmount the real `/var`, so they serialise on `VAR_OVERLAY_LOCK` and tear
+// everything down on drop, even when an assertion panics mid-test.
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// Serialises the two root-only tests: they mount the REAL `/var` tree, and
+    /// two concurrent overlays on the same mountpoint would stack and corrupt
+    /// the assertions (and disturb the host for longer).
+    static VAR_OVERLAY_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The canary file these tests own. Named `canary` on purpose — it is pir's
+    /// own test artifact; nothing else under `/var/cache` is ever touched.
+    const CANARY: &str = "/var/cache/canary.txt";
+    const CANARY_BODY: &str = "pir overlayfs write-quarantine canary\n";
+
+    /// Remove a stale real-fs canary (e.g. a hard-killed previous run) before
+    /// the overlay goes up, so the real fs starts pristine. Safe before mount:
+    /// the real tree is directly accessible until `/var` is overlaid.
+    fn clean_real_canary() {
+        let _ = std::fs::remove_file(CANARY);
+    }
+
+    /// True when this environment can run the real-`/var` overlay tests: the
+    /// process must be euid 0 (`pir` running as root — the premise of the
+    /// requirement) and an overlay backend must be usable.
+    fn overlay_env_ok() -> bool {
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        if uid != "0" {
+            return false;
+        }
+        overlay_available()
+    }
+
+    /// Build a quarantine restricted to the single `/var` tree (the smallest
+    /// overlay that physically intercepts `/var/cache` writes) with a private,
+    /// throwaway staging dir, and mount it. Fails loudly if the mount breaks.
+    fn mount_var_quarantine(tag: &str) -> Quarantine {
+        let staging =
+            std::env::temp_dir().join(format!("pir-canary-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&staging);
+        let mut policy = SecurityPolicy::default();
+        policy.quarantine_dirs = vec!["/var".to_string()];
+        policy.quarantine_staging = staging;
+        let mut q = Quarantine::from_policy(&policy);
+        let mounted = q.mount().expect("mount overlayfs quarantine over /var");
+        assert_eq!(mounted, 1, "expected exactly the /var tree to be overlaid");
+        q
+    }
+
+    /// Owns the mounted quarantine and guarantees the host is left clean even
+    /// when the test panics: lazy-unmount the overlay, drop the applied real-fs
+    /// canary (this test's own artifact), and wipe the private staging dir.
+    struct QuarantineGuard(Quarantine);
+
+    impl std::ops::Deref for QuarantineGuard {
+        type Target = Quarantine;
+        fn deref(&self) -> &Quarantine {
+            &self.0
+        }
+    }
+
+    impl Drop for QuarantineGuard {
+        fn drop(&mut self) {
+            let _ = self.0.suspend(); // lazy umount: real /var exposed again
+            clean_real_canary(); // in case apply() landed it
+            let _ = std::fs::remove_dir_all(&self.0.staging);
+        }
+    }
+
+    /// The agent (euid 0) writes the canary through the mounted overlay, then
+    /// we verify it is *staged*: the agent sees its own write immediately, the
+    /// quarantine manifest lists exactly one entry with
+    /// `real_path == /var/cache/canary.txt`, and the physical `upperdir` holds
+    /// the file (the real fs must NOT — see `assert_real_fs_untouched`).
+    fn stage_canary(q: &Quarantine) -> StagedWrite {
+        std::fs::create_dir_all("/var/cache").expect("agent can create /var/cache if missing");
+        std::fs::write(CANARY, CANARY_BODY)
+            .expect("agent (root) must be able to write /var/cache/canary.txt");
+
+        // The agent sees its write at once through the overlay view.
+        assert_eq!(
+            std::fs::read_to_string(CANARY).unwrap(),
+            CANARY_BODY,
+            "agent must see its staged write through the overlay immediately"
+        );
+
+        let mut staged: Vec<StagedWrite> = q
+            .staged()
+            .into_iter()
+            .filter(|s| s.real_path == Path::new(CANARY))
+            .collect();
+        assert!(
+            !staged.is_empty(),
+            "write to {CANARY} must appear in the quarantine stage:\n{}",
+            q.manifest()
+        );
+        assert_eq!(
+            staged.len(),
+            1,
+            "exactly one staged write expected:\n{}",
+            q.manifest()
+        );
+        staged.remove(0)
+    }
+
+    /// Prove the REAL filesystem is untouched while a write is only staged:
+    /// `suspend()` lazy-unmounts the overlay (exactly what `apply` does before
+    /// merging), exposing the raw real tree — the canary must not be there.
+    /// `resume()` then re-engages the overlay for the rest of the test.
+    fn assert_real_fs_untouched(q: &Quarantine) {
+        q.suspend().expect("lazy-unmount overlay to inspect the real fs");
+        let untouched = !Path::new(CANARY).exists();
+        if !untouched {
+            // Stray canary from a crash earlier — never let it skew a later run.
+            let _ = std::fs::remove_file(CANARY);
+        }
+        q.resume().expect("re-engage the overlay after inspecting the real fs");
+        assert!(
+            untouched,
+            "{CANARY} must NOT exist on the real fs while the write is only staged"
+        );
+    }
+
+    /// Requirement: when pir runs as root, the agent can write
+    /// `/var/cache/canary.txt`. With the system quarantine engaged the write
+    /// succeeds and is staged into the overlay `upperdir` — the agent sees it
+    /// immediately, the manifest lists it, and the real `/var/cache` is
+    /// untouched.
+    #[test]
+    fn root_agent_can_write_var_cache_canary() {
+        if !overlay_env_ok() {
+            eprintln!("SKIP root_agent_can_write_var_cache_canary: need euid 0 + overlayfs");
+            return;
+        }
+        let _lock = VAR_OVERLAY_LOCK.lock().unwrap();
+        clean_real_canary();
+
+        let guard = QuarantineGuard(mount_var_quarantine("write"));
+        let staged = stage_canary(&guard);
+
+        // The staged entry must point at the real-fs path that is hidden
+        // (only an explicit apply may make it appear there).
+        assert_eq!(staged.real_path, Path::new(CANARY));
+        assert_eq!(staged.overlay_path, Path::new(CANARY));
+
+        // Physical proof the write landed in the staging upperdir, not the real
+        // tree: the file exists as `…/upper-var/cache/canary.txt`.
+        let upper_file = guard
+            .staging
+            .join("upper-var")
+            .join("cache")
+            .join("canary.txt");
+        assert!(
+            upper_file.exists(),
+            "the write must physically land in the overlay upperdir: {}",
+            upper_file.display()
+        );
+
+        // The real filesystem must NOT have the canary yet.
+        assert_real_fs_untouched(&guard);
+        // guard drop: unmount + clean the real-fs canary + wipe staging.
+    }
+
+    /// Requirement: the agent can stage a write to `/var/cache`, and the write
+    /// does NOT land in the real `/var/cache` directory without explicit
+    /// authorisation — i.e. `Quarantine::apply` is the operator's explicit
+    /// go-ahead, and only after it does the real fs see the file.
+    #[test]
+    fn var_cache_write_stays_staged_until_apply() {
+        if !overlay_env_ok() {
+            eprintln!("SKIP var_cache_write_stays_staged_until_apply: need euid 0 + overlayfs");
+            return;
+        }
+        let _lock = VAR_OVERLAY_LOCK.lock().unwrap();
+        clean_real_canary();
+
+        let guard = QuarantineGuard(mount_var_quarantine("apply"));
+        stage_canary(&guard);
+
+        // Before authorisation the real /var/cache must not contain the file.
+        assert_real_fs_untouched(&guard);
+
+        // Explicit authorisation: apply the stage to the real filesystem.
+        let applied = guard.apply().expect("apply staged writes");
+        assert_eq!(applied, 1, "exactly the canary write should apply");
+
+        // Now, and only now, the write lands on the real fs.
+        guard.suspend().expect("lazy-unmount to inspect the real fs");
+        let landed = std::fs::read_to_string(CANARY).ok();
+        guard.resume().expect("re-engage the overlay");
+        assert_eq!(
+            landed.as_deref(),
+            Some(CANARY_BODY),
+            "applied write must land in the real /var/cache only after apply()"
+        );
+        // guard drop: unmount + remove the applied canary + wipe staging, so
+        // the host is left exactly as it was.
+    }
+}
