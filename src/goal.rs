@@ -9,7 +9,6 @@
 //! reloads the goal and drives the agent to the next pending step.
 
 use serde::{Deserialize, Serialize};
-use serde_json;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -277,7 +276,7 @@ mod tests {
         assert_eq!(store.goal.steps.len(), 2);
         assert_eq!(store.goal.steps[0].status, StepStatus::Done);
         assert_eq!(store.goal.next_id, 3);
-        let _ = std::fs::remove_file(&log.with_extension("goal.json"));
+        let _ = std::fs::remove_file(log.with_extension("goal.json"));
         let _ = std::fs::remove_file(&log);
     }
 

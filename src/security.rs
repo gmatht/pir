@@ -893,7 +893,7 @@ impl SecurityContext {
         let platform: Box<dyn Platform> = Box::new(ActivePlatform::default());
         let approval = Arc::new(ApprovalContext::default());
         let sink: Box<dyn RequestSink> = if headless {
-            Box::new(QueuedSink::default())
+            Box::new(QueuedSink)
         } else {
             Box::new(TtySink { approval: Some(approval.clone()) })
         };
@@ -1743,9 +1743,7 @@ pub fn quarantine_status_surface() -> String {
     if on {
         format!("write-quarantine engaged: {backend}")
     } else {
-        format!(
-            "write-quarantine NOT physically engaged — out-of-tree writes are guarded in-process (Yellow/ask), not staged; engage via a whitelisted worktree (`wt`) or run as root to mount the overlay"
-        )
+        "write-quarantine NOT physically engaged — out-of-tree writes are guarded in-process (Yellow/ask), not staged; engage via a whitelisted worktree (`wt`) or run as root to mount the overlay".to_string()
     }
 }
 /// Mitigation-level security engine (docs/MITIGATION_LEVEL_SECURITY.md): a
@@ -1777,8 +1775,7 @@ mod tests {
         ));
         assert_eq!(p.decide(&Ask::read("/home/me/.ssh/id_ed25519")), Verdict::Allow);
 
-        let mut g = SecurityPolicy::default();
-        g.read = ReadMode::GuardedSecrets;
+        let g = SecurityPolicy { read: ReadMode::GuardedSecrets, ..Default::default() };
         assert!(matches!(
             g.decide(&Ask::read("/home/me/.ssh/id_ed25519")),
             Verdict::Deny { parcel: Parcel::GuardSecrets, .. }
@@ -1802,8 +1799,7 @@ mod tests {
 
     #[test]
     fn network_modes_classify() {
-        let mut p = SecurityPolicy::default();
-        p.network = NetworkMode::On;
+        let mut p = SecurityPolicy { network: NetworkMode::On, ..Default::default() };
         assert_eq!(p.decide(&Ask::connect("github.com:443")), Verdict::Allow);
         p.network = NetworkMode::Off;
         assert!(matches!(
@@ -1866,11 +1862,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pir_pol_cfg_{}", std::process::id()));
         let old = std::env::var_os("PI_DIR");
         std::env::set_var("PI_DIR", &dir);
-        let mut p = SecurityPolicy::default();
-        p.level = SecurityLevel::Sandbox;
-        p.network = NetworkMode::Off;
-        p.quarantine = false;
-        p.quarantine_project = false;
+        let p = SecurityPolicy {
+            level: SecurityLevel::Sandbox,
+            network: NetworkMode::Off,
+            quarantine: false,
+            quarantine_project: false,
+            ..Default::default()
+        };
         save_policy(&p).expect("save_policy");
         let loaded = load_policy();
         assert_eq!(loaded.level, SecurityLevel::Sandbox);

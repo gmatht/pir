@@ -223,13 +223,11 @@ pub fn clip(s: &str, n: usize) -> String {
     }
     // Truncate on visible-character boundaries.
     let mut out = String::new();
-    let mut vis = 0usize;
-    for c in s.chars() {
+    for (vis, c) in s.chars().enumerate() {
         if vis >= n.saturating_sub(1) {
             break;
         }
         out.push(c);
-        vis += 1;
     }
     out.push('…');
     out
@@ -1068,7 +1066,7 @@ fn build_dir_history() -> Vec<String> {
             }
         }
     }
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|a| std::cmp::Reverse(a.0));
     let mut combined: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for (_mtime, p) in files {
@@ -2005,7 +2003,7 @@ pub mod raw {
                     // `i` now sits just past the consumed sequence (or at `nread`);
                     // the outer `while` advances it once more, which is correct.
                 }
-                c if c >= 0x20 && c < 0x7f => {
+                c if (0x20..0x7f).contains(&c) => {
                     buf.push(c as char);
                     update_typeahead(buf, typeahead);
                 }
@@ -2213,7 +2211,7 @@ pub mod raw {
                         drain_csi_sequence(fd);
                     }
                 }
-                c if c >= 0x20 && c < 0x7f => {
+                c if (0x20..0x7f).contains(&c) => {
                     buf.push(c as char);
                     update_typeahead(buf, typeahead);
                 }
@@ -2373,7 +2371,7 @@ mod tests {
 
     #[test]
     fn dir_history_recalls_prior_session_prompt() {
-        use rustyline::history::{DefaultHistory, History, MemHistory};
+        use rustyline::history::{History, MemHistory};
         let tag = format!("pir_dh_{:?}", std::thread::current().id());
         let tmp = std::env::temp_dir().join(tag);
         let _ = std::fs::create_dir_all(&tmp);
@@ -2557,8 +2555,8 @@ mod paste_tests {
     #[test]
     fn raw_input_poll_const_is_bounded() {
         // The throttle window is deliberately short (milliseconds), not 0.
-        assert!(super::raw::INPUT_POLL > 0, "INPUT_POLL must be > 0");
-        assert!(super::raw::INPUT_POLL <= 250, "INPUT_POLL too large would lag typing");
+        const _: () = assert!(super::raw::INPUT_POLL > 0, "INPUT_POLL must be > 0");
+        const _: () = assert!(super::raw::INPUT_POLL <= 250, "INPUT_POLL too large would lag typing");
     }
 
     fn ta() -> Arc<Mutex<String>> {
@@ -2571,15 +2569,7 @@ mod paste_tests {
     // while a turn runs queues multiple prompts".
     #[test]
     fn paste_wrapped_multiline_is_single_line() {
-        let bytes: Vec<u8> = [
-            b'\x1b', b'[', b'2', b'0', b'0', b'~',
-            b'l', b'i', b'n', b'e', b' ', b'o', b'n', b'e',
-            b'\n',
-            b'l', b'i', b'n', b'e', b' ', b't', b'w', b'o',
-            b'\n',
-            b'l', b'i', b'n', b'e', b' ', b't', b'h', b'r', b'e', b'e',
-            b'\x1b', b'[', b'2', b'0', b'1', b'~',
-        ]
+        let bytes: Vec<u8> = b"\x1b[200~line one\nline two\nline three\x1b[201~"
         .to_vec();
         let mut buf = String::new();
         let r = translate(&mut buf, &ta(), &bytes);
@@ -2599,11 +2589,7 @@ mod paste_tests {
     // CRLF inside a paste should normalise to a single LF, not two.
     #[test]
     fn paste_crlf_normalised() {
-        let bytes: Vec<u8> = [
-            b'\x1b', b'[', b'2', b'0', b'0', b'~',
-            b'a', b'\r', b'\n', b'b',
-            b'\x1b', b'[', b'2', b'0', b'1', b'~',
-        ]
+        let bytes: Vec<u8> = b"\x1b[200~a\r\nb\x1b[201~"
         .to_vec();
         let mut buf = String::new();
         let r = translate(&mut buf, &ta(), &bytes);
@@ -2615,9 +2601,9 @@ mod paste_tests {
     // ordinary CSI sequence like an arrow key (`ESC [ A`).
     #[test]
     fn only_paste_markers_are_detected() {
-        assert_eq!(paste_marker_at(&[b'\x1b', b'[', b'2', b'0', b'0', b'~'], 0), Some(true));
-        assert_eq!(paste_marker_at(&[b'\x1b', b'[', b'2', b'0', b'1', b'~'], 0), Some(false));
-        assert_eq!(paste_marker_at(&[b'\x1b', b'[', b'A'], 0), None);
+        assert_eq!(paste_marker_at(b"\x1b[200~", 0), Some(true));
+        assert_eq!(paste_marker_at(b"\x1b[201~", 0), Some(false));
+        assert_eq!(paste_marker_at(b"\x1b[A", 0), None);
     }
 }
 

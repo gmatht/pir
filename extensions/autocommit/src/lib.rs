@@ -11,8 +11,8 @@
 //! * VCS selection (see `select_vcs`):
 //!     - `PIR_VCS=git` (or unset)  -> git.
 //!     - `PIR_VCS=jj`              -> jj, but only after a lazy, idempotent
-//!                                    `jj init --git-repo .`; falls back to git
-//!                                    with a warning if `jj` is unusable.
+//!       `jj init --git-repo .`; falls back to git
+//!       with a warning if `jj` is unusable.
 //!     - We NEVER auto-switch based on detection. git is the deterministic
 //!       default so the same agent run behaves identically everywhere.
 //! * When git is selected and `jj` is *installed but not selected*, print a
@@ -285,10 +285,7 @@ impl AutoCommit {
     /// Maybe commit after a turn. Returns an optional message/error string for
     /// the agent to surface (Ok(None) means skipped/no-op).
     fn maybe_commit(&mut self, prompt: &str) -> Option<Outcome> {
-        let subject = match Self::prompt_subject(prompt) {
-            Some(s) => s,
-            None => return None, // meta-command / empty -> skip silently
-        };
+        let subject = Self::prompt_subject(prompt)?;
 
         // Hint (once) when git is selected but jj is available and not chosen.
         if self.vcs == Vcs::Git && self.jj_available && !self.hinted.swap(true, Ordering::SeqCst) {

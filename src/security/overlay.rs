@@ -479,10 +479,8 @@ pub fn quarantine_status() -> String {
     if e.any() {
         format!("write-quarantine engaged: {}", e.engaged_list())
     } else {
-        format!(
-            "write-quarantine NOT physically engaged — out-of-tree writes are guarded in-process (Yellow/ask), not staged; \
-             engage via a whitelisted worktree (`wt`), or set PIR_QUARANTINE_MODE and run as root to mount the overlay"
-        )
+        "write-quarantine NOT physically engaged — out-of-tree writes are guarded in-process (Yellow/ask), not staged; \
+             engage via a whitelisted worktree (`wt`), or set PIR_QUARANTINE_MODE and run as root to mount the overlay".to_string()
     }
 }
 
@@ -1382,7 +1380,7 @@ fn collect_baseline(dir: &Path, out: &mut Vec<String>) {
         let Ok(meta) = ent.metadata() else { continue };
         if meta.is_dir() {
             collect_baseline(&p, out);
-        } else if let Some(rel) = p.strip_prefix(container_rootfs_path()).ok() {
+        } else if let Ok(rel) = p.strip_prefix(container_rootfs_path()) {
             out.push(format!("/{}", rel.display()));
         }
     }
@@ -1813,8 +1811,7 @@ pub fn enter_private_mount_ns() -> std::io::Result<()> {
                 || std::fs::write("/proc/self/uid_map", umap).is_err()
             {
                 NS_ENTERED.store(false, Ordering::SeqCst);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(std::io::Error::other(
                     "failed to write user-namespace id map",
                 ));
             }
@@ -1827,7 +1824,7 @@ pub fn enter_private_mount_ns() -> std::io::Result<()> {
         }
         // Make our copy of the mount tree private so our mounts don't propagate
         // back to the parent namespace.
-        let slash = b"/\0".as_ptr() as *const std::os::raw::c_char;
+        let slash = c"/".as_ptr();
         let r = unsafe {
             libc::mount(
                 slash,
@@ -2001,9 +1998,11 @@ mod tests {
         let staging =
             std::env::temp_dir().join(format!("pir-canary-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&staging);
-        let mut policy = SecurityPolicy::default();
-        policy.quarantine_dirs = vec!["/var".to_string()];
-        policy.quarantine_staging = staging;
+        let policy = SecurityPolicy {
+            quarantine_dirs: vec!["/var".to_string()],
+            quarantine_staging: staging,
+            ..Default::default()
+        };
         let mut q = Quarantine::from_policy(&policy);
         let mounted = q.mount().expect("mount overlayfs quarantine over /var");
         assert_eq!(mounted, 1, "expected exactly the /var tree to be overlaid");

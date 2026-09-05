@@ -257,23 +257,23 @@ pub fn maybe_generate_verdict(log: Option<&PathBuf>) {
 /// path uses, so structural outcomes (`cancelled`/`budget`) still need no model
 /// call and return immediately.
 pub fn classify_now(log: &Path) -> Option<String> {
-    let outcome = match session::read_status(log) {
-        Some(m) => match m.status {
-            session::SessionStatus::Completed | session::SessionStatus::Finished => "complete".to_string(),
-            session::SessionStatus::Active => "interrupted".to_string(),
-            session::SessionStatus::Interrupted => {
-                if m.reason.contains("budget") {
-                    "budget".to_string()
-                } else if m.reason.contains("cancel") {
-                    "cancelled".to_string()
-                } else if m.reason.contains("turn error") || m.reason.contains("error") {
-                    format!("error:{}", m.reason)
-                } else {
-                    "interrupted".to_string()
-                }
+    let outcome = {
+        let m = session::read_status(log)?;
+        match m.status {
+        session::SessionStatus::Completed | session::SessionStatus::Finished => "complete".to_string(),
+        session::SessionStatus::Active => "interrupted".to_string(),
+        session::SessionStatus::Interrupted => {
+            if m.reason.contains("budget") {
+                "budget".to_string()
+            } else if m.reason.contains("cancel") {
+                "cancelled".to_string()
+            } else if m.reason.contains("turn error") || m.reason.contains("error") {
+                format!("error:{}", m.reason)
+            } else {
+                "interrupted".to_string()
             }
-        },
-        None => return None, // nothing recorded yet
+        }
+    }
     };
     // Structural outcomes need no model call (and shouldn't spend quota).
     match outcome.as_str() {
@@ -283,8 +283,8 @@ pub fn classify_now(log: &Path) -> Option<String> {
     }
     let providers = config::load_providers().unwrap_or_default();
     let (prov, model) = config::resolve_light_model(&providers)?;
-    let base_url = prov.model_base_url(&model).unwrap_or("").to_string();
-    let api_kind = prov.model_api(&model).unwrap_or(config::ApiKind::OpenAi);
+    let base_url = prov.model_base_url(model).unwrap_or("").to_string();
+    let api_kind = prov.model_api(model).unwrap_or(config::ApiKind::OpenAi);
     let api_key = prov.api_key()?;
     classify_verdict(log, &outcome, api_kind, &base_url, &api_key, &model.id)
 }
@@ -295,7 +295,7 @@ pub(crate) fn last_exchange(log: &Path) -> Option<(String, String)> {
     let Ok(f) = std::fs::File::open(log) else { return None };
     let mut last_user = String::new();
     let mut last_asst = String::new();
-    for line in std::io::BufReader::new(f).lines().flatten() {
+    for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
         if line.trim().is_empty() {
             continue;
         }
@@ -350,8 +350,8 @@ fn block_text(v: &Value) -> String {
 fn call_light(system: &str, user: &str) -> Option<String> {
     let providers = config::load_providers().unwrap_or_default();
     let (prov, model) = config::resolve_light_model(&providers)?;
-    let base_url = prov.model_base_url(&model).unwrap_or("").to_string();
-    let api_kind = prov.model_api(&model).unwrap_or(config::ApiKind::OpenAi);
+    let base_url = prov.model_base_url(model).unwrap_or("").to_string();
+    let api_kind = prov.model_api(model).unwrap_or(config::ApiKind::OpenAi);
     let api_key = prov.api_key()?;
     let model_id = model.id.clone();
 
@@ -478,9 +478,7 @@ fn clean_verdict(raw: &str, outcome: &str) -> String {
         "retry".to_string()
     } else if first.contains("block") {
         "blocked".to_string()
-    } else if first.contains("error") {
-        "error".to_string()
-    } else if outcome.starts_with("error") {
+    } else if first.contains("error") || outcome.starts_with("error") {
         "error".to_string()
     } else {
         "complete".to_string()
@@ -498,7 +496,7 @@ pub fn display_verdict(log: &Path) -> String {
 fn recent_prompts(log: &Path) -> Vec<String> {
     let Ok(f) = std::fs::File::open(log) else { return Vec::new() };
     let mut prompts: Vec<String> = Vec::new();
-    for line in std::io::BufReader::new(f).lines().flatten() {
+    for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
         if line.trim().is_empty() {
             continue;
         }

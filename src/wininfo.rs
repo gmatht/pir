@@ -16,7 +16,8 @@
 //! APIs are fragmented between X11 and the various Wayland compositors:
 //!   - window titles: `wmctrl -l` (X11; best-effort)
 //!   - clipboard:     `xclip -selection clipboard -o` (X11) or
-//!                    `wl-paste` (Wayland), whichever is present.
+//!     `wl-paste` (Wayland), whichever is present.
+//!
 //! Missing tools simply yield empty results.
 
 #![allow(dead_code)]
@@ -231,6 +232,7 @@ pub mod impls {
 ///   - `sk-…`                → openai (legacy user key)
 ///   - `xoxb-…`              → slack
 ///   - `ghp_` / `github_pat_`→ github
+///
 /// Anything else → `None`.
 pub fn guess_provider_from_key(key: &str) -> Option<&'static str> {
     let k = key.trim();
@@ -245,8 +247,6 @@ pub fn guess_provider_from_key(key: &str) -> Option<&'static str> {
         Some("google")
     } else if k.starts_with("AI") {
         Some("anthropic")
-    } else if k.starts_with("sk-proj-") {
-        Some("openai")
     } else if k.starts_with("sk-") {
         Some("openai")
     } else if k.starts_with("xoxb-") {

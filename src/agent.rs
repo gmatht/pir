@@ -163,14 +163,14 @@ impl SessionResume {
             out.push_str(&format!(
                 "{} first prompt: {}\n",
                 term::dim("·"),
-                term::dim(&self.first_prompt.lines().next().unwrap_or("").trim())
+                term::dim(self.first_prompt.lines().next().unwrap_or("").trim())
             ));
         }
         if !self.last_prompt.is_empty() {
             out.push_str(&format!(
                 "{} last  prompt: {}\n",
                 term::dim("·"),
-                term::dim(&self.last_prompt.lines().next().unwrap_or("").trim())
+                term::dim(self.last_prompt.lines().next().unwrap_or("").trim())
             ));
         }
         if !self.last_output.is_empty() {
@@ -194,6 +194,7 @@ impl Agent {
     /// shared buffer the REPL fills with keystrokes typed while the turn runs;
     /// the thinking spinner reads it so the user's input is shown while the
     /// model thinks.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         provider: Provider,
         model: Model,
@@ -1032,7 +1033,7 @@ impl Agent {
             };
         };
         let mut pending: Option<Message> = None;
-        for line in std::io::BufReader::new(f).lines().flatten() {
+        for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
             if line.trim().is_empty() {
                 continue;
             }
@@ -1509,7 +1510,7 @@ impl Agent {
                     stop_spinner();
                     think_buf.push_str(t);
                     if term::raw::keyboard_idle_long_enough() {
-                        term::out(&format!("{}", term::dim(&std::mem::take(&mut think_buf))));
+                        term::out(&term::dim(&std::mem::take(&mut think_buf)).to_string());
                     }
                 }
             };
@@ -1523,14 +1524,14 @@ impl Agent {
             // this guarantees the remaining room is never over-committed on the
             // output side. `approx_tokens` is a cheap `bytes/4` estimate, so a
             // generous (2k) system headroom guards against tokenizer drift.
-            let ctx = self.model.context.unwrap_or(200_000) as u64;
+            let ctx = self.model.context.unwrap_or(200_000);
             let sys_head = 2_000u64;
             let est_input = approx_tokens(&self.history) as u64;
             let out_cap = ctx
                 .saturating_sub(est_input)
                 .saturating_sub(sys_head)
                 .max(1024);
-            let max_tokens = (self.model.max_tokens.unwrap_or(8192) as u64).min(out_cap);
+            let max_tokens = self.model.max_tokens.unwrap_or(8192).min(out_cap);
             let result = self.client.chat(
                 &self.model.id,
                 max_tokens,
@@ -1554,7 +1555,7 @@ impl Agent {
             // `quiet_req` was set mid-stream) doesn't dump its leftover
             // thinking onto the now-backgrounded terminal.
             if !self.silent() && !think_buf.is_empty() {
-                term::out(&format!("{}", term::dim(&std::mem::take(&mut think_buf))));
+                term::out(&term::dim(&std::mem::take(&mut think_buf)).to_string());
             }
             // Ensure the footer spinner is stopped (covers the no-output case),
             // then move to a fresh line below the agent's text.
@@ -1599,7 +1600,7 @@ impl Agent {
                     // below already-printed tokens. The on-screen notification
                     // feed also gets an Error event.
                     if !think_buf.is_empty() {
-                        term::out(&format!("{}", term::dim(&std::mem::take(&mut think_buf))));
+                        term::out(&term::dim(&std::mem::take(&mut think_buf)).to_string());
                     }
                     if !self.silent() {
                         term::out(&format!("\r\x1b[K{}\n", term::red(&format!("✗ turn error: {e}"))));

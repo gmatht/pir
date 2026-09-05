@@ -413,8 +413,6 @@ fn fix_jj_setup(repo: &Path) -> String {
                 max
             )
         }
-        _ => format!(
-            "✗ jj repo: could not set jj commit hook (is `jj` configured?). Under jj, git's .git/hooks/pre-commit is ignored, so a guard must be a jj hook."
-        ),
+        _ => "✗ jj repo: could not set jj commit hook (is `jj` configured?). Under jj, git's .git/hooks/pre-commit is ignored, so a guard must be a jj hook.".to_string(),
     }
 }

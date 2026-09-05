@@ -195,9 +195,7 @@ impl ToolBackend for OllamaCloud {
 
     fn startup_report(&mut self) -> Option<String> {
         let key = ollama_cloud_api_key();
-        if key.is_none() {
-            return None; // no key -> provider wasn't registered; nothing to say
-        }
+        key.as_ref()?;
         let state = if self.tools_enabled() { "enabled" } else { "disabled" };
         Some(format!(
             "[ollama-cloud] provider ready; web tools {state} —ollama-webtools, /ollama-cloud-usage"
@@ -450,7 +448,6 @@ fn show_usage() -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::Ordering;
 
     fn ext() -> OllamaCloud {
         OllamaCloud {

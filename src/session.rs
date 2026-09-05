@@ -4,11 +4,11 @@
 //! `<session>.status.json` written by the `Agent` as it runs:
 //!
 //!   * `active`      — a turn is currently in flight (records the live process
-//!                     pid that owns the session);
+//!     pid that owns the session);
 //!   * `completed`   — a turn finished cleanly (the conversation was brought to
-//!                     a natural stopping point);
+//!     a natural stopping point);
 //!   * `interrupted` — a turn ended early (user cancel, a network/provider
-//!                     error, the token budget was hit, …).
+//!     error, the token budget was hit, …).
 //!
 //! A conversation counts as *unfinished* precisely when **no live process is
 //! driving it** but it isn't in a clean end-state:
@@ -298,13 +298,13 @@ pub fn scan_unfinished() -> Vec<UnfinishedEntry> {
             mtime,
         });
     }
-    out.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    out.sort_by_key(|a| std::cmp::Reverse(a.mtime));
     out
 }
 
 fn first_user_line(path: &Path) -> String {
     if let Ok(f) = fs::File::open(path) {
-        for line in std::io::BufReader::new(f).lines().flatten() {
+        for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                 if v.get("role").and_then(|r| r.as_str()) == Some("user") {
                     if let Some(txt) = v
@@ -397,7 +397,7 @@ pub fn read_preview(path: &Path) -> SessionPreview {
     let mut last_thinking = String::new();
     let mut last_output = String::new();
     if let Ok(f) = fs::File::open(path) {
-        for line in std::io::BufReader::new(f).lines().flatten() {
+        for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
             if line.trim().is_empty() {
                 continue;
             }

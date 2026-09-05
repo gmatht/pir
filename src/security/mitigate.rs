@@ -280,8 +280,8 @@ fn tokenize(command: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
-    let mut chars = command.chars().peekable();
-    while let Some(c) = chars.next() {
+    let chars = command.chars().peekable();
+    for c in chars {
         match quote {
             Some(q) => {
                 if c == q {
@@ -312,8 +312,8 @@ fn split_pipeline(command: &str) -> Vec<String> {
     let mut stages = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
-    let mut chars = command.chars().peekable();
-    while let Some(c) = chars.next() {
+    let chars = command.chars().peekable();
+    for c in chars {
         match quote {
             Some(q) => {
                 if c == q {
@@ -1025,9 +1025,9 @@ pub fn plan(command: &str, project_root: Option<&Path>) -> Option<Verdict> {
                 );
             }
         }
-        "curl" | "wget" => {
+        "curl" | "wget"
             // curl | sh -> staged download (two-phase).
-            if a.has(Capability::IngressToExec) {
+            if a.has(Capability::IngressToExec) => {
                 let url = a.args.iter().find(|x| x.starts_with("http")).cloned().unwrap_or_default();
                 moves.push(Move::TwoPhase {
                     description: "curl|sh -> download to a staged file, hash/allowlist, then execute".into(),
@@ -1038,7 +1038,6 @@ pub fn plan(command: &str, project_root: Option<&Path>) -> Option<Verdict> {
                     "curl -fsSL '{url}' -o /tmp/staged.sh && sha256sum /tmp/staged.sh && sh /tmp/staged.sh"
                 );
             }
-        }
         _ => {}
     }
 

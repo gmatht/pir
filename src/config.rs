@@ -422,6 +422,7 @@ pub fn merge_ollama_cloud(providers: &mut Vec<Provider>) {
 ///   2. an `ollama-cloud` entry in `~/.pi/agent/auth.json`
 ///   3. `~/.pi/agent/ollama-cloud.json` (`{ "apiKey": "..." }`, the package's
 ///      own per-extension config file)
+///
 /// Returns `None` when nothing is configured.
 pub fn ollama_cloud_api_key() -> Option<String> {
     if let Ok(v) = std::env::var("OLLAMA_API_KEY") {
@@ -726,9 +727,9 @@ pub const DEFAULT_LIGHT_MODEL: &str = "cerebras/gemma4";
 /// in the loaded catalog (e.g. the user hasn't configured Cerebras yet), so the
 /// caller can skip title generation rather than erroring. The returned
 /// `(Provider, Model)` borrows from `providers` and must outlive the call.
-pub fn resolve_light_model<'a>(
-    providers: &'a [Provider],
-) -> Option<(&'a Provider, &'a Model)> {
+pub fn resolve_light_model(
+    providers: &[Provider],
+) -> Option<(&Provider, &Model)> {
     let mut selector = std::env::var("PIR_LIGHT_MODEL")
         .ok()
         .filter(|s| !s.trim().is_empty())

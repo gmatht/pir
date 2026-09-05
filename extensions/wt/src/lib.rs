@@ -48,7 +48,7 @@ use crate::plugin::{Outcome, Registry, ToolBackend, ToolSpec};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 use std::os::unix::process::CommandExt;
 use std::sync::Mutex;
 
@@ -917,8 +917,8 @@ impl Wt {
             return Outcome::err(format!("wt(PR): `git push` of {branch} failed"));
         }
         // If we already have a PR number, assume it's still open for this branch.
-        if self.pr_number.is_some() {
-            return Outcome::ok(format!("wt(PR): branch {branch} pushed (PR #{} reused)", self.pr_number.unwrap()));
+        if let Some(pr) = self.pr_number {
+            return Outcome::ok(format!("wt(PR): branch {branch} pushed (PR #{pr} reused)"));
         }
         // Otherwise open a PR via `gh` if available.
         let gh = Command::new("gh")
@@ -969,7 +969,7 @@ impl Wt {
         // Is the PR mergeable right now? `gh pr view` reports state + mergeable.
         let view = Command::new("gh")
             .args([
-                "pr", "view", &branch, "--json", "state,mergeable,number",
+                "pr", "view", branch, "--json", "state,mergeable,number",
                 "--jq", "(.number|tostring) + \" \" + .state + \" \" + (.mergeable|tostring)",
             ])
             .current_dir(&root)
@@ -1636,8 +1636,7 @@ impl ToolBackend for Wt {
             && std::env::var_os("PIR_WT_AUTOCREATE")
                 .map(|v| v != "0" && !v.is_empty())
                 .unwrap_or(true)
-        {
-            if self.is_git() && !self.in_worktree() {
+            && self.is_git() && !self.in_worktree() {
                 self.prune_stale_worktrees();
                 eprintln!(
                     "{}",
@@ -1645,7 +1644,6 @@ impl ToolBackend for Wt {
                 );
                 let _ = self.create_inner("", false);
             }
-        }
     }
 
     /// Startup banner: report the worktree the agent is launching in (or the
@@ -1928,9 +1926,7 @@ mod tests {
                 .arg("sleep")
                 .arg("1000")
                 .pre_exec(|| {
-                    unsafe {
-                        libc::setsid();
-                    }
+                    libc::setsid();
                     Ok(())
                 })
                 .spawn()

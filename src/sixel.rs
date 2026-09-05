@@ -322,7 +322,7 @@ fn encode_sixel(rgb: &[u8], w: usize, h: usize) -> String {
     for (i, (r, g, b)) in palette.iter().enumerate() {
         out.push_str(&format!("#{};2;{};{};{}", i, r, g, b));
     }
-    let bands = (h + 5) / 6;
+    let bands = h.div_ceil(6);
     for band in 0..bands {
         let y0 = band * 6;
         // Which colours appear in this band?
@@ -332,8 +332,8 @@ fn encode_sixel(rgb: &[u8], w: usize, h: usize) -> String {
                 present[color_of[y * w + x] as usize] = true;
             }
         }
-        for ci in 0..palette.len() {
-            if !present[ci] {
+        for (ci, present_ci) in present.iter().enumerate() {
+            if !present_ci {
                 continue;
             }
             let mut colvals = vec![0u8; w];

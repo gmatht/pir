@@ -242,6 +242,7 @@ impl Client {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn chat(
         &self,
         model: &str,
@@ -412,7 +413,7 @@ impl Client {
                     } else {
                         (RETRY_BASE_BACKOFF * 2u32.pow(attempt as u32)).min(RETRY_MAX_BACKOFF)
                     };
-                    let _ = on_text(&format!(
+                    on_text(&format!(
                         "\n\u{26a0} request failed (attempt {}), retrying in {:.0?} (timeout was {:.0?}): {}\n",
                         attempt + 1, backoff, read_timeout, e
                     ));
@@ -438,6 +439,7 @@ impl Client {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn anthropic_request(
         &self,
         model: &str,
@@ -529,6 +531,7 @@ impl Client {
     /// OpenAI request with an explicit target URL (per-model override, used by
     /// the OpenCode Zen catalog) and a `reasoning_effort` opt-out for models
     /// that reject the field (kimi-k2.6, grok-build-0.1, forced-Go qwen/minimax).
+    #[allow(clippy::too_many_arguments)]
     fn openai_request_at(
         &self,
         url: &str,
@@ -695,7 +698,7 @@ impl Read for CancelableReader {
                     return Err(Error::new(ErrorKind::Interrupted, "request cancelled"));
                 }
                 if let Some(msg) = self.errored.lock().unwrap().take() {
-                    return Err(Error::new(ErrorKind::Other, format!("stream: {msg}")));
+                    return Err(Error::other(format!("stream: {msg}")));
                 }
                 // Clean EOF.
                 Ok(0)
@@ -783,7 +786,7 @@ pub(crate) fn http_status_detail(code: u16, body: &str) -> String {
     // If the API spoke JSON, prefer `error.message` / `message`. A JSON body
     // (even without a known message field) means the *model API* answered — so
     // the status is authoritative and not a routing mishap.
-    if let Some(v) = serde_json::from_str::<Value>(body).ok() {
+    if let Ok(v) = serde_json::from_str::<Value>(body) {
         let detail = v
             .pointer("/error/message")
             .and_then(Value::as_str)
@@ -1310,6 +1313,273 @@ mod tests {
         assert!(elapsed < std::time::Duration::from_secs(5), "stall took too long: {elapsed:?}");
     }
 
+    // ── CPU-spin regression guards ──────────────────────────────────────────
+    //
+    // Production bug: a 100%-CPU stream-parser spin. When the peer closed a
+    // streaming connection *without* the final SSE terminator (`[DONE]` /
+    // `message_stop`), an older build treated the resulting EOF like a transient
+    // read timeout and `continue`d — re-reading an always-empty buffer at full
+    // CPU (zero syscalls, a core pegged for ~16h) instead of breaking. These
+    // tests pin the fix: every `stream_*` parser must terminate promptly once
+    // the reader reports EOF (with or without prior data) and must surface
+    // transport errors instead of looping.
+    //
+    // `run_stream_with_deadline` runs the parser on its own thread and bounds
+    // the wait with a wall-clock `recv_timeout`. A `smol::future::or`/`Timer`
+    // race would NOT catch the bug class: an always-ready `read_line` never
+    // yields to the executor, so a timer inside the executor would never fire
+    // and the suite would hang instead of failing. The burner thread reproduces
+    // the original symptom (a tight, non-yielding loop) and the test fails with
+    // a clear marker the moment the deadline passes; the leaked thread is
+    // killed when the test process exits. The parser future itself never
+    // crosses a thread boundary (its `&mut dyn FnMut` callbacks are not `Send`):
+    // the `run` closure builds and drives it inside the worker thread from
+    // `Send` inputs.
+    fn run_stream_with_deadline<T: Send + 'static>(
+        run: impl FnOnce() -> Result<T, String> + Send + 'static,
+        deadline_secs: u64,
+    ) -> Result<T, String> {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(run());
+        });
+        match rx.recv_timeout(Duration::from_secs(deadline_secs)) {
+            Ok(res) => res,
+            Err(_) => Err(format!(
+                "SPIN_REGRESSION: stream parser did not terminate within {deadline_secs}s \
+                 (EOF/error treated as a retryable timeout instead of a break?)"
+            )),
+        }
+    }
+
+    #[test]
+    fn stream_openai_eof_mid_stream_returns_ok_not_spin() {
+        // The exact production scenario: real SSE tokens arrive, then the peer
+        // closes the connection without a final `[DONE]` (the last event has no
+        // trailing newline, so the next `read_line` hits EOF). The parser must
+        // break on EOF, flush the accumulated text and return Ok — NOT spin on
+        // the dead stream.
+        const STREAM: &str = concat!(
+            r#"data: {"choices":[{"delta":{"content":"Hello "}}]}"#,
+            "\n",
+            r#"data: {"choices":[{"delta":{"content":"world"}}]}"#,
+            "\n",
+            r#"data: {"choices":[{"delta":{"content":"."}}]}"#,
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_keep_sender_alive, rx) = smol_channel::<()>(1);
+        let run = move || {
+            let mut reader = smol::io::BufReader::new(smol::io::Cursor::new(STREAM.as_bytes()));
+            let mut seen: Vec<String> = Vec::new();
+            let res = smol::block_on(stream_openai(
+                &mut reader,
+                &mut |t: &str| seen.push(t.to_string()),
+                &mut false,
+                &mut false,
+                &cancel,
+                &rx,
+                &mut |_t: &str| {},
+            ));
+            res.map(|(msg, usage)| (msg, usage, seen))
+        };
+        let (msg, _usage, seen) = match run_stream_with_deadline(run, 5) {
+            Ok(v) => v,
+            Err(e) if e.contains("SPIN_REGRESSION") => {
+                panic!("CPU-spin regression (mid-stream EOF): {e}")
+            }
+            Err(e) => panic!("unexpected stream error: {e}"),
+        };
+        assert_eq!(msg.role, Role::Assistant);
+        assert_eq!(
+            seen,
+            vec!["Hello ".to_string(), "world".to_string(), ".".to_string()],
+            "streamed deltas must be delivered in order"
+        );
+        match msg.blocks.as_slice() {
+            [Block::Text(t)] => {
+                assert_eq!(t, "Hello world.", "mid-stream EOF must flush the accumulated text")
+            }
+            other => panic!("expected a single Text block, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_openai_immediate_eof_returns_ok_not_spin() {
+        // Connection closed before any byte: the very first `read_line` reports
+        // EOF. The parser must return Ok ("(empty response)") immediately —
+        // the old bug spun on the empty stream instead of breaking.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_keep_sender_alive, rx) = smol_channel::<()>(1);
+        let run = move || {
+            let mut reader = smol::io::BufReader::new(smol::io::Cursor::new(&b""[..]));
+            smol::block_on(stream_openai(
+                &mut reader,
+                &mut |_t: &str| {},
+                &mut false,
+                &mut false,
+                &cancel,
+                &rx,
+                &mut |_t: &str| {},
+            ))
+        };
+        let (msg, _usage) = match run_stream_with_deadline(run, 5) {
+            Ok(v) => v,
+            Err(e) if e.contains("SPIN_REGRESSION") => {
+                panic!("CPU-spin regression (empty-stream EOF): {e}")
+            }
+            Err(e) => panic!("unexpected stream error: {e}"),
+        };
+        match msg.blocks.as_slice() {
+            [Block::Text(t)] => assert_eq!(t, "(empty response)"),
+            other => panic!("expected an '(empty response)' Text block, got: {other:?}"),
+        }
+    }
+
+    /// An `AsyncBufRead` that fails immediately — a peer that reset the
+    /// connection (RST) rather than closing cleanly. The parser must surface
+    /// the error and terminate, not loop re-reading the dead connection.
+    struct ResetReader;
+    impl smol::io::AsyncRead for ResetReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut [u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(Error::new(
+                ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            )))
+        }
+    }
+    impl smol::io::AsyncBufRead for ResetReader {
+        fn poll_fill_buf(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<&[u8]>> {
+            std::task::Poll::Ready(Err(Error::new(
+                ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            )))
+        }
+        fn consume(self: std::pin::Pin<&mut Self>, _amt: usize) {}
+    }
+
+    #[test]
+    fn stream_openai_reader_error_terminates_not_spin() {
+        // A transport error (TCP reset) must terminate the parser promptly —
+        // the old build classified it like a timeout and looped.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_keep_sender_alive, rx) = smol_channel::<()>(1);
+        let run = move || {
+            let mut reader = ResetReader;
+            smol::block_on(stream_openai(
+                &mut reader,
+                &mut |_t: &str| {},
+                &mut false,
+                &mut false,
+                &cancel,
+                &rx,
+                &mut |_t: &str| {},
+            ))
+        };
+        match run_stream_with_deadline(run, 5) {
+            Ok(_) => panic!("expected the connection-reset error, got Ok"),
+            Err(e) if e.contains("SPIN_REGRESSION") => {
+                panic!("CPU-spin regression (reader error): {e}")
+            }
+            Err(e) => assert!(e.contains("connection reset by peer"), "unexpected error: {e}"),
+        }
+    }
+
+    #[test]
+    fn stream_anthropic_eof_mid_stream_returns_ok_not_spin() {
+        // Anthropic-flavoured stream cut mid-flight: text deltas arrive, then
+        // EOF without the final `message_stop`. The parser must break on EOF,
+        // flush the text and return Ok — not spin.
+        const STREAM: &str = concat!(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":42}}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello "}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"world"}}"#,
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_keep_sender_alive, rx) = smol_channel::<()>(1);
+        let run = move || {
+            let mut reader = smol::io::BufReader::new(smol::io::Cursor::new(STREAM.as_bytes()));
+            smol::block_on(stream_anthropic(
+                &mut reader,
+                &mut |_t: &str| {},
+                &mut false,
+                &mut false,
+                &cancel,
+                &rx,
+                &mut |_t: &str| {},
+            ))
+        };
+        let (msg, usage) = match run_stream_with_deadline(run, 5) {
+            Ok(v) => v,
+            Err(e) if e.contains("SPIN_REGRESSION") => {
+                panic!("CPU-spin regression (anthropic mid-stream EOF): {e}")
+            }
+            Err(e) => panic!("unexpected stream error: {e}"),
+        };
+        assert_eq!(msg.role, Role::Assistant);
+        assert_eq!(usage.input, 42, "usage must be parsed from message_start");
+        match msg.blocks.as_slice() {
+            [Block::Text(t)] => {
+                assert_eq!(t, "Hello world", "EOF must flush accumulated anthropic text")
+            }
+            other => panic!("expected a single Text block, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_openai_partial_tool_call_eof_flushes() {
+        // Provider died in the middle of a tool call (function `arguments` JSON
+        // still incomplete, no `[DONE]`). The dangling call must still be
+        // flushed as a ToolUse block — the "cut early" path the EOF-spin bug
+        // masked.
+        const STREAM: &str = concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"cmd\":"}}]}}]}"#,
+            "\n",
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"ls -la\"}"}}]}}]}"#,
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_keep_sender_alive, rx) = smol_channel::<()>(1);
+        let run = move || {
+            let mut reader = smol::io::BufReader::new(smol::io::Cursor::new(STREAM.as_bytes()));
+            smol::block_on(stream_openai(
+                &mut reader,
+                &mut |_t: &str| {},
+                &mut false,
+                &mut false,
+                &cancel,
+                &rx,
+                &mut |_t: &str| {},
+            ))
+        };
+        let (msg, _usage) = match run_stream_with_deadline(run, 5) {
+            Ok(v) => v,
+            Err(e) if e.contains("SPIN_REGRESSION") => {
+                panic!("CPU-spin regression (mid-tool-call EOF): {e}")
+            }
+            Err(e) => panic!("unexpected stream error: {e}"),
+        };
+        match msg.blocks.as_slice() {
+            [Block::ToolUse { id, name, input }] => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "bash");
+                assert_eq!(
+                    input,
+                    &json!({ "cmd": "ls -la" }),
+                    "partial args must be flushed as a tool call input"
+                );
+            }
+            other => panic!("expected a ToolUse block, got: {other:?}"),
+        }
+    }
+
     #[test]
     fn retryable_http_codes() {
         assert!(is_retryable("HTTP 429: rate limited"));
@@ -1408,7 +1678,7 @@ mod tests {
         // short so a Ctrl-C/Ctrl-D is honoured promptly. Read timeouts double
         // with NO cap — a slow provider is given ever more time per attempt.
         assert!(READ_TIMEOUT_INIT.as_secs() >= 15);
-        assert!(READ_TIMEOUT_GROWTH >= 2);
+        const _: () = assert!(READ_TIMEOUT_GROWTH >= 2);
         assert!(STALL_TIMEOUT.as_secs() >= 30);
         assert_eq!(MAX_RETRIES, 4);
     }
@@ -1571,10 +1841,12 @@ mod tests {
 
     /// A local listener that accepts TCP connections but **never writes a
     /// byte** — the "slow provider" case: `send_json` is parked in the connect
-    /// + status-line read until the per-attempt read timeout elapses. This is
-    /// exactly the phase that used to make a cancel appear to do nothing for
-    /// minutes (cancel was only re-checked at the *next retry boundary*,
-    /// i.e. after the whole read timeout — 120s on the first attempt).
+    /// + status-line read until the per-attempt read timeout elapses.
+    ///
+    /// This is exactly the phase that used to make a cancel appear to do
+    /// nothing for minutes (cancel was only re-checked at the *next retry
+    /// boundary*, i.e. after the whole read timeout — 120s on the first
+    /// attempt).
     fn never_sends_server() -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().unwrap().to_string();

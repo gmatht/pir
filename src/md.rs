@@ -76,7 +76,7 @@ pub fn stream_markdown(md: &str, color: bool, chunk_size: usize) -> Vec<String> 
         let end = (idx + chunk).min(bytes.len());
         // Land on a UTF-8 boundary so we never split a multi-byte char.
         let mut e = end;
-        while e > idx && bytes.get(e).map_or(false, |b| (b & 0xC0) == 0x80) {
+        while e > idx && bytes.get(e).is_some_and(|b| (b & 0xC0) == 0x80) {
             e -= 1;
         }
         acc.push_str(&md[idx..e]);
@@ -2233,7 +2233,7 @@ mod incremental_tests {
                 i += 1;
             }
         }
-        while screen.last().map_or(false, |l| l.trim().is_empty()) {
+        while screen.last().is_some_and(|l| l.trim().is_empty()) {
             screen.pop();
         }
         screen

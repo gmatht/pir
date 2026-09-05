@@ -199,7 +199,7 @@ pub fn draw_box(title: &str, lines: &[String]) -> usize {
     for _ in used..body_w + 2 {
         out.push('─');
     }
-    out.push_str("┐");
+    out.push('┐');
     // Body.
     for (i, line) in lines.iter().take(body_h).enumerate() {
         let row = top + 1 + i;
@@ -210,14 +210,14 @@ pub fn draw_box(title: &str, lines: &[String]) -> usize {
         for _ in lw..body_w {
             out.push(' ');
         }
-        out.push_str("│");
+        out.push('│');
     }
     // Bottom border.
     out.push_str(&format!("\x1b[{};{}H└", bottom, left));
     for _ in 0..body_w + 2 {
         out.push('─');
     }
-    out.push_str("┘");
+    out.push('┘');
     // Move cursor to a safe spot.
     out.push_str(&format!("\x1b[{};{}H", bottom + 1, left));
 
@@ -251,7 +251,7 @@ pub fn draw_box_scrolled(title: &str, lines: &[String], top: usize, left: usize,
     for _ in used..body_w + 2 {
         out.push('─');
     }
-    out.push_str("┐");
+    out.push('┐');
     // Body: render only the viewport `lines[top .. top+body_h]`.
     let end = (top + body_h).min(lines.len());
     for (i, line) in lines.iter().enumerate().take(end).skip(top) {
@@ -264,14 +264,14 @@ pub fn draw_box_scrolled(title: &str, lines: &[String], top: usize, left: usize,
         for _ in lw..body_w {
             out.push(' ');
         }
-        out.push_str("│");
+        out.push('│');
     }
     // Bottom border.
     out.push_str(&format!("\x1b[{};{}H└", bottom, left_col));
     for _ in 0..body_w + 2 {
         out.push('─');
     }
-    out.push_str("┘");
+    out.push('┘');
     // Footer (control hints) + cursor to a safe spot.
     let footer = truncate(footer, body_w);
     out.push_str(&format!("\x1b[{};{}H{}", bottom + 1, left_col, footer));
@@ -355,13 +355,11 @@ fn truncate(s: &str, n: usize) -> String {
         return s.to_string();
     }
     let mut out = String::new();
-    let mut vis = 0usize;
-    for c in s.chars() {
+    for (vis, c) in s.chars().enumerate() {
         if vis >= n.saturating_sub(1) {
             break;
         }
         out.push(c);
-        vis += 1;
     }
     out.push('…');
     out
@@ -414,7 +412,7 @@ pub fn main_menu() -> Option<MenuAction> {
             .enumerate()
             .map(|(i, (key, label))| {
                 let marker = if i == selected { "▸" } else { " " };
-                format!("{marker} [{}] {label}", if i == selected { key } else { key })
+                format!("{marker} [{key}] {label}")
             })
             .collect();
         draw_box("pir — main menu", &lines);
@@ -424,7 +422,7 @@ pub fn main_menu() -> Option<MenuAction> {
             Key::Enter | Key::Right => return Some(action_for(items[selected].0)),
             Key::Char(c) => {
                 let c = c.to_ascii_lowercase();
-                if let Some((i, _)) = items.iter().enumerate().find(|(_, (k, _))| k.chars().next() == Some(c)) {
+                if let Some((i, _)) = items.iter().enumerate().find(|(_, (k, _))| k.starts_with(c)) {
                     return Some(action_for(items[i].0));
                 }
             }
@@ -684,7 +682,7 @@ pub fn model_picker(providers: &[crate::config::Provider], current: &str) -> Opt
             .map(|(i, (ix, pid, label, cur))| {
                 let marker = if i == selected { "▸" } else { " " };
                 let cur_mark = if *cur { term::green("  •current") } else { String::new() };
-                format!("{marker} {:>3}  {:<w$}  {}{}  ", ix, term::cyan(&**pid), label, cur_mark)
+                format!("{marker} {:>3}  {:<w$}  {}{}  ", ix, term::cyan(pid), label, cur_mark)
             })
             .collect();
         draw_box("pir — choose model", &lines);
@@ -742,7 +740,7 @@ pub fn security_editor(policy: &mut crate::security::SecurityPolicy) -> Option<(
             format!("{} read               {}", marker(6), term::cyan(read.as_str())),
             format!("{} user-security     {}", marker(7), yn(user_security)),
             String::new(),
-            term::dim("[↑/↓] move  [←/→] change  [s] save  [q] discard").into(),
+            term::dim("[↑/↓] move  [←/→] change  [s] save  [q] discard"),
         ];
         draw_box("pir — security options", &lines);
         #[allow(clippy::too_many_arguments)]

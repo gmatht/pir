@@ -446,15 +446,14 @@ impl Notifier for Desktop {
         // notification center, since the Linux D-Bus bus is not bridged to it.
         #[cfg(target_os = "linux")]
         {
-            if running_under_wsl() {
-                if notify_via_windows(&title, &body) {
+            if running_under_wsl()
+                && notify_via_windows(&title, &body) {
                     return;
                 }
                 // Only fall through to notify-send if a Linux bus actually
                 // exists; otherwise we'd spawn a subprocess that prints
                 // "Could not connect: No such file or directory" onto the
                 // terminal (the source of the spurious leak).
-            }
             if !has_session_bus() {
                 return;
             }

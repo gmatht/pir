@@ -14,10 +14,11 @@
 //!     - `mk-ai-user <ai_NAME>`         (create a new ai_* account)
 //!     - `su-ai <ai_NAME>`              (switch to an ai_* account)
 //!     - `command <cmd>`                (one specific, allowlisted command)
-//!   The agent supplies a `reason`; the request is written to the spool and a
-//!   human is told how to apply it. If the *current* user already holds a
-//!   passwordless sudo rule for the exact intent, the tool may opportunistically
-//!   run `sudo -n` inline — but it never broadens its own privilege.
+//!       The agent supplies a `reason`; the request is written to the spool
+//!       and a human is told how to apply it. If the *current* user already
+//!       holds a passwordless sudo rule for the exact intent, the tool may
+//!       opportunistically run `sudo -n` inline — but it never broadens its
+//!       own privilege.
 //! * `run_as` — run a command as a user the agent is already permitted to
 //!   (e.g. an `ai_*`), using existing sudoers. No new privilege is granted.
 //!
@@ -28,9 +29,6 @@
 
 use crate::plugin::{Outcome, Registry, ToolBackend, ToolSpec};
 use serde_json::json;
-#[cfg(unix)]
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 

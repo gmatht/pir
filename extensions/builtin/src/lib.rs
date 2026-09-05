@@ -358,7 +358,7 @@ impl Builtin {
         }
         if su_present {
             let after_su = c.find("su").map(|i| &c[i + 2..]).unwrap_or("");
-            let target = after_su.trim_start().split_whitespace().next().unwrap_or("root");
+            let target = after_su.split_whitespace().next().unwrap_or("root");
             return Some(format!("su to {target}"));
         }
         None
@@ -1050,7 +1050,7 @@ timeout() { __pir_timeout_default "$@"; }
         // its child `before_exec`, with the saved uid collapsed so it can never
         // escalate back. No-op when no agent user is configured (plain `pir`).
         #[cfg(unix)]
-        c.before_exec(crate::user::drop_to_agent_user);
+        unsafe { c.pre_exec(crate::user::drop_to_agent_user) };
         c
     };
     let (prog, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("bash", "-c") };

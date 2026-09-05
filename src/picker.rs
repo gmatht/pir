@@ -5,11 +5,11 @@
 //! full-screen, two-pane terminal UI:
 //!
 //!   * left pane  — the list of candidate sessions (newest first), navigable
-//!                  with the Up/Down arrows (or `j`/`k`); the highlighted row is
-//!                  the selection;
+//!     with the Up/Down arrows (or `j`/`k`); the highlighted row is the
+//!     selection;
 //!   * right pane — a preview of the highlighted session: its first user
-//!                  prompt, its last user prompt, and the tail of the model's
-//!                  last thinking + response. It updates live as you move.
+//!     prompt, its last user prompt, and the tail of the model's
+//!     last thinking + response. It updates live as you move.
 //!
 //! Enter / Right resumes the highlighted session; `y` resumes the newest (index
 //! 0) for convenience; `n` / Esc / ctrl-c / ctrl-d / `q` abort (start a fresh
@@ -89,9 +89,7 @@ pub fn pick_session(items: &[PickItem]) -> PickResult {
 
         match wait_key() {
             Key::Up | Key::Char('k') => {
-                if selected > 0 {
-                    selected -= 1;
-                }
+                selected = selected.saturating_sub(1);
             }
             Key::Down | Key::Char('j') => {
                 if selected + 1 < items.len() {
@@ -147,7 +145,7 @@ fn page_step(n: usize) -> usize {
 fn draw(items: &[PickItem], selected: usize, preview: &SessionPreview, drawn_rows: &mut usize) {
     let w = term::terminal_width().max(40);
     let h = term::terminal_height().max(12);
-    let list_w = (w / 2).min(48).max(20);
+    let list_w = (w / 2).clamp(20, 48);
     let prev_w = (w.saturating_sub(list_w + 1)).max(20);
 
     let mut buf: Vec<u8> = Vec::new();
@@ -176,8 +174,7 @@ fn draw(items: &[PickItem], selected: usize, preview: &SessionPreview, drawn_row
 
     // Left pane: the session list.
     let mut rows = 0usize;
-    for idx in start..end {
-        let it = &items[idx];
+    for (idx, it) in items.iter().enumerate().take(end).skip(start) {
         let marker = if idx == selected { "▸" } else { " " };
         let mut label = it.name.replace("pir-", "").replace(".jsonl", "");
         let aw = list_w.saturating_sub(18).max(4);
@@ -259,15 +256,14 @@ fn draw(items: &[PickItem], selected: usize, preview: &SessionPreview, drawn_row
         }
     }
 
-    let mut prow = 2usize; // 1-based; header is row 1
-    for line in pcol {
+    // 1-based; header is row 1.
+    for (prow, line) in (2usize..).zip(pcol) {
         if prow > h {
             break;
         }
         buf.extend_from_slice(format!("\x1b[{};{}H", prow, list_w + 1).as_bytes());
         buf.extend_from_slice(term::clip(&line, prev_w).as_bytes());
         buf.extend_from_slice(b"\x1b[K");
-        prow += 1;
     }
 
     // Move cursor back to top-left so the next tick can erase the block.

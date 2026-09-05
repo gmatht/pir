@@ -906,9 +906,7 @@ fn main() {
     if crate::project::missing_git_guard(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))) {
         eprintln!(
             "{}",
-            term::yellow(&format!(
-                "[pir] this git repo has no commit guard hook — agents could commit large/binary files. Run /fix to make the .git setup sane for LLM use."
-            ))
+            term::yellow("[pir] this git repo has no commit guard hook — agents could commit large/binary files. Run /fix to make the .git setup sane for LLM use.")
         );
     }
 
@@ -1126,11 +1124,11 @@ fn main() {
                                 &current_ctx,
                             );
                         }
-                    } else if s.starts_with('/') {
+                    } else if let Some(slash_cmd) = s.strip_prefix('/') {
                         // Slash commands are handled immediately, even mid-turn.
                         input_buf.clear();
                         handle_command(
-                            &s[1..],
+                            slash_cmd,
                             &agent_slot,
                             &providers,
                             &mut jobs,
@@ -1720,7 +1718,7 @@ fn latest_built_binary() -> Option<PathBuf> {
             && name
                 .get("pir-".len()..)
                 .and_then(|s| s.chars().next())
-                .map_or(false, |c| c.is_ascii_digit())
+                .is_some_and(|c| c.is_ascii_digit())
             && (name.ends_with(".exe") || name == "pir")
     }
     // The freshly compiled binary `pir(.exe?)` with no `-<digits>` suffix.
@@ -1745,7 +1743,7 @@ fn latest_built_binary() -> Option<PathBuf> {
             if is_snapshot(name) || is_plain(name) {
                 if let Ok(meta) = std::fs::metadata(&p) {
                     if let Ok(m) = meta.modified() {
-                        if best.as_ref().map_or(true, |(bm, _)| m > *bm) {
+                        if best.as_ref().is_none_or(|(bm, _)| m > *bm) {
                             *best = Some((m, p.clone()));
                         }
                     }
@@ -1796,7 +1794,7 @@ fn menu_session_rows() -> Vec<(modal::SessionRow, PathBuf)> {
         Some(s) => s,
         None => return Vec::new(),
     };
-    sessions.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    sessions.sort_by_key(|a| std::cmp::Reverse(a.mtime));
     sessions
         .into_iter()
         .map(|s| {
@@ -1822,6 +1820,7 @@ fn menu_session_rows() -> Vec<(modal::SessionRow, PathBuf)> {
 /// is the truthful state (the REPL owns it via `fg_handle.is_some()`), so
 /// mid-turn `/cancel`/`/jobs` work even though the agent is *taken* out of the
 /// slot by the running worker.
+#[allow(clippy::too_many_arguments)]
 fn handle_command(
     cmd: &str,
     agent_slot: &AgentSlot,
@@ -1883,7 +1882,7 @@ fn handle_command(
                 Some(MenuAction::Security) => {
                     let mut policy = {
                         let g = agent_slot.lock().unwrap();
-                        g.as_ref().map(|a| a.security_policy()).flatten().unwrap_or_default()
+                        g.as_ref().and_then(|a| a.security_policy()).unwrap_or_default()
                     };
                     let orig_su = {
                         let g = agent_slot.lock().unwrap();
@@ -2066,9 +2065,9 @@ fn handle_command(
                                 println!(
                                     "{}",
                                     term::dim(&format!(
-                                        "to use this by default in new sessions, add to {}:\n  {}",
+                                        "to use this by default in new sessions, add to {}:\n  {{ \"defaultModel\": \"{}\" }}",
                                         config::pi_dir().join("agent").join("settings.json").display(),
-                                        format!("{{ \"defaultModel\": \"{}\" }}", agent.label())
+                                        agent.label()
                                     ))
                                 );
                             }
@@ -2097,9 +2096,9 @@ fn handle_command(
                             println!(
                                 "{}",
                                 term::dim(&format!(
-                                    "to use this by default in new sessions, add to {}:\n  {}",
+                                    "to use this by default in new sessions, add to {}:\n  {{ \"defaultModel\": \"{}\" }}",
                                     config::pi_dir().join("agent").join("settings.json").display(),
-                                    format!("{{ \"defaultModel\": \"{}\" }}", agent.label())
+                                    agent.label()
                                 ))
                             );
                         }
@@ -2257,26 +2256,23 @@ fn handle_command(
             // so the credential is usable immediately. Re-resolve the provider
             // list (it now includes the freshly stored key) so a provider that
             // was only present via a stored key works without a restart.
-            match config::load_providers() {
-                Ok(fresh) => {
-                    if let Some(p) = fresh.iter().find(|p| p.pid().eq_ignore_ascii_case(&provider_id)) {
-                        if !p.models.is_empty() {
-                            let mut g = agent_slot.lock().unwrap();
-                            let Some(agent) = g.as_mut() else {
-                                println!("{} key saved; it will be available after reload", term::dim("·"));
-                                return;
-                            };
-                            if agent.switch(p.clone(), p.models[0].clone()).is_ok() {
-                                if let Ok(mut ctx) = current_ctx.lock() {
-                                    ctx.0 = p.clone();
-                                    ctx.1 = p.models[0].clone();
-                                }
-                                println!("→ switched to {}", agent.label());
+            if let Ok(fresh) = config::load_providers() {
+                if let Some(p) = fresh.iter().find(|p| p.pid().eq_ignore_ascii_case(&provider_id)) {
+                    if !p.models.is_empty() {
+                        let mut g = agent_slot.lock().unwrap();
+                        let Some(agent) = g.as_mut() else {
+                            println!("{} key saved; it will be available after reload", term::dim("·"));
+                            return;
+                        };
+                        if agent.switch(p.clone(), p.models[0].clone()).is_ok() {
+                            if let Ok(mut ctx) = current_ctx.lock() {
+                                ctx.0 = p.clone();
+                                ctx.1 = p.models[0].clone();
                             }
+                            println!("→ switched to {}", agent.label());
                         }
                     }
                 }
-                Err(_) => {}
             }
         }
         "logout" => {
@@ -2334,7 +2330,7 @@ fn handle_command(
             if prompt.trim().is_empty() {
                 eprintln!("usage: /bg <prompt>  (or end a line with &)");
             } else {
-                jobs.spawn_prompt(prompt, &current_ctx, bus.clone());
+                jobs.spawn_prompt(prompt, current_ctx, bus.clone());
             }
         }
         "jobs" | "background" | "running" => {
@@ -2887,7 +2883,7 @@ fn list_sessions() -> String {
         my_pid
     ));
     // Newest first.
-    sessions.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    sessions.sort_by_key(|a| std::cmp::Reverse(a.mtime));
     for (idx, s) in sessions.iter().enumerate() {
         let from_here = s.shell_pid == my_pid;
         let marker = if from_here { term::cyan("▸") } else { " ".to_string() };
@@ -2930,7 +2926,7 @@ fn resolve_resume(token: Option<&str>) -> Option<PathBuf> {
         eprintln!("pir: no sessions to resume");
         return None;
     }
-    sessions.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    sessions.sort_by_key(|a| std::cmp::Reverse(a.mtime));
 
     let chosen = match token {
         None => sessions.iter().find(|s| s.shell_pid == term::parent_shell_pid()),
@@ -3050,7 +3046,7 @@ fn scan_sessions() -> Option<Vec<Session>> {
 
 fn first_user_line(path: &PathBuf) -> String {
     if let Ok(f) = std::fs::File::open(path) {
-        for line in std::io::BufReader::new(f).lines().flatten() {
+        for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                 if v.get("role").and_then(|r| r.as_str()) == Some("user") {
                     if let Some(txt) = v

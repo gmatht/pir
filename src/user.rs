@@ -982,8 +982,8 @@ pub fn provision(
     //    pre-commit guard hook (refuses huge/binary files) so agents can't
     //    accidentally bloat the repo. Under jj (git hooks don't run) this is a
     //    no-op and `/fix` handles jj separately.
-    if crate::project::is_git_repo(&path) && crate::project::detect_vcs(&path) == crate::project::Vcs::Git {
-        match crate::project::install_git_guard_hook(&path) {
+    if crate::project::is_git_repo(path) && crate::project::detect_vcs(path) == crate::project::Vcs::Git {
+        match crate::project::install_git_guard_hook(path) {
             Ok(true) => println!("installed .git/hooks/pre-commit guard (refuses large/binary files)"),
             Ok(false) => println!("a pre-commit hook already exists; left it in place"),
             Err(e) => eprintln!("warning: could not install git guard hook: {e}"),

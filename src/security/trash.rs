@@ -85,10 +85,7 @@ pub fn move_to_trash(path: &Path) -> Result<(), String> {
             .map(|s| s.success())
             .unwrap_or(false)
     } else {
-        match Command::new("trash-put").arg(path).status() {
-            Ok(s) if s.success() => true,
-            _ => false,
-        }
+        matches!(Command::new("trash-put").arg(path).status(), Ok(s) if s.success())
     };
     if ok {
         record_trash(1);
