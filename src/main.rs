@@ -159,7 +159,10 @@ OPTIONS
   -y, --full-auto            no confirmation for shell/write tools
   --confirm                  always prompt to confirm shell/write tools
   -n, --no-color             disable ANSI colors
-  -r, --resume [token]       resume a session; token selects by index/time/preview
+  -r, --resume, --session [token]  resume a session; token selects by index/time/preview
+  --secure [level]          run this session at the given security level
+                          (sandbox|strict|worktree|mitigation|guard|off;
+                          default mitigation; saved config unchanged)
   -c, --continue [token]     resume a session and continue its goal (pir -c)
   -u, --as <user>            run project commands as this user (default ai_<project>)
   -l, --latest-build         re-exec the most recent successfully built pir
@@ -200,6 +203,8 @@ COMMANDS
   /sh [cmd args]         drop to a shell, or run a command via the shell
                           (shell = $PIR_SHELL or $SHELL if set, else /bin/sh on
                           unix, or pwsh/powershell/cmd on Windows)
+  !! [cmd args]          one shell spawn with security off: always as the
+                          invoking user, never confined; changes no setting
   /project init            create the ai_<project> user and chown the cwd (root)
   /su-security <on|off|status>   enable/disable/inspect the su-based permission
                           model (sudoers.d/skynet-ai + wrappers); reversible (root)
@@ -213,9 +218,9 @@ COMMANDS
   /create [name]           scaffold a new project (seeds from clipboard .md spec)
   /login [provider]        store an API key for a provider in ~/.pi/agent/auth.json
   /logout [provider]       remove a stored provider credential from auth.json
-  /l                      show desktop window titles + clipboard; if the clipboard
-                          looks like an API key, pre-fill the next prompt with a
-                          ready-to-run /login <provider> <key> line
+  /l                      show desktop window titles + clipboard; guess the provider
+                          from a window title and/or the key format, then pre-fill
+                          the next prompt with a ready-to-run /login <provider> <key> line
   /markup_demo             render a canned reply (markdown + rust/js/json + table)
                           through the same incremental renderer a model reply uses
 
@@ -394,6 +399,10 @@ fn main() {
     let mut prompt: Vec<String> = Vec::new();
     let mut resume_token: Option<String> = None;
     let mut continue_token: Option<String> = None;
+    // `--secure [level]`: run this session at the given security level without
+    // touching the saved config (default: mitigation). Applied to the live
+    // agent right after it is built.
+    let mut secure_override: Option<crate::security::SecurityLevel> = None;
     // `as_user` is consumed only on unix (in the privilege-drop block below);
     // on non-unix builds it is assigned but never read, hence the allow.
     #[allow(unused_variables, unused_assignments)]
@@ -426,6 +435,20 @@ fn main() {
     // different (smaller) store — using it to resolve against the invoking
     // user's catalog produced "no model matches" fallbacks.
     let pre_drop_selector = std::env::var("PI_MODEL").ok().or_else(config::default_model_setting);
+    // Snapshot the invoking user's home BEFORE any drop/HOME rewrite: the
+    // security editor's `(d)` (save as global defaults) and the fresh-dir
+    // policy fallback resolve through it (see `global_defaults_file`).
+    #[cfg(unix)]
+    if let Some(h) = crate::user::invoking_home() {
+        std::env::set_var("PIR_INVOKING_HOME", h);
+    }
+    // Record the invoking user name before any drop: `/sh -u` (no arg) and
+    // `!!` resolve through it. Was previously only read, never stored, so the
+    // bare form always failed.
+    #[cfg(unix)]
+    if let Some(u) = crate::user::invoking_user_name() {
+        std::env::set_var("PIR_INVOKING_USER", u);
+    }
 
     let mut i = 0;
     while i < args.len() {
@@ -466,7 +489,7 @@ fn main() {
                 force_confirm = true;
                 full_auto = false;
             }
-            "-r" | "--resume" => {
+            "-r" | "--resume" | "--session" => {
                 // The next token is the resume token unless it's another flag.
                 if let Some(next) = args.get(i + 1) {
                     if !next.starts_with('-') {
@@ -481,6 +504,19 @@ fn main() {
                         continue_token = Some(next.clone());
                         i += 1;
                     }
+                }
+            }
+            "--secure" => {
+                // Optional level; bare `--secure` means mitigation. Invalid
+                // names die here (before any session starts) with the list.
+                match parse_secure_value(args.get(i + 1)) {
+                    Ok((level, consumed)) => {
+                        secure_override = Some(level);
+                        if consumed {
+                            i += 1;
+                        }
+                    }
+                    Err(e) => die(&e),
                 }
             }
             "-bg" | "--background" => {
@@ -589,10 +625,21 @@ fn main() {
             }
             None
         } else {
-            if let Err(e) = crate::user::become_user(&target) {
-                die(&e);
+            match crate::user::become_user(&target) {
+                Ok(()) => Some(target),
+                Err(e) => {
+                    // No sandbox user (fresh dir, never `pir project init`):
+                    // bricking the session here is hostile — the operator asked
+                    // for an agent, not a user-provisioning errand. Run as the
+                    // invoking user (== user-security off, behaviorally) with a
+                    // loud warning, so confinement remains opt-in via init.
+                    eprintln!(
+                        "pir: {e} — running as the invoking user WITHOUT command confinement (create it with `pir project init` for sandboxing)"
+                    );
+                    std::env::set_var("PIR_AGENT_AS_INVOKER", "1");
+                    None
+                }
             }
-            Some(target)
         }
     };
     #[cfg(not(unix))]
@@ -654,7 +701,7 @@ fn main() {
     // session to resume. With no token we default to the latest session that
     // came from the same shell (bash) that launched this pir.
     let resume = if resume_token.is_some() || continue_mode
-        || std::env::args().skip(1).any(|a| a == "-r" || a == "--resume")
+        || std::env::args().skip(1).any(|a| a == "-r" || a == "--resume" || a == "--session")
     {
         resolve_resume(resume_token.as_deref())
     } else {
@@ -690,6 +737,26 @@ fn main() {
         Ok(a) => a,
         Err(e) => die(&e),
     };
+    // Snapshot the session log path now: the worker *takes* the agent out of
+    // its slot while a turn runs, so quit paths during a turn (ctrl-c/ctrl-q)
+    // can't read it from the slot — this copy stays available everywhere.
+    let session_path = agent.log_path.clone();
+
+    // `--secure [level]`: session-only override. The saved config is left
+    // untouched; the live context (policy snapshot, mitigation engine) and
+    // the /menu display follow the override from here on.
+    if let Some(level) = secure_override {
+        let mut p = agent.security_policy().unwrap_or_default();
+        p.level = level;
+        let notes = agent.apply_security_policy(&p);
+        println!(
+            "{}",
+            term::dim(&format!(
+                "security level for this session: {} (config unchanged; {notes})",
+                level.as_str()
+            ))
+        );
+    }
 
     // Point the line editor's history file at the session's `.history` so the
     // per-session prompt history (and the prompts we seed below when resuming)
@@ -1097,19 +1164,10 @@ fn main() {
                         input_buf.clear();
                     } else if s.starts_with('!') {
                         // pi-style shell command, typed mid-turn (just like at
-                        // the idle prompt). Route to the /sh handler: a bare `!`
-                        // drops to an interactive shell, `! cmd args` runs a
-                        // single-shot command. The run-state guard (reject while
-                        // a turn is running) lives in the /sh handler itself.
-                        let shell_cmd = if let Some(rest) = s.strip_prefix('!') {
-                            if rest.is_empty() {
-                                "/sh".to_string()
-                            } else {
-                                format!("/sh {}", rest.trim_start())
-                            }
-                        } else {
-                            unreachable!()
-                        };
+                        // the idle prompt). `!` routes to /sh, `!!` to
+                        // /sh-as-invoker (one spawn as the invoking user). The
+                        // run-state guard lives in the handlers themselves.
+                        let shell_cmd = shell_cmd_for(s);
                         input_buf.clear();
                         if let Some(cmd) = shell_cmd.strip_prefix('/') {
                             handle_command(
@@ -1232,6 +1290,7 @@ fn main() {
                         let _ = h.join();
                     }
                     term::raw::disable_raw();
+                    println!("{}", term::dim(&resume_hint(session_path.as_ref())));
                     return;
                 }
                 term::raw::RawInput::Quit => {
@@ -1264,6 +1323,7 @@ fn main() {
                         let _ = h.join();
                     }
                     term::raw::disable_raw();
+                    println!("{}", term::dim(&resume_hint(session_path.as_ref())));
                     return;
                 }
                 term::raw::RawInput::Suspend => {
@@ -1328,6 +1388,7 @@ fn main() {
         match term::read_line("❯ ") {
             None => {
                 println!();
+                println!("{}", term::dim(&resume_hint(session_path.as_ref())));
                 break;
             }
             Some(s) => line = s,
@@ -1344,15 +1405,9 @@ fn main() {
         // the command via the shell). Aliased to /sh so it shares the exact
         // same handler, identity, and run-state guard.
         if input.starts_with('!') {
-            let shell_cmd = if let Some(rest) = input.strip_prefix('!') {
-                if rest.is_empty() {
-                    "/sh".to_string()
-                } else {
-                    format!("/sh {}", rest.trim_start())
-                }
-            } else {
-                unreachable!()
-            };
+            // `!` behaves like /sh; `!!` like /sh-as-invoker (one spawn as the
+            // invoking user, security off). See `shell_cmd_for`.
+            let shell_cmd = shell_cmd_for(input);
             if let Some(cmd) = shell_cmd.strip_prefix('/') {
                 handle_command(
                     cmd,
@@ -1652,6 +1707,16 @@ fn markup_demo(tty: bool, incremental: bool, color: bool) {
     println!();
 }
 
+/// pi-style restart hint printed on every quit path: `To restart, run:
+/// pir --session <file-name>`. The file name is a valid resume token
+/// (`resolve_resume` substring-matches it), so the hint is copy-paste exact.
+fn resume_hint(path: Option<&PathBuf>) -> String {
+    match path.and_then(|p| p.file_name().and_then(|n| n.to_str())) {
+        Some(name) => format!("To restart, run: pir --session {name}"),
+        None => "To restart, run: pir -r".to_string(),
+    }
+}
+
 /// A fresh session log path for a background job (tagged so it never collides
 /// with the foreground session or another job).
 fn session_log_path() -> PathBuf {
@@ -1872,7 +1937,11 @@ fn handle_command(
             match main_menu() {
                 None => eprintln!("pir: menu needs a tty"),
                 Some(MenuAction::None) => {}
-                Some(MenuAction::Quit) => std::process::exit(0),
+                Some(MenuAction::Quit) => {
+                    let p = agent_slot.lock().unwrap().as_ref().and_then(|a| a.log_path().cloned());
+                    println!("{}", term::dim(&resume_hint(p.as_ref())));
+                    std::process::exit(0);
+                }
                 Some(MenuAction::Help) => {
                     modal::help_dialog(HELP);
                 }
@@ -1880,33 +1949,53 @@ fn handle_command(
                     modal::about_dialog();
                 }
                 Some(MenuAction::Security) => {
-                    let mut policy = {
-                        let g = agent_slot.lock().unwrap();
-                        g.as_ref().and_then(|a| a.security_policy()).unwrap_or_default()
-                    };
-                    let orig_su = {
-                        let g = agent_slot.lock().unwrap();
-                        g.as_ref().map(|a| a.su_security_enabled()).unwrap_or(true)
-                    };
-                    modal::security_editor(&mut policy);
-                    // The "user-security" toggle is the UI for the per-project user
-                    // boundary. Disabling it must stop confining the agent's
-                    // commands to the sandbox user (the `nobody`/ai_X drop) so
-                    // `!`/`/sh` and the bash tool run as the *invoking* user —
-                    // exactly the authority `/su-security off` grants. Apply it to
-                    // the live session (and persist via the per-session `.susec`),
-                    // so flipping it in /menu takes effect immediately.
-                    if policy.user_security != orig_su {
-                        let mut g = agent_slot.lock().unwrap();
-                        if let Some(agent) = g.as_mut() {
-                            let reason = if policy.user_security {
-                                String::new()
+                    // Edit the SAVED policy (security.toml), not the live agent's
+                    // startup snapshot: otherwise the running session keeps stale
+                    // flags and the menu shows them again on the next open.
+                    let mut policy = crate::security::load_policy();
+                    // Compare against the editor's initial value (disk), not the
+                    // live session flag: a per-session `/su-security off` (`.susec`)
+                    // may differ from disk, and saving untouched options must not
+                    // flip the live session back.
+                    let editor_initial_su = policy.user_security;
+                    match modal::security_editor(&mut policy) {
+                        modal::SecuritySave::NoTty => eprintln!("pir: menu needs a tty"),
+                        modal::SecuritySave::Discarded => println!("{}", term::dim("security options discarded (no change)")),
+                        modal::SecuritySave::SaveFailed(e) => eprintln!("pir: SECURITY SAVE FAILED ({e}) — toggles NOT persisted"),
+                        modal::SecuritySave::Saved(paths) => {
+                            let list = paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ");
+                            if paths.len() > 1 {
+                                println!("security options saved to {list} (session file + global defaults for new projects)");
                             } else {
-                                "disabled via /menu security — agent authorized to act as the \
-                                 invoking user for this session"
-                                    .to_string()
-                            };
-                            println!("{}", agent.set_su_security(policy.user_security, &reason));
+                                println!("security options saved to {list} (new sessions of this project)");
+                            }
+                            // The "user-security" toggle is the UI for the per-project user
+                            // boundary. Disabling it must stop confining the agent's
+                            // commands to the sandbox user (the `nobody`/ai_X drop) so
+                            // `!`/`/sh` and the bash tool run as the *invoking* user —
+                            // exactly the authority `/su-security off` grants. Apply it to
+                            // the live session (and persist via the per-session `.susec`),
+                            // so flipping it in /menu takes effect immediately.
+                            if policy.user_security != editor_initial_su {
+                                let mut g = agent_slot.lock().unwrap();
+                                if let Some(agent) = g.as_mut() {
+                                    let reason = if policy.user_security {
+                                        String::new()
+                                    } else {
+                                        "disabled via /menu security — agent authorized to act as the \
+                                         invoking user for this session"
+                                            .to_string()
+                                    };
+                                    println!("{}", agent.set_su_security(policy.user_security, &reason));
+                                }
+                            }
+                            // Push the quarantine flags (and level/apt/network/ask/read)
+                            // into the live session too, so the next /menu open shows the
+                            // saved values and disabling tears down live overlays now.
+                            let mut g = agent_slot.lock().unwrap();
+                            if let Some(agent) = g.as_mut() {
+                                println!("{}", term::dim(&agent.apply_security_policy(&policy)));
+                            }
                         }
                     }
                 }
@@ -2168,7 +2257,9 @@ fn handle_command(
             }
             use crate::wininfo::impls::window_titles;
             use crate::wininfo::impls::clipboard_text;
-            use crate::wininfo::guess_provider_from_key;
+            use crate::wininfo::{
+                extract_key_candidate, guess_provider_from_key, guess_provider_from_title,
+            };
             let titles = window_titles();
             if titles.is_empty() {
                 println!("{} no visible window titles found (not attached to a desktop session?)", term::dim("·"));
@@ -2187,10 +2278,64 @@ fn handle_command(
                 let first = clip.lines().next().unwrap_or("").trim();
                 let preview = if first.len() > 80 { &first[..80] } else { first };
                 println!("{} clipboard: {}", term::bold("clipboard"), term::dim(preview));
-                if let Some(provider) = guess_provider_from_key(&clip) {
-                    let suggested = format!("/login {provider} {clip}");
+                // Detection combines both sources: the key format in the
+                // clipboard (`sk-ant-…` → anthropic, …) and the provider name
+                // in a window title ("OpenAI API keys - Chrome" → openai).
+                // Either alone suffices when it is unambiguous; together they
+                // cover the common flow (provider tab open + opaque key copied).
+                let clip_key = extract_key_candidate(&clip);
+                let key_provider = clip_key
+                    .as_deref()
+                    .and_then(guess_provider_from_key);
+                let title_provider: Option<String> = titles
+                    .iter()
+                    .find_map(|t| guess_provider_from_title(&t.title))
+                    .map(str::to_string)
+                    .or_else(|| {
+                        // Fall back to the live model catalog: if a title mentions a
+                        // configured provider id verbatim, honour it (covers custom /
+                        // self-hosted providers the static alias list can't know).
+                        titles.iter().find_map(|t| {
+                            let lower = t.title.to_lowercase();
+                            providers
+                                .iter()
+                                .find(|p| {
+                                    let pid = p.pid().to_lowercase();
+                                    !pid.is_empty() && lower.contains(pid.as_str())
+                                })
+                                .map(|p| p.pid().to_string())
+                        })
+                    });
+                // A key pasted into a window title itself (rare, but cheap to
+                // check): prefer the clipboard, then fall back to the title.
+                let title_key = titles
+                    .iter()
+                    .find_map(|t| extract_key_candidate(&t.title));
+                let title_key_provider = title_key
+                    .as_deref()
+                    .and_then(guess_provider_from_key);
+                if let Some(provider) = key_provider {
+                    // Key format alone identifies the provider (most specific).
+                    let key = clip_key.as_deref().unwrap_or(clip.trim());
+                    let suggested = format!("/login {provider} {key}");
                     println!("{} guessed provider '{}' from clipboard — pre-filling next prompt:", term::green("✓"), provider);
                     term::set_prefill(&suggested);
+                } else if let (Some(tp), Some(key)) = (title_provider.as_deref(), clip_key.as_deref()) {
+                    // Provider from the window title + opaque key from the
+                    // clipboard — the case the old code missed (it only looked
+                    // at the key prefix, so an opaque key never pre-filled).
+                    let suggested = format!("/login {tp} {key}");
+                    println!("{} guessed provider '{tp}' from window title + key from clipboard — pre-filling next prompt:", term::green("✓"));
+                    term::set_prefill(&suggested);
+                } else if let (Some(tp), Some(tkey)) =
+                    (title_provider.as_deref(), title_key.as_deref())
+                {
+                    let provider = title_key_provider.unwrap_or(tp);
+                    let suggested = format!("/login {provider} {tkey}");
+                    println!("{} guessed provider '{provider}' from window title — pre-filling next prompt:", term::green("✓"));
+                    term::set_prefill(&suggested);
+                } else if let Some(key) = clip_key.as_deref() {
+                    println!("{} clipboard looks like a key but no provider found in window titles — run /login <provider> {} to save it", term::dim("·"), term::dim(&key[..key.len().min(12)]));
                 } else {
                     println!("{} clipboard doesn't look like an API key (no provider guessed)", term::dim("·"));
                 }
@@ -2737,6 +2882,38 @@ fn handle_command(
                 eprintln!("pir: could not start shell");
             }
         }
+        "sh-as-invoker" => {
+            // `!! [cmd]` — one shell spawn with security off: always as the
+            // INVOKING user (the operator), never confined to the agent user,
+            // regardless of session posture. Changes no setting. Same shape
+            // as /sh (raw-mode dance + exit reporting).
+            if fg_running {
+                eprintln!("pir: a turn is running — finish or /cancel it first, then !!");
+                return;
+            }
+            let args: Vec<&str> = rest;
+            let was_raw = term::raw::is_active();
+            if was_raw {
+                term::raw::disable_raw();
+            }
+            #[cfg(unix)]
+            let status = match resolve_shell() {
+                Some((shell, _)) => crate::user::spawn_shell_as(&shell, &args, None),
+                None => None,
+            };
+            #[cfg(not(unix))]
+            let status = run_shell(args);
+            if was_raw {
+                term::raw::enable_raw();
+            }
+            if let Some(code) = status {
+                if code != 0 {
+                    eprintln!("pir: shell exited with status {code}");
+                }
+            } else {
+                eprintln!("pir: could not start shell");
+            }
+        }
         "usage" => {
             let g = agent_slot.lock().unwrap();
             match g.as_ref() {
@@ -2777,7 +2954,11 @@ fn handle_command(
                 println!("  - /{n}  {d}");
             }
         }
-        "quit" | "exit" => std::process::exit(0),
+        "quit" | "exit" => {
+            let p = agent_slot.lock().unwrap().as_ref().and_then(|a| a.log_path().cloned());
+            println!("{}", term::dim(&resume_hint(p.as_ref())));
+            std::process::exit(0);
+        }
         #[cfg(not(unix))]
         "q" => std::process::exit(0),
         other => {
@@ -3022,24 +3203,45 @@ fn build_pick_items(sessions: &[Session], my_pid: u32) -> Vec<crate::picker::Pic
 fn scan_sessions() -> Option<Vec<Session>> {
     use std::fs;
 
-    let dir = config::pi_dir().join("agent").join("sessions");
-    let entries = fs::read_dir(&dir).ok()?;
+    // Sessions live in the global dir AND/OR the project-local dir (see
+    // `session_dir`: cwd/.pir/sessions wins when present). Scan both, or a
+    // restart hint for a project-local session resolves to nothing.
+    let mut dirs = vec![config::pi_dir().join("agent").join("sessions")];
+    let local = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".pir")
+        .join("sessions");
+    if local != dirs[0] {
+        dirs.push(local);
+    }
     let mut out = Vec::new();
-    for e in entries.flatten() {
-        let path = e.path();
-        if path.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+    let mut seen = std::collections::HashSet::new();
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(&dir) else {
             continue;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            // pir-<timestamp>-sh<pid>.jsonl
+            let shell_pid = name
+                .rsplit("sh")
+                .next()
+                .and_then(|s| s.trim_end_matches(".jsonl").trim().parse::<u32>().ok())
+                .unwrap_or(0);
+            let mtime = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+            let preview = first_user_line(&path);
+            out.push(Session { path, name, shell_pid, mtime, preview });
         }
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-        // pir-<timestamp>-sh<pid>.jsonl
-        let shell_pid = name
-            .rsplit("sh")
-            .next()
-            .and_then(|s| s.trim_end_matches(".jsonl").trim().parse::<u32>().ok())
-            .unwrap_or(0);
-        let mtime = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
-        let preview = first_user_line(&path);
-        out.push(Session { path, name, shell_pid, mtime, preview });
+    }
+    if out.is_empty() {
+        return None;
     }
     Some(out)
 }
@@ -3201,6 +3403,42 @@ pub(crate) fn workspace_label() -> String {
 /// `ai_*` user), cwd and environment, so it behaves identically to the
 /// surrounding session. Returns the child's exit code, or `None` if the shell
 /// could not be spawned.
+/// Map a `!`/`!!` REPL line to the slash command that runs it. `!` behaves
+/// exactly like `/sh` (agent-user confinement applies); `!!` behaves like
+/// `/sh-as-invoker` — one spawn as the invoking user with security off,
+/// regardless of posture. Settings are never changed.
+fn shell_cmd_for(line: &str) -> String {
+    if let Some(rest) = line.strip_prefix("!!") {
+        if rest.is_empty() {
+            "/sh-as-invoker".to_string()
+        } else {
+            format!("/sh-as-invoker {}", rest.trim_start())
+        }
+    } else if let Some(rest) = line.strip_prefix('!') {
+        if rest.is_empty() {
+            "/sh".to_string()
+        } else {
+            format!("/sh {}", rest.trim_start())
+        }
+    } else {
+        unreachable!("shell_cmd_for called on a non-! line")
+    }
+}
+
+/// Parse the optional `--secure` value: `None`/another-flag following means
+/// bare mitigation (not consumed); a level name is consumed; anything else is
+/// an error naming the valid levels. Pure for tests.
+fn parse_secure_value(next: Option<&String>) -> Result<(crate::security::SecurityLevel, bool), String> {
+    use crate::security::SecurityLevel;
+    match next {
+        Some(v) if !v.starts_with('-') => match SecurityLevel::parse(v) {
+            Some(l) => Ok((l, true)),
+            None => Err("--secure needs a level: sandbox|strict|worktree|mitigation|guard|off".to_string()),
+        },
+        _ => Ok((SecurityLevel::Mitigation, false)),
+    }
+}
+
 fn parse_sh_u<'a>(args: &'a [&str]) -> Option<(Option<&'a str>, &'a [&'a str])> {
     if matches!(args.first(), Some(&"-u")) {
         return Some(match args.get(1) {
@@ -3368,4 +3606,65 @@ fn create_project(name: &str) -> Option<std::path::PathBuf> {
 
     println!("open it with:  cd {}", dir.display());
     Some(dir)
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+
+    /// `scan_sessions` must find sessions in the PI_DIR global dir: restart
+    /// hints (`pir --session <name>`) resolve through this scan, so a session
+    /// the scan can't see is a session the hint can't restart. Hermetic via a
+    /// throwaway PI_DIR (the cwd-local .pir dir may contribute real files;
+    /// assert by name, not by count).
+    #[test]
+    fn scan_finds_global_dir_sessions() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("pir_scan_{}", std::process::id()));
+        let sdir = dir.join("agent").join("sessions");
+        std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::write(
+            sdir.join("pir-20990101-000000-sh99999.jsonl"),
+            r#"{"role":"user","blocks":[{"type":"text","text":"hello scan"}]}"# .to_string() + "\n",
+        )
+        .unwrap();
+        let old = std::env::var_os("PI_DIR");
+        std::env::set_var("PI_DIR", &dir);
+        let sessions = scan_sessions();
+        match old {
+            Some(v) => std::env::set_var("PI_DIR", v),
+            None => std::env::remove_var("PI_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let sessions = sessions.expect("scan finds the temp global dir");
+        assert!(
+            sessions.iter().any(|s| s.name == "pir-20990101-000000-sh99999.jsonl"),
+            "fake session must be listed: {:?}",
+            sessions.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// `!` routes to /sh (confinement applies); `!!` routes to /sh-as-invoker
+    /// (one spawn as the invoking user). Both bare and with-command forms.
+    #[test]
+    fn bang_routing() {
+        assert_eq!(shell_cmd_for("!"), "/sh");
+        assert_eq!(shell_cmd_for("! ls -la"), "/sh ls -la");
+        assert_eq!(shell_cmd_for("!!"), "/sh-as-invoker");
+        assert_eq!(shell_cmd_for("!! systemctl reboot"), "/sh-as-invoker systemctl reboot");
+    }
+
+    /// `--secure` takes an optional level (bare = mitigation, not consumed),
+    /// consumes a valid name, and rejects anything else with the valid list.
+    #[test]
+    fn secure_value_parsing() {
+        use crate::security::SecurityLevel;
+        assert_eq!(parse_secure_value(None), Ok((SecurityLevel::Mitigation, false)));
+        let flag = "-r".to_string();
+        assert_eq!(parse_secure_value(Some(&flag)), Ok((SecurityLevel::Mitigation, false)));
+        let lvl = "strict".to_string();
+        assert_eq!(parse_secure_value(Some(&lvl)), Ok((SecurityLevel::Strict, true)));
+        let bad = "paranoid".to_string();
+        assert!(parse_secure_value(Some(&bad)).is_err());
+    }
 }

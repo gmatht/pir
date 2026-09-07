@@ -10,6 +10,8 @@ Test hardlinks for backup?
 
 maybe use BTRFS snapshots in place of worktree, and overlays when available.
 
+get /l<tab> working
+
 --
 The most efficient native method to detect changed files between two Btrfs snapshots is using btrfs send --no-data, which generates a stream of metadata changes without transferring file content.
 

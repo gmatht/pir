@@ -572,7 +572,7 @@ const SLASH_HELP: &[(&str, &str, &str)] = &[
     ("/jobs", "", "list background jobs"),
     ("/login", "<provider>", "store an API key for a provider"),
     ("/logout", "<provider>", "remove a stored provider credential"),
-    ("/l", "", "show window titles + clipboard; guess a provider and pre-fill /login"),
+    ("/l", "", "show window titles + clipboard; guess provider+key and pre-fill /login"),
     ("/markup_demo", "", "render a canned markdown + code demo reply"),
     ("/model", "<sel>", "switch the model for this session"),
     ("/model*", "<sel>", "switch model in all open pir terminals"),

@@ -270,18 +270,18 @@ impl Agent {
                 // agent's writes only, never the host's. If we can't get a private
                 // namespace we must NOT mount (that would shadow /var, /etc, ...
                 // for the whole system); we fall back to the in-process hard-deny
-                // guardrail instead.
-                let private_ns = crate::security::overlay::enter_private_mount_ns().is_ok();
-                // Engage the overlayfs write-quarantine (the default-on safe
-                // posture): if the launcher can mount (root) we stage the agent's
-                // writes behind overlay upperdirs so the real fs is untouched
-                // until the operator reviews + applies them with /quarantine. When
-                // mounting is impossible (the common non-root ai_* case) we
-                // gracefully skip it and rely on the in-process write guardrail.
+                // guardrail instead. Only enter the namespace when quarantine is
+                // actually engaged: entering a user+mount ns is permanent for
+                // the process (cannot setns back out) and remaps file ownership,
+                // so entering it when quarantine is off needlessly breaks things
+                // (e.g. root file writes appearing as nobody).
                 // FULL-ROOT / container mode: the whole fs is already handled; the
                 // selective system-tree overlay is redundant (skip it).
                 let fullroot = crate::security::overlay::fullroot_engaged()
                     || crate::security::overlay::container_engaged();
+                // Only enter the private userns/mntns when we'll actually mount an overlay.
+                let private_ns = (ctx.policy.quarantine && !fullroot)
+                    && crate::security::overlay::enter_private_mount_ns().is_ok();
                 // NON-ROOT auto-writable mode (default for unprivileged): overlay
                 // $HOME with fuse-overlayfs, worktree + ~/.cargo + ~/.pi real.
                 let home_q = crate::security::overlay::home_quarantine_wanted();
@@ -683,6 +683,90 @@ impl Agent {
                  no system-wide configuration was changed."
             )
         }
+    }
+
+    /// Push menu-edited policy flags into the live session. The security editor
+    /// saves to `security.toml` (new sessions); without this the running session
+    /// keeps its startup snapshot, so the menu shows stale toggles the next time
+    /// it opens. Disabling a quarantine also tears down its live overlays (an
+    /// "off" that keeps staging writes would be a lie); enabling mounts takes
+    /// effect for new sessions (mounts need startup context). A chroot
+    /// container / full-root namespace cannot be unwound mid-session, so there
+    /// disabling only stops future sessions. Returns a status line for display.
+    pub fn apply_security_policy(&mut self, updated: &crate::security::SecurityPolicy) -> String {
+        use crate::security::overlay;
+        let mut notes = Vec::new();
+        if let Some(ctx) = self.security.as_mut() {
+            // Live in-process flag follows the saved policy.
+            ctx.set_quarantine(updated.quarantine);
+            // Stored snapshot follows too, so the next /menu open shows the
+            // saved values. The context is only shared while a turn runs (the
+            // menu is idle-only), so exclusive access should hold.
+            match Arc::get_mut(ctx) {
+                Some(c) => {
+                    c.policy = updated.clone();
+                }
+                None => notes.push(
+                    "policy snapshot busy — menu display refreshes next session".to_string(),
+                ),
+            }
+        }
+        crate::security::set_mitigation_active(
+            updated.level.is_mitigation()
+                || updated.level == crate::security::SecurityLevel::Guard,
+        );
+        let locked_in = overlay::container_engaged() || overlay::fullroot_engaged();
+        if !updated.quarantine {
+            if locked_in {
+                notes.push(
+                    "write-quarantine saved OFF but this session stays staged: a chroot/container namespace cannot be unwound mid-session — relaunch for it to take effect"
+                        .to_string(),
+                );
+            } else if overlay::system_quarantine_engaged() {
+                let staged = overlay::with_active(|q| q.staged().len()).unwrap_or(0);
+                match overlay::teardown_active() {
+                    Ok(()) => notes.push(if staged > 0 {
+                        format!(
+                            "write-quarantine live: OFF (unmounted; {staged} staged write(s) discarded)"
+                        )
+                    } else {
+                        "write-quarantine live: OFF (unmounted)".to_string()
+                    }),
+                    Err(e) => notes.push(format!("write-quarantine teardown: {e}")),
+                }
+            } else {
+                notes.push("write-quarantine live: OFF (was not mounted)".to_string());
+            }
+        } else if locked_in {
+            notes.push("write-quarantine on (container/full-root already stages everything)".to_string());
+        } else {
+            notes.push("write-quarantine on (overlays mount for new sessions)".to_string());
+        }
+        if !updated.quarantine_project {
+            if locked_in {
+                notes.push(
+                    "project-quarantine saved OFF but this session stays staged (container namespace — relaunch for it to take effect)"
+                        .to_string(),
+                );
+            } else if overlay::project_quarantine_engaged() {
+                let staged = overlay::project_active_staged_count();
+                match overlay::project_active_teardown() {
+                    Ok(()) => notes.push(if staged > 0 {
+                        format!(
+                            "project-quarantine live: OFF (unmounted; {staged} staged write(s) discarded)"
+                        )
+                    } else {
+                        "project-quarantine live: OFF (unmounted)".to_string()
+                    }),
+                    Err(e) => notes.push(format!("project-quarantine teardown: {e}")),
+                }
+            } else {
+                notes.push("project-quarantine live: OFF (was not mounted)".to_string());
+            }
+        } else if !locked_in {
+            notes.push("project-quarantine on (overlay mounts for new sessions)".to_string());
+        }
+        notes.join("; ")
     }
 
     /// Persist the local su-security choice next to the session log

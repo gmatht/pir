@@ -1151,6 +1151,158 @@ fn with_project<R>(f: impl FnOnce(&ProjectQuarantine) -> R) -> Option<R> {
     active_project_lock().lock().ok().and_then(|g| g.as_ref().map(f))
 }
 
+/// Username for a host uid via /etc/passwd (first match), for diagnostics.
+#[cfg(unix)]
+fn username_of(uid: u32) -> Option<String> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    for line in passwd.lines() {
+        let mut f = line.split(':');
+        let n = f.next()?;
+        let _ = f.next();
+        if let Ok(u) = f.next()?.parse::<u32>() {
+            if u == uid {
+                return Some(n.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// All (start, count) ranges granted to our uid in a subuid/subgid file.
+/// (The files are keyed by *name*, so resolve it first.)
+#[cfg(unix)]
+fn subordinate_ranges(path: &str, uid: u32) -> Vec<(u32, u32)> {
+    let Some(name) = username_of(uid) else {
+        return Vec::new();
+    };
+    let Ok(subs) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    subs.lines()
+        .filter_map(|line| {
+            let mut f = line.split(':');
+            if f.next()?.trim() != name {
+                return None;
+            }
+            let s: u32 = f.next()?.trim().parse().ok()?;
+            let c: u32 = f.next()?.trim().parse().ok()?;
+            Some((s, c))
+        })
+        .collect()
+}
+
+/// Whether host id `id` is mappable into our quarantine user namespace:
+/// our own id always, plus anything inside our subordinate ranges.
+#[cfg(unix)]
+fn id_mappable(id: u32, me: u32, ranges: &[(u32, u32)]) -> bool {
+    id == me
+        || ranges
+            .iter()
+            .any(|(s, c)| (*s as u64..*s as u64 + *c as u64).contains(&(id as u64)))
+}
+
+/// Bounded ownership scan of `root` (no symlink following past the root
+/// itself): distinct foreign-owner uids with file counts, and whether the
+/// root itself is mappable. Cap 5000 entries so giant trees (target/, .git/)
+/// stay cheap; sets `sampled` when the cap cut the walk short.
+#[cfg(unix)]
+fn scan_unmappable_owners(
+    root: &Path,
+    uid: u32,
+    gid: u32,
+) -> (bool, Vec<(u32, u64)>, bool) {
+    use std::os::unix::fs::MetadataExt;
+    let ur = subordinate_ranges("/etc/subuid", uid);
+    let gr = subordinate_ranges("/etc/subgid", gid);
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut counts: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut root_ok = true;
+    let mut first = true;
+    let mut sampled = false;
+    let mut stack = vec![root];
+    let mut seen = 0usize;
+    const CAP: usize = 5000;
+    while let Some(p) = stack.pop() {
+        if seen >= CAP {
+            sampled = true;
+            break;
+        }
+        seen += 1;
+        let Ok(md) = std::fs::symlink_metadata(&p) else {
+            continue;
+        };
+        let (fu, fg) = (md.uid(), md.gid());
+        let ok = id_mappable(fu, uid, &ur) && id_mappable(fg, gid, &gr);
+        if first {
+            root_ok = ok;
+            first = false;
+        } else if !ok {
+            *counts.entry(fu).or_default() += 1;
+        }
+        if md.file_type().is_dir() && !md.file_type().is_symlink() {
+            if let Ok(rd) = std::fs::read_dir(&p) {
+                for e in rd.flatten() {
+                    stack.push(e.path());
+                }
+            }
+        }
+    }
+    (root_ok, counts.into_iter().collect(), sampled)
+}
+
+/// Refuse-or-warn when a tree about to be quarantined holds files the userns
+/// cannot map. Unmapped files appear as nobody/nogroup inside the namespace
+/// and are unreadable even for virtual root (no CAP_DAC_OVERRIDE over
+/// unmapped kuids) — silently worse than no quarantine. Refuses when the tree
+/// ROOT itself is unmappable (total blindness: not even traversable); warns
+/// (top owners + counts) for scattered foreign files. No-op for privileged
+/// launchers (the identity map covers everyone) and non-unix. Must run BEFORE
+/// any unshare: entering the namespace is permanent for the process.
+fn check_tree_mappable(root: &Path, role: &str) -> Result<(), OverlayError> {
+    #[cfg(unix)]
+    {
+        // Privileged: write_userns_id_maps installs a full identity map.
+        if unsafe { libc::geteuid() } == 0 {
+            return Ok(());
+        }
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let (root_ok, foreign, sampled) = scan_unmappable_owners(root, uid, gid);
+        if !root_ok {
+            return Err(OverlayError::Unsupported(format!(
+                "{role} {} is owned outside this process's mappable ids — an unprivileged user namespace would show it as nobody (read-only even for virtual root); refusing userns quarantine (run as root, or chown the tree)",
+                root.display()
+            )));
+        }
+        if !foreign.is_empty() {
+            let mut parts: Vec<String> = foreign
+                .iter()
+                .take(5)
+                .map(|(u, n)| {
+                    let name = username_of(*u).unwrap_or_else(|| format!("uid {u}"));
+                    format!("{name} ({n} file(s))")
+                })
+                .collect();
+            if foreign.len() > 5 {
+                parts.push(format!("+{} more", foreign.len() - 5));
+            }
+            eprintln!(
+                "{}",
+                crate::term::yellow(&format!(
+                    "[pir] {role} holds files owned outside the mappable ids ({}{}) — they appear as nobody (read-only) inside the quarantine; run as root for full coverage",
+                    parts.join(", "),
+                    if sampled { " — sampled" } else { "" },
+                ))
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, role);
+    }
+    Ok(())
+}
+
 /// Engage the project-scoped overlayfs write-quarantine: overlay `root` with a
 /// private staging upper and bind-mount `whitelist` (the agent's worktree)
 /// read-write on top. The real fs is untouched outside the worktree until the
@@ -1161,6 +1313,10 @@ fn with_project<R>(f: impl FnOnce(&ProjectQuarantine) -> R) -> Option<R> {
 /// keeps its real `/var`, `/etc`, and repos. Refuses to mount if a private
 /// namespace can't be obtained, rather than shadowing the host's filesystems.
 pub fn mount_project_quarantine(root: &Path, whitelist: &Path) -> Result<(), OverlayError> {
+    // Validate BEFORE any unshare (entering the namespace is permanent): when
+    // the worktree root itself isn't mappable the agent would be totally blind
+    // (every file nobody, read-only) — refuse rather than trap the process.
+    check_tree_mappable(whitelist, "worktree")?;
     // ROOT default (container mode): directory-rootfs container. Escape-able but
     // TOTAL — every write lands in the rootfs dir; nothing outside the whitelist
     // reaches the real host. Falls back to the selective project overlay if the
@@ -1578,6 +1734,9 @@ pub fn mount_home_quarantine() -> Result<(), OverlayError> {
             "worktree is not under $HOME; the home quarantine covers only $HOME (a repo outside $HOME is not overlayed here)".into(),
         ));
     }
+    // Validate BEFORE the unshare (permanent for the process): an unmappable
+    // $HOME would blind the agent to its own files.
+    check_tree_mappable(&home, "$HOME")?;
     if enter_private_mount_ns().is_err() {
         return Err(OverlayError::Unsupported("private namespace unavailable".into()));
     }
@@ -1631,6 +1790,11 @@ pub fn project_active_teardown() -> Result<(), OverlayError> {
     r
 }
 
+/// Number of staged project writes currently held (for disable-reporting).
+pub fn project_active_staged_count() -> usize {
+    with_project(|q| q.staged().len()).unwrap_or(0)
+}
+
 pub fn project_active_engaged() -> bool {
     active_project_lock().lock().map(|g| g.is_some()).unwrap_or(false)
 }
@@ -1672,19 +1836,26 @@ pub fn try_full_root_quarantine(root: &Path, whitelist: &Path, staging_base: &Pa
     {
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
+        // Spawn the map helper BEFORE the unshare — it must stay in the
+        // parent namespace to be privileged there (see its doc).
+        let mut map_helper = spawn_map_helper_if_privileged();
         let r = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) };
         if r != 0 {
             return Err(OverlayError::Unsupported("userns/mntns unavailable in this kernel".into()));
         }
-        // Map our host uid/gid to 0 inside (ai-root): we own the ns we created,
-        // no setuid helper needed for a self-map.
-        let _ = std::fs::write("/proc/self/setgroups", b"deny\n");
-        let gmap = format!("0 {} 1\n", gid);
-        let umap = format!("0 {} 1\n", uid);
-        if std::fs::write("/proc/self/gid_map", gmap).is_err()
-            || std::fs::write("/proc/self/uid_map", umap).is_err()
-        {
+        // Full-range map (ns-0 -> launcher PLUS the subordinate range, so
+        // other users' files stay addressable instead of collapsing to
+        // nobody). Falls back to the single-line self-map when no
+        // subuid/subgid range exists.
+        if write_userns_id_maps(uid, gid, &mut map_helper).is_err() {
             return Err(OverlayError::Unsupported("could not map uid/gid in the user namespace".into()));
+        }
+        // A narrowed map (kernel only honors self-maps) cannot host
+        // full-root's promise (ai-root over everything: every write stages).
+        // Refuse so the caller falls back to the selective overlays instead
+        // of trapping the agent in a namespace blind to foreign files.
+        if userns_map_is_narrow() {
+            return Err(OverlayError::Unsupported("user namespace maps only our own id on this kernel; refusing full-root quarantine (selective overlays will be used)".into()));
         }
     }
     let _ = run(&["mount", "--make-rprivate", "/"]);
@@ -1760,6 +1931,254 @@ pub fn try_full_root_quarantine(_r: &Path, _w: &Path, _s: &Path) -> Result<(), O
 // Capability detection (unix)
 // ===========================================================================
 
+/// Parse /proc/self/{uid_map,gid_map} text into (inside, lower, count)
+/// triples. The kernel pads columns; split whitespace. Pure for tests.
+fn parse_id_map(text: &str) -> IdMap {
+    text.lines()
+        .filter_map(|l| {
+            let mut n = l.split_whitespace();
+            Some((n.next()?.parse().ok()?, n.next()?.parse().ok()?, n.next()?.parse().ok()?))
+        })
+        .collect()
+}
+
+/// Read one id map of THIS process (empty when unreadable/non-unix).
+fn read_id_map(which: &str) -> IdMap {
+    #[cfg(unix)]
+    {
+        std::fs::read_to_string(format!("/proc/self/{which}"))
+            .map(|t| parse_id_map(&t))
+            .unwrap_or_default()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = which;
+        Vec::new()
+    }
+}
+
+/// True when the map text contains exactly the requested lines.
+fn map_has_exact_triples(which: &str, want: &[(u32, u32, u32)]) -> bool {
+    let have = read_id_map(which);
+    want.iter().all(|w| have.contains(w))
+}
+
+/// True when ns-id 0 maps to host `id` (virtual root == launcher) — the
+/// minimum functional namespace. u64 math: counts approach u32::MAX.
+fn ns_zero_maps_to(map: &IdMap, id: u32) -> bool {
+    map.iter().any(|(i, l, c)| {
+        *i == 0 && (*l as u64) <= (id as u64) && (id as u64) < (*l as u64) + (*c as u64)
+    })
+}
+
+/// Broad map: some line covers a wide count (>= 64k ids). Distinguishes a
+/// real identity/subordinate range from a narrow single-line self-map.
+fn map_is_broad(map: &IdMap) -> bool {
+    map.iter().any(|(_, _, c)| (*c as u64) >= 65536)
+}
+
+/// True when our user namespace maps (at most) our own ids — i.e. foreign
+/// files show as nobody. Read live from /proc, never assumed. try_full_root
+/// refuses a narrowed map (it cannot host full-root's promise); selective
+/// overlays proceed narrow with the gate's warnings.
+fn userns_map_is_narrow() -> bool {
+    !(map_is_broad(&read_id_map("uid_map")) && map_is_broad(&read_id_map("gid_map")))
+}
+
+/// Write the uid/gid maps for a freshly-created user namespace (must be called
+/// right after `unshare(CLONE_NEWUSER)`).
+///
+/// Goal: keep *every* host user addressable inside the ns — not just the
+/// launcher — so quarantined root can still write other users' files instead
+/// of seeing them as overflow-nobody (`nobody:nogroup`, read-only).
+///
+/// Strategy, in order:
+/// 1. Privileged (euid 0 in the parent ns): the kernel lets us write an
+///    arbitrary map directly. Identity-map the full range (`ns-N == host-N`)
+///    so all users stay mapped; when the launcher itself is non-zero (setuid /
+///    sudo edge) keep ns-0 pointed at the launcher and identity-map the rest.
+/// 2. Unprivileged: a process may only write a ONE-line self-map directly, so
+///    first try the setuid helpers `newuidmap`/`newgidmap` with our
+///    `/etc/subuid` + `/etc/subgid` range (`ns-0 -> launcher`, `ns-1.. ->
+///    subordinate range`). This is what gives the agent its low uid plus a
+///    tail of mapped ids.
+/// 3. Fallback: the single-line self-map (`0 <id> 1`). The agent runs as
+///    virtual root; other users' files show as nobody there.
+///
+/// Spawn the id-map helper child — must be called BEFORE the unshare.
+///
+/// A process that has already unshared `CLONE_NEWUSER` holds its capabilities
+/// in the NEW namespace only, so it cannot write any map covering kuids beyond
+/// its own — even when the launcher is real root (`geteuid()` also reads the
+/// overflow uid 65534 until a map is installed, so the privileged branch in
+/// [`write_userns_id_maps`] never fires). The standard fix — what util-linux
+/// `unshare(1)` does — is a helper process spawned before the unshare: it
+/// stays in the parent namespace, still holds CAP_SETUID there, and writes
+/// `/proc/<pid>/{uid,gid}_map` on request.
+///
+/// Only spawned for a real-root launcher (the only case the fallback
+/// strategies cannot handle). Returns `None` (and does nothing) otherwise.
+#[cfg(unix)]
+fn spawn_map_helper_if_privileged() -> Option<std::process::Child> {
+    if unsafe { libc::geteuid() } != 0 {
+        return None;
+    }
+    let script = "read umap; read gmap; \
+printf '%s\\n' \"$umap\" > /proc/$1/uid_map && printf '%s\\n' \"$gmap\" > /proc/$1/gid_map";
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .arg("sh")
+        .arg(std::process::id().to_string())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()
+}
+
+#[cfg(unix)]
+fn write_userns_id_maps(
+    uid: u32,
+    gid: u32,
+    map_helper: &mut Option<std::process::Child>,
+) -> std::io::Result<()> {
+    let _ = std::fs::write("/proc/self/setgroups", b"deny\n");
+    // --- 0. map helper from the parent namespace (root launcher) ---
+    // Installed by the pre-unshare helper (see
+    // [`spawn_map_helper_if_privileged`]): the full identity map, which no
+    // post-unshare write can install (after CLONE_NEWUSER we hold no caps in
+    // the parent ns). This keeps EVERY host uid/gid addressable, so files
+    // owned by other users — including the invoking user's own $HOME, i.e.
+    // pir's own security.toml / sessions — stay writable. Without it the
+    // single-line self-map below leaves $HOME owned by an unmapped kuid and
+    // every self-persistence write fails with EACCES. On any helper failure
+    // fall through to the strategies below.
+    if uid == 0 && gid == 0 {
+        if let Some(child) = map_helper.as_mut() {
+            const MAX: u64 = 4294967294; // highest valid kuid (2^32-2; -1 is overflow/nobody)
+            const MAX32: u32 = 4294967294;
+            let payload = format!("0 0 {MAX}\n0 0 {MAX}\n");
+            let mut ok = false;
+            if let Some(mut w) = child.stdin.take() {
+                ok = std::io::Write::write_all(&mut w, payload.as_bytes()).is_ok();
+                drop(w);
+            }
+            if ok {
+                ok = matches!(child.wait(), Ok(st) if st.success());
+            } else {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            // Verify, don't trust the helper's exit status: kernels exist
+            // that swallow multi-id maps while reporting success.
+            if ok
+                && map_has_exact_triples("uid_map", &[(0, 0, MAX32)])
+                && map_has_exact_triples("gid_map", &[(0, 0, MAX32)])
+            {
+                return Ok(());
+            }
+            // Else fall through to the narrower strategies below.
+        }
+    }
+    // --- 1. privileged direct write (no helper needed), VERIFIED ---
+    // Some kernels report success but install nothing for multi-id maps, so
+    // every strategy below is confirmed by reading the map back; unverified
+    // writes fall through to narrower strategies instead of lying.
+    if unsafe { libc::geteuid() } == 0 {
+        const MAX: u64 = 4294967294; // highest valid kuid (2^32-2; -1 is overflow/nobody)
+        const MAX32: u32 = 4294967294;
+        let (umap, uexp, gmap, gexp): (String, IdMap, String, IdMap);
+        if uid == 0 && gid == 0 {
+            // Common root-launcher case: pure identity map over everything.
+            umap = format!("0 0 {MAX}\n");
+            uexp = vec![(0, 0, MAX32)];
+            gmap = format!("0 0 {MAX}\n");
+            gexp = vec![(0, 0, MAX32)];
+        } else {
+            // ns-0 -> launcher, everything else identity, so virtual root is
+            // the launcher AND all other users stay addressable.
+            fn full_map(id: u32) -> (String, IdMap) {
+                let id64 = id as u64;
+                let mut s = format!("0 {id} 1\n");
+                let mut v = vec![(0, id, 1)];
+                if id > 0 {
+                    s.push_str(&format!("1 0 {id}\n"));
+                    v.push((1, 0, id));
+                }
+                if id64 + 1 < MAX {
+                    let tail = (MAX - id64 - 1).min(u32::MAX as u64) as u32;
+                    s.push_str(&format!("{} {} {}\n", id + 1, id + 1, tail));
+                    v.push((id + 1, id + 1, tail));
+                }
+                (s, v)
+            }
+            let (u_s, u_v) = full_map(uid);
+            let (g_s, g_v) = full_map(gid);
+            umap = u_s;
+            uexp = u_v;
+            gmap = g_s;
+            gexp = g_v;
+        }
+        let _ = std::fs::write("/proc/self/uid_map", umap.as_bytes());
+        let _ = std::fs::write("/proc/self/gid_map", gmap.as_bytes());
+        if map_has_exact_triples("uid_map", &uexp) && map_has_exact_triples("gid_map", &gexp) {
+            return Ok(());
+        }
+        // Not installed (or only partly): fall through to helpers / narrow.
+    }
+    // --- 2. unprivileged: newuidmap/newgidmap with our subordinate range ---
+    let pid = std::process::id().to_string();
+    // /etc/subuid + /etc/subgid are keyed by *name*; map ns-0 -> self and
+    // ns-1.. -> the first granted range (shared helper above).
+    let mut uid_done = false;
+    if let Some((start, count)) = subordinate_ranges("/etc/subuid", uid).first() {
+        let (start, count) = (*start, *count);
+        let (ss, sc) = (start.to_string(), count.to_string());
+        let _ = std::process::Command::new("newuidmap")
+            .args([pid.as_str(), "0", &uid.to_string(), "1", "1", &ss, &sc])
+            .status();
+        // Verify, don't trust the exit status: the kernel may swallow the map.
+        if map_has_exact_triples("uid_map", &[(0, uid, 1), (1, start, count)]) {
+            uid_done = true;
+        }
+    }
+    let mut gid_done = false;
+    if let Some((start, count)) = subordinate_ranges("/etc/subgid", gid).first() {
+        let (start, count) = (*start, *count);
+        let (ss, sc) = (start.to_string(), count.to_string());
+        let _ = std::process::Command::new("newgidmap")
+            .args([pid.as_str(), "0", &gid.to_string(), "1", "1", &ss, &sc])
+            .status();
+        if map_has_exact_triples("gid_map", &[(0, gid, 1), (1, start, count)]) {
+            gid_done = true;
+        }
+    }
+    // --- 3. narrow self-map for whichever map is still open ---
+    // (A map can only be written once; a write here errors when a previous
+    // strategy already installed something — ignored, verification decides.)
+    if !uid_done {
+        let _ = std::fs::write("/proc/self/uid_map", format!("0 {} 1\n", uid));
+    }
+    if !gid_done {
+        let _ = std::fs::write("/proc/self/gid_map", format!("0 {} 1\n", gid));
+    }
+    // Accept whatever verified: virtual-root==launcher in both maps is the
+    // minimum functional namespace (narrow but honest). Virgin maps are an
+    // error — callers must not mount into a namespace with no map at all.
+    if ns_zero_maps_to(&read_id_map("uid_map"), uid)
+        && ns_zero_maps_to(&read_id_map("gid_map"), gid)
+    {
+        return Ok(());
+    }
+    Err(std::io::Error::other(
+        "user-namespace id map did not install (kernel honored no range)",
+    ))
+}
+
+/// Parsed id-map: list of (inside-ns id, host id, count) triples.
+type IdMap = Vec<(u32, u32, u32)>;
+
 /// True once this process has entered its own private mount namespace. Used to
 /// make `enter_private_mount_ns` idempotent.
 static NS_ENTERED: AtomicBool = AtomicBool::new(false);
@@ -1787,6 +2206,17 @@ pub fn enter_private_mount_ns() -> std::io::Result<()> {
                 NS_ENTERED.store(false, Ordering::SeqCst);
                 return Err(std::io::Error::last_os_error());
             }
+        } else if unsafe { libc::geteuid() } == 0 {
+            // Root without kernel overlay (fuse path): a user namespace would
+            // only NARROW our vision (foreign-owned files -> nobody, read-only
+            // even for virtual root) while buying nothing — root already holds
+            // CAP_SYS_ADMIN for fuse-overlayfs. Stay in the init userns; the
+            // private mount namespace still scopes mounts to this agent.
+            let r = unsafe { libc::unshare(libc::CLONE_NEWNS) };
+            if r != 0 {
+                NS_ENTERED.store(false, Ordering::SeqCst);
+                return Err(std::io::Error::last_os_error());
+            }
         } else if fuse_overlayfs_available() {
             // Unprivileged path: a *user* namespace grants CAP_SYS_ADMIN *inside*
             // it (and scopes the mounts to us) so we can mount fuse-overlayfs
@@ -1794,22 +2224,19 @@ pub fn enter_private_mount_ns() -> std::io::Result<()> {
             // setuid helper needed -- we own the ns we just created).
             let uid = unsafe { libc::getuid() };
             let gid = unsafe { libc::getgid() };
+            // Spawn the map helper BEFORE the unshare — it must stay in the
+            // parent namespace to be privileged there (see its doc).
+            let mut map_helper = spawn_map_helper_if_privileged();
             let r = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) };
             if r != 0 {
                 NS_ENTERED.store(false, Ordering::SeqCst);
                 return Err(std::io::Error::last_os_error());
             }
-            let _ = std::fs::write("/proc/self/setgroups", b"deny\n");
-            // Single-line root-map: ns-0 -> our own host uid/gid. (The kernel
-            // only lets an unprivileged process write a ONE-line map of its own
-            // uid; multi-line maps need setuid-root newuidmap helpers.) The agent
-            // runs as virtual root here; `drop_to_agent_user` recognises that
-            // virtual root already IS the agent and skips the setuid.
-            let gmap = format!("0 {} 1\n", gid);
-            let umap = format!("0 {} 1\n", uid);
-            if std::fs::write("/proc/self/gid_map", gmap).is_err()
-                || std::fs::write("/proc/self/uid_map", umap).is_err()
-            {
+            // Full-range map when a subuid/subgid range exists (keeps other
+            // users' files addressable); single-line self-map fallback. The
+            // agent runs as virtual root here; `drop_to_agent_user` recognises
+            // that virtual root already IS the agent and skips the setuid.
+            if write_userns_id_maps(uid, gid, &mut map_helper).is_err() {
                 NS_ENTERED.store(false, Ordering::SeqCst);
                 return Err(std::io::Error::other(
                     "failed to write user-namespace id map",
@@ -1850,16 +2277,25 @@ pub fn enter_private_mount_ns() -> std::io::Result<()> {
     Ok(())
 }
 
+/// True when stdout of `id -u` reports uid 0. Split out for tests: the
+/// production `run()` helper returns (status, STDERR), and comparing that to
+/// "0" made `can_mount` always-false (sending every root session down the
+/// fuse+userns path into a narrowed namespace).
+#[cfg(unix)]
+fn id_output_is_root(out: &str) -> bool {
+    out.trim() == "0"
+}
+
 #[cfg(unix)]
 pub fn can_mount() -> bool {
     if !overlay_supported() {
         return false;
     }
-    // euid 0 is the common case here (the launcher runs as root). We shell
-    // `id -u` to avoid a libc dep.
-    match run(&["id", "-u"]) {
-        (true, out) => out.trim() == "0",
-        _ => false,
+    // euid 0 is the common case here (the launcher runs as root). Read
+    // STDOUT directly (`run()` yields stderr, which is empty here).
+    match std::process::Command::new("id").arg("-u").output() {
+        Ok(o) => o.status.success() && id_output_is_root(&String::from_utf8_lossy(&o.stdout)),
+        Err(_) => false,
     }
 }
 
@@ -2157,5 +2593,81 @@ mod tests {
         );
         // guard drop: unmount + remove the applied canary + wipe staging, so
         // the host is left exactly as it was.
+    }
+
+    /// `id_mappable` covers self plus every granted subordinate range.
+    #[test]
+    fn id_map_covers_self_and_subordinate_ranges() {
+        assert!(id_mappable(983, 983, &[]));
+        assert!(id_mappable(100_000, 983, &[(100_000, 65_536)]));
+        assert!(id_mappable(165_535, 983, &[(100_000, 65_536)]));
+        assert!(!id_mappable(165_536, 983, &[(100_000, 65_536)]));
+        assert!(!id_mappable(0, 983, &[]));
+        assert!(!id_mappable(0, 983, &[(100_000, 65_536)]));
+    }
+
+    /// A tree we own scans clean: root mappable, no foreign owners. Needs no
+    /// privileges (proves the scanner works for the common self-owned case).
+    #[test]
+    fn self_owned_tree_scans_mappable() {
+        let base = std::env::temp_dir().join(format!("pir-mapscan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        std::fs::write(base.join("a.txt"), b"x").unwrap();
+        std::fs::write(base.join("sub").join("b.txt"), b"y").unwrap();
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let (root_ok, foreign, _) = scan_unmappable_owners(&base, uid, gid);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(root_ok, "own tempdir root must be mappable");
+        assert!(
+            foreign.is_empty(),
+            "own files must not be reported foreign: {foreign:?}"
+        );
+    }
+
+    /// Detection core, privilege-free: scanning our own tree *as a stranger id*
+    /// must report the root unmappable (that is exactly what an unprivileged
+    /// launcher sees for another owner's files — the refuse trigger).
+    #[test]
+    fn stranger_ids_detect_tree_as_unmappable() {
+        let base = std::env::temp_dir().join(format!("pir-mapgate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("f.txt"), b"z").unwrap();
+        // Self-owned root always passes the gate (root and non-root alike:
+        // root identity-maps everything, non-root trivially maps itself).
+        assert!(check_tree_mappable(&base, "testtree").is_ok());
+        // Same tree viewed as an unrelated id: root must be unmappable.
+        let me = unsafe { libc::getuid() };
+        let stranger = me.wrapping_add(1);
+        assert_ne!(stranger, me);
+        let (root_ok, _, _) = scan_unmappable_owners(&base, stranger, stranger);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            !root_ok,
+            "tree owned by {me} must be unmappable for stranger id {stranger}"
+        );
+    }
+
+    /// Map-line parsing handles the kernel's padded columns, and coverage
+    /// math holds at the u32 edges (identity MAX must cover everyone).
+    #[test]
+    fn id_map_parse_and_coverage() {
+        let m = parse_id_map("         0          0          1\n");
+        assert_eq!(m, vec![(0, 0, 1)]);
+        assert!(ns_zero_maps_to(&m, 0));
+        assert!(!ns_zero_maps_to(&m, 983));
+        assert!(!map_is_broad(&m));
+        let full = parse_id_map("         0          0 4294967294\n");
+        assert!(ns_zero_maps_to(&full, 0));
+        assert!(ns_zero_maps_to(&full, 983));
+        assert!(ns_zero_maps_to(&full, 4294967293));
+        assert!(!ns_zero_maps_to(&full, 4294967294));
+        assert!(map_is_broad(&full));
+        // Malformed lines are skipped, never panic.
+        let mixed = parse_id_map("garbage\n0 1\n  0   5   10 \n");
+        assert_eq!(mixed, vec![(0, 5, 10)]);
+        assert!(parse_id_map("").is_empty());
     }
 }

@@ -222,6 +222,92 @@ pub mod impls {
     }
 }
 
+/// Guess the LLM provider from a desktop window title (e.g. the browser tab
+/// the user copied an API key from: "OpenAI API keys - Chrome",
+/// "Anthropic Console", "Google AI Studio", …). Returns the catalog-style
+/// provider id or `None` when no known provider name appears in the title.
+/// Case-insensitive substring match; the first matching alias wins.
+pub fn guess_provider_from_title(title: &str) -> Option<&'static str> {
+    let t = title.to_lowercase();
+    // Order matters only where substrings overlap (e.g. "ai studio" must be
+    // checked as part of the google rule before any generic "ai" rule —
+    // there is no generic "ai" rule here precisely to avoid false positives
+    // on titles like "AI assistant" or "Mail").
+    if t.contains("anthropic") || t.contains("claude") {
+        Some("anthropic")
+    } else if t.contains("openai") || t.contains("chatgpt") {
+        Some("openai")
+    } else if t.contains("gemini")
+        || t.contains("google ai")
+        || t.contains("ai studio")
+        || t.contains("aistudio")
+        || t.contains("makersuite")
+    {
+        Some("google")
+    } else if t.contains("openrouter") {
+        Some("openrouter")
+    } else if t.contains("groq") {
+        Some("groq")
+    } else if t.contains("mistral") {
+        Some("mistral")
+    } else if t.contains("deepseek") {
+        Some("deepseek")
+    } else if t.contains("xai") || t.contains("grok") {
+        Some("xai")
+    } else if t.contains("together") {
+        Some("together")
+    } else if t.contains("cerebras") {
+        Some("cerebras")
+    } else if t.contains("cohere") {
+        Some("cohere")
+    } else if t.contains("perplexity") {
+        Some("perplexity")
+    } else if t.contains("ollama") {
+        Some("ollama-cloud")
+    } else if t.contains("github") || t.contains("copilot") {
+        Some("github")
+    } else if t.contains("slack") {
+        Some("slack")
+    } else {
+        None
+    }
+}
+
+/// Does `s` look like it could hold an API key (a single opaque token, not a
+/// sentence)? True when the trimmed string contains a whitespace-separated
+/// token of at least 20 chars drawn from the usual key alphabet. Used so `/l`
+/// can combine "provider from window title" + "key from clipboard" even when
+/// the key format itself is opaque (no known `sk-…`-style prefix).
+pub fn looks_like_key(s: &str) -> bool {
+    extract_key_candidate(s).is_some()
+}
+
+/// Extract the first key-like token from `s` (the clipboard or a window title).
+/// Strips surrounding quotes/backticks/whitespace and returns the raw token.
+/// A token counts when it is at least 20 chars long and mostly drawn from
+/// `[A-Za-z0-9\-_.:~+=/]` (covers `sk-…`, `sk-ant-…`, `AIza…`, `xoxb-…`,
+/// `ghp_…`, JWT-ish and hex-ish keys). Returns `None` when there is no such
+/// token (e.g. empty clipboard, prose, or a short word).
+pub fn extract_key_candidate(s: &str) -> Option<String> {
+    for raw in s.split_whitespace() {
+        let tok = raw.trim_matches(|c: char| {
+            c == '"' || c == '\'' || c == '`' || c == '<' || c == '>' || c == ',' || c == ';'
+        });
+        if tok.len() < 20 {
+            continue;
+        }
+        let good = tok
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || "-_.:~+=/".contains(*c))
+            .count();
+        // At least 80% key-alphabet chars (allows a trailing `.`/`!` etc.).
+        if good * 5 >= tok.len() * 4 {
+            return Some(tok.to_string());
+        }
+    }
+    None
+}
+
 /// Guess the LLM provider from a candidate secret/key string. Returns the
 /// catalog-style provider id (`openai`, `anthropic`, …) or `None` when the
 /// format isn't recognised. Mirrors the heuristic shown to the user earlier:
@@ -273,5 +359,32 @@ mod tests {
         assert_eq!(guess_provider_from_key("github_pat_abc"), Some("github"));
         assert_eq!(guess_provider_from_key(""), None);
         assert_eq!(guess_provider_from_key("not-a-key"), None);
+    }
+
+    #[test]
+    fn guess_from_title_names() {
+        assert_eq!(
+            guess_provider_from_title("OpenAI API keys - Google Chrome"),
+            Some("openai")
+        );
+        assert_eq!(guess_provider_from_title("Anthropic Console - Claude"), Some("anthropic"));
+        assert_eq!(guess_provider_from_title("Google AI Studio"), Some("google"));
+        assert_eq!(guess_provider_from_title("Gemini API key"), Some("google"));
+        assert_eq!(guess_provider_from_title("Groq Console"), Some("groq"));
+        assert_eq!(guess_provider_from_title("Untitled - Notepad"), None);
+        // Must not false-positive on generic "AI" substrings like "Mail".
+        assert_eq!(guess_provider_from_title("Inbox - Gmail"), None);
+    }
+
+    #[test]
+    fn key_candidate_extraction() {
+        let opaque = "abcdefghij1234567890ABCD";
+        assert_eq!(extract_key_candidate(opaque), Some(opaque.to_string()));
+        assert!(looks_like_key(opaque));
+        assert_eq!(extract_key_candidate("short key"), None);
+        assert_eq!(extract_key_candidate(""), None);
+        // Multi-line clipboard: the key token is recovered, prose is skipped.
+        let multi = "here is my key:\nabcdefghij1234567890ABCD\nthanks";
+        assert_eq!(extract_key_candidate(multi), Some(opaque.to_string()));
     }
 }

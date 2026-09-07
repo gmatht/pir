@@ -43,6 +43,20 @@ pub fn name_of_uid(uid: u32) -> Option<String> {
     None
 }
 
+/// The invoking user's home directory (for global defaults): `SUDO_USER`'s
+/// home under sudo, else the startup `$HOME`. Call BEFORE any privilege drop
+/// or HOME rewrite; `main` snapshots it into `PIR_INVOKING_HOME`.
+#[cfg(unix)]
+pub fn invoking_home() -> Option<std::path::PathBuf> {
+    if let Ok(n) = std::env::var("SUDO_USER") {
+        if !n.trim().is_empty() {
+            if let Some(h) = home_of(n.trim()) {
+                return Some(h);
+            }
+        }
+    }
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
 /// The user who launched `pir` (the "invoking user"), captured before any
 /// privilege drop. `SUDO_USER` takes precedence (it is the human who ran
 /// `sudo … pir`); otherwise the *real* uid's name is used (`getuid()` is the
@@ -877,6 +891,80 @@ pub fn current_user_home() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
 
+/// Find the first free block of `count` ids at/above 100000 that overlaps no
+/// used range. Pure (takes the parsed used ranges) so it is unit-testable.
+fn find_free_subid_range(used: &[(u32, u32)], count: u32) -> u32 {
+    let mut start: u64 = 100_000;
+    loop {
+        let end = start + count as u64;
+        let overlaps = used.iter().any(|(u, c)| {
+            let (u, c) = (*u as u64, *c as u64);
+            start < u + c && u < end
+        });
+        if !overlaps && end <= u32::MAX as u64 {
+            return start as u32;
+        }
+        // Jump past the overlapping range instead of stepping by one.
+        let next = used
+            .iter()
+            .filter(|(u, c)| start < *u as u64 + *c as u64 && (*u as u64) < end)
+            .map(|(u, c)| *u as u64 + *c as u64)
+            .max()
+            .unwrap_or(start + 1);
+        start = next;
+        if start > u32::MAX as u64 - count as u64 {
+            return start.min(u32::MAX as u64) as u32;
+        }
+    }
+}
+
+/// Parse `name:start:count` lines from a subuid/subgid file into (start, count).
+fn parse_subid_file(path: &str) -> Vec<(String, u32, u32)> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|l| {
+            let mut f = l.split(':');
+            let name = f.next()?.trim().to_string();
+            let s: u32 = f.next()?.trim().parse().ok()?;
+            let c: u32 = f.next()?.trim().parse().ok()?;
+            Some((name, s, c))
+        })
+        .collect()
+}
+
+/// Ensure `user` has subordinate uid+gid ranges (best-effort, root-only).
+/// Without them an unprivileged quarantine's user-namespace map holds just
+/// one line (ns-0 -> self): every other owner's files appear as nobody and
+/// are read-only even for virtual root. Assigns a fresh non-overlapping
+/// 65536-block when missing; existing entries are left alone.
+#[cfg(unix)]
+fn ensure_subordinate_ids(user: &str) {
+    use std::process::Command;
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    for (path, kind, flag) in [
+        ("/etc/subuid", "subuid", "--add-subuids"),
+        ("/etc/subgid", "subgid", "--add-subgids"),
+    ] {
+        let entries = parse_subid_file(path);
+        if entries.iter().any(|(n, _, _)| n == user) {
+            continue;
+        }
+        let used: Vec<(u32, u32)> = entries.iter().map(|(_, s, c)| (*s, *c)).collect();
+        let start = find_free_subid_range(&used, 65_536);
+        let range = format!("{start}-{}", start + 65_535);
+        match Command::new("usermod").args([flag, &range, user]).status() {
+            Ok(s) if s.success() => println!("granted {user} {kind} range {range}"),
+            _ => eprintln!(
+                "warning: could not assign {kind} range to {user} (run as root: usermod {flag} {range} {user}); unprivileged quarantine will map only its own id"
+            ),
+        }
+    }
+}
+
 /// Idempotently provision the `ai_<project>` execution user for `path`.
 ///
 /// Must be run as root. Creates a non-login system account owning `path` and
@@ -965,6 +1053,13 @@ pub fn provision(
         }
     }
     println!("granted {user} ownership of {path_s}");
+
+    // 2b. Ensure subordinate uid/gid ranges so an unprivileged quarantine can
+    //     map more than just the agent's own id. Without an /etc/subuid entry
+    //     the user-namespace id map is a single line (ns-0 -> self) and every
+    //     other owner's files show up as nobody (read-only, even for virtual
+    //     root). Applies to new and pre-existing users alike.
+    ensure_subordinate_ids(user);
 
     // 3. Record mapping.
     crate::config::set_project_user(project, user, &path_s)?;
@@ -1177,5 +1272,31 @@ mod accessibility_tests {
         let md = std::fs::metadata(&base).unwrap();
         assert!(!can_traverse(&md, other, other_gid));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // The subuid allocator must hand out non-overlapping blocks at/above
+    // 100000: overlapping ranges would let two agent users map the same host
+    // ids (ownership confusion inside quarantine namespaces).
+    #[test]
+    fn free_subid_range_skips_used_blocks() {
+        assert_eq!(find_free_subid_range(&[], 65_536), 100_000);
+        assert_eq!(
+            find_free_subid_range(&[(100_000, 65_536)], 65_536),
+            165_536
+        );
+        // Adjacent but non-overlapping blocks pack tightly.
+        assert_eq!(
+            find_free_subid_range(&[(100_000, 65_536), (165_536, 65_536)], 65_536),
+            231_072
+        );
+        // A used block in the middle is jumped over, not stepped through.
+        assert_eq!(
+            find_free_subid_range(&[(165_536, 65_536)], 65_536),
+            100_000
+        );
+        assert_eq!(
+            find_free_subid_range(&[(100_000, 100_000)], 65_536),
+            200_000
+        );
     }
 }

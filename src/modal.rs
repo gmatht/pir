@@ -698,12 +698,25 @@ pub fn model_picker(providers: &[crate::config::Provider], current: &str) -> Opt
     }
 }
 
+/// Outcome of [`security_editor`]: saved (with the file path), discarded by
+/// the operator, or not openable (no tty). Returned explicitly so the caller
+/// can report the path or the error instead of swallowing it.
+pub enum SecuritySave {
+    /// One file saved (`s`), or session + global files (`d`).
+    Saved(Vec<std::path::PathBuf>),
+    SaveFailed(String),
+    Discarded,
+    NoTty,
+}
+
 /// The editable security-options dialog (opened from the menu's Security
 /// item). Arrow through the rows, `←/→` (or `h`/`l`) cycles the value, `s` or
 /// Enter saves to `security.toml` (takes effect for new sessions), `q`/Esc
 /// discards. Mutates `policy` only when the user saves.
-pub fn security_editor(policy: &mut crate::security::SecurityPolicy) -> Option<()> {
-    let _modal = Modal::enter()?;
+pub fn security_editor(policy: &mut crate::security::SecurityPolicy) -> SecuritySave {
+    let Some(_modal) = Modal::enter() else {
+        return SecuritySave::NoTty;
+    };
 
     let mut level = policy.level;
     let mut apt = policy.apt;
@@ -740,7 +753,8 @@ pub fn security_editor(policy: &mut crate::security::SecurityPolicy) -> Option<(
             format!("{} read               {}", marker(6), term::cyan(read.as_str())),
             format!("{} user-security     {}", marker(7), yn(user_security)),
             String::new(),
-            term::dim("[↑/↓] move  [←/→] change  [s] save  [q] discard"),
+            term::dim("[↑/↓] move  [←/→] change  [s] save  [d] save as global defaults  [q] discard"),
+            term::dim("note: disabling a quarantine mid-session unmounts its overlays + discards staged writes"),
         ];
         draw_box("pir — security options", &lines);
         #[allow(clippy::too_many_arguments)]
@@ -790,12 +804,15 @@ pub fn security_editor(policy: &mut crate::security::SecurityPolicy) -> Option<(
                 _ => {}
             }
         }
-        match read_key()? {
-            Key::Up | Key::Char('k') => selected = selected.saturating_sub(1),
-            Key::Down | Key::Char('j') => selected = (selected + 1).min(7),
-            Key::Left | Key::Char('h') => apply_spin(selected, -1, &spin, &mut level, &mut apt, &mut network, &mut ask, &mut read, &mut quarantine, &mut quarantine_project, &mut user_security),
-            Key::Right | Key::Char('l') => apply_spin(selected, 1, &spin, &mut level, &mut apt, &mut network, &mut ask, &mut read, &mut quarantine, &mut quarantine_project, &mut user_security),
-            Key::Char('s') | Key::Enter => {
+        let Some(key) = read_key() else {
+            return SecuritySave::NoTty;
+        };
+        match key {
+            Key::Up | Key::Char('k') | Key::Char('K') => selected = selected.saturating_sub(1),
+            Key::Down | Key::Char('j') | Key::Char('J') => selected = (selected + 1).min(7),
+            Key::Left | Key::Char('h') | Key::Char('H') => apply_spin(selected, -1, &spin, &mut level, &mut apt, &mut network, &mut ask, &mut read, &mut quarantine, &mut quarantine_project, &mut user_security),
+            Key::Right | Key::Char('l') | Key::Char('L') => apply_spin(selected, 1, &spin, &mut level, &mut apt, &mut network, &mut ask, &mut read, &mut quarantine, &mut quarantine_project, &mut user_security),
+            Key::Char('s') | Key::Char('S') | Key::Enter => {
                 policy.level = level;
                 policy.apt = apt;
                 policy.network = network;
@@ -804,10 +821,58 @@ pub fn security_editor(policy: &mut crate::security::SecurityPolicy) -> Option<(
                 policy.quarantine = quarantine;
                 policy.quarantine_project = quarantine_project;
                 policy.user_security = user_security;
-                let _ = crate::security::save_policy(policy);
-                return Some(());
+                // Never swallow the result: the caller reports the path (proof
+                // of where it landed) or the error (proof of why it didn't).
+                // On failure append the identity diagnostic: EACCES with euid 0
+                // means virtual-root-in-a-namespace or a container view, and
+                // the flags say which.
+                return match crate::security::save_policy(policy) {
+                    Ok(path) => SecuritySave::Saved(vec![path]),
+                    Err(e) => {
+                        let target = crate::config::pi_dir().join("agent").join("security.toml");
+                        SecuritySave::SaveFailed(format!(
+                            "{e} [{}]",
+                            crate::security::save_diagnostic(&target)
+                        ))
+                    }
+                };
             }
-            Key::Esc | Key::CtrlC | Key::CtrlD | Key::Char('q') => return Some(()),
+            Key::Char('d') | Key::Char('D') => {
+                policy.level = level;
+                policy.apt = apt;
+                policy.network = network;
+                policy.ask = ask;
+                policy.read = read;
+                policy.quarantine = quarantine;
+                policy.quarantine_project = quarantine_project;
+                policy.user_security = user_security;
+                // Save as global defaults: session file AND the invoking
+                // user's file (fresh projects inherit it via the load
+                // fallback). Session first so the current project stays
+                // consistent even if the global write fails.
+                let session_path = crate::config::pi_dir().join("agent").join("security.toml");
+                let global_path = crate::security::global_defaults_file();
+                let mut targets = vec![session_path];
+                if global_path != targets[0] {
+                    targets.push(global_path);
+                }
+                let mut saved = Vec::new();
+                for t in &targets {
+                    match crate::security::save_policy_to(policy, t) {
+                        Ok(p) => saved.push(p),
+                        Err(e) => {
+                            return SecuritySave::SaveFailed(format!(
+                                "{e} [{}]",
+                                crate::security::save_diagnostic(t)
+                            ));
+                        }
+                    }
+                }
+                return SecuritySave::Saved(saved);
+            }
+            Key::Esc | Key::CtrlC | Key::CtrlD | Key::Char('q') | Key::Char('Q') => {
+                return SecuritySave::Discarded;
+            }
             _ => {}
         }
     }

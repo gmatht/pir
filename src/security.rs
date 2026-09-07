@@ -217,7 +217,10 @@ impl Parcel {
 // Policy / posture
 // ===========================================================================
 
-/// The overall confinement level.
+/// The overall confinement level. Default is Mitigation: the command
+/// analyzer rewrites dangerous commands and denies RED, with the in-process
+/// guardrail behind it — safe to run anywhere, including fresh directories
+/// with no sandbox user (which downgrade to invoking-user mode).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SecurityLevel {
     Sandbox,
@@ -229,8 +232,8 @@ pub enum SecurityLevel {
     /// (raw-device / irreversible) with a prescriptive message, and emits an
     /// in-band receipt. Sits between the in-process guardrail and the OS
     /// boundary.
-    Mitigation,
     #[default]
+    Mitigation,
     Guard,
     Off,
 }
@@ -517,7 +520,7 @@ impl NetworkMode {
 impl Default for SecurityPolicy {
     fn default() -> Self {
         SecurityPolicy {
-            level: SecurityLevel::Guard,
+            level: SecurityLevel::Mitigation,
             apt: AptMode::Auto,
             network: NetworkMode::On,
             ask: AskMode::Ask,
@@ -1139,11 +1142,35 @@ impl RequestSink for QueuedSink {
 // ===========================================================================
 
 /// Load the security policy from `~/.pi/agent/security.toml` (if present),
-/// else the documented defaults. Tolerant of unknown keys / malformed lines.
+/// else the invoking user's global defaults (see [`global_defaults_file`],
+/// written by the editor's `(d)`), else the documented defaults. Tolerant of
+/// unknown keys / malformed lines. Policy therefore never comes from the repo
+/// itself — a malicious checkout cannot set your level.
 pub fn load_policy() -> SecurityPolicy {
     let path = crate::config::pi_dir().join("agent").join("security.toml");
+    load_policy_for(&path, &global_defaults_file())
+}
+
+/// Resolve a policy from an explicit session file + global file: session wins,
+/// then global defaults, then hardcoded defaults. Pure (no env) for tests.
+pub fn load_policy_for(session_file: &std::path::Path, global_file: &std::path::Path) -> SecurityPolicy {
+    if session_file.exists() {
+        return load_policy_file(session_file);
+    }
+    // No sandbox/project file (fresh dir, never configured): inherit the
+    // operator's global defaults instead of hardcoded ones, so new projects
+    // start at the chosen posture.
+    if global_file != session_file && global_file.exists() {
+        return load_policy_file(global_file);
+    }
+    SecurityPolicy::default()
+}
+
+/// Read a policy from an explicit file path (no env consulted). Missing or
+/// unreadable file yields the documented defaults.
+pub fn load_policy_file(path: &std::path::Path) -> SecurityPolicy {
     let mut policy = SecurityPolicy::default();
-    let Ok(raw) = std::fs::read_to_string(&path) else {
+    let Ok(raw) = std::fs::read_to_string(path) else {
         return policy;
     };
     for line in raw.lines() {
@@ -1250,12 +1277,81 @@ pub fn load_policy() -> SecurityPolicy {
     policy
 }
 
+/// One-line process-identity + quarantine-state diagnostic, appended to save
+/// failures. The classic shape is EACCES-with-euid-0: real root never gets
+/// EACCES from DAC, so it means virtual-root-in-a-userns (unmapped kuids) or
+/// a chroot/container view — the flags below say which.
+#[cfg(unix)]
+pub fn save_diagnostic(target: &std::path::Path) -> String {
+    let euid = unsafe { libc::geteuid() };
+    let uid = unsafe { libc::getuid() };
+    let userns = match (
+        std::fs::read_link("/proc/self/ns/user").ok(),
+        std::fs::read_link("/proc/1/ns/user").ok(),
+    ) {
+        (Some(a), Some(b)) => {
+            if a == b {
+                "init"
+            } else {
+                "non-init"
+            }
+            .to_string()
+        }
+        _ => "unknown".to_string(),
+    };
+    // Full maps (capped): first-line-only once hid a multi-line map behind a
+    // "0 0 1" head. Flatten newlines so the whole diagnostic stays one line.
+    let flat = |which: &str| {
+        std::fs::read_to_string(format!("/proc/self/{which}"))
+            .map(|m| {
+                let s = m.split_whitespace().collect::<Vec<_>>().join(" ");
+                if s.len() > 120 { format!("{}…", &s[..120]) } else { s }
+            })
+            .unwrap_or_else(|_| "unreadable".to_string())
+    };
+    let (umap, gmap) = (flat("uid_map"), flat("gid_map"));
+    format!(
+        "target={} euid={} uid={} userns={} uid_map=[{}] gid_map=[{}] container={} fullroot={} sys_q={} proj_q={}",
+        target.display(),
+        euid,
+        uid,
+        userns,
+        umap,
+        gmap,
+        overlay::container_engaged(),
+        overlay::fullroot_engaged(),
+        overlay::system_quarantine_engaged(),
+        overlay::project_quarantine_engaged(),
+    )
+}
+/// `~/.pi/agent/security.toml` (the file [`load_policy`] reads at startup) in
+/// the same flat `key = value` format. Written from the `/menu` security
+/// editor; takes effect for new sessions (the live context keeps its snapshot).
 /// Persist the operator-tunable fields of `policy` back to
 /// `~/.pi/agent/security.toml` (the file [`load_policy`] reads at startup) in
 /// the same flat `key = value` format. Written from the `/menu` security
 /// editor; takes effect for new sessions (the live context keeps its snapshot).
 pub fn save_policy(policy: &SecurityPolicy) -> Result<PathBuf, String> {
-    let p = crate::config::pi_dir().join("agent").join("security.toml");
+    save_policy_to(policy, &crate::config::pi_dir().join("agent").join("security.toml"))
+}
+
+/// The invoking user's global-defaults file: where the editor's `(d)` writes,
+/// and what [`load_policy`] falls back to when no sandbox/project file exists.
+/// Honors `PI_DIR` (then session and global coincide); otherwise the home
+/// captured in `PIR_INVOKING_HOME` at startup (SUDO_USER's home under sudo,
+/// else the startup `$HOME`).
+pub fn global_defaults_file() -> PathBuf {
+    if std::env::var_os("PI_DIR").is_some() {
+        return crate::config::pi_dir().join("agent").join("security.toml");
+    }
+    if let Some(h) = std::env::var_os("PIR_INVOKING_HOME") {
+        return PathBuf::from(h).join(".pi").join("agent").join("security.toml");
+    }
+    crate::config::pi_dir().join("agent").join("security.toml")
+}
+
+/// Write the tunable fields to an explicit path (same format as [`save_policy`]).
+pub fn save_policy_to(policy: &SecurityPolicy, p: &std::path::Path) -> Result<PathBuf, String> {
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
@@ -1276,8 +1372,8 @@ pub fn save_policy(policy: &SecurityPolicy) -> Result<PathBuf, String> {
     if let Some(wt) = &policy.allow_worktree {
         lines.push(format!("security.allow-worktree = \"{}\"", wt.display()));
     }
-    std::fs::write(&p, format!("{}\n", lines.join("\n"))).map_err(|e| e.to_string())?;
-    Ok(p)
+    std::fs::write(p, format!("{}\n", lines.join("\n"))).map_err(|e| e.to_string())?;
+    Ok(p.to_path_buf())
 }
 
 // ===========================================================================
@@ -1901,6 +1997,50 @@ mod tests {
             None => std::env::remove_var("PI_DIR"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fresh directories (no security.toml) and the missing-sandbox-user
+    /// downgrade run at mitigation level by default: analyzer rewrites +
+    /// RED-denies on, without requiring any OS user to exist.
+    #[test]
+    fn default_level_is_mitigation() {
+        let p = SecurityPolicy::default();
+        assert_eq!(p.level, SecurityLevel::Mitigation);
+        assert!(p.level.is_mitigation());
+        assert!(p.level.guards_writes());
+    }
+
+    /// With no session file, resolution inherits the invoking user's global
+    /// defaults (the editor's `(d)` target) instead of hardcoded defaults —
+    /// so new projects start at the operator's posture. Pure paths, no env.
+    #[test]
+    fn load_policy_falls_back_to_global_defaults() {
+        let base = std::env::temp_dir().join(format!("pir_pol_glob_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let session = base.join("session.toml");
+        let global = base.join("global.toml");
+        let gp = SecurityPolicy { level: SecurityLevel::Strict, quarantine: false, ..Default::default() };
+        save_policy_to(&gp, &global).expect("save global");
+        // Session missing -> global wins.
+        let loaded = load_policy_for(&session, &global);
+        assert_eq!(loaded.level, SecurityLevel::Strict);
+        assert!(!loaded.quarantine);
+        // Session present -> session wins over global.
+        let sp = SecurityPolicy { level: SecurityLevel::Sandbox, quarantine: true, ..Default::default() };
+        save_policy_to(&sp, &session).expect("save session");
+        let loaded2 = load_policy_for(&session, &global);
+        assert_eq!(loaded2.level, SecurityLevel::Sandbox);
+        assert!(loaded2.quarantine);
+        // Neither present -> hardcoded (mitigation) defaults.
+        let loaded3 = load_policy_for(&base.join("nope1.toml"), &base.join("nope2.toml"));
+        assert_eq!(loaded3.level, SecurityLevel::Mitigation);
+        // Explicit file read + write roundtrip through an arbitrary path.
+        let p2 = SecurityPolicy { level: SecurityLevel::Worktree, ..Default::default() };
+        let f = base.join("direct.toml");
+        save_policy_to(&p2, &f).expect("save direct");
+        assert_eq!(load_policy_file(&f).level, SecurityLevel::Worktree);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// With `user-security` on, a write into another user's tree is denied
