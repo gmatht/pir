@@ -1,0 +1,53 @@
+Output pir --resume session_name on exit
+
+Do output rendering parity tests.
+
+Get user, quarentine and migitagtion security all tested. (maybe working together)
+
+Test hardlinks for backup?
+
+--reflink
+
+maybe use BTRFS snapshots in place of worktree, and overlays when available.
+
+--
+The most efficient native method to detect changed files between two Btrfs snapshots is using btrfs send --no-data, which generates a stream of metadata changes without transferring file content.
+
+You can use this stream directly or decode it with tools like btrfs-snapshots-diff or btrfs-diff-go to list added, modified, or deleted files in a readable format.
+
+Alternatively, for a quick list of modified files in a newer snapshot relative to an older one, you can use btrfs subvolume find-new to identify files changed after the older snapshot's generation ID.
+
+Recommended Methods
+1. Using btrfs send --no-data (Native & Efficient)
+This command compares the metadata of a parent snapshot and a child snapshot, outputting a stream of changes. Piping this to btrfs receive --dump allows you to filter specific change types (like update_extent for content changes or update_inode for metadata).
+
+btrfs send --no-data -p /snapshots/parent /snapshots/child | btrfs receive --dump | grep ^update_extent
+
+2. Using btrfs-snapshots-diff (User-Friendly)
+This Python script decodes the btrfs send stream into a clear list of differences, supporting JSON or CSV output.
+
+btrfs-snapshots-diff.py -p /snapshots/parent -c /snapshots/child
+
+3. Using btrfs subvolume find-new (Generation-Based)
+This finds files changed in a subvolume after a specific transaction ID (generation). You can retrieve the generation of the older snapshot and use it to find changes in the newer one.
+
+# Find the generation of the older snapshot
+OLD_GEN=$(btrfs subvolume find-new /snapshots/parent 9999999 | awk '{print $4}')
+# List files changed in the newer snapshot since that generation
+btrfs subvolume find-new /snapshots/child $OLD_GEN
+
+4. Using Snapper (If Managed by Snapper)
+If your snapshots are managed by Snapper, you can use its built-in diff commands.
+
+# List changed files between snapshot 10 and 20
+snapper -c your_config diff 10..20
+
+# Show detailed file content differences
+snapper -c your_config diff 10..20 /path/to/file
+
+Limitations
+btrfs send --no-data primarily detects metadata and extent changes; it may not explicitly report file deletions in all dump formats without additional parsing.
+btrfs subvolume find-new does not detect deleted files, only files that exist and were modified after the specified generation.
+Standard diff commands require mounting both snapshots and comparing directories directly, which is slower than the metadata-only approaches above.
+--
+
