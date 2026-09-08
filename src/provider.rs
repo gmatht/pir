@@ -105,6 +105,10 @@ pub struct Client {
     kind: ApiKind,
     base_url: String,
     api_key: String,
+    /// Offline scripted model (see `crate::fake`): when set, `chat`/`complete`
+    /// synthesize turns locally and never touch the network. Wired by
+    /// `make_client` for the `fake` test provider only.
+    fake: bool,
     /// Shared cancellation flag. When set (e.g. by the REPL on Ctrl-C/Ctrl-D),
     /// an in-flight streaming response aborts at its next poll boundary instead
     /// of blocking until the whole model reply is received.
@@ -145,8 +149,14 @@ impl Client {
             kind,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
+            fake: false,
             cancel: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Enable the offline scripted model (see `crate::fake`).
+    pub fn set_fake(&mut self, fake: bool) {
+        self.fake = fake;
     }
 
     /// Point the client at the running turn's cancellation flag. The REPL sets
@@ -164,6 +174,10 @@ impl Client {
     /// "no opinion" by the caller. Honours `PIR_STALL_TIMEOUT_SECS`/the cancel
     /// flag like the streaming path, so a stuck provider can't hang the turn.
     pub fn complete(&self, model: &str, system: &str, prompt: &str) -> Result<String, String> {
+        if self.fake {
+            let _ = (model, system, prompt);
+            return Ok("fake ok".to_string());
+        }
         let kind = self.kind;
         let max_key = if model.starts_with("o1")
             || model.starts_with("o3")
@@ -261,6 +275,10 @@ impl Client {
         // `false` when the model rejects OpenAI `reasoning_effort`.
         allow_reasoning_effort: bool,
     ) -> Result<(Message, Usage), String> {
+        // Offline scripted model: synthesize locally, never touch the network.
+        if self.fake {
+            return crate::fake::fake_chat(history, &mut *on_text, &mut *on_think, &self.cancel);
+        }
         smol::block_on(async {
         let kind = api_override.unwrap_or(self.kind);
         let (url, body) = match kind {

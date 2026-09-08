@@ -47,6 +47,7 @@ type AgentSlot = Arc<Mutex<Option<Agent>>>;
 /// Run the TUI REPL. Returns `Ok(())` on a clean exit (ctrl-d / /exit) or an
 /// error if the terminal couldn't be set up. The `agent_slot` is taken and
 /// returned by the worker turns exactly like the streaming REPL does.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     agent_slot: &AgentSlot,
     fg_cancel: &Arc<AtomicBool>,
@@ -153,6 +154,7 @@ struct ConvLine {
 }
 
 impl ConvLine {
+    #[allow(clippy::wrong_self_convention)]
     fn into_line(&self, color: bool) -> Line<'static> {
         let (fg, prefix) = match self.kind {
             ConvKind::User => (Color::Green, "❯ "),
@@ -468,7 +470,7 @@ fn spawn_turn(ctx: &TuiCtx, prompt: String) -> JoinHandle<()> {
     run_foreground_turn(
         ctx.agent_slot,
         ctx.fg_cancel,
-        &ctx.fg_quiet,
+        ctx.fg_quiet,
         prompt,
         ctx.done_tx.clone(),
     )
@@ -554,8 +556,8 @@ fn spawn_background(ctx: &TuiCtx, state: &mut TuiState, prompt: String) {
 }
 
 /// Render one frame: conversation pane (top, scrollable) + footer (status + draft).
-fn draw(
-    term: &mut ratatui::Terminal<CrosstermBackend<Stdout>>,
+fn draw<B: ratatui::backend::Backend>(
+    term: &mut ratatui::Terminal<B>,
     state: &TuiState,
     status: &str,
     draft: &str,
@@ -565,9 +567,15 @@ fn draw(
 ) {
     let _ = term.draw(|f| {
         let size = f.area();
+        // Footer height fits its content exactly: 2 border rows + status +
+        // draft prompt + workspace/model (+ hint when present). A fixed
+        // Length(3) clipped everything below the status line, so the ❯ prompt
+        // was NEVER visible — the parity gap these tests guard. The prompt
+        // must appear in every frame, idle or running.
+        let footer_inner: u16 = 3 + u16::from(!state.hint.is_empty());
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(3)])
+            .constraints([Constraint::Min(3), Constraint::Length(footer_inner + 2)])
             .split(size);
 
         let conv_block = Block::default()
@@ -801,7 +809,7 @@ fn read_raw_into(buf: &mut String, typeahead: &Arc<Mutex<String>>) -> RawKey {
                     drain_csi_sequence(fd);
                 }
             }
-            c if c >= 0x20 && c < 0x7f => {
+            c if (0x20..0x7f).contains(&c) => {
                 buf.push(c as char);
                 update_tui_typeahead(buf, typeahead);
             }
@@ -1110,7 +1118,7 @@ fn read_idle_line(
                             buf.clear();
                         }
                     }
-                    c if c >= 0x20 && c < 0x7f => {
+                    c if (0x20..0x7f).contains(&c) => {
                         buf.push(c as char);
                         state.awaiting_input = false;
                         update_tui_typeahead(&buf, ctx.typeahead);
@@ -1568,5 +1576,133 @@ mod tui_completion_tests {
         assert!(s.hint.contains("Tab"));
         update_tui_hint(&mut s, "hello");
         assert!(s.hint.is_empty());
+    }
+}
+
+/// Render-parity tests: pi keeps the input prompt visible at all times, so
+/// the footer prompt (`❯ ` + draft) must appear in EVERY frame — idle,
+/// running, draft or not, conversation full or empty. These render through
+/// ratatui's TestBackend and assert on the actual cell grid (structural, not
+/// "did not crash"): prompt text present, footer bordered, footer docked at
+/// the bottom rows.
+#[cfg(test)]
+mod tui_prompt_render_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    /// Render one frame and return each row's symbols as strings.
+    fn render_rows(state: &TuiState, status: &str, draft: &str, running: bool) -> Vec<String> {
+        let backend = TestBackend::new(40, 12);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        draw(&mut term, state, status, draft, running, "ws", "model");
+        let buf = term.backend().buffer().clone();
+        let area = buf.area;
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn idle_state() -> TuiState {
+        TuiState::new()
+    }
+
+    fn running_state(draft_lines: usize) -> TuiState {
+        let mut s = TuiState::new();
+        s.running = true;
+        s.status = "thinking".into();
+        s.awaiting_input = false;
+        for i in 0..draft_lines {
+            s.conv.push(ConvLine {
+                kind: ConvKind::Assistant,
+                text: format!("streamed line {i} of a long model reply"),
+            });
+        }
+        s
+    }
+
+    /// Footer block border must exist (parity rendering, not bare text).
+    /// Scans the whole footer zone (up to 6 bottom rows with hint).
+    fn assert_footer_border(rows: &[String]) {
+        let n = rows.len().min(6);
+        let bottom: String = rows.iter().skip(rows.len() - n).cloned().collect();
+        for ch in ["┌", "┐", "└", "┘", "│", "─"] {
+            assert!(bottom.contains(ch), "footer border missing {ch} in:\n{bottom}");
+        }
+    }
+
+    #[test]
+    fn prompt_visible_when_idle() {
+        let rows = render_rows(&idle_state(), "idle", "", false);
+        assert_footer_border(&rows);
+        assert!(
+            rows.iter().any(|r| r.contains("❯ ")),
+            "idle frame must show the ❯ prompt:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn prompt_visible_with_draft_while_running() {
+        // The core parity case: mid-turn, the user's typed-ahead draft must
+        // stay on screen next to the prompt — like pi's persistent input.
+        let rows = render_rows(&running_state(5), "thinking…", "hello mid-turn", true);
+        assert_footer_border(&rows);
+        assert!(
+            rows.iter().any(|r| r.contains("❯ hello mid-turn")),
+            "running frame must show draft next to ❯:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn prompt_visible_while_running_empty_draft() {
+        // No draft yet: the bare prompt must still render (never a
+        // spinner-only footer with nowhere to type).
+        let rows = render_rows(&running_state(5), "thinking…", "", true);
+        assert!(
+            rows.iter().any(|r| r.contains("❯ ")),
+            "running frame with empty draft must still show ❯:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn prompt_survives_full_conversation() {
+        // A full scrollback pane must not push the prompt off screen: the
+        // footer is docked at the bottom rows in every frame.
+        let rows = render_rows(&running_state(200), "thinking…", "type here", true);
+        assert!(
+            rows.iter().any(|r| r.contains("❯ type here")),
+            "prompt must survive a full conversation pane:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("running")),
+            "conversation title must show running state:\n{}",
+            rows.join("\n")
+        );
+        // Draft lives in the footer region (last 4 rows), not the conv pane.
+        let footer_zone = rows.iter().skip(rows.len() - 4).cloned().collect::<String>();
+        assert!(
+            footer_zone.contains("❯ type here"),
+            "draft must sit in the footer zone:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn done_placeholder_keeps_prompt_marker() {
+        let mut s = idle_state();
+        s.awaiting_input = true;
+        let rows = render_rows(&s, "done", "", false);
+        assert!(
+            rows.iter().any(|r| r.contains("❯")),
+            "done placeholder must keep the ❯ marker:\n{}",
+            rows.join("\n")
+        );
     }
 }

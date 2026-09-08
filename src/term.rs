@@ -130,10 +130,65 @@ pub fn color_enabled() -> bool {
 /// wait for it to become writable via the smol reactor (the same event-driven
 /// mechanism the input path uses) instead of sleeping-and-retrying in a hot
 /// loop. A genuinely broken pipe is ignored silently.
+///
+/// Screen-write serialization + cursor parking for mid-turn output (unix).
+///
+/// While a turn runs, the spinner owns a 3-line footer zone and parks the
+/// hardware cursor at the end of the prompt row after every redraw, so the
+/// prompt looks alive. Every content write through [`out`] first moves the
+/// cursor back to the stream position, so output never lands on the prompt
+/// row. The mutex makes a tick and a write mutually exclusive (no torn
+/// frames); all moves are absolute (CUP / save-slot restore), never
+/// relative, so scrolling between operations cannot strand the cursor.
+/// Residual, accepted: `eprintln!` and child processes bypass the protocol
+/// (stderr/foreign fds cannot be wrapped) — the next tick redraws absolutely
+/// and self-heals.
+#[cfg(unix)]
+static SCREEN: Mutex<()> = Mutex::new(());
+/// True while the cursor is parked on the prompt row (stream position held in
+/// the terminal's save slot by the last unparked tick).
+#[cfg(unix)]
+static PARKED: Mutex<bool> = Mutex::new(false);
+
+#[cfg(unix)]
+fn screen_lock() -> std::sync::MutexGuard<'static, ()> {
+    SCREEN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(unix)]
+fn is_parked() -> bool {
+    PARKED.lock().map(|g| *g).unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn set_parked(v: bool) {
+    if let Ok(mut g) = PARKED.lock() {
+        *g = v;
+    }
+}
+
+/// 1-based column just past the draft on the prompt row (`❯ ` + text),
+/// clamped to the width. Pure for tests.
+fn prompt_cursor_col(draft: &str, w: usize) -> usize {
+    (3 + draft.chars().count()).min(w.max(1))
+}
+
 #[cfg(unix)]
 pub fn out(s: &str) {
     #[cfg(unix)]
     use std::os::unix::io::{AsRawFd, FromRawFd};
+    #[cfg(unix)]
+    let _screen = screen_lock();
+    #[cfg(unix)]
+    if is_parked() {
+        // Spinner parked the cursor on the prompt row: move it back to the
+        // stream position (terminal save slot) before writing, so content
+        // never lands on the prompt line.
+        let mut stdout = io::stdout();
+        let _ = stdout.write_all(b"\x1b[u");
+        let _ = stdout.flush();
+        set_parked(false);
+    }
     let bytes = s.as_bytes();
     let written = 0usize;
     // Bound the total work so a persistent stall can't spin forever.
@@ -268,8 +323,54 @@ pub fn status_line(workspace: &str, model: &str) -> String {
 /// prompt area (one above, one below) so the input zone is visually separated
 /// from the conversation. Dimmed so it separates without shouting.
 pub fn hrule() -> String {
-    let w = terminal_width().max(20);
+    hrule_w(terminal_width().max(20))
+}
+
+/// Width-explicit [`hrule`] for renderers that size to a given width (tests,
+/// the mid-turn zone builder).
+pub fn hrule_w(w: usize) -> String {
     dim(&"─".repeat(w))
+}
+
+/// Rows to scroll so the idle input zone (top hrule + prompt) fits above the
+/// 1-line footer, which serves as the zone's bottom border: with the cursor on
+/// 1-based row R in a height-H screen, the prompt lands on R+1 and must
+/// satisfy R+1 <= H-1. Pure for tests.
+pub fn zone_scroll_lines(cursor_row: usize, height: usize) -> usize {
+    (cursor_row + 2).saturating_sub(height)
+}
+
+/// Draw the top hrule of the idle input zone and leave the cursor on the next
+/// row for `read_line`, so the layout is hrule / prompt (cursor) / footer —
+/// the prompt always sits between its two rules with the cursor on it. Uses
+/// `\r\n` (never bare `\n`): in raw mode a bare linefeed keeps the column
+/// and piles every line at the right edge. Scrolls first (absolute moves
+/// only) when the zone would overlap the footer row. No-op without a tty or
+/// on a tiny screen (caller falls back to a plain prompt). There is no close
+/// step: after submit the existing footer redraw is the bottom border again.
+pub fn open_input_zone() {
+    if !is_terminal() {
+        return;
+    }
+    let h = terminal_height();
+    if h < 3 {
+        return;
+    }
+    // Blind fallback docks the zone above the footer; a DSR answer lets us
+    // keep it compact, right where the conversation ended.
+    let r = cursor_row().unwrap_or_else(|| h.saturating_sub(2)).clamp(1, h);
+    let s = zone_scroll_lines(r, h);
+    if s > 0 {
+        out(&format!("\x1b[{h};1H"));
+        for _ in 0..s {
+            out("\r\n");
+        }
+    }
+    let top = r.saturating_sub(s).max(1);
+    out(&format!("\x1b[{top};1H"));
+    out(&hrule());
+    out("\r\n");
+    out_flush();
 }
 
 /// A single full-width footer line: `── <status> ──…──`. The status text
@@ -278,7 +379,11 @@ pub fn hrule() -> String {
 /// bottom section the REPL keeps at the bottom row of the screen (idle status
 /// and the "thinking" spinner both render into it).
 pub fn footer_line(status: &str) -> String {
-    let w = terminal_width().max(20);
+    footer_line_w(status, terminal_width().max(20))
+}
+
+/// Width-explicit [`footer_line`] for renderers that size to a given width.
+fn footer_line_w(status: &str, w: usize) -> String {
     let head = format!("{} {status} ", dim("──"));
     let used = visible_len(&head);
     format!("{head}{}", dim(&"─".repeat(w.saturating_sub(used))))
@@ -297,15 +402,25 @@ pub fn draw_footer(status: &str) {
     let _ = out.flush();
 }
 
-/// Erase the footer line at the bottom row, restoring the cursor. No-op when
-/// stdout isn't a tty.
+/// Erase the mid-turn footer zone (all three rows), restoring the cursor.
+/// No-op when stdout isn't a tty.
 pub fn erase_footer() {
     if !is_terminal() {
         return;
     }
     let h = terminal_height();
     let mut out = io::stdout();
-    let _ = out.write_all(format!("\x1b[s\x1b[{h};1H\x1b[2K\x1b[u").as_bytes());
+    let mut buf = String::new();
+    buf.push_str("\x1b[s");
+    // Clear every row the zone can occupy (bottom three, or just the bottom
+    // row on tiny screens — mirroring the tick's layout) so no rule, prompt
+    // or draft text survives the turn.
+    let top = if h >= 4 { h - 2 } else { h };
+    for row in top..=h {
+        buf.push_str(&format!("\x1b[{row};1H\x1b[2K"));
+    }
+    buf.push_str("\x1b[u");
+    let _ = out.write_all(buf.as_bytes());
     let _ = out.flush();
 }
 
@@ -361,10 +476,41 @@ pub fn cursor_row() -> Option<usize> {
 /// Cursor-movement + erase sequence that removes the 3-line "working" panel and
 /// leaves the cursor at column 0 of its top line, so the next output (streamed
 /// model text, or the idle prompt on detach) starts cleanly there. The panel is
+/// The three content lines of the mid-turn footer zone (pure: no I/O), drawn
+/// at the bottom rows H-2/H-1/H every spinner tick with absolute cursor moves
+/// (so the zone can never drift, unlike the old relative-motion 3-line block):
+/// status hrule / `❯ draft` prompt line / plain hrule. The prompt row keeps
+/// the user's typed-ahead line visible for the whole turn, pi parity.
+/// `w` is the terminal width; the draft is clipped to fit and never wraps.
+fn midturn_zone_lines(
+    frame: &str,
+    label: &str,
+    cwd: &str,
+    draft: &str,
+    w: usize,
+    colored: bool,
+) -> Vec<String> {
+    let frame_s = if colored {
+        format!("\x1b[36m{frame}\x1b[0m")
+    } else {
+        frame.to_string()
+    };
+    let status = footer_line_w(&format!("{frame_s} {label} · {cwd}"), w);
+    let avail = w.saturating_sub(2); // "❯ "
+    let taken: String = draft.chars().take(avail).collect();
+    let prompt = format!("❯ {taken}");
+    vec![status, prompt, hrule_w(w)]
+}
+
 /// Build the single-line "thinking" footer the spinner draws at the bottom row
 /// of the terminal: `── ⠋ thinking · <cwd> · <typed> ──…──`. The typeahead is
 /// truncated so the whole line stays within `w` columns and never wraps (the
 /// footer is redrawn in place each tick, so a wrapped line would drift).
+///
+/// Legacy single-line format: Unix now ships the 3-line [`midturn_zone_lines`]
+/// zone instead; retained because the Windows (`nonunix_term`) spinner still
+/// renders this shape.
+#[allow(dead_code)]
 fn thinking_footer_line(
     frame: &str,
     label: &str,
@@ -379,18 +525,17 @@ fn thinking_footer_line(
         frame.to_string()
     };
     let mut status = format!("{frame_s} {label} · {cwd}");
-    if !typed.is_empty() {
-        let sep = " · ";
-        // Room left on the line after the fixed head (── prefix, frame, label,
-        // cwd and the trailing space) — the typeahead is clipped to fit.
-        let head = format!("── {frame_s} {label} · {cwd} ");
-        let avail = w.saturating_sub(visible_len(&head) + sep.chars().count());
-        let taken: String = typed.chars().take(avail).collect();
-        if !taken.is_empty() {
-            status.push_str(sep);
-            status.push_str(&taken);
-        }
-    }
+    // Pi-parity prompt: the typed-ahead line always renders next to a ❯
+    // marker — even when empty — so the prompt stays visible for the whole
+    // turn instead of the footer degrading to a spinner-only status line.
+    let prompt_sep = " · ❯ ";
+    // Room left on the line after the fixed head (── prefix, frame, label,
+    // cwd and the trailing space) — the typeahead is clipped to fit.
+    let head = format!("── {frame_s} {label} · {cwd} ");
+    let avail = w.saturating_sub(visible_len(&head) + prompt_sep.chars().count());
+    let taken: String = typed.chars().take(avail).collect();
+    status.push_str(prompt_sep);
+    status.push_str(&taken);
     // Build the whole line at exactly `w` columns so it can never wrap.
     let head = format!("{} {status} ", dim("──"));
     let used = visible_len(&head);
@@ -1439,9 +1584,11 @@ impl Spinner {
     /// `typeahead` is a buffer the REPL thread fills with any keystrokes the
     /// user types *while* the turn is running (the REPL runs in raw mode and is
     /// blocked waiting on the network). The spinner thread is the **only** thing
-    /// that writes to stdout while it's alive, so it owns the single "thinking"
-    /// line and renders the user's typing on it (inline after the label). This
-    /// avoids two threads racing on stdout — the previous design had the main
+    /// that writes to stdout while it's alive, so it owns a 3-line footer zone
+    /// (status hrule / `❯ ` prompt with the draft / hrule) redrawn with
+    /// absolute cursor moves every tick — pi parity: the prompt stays visible
+    /// for the whole turn, even with an empty draft. This avoids two threads
+    /// racing on stdout — the previous design had the main
     /// REPL thread echo keystrokes directly *and* the same line, which clobbered
     /// the user's input mid-thought (the "REPL doesn't display during thinking"
     /// bug).
@@ -1482,11 +1629,13 @@ impl Spinner {
             let w = terminal_width().max(20);
             let mut erased = false;
             while a.load(Ordering::SeqCst) {
-                // Detached turn: erase the footer once and go silent so a
-                // backgrounded turn leaves a clean terminal behind it.
+                // Detached turn: erase the footer zone once and go silent so
+                // a backgrounded turn leaves a clean terminal behind it; drop
+                // the parked state too (no prompt to sit on anymore).
                 if q.load(Ordering::SeqCst) {
                     if !erased {
                         erase_footer();
+                        set_parked(false);
                         erased = true;
                     }
                     std::thread::sleep(Duration::from_millis(80));
@@ -1495,23 +1644,56 @@ impl Spinner {
                 erased = false;
                 let frame = frames[i % frames.len()];
                 let typed = typeahead.lock().map(|g| g.clone()).unwrap_or_default();
-                let line = thinking_footer_line(&frame.to_string(), &label, &cwd, &typed, w, color());
-                // Rewrite the footer in place at the bottom row each tick. The
-                // cursor is saved/restored around the draw, so the position the
-                // next streamed token will write from never moves — unlike the
-                // old 3-line block, this can never drift or leave a stray line.
+                // 3-line footer zone (status hrule / ❯ draft prompt / hrule),
+                // every row addressed absolutely each tick, then the cursor is
+                // PARKED at the end of the prompt row so it looks alive there.
+                // Absolute addressing (never relative motion) is what keeps
+                // the zone from drifting no matter what scrolled between
+                // ticks. Content writes through [`out`] move the cursor back
+                // to the stream position first (serialized by the screen
+                // lock), so output never lands on the prompt row.
                 let h = terminal_height();
+                let _screen = screen_lock();
                 let mut buf = String::new();
-                buf.push_str(&format!("\x1b[s\x1b[{h};1H\x1b[2K{line}\x1b[u"));
+                if !is_parked() {
+                    buf.push_str("\x1b[s");
+                }
+                if h >= 4 {
+                    for (k, content) in midturn_zone_lines(
+                        &frame.to_string(),
+                        &label,
+                        &cwd,
+                        &typed,
+                        w,
+                        color(),
+                    )
+                    .iter()
+                    .enumerate()
+                    {
+                        let row = h - 2 + k;
+                        buf.push_str(&format!("\x1b[{row};1H\x1b[2K{content}"));
+                    }
+                    let prompt_col = prompt_cursor_col(&typed, w);
+                    buf.push_str(&format!("\x1b[{};{}H", h - 1, prompt_col));
+                } else {
+                    // Tiny screen: prompt line only, still every tick.
+                    let prompt_col = prompt_cursor_col(&typed, w);
+                    buf.push_str(&format!("\x1b[{h};1H\x1b[2K❯ {typed}"));
+                    buf.push_str(&format!("\x1b[{h};{prompt_col}H"));
+                }
+                set_parked(true);
                 let _ = out.write_all(buf.as_bytes());
                 let _ = out.flush();
                 std::thread::sleep(Duration::from_millis(80));
                 i = i.wrapping_add(1);
             }
-            // On stop, erase the footer and leave the cursor where it was so
-            // the next output (streamed model text, or the idle prompt on
-            // detach) starts cleanly there.
-            erase_footer();
+            // On stop, erase the footer zone and leave the cursor where it
+            // was so the next output starts cleanly there (under the screen
+            // lock so a concurrent content write can't tear the erase).
+            {
+                let _screen = screen_lock();
+                erase_footer();
+            }
         });
         Spinner { handle: Some(handle), alive }
     }
@@ -1520,6 +1702,14 @@ impl Spinner {
     #[cfg(unix)]
     pub fn stop(&mut self) {
         if self.alive.swap(false, Ordering::SeqCst) {
+            // Unpark first (under the screen lock so a racing tick can't
+            // re-park after us): later output must continue naturally, never
+            // restore a stale stream position. Then join the tick thread.
+            {
+                let _screen = screen_lock();
+                set_parked(false);
+                erase_footer();
+            }
             if let Some(h) = self.handle.take() {
                 let _ = h.join();
             }
@@ -2350,23 +2540,79 @@ mod tests {
     // garbage slice from the line start (`el hy3`).
     #[test]
     fn thinking_footer_line_size_and_fit() {
-        // The line is exactly `w` columns (── prefix + spinner + label + cwd +
-        // dashes) — it must never wrap, since the spinner redraws it in place.
-        let line = thinking_footer_line("⠧", "thinking", "~/src/pir", "", 40, false);
-        assert_eq!(visible_len(&line), 40, "footer must be exactly width: {line:?}");
-        assert!(line.contains("⠧ thinking"), "footer should carry spinner+label: {line:?}");
-        assert!(line.contains("~/src/pir"), "footer should show cwd: {line:?}");
-        // Typeahead longer than the line is truncated so it never wraps.
+        // The mid-turn zone's status line is exactly `w` columns (it must
+        // never wrap: the zone is redrawn in place each tick).
+        let lines = super::midturn_zone_lines("⠧", "thinking", "~/src/pir", "", 40, false);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(super::visible_len(&lines[0]), 40, "status must be exactly width: {:?}", lines[0]);
+        assert!(lines[0].contains("⠧ thinking"), "status carries spinner+label: {:?}", lines[0]);
+        assert!(lines[0].contains("~/src/pir"), "status shows cwd: {:?}", lines[0]);
+        // Typeahead longer than the line is truncated so the prompt row never
+        // wraps either.
         let long = "x".repeat(200);
-        let l2 = thinking_footer_line("⠋", "thinking", "~/x", &long, 40, false);
+        let l2 = super::midturn_zone_lines("⠋", "thinking", "~/x", &long, 40, false);
         assert!(
-            visible_len(&l2) <= 40,
-            "footer must not exceed width: {} > 40 ({l2:?})",
-            visible_len(&l2)
+            super::visible_len(&l2[1]) <= 40,
+            "prompt row must not exceed width: {} > 40 ({:?})",
+            super::visible_len(&l2[1]),
+            l2[1]
         );
         // The typeahead is visible when it fits.
-        let l3 = thinking_footer_line("⠋", "thinking", "~/x", "hi", 40, false);
-        assert!(l3.contains("hi"), "footer should show typeahead: {l3:?}");
+        let l3 = super::midturn_zone_lines("⠋", "thinking", "~/x", "hi", 40, false);
+        assert!(l3[1].contains("hi"), "prompt row should show typeahead: {:?}", l3[1]);
+    }
+
+    #[test]
+    fn prompt_cursor_col_follows_draft() {
+        // 1-based column just past "❯ " + draft, clamped to the width.
+        assert_eq!(super::prompt_cursor_col("", 40), 3);
+        assert_eq!(super::prompt_cursor_col("hi", 40), 5);
+        assert_eq!(super::prompt_cursor_col(&"x".repeat(200), 40), 40);
+        assert_eq!(super::prompt_cursor_col("hi", 0), 1);
+    }
+
+    #[test]
+    fn zone_scroll_geometry() {
+        // Zone rows R..R+1 plus the footer row H must fit: scroll exactly
+        // the overlap, never more.
+        assert_eq!(super::zone_scroll_lines(20, 24), 0); // rows 20..21, footer 24
+        assert_eq!(super::zone_scroll_lines(22, 24), 0); // rows 22..23
+        assert_eq!(super::zone_scroll_lines(23, 24), 1); // prompt would hit footer
+        assert_eq!(super::zone_scroll_lines(24, 24), 2);
+        assert_eq!(super::zone_scroll_lines(1, 24), 0);
+        assert_eq!(super::zone_scroll_lines(10, 10), 2);
+        // After scrolling S from R, the prompt row R-S+1 stays above footer.
+        for (r, h) in [(22usize, 24usize), (24, 24), (10, 10), (5, 6), (1, 3)] {
+            let s = super::zone_scroll_lines(r, h);
+            let prompt = r.saturating_sub(s) + 1;
+            assert!(prompt + 1 <= h || h < 3, "r={r} h={h} prompt={prompt}");
+        }
+    }
+
+    #[test]
+    fn thinking_footer_always_shows_prompt() {
+        // Pi parity: the ❯ prompt marker renders for the whole turn — even
+        // with an empty draft — on the zone's middle row, with hrules above
+        // and below it (never collapsed onto the status line).
+        let lines = super::midturn_zone_lines("⠧", "thinking", "~/src/pir", "", 40, false);
+        assert_eq!(super::visible_len(&lines[1]), 2, "empty draft row is just ❯ + space: {:?}", lines[1]);
+        assert!(lines[1].starts_with("❯ "), "middle row is the prompt: {:?}", lines[1]);
+        assert!(lines[0].contains("──"), "top row is the status hrule: {:?}", lines[0]);
+        assert!(!lines[2].contains("❯"), "bottom row is a plain hrule: {:?}", lines[2]);
+        // Color-agnostic: other tests may enable color globally (dim wraps in
+        // ANSI), so strip the known dim wrappers before checking rule chars.
+        let bare = lines[2].replace("\x1b[2m", "").replace("\x1b[0m", "");
+        assert!(
+            bare.chars().all(|c| c == '─'),
+            "bottom row is only rule chars: {lines:?}"
+        );
+        let typing = super::midturn_zone_lines("⠋", "thinking", "~/x", "hello", 40, false);
+        assert_eq!(super::visible_len(&typing[1]), 7, "prompt row stays narrow: {:?}", typing[1]);
+        assert!(
+            typing[1].starts_with("❯ hello"),
+            "draft must sit next to ❯ on the middle row: {:?}",
+            typing[1]
+        );
     }
 
     #[test]

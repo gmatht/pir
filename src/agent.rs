@@ -125,6 +125,121 @@ pub struct Agent {
     /// Avoids re-reading and re-parsing `~/.pi/agent/models-store.json` on every
     /// `/model` switch, resume, and `apply_persisted_model` call.
     cached_providers: Vec<Provider>,
+    /// Runaway-loop detector for the tool-use loop. Tracks the signature of the
+    /// most recent tool-call batch *and* the assistant's text output; when the
+    /// same signal repeats back-to-back [`LoopDetector::MAX_REPEATS`] times (the
+    /// model re-issuing the identical tool call, or repeating the same sentence,
+    /// because it's stuck), the turn is stopped with a banner instead of
+    /// spinning forever. Reset at the start of each turn.
+    loop_detector: LoopDetector,
+}
+
+/// Detects a model stuck repeating itself over and over (the classic "Let me
+/// look at the frontend's main.go" / "Let me search for X" infinite loop). Two
+/// independent signals are tracked — (a) the tool-call batch (tool names +
+/// normalized inputs), and (b) the assistant's text output (normalized).
+/// When either signal repeats [`MAX_REPEATS`] times in a row the turn is
+/// stopped. The detector is deliberately conservative — it only fires on
+/// *consecutive identical* signals, so legitimate repeated reads of the same
+/// file (e.g. re-checking a path after an edit) that are interleaved with other
+/// work never trip it.
+struct LoopDetector {
+    /// Signature of the previous tool-call batch (None before the first).
+    prev_tool: Option<String>,
+    /// How many consecutive times the current tool signature has repeated.
+    tool_repeats: usize,
+    /// Signature of the previous assistant text output (None before the first).
+    prev_text: Option<String>,
+    /// How many consecutive times the current text signature has repeated.
+    text_repeats: usize,
+}
+
+impl LoopDetector {
+    /// How many consecutive identical signals before we declare a loop. 3 gives
+    /// the model two chances to break out after the first repeat.
+    const MAX_REPEATS: usize = 3;
+
+    fn new() -> Self {
+        LoopDetector {
+            prev_tool: None,
+            tool_repeats: 0,
+            prev_text: None,
+            text_repeats: 0,
+        }
+    }
+
+    /// Feed the current tool-call batch's signature. Returns `true` when a
+    /// runaway loop is detected (the batch has repeated `MAX_REPEATS` times).
+    fn observe_tool(&mut self, sig: &str) -> bool {
+        if self.prev_tool.as_deref() == Some(sig) {
+            self.tool_repeats += 1;
+        } else {
+            self.prev_tool = Some(sig.to_string());
+            self.tool_repeats = 1;
+        }
+        self.tool_repeats >= Self::MAX_REPEATS
+    }
+
+    /// Feed the current assistant text output's signature. Returns `true` when
+    /// a runaway loop is detected (the text has repeated `MAX_REPEATS` times).
+    fn observe_text(&mut self, sig: &str) -> bool {
+        if self.prev_text.as_deref() == Some(sig) {
+            self.text_repeats += 1;
+        } else {
+            self.prev_text = Some(sig.to_string());
+            self.text_repeats = 1;
+        }
+        self.text_repeats >= Self::MAX_REPEATS
+    }
+}
+
+/// Fingerprint a tool-call batch for loop detection: the tool name plus a
+/// normalized (whitespace-collapsed) form of its JSON input. Two batches that
+/// issue the same tools with the same arguments produce the same signature, so
+/// a stuck model re-issuing `read_file("main.go")` is caught.
+fn tool_batch_signature(calls: &[(String, String, Value)]) -> String {
+    let mut out = String::new();
+    for (_, name, input) in calls {
+        out.push_str(name);
+        out.push('\u{1}');
+        // Collapse whitespace so formatting differences don't defeat detection.
+        let s = input.to_string();
+        let mut prev_space = false;
+        for c in s.chars() {
+            if c.is_whitespace() {
+                if !prev_space {
+                    out.push(' ');
+                }
+                prev_space = true;
+            } else {
+                out.push(c);
+                prev_space = false;
+            }
+        }
+        out.push('\u{1e}');
+    }
+    out
+}
+
+/// Fingerprint an assistant text output for loop detection: whitespace-collapsed
+/// and lowercased, so a model repeating the same sentence (e.g. "Let me look at
+/// the frontend's main.go") with trivial casing/whitespace drift is caught.
+fn text_signature(text: &str) -> String {
+    let mut out = String::new();
+    let mut prev_space = false;
+    for c in text.chars() {
+        let c = c.to_lowercase().next().unwrap_or(c);
+        if c.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    out
 }
 
 /// What `load_session` restored. The REPL (and `/fg`/`/resume`) renders
@@ -409,6 +524,7 @@ impl Agent {
             auto_retry: None,
             incremental_md: config::incremental_md_default(),
             cached_providers,
+            loop_detector: LoopDetector::new(),
         })
     }
 
@@ -1432,6 +1548,9 @@ impl Agent {
         // Record that a turn is now in flight (so a crash/network failure mid-turn
         // leaves a discoverable "unfinished" session owned by this live process).
         self.mark_status(SessionStatus::Active, self.goal_pending(), "");
+        // Fresh turn: reset the runaway-loop detector so a loop in a *previous*
+        // turn can't carry over into this one.
+        self.loop_detector = LoopDetector::new();
         let specs = self.registry.specs();
         let tty = crate::term::is_terminal();
         // `spinner` is hoisted out of the per-message loop so the "thinking…"
@@ -1445,8 +1564,10 @@ impl Agent {
         let stopped_here = Cell::new(false);
 
         // Stop the "thinking…" spinner (and its REPL prompt block) exactly once
-        // per model call, the moment the first token — text *or* reasoning —
-        // arrives. Shared by both stream callbacks so the spinner's 80ms
+        // per model call, the moment the first TEXT token arrives. Reasoning
+        // tokens do NOT stop it: the footer (with the ❯ prompt) stays pinned
+        // while thinking streams above, so the prompt is visible for the whole
+        // turn. Shared by both stream callbacks so the spinner's 80ms
         // redraws can never clobber streaming output.
         let stop_spinner = || {
             if !stopped_here.get() {
@@ -1590,8 +1711,11 @@ impl Agent {
                 if let Some(sec) = &self.security {
                     sec.approval.note_thinking(t);
                 }
+                // NOTE: no stop_spinner() here — the footer (❯ prompt) stays
+                // alive for the whole thinking stream (see above). Thinking
+                // output itself is still deferred while the user types (below)
+                // so it never wipes the in-progress draft line.
                 if !self.silent() && show_thinking {
-                    stop_spinner();
                     think_buf.push_str(t);
                     if term::raw::keyboard_idle_long_enough() {
                         term::out(&term::dim(&std::mem::take(&mut think_buf)).to_string());
@@ -1656,7 +1780,7 @@ impl Agent {
                 // The blank-line-only (non-incremental) path prints it below the
                 // single final render instead.
                 if !use_incremental {
-                    println!();
+                    term::out("\n");
                 }
             }
             // Render the assistant's reply as Markdown. When incremental (in-
@@ -1723,6 +1847,39 @@ impl Agent {
             log_line(&mut self.log, &assistant);
             self.history.push(assistant);
 
+            // Runaway-loop detection: if the model re-issues the *identical*
+            // tool-call batch, or repeats the *same* text output, several times
+            // in a row, it's stuck (e.g. endlessly re-reading the same file,
+            // re-searching for the same thing, or repeating "Let me look at
+            // main.go"). Stop the turn with a banner instead of burning tokens
+            // forever. The detector only fires on consecutive identical signals,
+            // so normal interleaved work is never affected.
+            let looped = self.loop_detector.observe_tool(&tool_batch_signature(&calls))
+                || self.loop_detector.observe_text(&text_signature(&assistant_text));
+            if looped {
+                if !self.silent() {
+                    if let Some(mut s) = spinner.borrow_mut().take() {
+                        s.stop();
+                    }
+                    term::out(&format!(
+                        "\r\x1b[K{}\n",
+                        term::yellow(
+                            "✗ loop detected: the model repeated the same tool call(s) or text 3× in a row — stopping turn"
+                        )
+                    ));
+                }
+                self.mark_status(
+                    SessionStatus::Interrupted,
+                    self.goal_pending(),
+                    "loop detected (repeated identical tool calls or text)",
+                );
+                self.notify.publish(self.turn_done_event(), false);
+                if !self.silent() {
+                    self.continuations.extend(self.registry.on_turn_end(user));
+                }
+                return Ok(());
+            }
+
             if calls.is_empty() {
                 self.registry.emit(EventKind::AgentEnd, &json!({}));
                 self.notify.publish(self.turn_done_event(), false);
@@ -1735,6 +1892,18 @@ impl Agent {
             }
 
             let mut results = Message { role: Role::User, blocks: Vec::new() };
+            // Tool execution can take a while (sleep, builds, test suites):
+            // keep the footer zone (with the ❯ prompt) alive across it, so the
+            // prompt stays visible for the whole turn — not just while waiting
+            // for tokens. The next model call's spinner replaces this one.
+            if !self.silent() {
+                *spinner.borrow_mut() = Some(term::Spinner::start_with(
+                    "running",
+                    self.typeahead.clone(),
+                    tty,
+                    self.quiet_req.clone(),
+                ));
+            }
             for (id, name, input) in &calls {
                 if !self.silent() {
                     // Trailing `\n` so back-to-back tool calls (and their
@@ -2234,6 +2403,9 @@ fn make_client(provider: &Provider, cancel: Arc<AtomicBool>) -> Result<Client, S
     // model call aborts the streaming read promptly instead of blocking until
     // the whole response arrives.
     client.set_cancel(cancel);
+    // Offline scripted model for tests/puppetry (see `crate::fake`): enabled
+    // by provider id so a user catalog can never collide with it by model id.
+    client.set_fake(provider.pid() == "fake");
     Ok(client)
 }
 

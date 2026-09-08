@@ -298,13 +298,15 @@ impl Wt {
             }
         }
         // 3) common trunk names.
+        // `output()` (not `status()`) so git's stderr — e.g. the
+        // "dubious ownership" fatal when the agent runs as root over another
+        // user's repo — is captured instead of spraying one message per
+        // candidate branch across the terminal at startup.
         for cand in [DEFAULT_BRANCH, "master", "trunk", "develop"] {
-            if Command::new("git")
-                .args(["show-ref", "--verify", "--quiet", &format!("refs/heads/{cand}")])
-                .current_dir(&root)
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
+            if self
+                .git(&["show-ref", "--verify", "--quiet", &format!("refs/heads/{cand}")])
+                .status
+                .success()
             {
                 return cand.to_string();
             }

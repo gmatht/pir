@@ -8,6 +8,7 @@
 
 mod agent;
 mod config;
+mod fake;
 mod goal;
 mod md;
 mod notify;
@@ -1378,14 +1379,22 @@ fn main() {
             let g = agent_slot.lock().unwrap();
             g.as_ref().map(|a| a.label()).unwrap_or_default()
         };
-        let h = term::terminal_height();
-        if let Some(row) = term::cursor_row() {
-            if row >= h.saturating_sub(1) {
-                term::out(&format!("\x1b[{h};1H\n\x1b[1A"));
-            }
-        }
+        // Boxed input zone: top hrule, then the prompt with the cursor on it;
+        // the persistent footer below is the bottom border (redrawn after).
+        term::open_input_zone();
         term::draw_footer(&term::status_line(&workspace, &model));
-        match term::read_line("❯ ") {
+        // Carry any partial line typed mid-turn into the idle prompt (pi
+        // parity: input is never lost at the turn boundary). The prompt
+        // reopens as `❯ <partial>`, fully editable. Also clears the shared
+        // typeahead so the next turn's spinner never shows stale text.
+        if let Some(partial) = take_partial_for_prefill(&mut input_buf) {
+            if let Ok(mut g) = typeahead.lock() {
+                g.clear();
+            }
+            term::set_prefill(&partial);
+        }
+        let res = term::read_line("❯ ");
+        match res {
             None => {
                 println!();
                 println!("{}", term::dim(&resume_hint(session_path.as_ref())));
@@ -3439,6 +3448,18 @@ fn parse_secure_value(next: Option<&String>) -> Result<(crate::security::Securit
     }
 }
 
+/// Take a partial line typed mid-turn (raw mode) for carry into the idle
+/// prompt: `Some(text)` when non-empty (buffer left empty), `None` when
+/// there is nothing to carry. The caller clears the shared typeahead and
+/// prefills the idle prompt so input is never lost at the turn boundary.
+fn take_partial_for_prefill(input_buf: &mut String) -> Option<String> {
+    if input_buf.is_empty() {
+        None
+    } else {
+        Some(std::mem::take(input_buf))
+    }
+}
+
 fn parse_sh_u<'a>(args: &'a [&str]) -> Option<(Option<&'a str>, &'a [&'a str])> {
     if matches!(args.first(), Some(&"-u")) {
         return Some(match args.get(1) {
@@ -3666,5 +3687,16 @@ mod main_tests {
         assert_eq!(parse_secure_value(Some(&lvl)), Ok((SecurityLevel::Strict, true)));
         let bad = "paranoid".to_string();
         assert!(parse_secure_value(Some(&bad)).is_err());
+    }
+
+    /// A partial mid-turn line is carried (buffer taken, left empty) so the
+    /// idle prompt can reopen with it; an empty buffer carries nothing.
+    #[test]
+    fn partial_carry_takes_nonempty_buffer() {
+        let mut b = "hel".to_string();
+        assert_eq!(take_partial_for_prefill(&mut b), Some("hel".to_string()));
+        assert!(b.is_empty(), "buffer must be empty after the take");
+        let mut e = String::new();
+        assert_eq!(take_partial_for_prefill(&mut e), None);
     }
 }

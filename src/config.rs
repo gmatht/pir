@@ -375,7 +375,34 @@ pub fn load_providers() -> Result<Vec<Provider>, String> {
 
     apply_prices(&mut providers);
     merge_ollama_cloud(&mut providers);
+    maybe_add_fake_provider(&mut providers);
     Ok(providers)
+}
+
+/// Append the offline scripted `fake` provider (see `crate::fake`) when
+/// `PIR_FAKE_MODEL` is set: opt-in test/puppet model, never in normal lists.
+fn maybe_add_fake_provider(providers: &mut Vec<Provider>) {
+    if std::env::var_os("PIR_FAKE_MODEL").map(|v| !v.is_empty()).unwrap_or(false)
+        && !providers.iter().any(|p| p.pid() == "fake")
+    {
+        providers.push(Provider {
+            id: Some("fake".to_string()),
+            name: Some("Fake (testing only, no network)".to_string()),
+            base_url: Some("fake://localhost".to_string()),
+            api_key: Some("fake".to_string()),
+            api: Some("openai".to_string()),
+            models: vec![Model {
+                id: "slow".to_string(),
+                name: Some("Fake slow (scripted turns)".to_string()),
+                context: Some(200_000),
+                max_tokens: Some(8192),
+                api_override: None,
+                url_override: None,
+                no_reasoning_effort: false,
+                price_per_1k: None,
+            }],
+        });
+    }
 }
 
 /// Merge the `ollama-cloud` provider (if not already present) into the catalog.
@@ -598,7 +625,7 @@ fn load_from_auth_fallback() -> Result<Vec<Provider>, String> {
         }
     }
     
-    if providers.is_empty() { Err("No providers found in auth.json".into()) } else { Ok(providers) }
+    if providers.is_empty() { Err("No providers found in auth.json".into()) } else { maybe_add_fake_provider(&mut providers); Ok(providers) }
 }
 
 fn guess_base_url(pid: &str) -> Option<String> {
