@@ -7,6 +7,12 @@ use std::path::{Path, PathBuf};
 pub enum ApiKind {
     Anthropic,
     OpenAi,
+    /// OpenAI Responses API (`/responses`): used by models whose catalog
+    /// entry says `openai-responses` (e.g. opencode-go's muse-spark, grok,
+    /// gpt-5.6-luna — see opencode.ai/docs/go endpoints table). Chat-style
+    /// `/chat/completions` calls to these models fail, so they need their own
+    /// request shape, streaming events, and usage envelope.
+    OpenAiResponses,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -156,6 +162,8 @@ impl ThinkingLevel {
             ThinkingLevel::Off => true,
             _ => match kind {
                 Some(ApiKind::OpenAi) => self.oai_effort().is_some(),
+                // Same effort names ride `reasoning.effort` on Responses.
+                Some(ApiKind::OpenAiResponses) => self.oai_effort().is_some(),
                 Some(ApiKind::Anthropic) => self.anthropic_budget(ctx).is_some(),
                 None => true,
             },
@@ -179,6 +187,7 @@ impl Provider {
         let base = self.base_url.as_deref().unwrap_or_default().to_lowercase();
         match api.as_deref() {
             Some(a) if a.contains("anthropic") => Some(ApiKind::Anthropic),
+            Some(a) if a.contains("responses") => Some(ApiKind::OpenAiResponses),
             Some(_) => Some(ApiKind::OpenAi),
             None if base.contains("anthropic.com") => Some(ApiKind::Anthropic),
             None if base.is_empty() => None,
@@ -197,6 +206,8 @@ impl Provider {
             let a = api.to_lowercase();
             return if a.contains("anthropic") {
                 Some(ApiKind::Anthropic)
+            } else if a.contains("responses") {
+                Some(ApiKind::OpenAiResponses)
             } else {
                 Some(ApiKind::OpenAi)
             };
@@ -249,11 +260,10 @@ pub fn pi_dir() -> PathBuf {
 /// quarantine config keys (`quarantine-staging`, `overlay`, …).
 pub fn path_from_string(s: &str) -> PathBuf {
     let s = s.trim();
-    if let Some(rest) = s.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME") {
             return PathBuf::from(home).join(rest);
         }
-    }
     PathBuf::from(s)
 }
 
@@ -452,27 +462,22 @@ pub fn merge_ollama_cloud(providers: &mut Vec<Provider>) {
 ///
 /// Returns `None` when nothing is configured.
 pub fn ollama_cloud_api_key() -> Option<String> {
-    if let Ok(v) = std::env::var("OLLAMA_API_KEY") {
-        if !v.is_empty() {
+    if let Ok(v) = std::env::var("OLLAMA_API_KEY")
+        && !v.is_empty() {
             return Some(v);
         }
-    }
-    if let Some(k) = load_auth_keys().get("ollama-cloud") {
-        if !k.is_empty() {
+    if let Some(k) = load_auth_keys().get("ollama-cloud")
+        && !k.is_empty() {
             return Some(k.clone());
         }
-    }
     // Package-style per-extension config: ~/.pi/agent/ollama-cloud.json
     let cfg = pi_dir().join("agent").join("ollama-cloud.json");
-    if let Ok(raw) = fs::read_to_string(&cfg) {
-        if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-            if let Some(k) = v.get("apiKey").or(v.get("key")).and_then(Value::as_str) {
-                if !k.is_empty() {
+    if let Ok(raw) = fs::read_to_string(&cfg)
+        && let Ok(v) = serde_json::from_str::<Value>(&raw)
+            && let Some(k) = v.get("apiKey").or(v.get("key")).and_then(Value::as_str)
+                && !k.is_empty() {
                     return Some(k.to_string());
                 }
-            }
-        }
-    }
     None
 }
 
@@ -558,19 +563,16 @@ fn apply_prices(providers: &mut [Provider]) {
     let mut table = default_prices();
     // Merge user prices from settings.json.
     let p = pi_dir().join("agent").join("settings.json");
-    if let Ok(raw) = fs::read_to_string(&p) {
-        if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-            if let Some(prices) = v.get("prices").and_then(Value::as_object) {
+    if let Ok(raw) = fs::read_to_string(&p)
+        && let Ok(v) = serde_json::from_str::<Value>(&raw)
+            && let Some(prices) = v.get("prices").and_then(Value::as_object) {
                 for (label, pv) in prices {
-                    if let Some(arr) = pv.as_array() {
-                        if let (Some(i), Some(o)) = (arr.first().and_then(Value::as_f64), arr.get(1).and_then(Value::as_f64)) {
+                    if let Some(arr) = pv.as_array()
+                        && let (Some(i), Some(o)) = (arr.first().and_then(Value::as_f64), arr.get(1).and_then(Value::as_f64)) {
                             table.insert(label.to_lowercase(), (i, o));
                         }
-                    }
                 }
             }
-        }
-    }
     for prov in providers.iter_mut() {
         let pid = prov.pid();
         for m in prov.models.iter_mut() {
@@ -598,9 +600,9 @@ fn load_from_auth_fallback() -> Result<Vec<Provider>, String> {
     let mut providers = Vec::new();
     if let Some(obj) = auth_v.as_object() {
         for (id, val) in obj {
-            if val.get("type").and_then(Value::as_str) == Some("api_key") {
-                if let Some(key) = val.get("key").and_then(Value::as_str) {
-                    if !key.is_empty() {
+            if val.get("type").and_then(Value::as_str) == Some("api_key")
+                && let Some(key) = val.get("key").and_then(Value::as_str)
+                    && !key.is_empty() {
                         let pid = id.to_lowercase();
                         providers.push(Provider {
                             id: Some(id.clone()),
@@ -620,8 +622,6 @@ fn load_from_auth_fallback() -> Result<Vec<Provider>, String> {
                             }],
                         });
                     }
-                }
-            }
         }
     }
     
@@ -630,9 +630,8 @@ fn load_from_auth_fallback() -> Result<Vec<Provider>, String> {
 
 fn guess_base_url(pid: &str) -> Option<String> {
     let env_var = format!("{}_BASE_URL", pid.to_uppercase().replace('-', "_"));
-    if let Ok(url) = std::env::var(&env_var) {
-        if !url.is_empty() { return Some(url); }
-    }
+    if let Ok(url) = std::env::var(&env_var)
+        && !url.is_empty() { return Some(url); }
 
     if pid.contains("openrouter") { return Some("https://openrouter.ai/api/v1".into()); }
     if pid.contains("anthropic") { return Some("https://api.anthropic.com/v1".into()); }
@@ -644,19 +643,15 @@ fn guess_base_url(pid: &str) -> Option<String> {
 fn load_auth_keys() -> std::collections::BTreeMap<String, String> {
     let path = pi_dir().join("agent").join("auth.json");
     let mut map = std::collections::BTreeMap::new();
-    if let Ok(raw) = fs::read_to_string(&path) {
-        if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-            if let Some(obj) = v.as_object() {
+    if let Ok(raw) = fs::read_to_string(&path)
+        && let Ok(v) = serde_json::from_str::<Value>(&raw)
+            && let Some(obj) = v.as_object() {
                 for (id, val) in obj {
-                    if val.get("type").and_then(Value::as_str) == Some("api_key") {
-                        if let Some(key) = val.get("key").and_then(Value::as_str) {
-                            if !key.is_empty() { map.insert(id.to_lowercase(), key.to_string()); }
-                        }
-                    }
+                    if val.get("type").and_then(Value::as_str) == Some("api_key")
+                        && let Some(key) = val.get("key").and_then(Value::as_str)
+                            && !key.is_empty() { map.insert(id.to_lowercase(), key.to_string()); }
                 }
             }
-        }
-    }
     map
 }
 
@@ -680,7 +675,7 @@ pub fn default_model_setting() -> Option<String> {
 pub fn set_default_model(provider: &str, model: &str) -> Result<PathBuf, String> {
     let p = pi_dir().join("agent").join("settings.json");
     if let Some(parent) = p.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|e| settings_write_error(parent, &e))?;
     }
     let mut v: Value = fs::read_to_string(&p)
         .ok()
@@ -693,8 +688,48 @@ pub fn set_default_model(provider: &str, model: &str) -> Result<PathBuf, String>
     obj.insert("defaultProvider".into(), Value::String(provider.to_string()));
     obj.insert("defaultModel".into(), Value::String(model.to_string()));
     fs::write(&p, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| settings_write_error(&p, &e))?;
     Ok(p)
+}
+
+/// Explain a settings-write failure with the path, the effective user, and
+/// HOME. A bare "Permission denied" hides the two usual causes: the file
+/// belongs to another user (sandbox drop or su/sudo left HOME pointing at
+/// someone else's `~/.pi`), or the dir isn't writable. Naming all three
+/// makes that visible instead of a dead-end os error 13.
+fn settings_write_error(path: &std::path::Path, e: impl std::fmt::Display) -> String {
+    format!(
+        "cannot write {}: {e} [running as {}, HOME={:?}] — fix ownership, run as the owning user, or point pir at a writable dir with PI_DIR=...",
+        path.display(),
+        current_user_label(),
+        std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned()),
+    )
+}
+
+/// `name (euid N)` for the effective uid, or `euid N` when unresolvable.
+fn current_user_label() -> String {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid/getpwuid are async-signal-safe getters; the
+        // returned passwd pointer is not freed (static storage).
+        let euid = unsafe { libc::geteuid() };
+        let name = unsafe {
+            let pw = libc::getpwuid(euid);
+            if pw.is_null() {
+                None
+            } else {
+                std::ffi::CStr::from_ptr((*pw).pw_name).to_str().ok()
+            }
+        };
+        match name {
+            Some(n) => format!("{n} (euid {euid})"),
+            None => format!("euid {euid}"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        "unknown user".to_string()
+    }
 }
 
 /// The persisted "use per-agent worktrees by default" flag (key `worktrees`
@@ -715,7 +750,7 @@ pub fn worktrees_default() -> bool {
 pub fn set_worktrees_default(on: bool) -> Result<PathBuf, String> {
     let p = pi_dir().join("agent").join("settings.json");
     if let Some(parent) = p.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|e| settings_write_error(parent, &e))?;
     }
     let mut v: Value = fs::read_to_string(&p)
         .ok()
@@ -726,7 +761,7 @@ pub fn set_worktrees_default(on: bool) -> Result<PathBuf, String> {
     }
     v.as_object_mut().unwrap().insert("worktrees".into(), Value::Bool(on));
     fs::write(&p, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| settings_write_error(&p, &e))?;
     Ok(p)
 }
 
@@ -828,9 +863,9 @@ pub fn remove_auth_key(provider: &str) -> Result<bool, String> {
 pub fn stored_auth_providers() -> Vec<String> {
     let p = auth_path();
     let mut out = Vec::new();
-    if let Ok(raw) = fs::read_to_string(&p) {
-        if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-            if let Some(obj) = v.as_object() {
+    if let Ok(raw) = fs::read_to_string(&p)
+        && let Ok(v) = serde_json::from_str::<Value>(&raw)
+            && let Some(obj) = v.as_object() {
                 for (id, val) in obj {
                     if val.get("type").and_then(Value::as_str) == Some("api_key")
                         && val.get("key").and_then(Value::as_str).map(|k| !k.is_empty()).unwrap_or(false)
@@ -839,8 +874,6 @@ pub fn stored_auth_providers() -> Vec<String> {
                     }
                 }
             }
-        }
-    }
     out
 }
 /// execution user and path. Created/updated by `pir project init`.
@@ -875,26 +908,21 @@ pub fn lookup_project_user(project: &str) -> Option<String> {
     let raw = fs::read_to_string(projects_file()).ok()?;
     let v: Value = serde_json::from_str(&raw).ok()?;
     let projects = v.get("projects").and_then(Value::as_object)?;
-    if let Some(p) = projects.get(project) {
-        if let Some(u) = p.get("user").and_then(Value::as_str) {
-            if !u.is_empty() {
+    if let Some(p) = projects.get(project)
+        && let Some(u) = p.get("user").and_then(Value::as_str)
+            && !u.is_empty() {
                 return Some(u.to_string());
             }
-        }
-    }
     // Fall back: match by path prefix.
     let cwd = std::env::current_dir().ok()?;
     let cwd_s = cwd.to_string_lossy().to_string();
     for (_, p) in projects {
-        if let Some(path) = p.get("path").and_then(Value::as_str) {
-            if !path.is_empty() && cwd_s.starts_with(path) {
-                if let Some(u) = p.get("user").and_then(Value::as_str) {
-                    if !u.is_empty() {
+        if let Some(path) = p.get("path").and_then(Value::as_str)
+            && !path.is_empty() && cwd_s.starts_with(path)
+                && let Some(u) = p.get("user").and_then(Value::as_str)
+                    && !u.is_empty() {
                         return Some(u.to_string());
                     }
-                }
-            }
-        }
     }
     None
 }
@@ -1105,8 +1133,8 @@ pub fn select<'a>(
     // `:N` positional selector: pick the Nth model from the same flat
     // (provider, then model) order `/models` prints, so an index shown by the
     // listing always resolves. Out-of-range -> a helpful error, never a panic.
-    if let Some(num) = sel.strip_prefix(':') {
-        if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+    if let Some(num) = sel.strip_prefix(':')
+        && !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
             let flat: Vec<(&'a Provider, &'a Model)> = providers
                 .iter()
                 .flat_map(|p| p.models.iter().map(move |m| (p, m)))
@@ -1120,7 +1148,6 @@ pub fn select<'a>(
                 )),
             };
         }
-    }
 
     if let Some((pid, mid)) = selector.trim().split_once('/') {
         for p in providers {
@@ -1564,16 +1591,66 @@ mod worktree_settings_tests {
         let _env = crate::config::TEST_ENV_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("pir_wt_cfg_{}", std::process::id()));
         let old = std::env::var_os("PI_DIR");
-        std::env::set_var("PI_DIR", &dir);
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PI_DIR", &dir); }
         assert!(!worktrees_default(), "default is off (guard posture; worktrees are opt-in)");
         set_worktrees_default(true).unwrap();
         assert!(worktrees_default(), "persisted on must read back");
         set_worktrees_default(false).unwrap();
         assert!(!worktrees_default(), "persisted off must read back");
         match old {
-            Some(v) => std::env::set_var("PI_DIR", v),
-            None => std::env::remove_var("PI_DIR"),
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_write_error_names_path_and_user() {
+        // The bug: `/default-model` failed with a bare "Permission denied
+        // (os error 13)" — no path, no user. The message must name the file
+        // and the effective user/HOME so an euid/HOME mismatch (sandbox drop
+        // or su/sudo leaving HOME at someone else's `~/.pi`) is visible.
+        let err = settings_write_error(
+            std::path::Path::new("/root/.pi/agent/settings.json"),
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Permission denied (os error 13)",
+            ),
+        );
+        assert!(err.contains("/root/.pi/agent/settings.json"), "must name the file: {err}");
+        assert!(err.contains("Permission denied"), "must keep the cause: {err}");
+        assert!(err.contains("euid"), "must name the effective user: {err}");
+        assert!(err.contains("HOME"), "must show HOME: {err}");
+    }
+
+    #[test]
+    fn model_api_maps_responses_kind() {
+        // opencode-go marks Responses-only models `openai-responses`; they
+        // need the `/responses` shape (chat bodies 500 on them).
+        let mut p = Provider {
+            id: Some("opencode-go".into()),
+            name: None,
+            base_url: Some("https://opencode.ai/zen/go/v1".into()),
+            api_key: Some("k".into()),
+            api: None,
+            models: vec![],
+        };
+        let mk = |api: &str| Model {
+            id: "m".into(),
+            name: None,
+            api_override: Some(api.into()),
+            url_override: None,
+            no_reasoning_effort: false,
+            context: None,
+            max_tokens: None,
+            price_per_1k: None,
+        };
+        assert_eq!(p.model_api(&mk("openai-responses")), Some(ApiKind::OpenAiResponses));
+        assert_eq!(p.model_api(&mk("openai-completions")), Some(ApiKind::OpenAi));
+        assert_eq!(p.model_api(&mk("anthropic-messages")), Some(ApiKind::Anthropic));
+        p.api = Some("openai-responses".into());
+        assert_eq!(p.kind(), Some(ApiKind::OpenAiResponses));
     }
 }

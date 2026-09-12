@@ -451,11 +451,10 @@ impl Builtin {
     fn write_file(&mut self, input: &serde_json::Value) -> Result<String, String> {
         let path = input["path"].as_str().ok_or("write_file: missing 'path'")?;
         let content = input["content"].as_str().ok_or("write_file: missing 'content'")?;
-        if let Some(parent) = Path::new(path).parent() {
-            if !parent.as_os_str().is_empty() {
+        if let Some(parent) = Path::new(path).parent()
+            && !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).map_err(|e| format!("write_file {path}: {e}"))?;
             }
-        }
         fs::write(path, content).map_err(|e| format!("write_file {path}: {e}"))?;
         Ok(format!("wrote {path} ({} lines, {} bytes)", content.lines().count(), content.len()))
     }
@@ -1122,7 +1121,9 @@ mod esc_tests {
         // came — job_kill never returned, the agent loop wedged, and the REPL
         // never came back. Regression: the group kill + bounded joins must
         // make job_kill return promptly.
-        std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1"); }
         let mut b = Builtin::new(PathBuf::from("."), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         let start = Instant::now();
         let detached = run_shell(&mut b, "sleep 60 > /dev/null 2>&1 & echo detached-ok; sleep 60").expect("run_shell result");
@@ -1141,7 +1142,9 @@ mod esc_tests {
         // Killing a running job should report it was stopped by a signal, not
         // a success exit code (previously `s.code()` on a signal death was
         // surfaced as -1, reading like a normal failure).
-        std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1"); }
         let mut b = Builtin::new(PathBuf::from("."), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         let detached = run_shell(&mut b, "sleep 60").expect("run_shell result");
         assert!(detached.contains("[detached]"), "expected detachment, got: {detached}");
@@ -1155,7 +1158,9 @@ mod esc_tests {
 
     #[test]
     fn esc_flag_sweep_kills_detached_jobs() {
-        std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1"); }
         let job_kill = Arc::new(AtomicBool::new(false));
         let mut b = Builtin::new(PathBuf::from("."), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         b.set_job_kill_handle(job_kill.clone());
@@ -1177,7 +1182,9 @@ mod esc_tests {
 
     #[test]
     fn kill_all_jobs_via_trait_kills_running_children() {
-        std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1"); }
         let mut b = Builtin::new(PathBuf::from("."), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         let d = run_shell(&mut b, "sleep 60").expect("detach");
         assert!(d.contains("[detached]"), "got: {d}");
@@ -1188,7 +1195,9 @@ mod esc_tests {
 
     #[test]
     fn job_kill_after_finish_reports_already_finished() {
-        std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1"); }
         let mut b = Builtin::new(PathBuf::from("."), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         // 2s command, 1s check-in: guaranteed to detach before it can finish.
         let detached = run_shell(&mut b, "sleep 2").expect("run_shell result");
@@ -1212,7 +1221,9 @@ mod esc_tests {
         // (the "job_kill then silence" hang). Regression: the whole kill dance
         // must stay poll-based and bounded, so job_kill returns promptly even
         // when a child won't die on the first KILL.
-        std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1"); }
         let mut b = Builtin::new(PathBuf::from("."), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         let start = Instant::now();
         // `setsid` escapes the group AND inherits (holds) stdout/stderr.

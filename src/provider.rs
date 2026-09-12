@@ -1,6 +1,7 @@
 use crate::config::ApiKind;
 use crate::plugin::ToolSpec;
 use crate::types::{Block, Message, Role, Usage};
+use isahc::config::Configurable;
 use serde_json::{json, Map, Value};
 use smol::channel::{bounded as smol_channel, Receiver as SmolRx};
 use smol::future;
@@ -8,18 +9,31 @@ use smol::io::AsyncBufRead;
 use smol::io::AsyncBufReadExt;
 use smol::io::AsyncReadExt;
 use smol::Timer;
-use std::io::{Error, ErrorKind, Read};
+use std::io::{Error, ErrorKind, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// How many times to retry a failed request (the first attempt is not a retry,
-/// so this is the number of *additional* attempts). Network blips, DNS hiccups,
-/// and transient 5xx / 429 responses from the provider are retried; hard errors
-/// (e.g. 401/unauthorized, malformed URL) are not.
-const MAX_RETRIES: usize = 4;
+/// Retry policy: transient failures that strike *before* any output is
+/// produced (network blips, DNS hiccups, timeouts, transient 5xx / 429) are
+/// retried **forever** — the turn never gives up on its own. The wait between
+/// attempts doubles each time (see `retry_backoff`), so a sick server gets
+/// progressively more breathing room instead of being hammered. Hard errors
+/// (e.g. 401/unauthorized, malformed URL, quota/usage-limit) and failures
+/// *after* output started (which can't be replayed without duplicating
+/// already-printed text) are still fatal immediately. Cancellation (ESC/Ctrl-C)
+/// aborts the loop at any point, including mid-wait.
+///
+/// Escape hatch (tests/scripts only): `PIR_MAX_ATTEMPTS=N` caps total attempts.
+/// Unset (the default) means unbounded.
+fn max_attempts() -> Option<u64> {
+    std::env::var("PIR_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+}
 
 /// Per-attempt network timeouts (applied to every request via the ureq agent).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -92,19 +106,71 @@ fn stall_timeout() -> Duration {
         .unwrap_or(STALL_TIMEOUT)
 }
 
-/// Backoff between retries for *non-timeout* transient failures (5xx/429): it
-/// doubles each attempt (capped), giving 60s, 120s,  240s. Starting at a
-/// full minute avoids hammering a sick server. Timeouts are retried *immediately*
-/// instead (see `chat`), since the per-attempt read timeout doubles each retry.
-/// Cancellation is still honoured promptly during the backoff because the sleep
-/// loop re-checks `cancel` every 100ms.
-const RETRY_BASE_BACKOFF: Duration = Duration::from_secs(60);
-const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(240);
+/// Wait before re-issuing a failed attempt. It doubles with each attempt so a
+/// struggling server gets progressively more room: timeouts (the server was
+/// merely slow) start short — 10s, 20s, 40s … capped at 5min — while other
+/// transient failures (5xx/429/transport, i.e. the server may be sick) start
+/// at 30s — 30s, 60s, 120s … capped at 10min. Cancellation is still honoured
+/// promptly during the wait because the sleep loop re-checks `cancel` every
+/// 100ms. `PIR_RETRY_BASE_SECS` / `PIR_RETRY_MAX_SECS` override the base/cap
+/// (tests set the base to 0 for instant retries).
+const RETRY_TIMEOUT_BASE: Duration = Duration::from_secs(10);
+const RETRY_TIMEOUT_MAX: Duration = Duration::from_secs(300);
+const RETRY_BASE_BACKOFF: Duration = Duration::from_secs(30);
+const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(600);
+
+fn retry_backoff(attempt: u32, timed_out: bool) -> Duration {
+    let (base, max) = if timed_out {
+        (RETRY_TIMEOUT_BASE, RETRY_TIMEOUT_MAX)
+    } else {
+        (RETRY_BASE_BACKOFF, RETRY_MAX_BACKOFF)
+    };
+    let base = std::env::var("PIR_RETRY_BASE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(base);
+    let max = std::env::var("PIR_RETRY_MAX_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(max);
+    // `attempt` grows without bound (retries never give up), so clamp the
+    // exponent — the cap clamps the result anyway.
+    base.saturating_mul(2u32.saturating_pow(attempt.min(16))).min(max)
+}
+
+/// Live progress of a retry wait, reported to `chat`'s `on_retry` callback
+/// roughly once per second (plus once at wait start and once at wait end).
+/// The UI renders the countdown from this; the provider itself stays
+/// UI-agnostic.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryWait {
+    /// 1-based number of the attempt that just failed.
+    pub attempt: u32,
+    /// Total wait before the next attempt.
+    pub total: Duration,
+    /// Time left. `ZERO` means the wait is over and the next attempt fires
+    /// now (the UI should erase the countdown line).
+    pub remaining: Duration,
+}
 
 pub struct Client {
     kind: ApiKind,
     base_url: String,
     api_key: String,
+    /// Shared HTTP client with a connection pool. Built once in `new` and
+    /// reused across `chat`/`complete` calls so successive turns reuse
+    /// TCP/TLS connections (keep-alive) instead of paying connect + TLS
+    /// handshake on every turn. Previously a fresh `HttpClient` was built per
+    /// attempt, which threw the pool away after each response.
+    http: isahc::HttpClient,
+    /// Stable per-conversation session id, sent as `x-opencode-session` on
+    /// OpenCode Go requests (routing + prompt caching; see
+    /// opencode.ai/docs/go). Set by `make_client` for the `opencode-go`
+    /// provider only — `None` everywhere else, so no other provider ever sees
+    /// the header. `OPENCODE_SESSION_ID` overrides the generated value.
+    session_id: Option<String>,
     /// Offline scripted model (see `crate::fake`): when set, `chat`/`complete`
     /// synthesize turns locally and never touch the network. Wired by
     /// `make_client` for the `fake` test provider only.
@@ -116,11 +182,19 @@ pub struct Client {
 }
 
 impl Client {
-    /// Build an async `isahc` client with the given per-attempt read timeout.
-    /// Kept as a free fn so the retry loop can rebuild the client with a larger
-    /// timeout each attempt without cloning the whole `Client`.
-    fn isahc_client(_read_timeout: Duration) -> isahc::HttpClient {
+    /// Build the shared `isahc` client (connection pool + DNS cache live here).
+    /// Only the connect timeout is baked in: reads are unbounded at the socket
+    /// level and bounded instead by the streaming stall watchdog + cancel flag,
+    /// so a slow/"thinking" provider is never cut off mid-stream by curl.
+    /// Automatic decompression is OFF: enabling it advertises
+    /// `Accept-Encoding: deflate, gzip`, and some proxies buffer compressed
+    /// SSE streams (killing live granularity — the byte-identical body that
+    /// streamed in 9.7s via curl dribbled for minutes through pir). Like curl,
+    /// we ask for identity and read exactly what the server sends.
+    fn build_http_client() -> isahc::HttpClient {
         isahc::HttpClient::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .automatic_decompression(false)
             .build()
             .expect("isahc client build failed")
     }
@@ -149,8 +223,46 @@ impl Client {
             kind,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
+            http: Self::build_http_client(),
+            session_id: None,
             fake: false,
             cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Attach the conversation's session id for `x-opencode-session` routing.
+    /// Called by `make_client` for providers that want it; ignored elsewhere.
+    pub fn set_session_id(&mut self, id: Option<String>) {
+        self.session_id = id.filter(|s| !s.is_empty());
+    }
+
+    /// pir's User-Agent: the vendor (opencode.ai/docs/go) asks clients to
+    /// identify with their own agent name rather than a generic SDK/HTTP
+    /// one, and uses it for routing/abuse decisions. Sent on every request.
+    fn user_agent() -> String {
+        format!("pir/{}", env!("CARGO_PKG_VERSION"))
+    }
+
+    /// Apply auth + session + identity headers for `kind` to a request
+    /// builder. Shared by `chat` and `complete` so the two can never drift
+    /// (a missing auth header on one path used to be a whole bug class).
+    fn apply_headers(
+        &self,
+        builder: isahc::http::request::Builder,
+        kind: ApiKind,
+    ) -> isahc::http::request::Builder {
+        let builder = builder.header("user-agent", Self::user_agent());
+        let builder = match kind {
+            ApiKind::Anthropic => builder
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01"),
+            ApiKind::OpenAi | ApiKind::OpenAiResponses => {
+                builder.header("Authorization", &format!("Bearer {}", self.api_key))
+            }
+        };
+        match &self.session_id {
+            Some(id) => builder.header("x-opencode-session", id),
+            None => builder,
         }
     }
 
@@ -217,21 +329,34 @@ impl Client {
                     }),
                 )
             }
+            ApiKind::OpenAiResponses => {
+                let mut url = self.base_url.trim_end_matches('/').to_string();
+                if !url.ends_with("/responses") && !url.contains('?') {
+                    url.push_str("/responses");
+                }
+                (
+                    url,
+                    json!({
+                        "model": model,
+                        "input": [
+                            { "role": "system", "content": system },
+                            { "role": "user", "content": prompt },
+                        ],
+                        "stream": false,
+                    }),
+                )
+            }
         };
         smol::block_on(async {
-            let client = Self::isahc_client(Duration::from_secs(60));
-            let builder = isahc::Request::builder()
-                .method("POST")
-                .uri(&url)
-                .header("content-type", "application/json");
-            let builder = match kind {
-                ApiKind::Anthropic => builder
-                    .header("x-api-key", &self.api_key)
-                    .header("anthropic-version", "2023-06-01"),
-                ApiKind::OpenAi => builder.header("Authorization", &format!("Bearer {}", self.api_key)),
-            };
+            let builder = self.apply_headers(
+                isahc::Request::builder()
+                    .method("POST")
+                    .uri(&url)
+                    .header("content-type", "application/json"),
+                kind,
+            );
             let req = builder.body(body.to_string()).map_err(|e| format!("complete: {e}"))?;
-            let resp = client.send_async(req).await.map_err(http_error)?;
+            let resp = self.http.send_async(req).await.map_err(http_error)?;
             let status = resp.status();
             if !status.is_success() {
                 let code = status.as_u16();
@@ -250,6 +375,28 @@ impl Client {
                 ApiKind::OpenAi => v
                     .pointer("/choices/0/message/content")
                     .and_then(Value::as_str)
+                    .map(str::to_string),
+                // Non-streaming Responses object: first message item's first
+                // output-text part. Missing/empty shapes read as no opinion.
+                ApiKind::OpenAiResponses => v
+                    .get("output")
+                    .and_then(Value::as_array)
+                    .and_then(|items| {
+                        items.iter().find_map(|it| {
+                            (it.get("type").and_then(Value::as_str) == Some("message"))
+                                .then(|| {
+                                    it.get("content").and_then(Value::as_array).and_then(|parts| {
+                                        parts.iter().find_map(|p| {
+                                            (p.get("type").and_then(Value::as_str)
+                                                == Some("output_text"))
+                                            .then(|| p.get("text").and_then(Value::as_str))
+                                            .flatten()
+                                        })
+                                    })
+                                })
+                                .flatten()
+                        })
+                    })
                     .map(str::to_string),
             };
             raw.ok_or_else(|| "complete: empty response".to_string())
@@ -274,11 +421,25 @@ impl Client {
         url_override: Option<&str>,
         // `false` when the model rejects OpenAI `reasoning_effort`.
         allow_reasoning_effort: bool,
+        // Retry-wait progress, called ~1/sec while backing off between
+        // attempts (plus once at wait start/end) so the UI can show a live
+        // "retrying in Ns" countdown. Never touches the transcript.
+        on_retry: &mut dyn FnMut(&RetryWait),
+        // Retry/failure notices (attempt failed, reconnected). Called instead
+        // of `on_text` so notices stay out of the model text, the markdown
+        // renderer, and the loop detector; the caller displays them and logs
+        // them as transcript-only entries.
+        on_notice: &mut dyn FnMut(&str),
     ) -> Result<(Message, Usage), String> {
         // Offline scripted model: synthesize locally, never touch the network.
         if self.fake {
             return crate::fake::fake_chat(history, &mut *on_text, &mut *on_think, &self.cancel);
         }
+        // Repair orphaned tool blocks (trim cuts, resume folds, skipped calls)
+        // so a bookkeeping glitch can't 400 the whole turn. Everything below
+        // (request builders + context estimate) uses the cleaned sequence.
+        let clean = sanitize_history(history);
+        let history: &[Message] = &clean;
         smol::block_on(async {
         let kind = api_override.unwrap_or(self.kind);
         let (url, body) = match kind {
@@ -296,13 +457,36 @@ impl Client {
                 ),
                 None => self.openai_request(model, max_tokens, system, history, tools, thinking),
             },
+            ApiKind::OpenAiResponses => match url_override {
+                Some(u) => self.responses_request_at(
+                    u,
+                    model,
+                    max_tokens,
+                    system,
+                    history,
+                    tools,
+                    thinking,
+                    allow_reasoning_effort,
+                ),
+                None => self.responses_request(
+                    model,
+                    max_tokens,
+                    system,
+                    history,
+                    tools,
+                    thinking,
+                    allow_reasoning_effort,
+                ),
+            },
         };
-        // Retry the whole request (connect + stream parse) on transient errors.
-        // `emitted_text` is set by the stream parsers the moment any token is
-        // delivered, so that — once the user is seeing streaming output — we
-        // NEVER re-run the attempt (and risk duplicating already-printed text);
-        // a mid-stream failure is surfaced as a hard error instead. A cancel
-        // request aborts the whole loop immediately (no retry) via `self.cancel`.
+        // Byte-identical replay support for speed diagnosis (see fn docs).
+        maybe_dump_payload(&body);
+        // Retry the whole request (connect + stream parse) on transient
+        // pre-output errors, **forever**: once the user is seeing streaming
+        // output (`emitted_text`/`saw_tool_calls`) we NEVER re-run the attempt
+        // (and risk duplicating already-printed text) — a mid-stream failure
+        // is surfaced as a hard error instead. A cancel request aborts the
+        // whole loop immediately (no retry) via `self.cancel`.
         let cancel = self.cancel.clone();
         let cancel_rx = self.start_cancel_forwarder();
         let mut emitted_text = false;
@@ -312,29 +496,29 @@ impl Client {
         // produced and can duplicate work. Treat partial tool progress like
         // partial text — surface the error rather than replaying.
         let mut saw_tool_calls = false;
-        for attempt in 0..=MAX_RETRIES {
+        // Timing telemetry for `PIR_DEBUG` (stderr, never the transcript):
+        // prompt bytes once (the payload is rebuilt per attempt from `body`),
+        // per-attempt spans below. Settles "is pir or the server slow?"
+        // with numbers: big `headers_ms` = network/queueing before the
+        // server answered; low tok/s = slow generation mid-stream.
+        let debug = std::env::var_os("PIR_DEBUG").is_some();
+        let body_bytes = body.to_string().len();
+        let mut attempt: u32 = 0;
+        loop {
             if cancel.load(Ordering::SeqCst) {
                 return Err("request cancelled".to_string());
             }
-            // Read timeout for this attempt: start generous and double each
-            // retry, with no upper bound. The *first* attempt already waits up
-            // to READ_TIMEOUT_INIT for the status line, so a slow/"thinking"
-            // provider has room to respond instead of failing instantly; later
-            // attempts get proportionally more time. Rebuild the ureq agent so
-            // the new timeout takes effect (it's baked in at build time).
-            let read_timeout = READ_TIMEOUT_INIT * READ_TIMEOUT_GROWTH.saturating_pow(attempt as u32);
-            let client = Self::isahc_client(read_timeout);
+            let send_start = Instant::now();
             // Build the request (isahc async; JSON body serialised directly).
-            let mut builder = isahc::Request::builder()
-                .method("POST")
-                .uri(&url)
-                .header("content-type", "application/json");
-            builder = match kind {
-                ApiKind::Anthropic => builder
-                    .header("x-api-key", &self.api_key)
-                    .header("anthropic-version", "2023-06-01"),
-                ApiKind::OpenAi => builder.header("Authorization", &format!("Bearer {}", self.api_key)),
-            };
+            // The shared client's sockets are unbounded: reads are bounded by
+            // the streaming stall watchdog, not a per-attempt socket timeout.
+            let builder = self.apply_headers(
+                isahc::Request::builder()
+                    .method("POST")
+                    .uri(&url)
+                    .header("content-type", "application/json"),
+                kind,
+            );
             let req = match builder.body(body.to_string()) {
                 Ok(r) => r,
                 Err(e) => return Err(format!("http body: {e}")),
@@ -349,7 +533,7 @@ impl Client {
             }
             let outcome = future::or(
                 async {
-                    match client.send_async(req).await {
+                    match self.http.send_async(req).await {
                         Ok(r) => ConnectOutcome::Resp(r),
                         Err(e) => ConnectOutcome::Err(http_error(e)),
                     }
@@ -360,84 +544,152 @@ impl Client {
                 },
             )
             .await;
-            let resp = match outcome {
+            // All three failure sources — a transport error, a non-2xx
+            // status (isahc returns Ok for any HTTP status), or a stream
+            // parse failure — fold into the attempt `result` below so every
+            // one goes through the same retry decision. Direct `return`s here
+            // used to make the `is_retryable` 429/5xx/transport arms dead
+            // letters (a 500/connection-refused ended the turn instantly).
+            let headers_ms = send_start.elapsed();
+            // Phase-timing flags live here (visible to the `Ok` arm below);
+            // the wrapping callbacks that set them live in the Resp branch.
+            let mut first_think_ms: Option<u128> = None;
+            let mut first_text_ms: Option<u128> = None;
+            let result: Result<(Message, Usage), String> = match outcome {
                 ConnectOutcome::Cancelled => return Err("request cancelled".to_string()),
-                ConnectOutcome::Err(e) => return Err(e),
-                ConnectOutcome::Resp(r) => r,
-            };
-            // isahc returns Ok for any HTTP status; surface non-2xx as an error.
-            if !resp.status().is_success() {
-                let code = resp.status().as_u16();
-                let mut body_txt = String::new();
-                let _ = resp.into_body().read_to_string(&mut body_txt).await;
-                return Err(http_status_detail(code, &body_txt));
-            }
-            let mut reader = smol::io::BufReader::new(Box::pin(resp.into_body()));
-            let result: Result<(Message, Usage), String> = match kind {
-                ApiKind::Anthropic => {
-                    stream_anthropic(
-                        &mut reader,
-                        on_text,
-                        &mut emitted_text,
-                        &mut saw_tool_calls,
-                        &cancel,
-                        &cancel_rx,
-                        on_think,
-                    )
-                    .await
-                }
-                ApiKind::OpenAi => {
-                    stream_openai(
-                        &mut reader,
-                        on_text,
-                        &mut emitted_text,
-                        &mut saw_tool_calls,
-                        &cancel,
-                        &cancel_rx,
-                        on_think,
-                    )
-                    .await
+                ConnectOutcome::Err(e) => Err(e),
+                ConnectOutcome::Resp(r) => if !r.status().is_success() {
+                    let code = r.status().as_u16();
+                    let mut body_txt = String::new();
+                    let _ = r.into_body().read_to_string(&mut body_txt).await;
+                    Err(http_status_detail(code, &body_txt))
+                } else {
+                    let mut reader = smol::io::BufReader::new(Box::pin(r.into_body()));
+                    // Phase timing for PIR_DEBUG: stamp the first reasoning
+                    // and first text token instants (relative to this
+                    // attempt's send), distinguishing "thinking dribbled"
+                    // from "content dribbled". The wrapped callbacks forward
+                    // everything untouched; only the first-nonempty instants
+                    // are recorded.
+                    let mut on_think_wrap = |t: &str| {
+                        if !t.is_empty() && first_think_ms.is_none() {
+                            first_think_ms = Some(send_start.elapsed().as_millis());
+                        }
+                        on_think(t);
+                    };
+                    let mut on_text_wrap = |t: &str| {
+                        if !t.is_empty() && first_text_ms.is_none() {
+                            first_text_ms = Some(send_start.elapsed().as_millis());
+                        }
+                        on_text(t);
+                    };
+                    match kind {
+                        ApiKind::Anthropic => {
+                            stream_anthropic(
+                                &mut reader,
+                                &mut on_text_wrap,
+                                &mut emitted_text,
+                                &mut saw_tool_calls,
+                                &cancel,
+                                &cancel_rx,
+                                &mut on_think_wrap,
+                            )
+                            .await
+                        }
+                        ApiKind::OpenAi => {
+                            stream_openai(
+                                &mut reader,
+                                &mut on_text_wrap,
+                                &mut emitted_text,
+                                &mut saw_tool_calls,
+                                &cancel,
+                                &cancel_rx,
+                                &mut on_think_wrap,
+                            )
+                            .await
+                        }
+                        ApiKind::OpenAiResponses => {
+                            stream_responses(
+                                &mut reader,
+                                &mut on_text_wrap,
+                                &mut emitted_text,
+                                &mut saw_tool_calls,
+                                &cancel,
+                                &cancel_rx,
+                                &mut on_think_wrap,
+                            )
+                            .await
+                        }
+                    }
                 }
             };
             match result {
-                Ok(r) => return Ok(r),
+                Ok(r) => {
+                    if debug {
+                        debug_log(&chat_debug_line(
+                                attempt + 1,
+                                body_bytes,
+                                headers_ms,
+                                send_start.elapsed().saturating_sub(headers_ms),
+                                r.1.output,
+                                first_think_ms,
+                                first_text_ms,
+                            ));
+                    }
+                    if attempt > 0 {
+                        on_notice(&format!(
+                            "\n✓ reconnected on attempt {} — continuing\n",
+                            attempt + 1
+                        ));
+                    }
+                    return Ok(r);
+                }
                 Err(e) => {
                     if e == "request cancelled" {
                         return Err(e);
                     }
                     // A stalled stream is terminal, not transient: the peer went
                     // silent mid-stream, so re-issuing the request won't make it
-                    // resume. (Without this, the retry loop would re-send up to
-                    // MAX_RETRIES times, each waiting a full read timeout before
-                    // the stall watchdog fired again — far longer than the stall
-                    // bound.) Cancellation is likewise fatal (handled above).
+                    // resume — it would just stall again for another full
+                    // watchdog period. Cancellation is likewise fatal (above).
                     if e.contains("stalled") {
                         return Err(e);
                     }
-                    if attempt >= MAX_RETRIES || !is_retryable(&e) || emitted_text || saw_tool_calls {
+                    if !is_retryable(&e) || emitted_text || saw_tool_calls {
                         return Err(e);
                     }
-                    // A timeout is retried *immediately* (no backoff): the
-                    // per-attempt read timeout already doubles each retry, so the
-                    // slow / "thinking" provider is given progressively more time
-                    // on the next attempt rather than being re-hit after a fixed
-                    // 60s wait. Non-timeout transient failures (5xx/429) keep the
-                    // geometric backoff so we don't hammer a sick server. Either
-                    // way, report the read timeout that killed this attempt so the
-                    // user can see how long the cancelled request waited.
+                    // Retryable and nothing shown yet: try again, forever.
+                    // (Tests/scripts can cap total attempts via PIR_MAX_ATTEMPTS.)
+                    let failed_attempt = attempt + 1;
+                    if let Some(max) = max_attempts()
+                        && u64::from(failed_attempt) >= max {
+                            return Err(format!(
+                                "gave up after {failed_attempt} attempts (PIR_MAX_ATTEMPTS={max}): {e}"
+                            ));
+                        }
+                    // The wait doubles each attempt (see `retry_backoff`) so a
+                    // struggling server gets progressively more room.
                     let timed_out = is_timeout(&e);
-                    let backoff = if timed_out {
-                        Duration::ZERO
-                    } else {
-                        (RETRY_BASE_BACKOFF * 2u32.pow(attempt as u32)).min(RETRY_MAX_BACKOFF)
-                    };
-                    on_text(&format!(
-                        "\n\u{26a0} request failed (attempt {}), retrying in {:.0?} (timeout was {:.0?}): {}\n",
-                        attempt + 1, backoff, read_timeout, e
+                    let backoff = retry_backoff(attempt, timed_out);
+                    on_notice(&format!(
+                        "\n\u{26a0} request failed (attempt {failed_attempt}), retrying in {:.0?} — keeps retrying until it succeeds (Ctrl-C to stop): {e}\n",
+                        backoff
                     ));
+                    // Report the wait so the UI can show a live countdown:
+                    // once now, ~1/sec while waiting, once at the end with
+                    // `remaining == ZERO` (the UI erases the line on that).
+                    let mut report = |waited: Duration| {
+                        on_retry(&RetryWait {
+                            attempt: failed_attempt,
+                            total: backoff,
+                            remaining: backoff.saturating_sub(waited),
+                        });
+                    };
+                    report(Duration::ZERO);
                     // Await the backoff in slices, raced against the cancel
                     // channel so a cancel mid-backoff is honoured instantly.
                     let mut waited = Duration::ZERO;
+                    let mut last_secs = backoff.as_secs();
                     while waited < backoff {
                         if cancel.load(Ordering::SeqCst) {
                             return Err("request cancelled".to_string());
@@ -449,11 +701,19 @@ impl Client {
                         )
                         .await;
                         waited += slice;
+                        // Tick the countdown on whole-second changes only, so
+                        // the UI redraws ~1/sec instead of 10/sec.
+                        let secs = backoff.saturating_sub(waited).as_secs();
+                        if secs != last_secs {
+                            last_secs = secs;
+                            report(waited);
+                        }
                     }
+                    report(backoff);
+                    attempt += 1;
                 }
             }
         }
-        unreachable!()
         })
     }
 
@@ -574,6 +834,75 @@ impl Client {
         let mut url = url.trim_end_matches('/').to_string();
         if !url.ends_with("/chat/completions") && !url.contains('?') {
             url.push_str("/chat/completions");
+        }
+        (url, body)
+    }
+
+    /// OpenAI Responses API request (`POST {base}/responses`). Models whose
+    /// catalog entry says `openai-responses` live here (opencode-go's
+    /// muse-spark/grok/gpt-5.6-luna); chat-style bodies 500 on them.
+    /// `input` is the flat item list (system first, then converted history),
+    /// output budget rides `max_output_tokens`, and thinking maps to the
+    /// `reasoning.effort` object. `allow_effort == false` drops it (models
+    /// that reject the field).
+    #[allow(clippy::too_many_arguments)]
+    fn responses_request(
+        &self,
+        model: &str,
+        max_tokens: u64,
+        system: &str,
+        history: &[Message],
+        tools: &[ToolSpec],
+        thinking: crate::config::ThinkingLevel,
+        allow_effort: bool,
+    ) -> (String, Value) {
+        let mut input = vec![json!({ "role": "system", "content": system })];
+        for m in history.iter().filter(|m| !m.is_empty()) {
+            input.extend(responses_input(m));
+        }
+        let mut body = Map::new();
+        body.insert("model".into(), json!(model));
+        body.insert("input".into(), Value::Array(input));
+        body.insert("stream".into(), json!(true));
+        body.insert("max_output_tokens".into(), json!(max_tokens));
+        body.insert(
+            "tools".into(),
+            Value::Array(tools.iter().map(|t| json!({
+                "type": "function",
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.schema,
+            })).collect()),
+        );
+        if allow_effort {
+            if let Some(effort) = thinking.oai_effort() {
+                body.insert("reasoning".into(), json!({ "effort": effort }));
+            }
+        }
+        (format!("{}/responses", self.base_url), Value::Object(body))
+    }
+
+    /// [`Self::responses_request`] against an explicit base URL (per-model
+    /// override, same convention as [`Self::openai_request_at`]).
+    #[allow(clippy::too_many_arguments)]
+    fn responses_request_at(
+        &self,
+        url: &str,
+        model: &str,
+        max_tokens: u64,
+        system: &str,
+        history: &[Message],
+        tools: &[ToolSpec],
+        thinking: crate::config::ThinkingLevel,
+        allow_effort: bool,
+    ) -> (String, Value) {
+        let (base, body) = self.responses_request(
+            model, max_tokens, system, history, tools, thinking, allow_effort,
+        );
+        let _ = base;
+        let mut url = url.trim_end_matches('/').to_string();
+        if !url.ends_with("/responses") && !url.contains('?') {
+            url.push_str("/responses");
         }
         (url, body)
     }
@@ -880,6 +1209,308 @@ fn is_timeout(error: &str) -> bool {
 fn is_read_timeout(e: &std::io::Error) -> bool {
     matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)
 }
+/// Repair orphaned tool blocks before serializing a request.
+///
+/// Several paths can leave `history` with tool calls that have no results or
+/// results that have no call: context `trim` cutting mid-turn, session resume
+/// folding assistant blocks into a user message, or a preflight `terminate`
+/// skipping the remaining calls. Either shape makes the provider reject the
+/// whole request with HTTP 400 (`role 'tool' must be a response to a
+/// preceding message with 'tool_calls'` / `tool_calls must be followed by
+/// tool messages`), killing the turn for want of bookkeeping.
+///
+/// This rewrites the sequence into valid form, preserving order and content:
+/// - `ToolUse` blocks found inside a *user* message are lifted into their own
+///   preceding assistant message (the resume-fold artifact).
+/// - `ToolResult`s with no matching open call become plain text (content kept,
+///   so nothing the tools said is silently lost).
+/// - calls left without results gain a synthetic error result, so no
+///   `tool_calls` dangles.
+/// - result blocks are emitted immediately after their assistant message
+///   (ahead of any user text from the same message), keeping the
+///   assistant → tool adjacency strict providers require.
+///
+/// Clean histories pass through with the same messages and blocks.
+/// Emit a `PIR_DEBUG` diagnostics line. `PIR_DEBUG=1` (or `true`) goes to
+/// stderr; any other value is treated as a file path to append to. The file
+/// form exists because stderr bypasses the spinner's screen protocol, so a
+/// footer repaint can wipe a freshly printed line off the display before it
+/// is read — a file never loses it.
+fn debug_log(line: &str) {
+    let val = match std::env::var_os("PIR_DEBUG") {
+        None => return,
+        Some(v) => v,
+    };
+    if val == "1" || val == "true" {
+        eprintln!("{line}");
+        return;
+    }
+    let path = std::path::PathBuf::from(&val);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = writeln!(f, "{line}");
+    } else {
+        // Unwritable path: fall back to stderr rather than losing it silently.
+        eprintln!("{line}");
+    }
+}
+
+/// Per-SSE-event arrival log for `PIR_DEBUG_CHUNKS=<path>`: one line per
+/// handled data event, `"<ms-since-stream-start> <kind> <bytes>"`, where kind
+/// is `text` / `reasoning` / `tool` / `usage` / `error` / `other`. No content
+/// is ever recorded (privacy + size). Lets a slow turn's gap structure be
+/// read off directly: dribble (even spacing) vs stall-then-burst (one huge
+/// gap) vs phase split (gaps only in one kind). Silent unless the env var is
+/// set; all writes best-effort. Construct per parser invocation with
+/// [`ChunkLog::open`] (path resolved once per process).
+struct ChunkLog {
+    w: Option<std::io::BufWriter<std::fs::File>>,
+    t0: Instant,
+}
+
+fn chunk_log_path() -> Option<std::path::PathBuf> {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::var_os("PIR_DEBUG_CHUNKS")
+            .map(std::path::PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+    })
+    .clone()
+}
+
+impl ChunkLog {
+    fn open() -> Self {
+        let w = chunk_log_path().and_then(|p| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&p)
+                .ok()
+                .map(std::io::BufWriter::new)
+        });
+        ChunkLog { w, t0: Instant::now() }
+    }
+
+    /// Test/diagnostic constructor with an explicit path (no env involved).
+    #[cfg(test)]
+    fn open_at(path: &std::path::Path) -> Self {
+        let w = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+            .map(std::io::BufWriter::new);
+        ChunkLog { w, t0: Instant::now() }
+    }
+
+    fn event(&mut self, kind: &str, bytes: usize) {
+        if let Some(w) = self.w.as_mut() {
+            let _ = writeln!(w, "{} {kind} {bytes}", self.t0.elapsed().as_millis());
+            // Flush every event: a few thousand syscalls per turn is nothing,
+            // and the log stays readable live (`tail -f`) and after a kill.
+            let _ = w.flush();
+        }
+    }
+}
+
+/// One-line timing summary for `PIR_DEBUG` (see [`debug_log`]: stderr or a
+/// file, never the transcript). `think_ms`/`text_ms` are the first-reasoning
+/// / first-content instants (None when that kind never arrived) — they split
+/// a slow turn into "thinking dribbled" vs "content dribbled". Pure for tests.
+fn chat_debug_line(
+    attempt: u32,
+    prompt_bytes: usize,
+    headers: Duration,
+    stream: Duration,
+    out_tokens: u64,
+    think_ms: Option<u128>,
+    text_ms: Option<u128>,
+) -> String {
+    let secs = stream.as_secs_f64().max(0.001);
+    let phase = |v: Option<u128>| v.map(|m| m.to_string()).unwrap_or_else(|| "-".to_string());
+    format!(
+        "pir-debug chat: attempt={} prompt_bytes={} headers_ms={} stream_ms={} out_tokens={} ({:.1} tok/s) think_first_ms={} text_first_ms={}",
+        attempt,
+        prompt_bytes,
+        headers.as_millis(),
+        stream.as_millis(),
+        out_tokens,
+        out_tokens as f64 / secs,
+        phase(think_ms),
+        phase(text_ms),
+    )
+}
+
+/// Dump the exact request body to a file when `PIR_DEBUG_PAYLOAD=<path>` is
+/// set (the header key is never part of the body, so the file is safe to
+/// share/curl). Lets anyone replay pir's byte-identical request through
+/// another client to isolate client-vs-provider speed differences.
+fn maybe_dump_payload(body: &Value) {
+    let Some(path) = std::env::var_os("PIR_DEBUG_PAYLOAD") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let _ = std::fs::write(path, body.to_string());
+}
+
+fn sanitize_history(history: &[Message]) -> Vec<Message> {
+    // Emit synthetic error results for still-open calls, closing them.
+    fn close_open(out: &mut Vec<Message>, open: &mut Vec<String>) {
+        if open.is_empty() {
+            return;
+        }
+        let ids = std::mem::take(open);
+        out.push(Message {
+            role: Role::User,
+            blocks: ids
+                .into_iter()
+                .map(|id| Block::ToolResult {
+                    tool_use_id: id,
+                    content: "skipped: no tool result was recorded for this call \
+                        (synthesized by pir to satisfy the provider API)"
+                        .to_string(),
+                    is_error: true,
+                })
+                .collect(),
+        });
+    }
+
+    let mut out: Vec<Message> = Vec::with_capacity(history.len());
+    // Call ids from the latest assistant message still awaiting results.
+    let mut open: Vec<String> = Vec::new();
+    for m in history {
+        match m.role {
+            Role::Assistant => {
+                // A new assistant message breaks adjacency: close any calls
+                // the previous one left dangling first.
+                close_open(&mut out, &mut open);
+                let mut calls = Vec::new();
+                for b in &m.blocks {
+                    if let Block::ToolUse { id, .. } = b {
+                        calls.push(id.clone());
+                    }
+                }
+                if !m.blocks.is_empty() {
+                    out.push(m.clone());
+                }
+                open = calls;
+            }
+            Role::User => {
+                let mut texts = Vec::new();
+                let mut uses = Vec::new();
+                let mut matched = Vec::new();
+                let mut orphans = Vec::new();
+                for b in &m.blocks {
+                    match b {
+                        Block::ToolUse { .. } => uses.push(b.clone()),
+                        Block::ToolResult { tool_use_id, content, .. } => {
+                            if open.contains(tool_use_id) {
+                                matched.push(b.clone());
+                            } else {
+                                orphans.push(Block::Text(format!(
+                                    "[pir: unpaired tool result for call '{tool_use_id}' — \
+                                    no matching tool call in history:]\n{content}"
+                                )));
+                            }
+                        }
+                        _ => texts.push(b.clone()),
+                    }
+                }
+                if !uses.is_empty() {
+                    // Resume-fold artifact: these belong to an assistant message.
+                    close_open(&mut out, &mut open);
+                    let ids: Vec<String> = uses
+                        .iter()
+                        .filter_map(|b| match b {
+                            Block::ToolUse { id, .. } => Some(id.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    out.push(Message { role: Role::Assistant, blocks: uses });
+                    open = ids;
+                }
+                if !matched.is_empty() {
+                    for b in &matched {
+                        if let Block::ToolResult { tool_use_id, .. } = b {
+                            open.retain(|id| id != tool_use_id);
+                        }
+                    }
+                    out.push(Message { role: Role::User, blocks: matched });
+                    // A results message always carries a turn's *complete* set
+                    // of results, so a partial consume means corruption: close
+                    // the rest now, while still adjacent to their calls.
+                    close_open(&mut out, &mut open);
+                } else if !open.is_empty() {
+                    // New turn content with calls still open and no results
+                    // here: close them first so adjacency holds.
+                    close_open(&mut out, &mut open);
+                }
+                texts.extend(orphans);
+                if !texts.is_empty() {
+                    out.push(Message { role: Role::User, blocks: texts });
+                }
+            }
+        }
+    }
+    // Dangling calls at the very end (e.g. trim cut right after them).
+    close_open(&mut out, &mut open);
+    out
+}
+
+/// Classify one parsed SSE data payload for chunk logging. Two vocabularies
+/// share this helper: Anthropic (`type` + `delta.type`) and OpenAI chat
+/// (`choices[0].delta.{content,reasoning*,tool_calls}`, top-level `usage`).
+/// Pure.
+fn sse_kind_chat(v: &Value) -> &'static str {
+    if v.get("error").is_some() {
+        return "error";
+    }
+    // Usage-only chunks (stream_options.include_usage) carry no choices.
+    if v.get("usage").is_some() {
+        return "usage";
+    }
+    // OpenAI chat shape (it carries no `type` field at all).
+    if let Some(choice) = v.get("choices").and_then(|c| c.get(0)) {
+        let delta = &choice["delta"];
+        if delta.get("tool_calls").is_some() {
+            return "tool";
+        }
+        let has = |k: &str| delta.get(k).and_then(Value::as_str).map_or(false, |s| !s.is_empty());
+        if has("content") {
+            return "text";
+        }
+        if has("reasoning") || has("reasoning_content") || has("reasoning_text") {
+            return "reasoning";
+        }
+        return "other";
+    }
+    match v.get("type").and_then(Value::as_str).unwrap_or("") {
+        "content_block_delta" => match v.get("delta").and_then(|d| d.get("type")).and_then(Value::as_str).unwrap_or("") {
+            "text_delta" => "text",
+            "thinking_delta" => "reasoning",
+            "input_json_delta" => "tool",
+            _ => "other",
+        },
+        "message_delta" => "usage",
+        "error" => "error",
+        _ => "other",
+    }
+}
+
+/// Classify a Responses event name for chunk logging. Pure.
+fn sse_kind_responses(ev: &str) -> &'static str {
+    match ev {
+        "response.output_text.delta" => "text",
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => "reasoning",
+        "response.output_item.done" => "tool",
+        "response.completed" => "usage",
+        "response.failed" | "error" => "error",
+        _ => "other",
+    }
+}
+
 fn anthropic_message(m: &Message) -> Value {
     let role = if m.role == Role::User { "user" } else { "assistant" };
     let blocks: Vec<Value> = m
@@ -902,13 +1533,59 @@ fn anthropic_message(m: &Message) -> Value {
     json!({ "role": role, "content": blocks })
 }
 
-fn openai_message(m: &Message) -> Vec<Value> {
+/// Convert one history message to Responses API input items (flat list).
+/// Text keeps role blocks; tool calls/results become `function_call` /
+/// `function_call_output` items keyed by call id; thinking blocks are dropped
+/// (never re-sent, like every other builder). Result blocks are emitted in
+/// block order so each output has its call nearby.
+fn responses_input(m: &Message) -> Vec<Value> {
     let mut out = Vec::new();
     match m.role {
         Role::User => {
             let text = m.text().trim().to_string();
             if !text.is_empty() {
                 out.push(json!({ "role": "user", "content": text }));
+            }
+            for b in &m.blocks {
+                if let Block::ToolResult { tool_use_id, content, .. } = b {
+                    out.push(json!({
+                        "type": "function_call_output",
+                        "call_id": tool_use_id,
+                        "output": content,
+                    }));
+                }
+            }
+        }
+        Role::Assistant => {
+            let text = m.text().trim().to_string();
+            if !text.is_empty() {
+                out.push(json!({ "role": "assistant", "content": text }));
+            }
+            for b in &m.blocks {
+                if let Block::ToolUse { id, name, input } = b {
+                    out.push(json!({
+                        "type": "function_call",
+                        "call_id": id,
+                        "name": name,
+                        "arguments": input.to_string(),
+                    }));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn openai_message(m: &Message) -> Vec<Value> {
+    let mut out = Vec::new();
+    match m.role {
+        Role::User => {
+            let text = m.text().trim().to_string();
+            if !text.is_empty() {
+                // Content-block form (pi parity: pi sends
+                // `[{type:"text", text}]`, never a bare string). Valid
+                // OpenAI and native to Anthropic.
+                out.push(json!({ "role": "user", "content": [{ "type": "text", "text": text }] }));
             }
             for b in &m.blocks {
                 if let Block::ToolResult { tool_use_id, content, .. } = b {
@@ -965,6 +1642,7 @@ async fn stream_anthropic<R: AsyncBufRead + Unpin>(
 
     let mut line = String::new();
     let mut last_byte = Instant::now();
+    let mut chunks = ChunkLog::open();
     loop {
         // Check cancellation and the stall watchdog before each read. The short
         // per-read ureq timeout makes each `read_line` wake within a couple of
@@ -1024,6 +1702,7 @@ async fn stream_anthropic<R: AsyncBufRead + Unpin>(
         let data = data.trim();
         if data == "[DONE]" { break; }
         let v: Value = match serde_json::from_str(data) { Ok(v) => v, Err(_) => continue };
+        chunks.event(sse_kind_chat(&v), data.len());
 
         match v["type"].as_str().unwrap_or("") {
             "message_start" => {
@@ -1131,6 +1810,7 @@ async fn stream_openai<R: AsyncBufRead + Unpin>(
 
     let mut line = String::new();
     let mut last_byte = Instant::now();
+    let mut chunks = ChunkLog::open();
     loop {
         if cancel.load(Ordering::SeqCst) {
             return Err("request cancelled".to_string());
@@ -1183,25 +1863,35 @@ async fn stream_openai<R: AsyncBufRead + Unpin>(
         let data = data.trim();
         if data == "[DONE]" { break; }
         let v: Value = match serde_json::from_str(data) { Ok(v) => v, Err(_) => continue };
+        chunks.event(sse_kind_chat(&v), data.len());
 
-        if let Some(u) = v.get("usage") {
-            if !u.is_null() {
+        if let Some(u) = v.get("usage")
+            && !u.is_null() {
                 if let Some(p) = u["prompt_tokens"].as_u64() { usage.input = p; }
                 if let Some(c) = u["completion_tokens"].as_u64() { usage.output = c; }
             }
-        }
         let Some(choice) = v["choices"].get(0) else { continue };
         let delta = &choice["delta"];
-        if let Some(t) = delta["content"].as_str() {
-            if !t.is_empty() {
+        if let Some(t) = delta["content"].as_str()
+            && !t.is_empty() {
                 *emitted_text = true;
                 on_text(t);
                 text.push_str(t);
             }
-        }
-        // OpenAI o-series reasoning: `delta.reasoning` carries the model's
-        // chain-of-thought. Forward it to `on_think`.
-        if let Some(t) = delta["reasoning"].as_str() {
+        // Reasoning chain-of-thought. The field name varies by provider and
+        // gateway: OpenAI o-series sends `delta.reasoning`, DeepSeek-compatible
+        // APIs (DeepSeek proper, Ollama Cloud) send `delta.reasoning_content`,
+        // and some gateways send `delta.reasoning_text`. Forward whichever
+        // arrives to `on_think` — an unrecognized field means a reasoning
+        // model's whole thinking phase is silently swallowed and the user
+        // stares at a bare spinner for minutes (exactly what happened with
+        // deepseek-v4-flash on ollama-cloud). First non-empty match wins so
+        // a gateway echoing two names can't duplicate the text.
+        if let Some(t) = ["reasoning", "reasoning_content", "reasoning_text"]
+            .into_iter()
+            .filter_map(|key| delta[key].as_str())
+            .find(|t| !t.is_empty())
+        {
             on_think(t);
             thinking.push_str(t);
         }
@@ -1212,12 +1902,10 @@ async fn stream_openai<R: AsyncBufRead + Unpin>(
                     calls.push((idx, String::new(), String::new(), String::new()));
                 }
                 let slot = calls.iter_mut().find(|(i, _, _, _)| *i == idx).unwrap();
-                if let Some(id) = tc["id"].as_str() {
-                    if !id.is_empty() { slot.1 = id.to_string(); }
-                }
-                if let Some(name) = tc["function"]["name"].as_str() {
-                    if !name.is_empty() { slot.2 = name.to_string(); }
-                }
+                if let Some(id) = tc["id"].as_str()
+                    && !id.is_empty() { slot.1 = id.to_string(); }
+                if let Some(name) = tc["function"]["name"].as_str()
+                    && !name.is_empty() { slot.2 = name.to_string(); }
                 if let Some(args) = tc["function"]["arguments"].as_str() {
                     slot.3.push_str(args);
                 }
@@ -1244,10 +1932,208 @@ async fn stream_openai<R: AsyncBufRead + Unpin>(
     Ok((Message { role: Role::Assistant, blocks }, usage))
 }
 
+/// Stream the OpenAI Responses API (`POST {base}/responses`, SSE). Same
+/// robustness contract as [`stream_openai`] (cancel race, stall watchdog,
+/// `emitted_text`/`saw_tool_calls` no-retry-after-output semantics) with the
+/// Responses event vocabulary: `event: <name>` lines select the handler and
+/// `data:` carries the payload (a bare `"type"` field in data is accepted
+/// too, for gateways that omit the event line).
+///
+/// - `response.output_text.delta` `{"delta"}` → streamed text.
+/// - `response.reasoning_summary_text.delta` / `response.reasoning_text.delta`
+///   → thinking.
+/// - `response.output_item.done` with `item.type == "function_call"` → a
+///   tool call (accumulated by call id, flushed at the end).
+/// - `response.completed` → usage envelope; `response.failed` / `error` → Err.
+#[allow(clippy::too_many_arguments)]
+async fn stream_responses<R: AsyncBufRead + Unpin>(
+    r: &mut R,
+    on_text: &mut dyn FnMut(&str),
+    emitted_text: &mut bool,
+    saw_tool_calls: &mut bool,
+    cancel: &Arc<AtomicBool>,
+    cancel_rx: &SmolRx<()>,
+    on_think: &mut dyn FnMut(&str),
+) -> Result<(Message, Usage), String> {
+    let mut usage = Usage::default();
+    let mut text = String::new();
+    let mut thinking = String::new();
+    let mut calls: Vec<(String, String, String)> = Vec::new(); // (id, name, args)
+    let mut event = String::new();
+
+    let mut line = String::new();
+    let mut last_byte = Instant::now();
+    let mut chunks = ChunkLog::open();
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("request cancelled".to_string());
+        }
+        if last_byte.elapsed() > stall_timeout() {
+            return Err("stream: stalled (no data for 180s)".to_string());
+        }
+        line.clear();
+        enum Step {
+            Line(std::io::Result<usize>),
+            Cancel,
+            Stall,
+        }
+        let step = future::or(
+            async { Step::Line(r.read_line(&mut line).await) },
+            future::or(
+                async {
+                    let _ = cancel_rx.recv().await;
+                    Step::Cancel
+                },
+                async {
+                    Timer::after(stall_timeout()).await;
+                    Step::Stall
+                },
+            ),
+        )
+        .await;
+        let n = match step {
+            Step::Cancel => return Err("request cancelled".to_string()),
+            Step::Stall => return Err("stream: stalled (no data for 180s)".to_string()),
+            Step::Line(Ok(n)) => n,
+            Step::Line(Err(e)) => {
+                if cancel.load(Ordering::SeqCst) {
+                    return Err("request cancelled".to_string());
+                }
+                return Err(format!("stream: {e}"));
+            }
+        };
+        if n == 0 {
+            if last_byte.elapsed() > stall_timeout() {
+                return Err("stream: stalled (no data for 180s)".to_string());
+            }
+            break;
+        }
+        last_byte = Instant::now();
+        let trimmed = line.trim_end();
+        if let Some(name) = trimmed.strip_prefix("event:") {
+            event = name.trim().to_string();
+            continue;
+        }
+        let Some(data) = trimmed.strip_prefix("data:") else { continue };
+        let data = data.trim();
+        if data == "[DONE]" {
+            break;
+        }
+        let v: Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // Event name from the `event:` line, else the payload's own type.
+        let ev = if event.is_empty() {
+            v.get("type").and_then(Value::as_str).unwrap_or("").to_string()
+        } else {
+            std::mem::take(&mut event)
+        };
+        chunks.event(sse_kind_responses(&ev), data.len());
+        match ev.as_str() {
+            "response.output_text.delta" => {
+                let t = v
+                    .get("delta")
+                    .or_else(|| v.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if !t.is_empty() {
+                    *emitted_text = true;
+                }
+                on_text(t);
+                text.push_str(t);
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                let t = v
+                    .get("delta")
+                    .or_else(|| v.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                on_think(t);
+                thinking.push_str(t);
+            }
+            "response.output_item.done" => {
+                let item = &v["item"];
+                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    let id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let name = item.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                    let args = item
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    match calls.iter_mut().find(|(i, _, _)| *i == id) {
+                        Some(slot) => {
+                            if slot.1.is_empty() {
+                                slot.1 = name;
+                            }
+                            slot.2.push_str(&args);
+                        }
+                        None => calls.push((id, name, args)),
+                    }
+                }
+            }
+            "response.completed" => {
+                let u = &v["response"]["usage"];
+                let u = if u.is_null() { &v["usage"] } else { u };
+                if let Some(p) = u["input_tokens"].as_u64() {
+                    usage.input = p;
+                }
+                if let Some(c) = u["output_tokens"].as_u64() {
+                    usage.output = c;
+                }
+                break;
+            }
+            "response.failed" => {
+                let msg = v["response"]["error"]["message"]
+                    .as_str()
+                    .or_else(|| v["error"]["message"].as_str())
+                    .or_else(|| v["message"].as_str())
+                    .unwrap_or("unknown API error");
+                return Err(msg.to_string());
+            }
+            "error" => {
+                let msg = v["message"].as_str().unwrap_or("unknown API error");
+                return Err(msg.to_string());
+            }
+            _ => {}
+        }
+    }
+    // Flush dangling state if the stream was cut early.
+    let mut blocks: Vec<Block> = Vec::new();
+    if !thinking.trim().is_empty() {
+        blocks.push(Block::Thinking { text: std::mem::take(&mut thinking) });
+    }
+    if !text.trim().is_empty() {
+        blocks.push(Block::Text(std::mem::take(&mut text)));
+    }
+    for (n, (id, name, args)) in calls.into_iter().enumerate() {
+        let id = if id.is_empty() { format!("call-{n}") } else { id };
+        let name = if name.is_empty() { "unknown_tool".to_string() } else { name };
+        let input: Value = serde_json::from_str(&args).unwrap_or_else(|_| json!({}));
+        blocks.push(Block::ToolUse { id, name, input });
+        *saw_tool_calls = true;
+    }
+    if blocks.is_empty() {
+        blocks.push(Block::Text("(empty response)".into()));
+    }
+    Ok((Message { role: Role::Assistant, blocks }, usage))
+}
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes the env-mutating retry tests: parallel test threads share
+    /// one process environment, so anything touching PIR_RETRY_* /
+    /// PIR_MAX_ATTEMPTS holds this while asserting.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A `Read` that yields `data` once, then reports a *timeout* on every
     /// subsequent read — simulating a server that connected, sent its preamble,
@@ -1308,7 +2194,9 @@ mod tests {
         // Point the stall watchdog low so it trips quickly. With a silent,
         // never-completing reader the parser must detect the stall via the
         // `smol::Timer` raced against the read (rather than waiting for EOF).
-        std::env::set_var("PIR_STALL_TIMEOUT_SECS", "1");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PIR_STALL_TIMEOUT_SECS", "1"); }
         let cancel = Arc::new(AtomicBool::new(false));
         // Keep the sender alive so the cancel arm of the `or` stays pending and
         // the stall timer (not a closed channel) is what fires.
@@ -1325,7 +2213,9 @@ mod tests {
             &mut |_s: &str| {},
         ));
         let elapsed = started.elapsed();
-        std::env::remove_var("PIR_STALL_TIMEOUT_SECS");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::remove_var("PIR_STALL_TIMEOUT_SECS"); }
         assert!(res.is_err(), "expected a stall error");
         assert!(res.unwrap_err().contains("stalled"), "expected stall error");
         assert!(elapsed < std::time::Duration::from_secs(5), "stall took too long: {elapsed:?}");
@@ -1678,17 +2568,34 @@ mod tests {
 
     #[test]
     fn backoff_grows_and_caps() {
-        let base = RETRY_BASE_BACKOFF;
-        let capped = RETRY_MAX_BACKOFF;
-        assert_eq!((base * 2u32.pow(0)).min(capped), Duration::from_secs(60));
-        assert_eq!((base * 2u32.pow(1)).min(capped), Duration::from_secs(120));
-        assert_eq!((base * 2u32.pow(2)).min(capped), Duration::from_secs(240)); // hits cap
-        assert_eq!((base * 2u32.pow(3)).min(capped), Duration::from_secs(240));
-        assert_eq!((base * 2u32.pow(10)).min(capped), capped);
+        // Serialize with the other env-sensitive retry tests (parallel test
+        // threads share one process environment).
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("PIR_RETRY_BASE_SECS");
+            std::env::remove_var("PIR_RETRY_MAX_SECS");
+        }
+        // Timeout tier: 10s, 20s, 40s … capped at 300s.
+        assert_eq!(retry_backoff(0, true), Duration::from_secs(10));
+        assert_eq!(retry_backoff(1, true), Duration::from_secs(20));
+        assert_eq!(retry_backoff(5, true), Duration::from_secs(300)); // hits cap
+        assert_eq!(retry_backoff(10, true), Duration::from_secs(300));
+        // Other-transient tier: 30s, 60s, 120s … capped at 600s.
+        assert_eq!(retry_backoff(0, false), Duration::from_secs(30));
+        assert_eq!(retry_backoff(1, false), Duration::from_secs(60));
+        assert_eq!(retry_backoff(2, false), Duration::from_secs(120));
+        assert_eq!(retry_backoff(5, false), Duration::from_secs(600)); // hits cap
+        assert_eq!(retry_backoff(100, false), Duration::from_secs(600));
     }
 
     #[test]
     fn timeout_constants_sane() {
+        // Reads the shared env: hold the lock + clear overrides so a
+        // concurrently-running retry test can't leak its vars in here.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("PIR_MAX_ATTEMPTS");
+        }
         assert!(CONNECT_TIMEOUT.as_secs() >= 5);
         // The streaming *status-line* read timeout is now generous, so a slow
         // / "thinking" provider has time to send its first byte before we
@@ -1698,7 +2605,11 @@ mod tests {
         assert!(READ_TIMEOUT_INIT.as_secs() >= 15);
         const _: () = assert!(READ_TIMEOUT_GROWTH >= 2);
         assert!(STALL_TIMEOUT.as_secs() >= 30);
-        assert_eq!(MAX_RETRIES, 4);
+        // Retries never give up on their own: no attempt cap by default, and
+        // the backoff doubles per attempt (capped) for both tiers.
+        assert_eq!(max_attempts(), None);
+        assert!(retry_backoff(1, false) > retry_backoff(0, false));
+        assert!(retry_backoff(1, true) > retry_backoff(0, true));
     }
 
     #[test]
@@ -1915,6 +2826,8 @@ mod tests {
             None,
             None,
             true,
+            &mut |_w: &RetryWait| {},
+            &mut |_n: &str| {},
         );
         let elapsed = started.elapsed();
         assert!(res.is_err(), "expected cancellation error, got {res:?}");
@@ -1963,6 +2876,8 @@ mod tests {
             None,
             None,
             true,
+            &mut |_w: &RetryWait| {},
+            &mut |_n: &str| {},
         );
         assert!(res.is_ok(), "slow-but-alive provider must complete, got {res:?}");
         assert!(text.contains("hi"), "expected streamed text, got {text:?}");
@@ -2013,8 +2928,662 @@ mod tests {
             None,
             None,
             true,
+            &mut |_w: &RetryWait| {},
+            &mut |_n: &str| {},
         );
         assert!(res.is_ok(), "response that lands before cancel must win, got {res:?}");
         assert!(text.contains("ok"), "expected streamed text, got {text:?}");
     }
+
+    #[test]
+    fn retries_forever_until_provider_recovers() {
+        // Two 500s then a success: with no PIR_MAX_ATTEMPTS the loop must
+        // keep going and return the recovered response, reporting each wait.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("PIR_RETRY_BASE_SECS", "0");
+            std::env::remove_var("PIR_MAX_ATTEMPTS");
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_srv = hits.clone();
+        let _srv = thread::spawn(move || {
+            use std::io::Write as _;
+            // Headroom past the 3 expected hits: a pooled dead connection
+            // can cost an extra accept, and the loop must still be listening
+            // when the real retry lands. `Connection: close` keeps the
+            // client from parking these sockets back in its pool.
+            for _ in 0..10 {
+                let (mut sock, _) = listener.accept().expect("accept");
+                let n = hits_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n < 2 {
+                    let _ = sock.write_all(
+                        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    let _ = sock.flush();
+                } else {
+                    let body = "{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"recovered\"}}]}";
+                    let frame = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {body}\ndata: [DONE]\n\n"
+                    );
+                    let _ = sock.write_all(frame.as_bytes());
+                    let _ = sock.flush();
+                    break;
+                }
+            }
+        });
+        let client = Client::new(ApiKind::OpenAi, &format!("http://{addr}"), "test-key".to_string());
+        let mut text = String::new();
+        let mut waits = 0usize;
+        let mut notices = String::new();
+        let res = client.chat(
+            "test-model",
+            16,
+            "sys",
+            &[Message { role: Role::User, blocks: vec![Block::Text("hi".into())] }],
+            &[],
+            &mut |t: &str| text.push_str(t),
+            crate::config::ThinkingLevel::Off,
+            0,
+            &mut |_s: &str| {},
+            None,
+            None,
+            true,
+            &mut |_w: &RetryWait| waits += 1,
+            &mut |n: &str| notices.push_str(n),
+        );
+        unsafe { std::env::remove_var("PIR_RETRY_BASE_SECS"); }
+        assert!(res.is_ok(), "must recover after transient 500s, got {res:?}");
+        assert!(text.contains("recovered"), "expected recovered text, got {text:?}");
+        // Notices travel the notice channel now, never the model text: the
+        // transcript stays pure model output while attempts are still reported.
+        assert!(!text.contains("attempt"), "model text must not carry notices: {text:?}");
+        assert!(
+            notices.contains("attempt 1") && notices.contains("attempt 2"),
+            "notices must show both failed attempts, got {notices:?}"
+        );
+        assert!(notices.contains("reconnected on attempt 3"), "must note recovery, got {notices:?}");
+        assert!(waits >= 2, "countdown must have been reported per wait, got {waits}");
+    }
+
+    #[test]
+    fn max_attempts_caps_retries_for_scripts() {
+        // Always-500 server with PIR_MAX_ATTEMPTS=2: must give up after
+        // exactly 2 attempts instead of looping forever.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("PIR_RETRY_BASE_SECS", "0");
+            std::env::set_var("PIR_MAX_ATTEMPTS", "2");
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_srv = hits.clone();
+        let _srv = thread::spawn(move || {
+            use std::io::Write as _;
+            // Serve a few more than the cap so a runaway loop can't deadlock
+            // on accept; the client must stop after 2.
+            for _ in 0..5 {
+                let Ok((mut sock, _)) = listener.accept() else { break };
+                hits_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = sock.write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+                );
+                let _ = sock.flush();
+            }
+        });
+        let client = Client::new(ApiKind::OpenAi, &format!("http://{addr}"), "test-key".to_string());
+        let mut text = String::new();
+        let res = client.chat(
+            "test-model",
+            16,
+            "sys",
+            &[Message { role: Role::User, blocks: vec![Block::Text("hi".into())] }],
+            &[],
+            &mut |t: &str| text.push_str(t),
+            crate::config::ThinkingLevel::Off,
+            0,
+            &mut |_s: &str| {},
+            None,
+            None,
+            true,
+            &mut |_w: &RetryWait| {},
+            &mut |_n: &str| {},
+        );
+        unsafe {
+            std::env::remove_var("PIR_RETRY_BASE_SECS");
+            std::env::remove_var("PIR_MAX_ATTEMPTS");
+        }
+        assert!(res.is_err(), "must give up under PIR_MAX_ATTEMPTS, got {res:?}");
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("gave up after 2 attempts"),
+            "error must name the attempt count, got: {err:?} (transcript: {text:?})"
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    fn user_text(s: &str) -> Message {
+        Message { role: Role::User, blocks: vec![Block::Text(s.to_string())] }
+    }
+
+    fn asst_tool(id: &str, name: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            blocks: vec![Block::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input: serde_json::json!({}),
+            }],
+        }
+    }
+
+    fn user_result(id: &str, content: &str) -> Message {
+        Message {
+            role: Role::User,
+            blocks: vec![Block::ToolResult {
+                tool_use_id: id.to_string(),
+                content: content.to_string(),
+                is_error: false,
+            }],
+        }
+    }
+
+    /// Every `role: tool` message in an OpenAI payload must reference a
+    /// `tool_call_id` from the immediately preceding assistant message.
+    fn assert_openai_tools_valid(body: &Value) {
+        let msgs = body.get("messages").and_then(Value::as_array).expect("messages");
+        let mut open: Vec<String> = Vec::new();
+        for m in msgs {
+            let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+            match role {
+                "assistant" => {
+                    open = m
+                        .get("tool_calls")
+                        .and_then(Value::as_array)
+                        .map(|cs| {
+                            cs.iter()
+                                .filter_map(|c| {
+                                    c.get("id").and_then(|v| v.as_str()).map(str::to_string)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                }
+                "tool" => {
+                    let id = m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
+                    assert!(
+                        open.contains(&id.to_string()),
+                        "orphan tool message for '{id}' after assistant calls {open:?}"
+                    );
+                    open.retain(|x| x != id);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn stream_openai_reasoning_content_forwarded_to_think() {
+        // DeepSeek-compatible APIs (DeepSeek, Ollama Cloud) stream the
+        // chain-of-thought as `delta.reasoning_content`, not `delta.reasoning`.
+        // It must reach `on_think` and the Thinking block — previously it was
+        // silently dropped and the whole reasoning phase showed as a bare spinner.
+        const STREAM: &str = concat!(
+            r#"data: {"choices":[{"delta":{"role":"assistant","reasoning_content":"let me think"}}]}"#,
+            "\n",
+            r#"data: {"choices":[{"delta":{"reasoning_content":" about clang"}}]}"#,
+            "\n",
+            r#"data: {"choices":[{"delta":{"content":"result"}}]}"#,
+            "\n",
+            "data: [DONE]\n",
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_keep_sender_alive, rx) = smol_channel::<()>(1);
+        // Shared buffers: the `run` closure must be 'static for the deadline
+        // thread, so plain `&mut` captures are illegal here.
+        let think_buf = Arc::new(Mutex::new(String::new()));
+        let text_buf = Arc::new(Mutex::new(String::new()));
+        let run = {
+            let think_buf = think_buf.clone();
+            let text_buf = text_buf.clone();
+            move || {
+                let mut reader =
+                    smol::io::BufReader::new(smol::io::Cursor::new(STREAM.as_bytes()));
+                smol::block_on(stream_openai(
+                    &mut reader,
+                    &mut |t: &str| text_buf.lock().unwrap().push_str(t),
+                    &mut false,
+                    &mut false,
+                    &cancel,
+                    &rx,
+                    &mut |t: &str| think_buf.lock().unwrap().push_str(t),
+                ))
+            }
+        };
+        let (msg, _usage) = match run_stream_with_deadline(run, 5) {
+            Ok(v) => v,
+            Err(e) => panic!("unexpected stream error: {e}"),
+        };
+        let think = think_buf.lock().unwrap().clone();
+        let text = text_buf.lock().unwrap().clone();
+        assert_eq!(think, "let me think about clang", "reasoning_content must reach on_think");
+        assert!(text.contains("result"));
+        assert!(
+            msg.blocks.iter().any(|b| matches!(b, Block::Thinking { .. })),
+            "Thinking block must be recorded, got {:?}",
+            msg.blocks
+        );
+    }
+
+    #[test]
+    fn chat_debug_line_format() {
+        // The PIR_DEBUG timing line must carry prompt size, both spans, and
+        // the token rate: that tuple is what separates "slow network" from
+        // "slow generation" from "huge prompt".
+        let s = chat_debug_line(2, 42137, Duration::from_millis(812), Duration::from_secs(38), 214, Some(900), Some(38100));
+        assert!(s.starts_with("pir-debug chat:"), "machine-greppable prefix: {s}");
+        assert!(s.contains("attempt=2"), "{s}");
+        assert!(s.contains("prompt_bytes=42137"), "{s}");
+        assert!(s.contains("headers_ms=812"), "{s}");
+        assert!(s.contains("out_tokens=214"), "{s}");
+        assert!(s.contains("tok/s"), "{s}");
+        assert!(s.contains("think_first_ms=900"), "{s}");
+        assert!(s.contains("text_first_ms=38100"), "{s}");
+    }
+
+    #[test]
+    fn debug_payload_dump_roundtrips() {
+        // `PIR_DEBUG_PAYLOAD=<path>` must persist the exact body so a turn
+        // can be replayed byte-identical through curl.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = std::env::temp_dir().join(format!("pir_body_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        unsafe { std::env::set_var("PIR_DEBUG_PAYLOAD", &path); }
+        let body = serde_json::json!({"model": "m", "stream": true});
+        maybe_dump_payload(&body);
+        unsafe { std::env::remove_var("PIR_DEBUG_PAYLOAD"); }
+        let back: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("payload file"))
+                .expect("valid json");
+        assert_eq!(back, body, "dumped body must parse back identically");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn debug_log_to_file_appends() {
+        // `PIR_DEBUG=<path>` must append the line to the file (stderr can be
+        // wiped by a spinner repaint before it is read).
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = std::env::temp_dir().join(format!("pir_dbg_{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        unsafe { std::env::set_var("PIR_DEBUG", &path); }
+        debug_log("pir-debug chat: attempt=1");
+        debug_log("pir-debug chat: attempt=2");
+        unsafe { std::env::remove_var("PIR_DEBUG"); }
+        let body = std::fs::read_to_string(&path).expect("log file");
+        assert!(
+            body.lines().count() == 2 && body.contains("attempt=2"),
+            "both lines appended: {body:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn client_sends_streaming_friendly_headers() {
+        // SSE must not be content-encoded: isahc enables transparent gzip/br
+        // by default, advertising `Accept-Encoding` — and some proxies buffer
+        // compressed streams, turning a live token drip into sludge while the
+        // byte-identical body streams instantly for curl (which sends no
+        // Accept-Encoding). Capture the raw request off the wire and assert
+        // pir asks for identity, like curl.
+        use std::io::Read as _;
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(false).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap_srv = captured.clone();
+        let srv = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            // Read headers, then exactly Content-Length body bytes.
+            let head_end = loop {
+                let n = sock.read(&mut tmp).expect("read");
+                if n == 0 {
+                    break None;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(p) = find_subslice(&buf, b"\r\n\r\n") {
+                    break Some(p + 4);
+                }
+            };
+            let head_end = head_end.expect("complete headers");
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+            let len: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("Content-Length:").or_else(|| l.strip_prefix("content-length:")))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            while buf.len() < head_end + len {
+                let n = sock.read(&mut tmp).expect("read body");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            *cap_srv.lock().unwrap() = buf;
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            let _ = sock.flush();
+        });
+        let client = Client::new(ApiKind::OpenAi, &format!("http://{addr}"), "k".to_string());
+        let res = smol::block_on(async {
+            let req = isahc::Request::builder()
+                .method("POST")
+                .uri(format!("http://{addr}/v1/chat/completions"))
+                .header("content-type", "application/json")
+                .body("{}")
+                .unwrap();
+            client.http.send_async(req).await
+        });
+        assert!(res.is_ok(), "local send must succeed: {res:?}");
+        srv.join().expect("server");
+        let raw = captured.lock().unwrap().clone();
+        let head = String::from_utf8_lossy(&raw);
+        let head = head.split("\r\n\r\n").next().unwrap_or("").to_lowercase();
+        for enc in ["gzip", "deflate", "br", "zstd"] {
+            assert!(
+                !head.contains(&format!("accept-encoding:").to_string()) || !head.contains(enc),
+                "must not advertise compressed encoding '{enc}':\n{head}"
+            );
+        }
+    }
+
+    fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        hay.windows(needle.len()).position(|w| w == needle)
+    }
+
+    #[test]
+    fn client_sends_identity_and_session_headers() {
+        // Vendor contract (opencode.ai/docs/go): identify as our own agent
+        // (never a bare HTTP-library UA) and send the stable per-conversation
+        // session id -- but ONLY when one is set (opencode-go via
+        // make_client), never leaking the header to other providers.
+        use std::io::Read as _;
+        use std::io::Write as _;
+        fn head_for(configure: impl FnOnce(&mut Client)) -> String {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().unwrap().to_string();
+            let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+            let cap_srv = captured.clone();
+            let srv = thread::spawn(move || {
+                let (mut sock, _) = listener.accept().expect("accept");
+                sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let head_end = loop {
+                    let n = sock.read(&mut tmp).expect("read");
+                    if n == 0 {
+                        break None;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(p) = find_subslice(&buf, b"\r\n\r\n") {
+                        break Some(p + 4);
+                    }
+                };
+                let head_end = head_end.expect("complete headers");
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("Content-Length:")
+                            .or_else(|| l.strip_prefix("content-length:"))
+                    })
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                while buf.len() < head_end + len {
+                    let n = sock.read(&mut tmp).expect("read body");
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                *cap_srv.lock().unwrap() = buf;
+                let _ = sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+                let _ = sock.flush();
+            });
+            let mut client =
+                Client::new(ApiKind::OpenAi, &format!("http://{addr}"), "k".to_string());
+            configure(&mut client);
+            let res = smol::block_on(async {
+                let req = client.apply_headers(
+                    isahc::Request::builder()
+                        .method("POST")
+                        .uri(format!("http://{addr}/v1/chat/completions"))
+                        .header("content-type", "application/json"),
+                    ApiKind::OpenAi,
+                );
+                let req = req.body("{}").unwrap();
+                client.http.send_async(req).await
+            });
+            assert!(res.is_ok(), "local send must succeed: {res:?}");
+            srv.join().expect("server");
+            let raw = captured.lock().unwrap().clone();
+            let full = String::from_utf8_lossy(&raw).to_string();
+            full.split("\r\n\r\n").next().unwrap_or("").to_lowercase()
+        }
+        // No session set (every other provider): UA present, no session header.
+        let plain = head_for(|_| {});
+        assert!(plain.contains("user-agent: pir/"), "UA names our agent:\n{plain}");
+        assert!(!plain.contains("x-opencode-session"), "no session leak:\n{plain}");
+        // Session set (make_client does this for opencode-go): both headers.
+        let sess = head_for(|c| c.set_session_id(Some("sess-1".to_string())));
+        assert!(sess.contains("user-agent: pir/"), "UA names our agent:\n{sess}");
+        assert!(
+            sess.contains("x-opencode-session: sess-1"),
+            "session header present:\n{sess}"
+        );
+    }
+
+    #[test]
+    fn sse_kinds_classify_phases() {
+        // Chunk-log phase labels: the gap analysis lives or dies on these.
+        let text = serde_json::json!({"type": "content_block_delta", "delta": {"type": "text_delta"}});
+        assert_eq!(sse_kind_chat(&text), "text");
+        let think = serde_json::json!({"type": "content_block_delta", "delta": {"type": "thinking_delta"}});
+        assert_eq!(sse_kind_chat(&think), "reasoning");
+        let tool = serde_json::json!({"type": "content_block_delta", "delta": {"type": "input_json_delta"}});
+        assert_eq!(sse_kind_chat(&tool), "tool");
+        let usage = serde_json::json!({"type": "message_delta"});
+        assert_eq!(sse_kind_chat(&usage), "usage");
+        let other = serde_json::json!({"type": "message_start"});
+        assert_eq!(sse_kind_chat(&other), "other");
+        // OpenAI chat shape (no `type` field): delta keys select the phase.
+        let otext = serde_json::json!({"choices": [{"delta": {"content": "hi"}}]});
+        assert_eq!(sse_kind_chat(&otext), "text");
+        let oreason = serde_json::json!({"choices": [{"delta": {"reasoning_content": "hmm"}}]});
+        assert_eq!(sse_kind_chat(&oreason), "reasoning");
+        let otool = serde_json::json!({"choices": [{"delta": {"tool_calls": []}}]});
+        assert_eq!(sse_kind_chat(&otool), "tool");
+        let ousage = serde_json::json!({"usage": {}});
+        assert_eq!(sse_kind_chat(&ousage), "usage");
+        let ostop = serde_json::json!({"choices": [{"finish_reason": "stop"}]});
+        assert_eq!(sse_kind_chat(&ostop), "other");
+        assert_eq!(sse_kind_responses("response.output_text.delta"), "text");
+        assert_eq!(sse_kind_responses("response.reasoning_summary_text.delta"), "reasoning");
+        assert_eq!(sse_kind_responses("response.output_item.done"), "tool");
+        assert_eq!(sse_kind_responses("response.completed"), "usage");
+        assert_eq!(sse_kind_responses("response.failed"), "error");
+        assert_eq!(sse_kind_responses("response.created"), "other");
+    }
+
+    #[test]
+    fn chunk_log_writes_arrival_lines() {
+        // `ms kind bytes`, one line per event, no content — the analyzer's input.
+        let path = std::env::temp_dir().join(format!("pir_chunks_{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut log = ChunkLog::open_at(&path);
+        log.event("text", 12);
+        log.event("reasoning", 200);
+        drop(log); // flush the BufWriter before reading back
+        let body = std::fs::read_to_string(&path).expect("chunk log");
+        let mut lines = body.lines();
+        let l1 = lines.next().expect("line 1");
+        let l2 = lines.next().expect("line 2");
+        assert!(l1.ends_with(" text 12"), "{l1:?}");
+        assert!(l2.ends_with(" reasoning 200"), "{l2:?}");
+        assert!(l1.split_whitespace().next().unwrap().parse::<u128>().is_ok(), "leading ms: {l1:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sanitize_clean_history_passes_through() {
+        let h = vec![
+            user_text("hi"),
+            asst_tool("c1", "read_file"),
+            user_result("c1", "contents"),
+            user_text("thanks"),
+        ];
+        let clean = sanitize_history(&h);
+        assert_eq!(clean.len(), h.len());
+        assert_eq!(format!("{:?}", clean), format!("{:?}", h));
+    }
+
+    #[test]
+    fn sanitize_orphan_result_becomes_text() {
+        // The reported 400: a tool result with no preceding tool call
+        // (trim cut the assistant message away).
+        let h = vec![user_text("hi"), user_result("ghost", "stale output")];
+        let clean = sanitize_history(&h);
+        let has_tool_result = clean.iter().flat_map(|m| m.blocks.iter()).any(|b| {
+            matches!(b, Block::ToolResult { .. })
+        });
+        assert!(!has_tool_result, "no ToolResult may survive: {clean:?}");
+        assert!(
+            clean.iter().any(|m| m.text().contains("stale output")),
+            "content must be preserved as text: {clean:?}"
+        );
+    }
+
+    #[test]
+    fn sanitize_dangling_calls_gain_synthetic_results() {
+        // Assistant tool calls with no results (trim cut / skipped calls).
+        let h = vec![user_text("hi"), asst_tool("c1", "bash")];
+        let clean = sanitize_history(&h);
+        assert_eq!(clean.len(), 3);
+        let last = &clean[2];
+        assert_eq!(last.role, Role::User);
+        match &last.blocks[..] {
+            [Block::ToolResult { tool_use_id, is_error, .. }] => {
+                assert_eq!(tool_use_id, "c1");
+                assert!(is_error);
+            }
+            other => panic!("expected synthetic result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sanitize_resume_fold_splits_roles() {
+        // Session resume folds assistant blocks into the user message:
+        // ToolUse inside a User message must be lifted back out.
+        let h = vec![Message {
+            role: Role::User,
+            blocks: vec![
+                Block::Text("do it".to_string()),
+                Block::ToolUse {
+                    id: "c9".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({}),
+                },
+                Block::ToolResult {
+                    tool_use_id: "c9".to_string(),
+                    content: "done".to_string(),
+                    is_error: false,
+                },
+            ],
+        }];
+        let clean = sanitize_history(&h);
+        assert_eq!(clean.len(), 3);
+        assert_eq!(clean[0].role, Role::Assistant);
+        assert!(matches!(clean[0].blocks[0], Block::ToolUse { .. }));
+        assert_eq!(clean[1].role, Role::User);
+        assert!(matches!(clean[1].blocks[0], Block::ToolResult { .. }));
+        assert_eq!(clean[2].role, Role::User);
+        assert!(clean[2].text().contains("do it"));
+    }
+
+    #[test]
+    fn sanitize_partial_results_close_immediately() {
+        // Two calls, one result (preflight terminate skipped the second):
+        // the missing one is synthesized adjacent, not left dangling.
+        let h = vec![{
+            let mut m = asst_tool("c1", "bash");
+            m.blocks.push(Block::ToolUse {
+                id: "c2".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({}),
+            });
+            m
+        }, user_result("c1", "ok")];
+        let clean = sanitize_history(&h);
+        assert_eq!(clean.len(), 3);
+        match &clean[2].blocks[..] {
+            [Block::ToolResult { tool_use_id, is_error, .. }] => {
+                assert_eq!(tool_use_id, "c2");
+                assert!(is_error);
+            }
+            other => panic!("expected synthetic result for c2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn openai_payload_has_no_orphan_tools_after_sanitize() {
+        // End to end: corrupted histories must serialize to valid OpenAI
+        // payloads (this is the exact 400 the user hit).
+        let client = Client::new(ApiKind::OpenAi, "http://x", "k".to_string());
+        let cases = vec![
+            // orphan result
+            vec![user_text("hi"), user_result("ghost", "stale")],
+            // dangling call
+            vec![user_text("hi"), asst_tool("c1", "bash")],
+            // resume fold
+            vec![Message {
+                role: Role::User,
+                blocks: vec![
+                    Block::Text("do it".to_string()),
+                    Block::ToolUse {
+                        id: "c9".to_string(),
+                        name: "bash".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                    Block::ToolResult {
+                        tool_use_id: "c9".to_string(),
+                        content: "done".to_string(),
+                        is_error: false,
+                    },
+                ],
+            }],
+        ];
+        for h in &cases {
+            let clean = sanitize_history(h);
+            let (_url, body) = client.openai_request(
+                "m",
+                16,
+                "sys",
+                &clean,
+                &[],
+                crate::config::ThinkingLevel::Off,
+            );
+            assert_openai_tools_valid(&body);
+        }
+    }
 }
+
+
+
+

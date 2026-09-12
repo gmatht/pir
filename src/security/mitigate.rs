@@ -1042,8 +1042,8 @@ pub fn plan(command: &str, project_root: Option<&Path>) -> Option<Verdict> {
     }
 
     // Redirect onto an existing file: journal-copy (reversible, undo class B).
-    if !a.redirects.is_empty() && !a.redirects.iter().any(|r| r.append) {
-        if let Some(r) = a.redirects.iter().find(|r| !r.append) {
+    if !a.redirects.is_empty() && !a.redirects.iter().any(|r| r.append)
+        && let Some(r) = a.redirects.iter().find(|r| !r.append) {
             // Resolve a relative target against the project root (which is the
             // agent's CWD in production) rather than the *process* CWD, so the
             // exists() gate sees the file the confined agent would touch. A
@@ -1079,7 +1079,6 @@ pub fn plan(command: &str, project_root: Option<&Path>) -> Option<Verdict> {
                 effective = format!("cp -a --reflink=auto '{}' '{}' && {}", r.target, bak, effective);
             }
         }
-    }
 
     // Quarantine boundary: an out-of-project write must be surfaced to the
     // operator (Yellow/ask) even when no rewrite move applies (e.g. a redirect
@@ -1243,10 +1242,10 @@ mod tests {
         ];
         let mut denied: Vec<&str> = Vec::new();
         for cmd in benign {
-            if let Some(v) = plan(cmd, root) {
-                if matches!(v, Verdict::Deny { .. }) {
-                    denied.push(cmd);
-                }
+            if let Some(v) = plan(cmd, root)
+                && matches!(v, Verdict::Deny { .. })
+            {
+                denied.push(cmd);
             }
         }
         assert!(denied.is_empty(), "benign commands were denied: {denied:?}");

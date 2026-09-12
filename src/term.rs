@@ -91,11 +91,10 @@ pub fn set_prefill(text: &str) {
 }
 
 fn color() -> bool {
-    if let Ok(g) = COLOR_OVERRIDE.lock() {
-        if let Some(v) = *g {
+    if let Ok(g) = COLOR_OVERRIDE.lock()
+        && let Some(v) = *g {
             return v;
         }
-    }
     // Auto: colour only when stdout is a terminal and NO_COLOR is unset.
     io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
@@ -133,13 +132,16 @@ pub fn color_enabled() -> bool {
 ///
 /// Screen-write serialization + cursor parking for mid-turn output (unix).
 ///
-/// While a turn runs, the spinner owns a 3-line footer zone and parks the
-/// hardware cursor at the end of the prompt row after every redraw, so the
-/// prompt looks alive. Every content write through [`out`] first moves the
-/// cursor back to the stream position, so output never lands on the prompt
-/// row. The mutex makes a tick and a write mutually exclusive (no torn
-/// frames); all moves are absolute (CUP / save-slot restore), never
-/// relative, so scrolling between operations cannot strand the cursor.
+/// While a turn runs, the spinner owns the bottom rows as a footer zone and
+/// scrolling is confined to the content region above them (DECSTBM, set on
+/// spinner start and refreshed every tick). The spinner parks the hardware
+/// cursor at the end of the prompt row after every redraw, so the prompt
+/// looks alive. Every content write through [`out`] while parked first jumps
+/// to the region bottom and scrolls once ([`content_lead_in`]), so output
+/// lands directly under the previous content and never on rows a repaint
+/// erases. The mutex makes a tick and a write mutually exclusive (no torn
+/// frames); all moves are absolute (CUP), never relative, so scrolling
+/// between operations cannot strand the cursor.
 /// Residual, accepted: `eprintln!` and child processes bypass the protocol
 /// (stderr/foreign fds cannot be wrapped) — the next tick redraws absolutely
 /// and self-heals.
@@ -181,11 +183,13 @@ pub fn out(s: &str) {
     let _screen = screen_lock();
     #[cfg(unix)]
     if is_parked() {
-        // Spinner parked the cursor on the prompt row: move it back to the
-        // stream position (terminal save slot) before writing, so content
-        // never lands on the prompt line.
+        // Spinner parked the cursor inside the footer zone: lead in via the
+        // region bottom (scroll once, then write) so content never lands on
+        // rows the next repaint erases. Afterwards the cursor is stream truth
+        // until the next tick re-parks it.
+        let h = terminal_height();
         let mut stdout = io::stdout();
-        let _ = stdout.write_all(b"\x1b[u");
+        let _ = stdout.write_all(content_lead_in(true, h).as_bytes());
         let _ = stdout.flush();
         set_parked(false);
     }
@@ -402,7 +406,11 @@ pub fn draw_footer(status: &str) {
     let _ = out.flush();
 }
 
-/// Erase the mid-turn footer zone (all three rows), restoring the cursor.
+/// Erase the mid-turn footer zone (the rows from [`zone_rows`]).
+/// Deliberately does NOT touch the terminal save slot: mid-turn cursor truth
+/// lives in [`out`]'s parked protocol, and a save here would clobber it with
+/// a zone-row position (which is how trailing content lines used to end up
+/// under the next repaint). Callers own the cursor afterwards.
 /// No-op when stdout isn't a tty.
 pub fn erase_footer() {
     if !is_terminal() {
@@ -411,15 +419,12 @@ pub fn erase_footer() {
     let h = terminal_height();
     let mut out = io::stdout();
     let mut buf = String::new();
-    buf.push_str("\x1b[s");
-    // Clear every row the zone can occupy (bottom three, or just the bottom
-    // row on tiny screens — mirroring the tick's layout) so no rule, prompt
-    // or draft text survives the turn.
-    let top = if h >= 4 { h - 2 } else { h };
-    for row in top..=h {
+    // Clear every row the zone can occupy so no rule, prompt or draft text
+    // survives the turn. Content can never be on these rows: while a spinner
+    // is alive, scrolling is confined above them (see [`zone_geometry`]).
+    for row in zone_rows(h) {
         buf.push_str(&format!("\x1b[{row};1H\x1b[2K"));
     }
-    buf.push_str("\x1b[u");
     let _ = out.write_all(buf.as_bytes());
     let _ = out.flush();
 }
@@ -473,18 +478,85 @@ pub fn cursor_row() -> Option<usize> {
     }
 }
 
-/// Cursor-movement + erase sequence that removes the 3-line "working" panel and
-/// leaves the cursor at column 0 of its top line, so the next output (streamed
-/// model text, or the idle prompt on detach) starts cleanly there. The panel is
+/// Geometry of the mid-turn footer zone for a screen `h` rows tall (pure).
+/// Returns `(zone_height, region_bottom)`: the spinner zone occupies
+/// `zone_rows(h)` and scrolling content is confined to `1..=region_bottom`
+/// via DECSTBM while a spinner is alive, so footer repaints can never touch
+/// conversation lines (previously the trailing lines of every short output
+/// burst — e.g. a tool's `»` line — sat in the zone rows and were erased by
+/// the next tick: user-visible output silently deleted).
+fn zone_geometry(h: usize) -> (usize, usize) {
+    let zone_h = if h >= 4 { 3 } else { 1 };
+    (zone_h, h.saturating_sub(zone_h).max(1))
+}
+
+/// The exact rows the spinner zone may paint (pure: single source of truth
+/// shared by the tick, the eraser, and the tests).
+fn zone_rows(h: usize) -> Vec<usize> {
+    if h >= 4 {
+        vec![h - 2, h - 1, h]
+    } else {
+        vec![h.max(1)]
+    }
+}
+
+/// Lead-in bytes for a content write: `""` when no spinner is parked,
+/// otherwise jump to the scroll-region bottom and scroll once. The scroll is
+/// confined to the region so it can only move conversation lines (never into
+/// the zone), and the write that follows lands on the fresh blank row
+/// directly under the previous content — never on rows the next repaint
+/// erases. Pure for tests.
+fn content_lead_in(parked: bool, h: usize) -> String {
+    if !parked {
+        return String::new();
+    }
+    let (_, region_bottom) = zone_geometry(h);
+    format!("\x1b[{region_bottom};1H\n")
+}
+
+/// Byte sequence that reserves the footer zone: confine scrolling to the
+/// content region, then park on the prompt row. Pure for tests.
+fn spinner_start_seq(h: usize) -> String {
+    let (_, region_bottom) = zone_geometry(h);
+    let prompt_row = if h >= 4 { h - 1 } else { h.max(1) };
+    format!("\x1b[1;{region_bottom}r\x1b[{prompt_row};1H")
+}
+
+/// Byte sequence that releases the footer zone: erase the zone rows, then
+/// reset the scroll region (order matters: clear while still confined).
+/// The cursor stays on the top blank zone row; the next write continues
+/// there and scrolls naturally. Pure for tests.
+fn spinner_stop_seq(h: usize) -> String {
+    let mut s = String::new();
+    for row in zone_rows(h) {
+        s.push_str(&format!("\x1b[{row};1H\x1b[2K"));
+    }
+    s.push_str("\x1b[r");
+    s
+}
 /// The three content lines of the mid-turn footer zone (pure: no I/O), drawn
 /// at the bottom rows H-2/H-1/H every spinner tick with absolute cursor moves
 /// (so the zone can never drift, unlike the old relative-motion 3-line block):
 /// status hrule / `❯ draft` prompt line / plain hrule. The prompt row keeps
 /// the user's typed-ahead line visible for the whole turn, pi parity.
 /// `w` is the terminal width; the draft is clipped to fit and never wraps.
+/// Format a spinnerical wait compactly for the footer status line: `12s`
+/// under a minute, `3m05s` under an hour, `1h02m` beyond. Pure for tests.
+fn fmt_elapsed(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
+    }
+}
+
 fn midturn_zone_lines(
     frame: &str,
     label: &str,
+    elapsed: &str,
     cwd: &str,
     draft: &str,
     w: usize,
@@ -495,7 +567,7 @@ fn midturn_zone_lines(
     } else {
         frame.to_string()
     };
-    let status = footer_line_w(&format!("{frame_s} {label} · {cwd}"), w);
+    let status = footer_line_w(&format!("{frame_s} {label} · {elapsed} · {cwd}"), w);
     let avail = w.saturating_sub(2); // "❯ "
     let taken: String = draft.chars().take(avail).collect();
     let prompt = format!("❯ {taken}");
@@ -514,6 +586,7 @@ fn midturn_zone_lines(
 fn thinking_footer_line(
     frame: &str,
     label: &str,
+    elapsed: &str,
     cwd: &str,
     typed: &str,
     w: usize,
@@ -524,14 +597,14 @@ fn thinking_footer_line(
     } else {
         frame.to_string()
     };
-    let mut status = format!("{frame_s} {label} · {cwd}");
+    let mut status = format!("{frame_s} {label} · {elapsed} · {cwd}");
     // Pi-parity prompt: the typed-ahead line always renders next to a ❯
     // marker — even when empty — so the prompt stays visible for the whole
     // turn instead of the footer degrading to a spinner-only status line.
     let prompt_sep = " · ❯ ";
     // Room left on the line after the fixed head (── prefix, frame, label,
     // cwd and the trailing space) — the typeahead is clipped to fit.
-    let head = format!("── {frame_s} {label} · {cwd} ");
+    let head = format!("── {frame_s} {label} · {elapsed} · {cwd} ");
     let avail = w.saturating_sub(visible_len(&head) + prompt_sep.chars().count());
     let taken: String = typed.chars().take(avail).collect();
     status.push_str(prompt_sep);
@@ -547,6 +620,28 @@ fn paint(code: &str, s: &str) -> String {
 }
 
 pub fn dim(s: &str) -> String { paint("2", s) }
+
+/// Join blank lines for auxiliary dimmed displays (the thinking stream).
+/// Model reasoning separates every micro-paragraph with blank lines; shown
+/// verbatim the reasoning drowns in whitespace, so display collapses every
+/// run of 2+ newlines to a single line break. Display-only: the session log
+/// and approval context keep the exact bytes. Pure for tests.
+pub fn compact_thinking(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut nl = 0usize;
+    for ch in s.chars() {
+        if ch == '\n' {
+            nl += 1;
+            if nl <= 1 {
+                out.push('\n');
+            }
+        } else {
+            nl = 0;
+            out.push(ch);
+        }
+    }
+    out
+}
 pub fn bold(s: &str) -> String { paint("1", s) }
 pub fn red(s: &str) -> String { paint("31", s) }
 pub fn green(s: &str) -> String { paint("32", s) }
@@ -616,26 +711,22 @@ pub fn epoch() -> u64 {
 #[cfg(unix)]
 #[cfg(unix)]
 pub fn parent_shell_pid() -> u32 {
-    if let Ok(v) = std::env::var("PIR_PARENT_PID") {
-        if let Ok(n) = v.parse::<u32>() {
-            if n != 0 {
+    if let Ok(v) = std::env::var("PIR_PARENT_PID")
+        && let Ok(n) = v.parse::<u32>()
+            && n != 0 {
                 return n;
             }
-        }
-    }
     parent_pid()
 }
 
 #[cfg(target_os = "linux")]
 fn parent_pid() -> u32 {
     // /proc/self/stat: pid (1) (ppid 4) ...
-    if let Ok(s) = std::fs::read_to_string("/proc/self/stat") {
-        if let Some(ppid) = s.split_whitespace().nth(3) {
-            if let Ok(n) = ppid.parse() {
+    if let Ok(s) = std::fs::read_to_string("/proc/self/stat")
+        && let Some(ppid) = s.split_whitespace().nth(3)
+            && let Ok(n) = ppid.parse() {
                 return n;
             }
-        }
-    }
     std::process::id()
 }
 
@@ -888,11 +979,10 @@ fn history_hint(ctx: &Context<'_>, typed: &str) -> Option<String> {
         // Find the *first* occurrence of the needle anywhere in the line, then
         // suggest the remainder *after that match* — not after the line start.
         if let Some(pos) = e.to_ascii_lowercase().find(&needle) {
-            if let Some(rest) = e.get(pos + typed.len()..) {
-                if !rest.is_empty() {
+            if let Some(rest) = e.get(pos + typed.len()..)
+                && !rest.is_empty() {
                     return Some(rest.to_string());
                 }
-            }
             // The match consumes the rest of the line: nothing left to suggest.
             return None;
         }
@@ -1010,11 +1100,10 @@ impl Hinter for PirHelper {
         // This is a substring ("needle") search, not a prefix-only match, so a
         // typed fragment anywhere in a prior line is recalled (e.g. typing
         // `dee` recalls `/model ollama-cloud:deepseek…`).
-        if !is_slash_command_line(line, pos) {
-            if let Some(h) = history_hint(ctx, &line[..pos]) {
+        if !is_slash_command_line(line, pos)
+            && let Some(h) = history_hint(ctx, &line[..pos]) {
                 return Some(h);
             }
-        }
         None
     }
 }
@@ -1615,6 +1704,18 @@ impl Spinner {
         if !enabled {
             return Spinner { handle: None, alive: Arc::new(AtomicBool::new(false)) };
         }
+        // Reserve the footer zone synchronously (before the first tick runs):
+        // confine scrolling to the content region and park the cursor, so
+        // output written in the gap already follows the protocol instead of
+        // landing on rows the first repaint would erase.
+        {
+            let _screen = screen_lock();
+            let h = terminal_height();
+            let mut stdout = io::stdout();
+            let _ = stdout.write_all(spinner_start_seq(h).as_bytes());
+            let _ = stdout.flush();
+            set_parked(true);
+        }
         let alive = Arc::new(AtomicBool::new(true));
         let a = alive.clone();
         let q = quiet.clone();
@@ -1626,6 +1727,9 @@ impl Spinner {
             // The working directory shown in the footer's status. Captured once:
             // it can't change while a turn is running.
             let cwd = crate::workspace_label();
+            // Tick zero for the elapsed-time readout (`thinking · 12s · …`),
+            // so a slow-but-alive turn is visibly distinct from a stuck one.
+            let started = std::time::Instant::now();
             let w = terminal_width().max(20);
             let mut erased = false;
             while a.load(Ordering::SeqCst) {
@@ -1649,19 +1753,23 @@ impl Spinner {
                 // PARKED at the end of the prompt row so it looks alive there.
                 // Absolute addressing (never relative motion) is what keeps
                 // the zone from drifting no matter what scrolled between
-                // ticks. Content writes through [`out`] move the cursor back
-                // to the stream position first (serialized by the screen
-                // lock), so output never lands on the prompt row.
+                // ticks. Content writes through [`out`] lead in via the
+                // region bottom (see [`content_lead_in`]), so output never
+                // lands on the rows repainted here.
                 let h = terminal_height();
                 let _screen = screen_lock();
                 let mut buf = String::new();
-                if !is_parked() {
-                    buf.push_str("\x1b[s");
-                }
+                // Re-assert the scroll region every tick: a resize or a
+                // foreign reset (e.g. a tool running a full-screen pager)
+                // self-heals within 80ms.
+                let (_, region_bottom) = zone_geometry(h);
+                buf.push_str(&format!("\x1b[1;{region_bottom}r"));
                 if h >= 4 {
+                    let elapsed = fmt_elapsed(started.elapsed());
                     for (k, content) in midturn_zone_lines(
                         &frame.to_string(),
                         &label,
+                        &elapsed,
                         &cwd,
                         &typed,
                         w,
@@ -1703,12 +1811,16 @@ impl Spinner {
     pub fn stop(&mut self) {
         if self.alive.swap(false, Ordering::SeqCst) {
             // Unpark first (under the screen lock so a racing tick can't
-            // re-park after us): later output must continue naturally, never
-            // restore a stale stream position. Then join the tick thread.
+            // re-park after us), erase the zone and release the scroll
+            // region. Later output continues naturally from the blank rows.
+            // Then join the tick thread.
             {
                 let _screen = screen_lock();
                 set_parked(false);
-                erase_footer();
+                let h = terminal_height();
+                let mut stdout = io::stdout();
+                let _ = stdout.write_all(spinner_stop_seq(h).as_bytes());
+                let _ = stdout.flush();
             }
             if let Some(h) = self.handle.take() {
                 let _ = h.join();
@@ -2539,18 +2651,112 @@ mod tests {
     // remainder after the *match position* (e.g. `3` for `/model hy3`), not a
     // garbage slice from the line start (`el hy3`).
     #[test]
+    fn compact_thinking_joins_blank_runs() {
+        // Display-only squash for the thinking stream: every run of 2+
+        // newlines becomes a single line break (the session log keeps the
+        // exact bytes). Reasoning that separates every micro-paragraph with
+        // a blank line renders dense instead of drowned in whitespace.
+        assert_eq!(super::compact_thinking("a\n\nb"), "a\nb");
+        assert_eq!(super::compact_thinking("a\n\n\n\nb"), "a\nb");
+        assert_eq!(super::compact_thinking("a\nb"), "a\nb");
+        assert_eq!(super::compact_thinking(""), "");
+        assert_eq!(super::compact_thinking("a\n\n"), "a\n");
+        assert_eq!(super::compact_thinking("\n\na"), "\na");
+        // No blank runs: byte-identical.
+        let plain = "Let me understand.\nLet me explore.";
+        assert_eq!(super::compact_thinking(plain), plain);
+    }
+
+    #[test]
+    fn fmt_elapsed_compact() {
+        assert_eq!(super::fmt_elapsed(Duration::from_secs(0)), "0s");
+        assert_eq!(super::fmt_elapsed(Duration::from_secs(12)), "12s");
+        assert_eq!(super::fmt_elapsed(Duration::from_secs(59)), "59s");
+        assert_eq!(super::fmt_elapsed(Duration::from_secs(60)), "1m00s");
+        assert_eq!(super::fmt_elapsed(Duration::from_secs(95)), "1m35s");
+        assert_eq!(super::fmt_elapsed(Duration::from_secs(3599)), "59m59s");
+        assert_eq!(super::fmt_elapsed(Duration::from_secs(3600)), "1h00m");
+        assert_eq!(super::fmt_elapsed(Duration::from_secs(7384)), "2h03m");
+    }
+
+    #[test]
+    fn zone_geometry_confines_zone_below_region() {
+        // Structural: every row the zone may paint must lie strictly below
+        // the scroll region, so repaints can never touch conversation lines.
+        for h in [2usize, 3, 4, 5, 24, 100] {
+            let (zone_h, region_bottom) = super::zone_geometry(h);
+            let rows = super::zone_rows(h);
+            assert_eq!(rows.len(), zone_h, "h={h}");
+            assert!(
+                rows.iter().all(|&row| row > region_bottom),
+                "h={h}: zone rows {rows:?} must all exceed region bottom {region_bottom}"
+            );
+            assert_eq!(*rows.last().unwrap(), h.max(1), "h={h}: zone ends at bottom");
+        }
+        // Degenerate 1-row screen: zone and region cannot be disjoint;
+        // the single row is shared (documented, unavoidable).
+        assert_eq!(super::zone_geometry(24), (3, 21));
+        assert_eq!(super::zone_geometry(3), (1, 2));
+    }
+
+    #[test]
+    fn content_lead_in_never_targets_zone_rows() {
+        // Structural: the parked lead-in must move inside the region and
+        // scroll (never emit text), so the following write lands below
+        // previous content and above the zone.
+        assert_eq!(super::content_lead_in(false, 24), "");
+        assert_eq!(super::content_lead_in(true, 24), "\x1b[21;1H\n");
+        assert_eq!(super::content_lead_in(true, 3), "\x1b[2;1H\n");
+        for h in [1usize, 2, 3, 4, 5, 24, 100] {
+            let lead = super::content_lead_in(true, h);
+            let (_, region_bottom) = super::zone_geometry(h);
+            assert!(
+                lead.starts_with(&format!("\x1b[{region_bottom};1H")),
+                "h={h}: lead-in must jump to region bottom first: {lead:?}"
+            );
+            // No printable content in the lead-in itself: only a jump +
+            // scroll, so it cannot overwrite anything.
+            assert!(!lead.contains('»'), "h={h}: lead-in carries no content");
+        }
+    }
+
+    #[test]
+    fn spinner_start_stop_own_region() {
+        // Structural: start confines scrolling then parks; stop erases the
+        // zone *before* releasing the region (clearing while confined).
+        let start = super::spinner_start_seq(24);
+        assert!(
+            start.contains("\x1b[1;21r"),
+            "start must confine scrolling to rows 1..=21: {start:?}"
+        );
+        assert!(
+            start.contains("\x1b[23;1H"),
+            "start must park on the prompt row: {start:?}"
+        );
+        let stop = super::spinner_stop_seq(24);
+        let erase_pos = stop.find("\x1b[22;1H").expect("stop erases zone rows");
+        let reset_pos = stop.find("\x1b[r").expect("stop resets the region");
+        assert!(
+            erase_pos < reset_pos,
+            "erase must precede region reset: {stop:?}"
+        );
+        assert!(!stop.contains("\x1b[s"), "stop must not touch the save slot: {stop:?}");
+    }
+
+    #[test]
     fn thinking_footer_line_size_and_fit() {
         // The mid-turn zone's status line is exactly `w` columns (it must
         // never wrap: the zone is redrawn in place each tick).
-        let lines = super::midturn_zone_lines("⠧", "thinking", "~/src/pir", "", 40, false);
+        let lines = super::midturn_zone_lines("⠧", "thinking", "12s", "~/src/pir", "", 40, false);
         assert_eq!(lines.len(), 3);
         assert_eq!(super::visible_len(&lines[0]), 40, "status must be exactly width: {:?}", lines[0]);
         assert!(lines[0].contains("⠧ thinking"), "status carries spinner+label: {:?}", lines[0]);
+        assert!(lines[0].contains("12s"), "status carries elapsed time: {:?}", lines[0]);
         assert!(lines[0].contains("~/src/pir"), "status shows cwd: {:?}", lines[0]);
         // Typeahead longer than the line is truncated so the prompt row never
         // wraps either.
         let long = "x".repeat(200);
-        let l2 = super::midturn_zone_lines("⠋", "thinking", "~/x", &long, 40, false);
+        let l2 = super::midturn_zone_lines("⠋", "thinking", "12s", "~/x", &long, 40, false);
         assert!(
             super::visible_len(&l2[1]) <= 40,
             "prompt row must not exceed width: {} > 40 ({:?})",
@@ -2558,7 +2764,7 @@ mod tests {
             l2[1]
         );
         // The typeahead is visible when it fits.
-        let l3 = super::midturn_zone_lines("⠋", "thinking", "~/x", "hi", 40, false);
+        let l3 = super::midturn_zone_lines("⠋", "thinking", "12s", "~/x", "hi", 40, false);
         assert!(l3[1].contains("hi"), "prompt row should show typeahead: {:?}", l3[1]);
     }
 
@@ -2585,7 +2791,7 @@ mod tests {
         for (r, h) in [(22usize, 24usize), (24, 24), (10, 10), (5, 6), (1, 3)] {
             let s = super::zone_scroll_lines(r, h);
             let prompt = r.saturating_sub(s) + 1;
-            assert!(prompt + 1 <= h || h < 3, "r={r} h={h} prompt={prompt}");
+            assert!(prompt < h || h < 3, "r={r} h={h} prompt={prompt}");
         }
     }
 
@@ -2594,7 +2800,7 @@ mod tests {
         // Pi parity: the ❯ prompt marker renders for the whole turn — even
         // with an empty draft — on the zone's middle row, with hrules above
         // and below it (never collapsed onto the status line).
-        let lines = super::midturn_zone_lines("⠧", "thinking", "~/src/pir", "", 40, false);
+        let lines = super::midturn_zone_lines("⠧", "thinking", "12s", "~/src/pir", "", 40, false);
         assert_eq!(super::visible_len(&lines[1]), 2, "empty draft row is just ❯ + space: {:?}", lines[1]);
         assert!(lines[1].starts_with("❯ "), "middle row is the prompt: {:?}", lines[1]);
         assert!(lines[0].contains("──"), "top row is the status hrule: {:?}", lines[0]);
@@ -2606,7 +2812,7 @@ mod tests {
             bare.chars().all(|c| c == '─'),
             "bottom row is only rule chars: {lines:?}"
         );
-        let typing = super::midturn_zone_lines("⠋", "thinking", "~/x", "hello", 40, false);
+        let typing = super::midturn_zone_lines("⠋", "thinking", "12s", "~/x", "hello", 40, false);
         assert_eq!(super::visible_len(&typing[1]), 7, "prompt row stays narrow: {:?}", typing[1]);
         assert!(
             typing[1].starts_with("❯ hello"),
@@ -3159,6 +3365,7 @@ mod nonunix_term {
                 let mut i = 0usize;
                 let mut out = io::stdout();
                 let cwd = crate::workspace_label();
+                let started = std::time::Instant::now();
                 let w = terminal_width().max(20);
                 let mut erased = false;
                 while a.load(Ordering::SeqCst) {
@@ -3179,7 +3386,8 @@ mod nonunix_term {
                         frames[i % frames.len()].to_string()
                     };
                     let typed = ta.lock().map(|g| g.clone()).unwrap_or_default();
-                    let line = super::thinking_footer_line(&frame, &label, &cwd, &typed, w, super::color_enabled());
+                    let elapsed = super::fmt_elapsed(started.elapsed());
+                    let line = super::thinking_footer_line(&frame, &label, &elapsed, &cwd, &typed, w, super::color_enabled());
                     // Rewrite the footer in place at the bottom row each tick
                     // (save/restore cursor), so it can never drift.
                     let h = terminal_height();
@@ -3543,22 +3751,18 @@ pub const DONE_PROMPT_TEXT: &str = "✓ DONE :) -- ✓ DONE :) --";
 
 pub fn done_prompt_color() -> String {
     // 1. env var wins.
-    if let Ok(v) = std::env::var("PIR_DONE_COLOR") {
-        if !v.trim().is_empty() {
+    if let Ok(v) = std::env::var("PIR_DONE_COLOR")
+        && !v.trim().is_empty() {
             return normalize_color_name(&v);
         }
-    }
     // 2. settings.json `donePromptColor`.
     let p = crate::config::pi_dir().join("agent").join("settings.json");
-    if let Ok(raw) = std::fs::read_to_string(&p) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-            if let Some(s) = v.get("donePromptColor").and_then(|s| s.as_str()) {
-                if !s.trim().is_empty() {
+    if let Ok(raw) = std::fs::read_to_string(&p)
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
+            && let Some(s) = v.get("donePromptColor").and_then(|s| s.as_str())
+                && !s.trim().is_empty() {
                     return normalize_color_name(s);
                 }
-            }
-        }
-    }
     "bright-yellow".to_string()
 }
 pub fn done_prompt_color_token() -> String {

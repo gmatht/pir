@@ -516,12 +516,16 @@ mod tests {
     #[test]
     fn search_requires_query() {
         // With a key present (env), missing query must error before any network.
-        std::env::set_var("OLLAMA_API_KEY", "test-key");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("OLLAMA_API_KEY", "test-key"); }
         let mut e = ext();
         let r = e.run("ollama_web_search", &json!({}));
         assert!(r.is_error);
         assert!(r.content.contains("missing 'query'"));
-        std::env::remove_var("OLLAMA_API_KEY");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::remove_var("OLLAMA_API_KEY"); }
         let _ = &mut e;
     }
 
@@ -536,14 +540,20 @@ mod tests {
 
     #[test]
     fn missing_key_surfaces_clear_error() {
-        std::env::remove_var("OLLAMA_API_KEY");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::remove_var("OLLAMA_API_KEY"); }
         // Ensure no auth.json / ollama-cloud.json in HOME during the test.
         let dir = std::env::temp_dir().join("pir-test-no-ollama");
         let _ = std::fs::create_dir_all(&dir);
-        std::env::set_var("HOME", &dir);
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("HOME", &dir); }
         let r = show_usage();
         assert!(r.is_error);
         assert!(r.content.contains("No Ollama Cloud API key"), "got: {}", r.content);
-        std::env::set_var("HOME", "/"); // harmless restore (tests don't depend on it)
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("HOME", "/"); } // harmless restore (tests don't depend on it)
     }
 }

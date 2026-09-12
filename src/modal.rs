@@ -291,13 +291,12 @@ pub fn draw_box_scrolled(title: &str, lines: &[String], top: usize, left: usize,
 /// moved" case) we skip writing anything at all.
 fn paint_frame(top: usize, bottom: usize, out: &str) -> usize {
     let mut prev = PREV_FRAME.lock().unwrap();
-    if let Some(p) = prev.as_ref() {
-        if p.out == out {
+    if let Some(p) = prev.as_ref()
+        && p.out == out {
             // Unchanged frame: nothing to do. Return the previous extents so the
             // caller's cursor math stays consistent.
             return p.bottom.saturating_sub(p.top);
         }
-    }
     let w = crate::term::terminal_width().max(2);
     let clear_top = prev.as_ref().map(|p| p.top).unwrap_or(top).min(top);
     let clear_bottom = prev.as_ref().map(|p| p.bottom).unwrap_or(bottom).max(bottom);

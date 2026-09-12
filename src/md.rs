@@ -339,13 +339,12 @@ impl PdRenderer {
             PdTagEnd::TableHead => {}
             PdTagEnd::TableRow => {}
             PdTagEnd::TableCell => {
-                if self.table_active && !self.cell_empty() {
-                    if let Some(row) = self.table_cells.last_mut() {
+                if self.table_active && !self.cell_empty()
+                    && let Some(row) = self.table_cells.last_mut() {
                         let cell =
                             self.table_cur_cell.replace('\n', " ").trim().to_string();
                         row.push(cell);
                     }
-                }
                 self.table_in_cell = false;
             }
             PdTagEnd::Link => {
@@ -1029,13 +1028,14 @@ impl IncrementalMarkdown {
             let stream = self.stream.get_or_insert_with(|| StreamingRenderer::new(self.color));
             stream.push(&self.pending[self.last_rendered..]);
             self.last_rendered = self.pending.len();
-            // Render any trailing partial line (a chunk that didn't end in `\n`).
-            // Safe because each frame overwrites the whole block, so a partial
-            // is replaced by the completed line on the next redraw. This is what
-            // makes the tail of a reply (and a ```md-fenced table) visible before
-            // `flush`.
-            stream.flush_pending_line();
-            stream.output().to_string()
+            // Non-committing preview of the trailing partial line (a chunk
+            // that didn't end in `\n`). Each frame overwrites the whole
+            // block, so the preview is replaced by the completed line on the
+            // next redraw — this is what makes the tail of a reply visible
+            // before `flush`. It MUST NOT consume the partial (the old
+            // `flush_pending_line` did, closing the block on every redraw so
+            // each streaming pause rendered as a newline).
+            format!("{}{}", stream.output(), stream.preview_partial())
         };
         self.emit_frame(&rendered);
     }
@@ -1235,6 +1235,44 @@ impl StreamingRenderer {
             self.on_event(ev);
         }
         self.out[start..].to_string()
+    }
+
+    /// Render the buffered partial line for DISPLAY ONLY, without feeding it
+    /// to the line parser. The old incremental path called
+    /// [`Self::flush_pending_line`] here, which consumed the partial as a
+    /// complete line: the parser closed the block (paragraph/list item) and
+    /// appended its end-of-line newline, so every throttled redraw during a
+    /// streaming pause committed a newline and the continuation arrived as a
+    /// new block — slow token streams rendered pauses as line breaks.
+    ///
+    /// The preview commits nothing: the partial stays buffered, parser state
+    /// is untouched, and when the rest of the line arrives it continues the
+    /// same block. Details that need full context are deliberately skipped:
+    /// tables-in-progress (column alignment needs all rows; the partial would
+    /// jitter) and fenced code (shown literally until the fence closes).
+    /// A throwaway inline parser is used — never `self.inline`, whose format
+    /// state must not be polluted by half-written constructs. Blockquote
+    /// continuations keep their `> ` prefix; everything else renders bare
+    /// (frames overwrite each other, and the final `flush()` is exact).
+    /// Idempotent and safe to call on every redraw.
+    pub fn preview_partial(&self) -> String {
+        if self.pending_line.is_empty() || !self.table_rows.is_empty() {
+            return String::new();
+        }
+        if self.md_fence.is_some() {
+            // Inside a fence: show the raw partial line literally.
+            return format!("{}\n", self.pending_line);
+        }
+        let mut preview = InlineParser::new();
+        let mut s = String::new();
+        if self.in_blockquote {
+            s.push_str("> ");
+        }
+        for el in preview.parse(&self.pending_line) {
+            self.render_inline_into(&el, &mut s);
+        }
+        s.push('\n');
+        s
     }
 
     /// Flush any trailing partial line (from a chunk that didn't end in `\n`)
@@ -1458,47 +1496,67 @@ impl StreamingRenderer {
         }
     }
 
+    /// [`Self::styled`] into an arbitrary buffer (for previews). Takes `&self`.
+    fn styled_into(&self, code: &str, s: &str, target: &mut String) {
+        if self.color {
+            target.push_str(code);
+            target.push_str(s);
+            target.push_str("\x1b[0m");
+        } else {
+            target.push_str(s);
+        }
+    }
+
     /// Render a single inline element (used for list-item content, which the
     /// streamdown parser leaves as raw markdown).
     fn on_inline(&mut self, el: InlineElement) {
+        let mut buf = String::new();
+        self.render_inline_into(&el, &mut buf);
+        self.out.push_str(&buf);
+    }
+
+    /// Render one inline element into `target`. Shared by the live path
+    /// (`on_inline`) and the non-committing [`Self::preview_partial`].
+    /// Takes `&self` (only `color` is read) so previews never disturb state.
+    fn render_inline_into(&self, el: &InlineElement, target: &mut String) {
         match el {
-            InlineElement::Text(t) => self.out.push_str(&t),
-            InlineElement::Bold(t) => self.styled("\x1b[1m", &t),
-            InlineElement::Italic(t) => self.styled("\x1b[3m", &t),
-            InlineElement::BoldItalic(t) => self.styled("\x1b[1;3m", &t),
-            InlineElement::Underline(t) => self.styled("\x1b[4m", &t),
-            InlineElement::Strikeout(t) => self.styled("\x1b[9m", &t),
+            InlineElement::Text(t) => target.push_str(t),
+            InlineElement::Bold(t) => self.styled_into("\x1b[1m", t, target),
+            InlineElement::Italic(t) => self.styled_into("\x1b[3m", t, target),
+            InlineElement::BoldItalic(t) => self.styled_into("\x1b[1;3m", t, target),
+            InlineElement::Underline(t) => self.styled_into("\x1b[4m", t, target),
+            InlineElement::Strikeout(t) => self.styled_into("\x1b[9m", t, target),
             InlineElement::Code(c) => {
                 if self.color {
                     // Bright-cyan text (no background / reverse video).
-                    self.out.push_str(&format!("\x1b[96m{}\x1b[0m", c));
+                    target.push_str(&format!("\x1b[96m{}\x1b[0m", c));
                 } else {
-                    self.out.push_str(&format!("`{}`", c));
+                    target.push_str(&format!("`{}`", c));
                 }
             }
             InlineElement::Link { text, url } => {
-                let text = sanitize_for_terminal(&text);
-                if let Some(url) = sanitize_url(&url) {
+                let text = sanitize_for_terminal(text);
+                if let Some(url) = sanitize_url(url) {
                     if !url.is_empty() && url != text {
                         if self.color {
-                            self.out.push_str(&osc8_link(&text, &url));
+                            target.push_str(&osc8_link(&text, &url));
                         } else {
-                            self.out.push_str(&format!("{text} [{url}]"));
+                            target.push_str(&format!("{text} [{url}]"));
                         }
                     } else {
-                        self.out.push_str(&text);
+                        target.push_str(&text);
                     }
                 } else {
-                    self.out.push_str(&text);
+                    target.push_str(&text);
                 }
             }
             InlineElement::Image { alt, .. } => {
                 if !alt.is_empty() {
-                    self.out.push_str(&format!("[image: {alt}]"));
+                    target.push_str(&format!("[image: {alt}]"));
                 }
             }
             InlineElement::Footnote(f) => {
-                self.out.push_str(&format!("[^{f}]"));
+                target.push_str(&format!("[^{f}]"));
             }
         }
     }
@@ -2005,30 +2063,35 @@ mod incremental_tests {
     #[test]
     fn throttle_is_configurable_via_env() {
         unsafe {
-            std::env::set_var("PIR_INCREMENTAL_MD_THROTTLE_MS", "5");
-        }
+            // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+            // it to startup config and explicit session toggles.
+            std::env::set_var("PIR_INCREMENTAL_MD_THROTTLE_MS", "5"); }
         let r = IncrementalMarkdown::new(true, false);
         assert_eq!(r.throttle(), Duration::from_millis(5));
         unsafe {
-            std::env::remove_var("PIR_INCREMENTAL_MD_THROTTLE_MS");
-        }
+            // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+            // it to startup config and explicit session toggles.
+            std::env::remove_var("PIR_INCREMENTAL_MD_THROTTLE_MS"); }
         let r2 = IncrementalMarkdown::new(true, false);
         assert_eq!(r2.throttle(), Duration::from_millis(200), "unsets to default");
         // A garbage/bad value (e.g. 0) falls back to the default rather than
         // letting the renderer redraw every byte (busy-spin) or panic.
         unsafe {
-            std::env::set_var("PIR_INCREMENTAL_MD_THROTTLE_MS", "0");
-        }
+            // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+            // it to startup config and explicit session toggles.
+            std::env::set_var("PIR_INCREMENTAL_MD_THROTTLE_MS", "0"); }
         let r3 = IncrementalMarkdown::new(true, false);
         assert_eq!(r3.throttle(), Duration::from_millis(200), "bad value falls back to default");
         unsafe {
-            std::env::set_var("PIR_INCREMENTAL_MD_THROTTLE_MS", "not-a-number");
-        }
+            // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+            // it to startup config and explicit session toggles.
+            std::env::set_var("PIR_INCREMENTAL_MD_THROTTLE_MS", "not-a-number"); }
         let r4 = IncrementalMarkdown::new(true, false);
         assert_eq!(r4.throttle(), Duration::from_millis(200), "non-numeric falls back to default");
         unsafe {
-            std::env::remove_var("PIR_INCREMENTAL_MD_THROTTLE_MS");
-        }
+            // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+            // it to startup config and explicit session toggles.
+            std::env::remove_var("PIR_INCREMENTAL_MD_THROTTLE_MS"); }
     }
 
     // On by default: a renderer built `enabled` starts drawing immediately, and
@@ -2311,6 +2374,93 @@ mod incremental_tests {
         assert_eq!(
             screen[0], "1234567887654321",
             "chunks must join on the same line without duplication: {screen:?}"
+        );
+    }
+
+    // Regression: streaming pauses must not render as newlines. Production
+    // pushes raw token slices straight into `push()` (unlike the
+    // `stream_markdown` harness, which holds back partials), so with a slow
+    // model every throttled redraw used to *commit* the trailing partial via
+    // `flush_pending_line` — closing the paragraph and appending its newline —
+    // and the continuation arrived as a brand-new block. A few-tokens-at-a-
+    // time stream therefore displayed every pause as a line break.
+    #[test]
+    fn slow_token_pauses_do_not_break_lines() {
+        let mut inc = IncrementalMarkdown::new(true, false);
+        inc.set_throttle(Duration::ZERO);
+        // Raw token slices, one redraw per token: exactly the production path.
+        for tok in ["We", " need", " to", " build", " the", " kernel"] {
+            inc.push(tok);
+        }
+        let screen = replay_frames_to_lines(inc.frames(), 80);
+        assert_eq!(
+            screen.len(),
+            1,
+            "pauses must not break lines, got {screen:?}"
+        );
+        assert_eq!(
+            screen[0], "We need to build the kernel",
+            "tokens must join on one line: {screen:?}"
+        );
+        inc.flush();
+        let screen = replay_frames_to_lines(inc.frames(), 80);
+        assert_eq!(
+            screen,
+            vec!["We need to build the kernel"],
+            "final flush must be exact: {screen:?}"
+        );
+    }
+
+    // The preview/commit contract at the renderer level: `preview_partial`
+    // shows the buffered text but commits nothing — `output()` stays empty
+    // until a real newline arrives, and the completed line renders exactly
+    // once (never as "partial\nrest").
+    #[test]
+    fn preview_does_not_commit() {
+        let mut r = StreamingRenderer::new(false);
+        r.push("hello ");
+        assert_eq!(r.output(), "", "nothing committed before a newline");
+        assert_eq!(
+            r.preview_partial(),
+            "hello \n",
+            "preview shows the partial"
+        );
+        assert_eq!(r.output(), "", "preview must not consume the partial");
+        r.push("world\n");
+        assert_eq!(r.output(), "hello world\n", "completed line renders once");
+        assert_eq!(r.preview_partial(), "", "no preview after commit");
+    }
+
+    // Oracle test: a verbose reply streamed one char at a time (worst-case
+    // token drizzle, a redraw per token) must render EXACTLY like the same
+    // reply pushed whole. Any pause-as-newline residue shows up here as a
+    // difference from the fast path.
+    #[test]
+    fn slow_verbose_reply_matches_fast_render() {
+        let md = "Let me understand the task.\n\nThe user wants me to implement `foo`.\n\n- first item\n- second item\n\nSome **bold** text.\n\n```rust\nlet x = 1;\n```\n\nDone.\n";
+        let body = |frames: &[String]| -> String {
+            let last = frames.last().expect("at least one frame");
+            match last.find("\x1b[J") {
+                Some(i) => last[i + 4..].to_string(),
+                None => last.clone(),
+            }
+        };
+        // Fast: whole buffer at once.
+        let mut fast = IncrementalMarkdown::new(true, false);
+        fast.set_throttle(Duration::ZERO);
+        fast.push(md);
+        fast.flush();
+        // Slow: one char per push, like tokens arriving a few at a time.
+        let mut slow = IncrementalMarkdown::new(true, false);
+        slow.set_throttle(Duration::ZERO);
+        for c in md.chars() {
+            slow.push(&c.to_string());
+        }
+        slow.flush();
+        assert_eq!(
+            body(slow.frames()),
+            body(fast.frames()),
+            "slow stream must render exactly like fast push"
         );
     }
 }

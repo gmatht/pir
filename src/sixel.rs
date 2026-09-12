@@ -1,16 +1,23 @@
-//! Render `docs/pir.png` as a sixel image on startup, with the help text
-//! printed to its right. Sixel is a terminal graphics protocol (DECSIXEL);
-//! Windows Terminal supports it (1.22+, opt-in via "Enable Sixel graphics").
+//! Startup banner: the embedded `docs/pir-banner.png` logo (48x58) rendered
+//! via `img2sixel`, with the status text printed to its right. Sixel is a
+//! terminal graphics protocol (DECSIXEL); Windows Terminal supports it
+//! (1.22+, opt-in via "Enable Sixel graphics").
 //!
-//! The PNG is decoded by shelling out to `ffmpeg` (no Rust image dependency),
-//! scaled to fit the terminal, and encoded as sixel. Terminal support is
-//! detected via the DA1 query (`ESC [ c`), which Windows Terminal answers with
-//! capability `4` only when sixel is enabled.
-
+//! No image code lives here on purpose: `img2sixel` reads, resizes,
+//! quantizes, and encodes, so there is one well-tested renderer instead of a
+//! hand-rolled encoder plus an ffmpeg decode. Terminal sixel support is
+//! detected via the DA1 query (`ESC [ c`), which Windows Terminal answers
+//! with capability `4` only when sixel is enabled.
+//!
 use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
+
+/// Eighth-size plus 25% (48x58; see scripts/rebuild-banner.py), pngcrushed
+/// banner logo embedded in the binary, so the sixel banner needs no
+/// external file and no runtime downscaling.
+const BANNER_PNG: &[u8] = include_bytes!("../docs/pir-banner.png");
 
 /// Whether sixel rendering is enabled. Auto-detects via DA1; `PIR_SIXEL=1`
 /// forces it on, `PIR_SIXEL=0` forces it off.
@@ -49,11 +56,10 @@ fn supported() -> bool {
         }
         // Conservative guards: never emit sixel into a dumb/unknown terminal or
         // over a remote (SSH) session where the local terminal may not render it.
-        if let Ok(term) = std::env::var("TERM") {
-            if term == "dumb" || term.is_empty() {
+        if let Ok(term) = std::env::var("TERM")
+            && (term == "dumb" || term.is_empty()) {
                 return false;
             }
-        }
         if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_CLIENT").is_some() {
             return false;
         }
@@ -215,21 +221,26 @@ fn query_terminal(seq: &str) -> Option<String> {
     }
 }
 
-/// Locate the pir logo PNG (docs/pir.png, falling back to ./pir.png).
+/// Locate the pir logo PNG: `docs/pir.png` / `./pir.png` relative to the cwd,
+/// plus the binary's directory and the compile-time manifest dir, so the
+/// banner still renders when `pir` is invoked from elsewhere on PATH.
 fn find_png() -> Option<std::path::PathBuf> {
-    for p in [Path::new("docs/pir.png"), Path::new("pir.png")] {
-        if p.exists() {
-            return Some(p.to_path_buf());
+    let mut candidates: Vec<std::path::PathBuf> = vec![
+        Path::new("docs/pir.png").to_path_buf(),
+        Path::new("pir.png").to_path_buf(),
+    ];
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent() {
+            candidates.push(dir.join("docs/pir.png"));
+            candidates.push(dir.join("pir.png"));
         }
-    }
-    None
+    candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/pir.png"));
+    candidates.into_iter().find(|p| p.exists())
 }
 
-/// Decode a PNG to raw RGB via `ffmpeg`. Returns (width, height, rgb). The
-/// dimensions are read from the PNG IHDR chunk; the pixel data comes from
-/// `ffmpeg -f rawvideo -pix_fmt rgb24`.
-fn decode_png(path: &Path) -> Option<(usize, usize, Vec<u8>)> {
-    let data = std::fs::read(path).ok()?;
+/// Read PNG dimensions from the IHDR chunk (pure Rust — only the size is
+/// needed for override scaling; `img2sixel` does the actual rendering).
+fn png_dims(data: &[u8]) -> Option<(usize, usize)> {
     if data.len() < 24 || &data[0..8] != b"\x89PNG\r\n\x1a\n" {
         return None;
     }
@@ -238,180 +249,226 @@ fn decode_png(path: &Path) -> Option<(usize, usize, Vec<u8>)> {
     if w == 0 || h == 0 {
         return None;
     }
-    let out = Command::new("ffmpeg")
-        .args(["-v", "error", "-i", path.to_str()?, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
-        .output()
+    Some((w, h))
+}
+
+/// Native size of the embedded banner in pixels.
+const BANNER_W: usize = 48;
+const BANNER_H: usize = 58;
+
+/// Word-wrap `line` to rows of at most `width` visible columns. ANSI SGR
+/// escapes ride along with the following text (zero-width) and are never
+/// split, so styled lines (e.g. `term::dim`) wrap without leaking raw
+/// escapes or breaking the styling. Long words hard-split on char
+/// boundaries. Never returns an empty vec.
+fn wrap_line(line: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    // Tokenize into escapes, words, and single-space gaps.
+    enum Tok {
+        Esc(String),
+        Word(String),
+        Space,
+    }
+    let mut toks: Vec<Tok> = Vec::new();
+    let mut word = String::new();
+    let flush_word = |word: &mut String, toks: &mut Vec<Tok>| {
+        if !word.is_empty() {
+            toks.push(Tok::Word(std::mem::take(word)));
+        }
+    };
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            flush_word(&mut word, &mut toks);
+            let mut esc = String::from('\x1b');
+            for e in chars.by_ref() {
+                esc.push(e);
+                if e == 'm' {
+                    break;
+                }
+            }
+            toks.push(Tok::Esc(esc));
+        } else if c == ' ' {
+            flush_word(&mut word, &mut toks);
+            toks.push(Tok::Space);
+        } else {
+            word.push(c);
+        }
+    }
+    flush_word(&mut word, &mut toks);
+
+    let mut rows: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_len = 0usize;
+    let flush = |rows: &mut Vec<String>, cur: &mut String, cur_len: &mut usize| {
+        if cur.is_empty() {
+            return;
+        }
+        // Drop a trailing gap space: it fit, but the next word wrapped, so
+        // keeping it would leave ragged whitespace at the row end.
+        let trimmed = cur.trim_end().to_owned();
+        *cur = trimmed;
+        if !cur.is_empty() {
+            rows.push(std::mem::take(cur));
+        }
+        *cur_len = 0;
+    };
+    // Push a (possibly long) word, hard-splitting on char boundaries when
+    // it exceeds the width. Words contain no escapes by construction.
+    // Spacing comes only from Space tokens (pushing here too doubled every
+    // gap); a word never adds its own leading space.
+    let push_word = |rows: &mut Vec<String>, cur: &mut String, cur_len: &mut usize, w: &str| {
+        let wlen = w.chars().count();
+        if wlen <= width && *cur_len + wlen <= width {
+            cur.push_str(w);
+            *cur_len += wlen;
+            return;
+        }
+        if wlen <= width {
+            flush(rows, cur, cur_len);
+            cur.push_str(w);
+            *cur_len = wlen;
+            return;
+        }
+        flush(rows, cur, cur_len);
+        let mut chunk = String::new();
+        let mut chunk_len = 0usize;
+        for ch in w.chars() {
+            if chunk_len + 1 > width {
+                rows.push(std::mem::take(&mut chunk));
+                chunk_len = 0;
+            }
+            chunk.push(ch);
+            chunk_len += 1;
+        }
+        *cur = chunk;
+        *cur_len = chunk_len;
+    };
+    for tok in toks {
+        match tok {
+            Tok::Esc(e) => cur.push_str(&e),
+            Tok::Word(w) => push_word(&mut rows, &mut cur, &mut cur_len, &w),
+            Tok::Space => {
+                if cur.is_empty() {
+                    continue;
+                }
+                if cur_len + 1 > width {
+                    flush(&mut rows, &mut cur, &mut cur_len);
+                } else {
+                    cur.push(' ');
+                    cur_len += 1;
+                }
+            }
+        }
+    }
+    if !cur.is_empty() {
+        rows.push(cur);
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
+}
+/// Run `img2sixel` on PNG bytes from stdin, returning the validated DCS
+/// string plus the rendered pixel size parsed from its `"1;1;W;H` device
+/// setup (ground truth for cursor math — never assumed). Returns `None`
+/// when the binary is missing, fails, or emits anything but a well-formed
+/// DCS. `-d none` keeps flat fills undithered; callers retry with trimmed
+/// flags for older libsixel builds.
+fn img2sixel(png: &[u8], args: &[&str]) -> Option<(String, usize, usize)> {
+    let mut child = Command::new("img2sixel")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
+    child.stdin.take()?.write_all(png).ok()?;
+    let out = child.wait_with_output().ok()?;
     if !out.status.success() {
         return None;
     }
-    let rgb = out.stdout;
-    if rgb.len() < w * h * 3 {
+    let s = String::from_utf8(out.stdout).ok()?;
+    let (dw, dh) = {
+        let body = s.strip_prefix("\x1bPq")?.strip_suffix("\x1b\\")?;
+        let rest = body.strip_prefix("\"1;1;")?;
+        let (ws, rest) = rest.split_once(';')?;
+        let hs: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let (dw, dh): (usize, usize) = (ws.parse().ok()?, hs.parse().ok()?);
+        if dw == 0 || dh == 0 {
+            return None;
+        }
+        (dw, dh)
+    };
+    if s.len() < 64 {
         return None;
     }
-    Some((w, h, rgb))
+    Some((s, dw, dh))
 }
 
-/// Nearest-neighbour scale `rgb` from (w,h) to (nw,nh).
-fn scale(rgb: &[u8], w: usize, h: usize, nw: usize, nh: usize) -> Vec<u8> {
-    let mut out = vec![0u8; nw * nh * 3];
-    for y in 0..nh {
-        let sy = (y * h) / nh;
-        for x in 0..nw {
-            let sx = (x * w) / nw;
-            let si = (sy * w + sx) * 3;
-            let di = (y * nw + x) * 3;
-            out[di..di + 3].copy_from_slice(&rgb[si..si + 3]);
-        }
-    }
-    out
-}
-
-/// Compute a target size that fits within `max_cols` terminal columns.
-fn scale_to_fit(w: usize, h: usize, max_cols: usize, cell_w: usize) -> (usize, usize) {
-    let max_px = (max_cols * cell_w).max(1);
-    let s = (max_px as f64 / w as f64).min(1.0);
-    let nw = ((w as f64) * s).round().max(1.0) as usize;
-    let nh = ((h as f64) * s).round().max(1.0) as usize;
-    (nw, nh)
-}
-
-/// Build a colour palette from the image's unique colours (up to 256) and a
-/// per-pixel palette index. Colours beyond 256 map to the nearest palette entry.
-fn build_palette(rgb: &[u8]) -> (Vec<(u8, u8, u8)>, Vec<u8>) {
-    let mut palette: Vec<(u8, u8, u8)> = Vec::new();
-    let mut map: std::collections::HashMap<(u8, u8, u8), u8> = std::collections::HashMap::new();
-    let mut color_of = vec![0u8; rgb.len() / 3];
-    for (i, px) in rgb.chunks(3).enumerate() {
-        let c = (px[0], px[1], px[2]);
-        if let Some(&idx) = map.get(&c) {
-            color_of[i] = idx;
-        } else if palette.len() < 256 {
-            let idx = palette.len() as u8;
-            map.insert(c, idx);
-            palette.push(c);
-            color_of[i] = idx;
-        } else {
-            color_of[i] = nearest(&palette, c);
-        }
-    }
-    (palette, color_of)
-}
-
-fn nearest(palette: &[(u8, u8, u8)], c: (u8, u8, u8)) -> u8 {
-    let mut best = 0u8;
-    let mut best_d = u32::MAX;
-    for (i, p) in palette.iter().enumerate() {
-        let dr = p.0 as i32 - c.0 as i32;
-        let dg = p.1 as i32 - c.1 as i32;
-        let db = p.2 as i32 - c.2 as i32;
-        let d = (dr * dr + dg * dg + db * db) as u32;
-        if d < best_d {
-            best_d = d;
-            best = i as u8;
-        }
-    }
-    best
-}
-
-/// Encode raw RGB as a sixel image (DCS-wrapped).
-fn encode_sixel(rgb: &[u8], w: usize, h: usize) -> String {
-    let (palette, color_of) = build_palette(rgb);
-    let mut out = String::new();
-    out.push_str("\x1bPq");
-    for (i, (r, g, b)) in palette.iter().enumerate() {
-        out.push_str(&format!("#{};2;{};{};{}", i, r, g, b));
-    }
-    let bands = h.div_ceil(6);
-    for band in 0..bands {
-        let y0 = band * 6;
-        // Which colours appear in this band?
-        let mut present = vec![false; palette.len()];
-        for y in y0..(y0 + 6).min(h) {
-            for x in 0..w {
-                present[color_of[y * w + x] as usize] = true;
-            }
-        }
-        for (ci, present_ci) in present.iter().enumerate() {
-            if !present_ci {
-                continue;
-            }
-            let mut colvals = vec![0u8; w];
-            for x in 0..w {
-                let mut v = 0u8;
-                for k in 0..6 {
-                    let y = y0 + k;
-                    if y < h && color_of[y * w + x] as usize == ci {
-                        v |= 1 << k;
-                    }
-                }
-                colvals[x] = v;
-            }
-            out.push_str(&format!("#{}", ci));
-            let mut x = 0;
-            while x < w {
-                let v = colvals[x];
-                let mut run = 1;
-                while x + run < w && colvals[x + run] == v {
-                    run += 1;
-                }
-                if run >= 3 {
-                    out.push('!');
-                    out.push_str(&run.to_string());
-                    out.push((0x3f + v) as char);
-                } else {
-                    for _ in 0..run {
-                        out.push((0x3f + v) as char);
-                    }
-                }
-                x += run;
-            }
-        }
-        out.push('-');
-    }
-    out.push_str("\x1b\\");
-    out
-}
-
-/// Render the logo as sixel with `help_lines` printed to its right. Returns
-/// `None` when sixel isn't available (no terminal, no ffmpeg, no PNG, or
-/// unsupported).
-pub fn render_banner(help_lines: &[String]) -> Option<String> {
+/// Render the logo via `img2sixel` with `side_lines` printed to its right.
+/// Returns `None` when sixel isn't available, `img2sixel` is missing/fails,
+/// or no logo is found. `img2sixel` ends its DCS with a carriage return on
+/// the image's bottom row, so the cursor starts at the bottom-left.
+pub fn render_banner(side_lines: &[String]) -> Option<String> {
     if !enabled() {
         return None;
     }
-    let png = find_png()?;
-    let (w, h, rgb) = decode_png(&png)?;
+    // Embedded banner first (no external file needed); an external
+    // docs/pir.png or ./pir.png is a full-size dev override resized to the
+    // banner width. Plain defaults are retried once for older libsixel
+    // builds that reject `-d none`.
+    let (sixel, dw, dh) = img2sixel(BANNER_PNG, &["-d", "none"])
+        .or_else(|| img2sixel(BANNER_PNG, &[]))
+        .or_else(|| {
+            let path = find_png()?;
+            let data = std::fs::read(path).ok()?;
+            png_dims(&data)?;
+            img2sixel(&data, &["-d", "none", "-w", "48px"])
+                .or_else(|| img2sixel(&data, &["-w", "48px"]))
+        })?;
     let (cell_w, cell_h) = cell_size();
+    let cols = (dw as f64 / cell_w as f64).ceil() as usize;
+    let rows = ((dh as f64 / cell_h as f64).ceil() as usize).max(1);
     let term_w = crate::term::terminal_width();
-    let max_cols = (term_w / 2).clamp(20, 40);
-    let (nw, nh) = scale_to_fit(w, h, max_cols, cell_w);
-    let scaled = scale(&rgb, w, h, nw, nh);
-    let sixel = encode_sixel(&scaled, nw, nh);
-    let cols = (nw as f64 / cell_w as f64).ceil() as usize;
-    let rows = (nh as f64 / cell_h as f64).ceil() as usize;
 
     let mut out = String::new();
     out.push_str(&sixel);
-    // After the sixel the cursor is at the bottom-left of the image. Move to
-    // the top-right and print the help lines.
-    out.push_str(&format!("\x1b[{}A\x1b[{}C", rows, cols));
-    let n = help_lines.len();
-    for (i, line) in help_lines.iter().enumerate() {
+    // Cursor sits at the bottom-left of the image. Rise to its top row and
+    // print EVERY wrapped text row indented past the image. The image's
+    // terminal height comes from cell-size queries that can be wrong (dead
+    // fallback, scaled sixel aspect), and any row starting at column 0
+    // risks overwriting the cat — as the help line did. A uniform indented
+    // block can never overlap, whatever the true geometry.
+    if rows > 1 {
+        out.push_str(&format!("\x1b[{}A", rows - 1));
+    }
+    out.push_str("\r");
+    let gap = 2usize;
+    let indent = cols + gap;
+    let avail = term_w.saturating_sub(indent).max(20);
+    let mut wrapped: Vec<String> = Vec::new();
+    for line in side_lines {
+        wrapped.extend(wrap_line(line, avail));
+    }
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+    let n = wrapped.len();
+    for (i, line) in wrapped.iter().enumerate() {
         if i > 0 {
-            let prev = crate::term::visible_len(&help_lines[i - 1]);
-            out.push_str(&format!("\x1b[1B\x1b[{}D", prev));
+            out.push_str("\x1b[1B\r");
         }
+        out.push_str(&format!("\x1b[{indent}C"));
         out.push_str(line);
     }
-    // Return the cursor to just below the image (bottom-left + 1 row).
-    let last_len = if n > 0 { crate::term::visible_len(&help_lines[n - 1]) } else { 0 };
-    let down = rows + 1 - n;
-    out.push_str(&format!("\x1b[{}B\x1b[{}D", down, cols + last_len));
+    // Park the cursor just below whichever is taller, image or text.
+    let down = (rows.max(n) + 1).saturating_sub(n).max(1);
+    out.push_str(&format!("\r\x1b[{down}B"));
     Some(out)
 }
 
-/// Drain any leftover bytes the startup terminal queries (DA1 / XTV) left in
+/// Drain any leftover/// Drain any leftover bytes the startup terminal queries (DA1 / XTV) left in
 /// the tty buffer, so they can't surface as the user's first REPL prompt (a
 /// stray `\x1b[?61;4;...c` style reply with no trailing newline). Re-issues the
 /// DA1 query and reads with a timeout in non-canonical/non-blocking mode,
@@ -448,53 +505,122 @@ mod tests {
     use super::*;
 
     #[test]
-    fn png_header_parses_dimensions() {
-        // Build a minimal PNG header (signature + IHDR) for a 4x3 image.
+    fn png_dims_reads_ihdr() {
+        // Minimal PNG header (signature + IHDR) for a 4x3 image.
         let mut data = Vec::new();
         data.extend_from_slice(b"\x89PNG\r\n\x1a\n");
         data.extend_from_slice(b"\x00\x00\x00\x0dIHDR");
         data.extend_from_slice(&4u32.to_be_bytes());
         data.extend_from_slice(&3u32.to_be_bytes());
-        let path = std::env::temp_dir().join("pir_test_ihdr.png");
-        std::fs::write(&path, &data).unwrap();
-        let d = std::fs::read(&path).unwrap();
-        let w = u32::from_be_bytes([d[16], d[17], d[18], d[19]]) as usize;
-        let h = u32::from_be_bytes([d[20], d[21], d[22], d[23]]) as usize;
-        assert_eq!((w, h), (4, 3));
-        let _ = std::fs::remove_file(&path);
+        assert_eq!(png_dims(&data), Some((4, 3)));
+        assert_eq!(png_dims(b"junk"), None);
+        assert_eq!(png_dims(BANNER_PNG), Some((BANNER_W, BANNER_H)));
     }
 
     #[test]
-    fn sixel_encoder_wraps_in_dcs() {
-        // 2x2 solid red image.
-        let rgb = vec![255u8, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0];
-        let s = encode_sixel(&rgb, 2, 2);
-        assert!(s.starts_with("\x1bPq"), "must start with DCS: {s:?}");
-        assert!(s.ends_with("\x1b\\"), "must end with ST: {s:?}");
-        assert!(s.contains("#0;2;255;0;0"), "palette must define red: {s:?}");
+    fn wrap_keeps_ansi_escapes_intact() {
+        let line = crate::term::dim("model cerebras/gpt-oss-120b · confirm-actions · config /home/ai_pir/.pi/agent");
+        let rows = wrap_line(&line, 40);
+        assert!(rows.len() > 1, "long status line must wrap");
+        for r in &rows {
+            assert!(crate::term::visible_len(r) <= 40, "row too wide: {r:?}");
+        }
+        let vis: String = rows.iter().map(|r| {
+            let mut s = String::new();
+            let mut esc = false;
+            for c in r.chars() {
+                if esc {
+                    if c == 'm' {
+                        esc = false;
+                    }
+                    continue;
+                }
+                if c == '\x1b' {
+                    esc = true;
+                    continue;
+                }
+                s.push(c);
+            }
+            s
+        }).collect::<Vec<_>>().join(" ");
+        assert!(vis.contains("cerebras/gpt-oss-120b"), "text must survive wrapping: {vis:?}");
+        assert!(!vis.contains("  "), "single spaces must not double: {vis:?}");
+        for r in &rows {
+            // Every ESC must open a complete `ESC [ … m` sequence: no split
+            // or truncated escape may appear in any wrapped row.
+            let mut chars = r.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c != '\x1b' {
+                    continue;
+                }
+                assert_eq!(chars.next(), Some('['), "broken escape in {r:?}");
+                let mut closed = false;
+                for e in chars.by_ref() {
+                    if e == 'm' {
+                        closed = true;
+                        break;
+                    }
+                    assert!(e.is_ascii_digit() || e == ';', "broken escape in {r:?}");
+                }
+                assert!(closed, "unterminated escape in {r:?}");
+            }
+        }
     }
 
     #[test]
-    fn sixel_encoder_two_colours() {
-        // 2x1: left red, right blue.
-        let rgb = vec![255, 0, 0, 0, 0, 255];
-        let s = encode_sixel(&rgb, 2, 1);
-        assert!(s.contains("#0;2;255;0;0"));
-        assert!(s.contains("#1;2;0;0;255"));
+    fn embedded_banner_dimensions() {
+        // The embedded logo must stay 48x58: cursor math and the `-w 48px`
+        // override sizing both assume it. Rebuild via scripts/rebuild-banner.py.
+        assert_eq!(png_dims(BANNER_PNG), Some((BANNER_W, BANNER_H)));
+        assert_eq!((BANNER_W, BANNER_H), (48, 58));
     }
 
     #[test]
-    fn scale_preserves_size() {
-        let rgb = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
-        let out = scale(&rgb, 2, 2, 2, 2);
-        assert_eq!(out, rgb);
+    fn banner_renders_when_forced() {
+        // The banner must render (Some) with valid DCS framing when sixel
+        // is forced on and img2sixel is installed. Skipped where it isn't:
+        // no external renderer, no banner — the fallback is plain text.
+        if Command::new("img2sixel").arg("--help").output().is_err() {
+            eprintln!("SKIP banner_renders_when_forced: img2sixel unavailable");
+            return;
+        }
+        unsafe { std::env::set_var("PIR_SIXEL", "1") };
+        let lines = vec![
+            "model test-model · confirm-actions · config /home/test/.pi".to_string(),
+            "/help for commands · ctrl-d quit".to_string(),
+        ];
+        let out = render_banner(&lines);
+        unsafe { std::env::remove_var("PIR_SIXEL") };
+        let out = out.expect("banner must render with PIR_SIXEL=1 and img2sixel present");
+        assert!(out.starts_with("\x1bPq"), "must start with sixel DCS");
+        assert!(out.contains("\x1b\\"), "must contain sixel ST");
+        assert!(out.contains("test-model"), "status text must be beside the image");
     }
 
     #[test]
-    fn scale_to_fit_respects_max() {
-        let (nw, nh) = scale_to_fit(308, 371, 40, 8);
-        assert!(nw <= 40 * 8);
-        assert!(nh <= 371);
+    fn side_text_never_starts_at_column_zero() {
+        // Regression: wrapped rows past the estimated image height started
+        // at column 0 and overwrote the cat (the help line). Every text
+        // row must begin with an indent move, unconditionally.
+        if Command::new("img2sixel").arg("--help").output().is_err() {
+            eprintln!("SKIP side_text_never_starts_at_column_zero: img2sixel unavailable");
+            return;
+        }
+        unsafe { std::env::set_var("PIR_SIXEL", "1") };
+        // Short lines: one wrapped row each, so the row count is exact.
+        // Five rows overflows the 3-row image: the old `i < rows` cutoff
+        // left rows 4-5 at column 0, overwriting the cat.
+        let lines = vec!["aaa".to_string(), "bbb".to_string(), "ccc".to_string(), "ddd".to_string(), "eee".to_string()];
+        let out = render_banner(&lines);
+        unsafe { std::env::remove_var("PIR_SIXEL") };
+        let out = out.expect("banner must render");
+        let tail = out.split("\x1b\\").nth(1).expect("text follows sixel ST");
+        // First row: carriage return then indent move.
+        assert!(tail.contains("\r\x1b["), "first row indented: {tail:?}");
+        // Every subsequent row: down + return, then an indent move — never
+        // bare text at column 0.
+        assert_eq!(tail.matches("\x1b[1B\r\x1b[").count(), 4, "all later rows indented: {tail:?}");
+        assert_eq!(tail.matches("\x1b[1B\r").count(), 4, "no stray row breaks: {tail:?}");
     }
 
     #[test]
@@ -582,3 +708,6 @@ mod leak_tests {
         }
     }
 }
+
+
+

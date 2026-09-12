@@ -305,9 +305,9 @@ pub fn scan_unfinished() -> Vec<UnfinishedEntry> {
 fn first_user_line(path: &Path) -> String {
     if let Ok(f) = fs::File::open(path) {
         for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                if v.get("role").and_then(|r| r.as_str()) == Some("user") {
-                    if let Some(txt) = v
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+                && v.get("role").and_then(|r| r.as_str()) == Some("user")
+                    && let Some(txt) = v
                         .get("blocks")
                         .and_then(|b| b.as_array())
                         .and_then(|a| {
@@ -321,8 +321,6 @@ fn first_user_line(path: &Path) -> String {
                             return truncate(s, 80);
                         }
                     }
-                }
-            }
         }
     }
     String::new()
@@ -424,8 +422,8 @@ pub fn read_preview(path: &Path) -> SessionPreview {
                         turns += 1;
                     }
                 }
-            } else if role == "assistant" {
-                if let Some(arr) = blocks {
+            } else if role == "assistant"
+                && let Some(arr) = blocks {
                     let mut thinking = String::new();
                     let mut text = String::new();
                     for b in arr {
@@ -454,7 +452,6 @@ pub fn read_preview(path: &Path) -> SessionPreview {
                         last_output = text;
                     }
                 }
-            }
         }
     }
     SessionPreview {

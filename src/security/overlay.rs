@@ -1159,11 +1159,10 @@ fn username_of(uid: u32) -> Option<String> {
         let mut f = line.split(':');
         let n = f.next()?;
         let _ = f.next();
-        if let Ok(u) = f.next()?.parse::<u32>() {
-            if u == uid {
+        if let Ok(u) = f.next()?.parse::<u32>()
+            && u == uid {
                 return Some(n.to_string());
             }
-        }
     }
     None
 }
@@ -1239,13 +1238,12 @@ fn scan_unmappable_owners(
         } else if !ok {
             *counts.entry(fu).or_default() += 1;
         }
-        if md.file_type().is_dir() && !md.file_type().is_symlink() {
-            if let Ok(rd) = std::fs::read_dir(&p) {
+        if md.file_type().is_dir() && !md.file_type().is_symlink()
+            && let Ok(rd) = std::fs::read_dir(&p) {
                 for e in rd.flatten() {
                     stack.push(e.path());
                 }
             }
-        }
     }
     (root_ok, counts.into_iter().collect(), sampled)
 }
@@ -1353,13 +1351,11 @@ pub fn mount_project_quarantine(root: &Path, whitelist: &Path) -> Result<(), Ove
     // security block) covers the repo when it is under $HOME, so the selective
     // project overlay is redundant here. If the repo is OUTSIDE $HOME, keep the
     // selective project overlay below.
-    if home_quarantine_wanted() {
-        if let Some(h) = std::env::var_os("HOME").map(PathBuf::from) {
-            if root.starts_with(&h) {
+    if home_quarantine_wanted()
+        && let Some(h) = std::env::var_os("HOME").map(PathBuf::from)
+            && root.starts_with(&h) {
                 return Ok(());
             }
-        }
-    }
     // FULL-ROOT container quarantine (PIR_QUARANTINE_MODE=fullroot):
     // overlay the whole / in a user+mount+PID namespace so the agent is ai-root
     // and every write stages. Engages only when the kernel can host it; on
@@ -1504,7 +1500,9 @@ pub fn mount_rootfs_container(root: &Path, whitelist: &Path) -> Result<(), Overl
         }
     }
     let _ = std::env::set_current_dir(PathBuf::from("/").join(wt_rel));
-    std::env::set_var("PIR_AGENT_NS_CONTAINER", "1");
+    // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+    // it to startup config and explicit session toggles.
+    unsafe { std::env::set_var("PIR_AGENT_NS_CONTAINER", "1"); }
     set_project_quarantine_engaged(true);
     set_system_quarantine_engaged(true);
     Ok(())
@@ -1660,7 +1658,7 @@ pub fn container_apply(only: Option<usize>) -> Result<(usize, usize), OverlayErr
     let mut applied = 0usize;
     let mut denied = 0usize;
     for (i, (real, op)) in staged.into_iter().enumerate() {
-        if let Some(n) = only { if i != n { continue; } }
+        if let Some(n) = only && i != n { continue; }
         // Auto-deny on `all` (explicit single apply overrides).
         if only.is_none()
             && matches!(crate::security::rules::evaluate(op, &real.to_string_lossy()),
@@ -1748,7 +1746,9 @@ pub fn mount_home_quarantine() -> Result<(), OverlayError> {
     *active_project_lock().lock().unwrap() = Some(q);
     set_project_quarantine_engaged(true);
     set_system_quarantine_engaged(true);
-    std::env::set_var("PIR_AGENT_NS_HOME", "1");
+    // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+    // it to startup config and explicit session toggles.
+    unsafe { std::env::set_var("PIR_AGENT_NS_HOME", "1"); }
     Ok(())
 }
 
@@ -1916,7 +1916,9 @@ pub fn try_full_root_quarantine(root: &Path, whitelist: &Path, staging_base: &Pa
     run(&["mount", "--rbind", pq.join("root").to_str().unwrap_or("/"), "/"])?;
     // The agent is now ai-root inside its own overlay; tell the drop logic to
     // stop setuid-ing to ai_X (it IS root here) and that full-root is live.
-    std::env::set_var("PIR_AGENT_NS_ROOT", "1");
+    // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+    // it to startup config and explicit session toggles.
+    unsafe { std::env::set_var("PIR_AGENT_NS_ROOT", "1"); }
     set_project_quarantine_engaged(true);
     set_system_quarantine_engaged(true);
     Ok(())
@@ -2054,8 +2056,8 @@ fn write_userns_id_maps(
     // single-line self-map below leaves $HOME owned by an unmapped kuid and
     // every self-persistence write fails with EACCES. On any helper failure
     // fall through to the strategies below.
-    if uid == 0 && gid == 0 {
-        if let Some(child) = map_helper.as_mut() {
+    if uid == 0 && gid == 0
+        && let Some(child) = map_helper.as_mut() {
             const MAX: u64 = 4294967294; // highest valid kuid (2^32-2; -1 is overflow/nobody)
             const MAX32: u32 = 4294967294;
             let payload = format!("0 0 {MAX}\n0 0 {MAX}\n");
@@ -2080,7 +2082,6 @@ fn write_userns_id_maps(
             }
             // Else fall through to the narrower strategies below.
         }
-    }
     // --- 1. privileged direct write (no helper needed), VERIFIED ---
     // Some kernels report success but install nothing for multi-id maps, so
     // every strategy below is confirmed by reading the map back; unverified

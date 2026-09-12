@@ -287,11 +287,10 @@ impl NotifyPolicy {
         }
 
         // Timing gate for turn-done.
-        if let EventKind::TurnDone = e.kind {
-            if e.duration.as_secs() < self.min_seconds {
+        if let EventKind::TurnDone = e.kind
+            && e.duration.as_secs() < self.min_seconds {
                 return false;
             }
-        }
 
         // Delivery-context gate.
         match self.when.as_str() {
@@ -353,15 +352,14 @@ impl NotifyBus {
         if self.policy.allows(&event, oneshot, false) {
             self.external.fire(&event);
         }
-        if self.policy.allows(&event, oneshot, true) {
-            if let Ok(mut feed) = self.feed.lock() {
+        if self.policy.allows(&event, oneshot, true)
+            && let Ok(mut feed) = self.feed.lock() {
                 feed.push(event);
                 if feed.len() > self.max_feed {
                     let drop = feed.len() - self.max_feed;
                     feed.drain(0..drop);
                 }
             }
-        }
     }
 
     /// Drain pending on-screen notifications, returning them for the caller to

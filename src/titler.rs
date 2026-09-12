@@ -53,11 +53,10 @@ fn throttle_wait() -> Duration {
         .and_then(|m| m.modified())
         .ok();
 
-    if let Some(last) = last_call {
-        if let Ok(elapsed) = now.duration_since(last) {
+    if let Some(last) = last_call
+        && let Ok(elapsed) = now.duration_since(last) {
             return MIN_INTERVAL.saturating_sub(elapsed);
         }
-    }
     Duration::ZERO
 }
 
@@ -339,6 +338,109 @@ fn block_text(v: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// pir's User-Agent for background calls (the vendor asks clients to
+/// identify with their agent name rather than a generic library one).
+fn user_agent() -> String {
+    format!("pir/{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// (url, body) for a tiny non-streaming call, per API kind. Responses models
+/// get the `/responses` shape (flat `input` + `max_output_tokens`).
+fn tiny_request(
+    base_url: &str,
+    api_kind: config::ApiKind,
+    model_id: &str,
+    max_tokens: u64,
+    system: &str,
+    user: &str,
+) -> (String, Value) {
+    let body = match api_kind {
+        config::ApiKind::OpenAiResponses => json!({
+            "model": model_id,
+            "input": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": user },
+            ],
+            "max_output_tokens": max_tokens,
+            "stream": false,
+        }),
+        _ => json!({
+            "model": model_id,
+            "max_tokens": max_tokens,
+            "stream": false,
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": user },
+            ],
+        }),
+    };
+    let url = match api_kind {
+        config::ApiKind::Anthropic => format!("{}/messages", base_url.trim_end_matches('/')),
+        config::ApiKind::OpenAi => {
+            let mut u = base_url.trim_end_matches('/').to_string();
+            if !u.ends_with("/chat/completions") && !u.contains('?') {
+                u.push_str("/chat/completions");
+            }
+            u
+        }
+        config::ApiKind::OpenAiResponses => {
+            let mut u = base_url.trim_end_matches('/').to_string();
+            if !u.ends_with("/responses") && !u.contains('?') {
+                u.push_str("/responses");
+            }
+            u
+        }
+    };
+    (url, body)
+}
+
+/// Auth (+ identity) headers for a tiny call.
+fn tiny_headers(req: ureq::Request, api_kind: config::ApiKind, api_key: &str) -> ureq::Request {
+    let req = req.set("user-agent", &user_agent());
+    match api_kind {
+        config::ApiKind::Anthropic => req
+            .set("x-api-key", api_key)
+            .set("anthropic-version", "2023-06-01"),
+        config::ApiKind::OpenAi | config::ApiKind::OpenAiResponses => {
+            req.set("Authorization", &format!("Bearer {api_key}"))
+        }
+    }
+}
+
+/// Extract the reply text from a tiny-call response object, per API kind
+/// (Responses objects nest message items with output-text parts).
+fn tiny_text(api_kind: config::ApiKind, v: &Value) -> Option<String> {
+    match api_kind {
+        config::ApiKind::Anthropic => v
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        config::ApiKind::OpenAi => v
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        config::ApiKind::OpenAiResponses => v
+            .get("output")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items.iter().find_map(|it| {
+                    (it.get("type").and_then(Value::as_str) == Some("message"))
+                        .then(|| {
+                            it.get("content").and_then(Value::as_array).and_then(|parts| {
+                                parts.iter().find_map(|p| {
+                                    (p.get("type").and_then(Value::as_str) == Some("output_text"))
+                                        .then(|| p.get("text").and_then(Value::as_str))
+                                        .flatten()
+                                })
+                            })
+                        })
+                        .flatten()
+                })
+            })
+            .map(str::to_string),
+    }
+}
+
 /// Ask the light model to refine `outcome` (a coarse hint: "complete" or
 /// "error:<msg>") into a canonical verdict from [`VERDICTS`], given the last
 /// exchange. Returns `None` on any failure — callers treat that as "skip",
@@ -355,39 +457,14 @@ fn call_light(system: &str, user: &str) -> Option<String> {
     let api_key = prov.api_key()?;
     let model_id = model.id.clone();
 
-    let body = json!({
-        "model": model_id,
-        "max_tokens": 12,
-        "stream": false,
-        "messages": [
-            { "role": "system", "content": system },
-            { "role": "user", "content": user },
-        ],
-    });
-
-    let url = match api_kind {
-        config::ApiKind::Anthropic => format!("{}/messages", base_url.trim_end_matches('/')),
-        config::ApiKind::OpenAi => {
-            let mut u = base_url.trim_end_matches('/').to_string();
-            if !u.ends_with("/chat/completions") && !u.contains('?') {
-                u.push_str("/chat/completions");
-            }
-            u
-        }
-    };
+    let (url, body) = tiny_request(&base_url, api_kind, &model_id, 12, system, user);
 
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(15))
         .timeout_read(Duration::from_secs(30))
         .timeout_write(Duration::from_secs(15))
         .build();
-    let mut req = agent.post(&url);
-    req = match api_kind {
-        config::ApiKind::Anthropic => req
-            .set("x-api-key", &api_key)
-            .set("anthropic-version", "2023-06-01"),
-        config::ApiKind::OpenAi => req.set("Authorization", &format!("Bearer {api_key}")),
-    };
+    let req = tiny_headers(agent.post(&url), api_kind, &api_key);
     let resp = match req.send_json(body) {
         Ok(r) => r,
         Err(_) => return None,
@@ -395,17 +472,7 @@ fn call_light(system: &str, user: &str) -> Option<String> {
     let Ok(v) = serde_json::from_reader::<_, Value>(resp.into_reader()) else {
         return None;
     };
-    let raw = match api_kind {
-        config::ApiKind::Anthropic => v
-            .pointer("/content/0/text")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        config::ApiKind::OpenAi => v
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-    };
-    let raw = raw?;
+    let raw = tiny_text(api_kind, &v)?;
     let t = raw.trim().to_lowercase();
     Some(
         t.split_whitespace()
@@ -566,39 +633,14 @@ fn generate_title(
     let system = "You name coding-agent conversations. Reply with ONE short title of at most 6 words that captures what the user is working on. No quotes, no 'Title:', no trailing punctuation. Examples: 'Fix parser crash on empty input', 'Add retry to upload tool', 'Refactor session picker'.";
     let user = format!("Recent prompts in this conversation:\n{joined}\n\nTitle:");
 
-    let body = json!({
-        "model": model_id,
-        "max_tokens": 24,
-        "stream": false,
-        "messages": [
-            { "role": "system", "content": system },
-            { "role": "user", "content": user },
-        ],
-    });
-
-    let url = match api_kind {
-        config::ApiKind::Anthropic => format!("{}/messages", base_url.trim_end_matches('/')),
-        config::ApiKind::OpenAi => {
-            let mut u = base_url.trim_end_matches('/').to_string();
-            if !u.ends_with("/chat/completions") && !u.contains('?') {
-                u.push_str("/chat/completions");
-            }
-            u
-        }
-    };
+    let (url, body) = tiny_request(&base_url, api_kind, &model_id, 24, system, &user);
 
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(15))
         .timeout_read(Duration::from_secs(30))
         .timeout_write(Duration::from_secs(15))
         .build();
-    let mut req = agent.post(&url);
-    req = match api_kind {
-        config::ApiKind::Anthropic => req
-            .set("x-api-key", api_key)
-            .set("anthropic-version", "2023-06-01"),
-        config::ApiKind::OpenAi => req.set("Authorization", &format!("Bearer {api_key}")),
-    };
+    let req = tiny_headers(agent.post(&url), api_kind, &api_key);
     // The light model is fire-and-forget; a single attempt is enough. If it
     // fails (rate-limited, offline, etc.) we just don't get a title this time.
     let resp = match req.send_json(body) {
@@ -609,17 +651,7 @@ fn generate_title(
         return None;
     };
 
-    let raw = match api_kind {
-        config::ApiKind::Anthropic => v
-            .pointer("/content/0/text")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        config::ApiKind::OpenAi => v
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-    };
-    let raw = raw?;
+    let raw = tiny_text(api_kind, &v)?;
     let title = clean_title(&raw);
     if title.is_empty() { None } else { Some(title) }
 }

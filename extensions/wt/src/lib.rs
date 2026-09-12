@@ -274,29 +274,24 @@ impl Wt {
             .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
             .current_dir(&root)
             .output()
-        {
-            if o.status.success() {
+            && o.status.success() {
                 let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if let Some(name) = s.rsplit('/').next() {
-                    if !name.is_empty() && name != "HEAD" {
+                if let Some(name) = s.rsplit('/').next()
+                    && !name.is_empty() && name != "HEAD" {
                         return name.to_string();
                     }
-                }
             }
-        }
         // 2) whatever branch the main checkout currently has checked out.
         if let Ok(o) = Command::new("git")
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
             .current_dir(&root)
             .output()
-        {
-            if o.status.success() {
+            && o.status.success() {
                 let b = String::from_utf8_lossy(&o.stdout).trim().to_string();
                 if !b.is_empty() && b != "HEAD" {
                     return b;
                 }
             }
-        }
         // 3) common trunk names.
         // `output()` (not `status()`) so git's stderr — e.g. the
         // "dubious ownership" fatal when the agent runs as root over another
@@ -352,11 +347,10 @@ impl Wt {
     /// (no override and no recognized project type) — callers must treat that as
     /// "we don't know", NOT as "pass".
     fn verify_cmd(&self, wt_dir: &Path) -> Option<String> {
-        if let Ok(c) = std::env::var("PIR_WT_CHECK") {
-            if !c.trim().is_empty() {
+        if let Ok(c) = std::env::var("PIR_WT_CHECK")
+            && !c.trim().is_empty() {
                 return Some(c);
             }
-        }
         // Rust project: Cargo.toml present.
         if wt_dir.join("Cargo.toml").exists() {
             return Some("cargo build --locked 2>&1 | tail -n 40 && cargo test --locked 2>&1 | tail -n 60".into());
@@ -565,14 +559,13 @@ impl Wt {
             let line = line.trim();
             if let Some(idx) = line.find("path =") {
                 let rest = &line[idx + "path =".len()..];
-                if let Some(q0) = rest.find('"') {
-                    if let Some(q1) = rest[q0 + 1..].find('"').map(|i| i + q0 + 1) {
+                if let Some(q0) = rest.find('"')
+                    && let Some(q1) = rest[q0 + 1..].find('"').map(|i| i + q0 + 1) {
                         let v = &rest[q0 + 1..q1];
                         if !v.is_empty() && !v.starts_with('/') && !refs.contains(&v.to_string()) {
                             refs.push(v.to_string());
                         }
                     }
-                }
             }
         }
         let mut linked = Vec::new();
@@ -667,24 +660,19 @@ impl Wt {
             .args(["status", "--porcelain"])
             .current_dir(wt_dir)
             .output()
-        {
-            if o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty() {
+            && o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty() {
                 return true;
             }
-        }
         // Committed (e.g. autocommit) changes: HEAD ahead of the base branch.
         let base = self.trunk();
         if let Ok(o) = Command::new("git")
             .args(["rev-list", "--count", &format!("{base}..HEAD")])
             .current_dir(wt_dir)
             .output()
-        {
-            if o.status.success() {
-                if let Ok(n) = String::from_utf8_lossy(&o.stdout).trim().parse::<u64>() {
+            && o.status.success()
+                && let Ok(n) = String::from_utf8_lossy(&o.stdout).trim().parse::<u64>() {
                     return n > 0;
                 }
-            }
-        }
         false
     }
 
@@ -699,12 +687,11 @@ impl Wt {
     fn health_check(&self, dir: &Path, check_warnings: bool) -> Option<(Tier, String)> {
         // A user-supplied single check command can't be tiered; treat any
         // failure as the build tier (we can't classify it further).
-        if let Ok(c) = std::env::var("PIR_WT_CHECK") {
-            if !c.trim().is_empty() {
+        if let Ok(c) = std::env::var("PIR_WT_CHECK")
+            && !c.trim().is_empty() {
                 let (ok, log) = sh_capture(dir, &c);
                 return if ok { None } else { Some((Tier::Build, log)) };
             }
-        }
         // Rust project (the common case in pir): explicit build -> warnings ->
         // tests ordering.
         if dir.join("Cargo.toml").exists() {
@@ -1173,7 +1160,9 @@ impl Wt {
                     ),
                     Err(e) => eprintln!("[pir] project write-quarantine not engaged: {e}"),
                 }
-                std::env::set_var("PIR_WT_WHITELIST", wt_dir.as_os_str());
+                // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+                // it to startup config and explicit session toggles.
+                unsafe { std::env::set_var("PIR_WT_WHITELIST", wt_dir.as_os_str()); }
             }
         }
         let mut msg = format!(
@@ -1722,8 +1711,8 @@ impl ToolBackend for Wt {
         // turn (quick repo question, no edits) skips the whole machinery — no
         // build, no tests, no fix prompts, no merge — because there's nothing
         // this turn introduced (tokens are only spent on changes).
-        if self.in_worktree() {
-            if let Some(wt_dir) = self.current.clone() {
+        if self.in_worktree()
+            && let Some(wt_dir) = self.current.clone() {
                 if !self.worktree_changed(&wt_dir) {
                     return Vec::new();
                 }
@@ -1738,7 +1727,6 @@ impl ToolBackend for Wt {
                 }
                 return fix.into_iter().collect();
             }
-        }
         // Main heal flow: after a merge, repeat the same fix cycle on main.
         if self.healing_main {
             let root = self.repo_root();
@@ -1854,8 +1842,12 @@ mod tests {
     #[test]
     fn creates_branch_and_merges_back_when_checks_pass() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("PIR_WT", "1");
-        std::env::remove_var("PIR_WT_AUTO");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PIR_WT", "1"); }
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::remove_var("PIR_WT_AUTO"); }
         let repo = scratch_repo();
         let _chdir = Chdir::new(&repo);
 
@@ -1875,7 +1867,9 @@ mod tests {
         Command::new("git").args(["commit", "-qm", "add change"]).current_dir(&here).status().unwrap();
 
         // With a real check command set, verify() runs it and should pass.
-        std::env::set_var("PIR_WT_CHECK", "true");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PIR_WT_CHECK", "true"); }
         let verdict = wt.verify(&here);
         assert!(matches!(verdict, Verdict::Passed(_)), "verify should pass with PIR_WT_CHECK=true");
 
@@ -1904,7 +1898,9 @@ mod tests {
         wt.return_to_main();
         assert!(!wt.in_worktree());
 
-        std::env::remove_var("PIR_WT");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::remove_var("PIR_WT"); }
     }
 
     // Uses the `flock` command (util-linux), which doesn't exist on Windows;
@@ -1965,18 +1961,24 @@ mod tests {
         // worktrees default is clean (off).
         let dir = std::env::temp_dir().join(format!("pir_wt_test_{}", std::process::id()));
         let old = std::env::var_os("PI_DIR");
-        std::env::set_var("PI_DIR", &dir);
-        std::env::remove_var("PIR_WT");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PI_DIR", &dir); }
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::remove_var("PIR_WT"); }
         let wt = Wt::new();
         assert!(!wt.enabled, "wt must be off by default (guard posture)");
         assert!(wt.specs().is_empty(), "tools should not register when disabled");
-        std::env::set_var("PIR_WT", "1");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PIR_WT", "1"); }
         let wt = Wt::new();
         assert!(wt.enabled, "PIR_WT=1 must enable");
         assert!(!wt.specs().is_empty(), "tools should be registered when enabled");
         match old {
-            Some(v) => std::env::set_var("PI_DIR", v),
-            None => std::env::remove_var("PI_DIR"),
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1984,11 +1986,15 @@ mod tests {
     #[test]
     fn pirt_wt_0_turns_it_off() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("PIR_WT", "0");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PIR_WT", "0"); }
         let wt = Wt::new();
         assert!(!wt.enabled, "PIR_WT=0 must disable wt");
         assert!(wt.specs().is_empty(), "no tools when disabled");
-        std::env::remove_var("PIR_WT");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::remove_var("PIR_WT"); }
     }
 
     #[test]
@@ -2007,13 +2013,19 @@ mod tests {
         // Verdict::NoChecks, never Verdict::Passed — so the extension will NOT
         // silently auto-merge it.
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("PIR_WT_CHECK");
-        std::env::set_var("PIR_WT", "0"); // disable so verify() is exercised standalone
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::remove_var("PIR_WT_CHECK"); }
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PIR_WT", "0"); } // disable so verify() is exercised standalone
         let repo = scratch_repo();
         let _chdir = Chdir::new(&repo);
         let wt = Wt::new();
         assert!(matches!(wt.verify(&repo), Verdict::NoChecks), "bare repo => NoChecks");
-        std::env::remove_var("PIR_WT");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::remove_var("PIR_WT"); }
     }
 
     #[test]
@@ -2022,7 +2034,9 @@ mod tests {
         // the trunk checkout and report the automation on/off state — this is
         // the "why wasn't my worktree reported?" fix.
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("PIR_WT", "0"); // for the "off" branch
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PIR_WT", "0"); } // for the "off" branch
         let repo = scratch_repo();
         let _chdir = Chdir::new(&repo);
 
@@ -2034,7 +2048,9 @@ mod tests {
         assert!(off.contains("worktree automation: off"), "off report: {off}");
 
         // On (explicit PIR_WT=1): should report automation enabled.
-        std::env::set_var("PIR_WT", "1");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PIR_WT", "1"); }
         let mut wt_on = Wt::new();
         wt_on.on_session_start(&repo);
         let on = wt_on.startup_report().unwrap();

@@ -132,17 +132,27 @@ pub struct Agent {
     /// because it's stuck), the turn is stopped with a banner instead of
     /// spinning forever. Reset at the start of each turn.
     loop_detector: LoopDetector,
+    /// Wall-clock start of the current turn (stamped in [`Self::turn`]).
+    /// [`Self::turn_done_event`] reports its elapsed time so the "turn done
+    /// in Ns" notification shows the real duration; `None` before the first
+    /// turn (one-shot paths then report zero, as before).
+    turn_started: Option<std::time::Instant>,
 }
 
 /// Detects a model stuck repeating itself over and over (the classic "Let me
 /// look at the frontend's main.go" / "Let me search for X" infinite loop). Two
-/// independent signals are tracked — (a) the tool-call batch (tool names +
-/// normalized inputs), and (b) the assistant's text output (normalized).
-/// When either signal repeats [`MAX_REPEATS`] times in a row the turn is
-/// stopped. The detector is deliberately conservative — it only fires on
-/// *consecutive identical* signals, so legitimate repeated reads of the same
-/// file (e.g. re-checking a path after an edit) that are interleaved with other
-/// work never trip it.
+/// signals are tracked — (a) the tool-call batch (tool names + normalized
+/// inputs), and (b) the assistant's text output (normalized).
+///
+/// The tool signal fires when the *identical* batch repeats [`MAX_REPEATS`]
+/// times in a row (the model re-issuing the same tools). The text signal is
+/// deliberately conservative: it only fires when the model is NOT making
+/// progress via distinct tool calls — i.e. it is re-issuing the same tool batch,
+/// or emitting no tools at all (a pure text loop). A model that repeats a short
+/// preamble while reading different files is progressing and must never be
+/// flagged. The detector only fires on *consecutive identical* signals, so
+/// legitimate repeated reads of the same file interleaved with other work never
+/// trip it.
 struct LoopDetector {
     /// Signature of the previous tool-call batch (None before the first).
     prev_tool: Option<String>,
@@ -168,25 +178,45 @@ impl LoopDetector {
         }
     }
 
-    /// Feed the current tool-call batch's signature. Returns `true` when a
-    /// runaway loop is detected (the batch has repeated `MAX_REPEATS` times).
-    fn observe_tool(&mut self, sig: &str) -> bool {
-        if self.prev_tool.as_deref() == Some(sig) {
+    /// Feed the current tool-call batch and assistant text signatures.
+    /// Returns `true` when a runaway loop is detected.
+    ///
+    /// The tool signal fires when the *identical* batch repeats
+    /// [`MAX_REPEATS`] times in a row (the model re-issuing the same tools).
+    ///
+    /// The text signal is deliberately conservative: it only fires when the
+    /// model is NOT making progress via distinct tool calls — i.e. it is
+    /// re-issuing the same tool batch, or emitting no tools at all (a pure
+    /// text loop). A model that repeats a short preamble while reading
+    /// different files is progressing and must never be flagged.
+    fn observe(&mut self, tool_sig: &str, text_sig: &str) -> bool {
+        // Tool signal: fire when the identical batch repeats MAX_REPEATS times.
+        let tool_repeating = self.prev_tool.as_deref() == Some(tool_sig);
+        if tool_repeating {
             self.tool_repeats += 1;
         } else {
-            self.prev_tool = Some(sig.to_string());
+            self.prev_tool = Some(tool_sig.to_string());
             self.tool_repeats = 1;
         }
-        self.tool_repeats >= Self::MAX_REPEATS
-    }
+        if self.tool_repeats >= Self::MAX_REPEATS {
+            return true;
+        }
 
-    /// Feed the current assistant text output's signature. Returns `true` when
-    /// a runaway loop is detected (the text has repeated `MAX_REPEATS` times).
-    fn observe_text(&mut self, sig: &str) -> bool {
-        if self.prev_text.as_deref() == Some(sig) {
+        // Text signal: only fire when the model is stuck on tools too. If the
+        // tool batch is changing (and there are tools at all), the model is
+        // progressing — reset the text counter so a repeated preamble never
+        // trips the detector.
+        let tools_progressing = !tool_sig.is_empty() && !tool_repeating;
+        if tools_progressing {
+            self.prev_text = Some(text_sig.to_string());
+            self.text_repeats = 1;
+            return false;
+        }
+
+        if self.prev_text.as_deref() == Some(text_sig) {
             self.text_repeats += 1;
         } else {
-            self.prev_text = Some(sig.to_string());
+            self.prev_text = Some(text_sig.to_string());
             self.text_repeats = 1;
         }
         self.text_repeats >= Self::MAX_REPEATS
@@ -301,6 +331,103 @@ impl SessionResume {
     }
 }
 
+/// Context files for a worktree, pi parity (`AGENTS.md` walking up from cwd):
+/// the global `~/.pi/agent/AGENTS.md` first, then one file per ancestor
+/// directory from the filesystem root down to `cwd` — `AGENTS.override.md`
+/// wins over `AGENTS.md`, which wins over `CLAUDE.md`. Returns
+/// (display-path, content) pairs in load order. Pure w.r.t. process state
+/// (takes the dir explicitly) for tests.
+pub(crate) fn context_files(cwd: &Path) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    let global = config::pi_dir().join("AGENTS.md");
+    if let Ok(s) = fs::read_to_string(&global)
+        && !s.trim().is_empty()
+    {
+        out.push((global, s));
+    }
+    let abs = crate::security::canonicalize_lenient(cwd);
+    let mut dirs: Vec<PathBuf> = abs.ancestors().map(|a| a.to_path_buf()).collect();
+    dirs.reverse(); // root first, cwd last (general -> specific)
+    for dir in dirs.into_iter().take(128) {
+        let pick = ["AGENTS.override.md", "AGENTS.md", "CLAUDE.md"]
+            .iter()
+            .map(|n| dir.join(n))
+            .find_map(|p| fs::read_to_string(&p).ok().map(|s| (p, s)));
+        if let Some((p, s)) = pick
+            && !s.trim().is_empty()
+        {
+            out.push((p, s));
+        }
+    }
+    out
+}
+
+/// Build the base system prompt (prompt/output parity with pi's *shape*,
+/// pir's *content* — see docs/PROMPT_PARITY.md §2). Both constructors share
+/// it; goal state is appended separately by `refresh_system`.
+fn build_system_prompt(cwd: &Path) -> String {
+    let mut system = String::from(
+        "You are pir, a minimal terminal coding agent (a lightweight Rust \
+         reimplementation of pi).\n\nEnvironment:\n",
+    );
+    system.push_str(&format!(
+        "- cwd: {}\n- platform: {}\n- date: {}\n",
+        cwd.display(),
+        std::env::consts::OS,
+        term::date_string(),
+    ));
+    system.push_str(
+        "\nAvailable tools:\n\
+         - bash: Run a shell command in the project directory\n\
+         - read_file: Read a UTF-8 text file (truncated past 100k chars)\n\
+         - write_file: Create or overwrite a file\n\
+         - edit_file: Replace exactly one occurrence of old_string with new_string\n\
+         - list_dir: List the entries of a directory (non-recursive)\n\
+         - job_status: Check on a long-running command that was detached\n\
+         - job_kill: Stop a detached long-running command\n\
+         - update_goal: Persist and update the current goal/continuation plan\n\
+         \n\
+         In addition to the tools above, you may have access to other custom tools depending on the project.\n",
+    );
+    system.push_str(
+        "\nGuidelines:\n\
+         - Use the tools to actually do the work; don't just describe it.\n\
+         - Use bash for file operations like ls, rg, find.\n\
+         - Use read_file to examine files instead of cat or sed.\n\
+         - Use write_file only for new files or complete rewrites.\n\
+         - Use edit_file for precise changes (old_string must match exactly).\n\
+         - Keep old_string as small as possible while still being unique in the file.\n\
+         - Read before editing; prefer edit_file over write_file for changes.\n\
+         - Be terse: code, commands, short answers, no preamble.\n\
+         - Show file paths clearly when working with files.\n\
+         - When finished, summarize what changed in a sentence or two.\n",
+    );
+    system.push_str(
+        "\nPIR documentation (read only when the user asks about pir itself, its extensions, themes, skills, or TUI):\n\
+         - Main documentation: docs/ in the pir source tree.\n\
+         - When asked about: extensions, themes, skills, prompt templates, TUI components, keybindings, SDK, custom providers, models, packages, environment variables.\n\
+         - Always read pir .md files completely and follow links to related docs.\n\
+         - pir sets PIR_* environment variables you can inspect (invoking user, worktree, quarantine state).\n",
+    );
+    // Project instructions in pi's <project_context> shape (parity) instead
+    // of the old `# Extra instructions` heading.
+    let mut projects = String::new();
+    for (p, s) in context_files(cwd) {
+        projects.push_str(&format!(
+            "Project-specific instructions and guidelines:\n\n<project_instructions path=\"{}\">\n{}\n</project_instructions>\n",
+            p.display(),
+            s.trim()
+        ));
+    }
+    if !projects.is_empty() {
+        system.push_str("\n<project_context>\n");
+        system.push_str(&projects);
+        system.push_str("</project_context>\n");
+    }
+    system.push_str(&format!("\nCurrent working directory: {}\n", cwd.display()));
+    system
+}
+
 impl Agent {
     /// `resume_from`, if set, continues the given session's log file instead
     /// of starting a fresh one (its parent-shell tag is preserved). `quiet`
@@ -364,7 +491,9 @@ impl Agent {
         // sandbox user: mirror `/su-security off` so commands run as the
         // invoking user (drop_to_agent_user / /sh read this env).
         if !user_security {
-            std::env::set_var("PIR_AGENT_AS_INVOKER", "1");
+            // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+            // it to startup config and explicit session toggles.
+            unsafe { std::env::set_var("PIR_AGENT_AS_INVOKER", "1"); }
         }
         // Mitigation-level security (docs/MITIGATION_LEVEL_SECURITY.md) is
         // active when the policy level is `mitigation` (or the default
@@ -462,28 +591,7 @@ impl Agent {
         // its cwd are known.
         registry.emit(EventKind::SessionStart, &json!({ "cwd": cwd.display().to_string() }));
 
-        let mut system = String::from(
-            "You are pir, a minimal terminal coding agent (a lightweight Rust \
-             reimplementation of pi).\n\nEnvironment:\n",
-        );
-        system.push_str(&format!(
-            "- cwd: {}\n- platform: {}\n- date: {}\n",
-            cwd.display(),
-            std::env::consts::OS,
-            term::date_string(),
-        ));
-        system.push_str(
-            "\nRules:\n\
-             - Use the tools to actually do the work; don't just describe it.\n\
-             - Read before editing; prefer edit_file over write_file for changes.\n\
-             - Be terse: code, commands, short answers, no preamble.\n\
-             - When finished, summarize what changed in a sentence or two.\n",
-        );
-        for p in [config::pi_dir().join("AGENTS.md"), PathBuf::from("AGENTS.md")] {
-            if let Ok(s) = fs::read_to_string(&p) {
-                system.push_str(&format!("\n# Extra instructions ({})\n\n{}\n", p.display(), s));
-            }
-        }
+        let system = build_system_prompt(&cwd);
 
         let (log, log_path) = open_log(resume_from);
 
@@ -525,34 +633,15 @@ impl Agent {
             incremental_md: config::incremental_md_default(),
             cached_providers,
             loop_detector: LoopDetector::new(),
+            turn_started: None,
         })
     }
 
     /// Inject (or refresh) the current goal snapshot into the system prompt so
     /// the model always sees the live plan without it being part of `history`.
     fn refresh_system(&mut self) {
-        let mut system = String::from(
-            "You are pir, a minimal terminal coding agent (a lightweight Rust \
-             reimplementation of pi).\n\nEnvironment:\n",
-        );
-        system.push_str(&format!(
-            "- cwd: {}\n- platform: {}\n- date: {}\n",
-            std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".into()),
-            std::env::consts::OS,
-            term::date_string(),
-        ));
-        system.push_str(
-            "\nRules:\n\
-             - Use the tools to actually do the work; don't just describe it.\n\
-             - Read before editing; prefer edit_file over write_file for changes.\n\
-             - Be terse: code, commands, short answers, no preamble.\n\
-             - When finished, summarize what changed in a sentence or two.\n",
-        );
-        for p in [config::pi_dir().join("AGENTS.md"), PathBuf::from("AGENTS.md")] {
-            if let Ok(s) = fs::read_to_string(&p) {
-                system.push_str(&format!("\n# Extra instructions ({})\n\n{}\n", p.display(), s));
-            }
-        }
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut system = build_system_prompt(&cwd);
         if let Some(store) = &self.goal_store {
             system.push_str("\n# Current goal (persisted — survives interrupts; resume with `pir -c`)\n\n");
             system.push_str(&store.goal.summary());
@@ -780,9 +869,13 @@ impl Agent {
         // `ai_X` (drop_to_agent_user reads this env) so the agent can act as
         // the invoking user (root). The reason is recorded in the response.
         if enabled {
-            std::env::remove_var("PIR_AGENT_AS_INVOKER");
+            // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+            // it to startup config and explicit session toggles.
+            unsafe { std::env::remove_var("PIR_AGENT_AS_INVOKER"); }
         } else {
-            std::env::set_var("PIR_AGENT_AS_INVOKER", "1");
+            // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+            // it to startup config and explicit session toggles.
+            unsafe { std::env::set_var("PIR_AGENT_AS_INVOKER", "1"); }
         }
         let note = if reason.trim().is_empty() {
             "(no reason given)".to_string()
@@ -906,9 +999,13 @@ impl Agent {
             Ok(s) => {
                 self.su_security_enabled = s.trim() == "1";
                 if self.su_security_enabled {
-                    std::env::remove_var("PIR_AGENT_AS_INVOKER");
+                    // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+                    // it to startup config and explicit session toggles.
+                    unsafe { std::env::remove_var("PIR_AGENT_AS_INVOKER"); }
                 } else {
-                    std::env::set_var("PIR_AGENT_AS_INVOKER", "1");
+                    // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+                    // it to startup config and explicit session toggles.
+                    unsafe { std::env::set_var("PIR_AGENT_AS_INVOKER", "1"); }
                 }
                 true
             }
@@ -950,6 +1047,14 @@ impl Agent {
                     Some(e) => format!("thinking: {}  (OpenAI reasoning_effort = {e})", level.as_str()),
                     None => format!(
                         "thinking: {}  (no OpenAI reasoning_effort for this level; will be ignored)",
+                        level.as_str()
+                    ),
+                },
+                // Responses API takes the same effort names via `reasoning.effort`.
+                Some(ApiKind::OpenAiResponses) => match level.oai_effort() {
+                    Some(e) => format!("thinking: {}  (Responses reasoning.effort = {e})", level.as_str()),
+                    None => format!(
+                        "thinking: {}  (no Responses reasoning effort for this level; will be ignored)",
                         level.as_str()
                     ),
                 },
@@ -1132,11 +1237,10 @@ impl Agent {
 
         let report = match action {
             "set_objective" => {
-                if let Some(o) = input.get("objective").and_then(Value::as_str) {
-                    if !o.trim().is_empty() {
+                if let Some(o) = input.get("objective").and_then(Value::as_str)
+                    && !o.trim().is_empty() {
                         store.goal.objective = o.trim().to_string();
                     }
-                }
                 format!("objective set: {}", store.goal.objective)
             }
             "add_steps" => match input.get("steps").and_then(Value::as_array) {
@@ -1289,10 +1393,13 @@ impl Agent {
                     last_user_prompt = text.clone();
                     prompts.push(text);
                 }
-            } else {
+            } else if role == "assistant" {
                 // Assistant message: if we already have a pending user turn,
                 // pair them; otherwise just queue the assistant alone. Remember
                 // its text as the latest assistant output (shown as the tail).
+                // Any other role (`notice` transcript entries, or anything a
+                // future writer adds) is skipped: transcript-only lines must
+                // never be replayed into model context.
                 if let Some(mut u) = pending.take() {
                     u.blocks.extend(blocks.clone());
                     self.history.push(u);
@@ -1393,8 +1500,8 @@ impl Agent {
             // Optional step cap (off by default). Logs the work done so far and
             // yields instead of looping forever; it does NOT truncate the model
             // or hide progress.
-            if let Some(limit) = max_steps {
-                if steps >= limit {
+            if let Some(limit) = max_steps
+                && steps >= limit {
                     out.push_str(&format!(
                         "step cap ({limit}) reached — {steps} step(s) run, {} in / {} out tokens used this run\n",
                         self.usage.input.saturating_sub(start_in),
@@ -1402,7 +1509,6 @@ impl Agent {
                     ));
                     break;
                 }
-            }
             // Read the live goal into locals; no outstanding borrow past here.
             let (terminal, pending) = match &self.goal_store {
                 Some(s) => (
@@ -1549,8 +1655,10 @@ impl Agent {
         // leaves a discoverable "unfinished" session owned by this live process).
         self.mark_status(SessionStatus::Active, self.goal_pending(), "");
         // Fresh turn: reset the runaway-loop detector so a loop in a *previous*
-        // turn can't carry over into this one.
+        // turn can't carry over into this one, and stamp the turn clock so the
+        // TurnDone notification reports the real wall time (not 0.0s).
         self.loop_detector = LoopDetector::new();
+        self.turn_started = Some(std::time::Instant::now());
         let specs = self.registry.specs();
         let tty = crate::term::is_terminal();
         // `spinner` is hoisted out of the per-message loop so the "thinking…"
@@ -1718,7 +1826,10 @@ impl Agent {
                 if !self.silent() && show_thinking {
                     think_buf.push_str(t);
                     if term::raw::keyboard_idle_long_enough() {
-                        term::out(&term::dim(&std::mem::take(&mut think_buf)).to_string());
+                        // Compacted for display (blank runs joined); the log
+                        // keeps exact bytes.
+                        let show = term::compact_thinking(&std::mem::take(&mut think_buf));
+                        term::out(&term::dim(&show).to_string());
                     }
                 }
             };
@@ -1740,6 +1851,44 @@ impl Agent {
                 .saturating_sub(sys_head)
                 .max(1024);
             let max_tokens = self.model.max_tokens.unwrap_or(8192).min(out_cap);
+            // Live retry countdown. The provider calls this ~1/sec while
+            // backing off between attempts (plus once with `remaining == 0`
+            // when the wait ends). Rendered in place on the current line —
+            // never appended to `assistant_text`, so the transcript keeps
+            // pure model text while the terminal shows the ticking countdown.
+            // Skipped when quiet/detached/non-tty (the wait still happens;
+            // only the display is gated).
+            let mut on_retry = |w: &crate::provider::RetryWait| {
+                if self.silent() || !tty {
+                    return;
+                }
+                if w.remaining.is_zero() {
+                    term::out("\r\x1b[K");
+                } else {
+                    term::out(&format!(
+                        "\r\x1b[K{}",
+                        term::dim(&format!(
+                            "\u{23f3} attempt {} failed — retrying in {}s… (Ctrl-C to stop)",
+                            w.attempt,
+                            w.remaining.as_secs()
+                        ))
+                    ));
+                }
+            };
+            // Retry/failure notices (attempt failed, reconnected). Shown
+            // immediately — bypassing the markdown renderer and
+            // `assistant_text`, so model text, loop detection, and the final
+            // render stay pure — and buffered for the session log, where a
+            // later debug can reconstruct how many attempts a turn took (the
+            // 254s turn taught us screen-only notices are unrecoverable).
+            // Skipped when quiet/detached like all output.
+            let notices: RefCell<Vec<String>> = RefCell::new(Vec::new());
+            let mut on_notice = |t: &str| {
+                if !self.silent() {
+                    term::out(t);
+                }
+                notices.borrow_mut().push(t.to_string());
+            };
             let result = self.client.chat(
                 &self.model.id,
                 max_tokens,
@@ -1754,7 +1903,15 @@ impl Agent {
                 self.provider.model_api(&self.model),
                 self.provider.model_base_url(&self.model),
                 !self.model.no_reasoning_effort,
+                &mut on_retry,
+                &mut on_notice,
             );
+            // Persist any retry notices as transcript-only log entries (never
+            // replayed to the model — see `log_notice`), so the session file
+            // records the attempt history the provider just reported.
+            for n in notices.borrow().iter() {
+                log_notice(&mut self.log, n);
+            }
             // Flush any thinking that arrived while the user was still typing
             // (deferred above) BEFORE the reply text / tool output prints, so
             // reasoning never appears interleaved after the response it
@@ -1763,7 +1920,8 @@ impl Agent {
             // `quiet_req` was set mid-stream) doesn't dump its leftover
             // thinking onto the now-backgrounded terminal.
             if !self.silent() && !think_buf.is_empty() {
-                term::out(&term::dim(&std::mem::take(&mut think_buf)).to_string());
+                let show = term::compact_thinking(&std::mem::take(&mut think_buf));
+                term::out(&term::dim(&show).to_string());
             }
             // Ensure the footer spinner is stopped (covers the no-output case),
             // then move to a fresh line below the agent's text.
@@ -1808,7 +1966,8 @@ impl Agent {
                     // below already-printed tokens. The on-screen notification
                     // feed also gets an Error event.
                     if !think_buf.is_empty() {
-                        term::out(&term::dim(&std::mem::take(&mut think_buf)).to_string());
+                        let show = term::compact_thinking(&std::mem::take(&mut think_buf));
+                        term::out(&term::dim(&show).to_string());
                     }
                     if !self.silent() {
                         term::out(&format!("\r\x1b[K{}\n", term::red(&format!("✗ turn error: {e}"))));
@@ -1844,18 +2003,20 @@ impl Agent {
                 .map(|(id, name, input)| (id.to_string(), name.to_string(), input.clone()))
                 .collect();
 
-            log_line(&mut self.log, &assistant);
-            self.history.push(assistant);
-
             // Runaway-loop detection: if the model re-issues the *identical*
-            // tool-call batch, or repeats the *same* text output, several times
-            // in a row, it's stuck (e.g. endlessly re-reading the same file,
-            // re-searching for the same thing, or repeating "Let me look at
-            // main.go"). Stop the turn with a banner instead of burning tokens
-            // forever. The detector only fires on consecutive identical signals,
-            // so normal interleaved work is never affected.
-            let looped = self.loop_detector.observe_tool(&tool_batch_signature(&calls))
-                || self.loop_detector.observe_text(&text_signature(&assistant_text));
+            // tool-call batch, or repeats the *same* text output while NOT
+            // making progress via distinct tool calls, several times in a row,
+            // it's stuck (e.g. endlessly re-reading the same file, re-searching
+            // for the same thing, or repeating "Let me look at main.go"). Stop
+            // the turn with a banner instead of burning tokens forever. The
+            // detector only fires on consecutive identical signals, and the
+            // text signal is gated on the model being stuck on tools too, so
+            // normal interleaved work (and a repeated preamble while reading
+            // different files) is never affected.
+            let looped = self.loop_detector.observe(
+                &tool_batch_signature(&calls),
+                &text_signature(&assistant_text),
+            );
             if looped {
                 if !self.silent() {
                     if let Some(mut s) = spinner.borrow_mut().take() {
@@ -1879,6 +2040,16 @@ impl Agent {
                 }
                 return Ok(());
             }
+
+            // Only record the assistant message (and its tool calls) in history
+            // once we know the turn is proceeding. If the loop detector fired
+            // above we return early, so the assistant's tool_calls must NOT be
+            // left in history without matching tool results — that dangling
+            // tool_call makes the next provider request fail with HTTP 400
+            // ("tool_calls must be followed by tool messages" / "tool must be a
+            // response to a preceding tool_calls").
+            log_line(&mut self.log, &assistant);
+            self.history.push(assistant);
 
             if calls.is_empty() {
                 self.registry.emit(EventKind::AgentEnd, &json!({}));
@@ -1950,11 +2121,10 @@ impl Agent {
                 }
                 // Snapshot the target file before a destructive edit so `/undo`
                 // can revert it. `write_file`/`edit_file` take `path`.
-                if name == "write_file" || name == "edit_file" {
-                    if let Some(p) = input.get("path").and_then(Value::as_str) {
+                if (name == "write_file" || name == "edit_file")
+                    && let Some(p) = input.get("path").and_then(Value::as_str) {
                         self.checkpoint_file(Path::new(p));
                     }
-                }
                 let outcome = match self.run_goal_tool(name, input) {
                     Some(o) => o,
                     None => self.registry.execute(name, input),
@@ -2246,11 +2416,12 @@ impl Agent {
     }
 
     /// Build the `TurnDone` event for the current session's cumulative usage.
-    /// Used by the one-shot / background exit paths, which have no meaningful
-    /// per-turn duration.
+    /// Carries the running turn's elapsed wall time (zero when no turn has
+    /// started yet, e.g. a fresh one-shot path).
     pub fn turn_done_event(&self) -> AgentEvent {
+        let duration = self.turn_started.map(|t| t.elapsed()).unwrap_or(std::time::Duration::ZERO);
         AgentEvent::turn_done(
-            std::time::Duration::ZERO,
+            duration,
             self.usage.input,
             self.usage.output,
             self.project_label(),
@@ -2373,7 +2544,7 @@ fn make_client(provider: &Provider, cancel: Arc<AtomicBool>) -> Result<Client, S
             Some(b) => b.trim_end_matches('/').to_string(),
             None => match kind {
                 ApiKind::Anthropic => "https://api.anthropic.com/v1".to_string(),
-                ApiKind::OpenAi => {
+                ApiKind::OpenAi | ApiKind::OpenAiResponses => {
                     return Err(format!("provider '{}' has no baseUrl", provider.pid()))
                 }
             },
@@ -2383,15 +2554,14 @@ fn make_client(provider: &Provider, cancel: Arc<AtomicBool>) -> Result<Client, S
         // The `{env:VAR}` reference (if any) was already resolved by
         // `expand_env`; an `Err` here means the variable is unset/empty, which
         // we name explicitly so the user isn't left with a generic failure.
-        if let Some(k) = provider.api_key.as_deref() {
-            if let Some(var) = k.strip_prefix("{env:").and_then(|r| r.strip_suffix('}')) {
+        if let Some(k) = provider.api_key.as_deref()
+            && let Some(var) = k.strip_prefix("{env:").and_then(|r| r.strip_suffix('}')) {
                 return format!(
                     "no API key for '{}' — the env var {var} is unset or empty (referenced in {}, or set apiKey directly)",
                     provider.pid(),
                     config::pi_dir().join("models-store.json").display()
                 );
             }
-        }
         format!(
             "no API key for '{}' — export the env var referenced in {}, or set apiKey directly",
             provider.pid(),
@@ -2406,6 +2576,25 @@ fn make_client(provider: &Provider, cancel: Arc<AtomicBool>) -> Result<Client, S
     // Offline scripted model for tests/puppetry (see `crate::fake`): enabled
     // by provider id so a user catalog can never collide with it by model id.
     client.set_fake(provider.pid() == "fake");
+    // OpenCode Go routes (and prompt-caches) on a stable per-conversation
+    // session id (`x-opencode-session`; see opencode.ai/docs/go). The log
+    // stem doesn't exist yet at construction time, so mint the same shape
+    // (`pir-<ts>-sh<pid>`) here; `OPENCODE_SESSION_ID` pins it explicitly
+    // (e.g. to keep cache hits across resumed sessions). Other providers
+    // never see the header (`set_session_id` is only called for Go).
+    if provider.pid() == "opencode-go" {
+        let id = std::env::var("OPENCODE_SESSION_ID")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "pir-{}-sh{}",
+                    crate::term::timestamp_compact(),
+                    crate::term::parent_shell_pid()
+                )
+            });
+        client.set_session_id(Some(id));
+    }
     Ok(client)
 }
 
@@ -2517,6 +2706,20 @@ fn log_line(log: &mut Option<fs::File>, m: &Message) {
     let _ = writeln!(f, "{entry}");
 }
 
+/// Append a transcript-only notice (retry/failure bookkeeping) to the session
+/// log. `role: "notice"` entries are display + forensics: `Agent::load_session`
+/// skips them so they are never replayed into model context (which would
+/// pollute prompts and could even 400 strict providers).
+fn log_notice(log: &mut Option<fs::File>, text: &str) {
+    let Some(f) = log.as_mut() else { return };
+    let entry = json!({
+        "ts": term::epoch(),
+        "role": "notice",
+        "blocks": [{ "type": "text", "text": text }],
+    });
+    let _ = writeln!(f, "{entry}");
+}
+
 fn open_log(resume_from: Option<&PathBuf>) -> (Option<fs::File>, Option<PathBuf>) {
     let dir = session_dir();
     if fs::create_dir_all(&dir).is_err() {
@@ -2549,12 +2752,146 @@ fn session_dir() -> PathBuf {
     // The project-local `.pir/sessions` dir may not exist on a fresh project;
     // if we can create it (i.e. we own `.pir`), prefer it over the global one.
     let local = cwd.join(".pir").join("sessions");
-    if let Some(parent) = local.parent() {
-        if parent.exists() && std::fs::create_dir_all(&local).is_ok() {
+    if let Some(parent) = local.parent()
+        && parent.exists() && std::fs::create_dir_all(&local).is_ok() {
             return local;
         }
-    }
     config::pi_dir().join("agent").join("sessions")
+}
+
+/// Prompt-parity matrix (docs/PROMPT_PARITY.md §3.6, pir-only rows): the
+/// system prompt keeps pi's *shape* (Available tools, Guidelines,
+/// <project_context>, Current working directory) with pir's *content*
+/// (identity, PIR docs, pir tool names, terse rules) — and never pi's.
+#[cfg(test)]
+mod prompt_parity_tests {
+    use super::build_system_prompt;
+    use std::path::PathBuf;
+
+    fn prompt() -> String {
+        // Point at dirs without AGENTS.md so assertions cover the stable
+        // core (project blocks are covered separately below).
+        build_system_prompt(&PathBuf::from("/nonexistent-wt-xyz"))
+    }
+
+    #[test]
+    fn identity_diverges_from_pi() {
+        let p = prompt();
+        assert!(
+            p.contains("You are pir, a minimal terminal coding agent"),
+            "pir identity line missing"
+        );
+        assert!(
+            !p.contains("operating inside pi"),
+            "must never claim to operate inside pi"
+        );
+    }
+
+    #[test]
+    fn docs_section_points_at_pir() {
+        let p = prompt();
+        assert!(p.contains("PIR documentation"), "PIR docs section missing");
+        assert!(!p.contains("packages/coding-agent"), "must not reference pi's package paths");
+        assert!(!p.contains("PI_*"), "must not reference pi's PI_* vars");
+        assert!(p.contains("PIR_*"), "must mention pir's own PIR_* vars");
+    }
+
+    #[test]
+    fn tool_list_names_pir_tools() {
+        let p = prompt();
+        for tool in ["read_file", "edit_file", "write_file", "list_dir", "bash", "update_goal"] {
+            assert!(p.contains(tool), "tool {tool} missing from Available tools");
+        }
+        // pi's bare names must not appear as list entries (`- read:`); the
+        // pir names contain them as substrings, so anchor on the entry shape.
+        for bare in ["\n- read:", "\n- edit:", "\n- write:", "\n- ls:"] {
+            assert!(!p.contains(bare), "pi-style tool entry {bare:?} must not appear");
+        }
+        assert!(
+            p.contains("custom tools depending on the project"),
+            "custom-tools note missing"
+        );
+    }
+
+    #[test]
+    fn guidelines_keep_pir_rules() {
+        let p = prompt();
+        assert!(p.contains("Guidelines:"), "Guidelines section missing");
+        assert!(p.contains("Be terse"), "terse rule missing");
+        assert!(p.contains("summarize what changed"), "summary rule missing");
+        assert!(p.contains("Show file paths clearly"), "file-paths rule missing");
+        assert!(p.contains("old_string must match exactly"), "edit discipline missing");
+    }
+
+    #[test]
+    fn shape_matches_pi() {
+        let p = prompt();
+        for section in [
+            "Available tools:",
+            "Guidelines:",
+            "PIR documentation",
+            "Current working directory:",
+            "Environment:",
+        ] {
+            assert!(p.contains(section), "shape section {section:?} missing");
+        }
+    }
+
+    #[test]
+    fn context_files_walk_parents_with_precedence() {
+        // base/AGENTS.md + sub/{AGENTS.md wins over CLAUDE.md} +
+        // deep/{AGENTS.override.md wins over both}, root-first order.
+        let base = std::env::temp_dir().join(format!("pir_ctx_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sub = base.join("sub");
+        let deep = sub.join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(base.join("AGENTS.md"), "root\n").unwrap();
+        std::fs::write(sub.join("CLAUDE.md"), "claude\n").unwrap();
+        std::fs::write(sub.join("AGENTS.md"), "sub\n").unwrap();
+        std::fs::write(deep.join("CLAUDE.md"), "deep-claude\n").unwrap();
+        std::fs::write(deep.join("AGENTS.md"), "deep\n").unwrap();
+        std::fs::write(deep.join("AGENTS.override.md"), "over\n").unwrap();
+        let found = super::context_files(&deep);
+        let _ = std::fs::remove_dir_all(&base);
+        // Keep only entries under our tree (the runner's real global file,
+        // if any, sorts first and is not under test here).
+        let ours: Vec<(String, String)> = found
+            .into_iter()
+            .filter(|(p, _)| p.starts_with(&base))
+            .map(|(p, s)| {
+                let rel = p.strip_prefix(&base).unwrap().display().to_string();
+                (rel, s.trim().to_string())
+            })
+            .collect();
+        let names: Vec<&str> = ours.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["AGENTS.md", "sub/AGENTS.md", "sub/deep/AGENTS.override.md"],
+            "root-first, one file per dir with override>AGENTS>CLAUDE"
+        );
+        let bodies: Vec<&str> = ours.iter().map(|(_, s)| s.as_str()).collect();
+        assert_eq!(bodies, vec!["root", "sub", "over"]);
+    }
+
+    #[test]
+    fn project_block_uses_pi_shape() {
+        // With a real AGENTS.md present, project instructions render in pi's
+        // <project_context>/<project_instructions> shape (not `# Extra`).
+        let dir = std::env::temp_dir().join(format!("pir_parity_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "Be excellent.\n").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let p = build_system_prompt(&dir);
+        std::env::set_current_dir(&cwd).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(p.contains("<project_context>"), "project_context wrapper missing");
+        assert!(p.contains("<project_instructions"), "project_instructions tag missing");
+        assert!(p.contains("Be excellent."), "project content missing");
+        assert!(!p.contains("# Extra instructions"), "old heading must be gone");
+    }
 }
 
 #[cfg(test)]
@@ -2565,7 +2902,7 @@ mod goal_bootstrap_tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Mutex;
 
-    fn fresh_agent() -> Agent {
+    pub(super) fn fresh_agent() -> Agent {
         let p: Provider =
             serde_json::from_str(r#"{"id":"test","baseUrl":"https://example.invalid/v1","apiKey":"x","api":"openai","models":[{"id":"m"}]}"#).unwrap();
         let m = p.models[0].clone();
@@ -2617,5 +2954,64 @@ mod goal_bootstrap_tests {
         assert!(d.contains("goal"), "got {d}");
         assert!(d.contains("set_step"), "got {d}");
         assert!(d.contains("#3"), "got {d}");
+    }
+}
+
+#[cfg(test)]
+mod turn_timer_tests {
+    use super::goal_bootstrap_tests::fresh_agent;
+
+    /// Regression: the TurnDone notification used to hardcode a zero duration
+    /// ("turn done in 0.0s") even for turns that ran minutes. The event must
+    /// carry the running turn's elapsed wall time.
+    #[test]
+    fn turn_done_event_reports_elapsed_wall_time() {
+        let mut a = fresh_agent();
+        // No turn started yet: zero, as before (one-shot paths).
+        let idle = a.turn_done_event();
+        assert_eq!(idle.duration, std::time::Duration::ZERO);
+        // A turn started 95s ago must report ~95s, not zero.
+        a.turn_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(95));
+        let ev = a.turn_done_event();
+        assert_eq!(ev.duration.as_secs(), 95, "expected ~95s, got {:?}", ev.duration);
+        assert!(
+            ev.summary().starts_with("turn done in 95."),
+            "summary must show it: {}",
+            ev.summary()
+        );
+    }
+}
+
+#[cfg(test)]
+mod notice_log_tests {
+    use super::goal_bootstrap_tests::fresh_agent;
+
+    /// Regression: retry notices are logged as `role: "notice"` entries so a
+    /// later debug can reconstruct attempt history — but resume must skip
+    /// them, otherwise transcript bookkeeping would be replayed into model
+    /// context (polluting prompts and risking strict-provider 400s).
+    #[test]
+    fn resume_skips_notice_entries() {
+        let mut a = fresh_agent();
+        let dir = std::env::temp_dir().join(format!("pir_notice_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        let lines = [
+            r#"{"ts":1,"role":"user","blocks":[{"type":"text","text":"hi"}]}"#,
+            r#"{"ts":2,"role":"notice","blocks":[{"type":"text","text":"⚠ request failed (attempt 99)"}]}"#,
+            r#"{"ts":3,"role":"assistant","blocks":[{"type":"text","text":"hello"}]}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let _ = a.load_session(&path);
+        let dump = format!("{:?}", a.history);
+        assert!(
+            !dump.contains("attempt 99"),
+            "notice text must never reach replayed history: {dump}"
+        );
+        assert!(
+            dump.contains("hi") && dump.contains("hello"),
+            "user+assistant around the notice must still pair: {dump}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

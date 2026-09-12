@@ -557,16 +557,14 @@ impl SecurityPolicy {
             // Reads allowed by default everywhere. Only a credential/secret read
             // is denied, and only in `GuardedSecrets` read mode.
             Op::Read => {
-                if self.read == ReadMode::GuardedSecrets {
-                    if let Some(path) = &ask.path {
-                        if is_secret(path) {
+                if self.read == ReadMode::GuardedSecrets
+                    && let Some(path) = &ask.path
+                        && is_secret(path) {
                             return Verdict::Deny {
                                 parcel: Parcel::GuardSecrets,
                                 risk: Risk::High,
                             };
                         }
-                    }
-                }
                 Verdict::Allow
             }
             Op::Write => {
@@ -1077,15 +1075,14 @@ impl RequestSink for TtySink {
         // line prompt. The dialog reads a key directly (not via `read_answer`),
         // so it works even while a turn has stdin in raw non-blocking mode —
         // fixing the mid-turn auto-deny bug.
-        if let Some(approval) = &self.approval {
-            if let Some(decision) = crate::modal::tool_approval(d, approval) {
+        if let Some(approval) = &self.approval
+            && let Some(decision) = crate::modal::tool_approval(d, approval) {
                 return match decision {
                     crate::modal::Approval::AllowOnce => Decision::AllowOnce,
                     crate::modal::Approval::AllowSession => Decision::AllowSession,
                     crate::modal::Approval::Deny => Decision::Deny,
                 };
             }
-        }
         // Fallback: plain line prompt (non-tty or dialog unavailable).
         let what = match &d.ask.path {
             Some(p) => p.display().to_string(),
@@ -1269,11 +1266,10 @@ pub fn load_policy_file(path: &std::path::Path) -> SecurityPolicy {
     // agent's own worktree) so the in-process guardrail — the fallback used when
     // the overlay can't mount — also allows writes there and denies the central
     // `.git` / other worktrees.
-    if let Some(wt) = std::env::var_os("PIR_WT_WHITELIST") {
-        if !wt.is_empty() {
+    if let Some(wt) = std::env::var_os("PIR_WT_WHITELIST")
+        && !wt.is_empty() {
             policy.allow_worktree = Some(PathBuf::from(wt));
         }
-    }
     policy
 }
 
@@ -1751,9 +1747,15 @@ pub fn idle_prompt(policy: &SecurityPolicy, probe: &HealthProbe) -> Option<Strin
 /// is needed in the extension.
 pub fn apply_worktree_env(policy: &SecurityPolicy) {
     if policy.level.is_worktree() {
-        std::env::set_var("PIR_WT", "1");
-        std::env::set_var("PIR_WT_PR", "1");
-        std::env::set_var("PIR_WT_AUTO", "1");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PIR_WT", "1"); }
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PIR_WT_PR", "1"); }
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PIR_WT_AUTO", "1"); }
     }
 }
 
@@ -1957,7 +1959,9 @@ mod tests {
         let _env = crate::config::TEST_ENV_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("pir_pol_cfg_{}", std::process::id()));
         let old = std::env::var_os("PI_DIR");
-        std::env::set_var("PI_DIR", &dir);
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PI_DIR", &dir); }
         let p = SecurityPolicy {
             level: SecurityLevel::Sandbox,
             network: NetworkMode::Off,
@@ -1972,8 +1976,8 @@ mod tests {
         assert!(!loaded.quarantine);
         assert!(!loaded.quarantine_project);
         match old {
-            Some(v) => std::env::set_var("PI_DIR", v),
-            None => std::env::remove_var("PI_DIR"),
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1985,7 +1989,9 @@ mod tests {
         let _env = crate::config::TEST_ENV_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("pir_pol_user_{}", std::process::id()));
         let old = std::env::var_os("PI_DIR");
-        std::env::set_var("PI_DIR", &dir);
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PI_DIR", &dir); }
         let mut p = SecurityPolicy::default();
         assert!(p.user_security, "user-security defaults on");
         p.user_security = false;
@@ -1993,8 +1999,8 @@ mod tests {
         let loaded = load_policy();
         assert!(!loaded.user_security, "user-security = false is read back");
         match old {
-            Some(v) => std::env::set_var("PI_DIR", v),
-            None => std::env::remove_var("PI_DIR"),
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

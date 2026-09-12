@@ -23,14 +23,13 @@ pub fn read_clipboard() -> Option<String> {
         let (Some(prog), args) = (parts.next(), parts.collect::<Vec<&str>>()) else {
             continue;
         };
-        if let Ok(out) = Command::new(prog).args(&args).output() {
-            if out.status.success() {
+        if let Ok(out) = Command::new(prog).args(&args).output()
+            && out.status.success() {
                 let s = String::from_utf8_lossy(&out.stdout).into_owned();
                 if !s.trim().is_empty() {
                     return Some(s);
                 }
             }
-        }
     }
     None
 }
@@ -364,15 +363,14 @@ pub fn fix_git_setup(repo: &Path) -> String {
          *.png binary\n*.jpg binary\n*.jpeg binary\n*.gif binary\n*.pdf binary\n\
          *.zip binary\n*.tar binary\n*.gz binary\n*.7z binary\n*.woff binary\n*.woff2 binary\n",
     );
-    if attrs.exists() {
-        if let Ok(existing) = std::fs::read_to_string(&attrs) {
+    if attrs.exists()
+        && let Ok(existing) = std::fs::read_to_string(&attrs) {
             if existing.contains("pir: mark common binary") {
                 attr = String::new(); // our block already present
             } else {
                 attr = format!("\n{}", attr); // append
             }
         }
-    }
     if !attr.is_empty() {
         let mut opts = std::fs::OpenOptions::new();
         if attrs.exists() {

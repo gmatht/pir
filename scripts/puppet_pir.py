@@ -236,9 +236,15 @@ class Puppet:
         self.send("\x04")
         self.wait_exit(timeout=15)
 
-    def wait_exit(self, timeout=20):
+    def wait_exit(self, timeout=20, drain=True):
         end = time.time() + timeout
         while time.time() < end:
+            # Drain throughout: an undrained pty buffer (64K) fills in ~20s
+            # of spinner ticks and then every writer blocks forever — a
+            # harness artifact that masks the real state. Draining keeps the
+            # wait honest.
+            if drain:
+                self._drain()
             wpid, status = os.waitpid(self.pid, os.WNOHANG)
             if wpid:
                 return status
@@ -577,7 +583,205 @@ def scenario_cursor_parked_midturn():
         p.close()
     print("PASS cursor parked on prompt mid-turn")
 
+def scenario_wire_parity():
+    """Mock-server parity: record what pir sends on the wire (§3.6).
+
+    Runs pir one-shot against a local mock OpenAI endpoint and asserts the
+    recorded request bodies: pir identity + shape sections present, user
+    text verbatim, tool schemas shipped, bash tool callable end-to-end."""
+    import json as _json
+    import socket as _socket
+    import subprocess as _sp
+    wt, pi, base = fresh_dirs("parity")
+    # A CLAUDE.md in the worktree must reach the model (pi parity).
+    with open(os.path.join(wt, "CLAUDE.md"), "w") as f:
+        f.write("# WireMarker\nAlways mention pineapples.\n")
+    port = 8799
+    log = os.path.join(base, "requests.jsonl")
+    store = {
+        "providers": [{
+            "id": "local", "name": "local", "api": "openai",
+            "baseUrl": f"http://127.0.0.1:{port}", "apiKey": "test",
+            "models": [{"id": "mock", "context": 200000, "maxTokens": 8192}],
+        }]
+    }
+    with open(os.path.join(pi, "agent", "models-store.json"), "w") as f:
+        _json.dump(store, f)
+    mock = os.path.join("/home/ai_pir/src/pir/scripts", "mock_server.py")
+    srv = _sp.Popen([sys.executable, mock, str(port), log],
+                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+    try:
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            try:
+                s = _socket.create_connection(("127.0.0.1", port), timeout=1)
+                s.close()
+                break
+            except OSError:
+                time.sleep(0.2)
+        env = {"PI_FULL_AUTO": "1"}
+        # round 1: tool call end-to-end over the wire
+        p = Puppet(wt, pi, extra_env=env,
+                   argv=[PIR, "-m", "local/mock", "MOCK: tool echo wire-ok"])
+        p.start()
+        try:
+            status = p.wait_exit(timeout=90)
+        finally:
+            p.close()
+        assert status == 0, f"one-shot tool turn exited {status}"
+        recs = [ _json.loads(l) for l in open(log) if l.strip() ]
+        assert recs, "mock recorded no requests"
+        first = recs[0]["body"]
+        system = first.get("system", "") or _sys_text(first)
+        assert "You are pir" in system, "identity missing from system prompt"
+        assert "Available tools:" in system, "Available tools section missing"
+        assert "Guidelines:" in system, "Guidelines section missing"
+        assert "Current working directory:" in system, "cwd trailer missing"
+        def _utext(m):
+            c = m.get("content", "")
+            if isinstance(c, str):
+                return c
+            if isinstance(c, list):
+                return " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+            return ""
+        user_texts = [_utext(m) for m in first.get("messages", [])
+                       if m.get("role") == "user"]
+        assert any("MOCK: tool echo wire-ok" in t for t in user_texts), \
+            f"user text not verbatim: {user_texts}"
+        assert "pineapples" in system, "CLAUDE.md content missing from system prompt"
+        tools = first.get("tools", [])
+        assert any(t.get("function", {}).get("name") == "bash" for t in tools), \
+            "bash tool schema missing from request"
+        # round 2: plain text turn resolves and exits clean
+        p2 = Puppet(wt, pi, extra_env=env,
+                    argv=[PIR, "-m", "local/mock", "MOCK: text hello-wire"])
+        p2.start()
+        try:
+            status2 = p2.wait_exit(timeout=90)
+        finally:
+            p2.close()
+        assert status2 == 0, f"one-shot text turn exited {status2}"
+        print("PASS wire parity: system shape + verbatim user + tool schemas")
+    finally:
+        srv.terminate()
+
+
+def _sys_text(body):
+    # system prompt may arrive as a messages[0] system entry instead
+    for m in body.get("messages", []):
+        if m.get("role") == "system" and isinstance(m.get("content"), str):
+            return m["content"]
+    return ""
+
+def scenario_pi_vs_pir():
+    """Drive pi AND pir against the same mock; diff per the §3.6 matrix.
+
+    Match: identical user text, Available tools + Guidelines sections in
+    both, cwd trailer in both, AGENTS.md marker content in both.
+    Diverge: identity lines and tool-name sets differ per agent."""
+    import json as _json
+    import socket as _socket
+    import subprocess as _sp
+    wt, pi, base = fresh_dirs("pivspir")
+    with open(os.path.join(wt, "AGENTS.md"), "w") as f:
+        f.write("# SharedMarker\nAlways be kind.\n")
+    port = 18799
+    log = os.path.join(base, "requests.jsonl")
+    mock = "/home/ai_pir/src/pir/scripts/mock_server.py"
+    for p in (8799, port):
+        _sp.run(["pkill", "-f", f"mock_server.py {p}"],
+                capture_output=True)
+    time.sleep(0.5)
+    srv = _sp.Popen([sys.executable, mock, str(port), log],
+                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+    bodies = {}
+    try:
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            try:
+                s = _socket.create_connection(("127.0.0.1", port), timeout=1)
+                s.close()
+                break
+            except OSError:
+                time.sleep(0.2)
+        prompt = "MOCK: text same-prompt"
+        # --- pi ---
+        pihome = os.path.join(base, "pihome")
+        os.makedirs(os.path.join(pihome, ".pi", "agent"), exist_ok=True)
+        with open(os.path.join(pihome, ".pi", "agent", "models.json"), "w") as f:
+            _json.dump({"providers": {"localmock": {
+                "baseUrl": f"http://127.0.0.1:{port}/v1",
+                "api": "openai-completions", "apiKey": "test",
+                "compat": {"supportsDeveloperRole": False, "supportsReasoningEffort": False},
+                "models": [{"id": "mock"}]} }}, f)
+        open(log, "w").write("")
+        pi_env = dict(os.environ, HOME=pihome, PI_TELEMETRY="0")
+        r = _sp.run(["pi", "--api-key", "test", "--model", "localmock/mock",
+                     "-p", prompt, "--no-session"],
+                    cwd=wt, env=pi_env, capture_output=True, text=True, timeout=120)
+        assert r.returncode == 0, f"pi failed: {r.stderr[-500:]}"
+        bodies["pi"] = [_json.loads(l) for l in open(log) if l.strip()][-1]["body"]
+        # --- pir ---
+        store = {"providers": [{
+            "id": "local", "name": "local", "api": "openai",
+            "baseUrl": f"http://127.0.0.1:{port}", "apiKey": "test",
+            "models": [{"id": "mock", "context": 200000, "maxTokens": 8192}]}]}
+        with open(os.path.join(pi, "agent", "models-store.json"), "w") as f:
+            _json.dump(store, f)
+        open(log, "w").write("")
+        pir_env = dict(os.environ, PI_DIR=pi, PI_FULL_AUTO="1")
+        r = _sp.run([PIR, "-m", "local/mock", prompt],
+                    cwd=wt, env=pir_env, capture_output=True, text=True, timeout=120)
+        assert r.returncode == 0, f"pir failed: {r.stderr[-500:]}"
+        bodies["pir"] = [_json.loads(l) for l in open(log) if l.strip()][-1]["body"]
+    finally:
+        srv.terminate()
+    # --- matrix: MATCH rows ---
+    texts = {}
+    for who, b in bodies.items():
+        ts = []
+        for m in b.get("messages", []):
+            if m.get("role") != "user":
+                continue
+            c = m.get("content", "")
+            if isinstance(c, str):
+                ts.append(c)
+            elif isinstance(c, list):
+                ts.append(" ".join(x.get("text", "") for x in c if isinstance(x, dict)))
+        texts[who] = " ".join(ts)
+    assert texts["pi"].strip() == texts["pir"].strip(), \
+        f"user text differs:\npi: {texts['pi'][:120]!r}\npir: {texts['pir'][:120]!r}"
+    systems = {}
+    for who, b in bodies.items():
+        s = ""
+        for m in b.get("messages", []):
+            if m.get("role") == "system":
+                c = m.get("content", "")
+                s = c if isinstance(c, str) else " ".join(
+                    x.get("text", "") for x in c if isinstance(x, dict))
+        systems[who] = s
+    for who, s in systems.items():
+        assert "Available tools:" in s, f"{who}: tools section missing"
+        assert "Guidelines:" in s, f"{who}: guidelines section missing"
+        assert "Current working directory:" in s, f"{who}: cwd trailer missing"
+        assert "Always be kind." in s, f"{who}: AGENTS.md marker missing"
+    # --- matrix: DIVERGE rows ---
+    assert "operating inside pi" in systems["pi"], "pi identity changed?"
+    assert "You are pir" in systems["pir"], "pir identity missing"
+    assert "operating inside pi" not in systems["pir"]
+    pi_tools = {t.get("function", {}).get("name") for t in bodies["pi"].get("tools", [])}
+    pir_tools = {t.get("function", {}).get("name") for t in bodies["pir"].get("tools", [])}
+    assert "read" in pi_tools and "read_file" not in pi_tools, f"pi tools: {pi_tools}"
+    assert "read_file" in pir_tools and "read" not in pir_tools, f"pir tools: {pir_tools}"
+    print("PASS pi-vs-pir: user/shape/context match, identity/tools diverge")
+
 if __name__ == "__main__":
+    which = sys.argv[1] if len(sys.argv) > 1 else "all"
+    if which in ("all", "pivspir"):
+        scenario_pi_vs_pir()
+    which = sys.argv[1] if len(sys.argv) > 1 else "all"
+    if which in ("all", "parity"):
+        scenario_wire_parity()
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     if which in ("all", "parked"):
         scenario_cursor_parked_midturn()

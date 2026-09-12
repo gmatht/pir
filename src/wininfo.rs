@@ -190,18 +190,15 @@ pub mod impls {
         // X11: xclip -selection clipboard -o
         if let Ok(output) =
             Command::new("xclip").args(["-selection", "clipboard", "-o"]).output()
-        {
-            if output.status.success() {
+            && output.status.success() {
                 return String::from_utf8_lossy(&output.stdout).trim().to_string();
             }
-        }
 
         // Wayland: wl-paste
-        if let Ok(output) = Command::new("wl-paste").output() {
-            if output.status.success() {
+        if let Ok(output) = Command::new("wl-paste").output()
+            && output.status.success() {
                 return String::from_utf8_lossy(&output.stdout).trim().to_string();
             }
-        }
 
         String::new()
     }

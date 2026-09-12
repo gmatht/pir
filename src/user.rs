@@ -48,13 +48,11 @@ pub fn name_of_uid(uid: u32) -> Option<String> {
 /// or HOME rewrite; `main` snapshots it into `PIR_INVOKING_HOME`.
 #[cfg(unix)]
 pub fn invoking_home() -> Option<std::path::PathBuf> {
-    if let Ok(n) = std::env::var("SUDO_USER") {
-        if !n.trim().is_empty() {
-            if let Some(h) = home_of(n.trim()) {
+    if let Ok(n) = std::env::var("SUDO_USER")
+        && !n.trim().is_empty()
+            && let Some(h) = home_of(n.trim()) {
                 return Some(h);
             }
-        }
-    }
     std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
 /// The user who launched `pir` (the "invoking user"), captured before any
@@ -66,11 +64,10 @@ pub fn invoking_home() -> Option<std::path::PathBuf> {
 /// survives the drop and is available to `/sh -u`.
 #[cfg(unix)]
 pub fn invoking_user_name() -> Option<String> {
-    if let Ok(u) = std::env::var("SUDO_USER") {
-        if !u.trim().is_empty() {
+    if let Ok(u) = std::env::var("SUDO_USER")
+        && !u.trim().is_empty() {
             return Some(u.trim().to_string());
         }
-    }
     name_of_uid(unsafe { libc::getuid() })
 }
 
@@ -165,11 +162,10 @@ fn traverse_blockers(cwd: &std::path::Path, user: &str) -> Vec<std::path::PathBu
     let mut blockers = Vec::new();
     // `ancestors()` yields cwd, then each parent up to `/`. Skip cwd itself.
     for ancestor in cwd.ancestors().skip(1) {
-        if let Ok(md) = std::fs::metadata(ancestor) {
-            if !can_traverse(&md, uid, gid) && !blockers.iter().any(|p| p == ancestor) {
+        if let Ok(md) = std::fs::metadata(ancestor)
+            && !can_traverse(&md, uid, gid) && !blockers.iter().any(|p| p == ancestor) {
                 blockers.push(ancestor.to_path_buf());
             }
-        }
     }
     blockers
 }
@@ -538,7 +534,9 @@ pub fn drop_to_agent_user() -> Result<(), std::io::Error> {
     // directories, never the invoking user's (root's) home. Mirrors what the
     // old `become_user` applied to the whole process.
     for (k, v) in toolchain_env_for(&user) {
-        std::env::set_var(k, v);
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var(k, v); }
     }
     Ok(())
 }
@@ -756,11 +754,10 @@ fn resolve_shell_path(shell: &str) -> String {
     }
     // Prefer the invoking user's login shell from passwd, then the env, then
     // the literal name, then /bin/sh.
-    if let Some(u) = std::env::var("PIR_INVOKING_USER").ok().filter(|s| !s.is_empty()) {
-        if let Some(path) = login_shell_of(&u) {
+    if let Some(u) = std::env::var("PIR_INVOKING_USER").ok().filter(|s| !s.is_empty())
+        && let Some(path) = login_shell_of(&u) {
             return path;
         }
-    }
     std::env::var("SHELL").unwrap_or_else(|_| shell.to_string())
 }
 
@@ -858,6 +855,8 @@ fn ensure_home_dir(user: &str) {
 #[cfg(unix)]
 fn apply_toolchain_env(user: &str) {
     for (k, v) in toolchain_env_for(user) {
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
         unsafe {
             std::env::set_var(k, v);
         }
@@ -882,11 +881,9 @@ pub fn current_user_home() -> Option<std::path::PathBuf> {
         ) == 0
             && !result.is_null()
             && !pwd.pw_dir.is_null()
-        {
-            if let Ok(s) = std::ffi::CStr::from_ptr(pwd.pw_dir).to_str() {
+            && let Ok(s) = std::ffi::CStr::from_ptr(pwd.pw_dir).to_str() {
                 return Some(std::path::PathBuf::from(s));
             }
-        }
     }
     std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
@@ -1208,11 +1205,10 @@ pub fn toolchain_env_for(user: &str) -> Vec<(String, String)> {
 #[cfg(unix)]
 pub fn session_dir_for(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
     let meta = cwd.join(".pir").join("sessions");
-    if let Ok(md) = std::fs::metadata(&meta) {
-        if md.is_dir() {
+    if let Ok(md) = std::fs::metadata(&meta)
+        && md.is_dir() {
             return Some(meta);
         }
-    }
     None
 }
 

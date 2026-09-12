@@ -533,14 +533,13 @@ impl ToolBackend for PiExtensions {
             };
         }
         // Namespaced tool call: parse `piext_<extId>__<tool>`.
-        if let Some(rest) = name.strip_prefix("piext_") {
-            if let Some((ext_id, tool)) = rest.split_once("__") {
+        if let Some(rest) = name.strip_prefix("piext_")
+            && let Some((ext_id, tool)) = rest.split_once("__") {
                 return match self.call_tool(ext_id, tool, input) {
                     Ok(s) => Outcome::ok(s),
                     Err(e) => Outcome::err(e),
                 };
             }
-        }
         Outcome::err(format!("unknown pi-extensions tool '{name}'"))
     }
 
@@ -565,14 +564,13 @@ impl ToolBackend for PiExtensions {
         if name == "piext" {
             return self.piext_control(args);
         }
-        if let Some(rest) = name.strip_prefix("piext_") {
-            if let Some((ext_id, cmd)) = rest.split_once("__") {
+        if let Some(rest) = name.strip_prefix("piext_")
+            && let Some((ext_id, cmd)) = rest.split_once("__") {
                 return match self.run_command(ext_id, cmd, args) {
                     Ok(s) => Outcome::ok(s),
                     Err(e) => Outcome::err(e),
                 };
             }
-        }
         Outcome::err(format!("unknown pi-extensions command '/{name}'"))
     }
 
@@ -729,7 +727,9 @@ mod tests {
     #[test]
     fn disabled_backend_registers_nothing() {
         // Without PIR_PI_EXTENSIONS the backend is inert.
-        std::env::remove_var("PIR_PI_EXTENSIONS");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::remove_var("PIR_PI_EXTENSIONS"); }
         let e = PiExtensions::new();
         assert!(!e.enabled);
         assert!(e.specs().is_empty());

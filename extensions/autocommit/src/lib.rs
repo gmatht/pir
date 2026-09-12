@@ -418,8 +418,12 @@ mod tests {
     #[test]
     fn auto_commits_prompt_as_subject_and_skips_meta_commands() {
         let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("PIR_AUTO_COMMIT", "1");
-        std::env::remove_var("PIR_VCS");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PIR_AUTO_COMMIT", "1"); }
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::remove_var("PIR_VCS"); }
         let dir = scratch_repo();
         fs::write(dir.join("change.txt"), "new\n").unwrap();
 
@@ -446,14 +450,20 @@ mod tests {
         assert!(!after.unwrap().is_error);
 
         let _ = fs::remove_dir_all(&dir);
-        std::env::remove_var("PIR_AUTO_COMMIT");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::remove_var("PIR_AUTO_COMMIT"); }
     }
 
     #[test]
     fn off_by_default_does_nothing() {
         let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("PIR_AUTO_COMMIT");
-        std::env::remove_var("PIR_VCS");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::remove_var("PIR_AUTO_COMMIT"); }
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::remove_var("PIR_VCS"); }
         let dir = scratch_repo();
         fs::write(dir.join("change.txt"), "new\n").unwrap();
         let mut ac = AutoCommit::new();

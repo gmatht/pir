@@ -179,7 +179,8 @@ OPTIONS
 CONFIG (reused from pi, never modified)
   ~/.pi/models.json          providers, models, api keys ("{env:VAR}" supported)
   ~/.pi/agent/settings.json  optional default model ("defaultModel" / "defaultProvider")
-  ~/.pi/AGENTS.md, ./AGENTS.md   appended to the system prompt
+  ~/.pi/agent/AGENTS.md (global) + AGENTS.md/CLAUDE.md walking up from cwd
+                          (AGENTS.override.md wins per dir) appended to the system prompt
   ~/.pi/agent/sessions/      pir session transcripts + goal files (pir-*.jsonl/.goal.json)
   ~/.pi/agent/projects.json  project -> execution-user mappings (set by `pir project init`)
 
@@ -441,14 +442,18 @@ fn main() {
     // policy fallback resolve through it (see `global_defaults_file`).
     #[cfg(unix)]
     if let Some(h) = crate::user::invoking_home() {
-        std::env::set_var("PIR_INVOKING_HOME", h);
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PIR_INVOKING_HOME", h); }
     }
     // Record the invoking user name before any drop: `/sh -u` (no arg) and
     // `!!` resolve through it. Was previously only read, never stored, so the
     // bare form always failed.
     #[cfg(unix)]
     if let Some(u) = crate::user::invoking_user_name() {
-        std::env::set_var("PIR_INVOKING_USER", u);
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PIR_INVOKING_USER", u); }
     }
 
     let mut i = 0;
@@ -492,20 +497,18 @@ fn main() {
             }
             "-r" | "--resume" | "--session" => {
                 // The next token is the resume token unless it's another flag.
-                if let Some(next) = args.get(i + 1) {
-                    if !next.starts_with('-') {
+                if let Some(next) = args.get(i + 1)
+                    && !next.starts_with('-') {
                         resume_token = Some(next.clone());
                         i += 1;
                     }
-                }
             }
             "-c" | "--continue" => {
-                if let Some(next) = args.get(i + 1) {
-                    if !next.starts_with('-') {
+                if let Some(next) = args.get(i + 1)
+                    && !next.starts_with('-') {
                         continue_token = Some(next.clone());
                         i += 1;
                     }
-                }
             }
             "--secure" => {
                 // Optional level; bare `--secure` means mitigation. Invalid
@@ -606,23 +609,29 @@ fn main() {
         let policy = match &target_home {
             Some(h) => {
                 let prev = std::env::var_os("HOME");
-                std::env::set_var("HOME", h);
+                // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+                // it to startup config and explicit session toggles.
+                unsafe { std::env::set_var("HOME", h); }
                 let p = crate::security::load_policy();
                 match prev {
-                    Some(p) => std::env::set_var("HOME", p),
-                    None => std::env::remove_var("HOME"),
+                    Some(p) => unsafe { std::env::set_var("HOME", p) },
+                    None => unsafe { std::env::remove_var("HOME") },
                 }
                 p
             }
             None => crate::security::load_policy(),
         };
         if !policy.user_security {
-            std::env::set_var("PIR_AGENT_AS_INVOKER", "1");
+            // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+            // it to startup config and explicit session toggles.
+            unsafe { std::env::set_var("PIR_AGENT_AS_INVOKER", "1"); }
             // Keep the sandbox user's HOME so config (security.toml, models)
             // stays consistent with the operator's /menu edits; the process
             // itself stays the invoking identity (no `become_user` drop).
             if let Some(h) = &target_home {
-                std::env::set_var("HOME", h);
+                // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+                // it to startup config and explicit session toggles.
+                unsafe { std::env::set_var("HOME", h); }
             }
             None
         } else {
@@ -637,7 +646,9 @@ fn main() {
                     eprintln!(
                         "pir: {e} — running as the invoking user WITHOUT command confinement (create it with `pir project init` for sandboxing)"
                     );
-                    std::env::set_var("PIR_AGENT_AS_INVOKER", "1");
+                    // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+                    // it to startup config and explicit session toggles.
+                    unsafe { std::env::set_var("PIR_AGENT_AS_INVOKER", "1"); }
                     None
                 }
             }
@@ -920,47 +931,69 @@ fn main() {
     }
 
     println!("{}", term::bold("pir"));
-    println!(
-        "{}",
-        term::dim(&format!(
-            "model {} · {} · config {}",
-            agent.label(),
-            if full_auto {
-                if running_as_agent {
-                    "full-auto (agent user)"
-                } else {
-                    "full-auto"
-                }
+    // Collect the startup status lines. They print to the right of the sixel
+    // logo when sixel is available, or plainly below when it isn't — the same
+    // lines in the same order either way (the banner wraps ANSI-aware, so the
+    // dim styling rides along into the side text).
+    let mut side_lines: Vec<String> = Vec::new();
+    side_lines.push(term::dim(&format!(
+        "model {} · {} · config {}",
+        agent.label(),
+        if full_auto {
+            if running_as_agent {
+                "full-auto (agent user)"
             } else {
-                "confirm-actions"
-            },
-            config::pi_dir().display()
-        ))
-    );
+                "full-auto"
+            }
+        } else {
+            "confirm-actions"
+        },
+        config::pi_dir().display()
+    )));
     // Surface extension startup banners (e.g. the worktree extension reporting
     // which worktree we launched in) before the first prompt.
     for line in agent.startup_reports() {
-        println!("{}", term::dim(&line));
+        side_lines.push(term::dim(&line));
     }
     // Show the execution user when it isn't the invoking root (per-project
     // `ai_X` sandbox), so it's clear commands run as that identity.
     #[cfg(unix)]
     if let Some(u) = resolved_user.as_deref() {
-        println!("{}", term::dim(&format!("running as user {u}")));
+        side_lines.push(term::dim(&format!("running as user {u}")));
     }
     if let Some(p) = &agent.log_path {
-        println!("{}", term::dim(&format!("session log: {}", p.display())));
+        side_lines.push(term::dim(&format!("session log: {}", p.display())));
     }
-    // Render the pir logo as sixels with the help text beside it, when the
-    // terminal supports sixel (Windows Terminal 1.22+ with "Enable Sixel
-    // graphics" on, or any sixel-capable emulator). Falls back to the plain
-    // help line below when sixel isn't available.
+    // pi parity: startup header names the loaded context files.
+    {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let files = crate::agent::context_files(&cwd);
+        if !files.is_empty() {
+            let names: Vec<String> = files
+                .iter()
+                .map(|(p, _)| {
+                    p.strip_prefix(&cwd)
+                        .map(|r| r.display().to_string())
+                        .unwrap_or_else(|_| p.display().to_string())
+                })
+                .collect();
+            side_lines.push(term::dim(&format!("context: {}", names.join(", "))));
+        }
+    }
+    // Render the pir logo via img2sixel with the status + help text beside
+    // it, when the terminal supports sixel (Windows Terminal 1.22+ with
+    // "Enable Sixel graphics" on, or any sixel-capable emulator) and the
+    // img2sixel binary is installed. Falls back to the plain lines below
+    // otherwise.
     let help_line = "/help for commands · ctrl-d quit · ctrl-q quit now (x2 to force) · type while a turn runs; ESC/ctrl-c cancels it instantly";
-    if let Some(banner) = crate::sixel::render_banner(&[help_line.to_string()]) {
+    side_lines.push(term::dim(help_line));
+    if let Some(banner) = crate::sixel::render_banner(&side_lines) {
         term::out(&banner);
         println!();
     } else {
-        println!("{}", term::dim(help_line));
+        for line in &side_lines {
+            println!("{line}");
+        }
     }
     // Flush any leftover bytes the startup terminal queries (DA1 / XTV) left in
     // the tty buffer -- otherwise the reply (a `\x1b[?61;4;...c` style string
@@ -1050,8 +1083,8 @@ fn main() {
 
         // If a foreground turn finished, join it and either start the next
         // queued prompt or return to the idle prompt.
-        if let Some(h) = fg_handle.as_ref() {
-            if h.is_finished() {
+        if let Some(h) = fg_handle.as_ref()
+            && h.is_finished() {
                 let h = fg_handle.take().unwrap();
                 let _ = h.join();
                 term::raw::disable_raw();
@@ -1145,7 +1178,6 @@ fn main() {
                     }
                 }
             }
-        }
 
         if fg_handle.is_some() {
             // A turn is running on a worker thread: stay responsive. Block
@@ -1814,15 +1846,12 @@ fn latest_built_binary() -> Option<PathBuf> {
         for e in entries.flatten() {
             let p = e.path();
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if is_snapshot(name) || is_plain(name) {
-                if let Ok(meta) = std::fs::metadata(&p) {
-                    if let Ok(m) = meta.modified() {
-                        if best.as_ref().is_none_or(|(bm, _)| m > *bm) {
+            if (is_snapshot(name) || is_plain(name))
+                && let Ok(meta) = std::fs::metadata(&p)
+                    && let Ok(m) = meta.modified()
+                        && best.as_ref().is_none_or(|(bm, _)| m > *bm) {
                             *best = Some((m, p.clone()));
                         }
-                    }
-                }
-            }
             // Recurse so triple-target builds (target/<triple>/<profile>/) are
             // covered, not just target/<profile>/. Don't go deeper than
             // depth 2 (target/<triple>/<profile>), and never walk Cargo's cache
@@ -2036,11 +2065,9 @@ fn handle_command(
                     let ctx = agent.model().context.unwrap_or(0);
                     if let Some(level) =
                         modal::thinking_picker(agent.thinking_level().as_str(), kind, ctx)
-                    {
-                        if let Some(lvl) = config::ThinkingLevel::parse(&level) {
+                        && let Some(lvl) = config::ThinkingLevel::parse(&level) {
                             println!("{}", agent.set_thinking(lvl));
                         }
-                    }
                 }
                 Some(MenuAction::Model) => {
                     // Open the model picker; Esc cancels. On a pick, switch the
@@ -2241,8 +2268,8 @@ fn handle_command(
                     let _ = config::set_default_model(&p.pid(), &m.id);
                     // Broadcast to other running instances of this user.
                     match config::publish_model_broadcast(&format!("{}/{}", p.pid(), m.id)) {
-                        Some(gen) => println!(
-                            "{} broadcasting to all your open terminals (generation {gen})",
+                        Some(generation) => println!(
+                            "{} broadcasting to all your open terminals (generation {generation})",
                             term::dim("·")
                         ),
                         None => eprintln!("pir: could not write broadcast file"),
@@ -2410,9 +2437,9 @@ fn handle_command(
             // so the credential is usable immediately. Re-resolve the provider
             // list (it now includes the freshly stored key) so a provider that
             // was only present via a stored key works without a restart.
-            if let Ok(fresh) = config::load_providers() {
-                if let Some(p) = fresh.iter().find(|p| p.pid().eq_ignore_ascii_case(&provider_id)) {
-                    if !p.models.is_empty() {
+            if let Ok(fresh) = config::load_providers()
+                && let Some(p) = fresh.iter().find(|p| p.pid().eq_ignore_ascii_case(&provider_id))
+                    && !p.models.is_empty() {
                         let mut g = agent_slot.lock().unwrap();
                         let Some(agent) = g.as_mut() else {
                             println!("{} key saved; it will be available after reload", term::dim("·"));
@@ -2426,8 +2453,6 @@ fn handle_command(
                             println!("→ switched to {}", agent.label());
                         }
                     }
-                }
-            }
         }
         "logout" => {
             // Remove a stored credential from ~/.pi/agent/auth.json (pi's
@@ -3258,9 +3283,9 @@ fn scan_sessions() -> Option<Vec<Session>> {
 fn first_user_line(path: &PathBuf) -> String {
     if let Ok(f) = std::fs::File::open(path) {
         for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                if v.get("role").and_then(|r| r.as_str()) == Some("user") {
-                    if let Some(txt) = v
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+                && v.get("role").and_then(|r| r.as_str()) == Some("user")
+                    && let Some(txt) = v
                         .get("blocks")
                         .and_then(|b| b.as_array())
                         .and_then(|a| a.iter().find(|b| b.get("type").and_then(|t| t.as_str()) == Some("text")))
@@ -3268,8 +3293,6 @@ fn first_user_line(path: &PathBuf) -> String {
                     {
                         return truncate(txt.lines().next().unwrap_or("").trim(), 80);
                     }
-                }
-            }
         }
     }
     String::new()
@@ -3395,11 +3418,10 @@ fn home_collapsed(path: &std::path::Path) -> String {
 /// any subdirectory.
 pub(crate) fn workspace_label() -> String {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    if crate::project::is_git_repo(&cwd) {
-        if let Some(root) = crate::project::repo_root_opt(&cwd) {
+    if crate::project::is_git_repo(&cwd)
+        && let Some(root) = crate::project::repo_root_opt(&cwd) {
             return home_collapsed(&root);
         }
-    }
     home_collapsed(&cwd)
 }
 
@@ -3541,8 +3563,8 @@ fn run_shell(args: Vec<&str>) -> Option<i32> {
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false);
     #[cfg(unix)]
-    if !as_invoker {
-        if let Some(agent) = crate::user::agent_exec_user() {
+    if !as_invoker
+        && let Some(agent) = crate::user::agent_exec_user() {
         let already = {
             #[cfg(unix)]
             {
@@ -3558,7 +3580,6 @@ fn run_shell(args: Vec<&str>) -> Option<i32> {
             return crate::user::spawn_shell_as(&shell, &args, Some(&agent));
         }
         }
-    }
     let status = if args.is_empty() {
         // Interactive: hand the terminal straight to the login shell. HISTFILE=/dev/null
         // so the agent's own commands never persist into the real ~/.bash_history
@@ -3609,8 +3630,8 @@ fn create_project(name: &str) -> Option<std::path::PathBuf> {
     println!("created project dir {}", dir.display());
 
     // Offer to seed the project from clipboard markdown (unmd2.sh format).
-    if let Some(text) = crate::project::read_clipboard() {
-        if crate::project::looks_like_project_md(&text) {
+    if let Some(text) = crate::project::read_clipboard()
+        && crate::project::looks_like_project_md(&text) {
             let n = crate::project::count_md_files(&text);
             let ans = term::read_answer(&format!(
                 "clipboard looks like a {}‑file project spec — extract it here? [y]es / [n]o",
@@ -3623,7 +3644,6 @@ fn create_project(name: &str) -> Option<std::path::PathBuf> {
                 }
             }
         }
-    }
 
     println!("open it with:  cd {}", dir.display());
     Some(dir)
@@ -3650,11 +3670,13 @@ mod main_tests {
         )
         .unwrap();
         let old = std::env::var_os("PI_DIR");
-        std::env::set_var("PI_DIR", &dir);
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PI_DIR", &dir); }
         let sessions = scan_sessions();
         match old {
-            Some(v) => std::env::set_var("PI_DIR", v),
-            None => std::env::remove_var("PI_DIR"),
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
         }
         let _ = std::fs::remove_dir_all(&dir);
         let sessions = sessions.expect("scan finds the temp global dir");
