@@ -2573,6 +2573,13 @@ fn make_client(provider: &Provider, cancel: Arc<AtomicBool>) -> Result<Client, S
     // model call aborts the streaming read promptly instead of blocking until
     // the whole response arrives.
     client.set_cancel(cancel);
+    // HTTP transport for the streaming core: `PIR_HTTP_BACKEND` or the
+    // `http_backend` settings.json key (`"isahc"` default, `"ureq"`).
+    // Unknown values fall back to the default rather than failing startup.
+    if let Some(name) = config::http_backend_name()
+        && let Some(backend) = crate::provider::HttpBackend::parse(&name) {
+            client.set_backend(backend);
+        }
     // Offline scripted model for tests/puppetry (see `crate::fake`): enabled
     // by provider id so a user catalog can never collide with it by model id.
     client.set_fake(provider.pid() == "fake");

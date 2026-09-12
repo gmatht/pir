@@ -745,6 +745,21 @@ pub fn worktrees_default() -> bool {
     v.get("worktrees").and_then(Value::as_bool).unwrap_or(false)
 }
 
+/// Selected HTTP transport backend (`http_backend` in
+/// `~/.pi/agent/settings.json`: `"isahc"` or `"ureq"`). `PIR_HTTP_BACKEND`
+/// wins when set. Returns the raw value for the caller to parse; `None`
+/// (or anything unparseable) means the default backend.
+pub fn http_backend_name() -> Option<String> {
+    if let Ok(v) = std::env::var("PIR_HTTP_BACKEND")
+        && !v.trim().is_empty() {
+            return Some(v);
+        }
+    let p = pi_dir().join("agent").join("settings.json");
+    let raw = fs::read_to_string(p).ok()?;
+    let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    v.get("http_backend").and_then(Value::as_str).map(str::to_string)
+}
+
 /// Persist the worktree default flag (writes `worktrees` into
 /// `~/.pi/agent/settings.json`, preserving the other keys).
 pub fn set_worktrees_default(on: bool) -> Result<PathBuf, String> {
@@ -1600,6 +1615,37 @@ mod worktree_settings_tests {
         set_worktrees_default(false).unwrap();
         assert!(!worktrees_default(), "persisted off must read back");
         match old {
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // `PIR_HTTP_BACKEND` wins; otherwise the `http_backend` settings.json
+    // key under an isolated PI_DIR; otherwise None (caller defaults). File
+    // writes go to a temp dir so the real user config is never touched.
+    #[test]
+    fn http_backend_name_env_and_file() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap();
+        let old_backend = std::env::var_os("PIR_HTTP_BACKEND");
+        let old_dir = std::env::var_os("PI_DIR");
+        let dir = std::env::temp_dir().join(format!("pir_http_cfg_{}", std::process::id()));
+        unsafe {
+            std::env::set_var("PI_DIR", &dir);
+            std::env::set_var("PIR_HTTP_BACKEND", "ureq");
+        }
+        assert_eq!(http_backend_name(), Some("ureq".to_string()), "env wins");
+        unsafe { std::env::remove_var("PIR_HTTP_BACKEND"); }
+        assert_eq!(http_backend_name(), None, "no file means default");
+        let agent = dir.join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(agent.join("settings.json"), "{\"http_backend\": \"ureq\"}").unwrap();
+        assert_eq!(http_backend_name(), Some("ureq".to_string()), "file fallback");
+        match old_backend {
+            Some(v) => unsafe { std::env::set_var("PIR_HTTP_BACKEND", v) },
+            None => unsafe { std::env::remove_var("PIR_HTTP_BACKEND") },
+        }
+        match old_dir {
             Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
             None => unsafe { std::env::remove_var("PI_DIR") },
         }

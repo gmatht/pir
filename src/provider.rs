@@ -7,6 +7,8 @@ use smol::channel::{bounded as smol_channel, Receiver as SmolRx};
 use smol::future;
 use smol::io::AsyncBufRead;
 use smol::io::AsyncBufReadExt;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use smol::io::AsyncReadExt;
 use smol::Timer;
 use std::io::{Error, ErrorKind, Read, Write};
@@ -106,6 +108,38 @@ fn stall_timeout() -> Duration {
         .unwrap_or(STALL_TIMEOUT)
 }
 
+/// HTTP transport backend for the streaming core. `Isahc` (default) is the
+/// async client: connection pooling, cancel racing at the reactor level,
+/// unbounded reads bounded by the stall watchdog. `Ureq` is the blocking
+/// client run inside `smol::unblock`, bridged back to async for the shared
+/// SSE parsers; per-read wake comes from the parser-side cancel/stall race,
+/// with `timeout_read` as the backstop so a dangling pump thread always dies.
+/// Selected by `PIR_HTTP_BACKEND` or the `http_backend` settings.json key
+/// (see `config::http_backend_name`); unknown values fall back to `Isahc`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HttpBackend {
+    #[default]
+    Isahc,
+    Ureq,
+}
+
+impl HttpBackend {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "isahc" => Some(HttpBackend::Isahc),
+            "ureq" => Some(HttpBackend::Ureq),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            HttpBackend::Isahc => "isahc",
+            HttpBackend::Ureq => "ureq",
+        }
+    }
+}
+
 /// Wait before re-issuing a failed attempt. It doubles with each attempt so a
 /// struggling server gets progressively more room: timeouts (the server was
 /// merely slow) start short — 10s, 20s, 40s … capped at 5min — while other
@@ -165,6 +199,11 @@ pub struct Client {
     /// handshake on every turn. Previously a fresh `HttpClient` was built per
     /// attempt, which threw the pool away after each response.
     http: isahc::HttpClient,
+    /// Blocking client for the `Ureq` backend (built once; `ureq::Agent` is
+    /// cheap to clone per attempt). Only used when `backend` is `Ureq`.
+    ureq_agent: ureq::Agent,
+    /// Selected transport; `Isahc` unless `set_backend` says otherwise.
+    backend: HttpBackend,
     /// Stable per-conversation session id, sent as `x-opencode-session` on
     /// OpenCode Go requests (routing + prompt caching; see
     /// opencode.ai/docs/go). Set by `make_client` for the `opencode-go`
@@ -199,6 +238,19 @@ impl Client {
             .expect("isahc client build failed")
     }
 
+    /// Build the blocking `ureq` client for the `Ureq` backend. Read timeout
+    /// mirrors the stall watchdog (it only ever fires on true silence, which
+    /// the watchdog reports first); cancel promptness comes from the
+    /// parser-side cancel race, not the socket.
+    fn build_ureq_agent() -> ureq::Agent {
+        ureq::AgentBuilder::new()
+            .timeout_connect(CONNECT_TIMEOUT)
+            .timeout_read(stall_timeout())
+            .timeout_write(CONNECT_TIMEOUT)
+            .user_agent(&Self::user_agent())
+            .build()
+    }
+
     /// Bridge the shared `cancel` `AtomicBool` (set by the REPL on ESC/ctrl-c)
     /// into a `smol` channel the streaming loop can `or()` against, so cancel is
     /// observed at the reactor level (instant) rather than only at the next
@@ -224,10 +276,18 @@ impl Client {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             http: Self::build_http_client(),
+            ureq_agent: Self::build_ureq_agent(),
+            backend: HttpBackend::default(),
             session_id: None,
             fake: false,
             cancel: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Select the HTTP transport for the streaming core (`Isahc` default).
+    /// Called by `make_client` from `PIR_HTTP_BACKEND` / `http_backend`.
+    pub fn set_backend(&mut self, backend: HttpBackend) {
+        self.backend = backend;
     }
 
     /// Attach the conversation's session id for `x-opencode-session` routing.
@@ -246,24 +306,43 @@ impl Client {
     /// Apply auth + session + identity headers for `kind` to a request
     /// builder. Shared by `chat` and `complete` so the two can never drift
     /// (a missing auth header on one path used to be a whole bug class).
+    /// Auth + session + identity headers for `kind` as plain pairs — the
+    /// single source both transports apply, so the two backends can never
+    /// drift (a missing auth header on one path used to be a whole bug class).
+    fn request_headers(&self, kind: ApiKind) -> Vec<(String, String)> {
+        let mut out = vec![("user-agent".to_string(), Self::user_agent())];
+        match kind {
+            ApiKind::Anthropic => {
+                out.push(("x-api-key".to_string(), self.api_key.clone()));
+                out.push(("anthropic-version".to_string(), "2023-06-01".to_string()));
+            }
+            ApiKind::OpenAi | ApiKind::OpenAiResponses => {
+                out.push(("Authorization".to_string(), format!("Bearer {}", self.api_key)));
+            }
+        }
+        if let Some(id) = &self.session_id {
+            out.push(("x-opencode-session".to_string(), id.clone()));
+        }
+        out
+    }
+
     fn apply_headers(
         &self,
-        builder: isahc::http::request::Builder,
+        mut builder: isahc::http::request::Builder,
         kind: ApiKind,
     ) -> isahc::http::request::Builder {
-        let builder = builder.header("user-agent", Self::user_agent());
-        let builder = match kind {
-            ApiKind::Anthropic => builder
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", "2023-06-01"),
-            ApiKind::OpenAi | ApiKind::OpenAiResponses => {
-                builder.header("Authorization", &format!("Bearer {}", self.api_key))
-            }
-        };
-        match &self.session_id {
-            Some(id) => builder.header("x-opencode-session", id),
-            None => builder,
+        for (k, v) in self.request_headers(kind) {
+            builder = builder.header(&k, &v);
         }
+        builder
+    }
+
+    /// Apply the shared headers to a blocking `ureq` request.
+    fn apply_ureq_headers(&self, mut req: ureq::Request, kind: ApiKind) -> ureq::Request {
+        for (k, v) in self.request_headers(kind) {
+            req = req.set(&k, &v);
+        }
+        req
     }
 
     /// Enable the offline scripted model (see `crate::fake`).
@@ -348,25 +427,49 @@ impl Client {
             }
         };
         smol::block_on(async {
-            let builder = self.apply_headers(
-                isahc::Request::builder()
-                    .method("POST")
-                    .uri(&url)
-                    .header("content-type", "application/json"),
-                kind,
-            );
-            let req = builder.body(body.to_string()).map_err(|e| format!("complete: {e}"))?;
-            let resp = self.http.send_async(req).await.map_err(http_error)?;
-            let status = resp.status();
-            if !status.is_success() {
-                let code = status.as_u16();
-                let mut b = String::new();
-                let _ = resp.into_body().read_to_string(&mut b).await;
-                return Err(http_status_detail(code, &b));
-            }
-            let mut b = String::new();
-            let _ = resp.into_body().read_to_string(&mut b).await;
-            let v: Value = serde_json::from_str(&b).map_err(|e| format!("complete: {e}"))?;
+            let v: Value = match self.backend {
+                HttpBackend::Isahc => {
+                    let builder = self.apply_headers(
+                        isahc::Request::builder()
+                            .method("POST")
+                            .uri(&url)
+                            .header("content-type", "application/json"),
+                        kind,
+                    );
+                    let req = builder.body(body.to_string()).map_err(|e| format!("complete: {e}"))?;
+                    let resp = self.http.send_async(req).await.map_err(http_error)?;
+                    let status = resp.status();
+                    if !status.is_success() {
+                        let code = status.as_u16();
+                        let mut b = String::new();
+                        let _ = resp.into_body().read_to_string(&mut b).await;
+                        return Err(http_status_detail(code, &b));
+                    }
+                    let mut b = String::new();
+                    let _ = resp.into_body().read_to_string(&mut b).await;
+                    serde_json::from_str(&b).map_err(|e| format!("complete: {e}"))?
+                }
+                HttpBackend::Ureq => {
+                    // One blocking round trip on a worker thread; the whole
+                    // body arrives at once (no streaming here by design).
+                    let agent = self.ureq_agent.clone();
+                    let url = url.clone();
+                    let headers = self.request_headers(kind);
+                    let body_str = body.to_string();
+                    let txt = smol::unblock(move || {
+                        let mut req = agent.post(&url);
+                        for (k, v) in &headers {
+                            req = req.set(k, v);
+                        }
+                        match req.set("content-type", "application/json").send_string(&body_str) {
+                            Ok(resp) => resp.into_string().map_err(|e| format!("complete: {e}")),
+                            Err(e) => Err(ureq_error(e)),
+                        }
+                    })
+                    .await?;
+                    serde_json::from_str(&txt).map_err(|e| format!("complete: {e}"))?
+                }
+            };
             let raw = match kind {
                 ApiKind::Anthropic => v
                     .pointer("/content/0/text")
@@ -509,41 +612,86 @@ impl Client {
                 return Err("request cancelled".to_string());
             }
             let send_start = Instant::now();
-            // Build the request (isahc async; JSON body serialised directly).
-            // The shared client's sockets are unbounded: reads are bounded by
-            // the streaming stall watchdog, not a per-attempt socket timeout.
-            let builder = self.apply_headers(
-                isahc::Request::builder()
-                    .method("POST")
-                    .uri(&url)
-                    .header("content-type", "application/json"),
-                kind,
-            );
-            let req = match builder.body(body.to_string()) {
-                Ok(r) => r,
-                Err(e) => return Err(format!("http body: {e}")),
-            };
+            // Build the request (JSON body serialised directly). The
+            // shared isahc sockets are unbounded: reads are bounded by the
+            // streaming stall watchdog, not a per-attempt socket timeout.
             // Race the connect/status-line against the cancel channel so a cancel
             // pressed while still waiting on the socket is honoured instantly:
             // the smol reactor wakes the moment `cancel_tx` fires, no polling.
+            // Both backends converge here: a boxed async buffered reader the
+            // shared SSE parsers consume, so transport never leaks downstream.
             enum ConnectOutcome {
-                Resp(isahc::Response<isahc::AsyncBody>),
+                Body(Pin<Box<dyn AsyncBufRead + Unpin + Send>>),
                 Cancelled,
                 Err(String),
             }
-            let outcome = future::or(
-                async {
-                    match self.http.send_async(req).await {
-                        Ok(r) => ConnectOutcome::Resp(r),
-                        Err(e) => ConnectOutcome::Err(http_error(e)),
-                    }
-                },
-                async {
-                    let _ = cancel_rx.recv().await;
-                    ConnectOutcome::Cancelled
-                },
-            )
-            .await;
+            let outcome = match self.backend {
+                HttpBackend::Isahc => {
+                    let builder = self.apply_headers(
+                        isahc::Request::builder()
+                            .method("POST")
+                            .uri(&url)
+                            .header("content-type", "application/json"),
+                        kind,
+                    );
+                    let req = match builder.body(body.to_string()) {
+                        Ok(r) => r,
+                        Err(e) => return Err(format!("http body: {e}")),
+                    };
+                    future::or(
+                        async {
+                            match self.http.send_async(req).await {
+                                Ok(r) => {
+                                    if !r.status().is_success() {
+                                        let code = r.status().as_u16();
+                                        let mut body_txt = String::new();
+                                        let _ = r.into_body().read_to_string(&mut body_txt).await;
+                                        ConnectOutcome::Err(http_status_detail(code, &body_txt))
+                                    } else {
+                                        let reader: Pin<Box<dyn AsyncBufRead + Unpin + Send>> =
+                                            Box::pin(smol::io::BufReader::new(Box::pin(r.into_body())));
+                                        ConnectOutcome::Body(reader)
+                                    }
+                                }
+                                Err(e) => ConnectOutcome::Err(http_error(e)),
+                            }
+                        },
+                        async {
+                            let _ = cancel_rx.recv().await;
+                            ConnectOutcome::Cancelled
+                        },
+                    )
+                    .await
+                }
+                HttpBackend::Ureq => {
+                    // Blocking client on a worker thread; the pump thread
+                    // behind the channel feeds the same async parsers. A lost
+                    // connect race detaches cleanly: the receiver is dropped
+                    // and the pump's bounded send fails fast.
+                    let agent = self.ureq_agent.clone();
+                    let url = url.clone();
+                    let headers = self.request_headers(kind);
+                    let body_str = body.to_string();
+                    future::or(
+                        async {
+                            match smol::unblock(move || ureq_send(&agent, &url, &headers, &body_str)).await
+                            {
+                                Ok(pump) => {
+                                    let reader: Pin<Box<dyn AsyncBufRead + Unpin + Send>> =
+                                        Box::pin(pump);
+                                    ConnectOutcome::Body(reader)
+                                }
+                                Err(e) => ConnectOutcome::Err(e),
+                            }
+                        },
+                        async {
+                            let _ = cancel_rx.recv().await;
+                            ConnectOutcome::Cancelled
+                        },
+                    )
+                    .await
+                }
+            };
             // All three failure sources — a transport error, a non-2xx
             // status (isahc returns Ok for any HTTP status), or a stream
             // parse failure — fold into the attempt `result` below so every
@@ -558,13 +706,7 @@ impl Client {
             let result: Result<(Message, Usage), String> = match outcome {
                 ConnectOutcome::Cancelled => return Err("request cancelled".to_string()),
                 ConnectOutcome::Err(e) => Err(e),
-                ConnectOutcome::Resp(r) => if !r.status().is_success() {
-                    let code = r.status().as_u16();
-                    let mut body_txt = String::new();
-                    let _ = r.into_body().read_to_string(&mut body_txt).await;
-                    Err(http_status_detail(code, &body_txt))
-                } else {
-                    let mut reader = smol::io::BufReader::new(Box::pin(r.into_body()));
+                ConnectOutcome::Body(mut reader) => {
                     // Phase timing for PIR_DEBUG: stamp the first reasoning
                     // and first text token instants (relative to this
                     // attempt's send), distinguishing "thinking dribbled"
@@ -1189,6 +1331,160 @@ pub(crate) fn http_status_detail(code: u16, body: &str) -> String {
 
 fn http_error(e: isahc::Error) -> String {
     e.to_string()
+}
+
+/// Map a `ureq` failure to the same strings the isahc path produces, so
+/// retries, stall detection, and REPL messages behave identically whichever
+/// backend served the attempt. Transport Display already contains timeout
+/// wording ("timed out") that `is_timeout` matches for fast retries.
+fn ureq_error(e: ureq::Error) -> String {
+    match e {
+        ureq::Error::Status(code, resp) => {
+            let mut txt = String::new();
+            let _ = resp.into_reader().read_to_string(&mut txt);
+            http_status_detail(code, &txt)
+        }
+        e => e.to_string(),
+    }
+}
+
+/// `AsyncBufRead` over a background thread pumping a blocking (ureq) body.
+/// Chunks travel over a bounded channel (backpressure included); a transport
+/// error is sticky and surfaces at EOF, so a mid-stream cut is never
+/// mistaken for a clean end the way a bare channel close would be.
+struct ChannelBody {
+    rx: Pin<Box<smol::channel::Receiver<std::io::Result<Vec<u8>>>>>,
+    buf: Vec<u8>,
+    pos: usize,
+    failed: Option<String>,
+}
+
+impl ChannelBody {
+    /// Spawn the pump thread for `reader` (a blocking ureq response body)
+    /// and return the async adapter. The thread exits when the body ends,
+    /// errors, or the receiver is dropped (a bounded send then fails fast).
+    fn pump<R: std::io::Read + Send + 'static>(reader: R) -> Self {
+        let (tx, rx) = smol::channel::bounded::<std::io::Result<Vec<u8>>>(8);
+        std::thread::spawn(move || {
+            let mut reader = reader;
+            let mut chunk = vec![0u8; 8192];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send_blocking(Ok(chunk[..n].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send_blocking(Err(e));
+                        break;
+                    }
+                }
+            }
+        });
+        ChannelBody { rx: Box::pin(rx), buf: Vec::new(), pos: 0, failed: None }
+    }
+
+    /// Fill `buf` from the channel; `Ok(true)` means bytes are available.
+    fn poll_fill(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
+        use smol::stream::Stream as _;
+        if self.pos < self.buf.len() {
+            return Poll::Ready(Ok(true));
+        }
+        match self.rx.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                self.buf = chunk;
+                self.pos = 0;
+                Poll::Ready(Ok(true))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                self.failed = Some(e.to_string());
+                Poll::Ready(Ok(false))
+            }
+            Poll::Ready(None) => Poll::Ready(Ok(false)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl smol::io::AsyncRead for ChannelBody {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        out: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.failed.is_some() {
+            let msg = self.failed.clone().unwrap_or_default();
+            return Poll::Ready(Err(std::io::Error::other(msg)));
+        }
+        match self.poll_fill(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Ok(false)) => match self.failed.take() {
+                Some(msg) => Poll::Ready(Err(std::io::Error::other(msg))),
+                None => Poll::Ready(Ok(0)),
+            },
+            Poll::Ready(Ok(true)) => {
+                let n = (self.buf.len() - self.pos).min(out.len());
+                out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+                self.pos += n;
+                if self.pos >= self.buf.len() {
+                    self.buf.clear();
+                    self.pos = 0;
+                }
+                Poll::Ready(Ok(n))
+            }
+        }
+    }
+}
+
+impl smol::io::AsyncBufRead for ChannelBody {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<&[u8]>> {
+        let this = self.get_mut();
+        match this.poll_fill(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Ok(_)) => {
+                if this.pos < this.buf.len() {
+                    Poll::Ready(Ok(&this.buf[this.pos..]))
+                } else if let Some(msg) = this.failed.take() {
+                    Poll::Ready(Err(std::io::Error::other(msg)))
+                } else {
+                    Poll::Ready(Ok(&[]))
+                }
+            }
+        }
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        let this = self.get_mut();
+        this.pos = (this.pos + amt).min(this.buf.len());
+        if this.pos >= this.buf.len() {
+            this.buf.clear();
+            this.pos = 0;
+        }
+    }
+}
+
+/// Blocking ureq POST for the `Ureq` backend. Runs inside `smol::unblock`
+/// (never on the executor). On 2xx spawns the pump thread and returns its
+/// channel; anything else becomes the same strings the isahc path produces.
+fn ureq_send(
+    agent: &ureq::Agent,
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+) -> Result<ChannelBody, String> {
+    let mut req = agent.post(url);
+    for (k, v) in headers {
+        req = req.set(k, v);
+    }
+    let req = req.set("content-type", "application/json");
+    match req.send_string(body) {
+        Ok(resp) => Ok(ChannelBody::pump(resp.into_reader())),
+        Err(e) => Err(ureq_error(e)),
+    }
 }
 
 /// True when an error represents a network timeout (read/connect). Used to
@@ -2586,6 +2882,195 @@ mod tests {
         assert_eq!(retry_backoff(2, false), Duration::from_secs(120));
         assert_eq!(retry_backoff(5, false), Duration::from_secs(600)); // hits cap
         assert_eq!(retry_backoff(100, false), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn http_backend_parse() {
+        assert_eq!(HttpBackend::parse("isahc"), Some(HttpBackend::Isahc));
+        assert_eq!(HttpBackend::parse("ureq"), Some(HttpBackend::Ureq));
+        assert_eq!(HttpBackend::parse(" UREQ "), Some(HttpBackend::Ureq));
+        assert_eq!(HttpBackend::parse("curl"), None);
+        assert_eq!(HttpBackend::parse(""), None);
+        assert_eq!(HttpBackend::default(), HttpBackend::Isahc);
+        assert_eq!(HttpBackend::Isahc.name(), "isahc");
+        assert_eq!(HttpBackend::Ureq.name(), "ureq");
+    }
+
+    #[test]
+    fn request_headers_single_source() {
+        // Both transports apply this vec: auth must never drift between them.
+        let client = Client::new(ApiKind::OpenAi, "http://x", "k".to_string());
+        let h = client.request_headers(ApiKind::OpenAi);
+        assert!(
+            h.contains(&("user-agent".to_string(), format!("pir/{}", env!("CARGO_PKG_VERSION")))),
+            "user-agent present: {h:?}"
+        );
+        assert!(h.contains(&("Authorization".to_string(), "Bearer k".to_string())), "bearer: {h:?}");
+        let a = Client::new(ApiKind::Anthropic, "http://x", "k".to_string());
+        let h = a.request_headers(ApiKind::Anthropic);
+        assert!(h.contains(&("x-api-key".to_string(), "k".to_string())), "api key: {h:?}");
+        assert!(
+            h.contains(&("anthropic-version".to_string(), "2023-06-01".to_string())),
+            "version: {h:?}"
+        );
+    }
+
+    #[test]
+    fn channel_body_streams_then_eofs() {
+        let (tx, rx) = smol::channel::bounded::<std::io::Result<Vec<u8>>>(8);
+        tx.send_blocking(Ok(b"hel".to_vec())).unwrap();
+        tx.send_blocking(Ok(b"lo".to_vec())).unwrap();
+        drop(tx);
+        let text = smol::block_on(async {
+            use smol::io::AsyncReadExt as _;
+            let mut body = ChannelBody { rx: Box::pin(rx), buf: Vec::new(), pos: 0, failed: None };
+            let mut s = String::new();
+            body.read_to_string(&mut s).await.unwrap();
+            s
+        });
+        assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn channel_body_surfaces_midstream_error() {
+        // Bytes first, then a transport failure: the partial read succeeds,
+        // the tail reports the error (never a silent clean EOF).
+        let (tx, rx) = smol::channel::bounded::<std::io::Result<Vec<u8>>>(8);
+        tx.send_blocking(Ok(b"partial".to_vec())).unwrap();
+        tx.send_blocking(Err(std::io::Error::other("boom"))).unwrap();
+        drop(tx);
+        smol::block_on(async {
+            use smol::io::AsyncReadExt as _;
+            let mut body = ChannelBody { rx: Box::pin(rx), buf: Vec::new(), pos: 0, failed: None };
+            let mut head = [0u8; 7];
+            body.read_exact(&mut head).await.unwrap();
+            assert_eq!(&head, b"partial");
+            let mut tail = String::new();
+            let err = body.read_to_string(&mut tail).await.unwrap_err().to_string();
+            assert!(err.contains("boom"), "sticky error surfaces: {err}");
+        });
+    }
+
+    #[test]
+    fn ureq_backend_streams_mock_sse() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        let _srv = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            use std::io::Write as _;
+            let body = "{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi-ureq\"}}]}\n\n";
+            let frame = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {body}data: [DONE]\n\n");
+            let _ = sock.write_all(frame.as_bytes());
+            let _ = sock.flush();
+            thread::sleep(Duration::from_millis(200));
+        });
+        let mut client = Client::new(ApiKind::OpenAi, &format!("http://{addr}"), "test-key".to_string());
+        client.set_backend(HttpBackend::Ureq);
+        let mut text = String::new();
+        let res = client.chat(
+            "test-model",
+            16,
+            "sys",
+            &[Message { role: Role::User, blocks: vec![Block::Text("hi".into())] }],
+            &[],
+            &mut |t: &str| text.push_str(t),
+            crate::config::ThinkingLevel::Off,
+            0,
+            &mut |_s: &str| {},
+            None,
+            None,
+            true,
+            &mut |_w: &RetryWait| {},
+            &mut |_n: &str| {},
+        );
+        assert!(res.is_ok(), "ureq backend must stream, got {res:?}");
+        assert!(text.contains("hi-ureq"), "expected streamed text, got {text:?}");
+    }
+
+    #[test]
+    fn ureq_backend_maps_error_status() {
+        // HTTP 400 is not retryable: single attempt, no env mutation needed.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        let _srv = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            use std::io::Write as _;
+            let body = "{\"error\":{\"message\":\"bad key\"}}";
+            let frame = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(frame.as_bytes());
+            let _ = sock.flush();
+            thread::sleep(Duration::from_millis(200));
+        });
+        let mut client = Client::new(ApiKind::OpenAi, &format!("http://{addr}"), "test-key".to_string());
+        client.set_backend(HttpBackend::Ureq);
+        let mut text = String::new();
+        let res = client.chat(
+            "test-model",
+            16,
+            "sys",
+            &[Message { role: Role::User, blocks: vec![Block::Text("hi".into())] }],
+            &[],
+            &mut |t: &str| text.push_str(t),
+            crate::config::ThinkingLevel::Off,
+            0,
+            &mut |_s: &str| {},
+            None,
+            None,
+            true,
+            &mut |_w: &RetryWait| {},
+            &mut |_n: &str| {},
+        );
+        let err = res.unwrap_err();
+        assert!(err.contains("HTTP 400"), "status mapped: {err}");
+        assert!(err.contains("bad key"), "API message kept: {err}");
+    }
+
+    #[test]
+    fn ureq_backend_cancel_is_prompt() {
+        // Server holds the connection open; the flag flips mid-connect and
+        // the turn must abort promptly, not hang on the socket.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        let _srv = thread::spawn(move || {
+            let (_sock, _) = listener.accept().expect("accept");
+            thread::sleep(Duration::from_secs(30));
+        });
+        let mut client = Client::new(ApiKind::OpenAi, &format!("http://{addr}"), "test-key".to_string());
+        client.set_backend(HttpBackend::Ureq);
+        let cancel = Arc::new(AtomicBool::new(false));
+        client.set_cancel(cancel.clone());
+        let cancel2 = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(250));
+            cancel2.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let res = client.chat(
+            "test-model",
+            16,
+            "sys",
+            &[Message { role: Role::User, blocks: vec![Block::Text("hi".into())] }],
+            &[],
+            &mut |_s: &str| {},
+            crate::config::ThinkingLevel::Off,
+            0,
+            &mut |_s: &str| {},
+            None,
+            None,
+            true,
+            &mut |_w: &RetryWait| {},
+            &mut |_n: &str| {},
+        );
+        let elapsed = started.elapsed();
+        assert!(res.is_err(), "expected cancellation error, got {res:?}");
+        assert_eq!(res.unwrap_err(), "request cancelled");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "ureq cancel took {elapsed:?}, must be prompt"
+        );
     }
 
     #[test]
