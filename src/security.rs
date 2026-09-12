@@ -1320,6 +1320,13 @@ pub fn save_diagnostic(target: &std::path::Path) -> String {
         overlay::project_quarantine_engaged(),
     )
 }
+
+/// Non-unix identity diagnostic: no uid/userns/container view exists here,
+/// so there is nothing to append to a save failure.
+#[cfg(not(unix))]
+pub fn save_diagnostic(_target: &std::path::Path) -> String {
+    "no unix identity/container diagnostics on this platform".to_string()
+}
 /// `~/.pi/agent/security.toml` (the file [`load_policy`] reads at startup) in
 /// the same flat `key = value` format. Written from the `/menu` security
 /// editor; takes effect for new sessions (the live context keeps its snapshot).
@@ -1811,6 +1818,44 @@ pub mod privilege;
 /// (overlayfs / mount namespaces); not compiled on Windows yet.
 #[cfg(unix)]
 pub mod overlay;
+
+/// Windows stub for the overlayfs write-quarantine: mount namespaces don't
+/// exist here, so no overlay is ever engaged. Inert-but-truthful shims keep
+/// the cross-platform policy UI compiling; every predicate reports the real
+/// state (inactive), and teardown is a no-op success.
+#[cfg(not(unix))]
+pub mod overlay {
+    pub struct Quarantine;
+    impl Quarantine {
+        pub fn staged(&self) -> Vec<std::path::PathBuf> {
+            Vec::new()
+        }
+    }
+    pub fn container_engaged() -> bool {
+        false
+    }
+    pub fn fullroot_engaged() -> bool {
+        false
+    }
+    pub fn system_quarantine_engaged() -> bool {
+        false
+    }
+    pub fn project_quarantine_engaged() -> bool {
+        false
+    }
+    pub fn with_active<T>(_: impl FnOnce(&Quarantine) -> T) -> Option<T> {
+        None
+    }
+    pub fn teardown_active() -> Result<(), String> {
+        Ok(())
+    }
+    pub fn project_active_staged_count() -> usize {
+        0
+    }
+    pub fn project_active_teardown() -> Result<(), String> {
+        Ok(())
+    }
+}
 
 /// Cross-platform, truthful summary of whether a physical write-quarantine
 /// backend is engaged right now. Returns `(engaged: bool, backend: &str)`.

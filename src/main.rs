@@ -1374,6 +1374,34 @@ fn main() {
                     term::raw::enable_raw();
                 }
                 term::raw::RawInput::None => { /* turn finished / no input; re-check loop */ }
+                // Windows byte-path outcomes (unreachable via wait_input,
+                // which accumulates keystrokes into its buffer): preserve
+                // typed text, ignore the rest, never lose a keystroke.
+                #[cfg(not(unix))]
+                term::raw::RawInput::Char(c) => {
+                    input_buf.push(c);
+                    if let Ok(mut g) = typeahead.lock() {
+                        g.clear();
+                        g.push_str(&input_buf);
+                    }
+                }
+                #[cfg(not(unix))]
+                term::raw::RawInput::Enter
+                | term::raw::RawInput::Tab
+                | term::raw::RawInput::Up
+                | term::raw::RawInput::Down
+                | term::raw::RawInput::Left
+                | term::raw::RawInput::Right
+                | term::raw::RawInput::Resize
+                | term::raw::RawInput::Other(_) => {}
+                #[cfg(not(unix))]
+                term::raw::RawInput::Paste(s) => {
+                    input_buf.push_str(&s);
+                    if let Ok(mut g) = typeahead.lock() {
+                        g.clear();
+                        g.push_str(&input_buf);
+                    }
+                }
             }
             continue;
         }

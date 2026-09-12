@@ -53,6 +53,13 @@ crossterm = "0.28"
 rustxwidgets = { path = "rustxWidgets/rustxwidgets", version = "0.1.0", default-features = false, optional = true }
 synoptic = "2"                                        # regex-based syntax highlighter for fenced code blocks (unicode-aware)
 
+# Static OpenSSL everywhere except Windows (schannel there): portable
+# binaries must not link the host libssl (AlmaLinux 8 ships 1.1, Ubuntu
+# 24.04 ships 3.x). The `vendored` feature builds OpenSSL from source
+# (openssl-src) once per target; the release binaries carry their own TLS.
+[target.'cfg(not(windows))'.dependencies]
+openssl-sys = { version = "0.9", features = ["vendored"] }
+
 [features]
 # Full-screen TUI REPL: a real layout engine (no hand-rolled ANSI block)
 # with a conversation pane + footer pane (thinking + live draft prompt) and

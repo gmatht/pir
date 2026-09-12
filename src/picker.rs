@@ -456,6 +456,27 @@ fn translate_result(res: &term::raw::RawInput, buf: &str) -> Key {
             let _ = buf;
             Key::None
         }
+        // Windows byte-path outcomes (unreachable via wait_input, which
+        // accumulates into its buffer): map the keypresses the picker
+        // understands, ignore the rest.
+        #[cfg(not(unix))]
+        RawInput::Char(c) => Key::Char(*c),
+        #[cfg(not(unix))]
+        RawInput::Enter => Key::Enter,
+        #[cfg(not(unix))]
+        RawInput::Tab
+        | RawInput::Up
+        | RawInput::Down
+        | RawInput::Left
+        | RawInput::Right
+        | RawInput::Resize
+        | RawInput::Other(_) => Key::None,
+        #[cfg(not(unix))]
+        RawInput::Paste(s) => s
+            .chars()
+            .find(|c| !c.is_whitespace())
+            .map(Key::Char)
+            .unwrap_or(Key::None),
     }
 }
 

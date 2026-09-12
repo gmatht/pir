@@ -100,7 +100,7 @@ pub mod impls {
             }
             // Close the clipboard on any return path (including early returns).
             let _guard = ScopeGuardClose;
-            let h = GetClipboardData(CF_UNICODETEXT);
+            let h = GetClipboardData(CF_UNICODETEXT.into());
             if h.is_null() {
                 return String::new();
             }

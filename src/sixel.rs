@@ -195,6 +195,7 @@ fn query_terminal(seq: &str) -> Option<String> {
         }
         #[cfg(windows)]
         {
+            use std::io::Read;
             use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
             use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
             use windows_sys::Win32::System::Threading::WaitForSingleObject;
