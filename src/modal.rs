@@ -889,18 +889,28 @@ fn state_color(state: &str) -> String {
 
 /// Show a thinking-level picker on the alternate screen and return the chosen
 /// level. Returns `None` if not a tty or the user cancels.
-pub fn thinking_picker(current: &str, kind: Option<ApiKind>, ctx: u64) -> Option<String> {
+pub fn thinking_picker(
+    current: &str,
+    kind: Option<ApiKind>,
+    ctx: u64,
+    model: Option<&crate::config::Model>,
+) -> Option<String> {
     let _modal = Modal::enter()?;
     // Only offer levels that actually take effect for this provider + context
     // window. Showing `minimal` on an OpenAI model (no reasoning_effort) or an
     // under-budget Anthropic level would let the user pick something that is
     // silently ignored. `off` is always offered as an explicit opt-out.
+    // When catalog metadata is available, additionally honor the model's
+    // `thinkingLevelMap` (pi `getSupportedThinkingLevels`): explicitly-null
+    // levels are hidden, and `xhigh`/`max` require an explicit entry — e.g.
+    // opencode-go's deepseek-v4.1-flash only offers off/high/max.
     let all: Vec<crate::config::ThinkingLevel> = [
         "off", "minimal", "low", "medium", "high", "xhigh", "max",
     ]
     .iter()
     .filter_map(|l| crate::config::ThinkingLevel::parse(l))
     .filter(|l| l.effective(kind, ctx))
+    .filter(|l| model.map(|m| m.supported_levels().contains(l)).unwrap_or(true))
     .collect();
     let levels: Vec<&'static str> = all.iter().map(|l| l.as_str()).collect();
     let mut selected = levels.iter().position(|l| *l == current).unwrap_or(0);

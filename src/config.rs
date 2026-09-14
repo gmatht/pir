@@ -50,6 +50,31 @@ pub struct Model {
     #[serde(default)]
     #[serde(skip_deserializing)]
     pub no_reasoning_effort: bool,
+    /// pi `reasoning`: whether the model supports extended thinking. Gates all
+    /// thinking controls — when false, pir sends no `thinking`,
+    /// `reasoning_effort`, or `reasoning` params at all (pi sends nothing for
+    /// non-reasoning models either). Defaults to false (pi's default); the
+    /// catalog sets it true for reasoning models. Parsed from the top-level
+    /// `reasoning` key in `models-store.json` (see `load_providers`).
+    #[serde(default)]
+    pub reasoning: bool,
+    /// pi `compat.thinkingFormat` (`deepseek`, `openrouter`, `qwen`,
+    /// `qwen-chat-template`, `openai`, …). `None` means the default
+    /// OpenAI-style handling (legacy pir behavior: raw `reasoning_effort`).
+    /// Model-level value wins; provider-level `compat` is the fallback.
+    #[serde(default)]
+    pub thinking_format: Option<String>,
+    /// pi `compat.supportsReasoningEffort`. `None` means true (send the mapped
+    /// effort). Model-level wins; provider-level `compat` is the fallback.
+    #[serde(default)]
+    pub supports_reasoning_effort: Option<bool>,
+    /// pi `thinkingLevelMap`: pi level name (`off`, `minimal`, `low`,
+    /// `medium`, `high`, `xhigh`, `max`) → provider value, or `None` when the
+    /// level is explicitly unsupported/hidden (`null` in JSON). A missing key
+    /// falls back to pir's default effort names. Parsed from the top-level
+    /// `thinkingLevelMap` object in `models-store.json`.
+    #[serde(default)]
+    pub thinking_level_map: std::collections::BTreeMap<String, Option<String>>,
     /// Optional per-1k-token price (USD) for input/output, used by the
     /// cost/price tracking in `Usage::cost`. Set via `set_price` after loading
     /// from a user-supplied price map; not read from the provider config.
@@ -63,6 +88,99 @@ impl Model {
     pub fn with_price(mut self, input: f64, output: f64) -> Self {
         self.price_per_1k = Some((input, output));
         self
+    }
+
+    /// pi `compat.thinkingFormat`, defaulting to OpenAI-style handling.
+    pub fn thinking_format_name(&self) -> &str {
+        self.thinking_format.as_deref().unwrap_or("openai")
+    }
+
+    /// pi `compat.supportsReasoningEffort`, defaulting to true.
+    pub fn supports_effort(&self) -> bool {
+        self.supports_reasoning_effort.unwrap_or(true)
+    }
+
+    /// Whether `thinkingLevelMap` explicitly hides the `off` level (`off` is
+    /// `null`). Only explicit null skips the disable toggle — a missing `off`
+    /// key still sends it (pi's `thinkingLevelMap?.off !== null` check).
+    pub fn off_is_null(&self) -> bool {
+        matches!(self.thinking_level_map.get("off"), Some(None))
+    }
+
+    /// Map a thinking level to the provider effort string, honoring
+    /// `thinkingLevelMap`: an explicit string wins, otherwise pir's default
+    /// effort names apply (`ThinkingLevel::oai_effort`). `Off` only maps when
+    /// `off` is an explicit string (e.g. `"none"`); explicit-null levels fall
+    /// back to the defaults too (the picker hides them, so this path only
+    /// triggers for persisted/forced selections — same fallback pi's `??`
+    /// applies, but with pir's server-compatible collapsed names instead of
+    /// the raw level). Pure mapping: the caller gates on `reasoning`.
+    pub fn mapped_effort(&self, level: ThinkingLevel) -> Option<String> {
+        if level == ThinkingLevel::Off {
+            return self.thinking_level_map.get("off").and_then(|v| v.clone());
+        }
+        if let Some(Some(s)) = self.thinking_level_map.get(level.as_str()) {
+            return Some(s.clone());
+        }
+        level.oai_effort().map(str::to_string)
+    }
+
+    /// pi `getSupportedThinkingLevels` (pi-ai `models.js`): non-reasoning
+    /// models offer only `off`. Otherwise `off`/`minimal`/`low`/`medium`/`high`
+    /// show unless explicitly null, while `xhigh`/`max` additionally require
+    /// an explicit string entry (a missing extended key means hidden).
+    pub fn supported_levels(&self) -> Vec<ThinkingLevel> {
+        if !self.reasoning {
+            return vec![ThinkingLevel::Off];
+        }
+        const ORDER: [ThinkingLevel; 7] = [
+            ThinkingLevel::Off,
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::XHigh,
+            ThinkingLevel::Max,
+        ];
+        ORDER
+            .into_iter()
+            .filter(|l| match self.thinking_level_map.get(l.as_str()) {
+                Some(None) => false, // explicit null → hidden
+                Some(Some(_)) => true, // explicit string → shown
+                // Missing: standard levels shown, extended levels hidden.
+                None => !matches!(l, ThinkingLevel::XHigh | ThinkingLevel::Max),
+            })
+            .collect()
+    }
+
+    /// pi `clampThinkingLevel`: the nearest available level, preferring
+    /// upward (toward stronger thinking) then downward.
+    pub fn clamp_thinking(&self, level: ThinkingLevel) -> ThinkingLevel {
+        let avail = self.supported_levels();
+        if avail.contains(&level) {
+            return level;
+        }
+        const ORDER: [ThinkingLevel; 7] = [
+            ThinkingLevel::Off,
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::XHigh,
+            ThinkingLevel::Max,
+        ];
+        let idx = ORDER.iter().position(|l| *l == level).unwrap_or(0);
+        for candidate in ORDER.iter().skip(idx) {
+            if avail.contains(candidate) {
+                return *candidate;
+            }
+        }
+        for candidate in ORDER[..idx].iter().rev() {
+            if avail.contains(candidate) {
+                return *candidate;
+            }
+        }
+        ThinkingLevel::Off
     }
 }
 
@@ -267,18 +385,117 @@ pub fn path_from_string(s: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Parse pi `thinkingLevelMap` (`{ level: string|null }`, also accepted as
+/// `thinking_level_map`) from a model value. Keys are lowercased; explicit
+/// `null` becomes `None` (hidden level), strings become `Some(value)`, and
+/// non-string values are ignored. Missing/invalid shapes yield an empty map
+/// (no constraints — legacy pir behavior).
+fn parse_thinking_map(mv: &Value) -> std::collections::BTreeMap<String, Option<String>> {
+    let mut map = std::collections::BTreeMap::new();
+    let obj = mv
+        .get("thinkingLevelMap")
+        .or(mv.get("thinking_level_map"))
+        .and_then(Value::as_object);
+    if let Some(obj) = obj {
+        for (k, v) in obj {
+            let key = k.to_lowercase();
+            if v.is_null() {
+                map.insert(key, None);
+            } else if let Some(s) = v.as_str() {
+                map.insert(key, Some(s.to_string()));
+            }
+        }
+    }
+    map
+}
+
+/// Parse a pi `compat` string key, preferring the model value and falling
+/// back to the provider value (pi merges provider-level `compat` under
+/// model-level `compat`). Accepts both camelCase and snake_case spellings.
+fn parse_compat_str(mv: &Value, pval: &Value, camel: &str, snake: &str) -> Option<String> {
+    mv.get("compat")
+        .and_then(|c| c.get(camel).or(c.get(snake)))
+        .or(pval.get("compat").and_then(|c| c.get(camel).or(c.get(snake))))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Parse a pi `compat` bool key with the same model-over-provider precedence.
+fn parse_compat_bool(mv: &Value, pval: &Value, camel: &str, snake: &str) -> Option<bool> {
+    mv.get("compat")
+        .and_then(|c| c.get(camel).or(c.get(snake)))
+        .or(pval.get("compat").and_then(|c| c.get(camel).or(c.get(snake))))
+        .and_then(Value::as_bool)
+}
+
+/// Parse pi `reasoning` (top-level model key). Missing means false — pi's
+/// documented default; only catalog-declared reasoning models get thinking
+/// controls and extended picker levels.
+fn parse_reasoning(mv: &Value) -> bool {
+    mv.get("reasoning").and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// Process-wide snapshot of the catalog as read by the *invoking* user, before
+/// the privilege drop. `main` seeds this at startup (see `seed_catalog`).
+///
+/// Why this exists: `become_user` drops pir to the sandbox user (`ai_X`) and
+/// rewrites `HOME`, but the catalog itself lives in the invoking user's `~/.pi`
+/// and is typically mode `0600` — the dropped identity cannot read it. pir
+/// loads providers pre-drop for exactly that reason, but later code
+/// (`Agent::new`'s cache, the mid-session `/provider` reload, the titler) calls
+/// `load_providers` again *after* the drop, where the read fails EACCES. That
+/// read is not an agent action, so it must not be subject to the drop; serving
+/// the pre-drop snapshot keeps model switching working instead of silently
+/// degrading to the (much smaller) sandbox store or the auth fallback.
+static INVOKER_CATALOG: std::sync::OnceLock<Vec<Provider>> = std::sync::OnceLock::new();
+
+/// Snapshot the catalog read as the invoking user, for post-drop reuse. Called
+/// by `main` right after the pre-drop `load_providers`. No-op when unset.
+pub fn seed_catalog(providers: &[Provider]) {
+    if !providers.is_empty() {
+        let _ = INVOKER_CATALOG.set(providers.to_vec());
+    }
+}
+
+/// The pre-drop catalog snapshot, if `main` seeded one.
+pub fn invoker_catalog() -> Option<&'static Vec<Provider>> {
+    INVOKER_CATALOG.get()
+}
+
 pub fn load_providers() -> Result<Vec<Provider>, String> {
+    match load_providers_uncached() {
+        Ok(p) if !p.is_empty() => Ok(p),
+        // The read failed or came back empty *after* the drop (or otherwise):
+        // prefer the catalog the invoking user could read. This is the
+        // difference between "model switch works" and "no model matches".
+        _ => match invoker_catalog() {
+            Some(p) if !p.is_empty() => Ok(p.clone()),
+            _ => load_providers_uncached(),
+        },
+    }
+}
+
+fn load_providers_uncached() -> Result<Vec<Provider>, String> {
     let path = pi_dir().join("agent").join("models-store.json");
-    
+
+    // When a pre-drop snapshot exists, an unreadable store is expected (the
+    // dropped sandbox identity can't read the invoking user's 0600 file) and
+    // `load_providers` will serve the snapshot — so stay quiet instead of
+    // printing a misleading "Falling back" warning on every call.
+    let quiet = invoker_catalog().is_some();
     if !path.exists() {
-        eprintln!("! models-store.json not found. Falling back to auth.json");
+        if !quiet {
+            eprintln!("! models-store.json not found. Falling back to auth.json");
+        }
         return load_from_auth_fallback();
     }
 
     let raw = match fs::read_to_string(&path) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("! Cannot read models-store.json: {e}. Falling back");
+            if !quiet {
+                eprintln!("! Cannot read models-store.json: {e}. Falling back");
+            }
             return load_from_auth_fallback();
         }
     };
@@ -336,9 +553,18 @@ pub fn load_providers() -> Result<Vec<Provider>, String> {
                             name: mv.get("name").and_then(Value::as_str).map(String::from),
                             context: mv.get("context").or(mv.get("contextWindow")).and_then(Value::as_u64),
                             max_tokens: mv.get("maxTokens").or(mv.get("max_tokens")).and_then(Value::as_u64),
-                            api_override: None,
-                            url_override: None,
+                            // Per-model `api` (OpenCode Zen marks individual
+                            // models `openai-responses` while the provider is
+                            // `openai-completions`; see `model_api`).
+                            api_override: mv.get("api").and_then(Value::as_str).map(String::from),
+                            // Per-model `baseUrl` (Zen routes some models to a
+                            // different host than the provider default).
+                            url_override: mv.get("baseUrl").or(mv.get("base_url")).and_then(Value::as_str).map(String::from),
                             no_reasoning_effort: false,
+                            reasoning: parse_reasoning(mv),
+                            thinking_format: parse_compat_str(mv, pval, "thinkingFormat", "thinking_format"),
+                            supports_reasoning_effort: parse_compat_bool(mv, pval, "supportsReasoningEffort", "supports_reasoning_effort"),
+                            thinking_level_map: parse_thinking_map(mv),
                             price_per_1k: None,
                         });
                     }
@@ -357,9 +583,15 @@ pub fn load_providers() -> Result<Vec<Provider>, String> {
                         name: mv.get("name").and_then(Value::as_str).map(String::from),
                         context: mv.get("context").or(mv.get("contextWindow")).and_then(Value::as_u64),
                         max_tokens: mv.get("maxTokens").or(mv.get("max_tokens")).and_then(Value::as_u64),
-                        api_override: None,
-                        url_override: None,
+                        // Per-model `api` / `baseUrl` (see the array branch
+                        // above for why these are not hardcoded to None).
+                        api_override: mv.get("api").and_then(Value::as_str).map(String::from),
+                        url_override: mv.get("baseUrl").or(mv.get("base_url")).and_then(Value::as_str).map(String::from),
                         no_reasoning_effort: false,
+                        reasoning: parse_reasoning(mv),
+                        thinking_format: parse_compat_str(mv, pval, "thinkingFormat", "thinking_format"),
+                        supports_reasoning_effort: parse_compat_bool(mv, pval, "supportsReasoningEffort", "supports_reasoning_effort"),
+                        thinking_level_map: parse_thinking_map(mv),
                         price_per_1k: None,
                     });
                 }
@@ -409,6 +641,10 @@ fn maybe_add_fake_provider(providers: &mut Vec<Provider>) {
                 api_override: None,
                 url_override: None,
                 no_reasoning_effort: false,
+                reasoning: false,
+                thinking_format: None,
+                supports_reasoning_effort: None,
+                thinking_level_map: Default::default(),
                 price_per_1k: None,
             }],
         });
@@ -518,6 +754,10 @@ pub fn ollama_cloud_models() -> Vec<Model> {
             api_override: None,
             url_override: None,
             no_reasoning_effort: false,
+            reasoning: false,
+            thinking_format: None,
+            supports_reasoning_effort: None,
+            thinking_level_map: Default::default(),
             price_per_1k: None,
         })
         .collect()
@@ -618,6 +858,10 @@ fn load_from_auth_fallback() -> Result<Vec<Provider>, String> {
                                 api_override: None,
                                 url_override: None,
                                 no_reasoning_effort: false,
+                                reasoning: false,
+                                thinking_format: None,
+                                supports_reasoning_effort: None,
+                                thinking_level_map: Default::default(),
                                 price_per_1k: None,
                             }],
                         });
@@ -1473,6 +1717,10 @@ mod select_tests {
             api_override: None,
             url_override: None,
             no_reasoning_effort: false,
+            reasoning: false,
+            thinking_format: None,
+            supports_reasoning_effort: None,
+            thinking_level_map: Default::default(),
             price_per_1k: None,
         }
     }
@@ -1689,6 +1937,10 @@ mod worktree_settings_tests {
             api_override: Some(api.into()),
             url_override: None,
             no_reasoning_effort: false,
+            reasoning: false,
+            thinking_format: None,
+            supports_reasoning_effort: None,
+            thinking_level_map: Default::default(),
             context: None,
             max_tokens: None,
             price_per_1k: None,
@@ -1698,5 +1950,265 @@ mod worktree_settings_tests {
         assert_eq!(p.model_api(&mk("anthropic-messages")), Some(ApiKind::Anthropic));
         p.api = Some("openai-responses".into());
         assert_eq!(p.kind(), Some(ApiKind::OpenAiResponses));
+    }
+
+    /// `load_providers` must carry each model's own `api`/`baseUrl` into
+    /// `api_override`/`url_override`. Regression: both branches hardcoded
+    /// `api_override: None`, so a per-model `openai-responses` entry inherited
+    /// the provider-level `openai-completions` and pir POSTed a chat body
+    /// (`messages`/`max_tokens`) to `/responses` — the provider answered
+    /// `500 Internal server error` and the turn retried forever. This is the
+    /// exact `opencode-go` store shape that made muse-spark unreachable while
+    /// the catalog itself was fine.
+    #[test]
+    fn model_api_override_survives_store_load() {
+        let _env = TEST_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("pir_apiovr_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let agent = dir.join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        // Mirrors the live store: provider is openai-completions, the
+        // muse-spark entry overrides to openai-responses.
+        std::fs::write(
+            agent.join("models-store.json"),
+            serde_json::json!({
+                "providers": {
+                    "opencode-go": {
+                        "baseUrl": "https://opencode.ai/zen/go/v1",
+                        "apiKey": "k",
+                        "api": "openai-completions",
+                        "models": [
+                            { "id": "deepseek-v4-flash", "api": "openai-completions" },
+                            { "id": "muse-spark-1.3-contributor",
+                              "api": "openai-responses",
+                              "baseUrl": "https://opencode.ai/zen/go/v1",
+                              "reasoning": true },
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let old = std::env::var_os("PI_DIR");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PI_DIR", &dir); }
+        let providers = load_providers().expect("store must load");
+        match old {
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let p = providers
+            .iter()
+            .find(|p| p.pid() == "opencode-go")
+            .expect("opencode-go present");
+        let muse = p
+            .models
+            .iter()
+            .find(|m| m.id == "muse-spark-1.3-contributor")
+            .expect("muse model present");
+        assert_eq!(
+            muse.api_override.as_deref(),
+            Some("openai-responses"),
+            "per-model `api` must survive the load"
+        );
+        assert_eq!(
+            p.model_api(muse),
+            Some(ApiKind::OpenAiResponses),
+            "muse must route to /responses, not chat/completions"
+        );
+        assert_eq!(muse.url_override.as_deref(), Some("https://opencode.ai/zen/go/v1"));
+        // The sibling that does NOT override still inherits the provider API.
+        let flash = p.models.iter().find(|m| m.id == "deepseek-v4-flash").unwrap();
+        assert_eq!(p.model_api(flash), Some(ApiKind::OpenAi));
+    }
+
+    /// The pre-drop catalog snapshot must be served when a later (post-drop)
+    /// read can't reach the store — the `PI_DIR`-at-root-owned-store case,
+    /// where `become_user` has already dropped pir to `ai_X` and the invoker's
+    /// `0600` store is now EACCES. Without the snapshot the catalog silently
+    /// degrades to the auth fallback and model switching stops resolving.
+    #[test]
+    fn seeded_catalog_survives_unreadable_store() {
+        let _env = TEST_ENV_LOCK.lock().unwrap();
+        // A store path that cannot be read (a directory, not a file).
+        let dir = std::env::temp_dir().join(format!("pir_seed_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let agent = dir.join("agent");
+        std::fs::create_dir_all(agent.join("models-store.json")).unwrap();
+        let old = std::env::var_os("PI_DIR");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PI_DIR", &dir); }
+        // An unreadable store alone would fall back to auth (empty here).
+        let unseeded = load_providers().map(|p| p.len()).unwrap_or(0);
+        // Seed the snapshot the way `main` does, then confirm it is served
+        // even though the on-disk read still fails.
+        let seeded = vec![Provider {
+            id: Some("opencode-go".into()),
+            name: None,
+            base_url: Some("https://opencode.ai/zen/go/v1".into()),
+            api_key: Some("k".into()),
+            api: Some("openai-completions".into()),
+            models: vec![compat_model(None, &[])],
+        }];
+        seed_catalog(&seeded);
+        let got = load_providers().expect("snapshot must be served");
+        match old {
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            got.iter().filter(|p| p.pid() == "opencode-go").count(),
+            1,
+            "seeded catalog must survive an unreadable store (unseeded len was {unseeded})"
+        );
+        assert!(
+            invoker_catalog().is_some(),
+            "snapshot must remain available for the process lifetime"
+        );
+    }
+
+    /// Build a reasoning model with the given format + level map, mirroring a
+    /// `models-store.json` entry (e.g. opencode-go's deepseek-v4.1-flash).
+    fn compat_model(
+        format: Option<&str>,
+        map: &[(&str, Option<&str>)],
+    ) -> Model {
+        Model {
+            id: "m".into(),
+            name: None,
+            context: Some(1_000_000),
+            max_tokens: Some(384_000),
+            api_override: None,
+            url_override: None,
+            no_reasoning_effort: false,
+            reasoning: true,
+            thinking_format: format.map(str::to_string),
+            supports_reasoning_effort: None,
+            thinking_level_map: map
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.map(str::to_string)))
+                .collect(),
+            price_per_1k: None,
+        }
+    }
+
+    fn level_names(levels: &[ThinkingLevel]) -> Vec<&'static str> {
+        levels.iter().map(|l| l.as_str()).collect()
+    }
+
+    #[test]
+    fn thinking_map_parses_from_store_json() {
+        // The exact opencode-go deepseek-v4.1-flash shape: top-level
+        // `reasoning`, nested `compat.thinkingFormat`, `thinkingLevelMap`
+        // with nulls.
+        let mv: Value = serde_json::json!({
+            "id": "deepseek-v4.1-flash",
+            "reasoning": true,
+            "compat": { "thinkingFormat": "deepseek" },
+            "thinkingLevelMap": {
+                "minimal": null, "low": null, "medium": null,
+                "high": "high", "max": "max"
+            }
+        });
+        let pval: Value = serde_json::json!({});
+        assert!(parse_reasoning(&mv));
+        assert_eq!(
+            parse_compat_str(&mv, &pval, "thinkingFormat", "thinking_format"),
+            Some("deepseek".to_string())
+        );
+        let map = parse_thinking_map(&mv);
+        assert_eq!(map.get("minimal"), Some(&None));
+        assert_eq!(map.get("medium"), Some(&None));
+        assert_eq!(map.get("high"), Some(&Some("high".to_string())));
+        assert_eq!(map.get("max"), Some(&Some("max".to_string())));
+        assert_eq!(map.get("off"), None); // missing ≠ null
+    }
+
+    #[test]
+    fn provider_compat_is_fallback_for_model() {
+        // pi merges provider-level `compat` under model-level `compat`.
+        let mv: Value = serde_json::json!({ "id": "m", "reasoning": true });
+        let pval: Value =
+            serde_json::json!({ "compat": { "thinkingFormat": "qwen" } });
+        assert_eq!(
+            parse_compat_str(&mv, &pval, "thinkingFormat", "thinking_format"),
+            Some("qwen".to_string())
+        );
+        // Model-level wins over provider-level.
+        let mv2: Value = serde_json::json!({
+            "id": "m",
+            "compat": { "thinkingFormat": "deepseek" }
+        });
+        assert_eq!(
+            parse_compat_str(&mv2, &pval, "thinkingFormat", "thinking_format"),
+            Some("deepseek".to_string())
+        );
+    }
+
+    #[test]
+    fn supported_levels_match_pi_for_deepseek_v41() {
+        // pi `getSupportedThinkingLevels` for
+        // `{minimal:null, low:null, medium:null, high:"high", max:"max"}`
+        // (off/xhigh missing): off/high/max only.
+        let m = compat_model(
+            Some("deepseek"),
+            &[
+                ("minimal", None),
+                ("low", None),
+                ("medium", None),
+                ("high", Some("high")),
+                ("max", Some("max")),
+            ],
+        );
+        assert_eq!(level_names(&m.supported_levels()), vec!["off", "high", "max"]);
+        // Clamp walks up first (pi `clampThinkingLevel`): medium → high,
+        // minimal → high, xhigh → max, low → high.
+        assert_eq!(m.clamp_thinking(ThinkingLevel::Medium), ThinkingLevel::High);
+        assert_eq!(m.clamp_thinking(ThinkingLevel::Minimal), ThinkingLevel::High);
+        assert_eq!(m.clamp_thinking(ThinkingLevel::XHigh), ThinkingLevel::Max);
+        assert_eq!(m.clamp_thinking(ThinkingLevel::Low), ThinkingLevel::High);
+        assert_eq!(m.clamp_thinking(ThinkingLevel::High), ThinkingLevel::High);
+        assert_eq!(m.clamp_thinking(ThinkingLevel::Off), ThinkingLevel::Off);
+    }
+
+    #[test]
+    fn non_reasoning_models_offer_only_off() {
+        // pi: `!model.reasoning` → `["off"]`.
+        let mut m = compat_model(None, &[]);
+        m.reasoning = false;
+        assert_eq!(level_names(&m.supported_levels()), vec!["off"]);
+        assert_eq!(m.clamp_thinking(ThinkingLevel::High), ThinkingLevel::Off);
+    }
+
+    #[test]
+    fn mapped_effort_honors_explicit_strings() {
+        // Max must stay "max" (not collapse to pir's default "high").
+        let m = compat_model(
+            Some("deepseek"),
+            &[("high", Some("high")), ("max", Some("max"))],
+        );
+        assert_eq!(m.mapped_effort(ThinkingLevel::High), Some("high".to_string()));
+        assert_eq!(m.mapped_effort(ThinkingLevel::Max), Some("max".to_string()));
+        // No map entry → legacy collapsed names; minimal → none.
+        let plain = compat_model(None, &[]);
+        assert_eq!(
+            plain.mapped_effort(ThinkingLevel::XHigh),
+            Some("high".to_string())
+        );
+        assert_eq!(plain.mapped_effort(ThinkingLevel::Minimal), None);
+        // Off only maps with an explicit string (e.g. "none").
+        assert_eq!(plain.mapped_effort(ThinkingLevel::Off), None);
+        let off_none = compat_model(None, &[("off", Some("none"))]);
+        assert_eq!(
+            off_none.mapped_effort(ThinkingLevel::Off),
+            Some("none".to_string())
+        );
     }
 }

@@ -1028,37 +1028,66 @@ impl Agent {
     pub fn set_thinking(&mut self, level: config::ThinkingLevel) -> String {
         self.thinking = level;
         self.persist_thinking();
+        // pi `thinkingLevelMap` note: when the catalog hides this level for
+        // the current model, say what the request will actually carry (the
+        // mapped fallback) instead of implying the raw level applies.
+        let mut hidden_note = String::new();
+        if self.model.reasoning && !self.model.supported_levels().contains(&level) {
+            let clamped = self.model.clamp_thinking(level);
+            hidden_note = format!(
+                "  (hidden for {}/{} by thinkingLevelMap — nearest offered level is '{}'; the request falls back to the mapped effort)",
+                self.provider.pid(),
+                self.model.id,
+                clamped.as_str(),
+            );
+        } else if !self.model.reasoning && level.enabled() {
+            hidden_note = format!(
+                "  ({}/{} is not marked reasoning-capable — no thinking params will be sent)",
+                self.provider.pid(),
+                self.model.id,
+            );
+        }
         if level.enabled() {
             let budget = self
                 .thinking
                 .anthropic_budget(self.model.context.unwrap_or(200_000));
+            // Mapped effort for display: the catalog value when present,
+            // else the legacy default name.
+            let mapped = self.model.mapped_effort(level);
             match self.provider.kind() {
                 Some(ApiKind::Anthropic) => match budget {
                     Some(b) => format!(
-                        "thinking: {}  (Anthropic budget ≈ {} tokens — may exceed the model's max unless it supports extended thinking)",
+                        "thinking: {}  (Anthropic budget ≈ {} tokens — may exceed the model's max unless it supports extended thinking){hidden_note}",
                         level.as_str(), b
                     ),
                     None => format!(
-                        "thinking: {}  (model context too small for a meaningful thinking budget; will be ignored)",
+                        "thinking: {}  (model context too small for a meaningful thinking budget; will be ignored){hidden_note}",
                         level.as_str()
                     ),
                 },
-                Some(ApiKind::OpenAi) => match level.oai_effort() {
-                    Some(e) => format!("thinking: {}  (OpenAI reasoning_effort = {e})", level.as_str()),
+                Some(ApiKind::OpenAi) => match mapped.as_deref() {
+                    Some(e) => format!(
+                        "thinking: {}  (OpenAI reasoning_effort = {e}{}){hidden_note}",
+                        level.as_str(),
+                        match self.model.thinking_format_name() {
+                            "openai" => String::new(),
+                            f => format!(", thinkingFormat = {f}"),
+                        }
+                    ),
                     None => format!(
-                        "thinking: {}  (no OpenAI reasoning_effort for this level; will be ignored)",
+                        "thinking: {}  (no OpenAI reasoning_effort for this level; will be ignored){hidden_note}",
                         level.as_str()
                     ),
                 },
                 // Responses API takes the same effort names via `reasoning.effort`.
-                Some(ApiKind::OpenAiResponses) => match level.oai_effort() {
-                    Some(e) => format!("thinking: {}  (Responses reasoning.effort = {e})", level.as_str()),
+                Some(ApiKind::OpenAiResponses) => match mapped.as_deref() {
+                    Some(e) => format!("thinking: {}  (Responses reasoning.effort = {e}){hidden_note}", level.as_str()),
                     None => format!(
-                        "thinking: {}  (no Responses reasoning effort for this level; will be ignored)",
+                        "thinking: {}  (no Responses reasoning effort for this level; will be ignored){hidden_note}",
                         level.as_str()
                     ),
                 },
-                None => format!("thinking: {}", level.as_str()),
+                None => format!("thinking: {}{hidden_note}", level.as_str()),
             }
         } else {
             "thinking: off".to_string()
@@ -1813,6 +1842,17 @@ impl Agent {
             // reordered relative to the reply.
             let show_thinking = self.show_thinking;
             let mut think_buf = String::new();
+            // Coalesce micro-deltas before touching the terminal: providers
+            // stream thinking in 1-2 token fragments ("o", "trans", "p",
+            // "iler", ...) and the old code did one `term::out` + flush per
+            // fragment. Each write contends with the spinner's 80ms footer
+            // redraw (which re-parks the cursor), so consecutive fragments
+            // landed on separate scrolled lines and the turn crawled under
+            // syscall/escape-sequence overhead. Buffer instead and flush when
+            // there is a newline to show, the buffer is sizable, or the
+            // throttle window has elapsed — mirroring the throttled
+            // IncrementalMarkdown path used for reply text.
+            let mut last_think_flush = std::time::Instant::now();
             let mut on_think = |t: &str| {
                 // Record thinking in the shared approval context so a tool-
                 // approval dialog can show the agent's recent reasoning.
@@ -1828,8 +1868,12 @@ impl Agent {
                     if term::raw::keyboard_idle_long_enough() {
                         // Compacted for display (blank runs joined); the log
                         // keeps exact bytes.
-                        let show = term::compact_thinking(&std::mem::take(&mut think_buf));
-                        term::out(&term::dim(&show).to_string());
+                        let due = last_think_flush.elapsed() >= std::time::Duration::from_millis(200);
+                        if think_buf.contains('\n') || think_buf.len() >= 512 || due {
+                            let show = term::compact_thinking(&std::mem::take(&mut think_buf));
+                            term::out(&term::dim(&show).to_string());
+                            last_think_flush = std::time::Instant::now();
+                        }
                     }
                 }
             };
@@ -1903,6 +1947,11 @@ impl Agent {
                 self.provider.model_api(&self.model),
                 self.provider.model_base_url(&self.model),
                 !self.model.no_reasoning_effort,
+                // Catalog thinking metadata (`reasoning`,
+                // `compat.thinkingFormat`, `thinkingLevelMap`) so the request
+                // sends pi-shaped thinking controls (e.g. deepseek's
+                // `thinking: {type: …}` toggle + mapped effort).
+                Some(&self.model),
                 &mut on_retry,
                 &mut on_notice,
             );

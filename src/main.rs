@@ -578,6 +578,12 @@ fn main() {
         Ok(_) => die("~/.pi/models.json contains no providers"),
         Err(e) => die(&e),
     };
+    // Snapshot the pre-drop catalog for later `load_providers()` calls
+    // (`Agent::new`'s cache, the `/provider` reload, the titler). Those run
+    // *after* `become_user` drops to `ai_X` and rewrites `HOME`, where a store
+    // owned by the invoking user (typically 0600) is unreadable — a read that
+    // isn't an agent action and so must not be caught by the drop.
+    config::seed_catalog(&providers);
     term::set_model_providers(&providers);
 
     // Drop privileges to the per-project user *after* config/providers are
@@ -985,7 +991,7 @@ fn main() {
     // "Enable Sixel graphics" on, or any sixel-capable emulator) and the
     // img2sixel binary is installed. Falls back to the plain lines below
     // otherwise.
-    let help_line = "/help for commands · ctrl-d quit · ctrl-q quit now (x2 to force) · type while a turn runs; ESC/ctrl-c cancels it instantly";
+    let help_line = "/help for commands · ctrl-d quit · ctrl-q quit now (x2 to force) · ctrl-c/Esc ×3 quit · type while a turn runs: ESC/ctrl-c cancels, ↑↓ recalls history";
     side_lines.push(term::dim(help_line));
     if let Some(banner) = crate::sixel::render_banner(&side_lines) {
         term::out(&banner);
@@ -1055,6 +1061,10 @@ fn main() {
     let mut pending: Vec<String> = Vec::new();
     // Partial line buffer for the raw-mode input while a turn runs.
     let mut input_buf = String::new();
+    // Up/Down history navigation while a turn runs (see `term::HistRecall`):
+    // persists across input polls within a turn, reset whenever a new turn
+    // starts so a stale recall can't leak across turns.
+    let mut hist_recall = term::HistRecall::default();
     // `typeahead` (the *same* Arc the agent + spinner thread were built with,
     // declared just before `Agent::new`) is reused here: the REPL thread only
     // ever *writes* to it and the spinner thread *reads* it, so the user's
@@ -1187,7 +1197,7 @@ fn main() {
             // ctrl-d stops the session. The user's keystrokes are recorded into
             // `typeahead` (rendered by the thinking spinner) rather than echoed
             // here, so the two stdout writers never race.
-            match term::raw::wait_input(&mut input_buf, &typeahead, &done_rx) {
+            match term::raw::wait_input(&mut input_buf, &typeahead, &done_rx, &mut hist_recall) {
                 term::raw::RawInput::Line(s) => {
                     let s = s.trim();
                     // Clear the typeahead so the spinner line is blank before
@@ -1300,7 +1310,13 @@ fn main() {
                         f.store(true, Ordering::SeqCst);
                     }
                     let _ = killed;
-                    term::out(&term::dim("· cancelling turn (ESC/ctrl-c)…"));
+                    // Second consecutive press: say the next one quits (the
+                    // 3rd press arrives as `Quit`, handled below).
+                    if term::quit_press_count() >= 2 {
+                        term::out(&term::dim("· cancelling turn — press ctrl-c/Esc once more to quit"));
+                    } else {
+                        term::out(&term::dim("· cancelling turn (ESC/ctrl-c)…"));
+                    }
                 }
                 term::raw::RawInput::Eof => {
                     if let Ok(mut g) = typeahead.lock() { g.clear(); }
@@ -1513,6 +1529,7 @@ fn main() {
             // switch so a previously detached turn's quiet state can't leak.
             fg_quiet.store(false, Ordering::SeqCst);
             cleanup_running = false;
+            hist_recall.reset();
             fg_handle = Some(run_foreground_turn(
                 &agent_slot,
                 &fg_cancel,
@@ -1532,6 +1549,7 @@ fn main() {
             fg_quiet.store(false, Ordering::SeqCst);
             cleanup_running = true;
             println!("{} autoclean: fixing all errors/warnings/failing tests", term::bold("·"));
+            hist_recall.reset();
             fg_handle = Some(run_foreground_turn(
                 &agent_slot,
                 &fg_cancel,
@@ -2091,11 +2109,17 @@ fn handle_command(
                         _ => None,
                     };
                     let ctx = agent.model().context.unwrap_or(0);
-                    if let Some(level) =
-                        modal::thinking_picker(agent.thinking_level().as_str(), kind, ctx)
-                        && let Some(lvl) = config::ThinkingLevel::parse(&level) {
-                            println!("{}", agent.set_thinking(lvl));
-                        }
+                    // Owned clone for the picker's `thinkingLevelMap` filter.
+                    let model = agent.model();
+                    if let Some(level) = modal::thinking_picker(
+                        agent.thinking_level().as_str(),
+                        kind,
+                        ctx,
+                        Some(&model),
+                    )
+                    && let Some(lvl) = config::ThinkingLevel::parse(&level) {
+                        println!("{}", agent.set_thinking(lvl));
+                    }
                 }
                 Some(MenuAction::Model) => {
                     // Open the model picker; Esc cancels. On a pick, switch the

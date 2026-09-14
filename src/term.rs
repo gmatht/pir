@@ -14,6 +14,101 @@ use rustyline::hint::{Hinter, HistoryHinter};
 use rustyline::history::History;
 use rustyline::validate::Validator;
 use rustyline::{At, Cmd, CompletionType, Config, Context, Editor, Event, KeyCode, KeyEvent, Modifiers, Movement, Word};
+use rustyline::{ConditionalEventHandler, EventContext, RepeatCount};
+
+/// rustyline handler for the triple-press-to-quit gesture at the idle prompt.
+/// Counts Ctrl-C / Esc presses via [`note_cancel_press`]: presses 1–2 return
+/// `fallback` (preserving today's behavior — clear-line for Ctrl-C, nothing
+/// for Esc), and the 3rd returns `Interrupt`, which [`read_line`] maps to
+/// `None` (quit, same as Ctrl-Q).
+struct QuitPressHandler {
+    fallback: Cmd,
+}
+
+impl ConditionalEventHandler for QuitPressHandler {
+    fn handle(
+        &self,
+        _evt: &Event,
+        _n: RepeatCount,
+        _positive: bool,
+        _ctx: &EventContext,
+    ) -> Option<Cmd> {
+        if note_cancel_press() {
+            Some(Cmd::Interrupt)
+        } else {
+            Some(self.fallback.clone())
+        }
+    }
+}
+
+/// rustyline observer: any other key is activity, not hammering — reset the
+/// triple-press count. Returns `None` so the default command runs; purely an
+/// observer. Bound to `Event::Any`, which only fires when no specific
+/// binding matches (so it never sees the Ctrl-C / Esc presses counted above).
+struct ResetQuitPresses;
+
+impl ConditionalEventHandler for ResetQuitPresses {
+    fn handle(
+        &self,
+        _evt: &Event,
+        _n: RepeatCount,
+        _positive: bool,
+        _ctx: &EventContext,
+    ) -> Option<Cmd> {
+        reset_quit_presses();
+        None
+    }
+}
+
+/// Triple-press-to-quit: consecutive cancel-key (Ctrl-C / Esc) presses no
+/// more than this far apart count as one quit gesture. Three such presses —
+/// from the idle prompt, mid-turn, or spanning the two — quit pir (same
+/// graceful path as Ctrl-Q: sweep jobs, join the worker, print the resume
+/// hint). Any other key, or a longer gap, restarts the count, and quitting
+/// never loses anything: the session is saved either way.
+pub(crate) const QUIT_PRESS_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+/// Presses that quit (the 3rd consecutive cancel-key press).
+pub(crate) const QUIT_PRESSES: u8 = 3;
+
+/// Pending quit gesture: consecutive cancel-key presses within
+/// [`QUIT_PRESS_WINDOW`] (count, last press). One counter is shared by Ctrl-C
+/// and Esc across the idle prompt and running turns, so hammering either key
+/// — or mixing them — quits. Guarded by a Mutex; only the main thread
+/// touches it, so the lock is uncontended.
+static QUIT_PRESSES_STATE: Mutex<(u8, Option<std::time::Instant>)> = Mutex::new((0, None));
+
+/// Pure core of the triple-press counter (deterministic under test): fold a
+/// press at `now` into `(count, last)`, restarting at 1 after a gap.
+/// Returns the new consecutive count.
+fn fold_quit_press(state: &mut (u8, Option<std::time::Instant>), now: std::time::Instant) -> u8 {
+    let restart = match state.1 {
+        Some(last) => now.duration_since(last) > QUIT_PRESS_WINDOW,
+        None => true,
+    };
+    state.0 = if restart { 1 } else { state.0.saturating_add(1) };
+    state.1 = Some(now);
+    state.0
+}
+
+/// Register one cancel-key (Ctrl-C / Esc) press. Returns `true` when this
+/// press completes the triple — the caller should quit now (mid-turn readers
+/// return `Quit`; the idle prompt returns `Interrupt`).
+pub fn note_cancel_press() -> bool {
+    let mut g = QUIT_PRESSES_STATE.lock().unwrap();
+    fold_quit_press(&mut g, std::time::Instant::now()) >= QUIT_PRESSES
+}
+
+/// Current consecutive cancel-key press count (for "once more to quit"
+/// hints). The lock is uncontended.
+pub fn quit_press_count() -> u8 {
+    QUIT_PRESSES_STATE.lock().unwrap().0
+}
+
+/// Forget pending cancel-key presses. Called on any other key, a submitted
+/// line, or an explicit state change — only *consecutive* hammering quits.
+pub fn reset_quit_presses() {
+    *QUIT_PRESSES_STATE.lock().unwrap() = (0, None);
+}
 
 static COLOR_OVERRIDE: Mutex<Option<bool>> = Mutex::new(None);
 
@@ -1258,7 +1353,33 @@ fn new_editor() -> Option<Editor<PirHelper, rustyline::history::DefaultHistory>>
     // default Ctrl-C is `Cmd::Interrupt`, which we now reserve for Ctrl-Q's
     // quit signal — so rebind it to a whole-line kill to preserve the
     // "clear the line" behavior.
-    let _ = rl.bind_sequence(KeyEvent::ctrl('C'), Cmd::Kill(Movement::WholeLine));
+    //
+    // Triple-press-to-quit: the 1st/2nd quick Ctrl-C still just clears the
+    // line, but a 3rd within the window returns `Interrupt` (quit, like
+    // Ctrl-Q). Any other key resets the count (see `ResetQuitPresses`).
+    let _ = rl.bind_sequence(
+        KeyEvent::ctrl('C'),
+        rustyline::EventHandler::Conditional(Box::new(QuitPressHandler {
+            fallback: Cmd::Kill(Movement::WholeLine),
+        })),
+    );
+    // Lone Esc (currently a No-op): same triple-press gesture — 1st/2nd do
+    // nothing, 3rd quits. Arrow/function keys arrive as multi-byte sequences
+    // (parsed to Up/Down/etc., never a lone Esc) and Alt+key combos parse as
+    // Meta-modified keys, so this binding can't swallow them.
+    let _ = rl.bind_sequence(
+        KeyEvent(KeyCode::Esc, Modifiers::NONE),
+        rustyline::EventHandler::Conditional(Box::new(QuitPressHandler {
+            fallback: Cmd::Noop,
+        })),
+    );
+    // Observer: any other keypress is activity — restart the quit gesture.
+    // Fires only when no specific binding matches, returning `None` so the
+    // default command runs untouched.
+    let _ = rl.bind_sequence(
+        Event::Any,
+        rustyline::EventHandler::Conditional(Box::new(ResetQuitPresses)),
+    );
     Some(rl)
 }
 
@@ -1362,23 +1483,107 @@ fn save_history(rl: &mut Editor<PirHelper, rustyline::history::DefaultHistory>) 
 /// TUI shows the exact same previous prompts (including those from before a
 /// `pir -r` resume an empty vec when no history has been loaded yet.
 pub fn load_history_lines() -> Vec<String> {
-    let lines = EDITOR.with(|e| {
-        let g = e.borrow();
-        match g.as_ref() {
-            Some(rl) => rl.history().iter().cloned().collect(),
-            None => Vec::new(),
-        }
-    });
+    let lines = session_history_lines();
     eprintln!("pir-debug load_history_lines: {} entries", lines.len());
     lines
+}
+
+/// Session prompt history (oldest→newest, empties dropped) without logging —
+/// the quiet source for mid-turn Up/Down recall, which fires per keypress.
+/// Same underlying history the idle prompt recalls from, so mid-turn recall
+/// matches idle recall.
+pub fn session_history_lines() -> Vec<String> {
+    EDITOR.with(|e| {
+        let g = e.borrow();
+        match g.as_ref() {
+            Some(rl) => rl
+                .history()
+                .iter()
+                .filter(|s| !s.trim().is_empty())
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        }
+    })
+}
+
+/// Up/Down history navigation while a turn runs. The mid-turn raw readers
+/// have no cursor editing: a recalled line replaces the draft (shown on the
+/// spinner/footer line) and submits like typed text on Enter. `idx == -1`
+/// means "not recalling"; any typing abandons the recall (the caller
+/// resets), while submitting also resets.
+#[derive(Debug)]
+pub struct HistRecall {
+    idx: isize,
+    saved: String,
+}
+
+impl Default for HistRecall {
+    fn default() -> Self {
+        HistRecall { idx: -1, saved: String::new() }
+    }
+}
+
+impl HistRecall {
+    /// Abandon any in-progress recall (typing, submit, new turn).
+    pub fn reset(&mut self) {
+        self.idx = -1;
+        self.saved.clear();
+    }
+
+    /// Navigate one step: `up == true` for Up (older), `false` for Down
+    /// (newer). `history` is oldest→newest; `draft` is the current buffer.
+    /// Returns the replacement draft, or `None` when nothing changes (empty
+    /// history, or Down while not recalling). Up clamps at the oldest entry;
+    /// Down past the newest restores the pre-recall draft.
+    pub fn step(&mut self, history: &[String], draft: &str, up: bool) -> Option<String> {
+        if history.is_empty() {
+            return None;
+        }
+        if up {
+            if self.idx < 0 {
+                self.saved = draft.to_string();
+                self.idx = 0;
+            } else {
+                self.idx = (self.idx + 1).min(history.len() as isize - 1);
+            }
+            Some(history[history.len() - 1 - self.idx as usize].clone())
+        } else if self.idx <= 0 {
+            if self.idx == 0 {
+                self.idx = -1;
+                return Some(std::mem::take(&mut self.saved));
+            }
+            None
+        } else {
+            self.idx -= 1;
+            Some(history[history.len() - 1 - self.idx as usize].clone())
+        }
+    }
+}
+
+/// Classify the escape sequence starting at `seq[0] == 0x1b` for history
+/// recall: `[A` (Up) → `Some(true)`, `[B` (Down) → `Some(false)`, anything
+/// else (other CSI, lone Esc, truncated) → `None`. Pure helper so the
+/// mid-turn readers' arrow handling is unit-testable without a tty.
+pub(crate) fn csi_arrow(seq: &[u8]) -> Option<bool> {
+    if seq.len() >= 3 && seq[0] == 0x1b && seq[1] == 0x5b {
+        match seq[2] {
+            b'A' => Some(true),
+            b'B' => Some(false),
+            _ => None,
+        }
+    } else {
+        None
+    }
 }
 
 /// Read a line with full line editing: arrow-up/down history, left/right
 /// cursor movement, home/end, word motion, etc. (provided by rustyline).
 ///
-/// Returns `None` on EOF (ctrl-d) or Ctrl-Q (bound to `Cmd::Interrupt` in
-/// `new_editor`) so the caller can quit cleanly — Ctrl-Q quits even with
-/// text in the buffer.
+/// Returns `None` on EOF (ctrl-d), Ctrl-Q (bound to `Cmd::Interrupt` in
+/// `new_editor`), or a triple Ctrl-C / Esc within the quit window (the 3rd
+/// press returns `Cmd::Interrupt`) so the caller can quit cleanly — Ctrl-Q
+/// quits even with text in the buffer.
 pub fn read_line(prompt: &str) -> Option<String> {
     use rustyline::error::ReadlineError;
 
@@ -2087,13 +2292,17 @@ pub mod raw {
         buf: &mut String,
         typeahead: &Arc<Mutex<String>>,
         done: &smol::channel::Receiver<()>,
+        // Up/Down history navigation state, owned by the caller's turn loop
+        // (fresh per turn). Persists across polls within a turn so repeated
+        // Up walks older prompts.
+        recall: &mut super::HistRecall,
     ) -> RawInput {
         // Build an async wrapper around stdin for this wait. `enable_raw` already
         // put fd 0 into non-blocking mode; `Async::new` registers it with the
         // smol reactor (and deregisters on drop) so we can await readiness.
         let stdin = match smol::Async::new(io::stdin()) {
             Ok(s) => s,
-            Err(_) => return read_chunk(buf, typeahead),
+            Err(_) => return read_chunk(buf, typeahead, recall),
         };
         // Race "stdin became readable" against "the turn finished". Both arms
         // yield `()` so `or` can select between them.
@@ -2102,7 +2311,7 @@ pub mod raw {
         let finished = async { let _ = done.recv().await; };
         smol::block_on(smol::future::or(readable, finished));
         // Either side fired (or stdin closed): drain whatever is buffered.
-        let result = read_chunk(buf, typeahead);
+        let result = read_chunk(buf, typeahead, recall);
         // Throttle the EOF case. A pipe at EOF is *permanently* readable (a
         // closed fd wakes the reactor immediately, forever), and the turn never
         // signals completion while it's parked in a retry backoff — so racing
@@ -2126,11 +2335,20 @@ pub mod raw {
     /// more bytes are readable. Backspace pops the buffer; ctrl-c/ctrl-d/Enter
     /// are surfaced to the caller. This thread never writes to stdout.
     ///
+    /// Up/Down (`ESC[A` / `ESC[B`) recall session history into the draft via
+    /// `recall` (same history the idle prompt uses) — the recalled line shows
+    /// on the spinner line and submits like typed text. Any edit abandons the
+    /// recall; other escape sequences are swallowed as before.
+    ///
     /// Bracketed-paste aware: while a `ESC [ 2 0 0 ~ … ESC [ 2 0 1 ~` paste
     /// wrapper is open, embedded newlines are kept as part of the line (as
     /// `'\n'`) instead of being interpreted as Enter — so a *pasted* multiline
     /// block becomes a single queued prompt rather than one prompt per line.
-    fn read_chunk(buf: &mut String, typeahead: &Arc<Mutex<String>>) -> RawInput {
+    fn read_chunk(
+        buf: &mut String,
+        typeahead: &Arc<Mutex<String>>,
+        recall: &mut super::HistRecall,
+    ) -> RawInput {
         let fd = io::stdin().as_raw_fd();
         let mut tmp = [0u8; 256];
         let mut nread = 0usize;
@@ -2184,8 +2402,12 @@ pub mod raw {
                     if pasting {
                         buf.push('\n');
                         update_typeahead(buf, typeahead);
+                        super::reset_quit_presses();
+                        recall.reset();
                     } else {
                         let line = std::mem::take(buf);
+                        super::reset_quit_presses();
+                        recall.reset();
                         return RawInput::Line(line);
                     }
                 }
@@ -2198,8 +2420,12 @@ pub mod raw {
                             buf.push('\n');
                             update_typeahead(buf, typeahead);
                         }
+                        super::reset_quit_presses();
+                        recall.reset();
                     } else {
                         let line = std::mem::take(buf);
+                        super::reset_quit_presses();
+                        recall.reset();
                         return RawInput::Line(line);
                     }
                 }
@@ -2213,11 +2439,20 @@ pub mod raw {
                             g.push_str(buf);
                         }
                     }
+                    // Editing is activity, not hammering.
+                    super::reset_quit_presses();
+                    // Any edit abandons an in-progress history recall.
+                    recall.reset();
                 }
                 0x03 => {
                     buf.clear();
                     if let Ok(mut g) = typeahead.lock() {
                         g.clear();
+                    }
+                    // Triple-press-to-quit: 1st/2nd cancel the turn (as
+                    // before); the 3rd consecutive press quits instead.
+                    if super::note_cancel_press() {
+                        return RawInput::Quit;
                     }
                     return RawInput::Interrupt;
                 }
@@ -2265,10 +2500,20 @@ pub mod raw {
                         if let Ok(mut g) = typeahead.lock() {
                             g.clear();
                         }
+                        // Lone Esc counts like ctrl-c: 1st/2nd cancel, 3rd quits.
+                        if super::note_cancel_press() {
+                            return RawInput::Quit;
+                        }
                         return RawInput::Cancel;
                     }
                     // We're in a CSI sequence. Check whether it's a bracketed-
                     // paste wrapper (`ESC[200~` starts, `ESC[201~` ends).
+                    // Up/Down for mid-turn history recall (`ESC[A` / `ESC[B`):
+                    // peek the parameter byte while it's still buffered. (If the
+                    // terminator didn't arrive in this batch, the tail is topped
+                    // up below and unreadable — the sequence is swallowed with
+                    // no recall, as before.)
+                    let arrow = super::csi_arrow(&tmp[i..nread]);
                     if let Some(start) = paste_marker_at(&tmp[..nread], i) {
                         // It's `ESC[200~` (start) or `ESC[201~` (end). Consume
                         // the whole wrapper (`ESC [ 2 0 0 ~` = 6 bytes including
@@ -2302,14 +2547,35 @@ pub mod raw {
                         // fd. Top up (bounded) so it doesn't leak into the next poll.
                         drain_csi_sequence(fd);
                     }
+                    // A consumed escape sequence (arrows, function keys, paste
+                    // wrappers) is activity, not hammering.
+                    super::reset_quit_presses();
+                    // Recalled history replaces the draft (shown on the spinner
+                    // line); Enter submits it like typed text.
+                    if let Some(up) = arrow {
+                        let hist = super::session_history_lines();
+                        if let Some(line) = recall.step(&hist, buf, up) {
+                            buf.clear();
+                            buf.push_str(&line);
+                            update_typeahead(buf, typeahead);
+                        }
+                    }
                     // `i` now sits just past the consumed sequence (or at `nread`);
                     // the outer `while` advances it once more, which is correct.
                 }
                 c if (0x20..0x7f).contains(&c) => {
                     buf.push(c as char);
                     update_typeahead(buf, typeahead);
+                    // Typing restarts the quit gesture.
+                    super::reset_quit_presses();
+                    // Typing abandons an in-progress history recall.
+                    recall.reset();
                 }
-                _ => { /* ignore other control bytes */ }
+                _ => {
+                    // Other control bytes are ignored, but they are still
+                    // keypresses — not hammering.
+                    super::reset_quit_presses();
+                }
             }
             i += 1;
         }
@@ -2909,6 +3175,10 @@ mod tests {
                     api_override: None,
                     url_override: None,
                     no_reasoning_effort: false,
+                    reasoning: false,
+                    thinking_format: None,
+                    supports_reasoning_effort: None,
+                    thinking_level_map: Default::default(),
                     price_per_1k: None,
                 }],
             },
@@ -2926,6 +3196,10 @@ mod tests {
                     api_override: None,
                     url_override: None,
                     no_reasoning_effort: false,
+                    reasoning: false,
+                    thinking_format: None,
+                    supports_reasoning_effort: None,
+                    thinking_level_map: Default::default(),
                     price_per_1k: None,
                 }],
             },
@@ -2939,6 +3213,145 @@ mod tests {
         assert_eq!(matches, vec!["claude-fake".to_string()]);
         // The completion replaces only the argument (after the command + space).
         assert_eq!(start, "/default-model ".len());
+    }
+}
+
+#[cfg(test)]
+mod quit_press_tests {
+    use super::*;
+
+    // Serializes the global-counter tests: all threads share one
+    // QUIT_PRESSES_STATE, so anything touching it holds this.
+    static QUIT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn t0() -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
+    #[test]
+    fn triple_press_quits_on_third() {
+        // Three presses well within the window: counts 1, 2, 3 — only the
+        // 3rd completes the gesture (explicit Instants: no sleeps, no clock
+        // dependence).
+        let base = t0();
+        let mut state = (0u8, None);
+        assert_eq!(fold_quit_press(&mut state, base), 1);
+        let second = fold_quit_press(&mut state, base + Duration::from_millis(100));
+        assert_eq!(second, 2);
+        assert!(second < QUIT_PRESSES);
+        assert_eq!(fold_quit_press(&mut state, base + Duration::from_millis(200)), QUIT_PRESSES);
+    }
+
+    #[test]
+    fn gap_restarts_count() {
+        // A press after the window expires restarts at 1 — slow, deliberate
+        // cancels never accumulate into a quit.
+        let base = t0();
+        let mut state = (0u8, None);
+        assert_eq!(fold_quit_press(&mut state, base), 1);
+        assert_eq!(fold_quit_press(&mut state, base + Duration::from_millis(100)), 2);
+        assert_eq!(
+            fold_quit_press(&mut state, base + QUIT_PRESS_WINDOW + Duration::from_secs(1)),
+            1
+        );
+    }
+
+    #[test]
+    fn press_exactly_at_window_edge_still_counts() {
+        // Only gaps *strictly* beyond the window restart; a press exactly on
+        // the edge continues the gesture.
+        let base = t0();
+        let mut state = (0u8, None);
+        assert_eq!(fold_quit_press(&mut state, base), 1);
+        assert_eq!(fold_quit_press(&mut state, base + QUIT_PRESS_WINDOW), 2);
+    }
+
+    #[test]
+    fn globals_count_reset_and_quit() {
+        // End to end through the process-global counter: two presses arm,
+        // the third quits, reset disarms. Rapid succession keeps every gap
+        // far inside the window (no timing dependence).
+        let _guard = QUIT_TEST_LOCK.lock().unwrap();
+        reset_quit_presses();
+        assert_eq!(quit_press_count(), 0);
+        assert!(!note_cancel_press());
+        assert_eq!(quit_press_count(), 1);
+        assert!(!note_cancel_press());
+        assert_eq!(quit_press_count(), 2);
+        assert!(note_cancel_press());
+        assert_eq!(quit_press_count(), 3);
+        // A further press stays quitting (saturating, never wraps to 0).
+        assert!(note_cancel_press());
+        // Reset disarms: the next press is a fresh first.
+        reset_quit_presses();
+        assert_eq!(quit_press_count(), 0);
+        assert!(!note_cancel_press());
+        assert_eq!(quit_press_count(), 1);
+        reset_quit_presses();
+    }
+}
+
+#[cfg(test)]
+mod hist_recall_tests {
+    use super::*;
+
+    fn hist() -> Vec<String> {
+        vec!["first".to_string(), "second".to_string(), "third".to_string()]
+    }
+
+    #[test]
+    fn up_walks_older_and_clamps_down_restores_draft() {
+        // Oldest→newest [first, second, third], draft "draft": Up recalls
+        // newest-first and clamps at the oldest; Down walks back and finally
+        // restores the pre-recall draft.
+        let h = hist();
+        let mut r = HistRecall::default();
+        assert_eq!(r.step(&h, "draft", true), Some("third".to_string()));
+        assert_eq!(r.step(&h, "draft", true), Some("second".to_string()));
+        assert_eq!(r.step(&h, "draft", true), Some("first".to_string()));
+        assert_eq!(r.step(&h, "draft", true), Some("first".to_string()));
+        assert_eq!(r.step(&h, "changed", false), Some("second".to_string()));
+        assert_eq!(r.step(&h, "changed", false), Some("third".to_string()));
+        // Down past the newest restores the draft saved on the first Up
+        // ("draft", not the later "changed" buffer).
+        assert_eq!(r.step(&h, "changed", false), Some("draft".to_string()));
+        // No longer recalling: Down is a no-op.
+        assert_eq!(r.step(&h, "draft", false), None);
+    }
+
+    #[test]
+    fn empty_history_recalls_nothing() {
+        let mut r = HistRecall::default();
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(r.step(&empty, "draft", true), None);
+        assert_eq!(r.step(&empty, "draft", false), None);
+    }
+
+    #[test]
+    fn reset_abandons_recall() {
+        let h = hist();
+        let mut r = HistRecall::default();
+        assert_eq!(r.step(&h, "draft", true), Some("third".to_string()));
+        r.reset();
+        // Fresh Up starts at the newest again (not where we left off).
+        assert_eq!(r.step(&h, "other", true), Some("third".to_string()));
+    }
+
+    #[test]
+    fn csi_arrow_classifies_up_down_only() {
+        // Up / Down terminators (with trailing bytes tolerated).
+        assert_eq!(csi_arrow(&[0x1b, 0x5b, b'A']), Some(true));
+        assert_eq!(csi_arrow(&[0x1b, 0x5b, b'B']), Some(false));
+        assert_eq!(csi_arrow(&[0x1b, 0x5b, b'A', b'X']), Some(true));
+        // Other CSI (Left/Right/Home/paste wrappers), lone Esc, truncated.
+        assert_eq!(csi_arrow(&[0x1b, 0x5b, b'C']), None);
+        assert_eq!(csi_arrow(&[0x1b, 0x5b, b'D']), None);
+        assert_eq!(csi_arrow(&[0x1b, 0x5b, b'H']), None);
+        assert_eq!(csi_arrow(&[0x1b, 0x5b, b'2', b'0', b'0', b'~']), None);
+        assert_eq!(csi_arrow(&[0x1b]), None);
+        assert_eq!(csi_arrow(&[0x1b, 0x5b]), None);
+        assert_eq!(csi_arrow(&[0x03]), None);
+        assert_eq!(csi_arrow(&[]), None);
     }
 }
 

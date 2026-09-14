@@ -248,13 +248,16 @@ fn run_inner(
     state.push(
         ConvKind::System,
         &format!(
-            "pir · {} · full-screen TUI (/help for commands · Esc/ctrl-c cancel · ctrl-d quit · ctrl-q quit now (x2 to force))",
+            "pir · {} · full-screen TUI (/help for commands · Esc/ctrl-c cancel · ↑↓ recall · ctrl-c/Esc ×3 quit · ctrl-d quit · ctrl-q quit now (x2 to force))",
             ctx.providers[0].pid()
         ),
     );
 
     let mut fg_handle: Option<JoinHandle<()>> = None;
     let mut pending: Vec<String> = Vec::new();
+    // Up/Down history navigation while a turn runs: persists across input
+    // polls within a turn, reset whenever a new turn starts.
+    let mut hist_recall = crate::term::HistRecall::default();
 
     let spinner_frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -296,6 +299,7 @@ fn run_inner(
                     if let Ok(mut g) = ctx.typeahead.lock() {
                         g.clear();
                     }
+                    hist_recall.reset();
                     fg_handle = Some(spawn_turn(ctx, next));
                 } else {
                     let follow = {
@@ -309,6 +313,7 @@ fn run_inner(
                         if let Ok(mut g) = ctx.typeahead.lock() {
                             g.clear();
                         }
+                        hist_recall.reset();
                         fg_handle = Some(spawn_turn(ctx, next));
                     } else {
                         state.running = false;
@@ -351,7 +356,7 @@ fn run_inner(
 
         // ---- Input ----
         if running {
-            match wait_raw_input(ctx) {
+            match wait_raw_input(ctx, &mut hist_recall) {
                 RawKey::Line(s) => {
                     let s = s.trim();
                     if let Ok(mut g) = ctx.typeahead.lock() {
@@ -388,7 +393,13 @@ fn run_inner(
                         g.clear();
                     }
                     ctx.fg_cancel.store(true, Ordering::SeqCst);
-                    state.push(ConvKind::System, "· cancelling turn (ESC/ctrl-c) — stopping now…");
+                    // Second consecutive press: say the next one quits (the
+                    // 3rd press arrives as `Quit`, handled below).
+                    if crate::term::quit_press_count() >= 2 {
+                        state.push(ConvKind::System, "· cancelling turn (ESC/ctrl-c) — press once more to quit");
+                    } else {
+                        state.push(ConvKind::System, "· cancelling turn (ESC/ctrl-c) — stopping now…");
+                    }
                 }
                 RawKey::Eof => {
                     ctx.fg_cancel.store(true, Ordering::SeqCst);
@@ -451,6 +462,7 @@ fn run_inner(
                         let prompt = input.trim_end_matches('&').trim().to_string();
                         spawn_background(ctx, &mut state, prompt);
                     } else if fg_handle.is_none() {
+                        hist_recall.reset();
                         fg_handle = Some(spawn_turn(ctx, input.clone()));
                         term::push_history(&input);
                     } else {
@@ -640,7 +652,7 @@ fn draw<B: ratatui::backend::Backend>(
 /// Read raw keystrokes while a turn runs (event-driven, like the streaming
 /// REPL's `raw::wait_input`) but routed through crossterm so the TUI stays the
 /// sole screen owner. Returns a `RawKey` outcome.
-fn wait_raw_input(ctx: &TuiCtx) -> RawKey {
+fn wait_raw_input(ctx: &TuiCtx, recall: &mut crate::term::HistRecall) -> RawKey {
     let stdin = match smol::Async::new(io::stdin()) {
         Ok(s) => s,
         Err(_) => return RawKey::None,
@@ -655,7 +667,7 @@ fn wait_raw_input(ctx: &TuiCtx) -> RawKey {
     let finished = async { let _ = ctx.done_rx.recv().await; };
     smol::block_on(smol::future::or(readable, finished));
     let mut buf = String::new();
-    let key = read_raw_into(&mut buf, ctx.typeahead);
+    let key = read_raw_into(&mut buf, ctx.typeahead, recall);
     // No actual input and barely any wall time elapsed (EOF pipe): sleep the
     // rest of the poll window so the idle TUI stays near 0% CPU. Genuine input
     // returns instantly.
@@ -675,7 +687,14 @@ fn wait_raw_input(ctx: &TuiCtx) -> RawKey {
 /// `ESC[200~ … ESC[201~` wrapper, embedded newlines are kept as part of the
 /// line (a real `'\n'`) instead of ending it — so a pasted multiline block
 /// becomes a single queued prompt rather than one per line.
-fn read_raw_into(buf: &mut String, typeahead: &Arc<Mutex<String>>) -> RawKey {
+///
+/// Up/Down (`ESC[A` / `ESC[B`) recall session history into the draft via
+/// `recall` (same history the idle prompt uses), shown in the footer draft.
+fn read_raw_into(
+    buf: &mut String,
+    typeahead: &Arc<Mutex<String>>,
+    recall: &mut crate::term::HistRecall,
+) -> RawKey {
     use std::os::unix::io::AsRawFd;
     let fd = io::stdin().as_raw_fd();
     let mut tmp = [0u8; 256];
@@ -721,8 +740,12 @@ fn read_raw_into(buf: &mut String, typeahead: &Arc<Mutex<String>>) -> RawKey {
                         buf.push('\n');
                         update_tui_typeahead(buf, typeahead);
                     }
+                    crate::term::reset_quit_presses();
+                    recall.reset();
                 } else {
                     let line = std::mem::take(buf);
+                    crate::term::reset_quit_presses();
+                    recall.reset();
                     return RawKey::Line(line);
                 }
             }
@@ -731,11 +754,18 @@ fn read_raw_into(buf: &mut String, typeahead: &Arc<Mutex<String>>) -> RawKey {
                     buf.pop();
                     update_tui_typeahead(buf, typeahead);
                 }
+                crate::term::reset_quit_presses();
+                recall.reset();
             }
             0x03 => {
                 buf.clear();
                 if let Ok(mut g) = typeahead.lock() {
                     g.clear();
+                }
+                // Triple-press-to-quit: 1st/2nd cancel the turn (as before);
+                // the 3rd consecutive press quits instead.
+                if crate::term::note_cancel_press() {
+                    return RawKey::Quit;
                 }
                 return RawKey::Interrupt;
             }
@@ -772,11 +802,18 @@ fn read_raw_into(buf: &mut String, typeahead: &Arc<Mutex<String>>) -> RawKey {
                     if let Ok(mut g) = typeahead.lock() {
                         g.clear();
                     }
+                    // Lone Esc counts like ctrl-c: 1st/2nd cancel, 3rd quits.
+                    if crate::term::note_cancel_press() {
+                        return RawKey::Quit;
+                    }
                     return RawKey::Cancel;
                 }
                 // We're in a CSI sequence. Check for the bracketed-paste wrapper
                 // (`ESC[200~` starts, `ESC[201~` ends). The byte after `0x5b` is
                 // the first parameter byte.
+                // Up/Down for mid-turn history recall (`ESC[A` / `ESC[B`): peek
+                // while buffered (`i - 1` is the `0x1b`, already consumed).
+                let arrow = crate::term::csi_arrow(&tmp[i - 1..nread]);
                 let after_bracket = i + 1; // index just after `0x5b`
                 let is_paste_marker = after_bracket + 3 <= nread
                     && tmp[after_bracket] == b'2'
@@ -808,12 +845,31 @@ fn read_raw_into(buf: &mut String, typeahead: &Arc<Mutex<String>>) -> RawKey {
                 if i >= nread {
                     drain_csi_sequence(fd);
                 }
+                // A consumed escape sequence is activity, not hammering.
+                crate::term::reset_quit_presses();
+                // Recalled history replaces the draft (shown in the footer).
+                if let Some(up) = arrow {
+                    let hist = crate::term::session_history_lines();
+                    if let Some(line) = recall.step(&hist, buf, up) {
+                        buf.clear();
+                        buf.push_str(&line);
+                        update_tui_typeahead(buf, typeahead);
+                    }
+                }
             }
             c if (0x20..0x7f).contains(&c) => {
                 buf.push(c as char);
                 update_tui_typeahead(buf, typeahead);
+                // Typing restarts the quit gesture.
+                crate::term::reset_quit_presses();
+                // Typing abandons an in-progress history recall.
+                recall.reset();
             }
-            _ => { /* ignore other control bytes */ }
+            _ => {
+                // Other control bytes are ignored, but they are still
+                // keypresses — not hammering.
+                crate::term::reset_quit_presses();
+            }
         }
     }
     RawKey::None
@@ -1042,17 +1098,26 @@ fn read_idle_line(
                             if b == 0x0a || !(i < n as usize && tmp[i] == 0x0a) {
                                 buf.push('\n');
                             }
+                            crate::term::reset_quit_presses();
                         } else {
                             let line = std::mem::take(&mut buf);
                             state.draft.clear();
+                            crate::term::reset_quit_presses();
                             return Some(line);
                         }
                     }
                     0x7f | 0x08 => {
                         buf.pop();
+                        crate::term::reset_quit_presses();
                     }
                     0x03 => {
                         state.draft.clear();
+                        // Triple-press-to-quit: 1st/2nd just clear the draft
+                        // (as before); the 3rd consecutive press quits, like
+                        // ctrl-d.
+                        if crate::term::note_cancel_press() {
+                            return None;
+                        }
                         return Some(String::new());
                     }
                     0x04 => {
@@ -1063,9 +1128,11 @@ fn read_idle_line(
                         // CSI sequence: handle Up/Down for history and the
                         // bracketed-paste wrappers (`ESC[200~` start / `ESC[201~`
                         // end). Other CSI (arrows Left/Right, etc.) we swallow so
-                        // it doesn't leak into the buffer.
+                        // it doesn't leak into the buffer. A lone Esc (no `[`
+                        // following) counts toward triple-press-to-quit.
                         let mut is_up = false;
                         let mut is_down = false;
+                        let lone = !(i < n as usize && tmp[i] == 0x5b);
                         if i < n as usize && tmp[i] == 0x5b {
                             // Peek the parameter bytes to see if this is a paste
                             // wrapper before consuming the sequence.
@@ -1100,6 +1167,7 @@ fn read_idle_line(
                             }
                         }
                         if is_up {
+                            crate::term::reset_quit_presses();
                             if !history.is_empty() {
                                 if hist_idx < (history.len() as i32) - 1 {
                                     hist_idx += 1;
@@ -1107,6 +1175,7 @@ fn read_idle_line(
                                 buf = history[(history.len() as i32 - 1 - hist_idx) as usize].clone();
                             }
                         } else if is_down {
+                            crate::term::reset_quit_presses();
                             if hist_idx > 0 {
                                 hist_idx -= 1;
                                 buf = history[(history.len() as i32 - 1 - hist_idx) as usize].clone();
@@ -1116,6 +1185,17 @@ fn read_idle_line(
                             }
                         } else {
                             buf.clear();
+                            if lone {
+                                // Lone Esc: 1st/2nd just clear (as before);
+                                // the 3rd consecutive press quits.
+                                if crate::term::note_cancel_press() {
+                                    state.draft.clear();
+                                    return None;
+                                }
+                            } else {
+                                // Other CSI is activity, not hammering.
+                                crate::term::reset_quit_presses();
+                            }
                         }
                     }
                     c if (0x20..0x7f).contains(&c) => {
@@ -1123,6 +1203,7 @@ fn read_idle_line(
                         state.awaiting_input = false;
                         update_tui_typeahead(&buf, ctx.typeahead);
                         update_tui_hint(state, &buf);
+                        crate::term::reset_quit_presses();
                     }
                     0x09 => {
                         if let Some(completed) = complete_idle(&buf) {
@@ -1130,6 +1211,7 @@ fn read_idle_line(
                             update_tui_typeahead(&buf, ctx.typeahead);
                             update_tui_hint(state, &buf);
                         }
+                        crate::term::reset_quit_presses();
                     }
                     0x1a => {
                         // Ctrl-Z: suspend the whole process (the TUI thread +
@@ -1152,7 +1234,10 @@ fn read_idle_line(
                         let _ = crossterm::execute!(io::stdout(), EnterAlternateScreen);
                         let _ = io::stdout().flush();
                     }
-                    _ => { /* ignore other control bytes */ }
+                    _ => {
+                        // Ignored control bytes are still keypresses, not hammering.
+                        crate::term::reset_quit_presses();
+                    }
                 }
             }
         } else if n < 0 && started.elapsed() < Duration::from_millis(30) {

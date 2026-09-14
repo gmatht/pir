@@ -189,6 +189,97 @@ pub struct RetryWait {
     pub remaining: Duration,
 }
 
+/// Apply pi-compatible thinking controls to an OpenAI Chat Completions
+/// request body (`openai-completions.js` parity). The per-model
+/// `thinkingFormat` decides the shape and `thinkingLevelMap` maps the level:
+///
+/// - non-reasoning models (catalog metadata present, `reasoning == false`)
+///   get no thinking params at all;
+/// - `deepseek`: a `thinking: {type: enabled/disabled}` toggle plus a mapped
+///   `reasoning_effort` (the toggle is what actually enables thinking —
+///   sending a bare effort is the slow-thinking bug this fixes);
+/// - `openrouter`: a nested `reasoning: {effort}` object;
+/// - `qwen`: `enable_thinking` plus a mapped `reasoning_effort`;
+/// - `qwen-chat-template`: `chat_template_kwargs` with `enable_thinking` +
+///   `preserve_thinking`;
+/// - default (`openai`, missing, or anything unrecognized): plain mapped
+///   `reasoning_effort` (legacy pir behavior when no catalog metadata is
+///   available, i.e. `model_meta == None`).
+///
+/// An explicit `thinkingLevelMap` string always wins; otherwise pir's default
+/// effort names apply (`ThinkingLevel::oai_effort`). When thinking is off, an
+/// effort is only sent where pi sends one (explicit `off` strings and the
+/// OpenRouter/Responses `"none"` fallback).
+fn apply_openai_thinking(
+    body: &mut Map<String, Value>,
+    thinking: crate::config::ThinkingLevel,
+    model_meta: Option<&crate::config::Model>,
+) {
+    use crate::config::ThinkingLevel;
+    let Some(m) = model_meta else {
+        // No catalog metadata (tests, legacy stores): legacy behavior.
+        if let Some(effort) = thinking.oai_effort() {
+            body.insert("reasoning_effort".into(), json!(effort));
+        }
+        return;
+    };
+    if !m.reasoning {
+        return; // pi sends no thinking params for non-reasoning models.
+    }
+    let enabled = thinking != ThinkingLevel::Off;
+    let allow_effort = m.supports_effort();
+    let effort = m.mapped_effort(thinking);
+    match m.thinking_format_name() {
+        "deepseek" => {
+            if enabled {
+                body.insert("thinking".into(), json!({ "type": "enabled" }));
+            } else if !m.off_is_null() {
+                body.insert("thinking".into(), json!({ "type": "disabled" }));
+            }
+            if enabled && allow_effort && let Some(e) = effort {
+                body.insert("reasoning_effort".into(), json!(e));
+            }
+        }
+        "openrouter" => {
+            if enabled {
+                if allow_effort && let Some(e) = effort {
+                    body.insert("reasoning".into(), json!({ "effort": e }));
+                }
+            } else if !m.off_is_null() {
+                let off = m
+                    .thinking_level_map
+                    .get("off")
+                    .and_then(|v| v.clone())
+                    .unwrap_or_else(|| "none".to_string());
+                body.insert("reasoning".into(), json!({ "effort": off }));
+            }
+        }
+        "qwen" => {
+            body.insert("enable_thinking".into(), json!(enabled));
+            if enabled && allow_effort && let Some(e) = effort {
+                body.insert("reasoning_effort".into(), json!(e));
+            }
+        }
+        "qwen-chat-template" => {
+            body.insert(
+                "chat_template_kwargs".into(),
+                json!({ "enable_thinking": enabled, "preserve_thinking": true }),
+            );
+        }
+        _ => {
+            if enabled && allow_effort && let Some(e) = effort {
+                body.insert("reasoning_effort".into(), json!(e));
+            } else if !enabled && allow_effort {
+                // pi only sends an off value when it is an explicit string
+                // (e.g. `"none"`); `mapped_effort(Off)` is exactly that.
+                if let Some(e) = effort {
+                    body.insert("reasoning_effort".into(), json!(e));
+                }
+            }
+        }
+    }
+}
+
 pub struct Client {
     kind: ApiKind,
     base_url: String,
@@ -524,6 +615,11 @@ impl Client {
         url_override: Option<&str>,
         // `false` when the model rejects OpenAI `reasoning_effort`.
         allow_reasoning_effort: bool,
+        // Per-model catalog metadata for thinking controls (`reasoning`,
+        // `compat.thinkingFormat`, `thinkingLevelMap`). `None` keeps the
+        // legacy raw-`reasoning_effort` behavior (tests); the agent passes
+        // `Some(&self.model)`.
+        model_meta: Option<&crate::config::Model>,
         // Retry-wait progress, called ~1/sec while backing off between
         // attempts (plus once at wait start/end) so the UI can show a live
         // "retrying in Ns" countdown. Never touches the transcript.
@@ -557,8 +653,9 @@ impl Client {
                     tools,
                     thinking,
                     allow_reasoning_effort,
+                    model_meta,
                 ),
-                None => self.openai_request(model, max_tokens, system, history, tools, thinking),
+                None => self.openai_request(model, max_tokens, system, history, tools, thinking, model_meta),
             },
             ApiKind::OpenAiResponses => match url_override {
                 Some(u) => self.responses_request_at(
@@ -570,6 +667,7 @@ impl Client {
                     tools,
                     thinking,
                     allow_reasoning_effort,
+                    model_meta,
                 ),
                 None => self.responses_request(
                     model,
@@ -579,6 +677,7 @@ impl Client {
                     tools,
                     thinking,
                     allow_reasoning_effort,
+                    model_meta,
                 ),
             },
         };
@@ -905,6 +1004,8 @@ impl Client {
         )
     }
 
+    /// `model_meta` carries the catalog thinking metadata; see its doc.
+    #[allow(clippy::too_many_arguments)]
     fn openai_request(
         &self,
         model: &str,
@@ -913,6 +1014,11 @@ impl Client {
         history: &[Message],
         tools: &[ToolSpec],
         thinking: crate::config::ThinkingLevel,
+        // Per-model catalog metadata (`reasoning`, `compat.thinkingFormat`,
+        // `compat.supportsReasoningEffort`, `thinkingLevelMap`). `None` keeps
+        // the legacy behavior (raw `reasoning_effort`); `Some` with
+        // `reasoning == false` sends no thinking params at all (pi parity).
+        model_meta: Option<&crate::config::Model>,
     ) -> (String, Value) {
         let mut messages = vec![json!({ "role": "system", "content": system })];
         for m in history.iter().filter(|m| !m.is_empty()) {
@@ -940,11 +1046,11 @@ impl Client {
                 "function": { "name": t.name, "description": t.description, "parameters": t.schema },
             })).collect()),
         );
-        // OpenAI reasoning effort (o-series models). Non-reasoning models ignore
-        // it, so we only set it when the level maps to a concrete effort.
-        if let Some(effort) = thinking.oai_effort() {
-            body.insert("reasoning_effort".into(), json!(effort));
-        }
+        // Thinking controls (pi `openai-completions` parity — see
+        // `apply_openai_thinking`): the per-model `thinkingFormat` decides the
+        // shape (`thinking` toggle, nested `reasoning`, `enable_thinking`, or
+        // plain `reasoning_effort`) and `thinkingLevelMap` maps the level.
+        apply_openai_thinking(&mut body, thinking, model_meta);
         (format!("{}/chat/completions", self.base_url), Value::Object(body))
     }
 
@@ -962,11 +1068,17 @@ impl Client {
         tools: &[ToolSpec],
         thinking: crate::config::ThinkingLevel,
         allow_effort: bool,
+        model_meta: Option<&crate::config::Model>,
     ) -> (String, Value) {
-        let (base, mut body) = self.openai_request(model, max_tokens, system, history, tools, thinking);
+        let (base, mut body) = self.openai_request(model, max_tokens, system, history, tools, thinking, model_meta);
         let _ = base;
         if !allow_effort {
-            body.as_object_mut().unwrap().remove("reasoning_effort");
+            let obj = body.as_object_mut().unwrap();
+            // The model rejects effort fields: drop both the plain and the
+            // OpenRouter-nested shapes. The `thinking` toggle / language-model
+            // `enable_thinking` switches are separate concerns and stay.
+            obj.remove("reasoning_effort");
+            obj.remove("reasoning");
         }
         // The override is a BASE URL (e.g. "https://api.cerebras.ai" or
         // ".../v1"), not a full endpoint: POSTing it verbatim hits
@@ -997,6 +1109,7 @@ impl Client {
         tools: &[ToolSpec],
         thinking: crate::config::ThinkingLevel,
         allow_effort: bool,
+        model_meta: Option<&crate::config::Model>,
     ) -> (String, Value) {
         let mut input = vec![json!({ "role": "system", "content": system })];
         for m in history.iter().filter(|m| !m.is_empty()) {
@@ -1017,8 +1130,24 @@ impl Client {
             })).collect()),
         );
         if allow_effort {
-            if let Some(effort) = thinking.oai_effort() {
-                body.insert("reasoning".into(), json!({ "effort": effort }));
+            // pi `openai-responses` parity: the effort rides
+            // `reasoning.effort`, mapped through `thinkingLevelMap` (`off`
+            // falls back to `"none"` unless explicitly null). Models without
+            // catalog metadata keep the legacy raw-effort behavior.
+            let effort: Option<String> = match model_meta {
+                None => thinking.oai_effort().map(str::to_string),
+                Some(m) if !m.reasoning || !m.supports_effort() => None,
+                Some(m) if thinking.enabled() => m.mapped_effort(thinking),
+                Some(m) if !m.off_is_null() => Some(
+                    m.thinking_level_map
+                        .get("off")
+                        .and_then(|v| v.clone())
+                        .unwrap_or_else(|| "none".to_string()),
+                ),
+                Some(_) => None,
+            };
+            if let Some(e) = effort {
+                body.insert("reasoning".into(), json!({ "effort": e }));
             }
         }
         (format!("{}/responses", self.base_url), Value::Object(body))
@@ -1037,9 +1166,10 @@ impl Client {
         tools: &[ToolSpec],
         thinking: crate::config::ThinkingLevel,
         allow_effort: bool,
+        model_meta: Option<&crate::config::Model>,
     ) -> (String, Value) {
         let (base, body) = self.responses_request(
-            model, max_tokens, system, history, tools, thinking, allow_effort,
+            model, max_tokens, system, history, tools, thinking, allow_effort, model_meta,
         );
         let _ = base;
         let mut url = url.trim_end_matches('/').to_string();
@@ -2980,6 +3110,7 @@ mod tests {
             None,
             None,
             true,
+            None,
             &mut |_w: &RetryWait| {},
             &mut |_n: &str| {},
         );
@@ -3020,6 +3151,7 @@ mod tests {
             None,
             None,
             true,
+            None,
             &mut |_w: &RetryWait| {},
             &mut |_n: &str| {},
         );
@@ -3061,6 +3193,7 @@ mod tests {
             None,
             None,
             true,
+            None,
             &mut |_w: &RetryWait| {},
             &mut |_n: &str| {},
         );
@@ -3311,6 +3444,7 @@ mod tests {
             None,
             None,
             true,
+            None,
             &mut |_w: &RetryWait| {},
             &mut |_n: &str| {},
         );
@@ -3361,6 +3495,7 @@ mod tests {
             None,
             None,
             true,
+            None,
             &mut |_w: &RetryWait| {},
             &mut |_n: &str| {},
         );
@@ -3413,6 +3548,7 @@ mod tests {
             None,
             None,
             true,
+            None,
             &mut |_w: &RetryWait| {},
             &mut |_n: &str| {},
         );
@@ -3475,6 +3611,7 @@ mod tests {
             None,
             None,
             true,
+            None,
             &mut |_w: &RetryWait| waits += 1,
             &mut |n: &str| notices.push_str(n),
         );
@@ -3533,6 +3670,7 @@ mod tests {
             None,
             None,
             true,
+            None,
             &mut |_w: &RetryWait| {},
             &mut |_n: &str| {},
         );
@@ -4063,9 +4201,177 @@ mod tests {
                 &clean,
                 &[],
                 crate::config::ThinkingLevel::Off,
+                None,
             );
             assert_openai_tools_valid(&body);
         }
+    }
+
+    /// Reasoning model builders mirroring `models-store.json` entries.
+    fn reasoning_model(
+        format: Option<&str>,
+        map: &[(&str, Option<&str>)],
+    ) -> crate::config::Model {
+        crate::config::Model {
+            id: "m".into(),
+            name: None,
+            context: Some(1_000_000),
+            max_tokens: Some(384_000),
+            api_override: None,
+            url_override: None,
+            no_reasoning_effort: false,
+            reasoning: true,
+            thinking_format: format.map(str::to_string),
+            supports_reasoning_effort: None,
+            thinking_level_map: map
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.map(str::to_string)))
+                .collect(),
+            price_per_1k: None,
+        }
+    }
+
+    fn non_reasoning_model() -> crate::config::Model {
+        let mut m = reasoning_model(None, &[]);
+        m.reasoning = false;
+        m
+    }
+
+    fn chat_body(
+        format: Option<&str>,
+        map: &[(&str, Option<&str>)],
+        thinking: crate::config::ThinkingLevel,
+    ) -> Value {
+        let client = Client::new(ApiKind::OpenAi, "http://x", "k".to_string());
+        let m = reasoning_model(format, map);
+        let (_url, body) =
+            client.openai_request("m", 16, "sys", &[], &[], thinking, Some(&m));
+        body
+    }
+
+    #[test]
+    fn deepseek_format_sends_thinking_toggle_and_mapped_effort() {
+        use crate::config::ThinkingLevel as L;
+        // The opencode-go deepseek-v4.1-flash shape: high/max only.
+        let map: &[(&str, Option<&str>)] = &[
+            ("minimal", None),
+            ("low", None),
+            ("medium", None),
+            ("high", Some("high")),
+            ("max", Some("max")),
+        ];
+        // High: toggle enabled + mapped effort. This is the slow-thinking
+        // fix: previously only a bare `reasoning_effort` was sent.
+        let body = chat_body(Some("deepseek"), map, L::High);
+        assert_eq!(body["thinking"], serde_json::json!({ "type": "enabled" }));
+        assert_eq!(body["reasoning_effort"], serde_json::json!("high"));
+        // Max must map to "max", not pir's collapsed default "high".
+        let body = chat_body(Some("deepseek"), map, L::Max);
+        assert_eq!(body["thinking"], serde_json::json!({ "type": "enabled" }));
+        assert_eq!(body["reasoning_effort"], serde_json::json!("max"));
+        // Off: explicit disable toggle, no effort (pi parity).
+        let body = chat_body(Some("deepseek"), map, L::Off);
+        assert_eq!(body["thinking"], serde_json::json!({ "type": "disabled" }));
+        assert!(body.get("reasoning_effort").is_none(), "off sends no effort: {body}");
+        // Hidden-but-persisted level (medium): toggle still enables thinking
+        // (pi sends it when forced); the effort falls back to the default.
+        let body = chat_body(Some("deepseek"), map, L::Medium);
+        assert_eq!(body["thinking"], serde_json::json!({ "type": "enabled" }));
+        assert_eq!(body["reasoning_effort"], serde_json::json!("medium"));
+    }
+
+    #[test]
+    fn deepseek_off_null_skips_disable_toggle() {
+        use crate::config::ThinkingLevel as L;
+        // `off: null` means thinking cannot be disabled (pi parity).
+        let body = chat_body(Some("deepseek"), &[("off", None)], L::Off);
+        assert!(body.get("thinking").is_none(), "no toggle when off is null: {body}");
+    }
+
+    #[test]
+    fn non_reasoning_models_send_no_thinking_params() {
+        use crate::config::ThinkingLevel as L;
+        let client = Client::new(ApiKind::OpenAi, "http://x", "k".to_string());
+        let m = non_reasoning_model();
+        for level in [L::Low, L::Medium, L::High, L::Max] {
+            let (_url, body) =
+                client.openai_request("m", 16, "sys", &[], &[], level, Some(&m));
+            assert!(body.get("thinking").is_none(), "{level:?}: {body}");
+            assert!(body.get("reasoning_effort").is_none(), "{level:?}: {body}");
+            assert!(body.get("reasoning").is_none(), "{level:?}: {body}");
+        }
+    }
+
+    #[test]
+    fn legacy_no_meta_keeps_raw_effort() {
+        use crate::config::ThinkingLevel as L;
+        // No catalog metadata: exact legacy behavior (raw effort names).
+        let client = Client::new(ApiKind::OpenAi, "http://x", "k".to_string());
+        let (_url, body) =
+            client.openai_request("m", 16, "sys", &[], &[], L::Medium, None);
+        assert_eq!(body["reasoning_effort"], serde_json::json!("medium"));
+        let (_url, body) =
+            client.openai_request("m", 16, "sys", &[], &[], L::Minimal, None);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn openrouter_format_uses_nested_reasoning_object() {
+        use crate::config::ThinkingLevel as L;
+        let map: &[(&str, Option<&str>)] = &[("high", Some("high")), ("off", Some("none"))];
+        let body = chat_body(Some("openrouter"), map, L::High);
+        assert_eq!(body["reasoning"], serde_json::json!({ "effort": "high" }));
+        assert!(body.get("reasoning_effort").is_none(), "nested, not flat: {body}");
+        // Off falls back to the explicit off value (pi `?? "none"`).
+        let body = chat_body(Some("openrouter"), &[("high", Some("high"))], L::Off);
+        assert_eq!(body["reasoning"], serde_json::json!({ "effort": "none" }));
+    }
+
+    #[test]
+    fn qwen_format_sets_enable_thinking() {
+        use crate::config::ThinkingLevel as L;
+        let body = chat_body(Some("qwen"), &[], L::High);
+        assert_eq!(body["enable_thinking"], serde_json::json!(true));
+        assert_eq!(body["reasoning_effort"], serde_json::json!("high"));
+        let body = chat_body(Some("qwen"), &[], L::Off);
+        assert_eq!(body["enable_thinking"], serde_json::json!(false));
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn effort_opt_out_drops_effort_but_keeps_toggle() {
+        use crate::config::ThinkingLevel as L;
+        // Models that reject effort fields (kimi-k2.6 style): the toggle
+        // stays, both effort shapes go.
+        let client = Client::new(ApiKind::OpenAi, "http://x", "k".to_string());
+        let m = reasoning_model(Some("deepseek"), &[("high", Some("high"))]);
+        let (_url, body) = client.openai_request_at(
+            "https://example.com/v1",
+            "m",
+            16,
+            "sys",
+            &[],
+            &[],
+            L::High,
+            false,
+            Some(&m),
+        );
+        assert_eq!(body["thinking"], serde_json::json!({ "type": "enabled" }));
+        assert!(body.get("reasoning_effort").is_none(), "opt-out drops effort: {body}");
+    }
+
+    #[test]
+    fn responses_request_maps_effort_through_level_map() {
+        use crate::config::ThinkingLevel as L;
+        let client = Client::new(ApiKind::OpenAiResponses, "http://x", "k".to_string());
+        let m = reasoning_model(None, &[("max", Some("max"))]);
+        let (_url, body) =
+            client.responses_request("m", 16, "sys", &[], &[], L::Max, true, Some(&m));
+        assert_eq!(body["reasoning"], serde_json::json!({ "effort": "max" }));
+        // Off → explicit "none" (pi parity).
+        let (_url, body) =
+            client.responses_request("m", 16, "sys", &[], &[], L::Off, true, Some(&m));
+        assert_eq!(body["reasoning"], serde_json::json!({ "effort": "none" }));
     }
 }
 
