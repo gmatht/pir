@@ -8,6 +8,7 @@ use crate::term;
 use crate::types::{Block, Message, Role, Usage};
 use crate::session::SessionStatus;
 use serde_json::{json, Value};
+use streamdown_ansi::sanitize::sanitize_for_terminal;
 use std::cell::{Cell, RefCell};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, Write};
@@ -2193,7 +2194,16 @@ impl Agent {
                     None => self.registry.execute(name, input),
                 };
                 if !self.silent() {
-                    term::out(&term::dim(&format!("  {}\n", first_line(&outcome.content))));
+                    // Echo the result for the human: multi-line, but abridged so
+                    // a huge build log can't bury the prompt. The model and the
+                    // session log still receive the full `outcome.content`.
+                    let echoed = abridge_output(&outcome.content);
+                    let indented = echoed
+                        .lines()
+                        .map(|l| format!("  {l}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    term::out(&term::dim(&format!("{indented}\n")));
                 }
                 results.blocks.push(Block::ToolResult {
                     tool_use_id: id.clone(),
@@ -2726,13 +2736,63 @@ fn describe_call(name: &str, input: &Value) -> String {
     }
 }
 
-fn first_line(s: &str) -> String {
-    let t = s.trim();
-    let mut out: String = t.lines().next().unwrap_or("").chars().take(120).collect();
-    if t.lines().count() > 1 {
-        out.push_str(" …");
+/// Lines of a tool result echoed from the head and the tail when the output is
+/// long. The tail matters: the `bash` tool appends `[stderr]` and
+/// `[exit code N]` at the end, so a head-only preview hid exactly the part a
+/// human needs in order to see a command fail.
+const OUTPUT_HEAD_LINES: usize = 15;
+const OUTPUT_TAIL_LINES: usize = 15;
+/// Longest single line echoed verbatim; longer lines are clipped.
+const OUTPUT_LINE_CHARS: usize = 240;
+
+/// Format a tool result for the human-facing REPL echo.
+///
+/// The model and the session log still receive the untouched `content`; this is
+/// only what is scrolled into the terminal, so it must stay readable for a
+/// 30k-line build log while still showing that something failed. Control
+/// characters are sanitized (a stray `\r` or escape must not overwrite the
+/// prompt), `\r\n`/`\r` become line breaks, and the middle is elided when the
+/// output exceeds the head+tail budget.
+pub(crate) fn abridge_output(content: &str) -> String {
+    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    let clean = sanitize_for_terminal(&normalized);
+    let clean = clean.trim_end_matches(['\n', ' ', '\t']);
+    if clean.is_empty() {
+        return "(no output)".to_string();
     }
-    out
+    let lines: Vec<&str> = clean.lines().collect();
+    let total = lines.len();
+    let mut out_lines: Vec<String> = Vec::new();
+    if total <= OUTPUT_HEAD_LINES + OUTPUT_TAIL_LINES {
+        out_lines.extend(lines.iter().map(|l| clip_line(l, OUTPUT_LINE_CHARS)));
+    } else {
+        out_lines.extend(
+            lines[..OUTPUT_HEAD_LINES]
+                .iter()
+                .map(|l| clip_line(l, OUTPUT_LINE_CHARS)),
+        );
+        out_lines.push(format!(
+            "… [pir] {} line(s) elided",
+            total - OUTPUT_HEAD_LINES - OUTPUT_TAIL_LINES
+        ));
+        out_lines.extend(
+            lines[total - OUTPUT_TAIL_LINES..]
+                .iter()
+                .map(|l| clip_line(l, OUTPUT_LINE_CHARS)),
+        );
+    }
+    out_lines.join("\n")
+}
+
+/// Clip one output line to `max` chars (on a char boundary) with an ellipsis.
+fn clip_line(line: &str, max: usize) -> String {
+    let line = line.trim_end();
+    if line.chars().count() <= max {
+        return line.to_string();
+    }
+    let mut s: String = line.chars().take(max.saturating_sub(1)).collect();
+    s.push('…');
+    s
 }
 
 /// Truncate `s` to `n` chars (with a trailing ellipsis) for compact status lines.
@@ -3083,5 +3143,67 @@ mod notice_log_tests {
             "user+assistant around the notice must still pair: {dump}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod output_echo_tests {
+    use super::{abridge_output, OUTPUT_HEAD_LINES, OUTPUT_TAIL_LINES};
+
+    /// The regression that motivated this: the agent echoed only the *first
+    /// line* of a tool result, so a failing `bash` command's `[stderr]` block
+    /// and `[exit code N]` tail were never visible to the human.
+    #[test]
+    fn long_output_keeps_head_and_tail_with_exit_code() {
+        let mut body = String::new();
+        for i in 0..100 {
+            body.push_str(&format!("line {i}\n"));
+        }
+        body.push_str("[stderr]\nboom: it failed\n[exit code 1]");
+        let shown = abridge_output(&body);
+        assert!(shown.starts_with("line 0\n"), "head missing: {shown}");
+        assert!(shown.contains("line 14"), "expected the last head line: {shown}");
+        assert!(!shown.contains("line 50"), "middle must be elided: {shown}");
+        assert!(shown.contains("boom: it failed"), "stderr must be echoed: {shown}");
+        assert!(shown.contains("[exit code 1]"), "exit code must be echoed: {shown}");
+        assert!(
+            shown.contains("line(s) elided"),
+            "elision must be marked: {shown}"
+        );
+    }
+
+    #[test]
+    fn exact_budget_is_shown_whole() {
+        let budget = OUTPUT_HEAD_LINES + OUTPUT_TAIL_LINES;
+        let body: String = (0..budget)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let shown = abridge_output(&body);
+        assert!(!shown.contains("elided"), "no elision at the budget: {shown}");
+        assert_eq!(shown.lines().count(), budget);
+    }
+
+    #[test]
+    fn empty_output_is_marked() {
+        assert_eq!(abridge_output("   \n\n"), "(no output)");
+        assert_eq!(abridge_output(""), "(no output)");
+    }
+
+    /// Command output is untrusted: a carriage return or escape sequence must
+    /// not be able to overwrite the prompt or recolor the terminal.
+    #[test]
+    fn control_characters_are_sanitized_and_cr_splits_lines() {
+        let shown = abridge_output("progress 1\rprogress 2\n\x1b[31mred\x1b[0m");
+        assert!(!shown.contains('\r'), "raw CR survived: {shown:?}");
+        assert!(!shown.contains('\x1b'), "raw escape survived: {shown:?}");
+        assert!(shown.contains("progress 1") && shown.contains("progress 2"));
+    }
+
+    #[test]
+    fn overlong_line_is_clipped() {
+        let shown = abridge_output(&"x".repeat(1000));
+        assert!(shown.ends_with('…'), "long line must be clipped: {shown}");
+        assert_eq!(shown.chars().count(), super::OUTPUT_LINE_CHARS);
     }
 }

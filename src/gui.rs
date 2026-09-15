@@ -894,8 +894,12 @@ fn drain_session_log(log: PathBuf, state: &mut GuiState) {
                     }
                     Some("tool_result") => {
                         let c = b.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                        let c: String = c.lines().take(1).collect::<Vec<_>>().join(" ");
-                        text.push_str(&format!("  {c}\n"));
+                        // Same abridged multi-line echo as the live REPL, so a
+                        // resumed session shows command output, not just one
+                        // line of it.
+                        for line in crate::agent::abridge_output(c).lines() {
+                            text.push_str(&format!("  {line}\n"));
+                        }
                     }
                     _ => {}
                 }
