@@ -1997,6 +1997,13 @@ impl Spinner {
                 set_parked(true);
                 let _ = out.write_all(buf.as_bytes());
                 let _ = out.flush();
+                // Release SCREEN before the tick sleep. Holding it across the
+                // sleep starves every other SCREEN user for up to 80ms per
+                // tick — and `Spinner::start_with` (which locks SCREEN while a
+                // spinner is replaced) plus content writes (`term::out`) can
+                // wait many seconds, stalling the whole turn. The lock only
+                // needs to guard the repaint above.
+                drop(_screen);
                 std::thread::sleep(Duration::from_millis(80));
                 i = i.wrapping_add(1);
             }
