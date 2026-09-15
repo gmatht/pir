@@ -393,7 +393,7 @@ fn build_system_prompt(cwd: &Path) -> String {
     system.push_str(
         "\nGuidelines:\n\
          - Use the tools to actually do the work; don't just describe it.\n\
-         - Use bash for file operations like ls, rg, find.\n\
+         - Use bash for file operations; prefer rg over grep/find (both are wrapped to rg by default).\n\
          - Use read_file to examine files instead of cat or sed.\n\
          - Use write_file only for new files or complete rewrites.\n\
          - Use edit_file for precise changes (old_string must match exactly).\n\

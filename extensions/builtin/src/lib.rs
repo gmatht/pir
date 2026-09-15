@@ -1018,6 +1018,75 @@ fn truncate_mid(s: &str, max: usize) -> String {
     format!("{head}…{tail}")
 }
 
+/// Script sourced by every non-interactive `bash -c` the agent spawns (via
+/// `BASH_ENV`). It wraps `timeout` for hard-kill semantics and, when ripgrep
+/// is installed, wraps `grep`/`find` to steer the agent away from slow
+/// searches (a whole-filesystem `find /` is the usual offender). Version-
+/// tagged so a cached `/tmp/pir-timeout/bashenv` from an older build is
+/// rewritten.
+const PIR_BASHENV: &str = r#"# pir-bashenv-v2
+# Wrap `timeout` so a model-issued `timeout N cmd` also hard-kills a child
+# that ignores SIGTERM (KILL 5s after TERM). User overrides in this file win.
+__pir_timeout_default() { command timeout -k 5 "$@"; }
+timeout() { __pir_timeout_default "$@"; }
+
+# Steer the agent's searches at ripgrep when it is installed (set
+# PIR_RG_ALIASES=0 to opt out). The usual offender is a whole-filesystem
+# `find /`; rg is far faster and respects .gitignore. These are shell
+# *functions*, not aliases: a non-interactive `bash -c` does not expand
+# aliases. Each wrapper falls back to the real tool for arguments it cannot
+# translate safely.
+__pir_rg_on() {
+  case "${PIR_RG_ALIASES:-1}" in
+    0|off|false|no|OFF|False|No) return 1 ;;
+  esac
+  command -v rg >/dev/null 2>&1
+}
+if __pir_rg_on; then
+  # grep -> rg. GNU's recursive -r/-R is dropped (rg is recursive by default
+  # and `-r` means --replace); simple recursive clusters such as -rn/-ri are
+  # rewritten. Flags rg does not share, or clusters we cannot rewrite safely,
+  # fall back to the real grep.
+  grep() {
+    local x
+    local -a out=()
+    for x in "$@"; do
+      case "$x" in
+        --include|--include=*|--exclude|--exclude=*|--exclude-from|--exclude-from=*|-d|-D|-z|-Z|--binary-files|--binary-files=*)
+          command grep "$@"; return ;;
+      esac
+    done
+    for x in "$@"; do
+      case "$x" in
+        -r|-R) : ;;
+        --*) out+=("$x") ;;
+        -*)
+          if [[ "$x" =~ ^-[rRivnlLcoqwxasHIEF]+$ ]]; then
+            out+=("-${x//[rR]/}")
+          elif [[ "$x" == *r* || "$x" == *R* ]]; then
+            command grep "$@"; return
+          else
+            out+=("$x")
+          fi ;;
+        *) out+=("$x") ;;
+      esac
+    done
+    command rg "${out[@]}"
+  }
+  # find -> rg --files for a plain directory listing; any predicate
+  # (-name/-type/-exec/...) defers to the real find, which rg does not
+  # implement. rg --files respects .gitignore and omits hidden files, unlike
+  # find(1).
+  find() {
+    local x
+    for x in "$@"; do
+      case "$x" in -*) command find "$@"; return ;; esac
+    done
+    command rg --files "$@"
+  }
+fi
+"#;
+
 fn spawn_shell(command: &str, cwd: &Path) -> Result<std::process::Child, String> {
     // Hard-kill behind every `timeout`: GNU `timeout` alone sends only
     // SIGTERM, so a child that ignores/traps TERM (or is wedged) survives the
@@ -1030,16 +1099,21 @@ fn spawn_shell(command: &str, cwd: &Path) -> Result<std::process::Child, String>
     // overrides in the same file win over this default.
     #[cfg(unix)]
     {
-        let script = r#"
-__pir_timeout_default() { command timeout -k 5 "$@"; }
-timeout() { __pir_timeout_default "$@"; }
-"#;
         let stash_dir = std::env::temp_dir().join("pir-timeout");
         let _ = fs::create_dir_all(&stash_dir);
         let path = stash_dir.join("bashenv");
-        let exists = fs::read_to_string(&path).map(|s| s.contains("__pir_timeout_default")).unwrap_or(false);
-        if !exists {
-            let _ = fs::write(&path, script);
+        // Rewrite when the on-disk script is from an older version (marker
+        // changed), so existing caches pick up new wrappers.
+        let current = fs::read_to_string(&path)
+            .map(|s| s.contains("# pir-bashenv-v2"))
+            .unwrap_or(false);
+        if !current {
+            // Write via a unique temp + rename so a concurrently spawned
+            // `bash` can never source a half-written file.
+            let tmp = stash_dir.join(format!("bashenv.tmp.{}", std::process::id()));
+            if fs::write(&tmp, PIR_BASHENV).is_ok() {
+                let _ = fs::rename(&tmp, &path);
+            }
         }
     }
     let build = |prog: &str, flag: &str| {
@@ -1289,6 +1363,43 @@ mod esc_tests {
             "job_kill took {elapsed:?} — the escaped-grandchild hang is back"
         );
         assert!(out.contains("job#1"), "unexpected job_kill reply: {out}");
+    }
+
+    /// The agent's bash environment must steer `grep`/`find` at ripgrep when
+    /// it is installed (PIR_RG_ALIASES defaults on), so agents don't burn
+    /// minutes on a whole-filesystem `find /`. The wrappers are shell
+    /// functions and must fall back to the real tools for inputs rg cannot
+    /// take.
+    #[test]
+    fn bashenv_prefers_rg_for_grep_and_find() {
+        // The generated script always carries the wrappers; the runtime gate
+        // decides whether they are installed.
+        assert!(PIR_BASHENV.contains("grep()"), "grep wrapper missing");
+        assert!(PIR_BASHENV.contains("find()"), "find wrapper missing");
+        assert!(PIR_BASHENV.contains("PIR_RG_ALIASES"), "opt-out missing");
+        let have_rg = std::process::Command::new("rg")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let opted_out = std::env::var("PIR_RG_ALIASES")
+            .map(|v| v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false);
+        if !have_rg || opted_out {
+            return; // the runtime gate would leave the real tools in place
+        }
+        let abort = Arc::new(AtomicBool::new(false));
+        let mut b = Builtin::new(PathBuf::from("."), abort, Arc::new(AtomicBool::new(false)));
+        let out = run_shell(&mut b, "type grep; type find").expect("run_shell");
+        assert!(out.contains("function"), "grep/find should be functions with rg present: {out}");
+        // GNU's recursive `-r` must be rewritten (rg's `-r` means --replace).
+        let out = run_shell(&mut b, "printf 'alpha\\nbeta\\n' | grep -r alpha").expect("run_shell");
+        assert!(out.contains("alpha"), "grep -r via rg should match: {out}");
+        // A `find` predicate must still work through the real-find fallback.
+        let out = run_shell(&mut b, "find . -maxdepth 1 -name 'Cargo.toml'").expect("run_shell");
+        assert!(out.contains("Cargo.toml"), "find predicate fallback should work: {out}");
     }
 }
 

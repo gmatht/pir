@@ -194,6 +194,12 @@ AGENT USERS RUN UNATTENDED
   sandbox boundary is the user account itself. Use `pir -c`/`--confirm` or set
   PIR_CONFIRM=1 to force prompts even as an ai_* user.
 
+AGENT SHELL
+  Agent `bash` commands source a small env that wraps `grep`/`find` to
+  ripgrep when it is installed, so searches stay fast (a whole-filesystem
+  `find /` is the usual offender). `grep -r` is rewritten for rg; `find`
+  keeps its predicates via the real find. Set PIR_RG_ALIASES=0 to disable.
+
 COMMANDS
   /help  /menu  /model <sel>  /models  /default-model <sel>  /sessions  /goal [objective]  /continue
   /thinking [<level>] [show|hide]   set the model's thinking level
