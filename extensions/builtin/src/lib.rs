@@ -615,6 +615,28 @@ fn list_dir(input: &serde_json::Value, anchor: &Path) -> Result<String, String> 
     Ok(entries.join("\n"))
 }
 
+/// Poll granularity for the command wait/clock loops. These used fixed
+/// 250-500 ms sleeps, so an ESC/ctrl-c could sit unnoticed for half a second
+/// before the kill even started (the "tool cancelling takes >99 ms" report).
+/// Slicing at this interval bounds that latency while each slice costs only a
+/// cheap atomic load (plus a `try_wait` in the main loop).
+const WAIT_SLICE: Duration = Duration::from_millis(10);
+
+/// Sleep up to `total`, returning as soon as `stop` flips. Used by the
+/// elapsed-clock thread so `run_shell` can join it immediately on abort
+/// instead of waiting out its full 250-500 ms tick (that join alone was
+/// ~500 ms of the measured cancel latency).
+fn sleep_or_stop(stop: &AtomicBool, total: Duration) {
+    let deadline = Instant::now() + total;
+    loop {
+        let now = Instant::now();
+        if now >= deadline || stop.load(Ordering::SeqCst) {
+            return;
+        }
+        std::thread::sleep((deadline - now).min(WAIT_SLICE));
+    }
+}
+
 fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
     // Hard ceiling for a single foreground command. Raised from 120s so the
     // 10-minute check-in below is reachable; if it overruns the ceiling it is
@@ -675,7 +697,7 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
     let elapsed_tid = std::thread::spawn(move || {
         if !clock_tty {
             while !clock_stop_w.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(500));
+                sleep_or_stop(&clock_stop_w, Duration::from_millis(500));
             }
             return;
         }
@@ -691,10 +713,10 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
                     let mut serr = io::stderr();
                     let _ = serr.flush();
                 }
-                std::thread::sleep(Duration::from_millis(250));
+                sleep_or_stop(&clock_stop_w, Duration::from_millis(250));
                 continue;
             }
-            std::thread::sleep(Duration::from_millis(250));
+            sleep_or_stop(&clock_stop_w, Duration::from_millis(250));
             let elapsed = started.elapsed();
             if elapsed < SHOW_AFTER {
                 continue;
@@ -776,7 +798,7 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
                         id
                     ));
                 }
-                std::thread::sleep(Duration::from_millis(250));
+                std::thread::sleep(WAIT_SLICE);
             }
         }
     };
@@ -920,12 +942,12 @@ pub(crate) fn kill_process_tree(child: &mut std::process::Child) -> Option<std::
                         match child.try_wait() {
                             Ok(Some(status)) => return Some(status),
                             Ok(None) if std::time::Instant::now() >= hard => return None,
-                            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                            Ok(None) => std::thread::sleep(WAIT_SLICE),
                             Err(_) => return None,
                         }
                     }
                 }
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                Ok(None) => std::thread::sleep(WAIT_SLICE),
                 Err(_) => return None,
             }
         }
@@ -957,7 +979,7 @@ fn join_drain(h: JoinHandle<()>) -> bool {
             drop(h); // detach; never block the REPL on a stuck pipe
             return false;
         }
-        std::thread::sleep(std::time::Duration::from_millis(25));
+        std::thread::sleep(WAIT_SLICE);
     }
 }
 
@@ -1090,6 +1112,33 @@ mod esc_tests {
             "abort took too long ({elapsed:?}) — command should be killed promptly"
         );
         assert!(out.contains("aborted by user"), "aborted command should report user abort, got: {out}");
+    }
+
+    /// ESC/ctrl-c must interrupt a running foreground command within a human
+    /// blink, not at the next 250 ms tick. The old wait loop slept a fixed
+    /// 250 ms between abort checks, so pressing ESC just after a tick could
+    /// leave the command (and the `running` spinner) alive for ~250 ms — the
+    /// "tool cancelling takes >99 ms" report. This asserts the *latency from
+    /// the abort flag flipping to the command being reaped*, measured on a
+    /// freshly parked loop so the old 250 ms sleep is the only variable.
+    #[test]
+    fn abort_latency_is_sub_100ms() {
+        let abort = Arc::new(AtomicBool::new(false));
+        let mut b = Builtin::new(PathBuf::from("."), abort.clone(), Arc::new(AtomicBool::new(false)));
+        let handle = std::thread::spawn(move || run_shell(&mut b, "sleep 30"));
+        // Land mid-wait: with a 250 ms sleep the loop parks at ~250/500/750…,
+        // so at 300 ms it is ~50 ms into a sleep and would not wake until
+        // ~200 ms after the abort below.
+        std::thread::sleep(Duration::from_millis(300));
+        let t0 = Instant::now();
+        abort.store(true, Ordering::SeqCst);
+        let out = handle.join().unwrap().expect("run_shell result");
+        let latency = t0.elapsed();
+        assert!(
+            latency < Duration::from_millis(100),
+            "abort latency {latency:?} exceeds 100ms — the wait loop is still polling too coarsely"
+        );
+        assert!(out.contains("aborted by user"), "got: {out}");
     }
 
     #[test]
