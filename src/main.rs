@@ -598,10 +598,38 @@ fn main() {
     // happen under the invoking user's HOME while the write happened under the
     // (dropped-to) sandbox user's HOME.
     #[cfg(unix)]
-    let resolved_user: Option<String> = {
+    let resolved_user: Option<String> = 'resolved: {
         let target = as_user.clone().unwrap_or_else(|| {
             crate::config::resolve_project_user(None, project_name.as_deref())
         });
+        // No sandbox account exists (fresh checkout that never ran
+        // `pir project init`): there is nothing to drop to, so do NOT read any
+        // security policy here. The invoking user's policy defaults have
+        // user-security + write-quarantine ON, and inheriting them made us
+        // (a) try `become_user` an account that does not exist only to fall
+        // back, and (b) later mount system-tree overlays (/etc, /var, ...) for
+        // a session that runs unconfined — the dominant cost of a cold start.
+        // Start user-security OFF and tell the operator how to opt in.
+        if crate::user::lookup_user(&target).is_err() {
+            eprintln!(
+                "{}",
+                crate::term::red(&format!(
+                    "[pir] no sandbox user '{target}' — starting WITHOUT user-security (and its write-quarantine). \
+                     Run `pir project init` (or /project init) to create it and enable confinement."
+                ))
+            );
+            // `PIR_NO_SANDBOX_USER` is consumed by `Agent::new` to force the
+            // user-security boundary and its write-quarantine off; it is set
+            // only on this startup fallback, so background agents inherit the
+            // same no-sandbox posture and unit tests are unaffected.
+            // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+            // it to startup config and explicit session toggles.
+            unsafe {
+                std::env::set_var("PIR_AGENT_AS_INVOKER", "1");
+                std::env::set_var("PIR_NO_SANDBOX_USER", "1");
+            }
+            break 'resolved None;
+        }
         // Decide confinement from the *target* (sandbox) user's policy: the
         // operator edits `security.toml` as that user (via `/menu`), so we must
         // read it from their home, not the invoking user's. When user-security

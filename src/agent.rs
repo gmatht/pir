@@ -480,7 +480,21 @@ impl Agent {
         // escalation ask-only). `None` -> no guardrail consulted. The context
         // is built once and shared; its `check` is the single entry point the
         // tool path calls before each tool runs.
-        let policy = crate::security::load_policy();
+        let mut policy = crate::security::load_policy();
+        // No per-project sandbox user was provisioned at startup (fresh
+        // checkout, never `pir project init`): the operator has not asked for
+        // the user-security boundary and there is no account to enforce it, so
+        // force it off here. Its write-quarantine goes with it — mounting
+        // system-tree overlays for a session that runs as the invoking user is
+        // wrong, and was the dominant cost of a cold start (see main.rs).
+        // `PIR_NO_SANDBOX_USER` is set only by that startup fallback, so
+        // background agents inherit the same posture and unit tests are
+        // unaffected.
+        if std::env::var_os("PIR_NO_SANDBOX_USER").is_some() {
+            policy.user_security = false;
+            policy.quarantine = false;
+            policy.quarantine_project = false;
+        }
         // The "user-security" policy IS the per-project user boundary: when it
         // is OFF the agent must not be confined to the sandbox user, so its
         // commands run as the *invoking* user (mirrors `/su-security off`).
