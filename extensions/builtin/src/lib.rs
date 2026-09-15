@@ -1024,7 +1024,7 @@ fn truncate_mid(s: &str, max: usize) -> String {
 /// searches (a whole-filesystem `find /` is the usual offender). Version-
 /// tagged so a cached `/tmp/pir-timeout/bashenv` from an older build is
 /// rewritten.
-const PIR_BASHENV: &str = r#"# pir-bashenv-v2
+const PIR_BASHENV: &str = r#"# pir-bashenv-v3
 # Wrap `timeout` so a model-issued `timeout N cmd` also hard-kills a child
 # that ignores SIGTERM (KILL 5s after TERM). User overrides in this file win.
 __pir_timeout_default() { command timeout -k 5 "$@"; }
@@ -1045,14 +1045,15 @@ __pir_rg_on() {
 if __pir_rg_on; then
   # grep -> rg. GNU's recursive -r/-R is dropped (rg is recursive by default
   # and `-r` means --replace); simple recursive clusters such as -rn/-ri are
-  # rewritten. Flags rg does not share, or clusters we cannot rewrite safely,
-  # fall back to the real grep.
+  # rewritten. Only short flags GNU grep and rg agree on are passed through;
+  # anything else (notably -E, -h, -H, -I, -L, -P, where rg means something
+  # different) falls back to the real grep.
   grep() {
-    local x
+    local x stripped
     local -a out=()
     for x in "$@"; do
       case "$x" in
-        --include|--include=*|--exclude|--exclude=*|--exclude-from|--exclude-from=*|-d|-D|-z|-Z|--binary-files|--binary-files=*)
+        --include|--include=*|--exclude|--exclude=*|--exclude-dir|--exclude-dir=*|--exclude-from|--exclude-from=*|--directories|--directories=*|--binary-files|--binary-files=*|--label|--label=*|--mmap|--initial-tab)
           command grep "$@"; return ;;
       esac
     done
@@ -1060,13 +1061,13 @@ if __pir_rg_on; then
       case "$x" in
         -r|-R) : ;;
         --*) out+=("$x") ;;
+        -[efmABC]*) out+=("$x") ;;
         -*)
-          if [[ "$x" =~ ^-[rRivnlLcoqwxasHIEF]+$ ]]; then
-            out+=("-${x//[rR]/}")
-          elif [[ "$x" == *r* || "$x" == *R* ]]; then
-            command grep "$@"; return
+          if [[ "$x" =~ ^-[rRivnlcoqwxsaF]+$ ]]; then
+            stripped="-${x//[rR]/}"
+            [ "$stripped" = "-" ] || out+=("$stripped")
           else
-            out+=("$x")
+            command grep "$@"; return
           fi ;;
         *) out+=("$x") ;;
       esac
@@ -1105,7 +1106,7 @@ fn spawn_shell(command: &str, cwd: &Path) -> Result<std::process::Child, String>
         // Rewrite when the on-disk script is from an older version (marker
         // changed), so existing caches pick up new wrappers.
         let current = fs::read_to_string(&path)
-            .map(|s| s.contains("# pir-bashenv-v2"))
+            .map(|s| s.contains("# pir-bashenv-v3"))
             .unwrap_or(false);
         if !current {
             // Write via a unique temp + rename so a concurrently spawned
@@ -1400,6 +1401,15 @@ mod esc_tests {
         // A `find` predicate must still work through the real-find fallback.
         let out = run_shell(&mut b, "find . -maxdepth 1 -name 'Cargo.toml'").expect("run_shell");
         assert!(out.contains("Cargo.toml"), "find predicate fallback should work: {out}");
+        // Flags where rg differs from GNU grep must fall back to the real
+        // grep: `-h` is rg's help and `-E` is rg's --encoding.
+        let out = run_shell(&mut b, "grep -h \"fn main\" src/main.rs").expect("run_shell");
+        assert!(
+            out.contains("fn main") && !out.contains("ripgrep"),
+            "grep -h must use the real grep: {out}"
+        );
+        let out = run_shell(&mut b, "printf 'foo\\nbar\\n' | grep -E 'foo|bar'").expect("run_shell");
+        assert!(out.contains("foo") && out.contains("bar"), "grep -E must use the real grep: {out}");
     }
 }
 
