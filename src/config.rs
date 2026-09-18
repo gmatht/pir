@@ -2074,6 +2074,126 @@ mod worktree_settings_tests {
         );
     }
 
+    /// The real-world bug this pins: `opencode-go/muse-spark-1.3-contributor`
+    /// missing from `/models` was never a catalog/filter bug — pir read the
+    /// *sandbox* user's store (`~ai_pir/.pi/...`, one `local/fake` provider)
+    /// instead of the invoking user's rich catalog, so the whole `opencode-go`
+    /// provider was absent from the list.
+    ///
+    /// `main` resolves `HOME` as the invoking user *before* `become_user`
+    /// (which rewrites `HOME` to the sandbox account). `pi_dir()` is derived
+    /// from `HOME`, so the pre-drop read must land on the invoking user's
+    /// `~/.pi/agent/models-store.json` — not the `ai_X` store. This simulates
+    /// both sides of the drop by moving `HOME` between two real stores and
+    /// asserts the catalog follows: the rich one is seen pre-drop, the stub
+    /// never shadows it.
+    #[test]
+    fn pre_drop_load_reads_invoking_user_store_not_sandbox() {
+        let _env = TEST_ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("pir_homedrop_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // The INVOKING user's home (`/root`): the real 0600 store with the
+        // opencode-go provider, including the exact muse entry from the report.
+        let invoker_home = root.join("invoker");
+        let invoker_agent = invoker_home.join(".pi").join("agent");
+        std::fs::create_dir_all(&invoker_agent).unwrap();
+        std::fs::write(
+            invoker_agent.join("models-store.json"),
+            serde_json::json!({
+                "providers": {
+                    "opencode-go": {
+                        "baseUrl": "https://opencode.ai/zen/go/v1",
+                        "apiKey": "k",
+                        "api": "openai-completions",
+                        "models": [
+                            { "id": "deepseek-v4-flash", "api": "openai-completions" },
+                            { "id": "muse-spark-1.3-contributor",
+                              "api": "openai-responses",
+                              "baseUrl": "https://opencode.ai/zen/go/v1" },
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // The SANDBOX user's home (`/home/ai_pir`): a tiny stub store with no
+        // opencode-go at all — exactly what made muse unreachable.
+        let sandbox_home = root.join("ai_pir");
+        let sandbox_agent = sandbox_home.join(".pi").join("agent");
+        std::fs::create_dir_all(&sandbox_agent).unwrap();
+        std::fs::write(
+            sandbox_agent.join("models-store.json"),
+            serde_json::json!({
+                "providers": [{
+                    "id": "local",
+                    "baseUrl": "http://127.0.0.1:8799/v1",
+                    "apiKey": "literalkey123",
+                    "api": "openai",
+                    "models": [{ "id": "fake", "name": "Fake", "context": 8000 }]
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let old_home = std::env::var_os("HOME");
+        let old_pidir = std::env::var_os("PI_DIR");
+        // `PI_DIR` wins over `HOME` in `pi_dir()`, so clear it to exercise the
+        // HOME-derived path this test is about.
+        unsafe { std::env::remove_var("PI_DIR"); }
+
+        // --- Pre-drop: running as the invoking user (HOME=/root-like). ---
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("HOME", &invoker_home); }
+        let pre_drop = load_providers().expect("invoking-user store must load");
+        let pre_has_muse = pre_drop.iter().any(|p| {
+            p.pid() == "opencode-go"
+                && p.models
+                    .iter()
+                    .any(|m| m.id == "muse-spark-1.3-contributor")
+        });
+
+        // --- Post-drop: `become_user` rewrote HOME to the sandbox account. ---
+        unsafe { std::env::set_var("HOME", &sandbox_home); }
+        let post_drop = load_providers().expect("sandbox store must load");
+        let post_has_muse = post_drop.iter().any(|p| {
+            p.pid() == "opencode-go"
+                && p.models
+                    .iter()
+                    .any(|m| m.id == "muse-spark-1.3-contributor")
+        });
+
+        // Restore env before any assertion so a failure can't leak state.
+        match old_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match old_pidir {
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        // The whole point: the pre-drop read IS the invoking user's authority.
+        assert!(
+            pre_has_muse,
+            "pre-drop load must read the INVOKING user's store (HOME-derived), \
+             so opencode-go/muse-spark-1.3-contributor is present"
+        );
+        // And the sandbox store genuinely lacks it — proving the drop is what
+        // changes the answer (a regression that read the sandbox store first
+        // would fail the assertion above, not silently pass).
+        assert!(
+            !post_has_muse,
+            "the sandbox ai_ user's stub store has no opencode-go, so this test \
+             actually discriminates between the two paths"
+        );
+    }
+
     /// Build a reasoning model with the given format + level map, mirroring a
     /// `models-store.json` entry (e.g. opencode-go's deepseek-v4.1-flash).
     fn compat_model(
