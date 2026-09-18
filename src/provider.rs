@@ -19,7 +19,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// Retry policy: transient failures that strike *before* any output is
-/// produced (network blips, DNS hiccups, timeouts, transient 5xx / 429) are
+/// produced (network blips, DNS hiccups, timeouts, transient 5xx / 429,
+/// stalled streams with no bytes yet) are
 /// retried **forever** — the turn never gives up on its own. The wait between
 /// attempts doubles each time (see `retry_backoff`), so a sick server gets
 /// progressively more breathing room instead of being hammered. Hard errors
@@ -889,13 +890,10 @@ impl Client {
                     if e == "request cancelled" {
                         return Err(e);
                     }
-                    // A stalled stream is terminal, not transient: the peer went
-                    // silent mid-stream, so re-issuing the request won't make it
-                    // resume — it would just stall again for another full
-                    // watchdog period. Cancellation is likewise fatal (above).
-                    if e.contains("stalled") {
-                        return Err(e);
-                    }
+                    // Mid-stream failures after visible output stay fatal:
+                    // re-issuing would duplicate already-printed text. A
+                    // pre-output stall (no bytes yet) retries forever with
+                    // exponential backoff like any transient failure.
                     if !is_retryable(&e) || emitted_text || saw_tool_calls {
                         return Err(e);
                     }
@@ -1342,16 +1340,19 @@ impl Drop for CancelableReader {
 }
 
 /// Decide whether an error is worth retrying. Retry on transport-level
-/// failures (DNS, connection refused, TLS, timeouts, I/O) and on transient
+/// failures (DNS, connection refused, TLS, timeouts, I/O), pre-output
+/// stalled streams (peer silent before any bytes — a fresh attempt may
+/// connect cleanly), and on transient
 /// HTTP status codes (429 rate-limit, 500/502/503/504 server errors). Do
 /// NOT retry on 4xx client errors other than 429 (e.g. 401 unauthorized,
 /// 400 bad request) — those won't succeed on replay.
 fn is_retryable(error: &str) -> bool {
-    // A stalled stream (peer went silent mid-stream) or a cancellation is not a
-    // transient failure worth replaying — retry would just re-block on the same
-    // dead connection. These are handled as fatal by the caller; refuse them
-    // here too so `is_retryable` stays the single source of truth.
-    if error.contains("stalled") || error == "request cancelled" {
+    // Cancellation is never worth replaying — handled as fatal by the caller.
+    // A stalled stream is retryable here; the caller decides via
+    // emitted_text/saw_tool_calls (pre-output stalls retry forever with
+    // backoff, mid-stream stalls after visible output stay fatal to avoid
+    // duplicating already-printed text).
+    if error == "request cancelled" {
         return false;
     }
     // Quota / usage-limit errors are terminal, not transient: a rate limit that
@@ -1363,7 +1364,6 @@ fn is_retryable(error: &str) -> bool {
     let l = error.to_lowercase();
     if l.contains("usage limit")
         || l.contains("weekly usage")
-        || l.contains("rate limit exceeded")
         || l.contains("quota exceeded")
         || l.contains("quota_exceeded")
         || l.contains("insufficient_quota")
