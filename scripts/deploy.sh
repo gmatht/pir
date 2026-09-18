@@ -71,16 +71,98 @@
 
 set -euo pipefail
 
-WSL_EXEC='/mnt/c/Program Files/WSL/wsl.exe'
-# We wrap the cargo commands to run in the AlmaLinux8 distro.
-# This assumes the AlmaLinux8 distro is installed and configured in WSL.
-# The cargo commands are executed inside the container while keeping the 
-# current working directory (which is shared/mounted).
-cargo() {
-  "$WSL_EXEC" -d AlmaLinux8 cargo "$@"
+# --------------------------------------------------------------- build harness
+#
+# The release must be built against an OLD glibc so the binary also runs on
+# RHEL/Rocky/AlmaLinux 9 and other modern glibc distros (backward-only compat),
+# so cargo runs inside the AlmaLinux 8 WSL distro rather than on the host.
+#
+# Two traps this harness exists to avoid — both silently produced a "successful"
+# deploy that built and tested NOTHING:
+#
+#  1. DISTRO NAME. WSL names the distro `AlmaLinux-8` (hyphen) while this script
+#     used to say `AlmaLinux8`. `wsl.exe -d AlmaLinux8` fails with
+#     WSL_E_DISTRO_NOT_FOUND and — critically — the error text goes to a stream
+#     the caller was capturing, so `rustc --version` "returned" the words
+#     `is` / `code:` instead of a version. The `ver_ge` check then compared
+#     garbage, and because that comparison is inside a `$( )` in a `||` the
+#     script sailed on and exited 0. Never let a tool's failure be mistaken for
+#     its output: every wrapper below checks the exit status explicitly.
+#
+#  2. FILESYSTEM VISIBILITY. Each WSL distro is its own VM. Ubuntu2404 (where
+#     the repo lives) and AlmaLinux-8 cannot see each other's filesystems, so
+#     `cd "$SRC"` then invoking cargo in AlmaLinux-8 cannot work: the relay
+#     fails to translate the cwd and (worse) cargo would silently run somewhere
+#     else. We therefore COPY the source into the distro's own filesystem and
+#     run cargo there, then copy the built artifact back. Stdin (`wsl.exe`) is a
+#     usable byte pipe even when the cwd can't be translated, so the source goes
+#     over as a tar stream and the artifact comes back the same way (base64, to
+#     survive a text-mode hop).
+#
+# Set PIR_DEPLOY_DISTRO to override the distro name, or PIR_DEPLOY_NO_WSL=1 to
+# build with the host toolchain (see the fallback note in `cargo`).
+
+# NB: no quotes INSIDE the default value. `${X:-'...'}` does not strip the
+# quotes — it embeds them literally, so the path became
+# `'/mnt/c/Program Files/WSL/wsl.exe'` (with quote characters) and every
+# `[ -x ]` / exec test failed, silently disabling the distro build. Keep the
+# default bare and quote at the point of use.
+WSL_EXEC="${PIR_DEPLOY_WSL_EXEC:-/mnt/c/Program Files/WSL/wsl.exe}"
+DISTRO="${PIR_DEPLOY_DISTRO:-AlmaLinux-8}"
+# Remote build dir inside the distro (its own disk: the repo is unreachable
+# cross-distro, and /mnt/c is not writable by the build user).
+REMOTE_DIR="${PIR_DEPLOY_REMOTE_DIR:-/home/john/pir-deploy-build}"
+
+# WSL_AVAILABLE tracks whether we can actually use the distro. It starts true
+# and is settled by `wsl_probe` once a distro name is resolved.
+WSL_AVAILABLE=1
+
+# wsl_run: run a shell snippet inside the build distro. `$1` is the working
+# directory (use `-` to mean the staged source). The explicit cd is what
+# guarantees cargo never runs in the wrong place (the relay's default cwd is
+# untranslatable and unreliable).
+#
+# Version probes (`rustc --version`) run before the source is staged, so they
+# must NOT require $REMOTE_DIR to exist — hence the `-` form. Only the build
+# commands need the pinned source directory.
+wsl_run() {
+  local dir="$1"; shift
+  local pre=""
+  if [ "$dir" != "-" ]; then
+    pre="cd '$dir' || { echo 'deploy: staged source missing in distro' >&2; exit 97; }; "
+  fi
+  "$WSL_EXEC" -d "$DISTRO" -- bash -lc "${pre}$*"
 }
+
+# has_wsl: true when the configured distro exists and runs commands. Probes by
+# EXIT STATUS (never by parsing stdout), so a missing distro can't masquerade
+# as a working one.
+has_wsl() {
+  [ "$WSL_AVAILABLE" -eq 1 ] || return 1
+  [ -x "$WSL_EXEC" ] || return 1
+  "$WSL_EXEC" -d "$DISTRO" -- true >/dev/null 2>&1
+}
+
+# cargo/rustc: when the AlmaLinux 8 distro is usable, run the tool there (with
+# the cwd pinned to the staged copy) so the artifact links an old glibc.
+# Otherwise fall back to the host toolchain, with a loud warning: the build
+# still works, but the resulting binary is only guaranteed to run on hosts at
+# least as new as this one.
+cargo() {
+  if has_wsl; then
+    wsl_run "$REMOTE_DIR" "cargo $(printf '%q ' "$@")"
+  else
+    command cargo "$@"
+  fi
+}
+# rustc: used only for the version probe, which runs before staging, so it does
+# not pin the (not-yet-existing) staged directory.
 rustc() {
-  "$WSL_EXEC" -d AlmaLinux8 rustc "$@"
+  if has_wsl; then
+    wsl_run "-" "rustc $(printf '%q ' "$@")"
+  else
+    command rustc "$@"
+  fi
 }
 
 
@@ -187,7 +269,7 @@ ver_ge "$RUST_VER" "1.70" || die "rustc $RUST_VER < 1.70 required"
 
 # Total number of top-level steps (for the step progress markers). Phases that
 # are conditionally skipped still reserve their slot; the marker simply won't print.
-_STEP_TOTAL=8
+_STEP_TOTAL=10
 
 dbg "PREFIX=$PREFIX VERBOSE=$VERBOSE DEBUG=$DEBUG PUSH=$PUSH REF='${REF}'"
 dbg "rustc=$(rustc --version)  cargo=$(cargo --version)"
@@ -223,6 +305,35 @@ grep -q '^name = "pir"' Cargo.toml || die "$SRC: Cargo.toml is not pir"
 dbg "SRC=$SRC  CLEANUP_WORKTREE=$CLEANUP_WORKTREE"
 step_done "source tree resolved -> $SRC"
 
+# --------------------------------------------------------------- stage to distro
+# Copy the (clean) source into the build distro's own filesystem. See the
+# build-harness note at the top: cross-distro paths are unusable, so the tree is
+# transferred as a tar stream over stdin (the one channel that works even when
+# the cwd cannot be translated) and cargo runs there.
+step "stage source into build distro ($DISTRO)"
+if has_wsl; then
+  say "  distro '$DISTRO' available; staging to $REMOTE_DIR"
+  # Echo the remote dir so a failed extraction is visible rather than silent.
+  # `--exclude` keeps the transfer small: target/ is rebuilt, .git isn't needed
+  # to compile (the version comes from Cargo.toml, not git).
+  if ! tar czf - --exclude=./target --exclude=./.git --exclude=./build . \
+      | "$WSL_EXEC" -d "$DISTRO" -- bash -lc \
+          "rm -rf '$REMOTE_DIR' && mkdir -p '$REMOTE_DIR' && tar xzf - -C '$REMOTE_DIR' && cd '$REMOTE_DIR' && test -f Cargo.toml && grep -q '^name = \"pir\"' Cargo.toml && echo staged-ok"
+  then
+    die "could not stage source into distro '$DISTRO' (is it installed and is $REMOTE_DIR writable?)"
+  fi
+  say "  staged ok"
+  STAGED=1
+else
+  # No distro: build with the host toolchain (see the `cargo` wrapper). Warn
+  # loudly because the artifact's glibc floor becomes the host's, not 2.28.
+  warn "build distro '$DISTRO' unavailable — building with the HOST toolchain."
+  warn "  the binary will require this host's glibc or newer (not the AlmaLinux 8 baseline)."
+  warn "  set PIR_DEPLOY_DISTRO / PIR_DEPLOY_WSL_EXEC to target the containerised build."
+  STAGED=0
+fi
+step_done "source staged (staged=$STAGED)"
+
 # --------------------------------------------------------------- external path deps
 # (None currently: rustxWidgets was removed from this repo and is an optional,
 # out-of-tree GUI dependency. See Cargo.toml. The default `pir` binary has no
@@ -232,16 +343,31 @@ step_done "external path dependencies materialized (none required)"
 
 # --------------------------------------------------------------- tests + build
 if [ "$TESTS" -eq 1 ]; then
-  step "run unit tests (cargo test --release --locked)"
+  step "run unit tests (cargo test --release --locked -- --test-threads=1)"
+  # Serial execution is REQUIRED, not a speed/robustness preference.
+  #
+  # `ext_tests::test_ext_builtin::esc_tests` spawns `sleep 30`/`sleep 60`
+  # children, puts them in their own process groups and kills them on an abort
+  # flag. In parallel the suite deadlocks (tests observed stuck >60s each); the
+  # same tests pass alone (11/11, 3.7s) and the whole suite passes serially
+  # (293/293, ~18s). A release gate must be deterministic, so run it serially
+  # until the underlying parallel race is fixed (tracked separately).
+  #
+  # `--test-threads=1` goes after `--` so cargo forwards it to the test binary.
+  # It must also survive `cargo test --release --locked` building the SAME
+  # artifacts either way, so no separate `--no-fail-fast` is needed.
+  #
   # Capture to a log file (not a live `| tail` pipe) so the run can't be
   # starved by an unrelated process holding the pipeline's write end open, and
   # so the output survives for debugging. We tail the file afterwards.
   _TLOG="$(mktemp "${TMPDIR:-/tmp}/pir-deploy-test.XXXXXX.log")"
-  cargo test --release --locked >"$_TLOG" 2>&1 || true
+  cargo test --release --locked -- --test-threads=1 >"$_TLOG" 2>&1 || true
   dbg "cargo test log: $_TLOG ($(wc -l < "$_TLOG") lines)"
   tail -25 "$_TLOG"
-  # cargo test fails the pipe with set -o pipefail only if it errors; assert exit:
-  cargo test --release --locked >/dev/null || die "unit tests failed"
+  # assert exit: the second run must use the SAME flags as the first, or it
+  # would silently re-run the suite in parallel (and hang) while reporting on
+  # a different execution than the one whose output was just shown.
+  cargo test --release --locked -- --test-threads=1 >/dev/null || die "unit tests failed"
   step_done "unit tests passed"
 else
   say "skipping unit tests (--no-tests / --fast)"
@@ -266,7 +392,29 @@ fi
 
 step "build release (cargo build --release --locked)"
 cargo build --release --locked || die "release build failed"
+
+# Retrieve the artifact. When building in the distro the binary lands in ITS
+# filesystem (unreachable cross-distro), so pull it back over stdout as base64
+# — a byte-exact channel that survives the text-mode hop. Building on the host
+# needs no copy.
+EXPECT_VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([0-9.]+)".*/\1/')"
 BIN="$SRC/target/release/pir"
+if [ "$STAGED" -eq 1 ]; then
+  step "retrieve artifact from distro"
+  mkdir -p "$SRC/target/release"
+  if ! "$WSL_EXEC" -d "$DISTRO" -- bash -lc "base64 -w0 '$REMOTE_DIR/target/release/pir'" > "$BIN.b64"; then
+    die "could not retrieve the built binary from $DISTRO:$REMOTE_DIR/target/release/pir"
+  fi
+  [ -s "$BIN.b64" ] || die "retrieved artifact is empty (build produced no binary?)"
+  base64 -d "$BIN.b64" > "$BIN" || die "could not decode the retrieved artifact"
+  rm -f "$BIN.b64"
+  chmod 0755 "$BIN"
+  # A static-ish ELF must have survived the round trip intact; if base64 or the
+  # pipe mangled it, fail here rather than shipping a corrupt binary.
+  [ "$(head -c4 "$BIN" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ] \
+    || die "retrieved artifact is not an ELF binary (export/copy corrupted it)"
+  step_done "artifact retrieved -> $BIN"
+fi
 [ -x "$BIN" ] || die "binary not produced at $BIN"
 dbg "BIN=$BIN  size=$(stat -c%s "$BIN" 2>/dev/null || echo '?') bytes"
 step_done "release build at $BIN"
@@ -275,7 +423,15 @@ step_done "release build at $BIN"
 step "smoke tests on built binary"
 V="$($BIN --version 2>&1)" || die "--version failed"
 [[ "$V" =~ ^pir\ [0-9]+\.[0-9]+\.[0-9]+ ]] || die "unexpected --version output: $V"
-say "  version ok: $V"
+# The binary MUST report the version we are about to tag. Previously only the
+# *shape* was checked, so a stale artifact (e.g. an old build that wasn't
+# rebuilt) would pass and get published under the new tag.
+case "$V" in
+  *"$EXPECT_VER"*) ;;
+  *) die "version mismatch: binary reports '$V' but Cargo.toml is $EXPECT_VER —
+       refusing to publish a stale or mismatched artifact" ;;
+esac
+say "  version ok: $V (matches Cargo.toml $EXPECT_VER)"
 
 $BIN --help >/dev/null 2>&1 || die "--help exited non-zero"
 say "  --help ok"
