@@ -1835,6 +1835,81 @@ mod select_tests {
         // The infix-only matches are still offered as fallbacks, just after.
         assert!(ms.iter().any(|c| c.starts_with("anthropic/")), "infix matches must remain: {ms:?}");
     }
+
+    /// The `opencode-go/muse-spark-1.3-contributor` bug: `/model opencode-go/`
+    /// showed only the first 10 models (alphabetically ending at `grok-4.6`)
+    /// because both the completer and the hinter passed a hardcoded `limit` of
+    /// 10 to `match_models`, which truncates *after* ranking. `opencode-go`
+    /// ships 27 models, so the two `muse-*` entries (alphabetical positions
+    /// 20/21) never appeared in the list — the provider looked complete while
+    /// silently hiding models. Pin the full-provider-listing behaviour: every
+    /// model of a provider must be offered when completing `provider/`, using
+    /// the real 27-entry `opencode-go` id set.
+    #[test]
+    fn provider_prefix_completion_lists_every_model() {
+        // The exact live `opencode-go` model ids, in catalog order.
+        const OPCODE_GO: &[&str] = &[
+            "deepseek-v4-flash",
+            "deepseek-v4-flash-vision-exp",
+            "deepseek-v4-pro",
+            "deepseek-v4.1-flash",
+            "glm-5.1",
+            "glm-5.2",
+            "glm-5.3",
+            "glm-5.3-flash",
+            "gpt-5.6-luna",
+            "grok-4.6",
+            "hy3",
+            "hy4-preview",
+            "kimi-k2.6",
+            "kimi-k2.7-code",
+            "kimi-k3",
+            "longcat-2.0",
+            "mimo-v2.5",
+            "mimo-v2.5-pro",
+            "minimax-m2.7",
+            "minimax-m3",
+            "muse-spark-1.2-contributor",
+            "muse-spark-1.3-contributor",
+            "qwen3.6-plus",
+            "qwen3.7-max",
+            "qwen3.7-plus",
+            "qwen3.8-flash",
+            "qwen3.8-max",
+        ];
+        let provs = vec![Provider {
+            id: Some("opencode-go".into()),
+            name: None,
+            api: Some("openai-completions".into()),
+            base_url: Some("https://opencode.ai/zen/go/v1".into()),
+            api_key: None,
+            models: OPCODE_GO.iter().map(|id| mk(id, id)).collect(),
+        }];
+
+        let ms = match_models(&provs, "opencode-go/", crate::term::MODEL_COMPLETION_LIMIT);
+
+        // Every model is offered — nothing is silently truncated.
+        assert_eq!(
+            ms.len(),
+            OPCODE_GO.len(),
+            "all {} models must be listed, got {}: {ms:?}",
+            OPCODE_GO.len(),
+            ms.len()
+        );
+        // The two that the old cap of 10 hid are present.
+        for id in ["muse-spark-1.3-contributor", "muse-spark-1.2-contributor"] {
+            let label = format!("opencode-go/{id}");
+            assert!(ms.contains(&label), "missing {label} from completion: {ms:?}");
+        }
+        // And the old cap would genuinely have missed them (guards the test
+        // itself against a catalogue-order change that made muse sort early).
+        let capped = match_models(&provs, "opencode-go/", 10);
+        assert!(
+            !capped.iter().any(|c| c.contains("muse")),
+            "with the old cap of 10, muse must be absent — otherwise this test \
+             no longer proves the truncation bug: {capped:?}"
+        );
+    }
 }
 
 /// Serializes tests that mutate process-global env (`PI_DIR` / `PIR_WT`) so

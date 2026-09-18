@@ -122,6 +122,18 @@ pub fn set_model_providers(providers: &[crate::config::Provider]) {
     let _ = MODEL_PROVIDERS.set(providers.to_vec());
 }
 
+/// Cap on how many `/model` completion candidates the completer/hinter show.
+///
+/// This must comfortably exceed the largest provider's model count, because
+/// `match_models` truncates *after* ranking — so a cap below the catalogue
+/// size silently hides models with no indication that a cut happened. That
+/// was the `opencode-go/muse-spark-1.3-contributor` bug: `opencode-go` ships
+/// 27 models, the old hardcoded cap of 10 ended at `grok-4.6`, and both muse
+/// entries (positions 20/21 alphabetically) were unreachable from the list.
+/// 500 is far above any real provider (openrouter's ~379 is the largest we
+/// know of) while still bounding the list.
+pub const MODEL_COMPLETION_LIMIT: usize = 500;
+
 /// Extension-registered slash commands (e.g. `ollama-webtools`,
 /// `ollama-cloud-usage`, `wt_create`, `request_root`, `commit`…), supplied by
 /// dispatch in `handle_command` (they fall through to
@@ -1150,7 +1162,7 @@ impl Completer for PirHelper {
         let arg_lead = after.find(|c: char| !c.is_whitespace()).unwrap_or(after.len());
         let arg_start = start_idx + cmd_end + arg_lead;
         let prefix = &left[arg_start..];
-        let matches = crate::config::match_models(providers, prefix, 10);
+        let matches = crate::config::match_models(providers, prefix, MODEL_COMPLETION_LIMIT);
         Ok((arg_start, matches))
     }
 }
@@ -1180,7 +1192,7 @@ impl Hinter for PirHelper {
                     let arg_lead = after.find(|c: char| !c.is_whitespace()).unwrap_or(after.len());
                     let arg_start = start_idx + cmd_end + arg_lead;
                     let prefix = &left[arg_start..];
-                    let candidates = crate::config::match_models(providers, prefix, 10);
+                    let candidates = crate::config::match_models(providers, prefix, MODEL_COMPLETION_LIMIT);
                     let hint = candidates
                         .into_iter()
                         .find_map(|m| crate::config::hint_remainder(&m, prefix));
