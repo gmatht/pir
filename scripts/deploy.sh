@@ -343,31 +343,37 @@ step_done "external path dependencies materialized (none required)"
 
 # --------------------------------------------------------------- tests + build
 if [ "$TESTS" -eq 1 ]; then
-  step "run unit tests (cargo test --release --locked -- --test-threads=1)"
-  # Serial execution is REQUIRED, not a speed/robustness preference.
+  step "run unit tests (cargo test --release --locked -- --test-threads=8)"
+  # `--test-threads=8` is a MEASURED stability ceiling, not a tuning knob.
   #
-  # `ext_tests::test_ext_builtin::esc_tests` spawns `sleep 30`/`sleep 60`
-  # children, puts them in their own process groups and kills them on an abort
-  # flag. In parallel the suite deadlocks (tests observed stuck >60s each); the
-  # same tests pass alone (11/11, 3.7s) and the whole suite passes serially
-  # (293/293, ~18s). A release gate must be deterministic, so run it serially
-  # until the underlying parallel race is fixed (tracked separately).
+  # With full parallelism (16 here) the suite deadlocks: tests stop producing
+  # results and the binary has to be killed. Measured on a 16-core box:
   #
-  # `--test-threads=1` goes after `--` so cargo forwards it to the test binary.
-  # It must also survive `cargo test --release --locked` building the SAME
-  # artifacts either way, so no separate `--no-fail-fast` is needed.
+  #     1 thread   ok 27.0s      8 threads  ok  4.2s     (3/3 runs)
+  #     2 threads  ok 10.7s     10 threads  1/3 ok (flaky)
+  #     4 threads  ok  5.9s     12 threads  HANG (timeout)
+  #                             16 threads  HANG (timeout)
+  #
+  # Every extension test module passes ALONE even at 16 threads; the hang needs
+  # several run concurrently (all extensions @16 hangs). The contention is
+  # between extension tests that spawn children — `builtin`'s run_shell
+  # sleep/process-group tests and `autocommit`'s git tests — so 8 keeps them
+  # stable while still being ~7x faster than serial. Revisit when the
+  # underlying race is fixed; do not raise this to "match nproc".
+  #
+  # `--test-threads` goes after `--` so cargo forwards it to the test binary.
   #
   # Capture to a log file (not a live `| tail` pipe) so the run can't be
   # starved by an unrelated process holding the pipeline's write end open, and
   # so the output survives for debugging. We tail the file afterwards.
   _TLOG="$(mktemp "${TMPDIR:-/tmp}/pir-deploy-test.XXXXXX.log")"
-  cargo test --release --locked -- --test-threads=1 >"$_TLOG" 2>&1 || true
+  cargo test --release --locked -- --test-threads=8 >"$_TLOG" 2>&1 || true
   dbg "cargo test log: $_TLOG ($(wc -l < "$_TLOG") lines)"
   tail -25 "$_TLOG"
   # assert exit: the second run must use the SAME flags as the first, or it
-  # would silently re-run the suite in parallel (and hang) while reporting on
-  # a different execution than the one whose output was just shown.
-  cargo test --release --locked -- --test-threads=1 >/dev/null || die "unit tests failed"
+  # would silently re-run the suite at full parallelism (and hang) while
+  # reporting on a different execution than the one whose output was just shown.
+  cargo test --release --locked -- --test-threads=8 >/dev/null || die "unit tests failed"
   step_done "unit tests passed"
 else
   say "skipping unit tests (--no-tests / --fast)"

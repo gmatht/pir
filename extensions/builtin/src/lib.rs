@@ -1116,6 +1116,14 @@ fn spawn_shell(command: &str, cwd: &Path) -> Result<std::process::Child, String>
                 let _ = fs::rename(&tmp, &path);
             }
         }
+        // NB: we deliberately do NOT record BASH_ENV here. The stash lives in a
+        // SHARED temp dir, so it can be stale and unrewritable — a leftover
+        // owned by a different identity leaves the `fs::write` above failing on
+        // permissions, and blindly setting BASH_ENV then made every spawned
+        // `bash -c` die with a bare
+        //   "spawn bash: No such file or directory (os error 2)"
+        // because bash could not source the foreign stanza. The `build` closure
+        // re-verifies the content before setting BASH_ENV.
     }
     let build = |prog: &str, flag: &str| {
         let mut c = Command::new(prog);
@@ -1135,7 +1143,15 @@ fn spawn_shell(command: &str, cwd: &Path) -> Result<std::process::Child, String>
         #[cfg(unix)]
         {
             let path = std::env::temp_dir().join("pir-timeout/bashenv");
-            if path.is_file() {
+            // Verify the CONTENT, not merely existence: a stale or partially
+            // written stanza (or one left by another user) must not be handed
+            // to bash as BASH_ENV, or `bash -c` fails to start at all. Failing
+            // open to "no wrapper" preserves the pre-existing no-override
+            // behaviour instead of breaking every command.
+            let usable = fs::read_to_string(&path)
+                .map(|s| s.contains("# pir-bashenv-v3"))
+                .unwrap_or(false);
+            if usable {
                 c.env("BASH_ENV", path);
             }
         }
@@ -1214,6 +1230,78 @@ mod esc_tests {
             "abort latency {latency:?} exceeds 100ms — the wait loop is still polling too coarsely"
         );
         assert!(out.contains("aborted by user"), "got: {out}");
+    }
+
+    /// A stale or foreign `bashenv` that CANNOT be rewritten must not be handed
+    /// to bash as `BASH_ENV`. The stash lives in a SHARED temp dir, so a
+    /// leftover written by another identity (observed in the wild: owned by
+    /// `ai_pir` while the build ran as `john`) can be neither replaced
+    /// (permission denied) nor sourced — and blindly setting BASH_ENV made
+    /// `spawn bash -c` fail with a bare
+    /// `No such file or directory (os error 2)`, breaking every command.
+    /// Failing open to "no wrapper" is correct: the timeout wrapper is
+    /// defence-in-depth, not required for a command to run.
+    ///
+    /// Scope note: this asserts the fix's CONTRACT — a v3-less stash is ignored
+    /// and the command still runs. It does not fail against the old code on a
+    /// host where bash readily sources a marker-less stanza; the hard ENOENT
+    /// reproduced only under the containerised build user's environment. Treat
+    /// it as a guard against regressing the content check, not as a
+    /// reproduction of the original crash.
+    #[cfg(unix)]
+    #[test]
+    fn foreign_bashenv_does_not_break_shell_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join("pir-timeout");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("bashenv");
+
+        // Remember the real stash so this test cannot poison sibling tests or
+        // the developer's cache, and so the file/dir modes are restored.
+        let saved_contents = fs::read_to_string(&path).ok();
+        let saved_mode = fs::metadata(&path).ok().map(|m| m.permissions().mode());
+        let saved_dir_mode = fs::metadata(&dir).ok().map(|m| m.permissions().mode());
+
+        // A foreign stanza with no v3 marker: what an older pir leaves behind.
+        fs::write(&path, "__pir_timeout_default() { :; }\n").expect("write foreign stash");
+        // Read-only FILE and DIR: the temp+rename that would replace it needs
+        // write permission on the directory, so this is exactly the "foreign
+        // stash owned by another user" condition.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let mut b = Builtin::new(
+            PathBuf::from("."),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let result = run_shell(&mut b, "echo survived-foreign-bashenv");
+
+        // Restore before asserting so a failure can't leave a read-only stash
+        // behind (which would break every later test in this binary).
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(saved_dir_mode.unwrap_or(0o755)));
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(saved_mode.unwrap_or(0o644)));
+        match saved_contents {
+            Some(prev) => {
+                let _ = fs::write(&path, prev);
+            }
+            None => {
+                let _ = fs::remove_file(&path);
+            }
+        }
+        if let Some(mode) = saved_dir_mode {
+            let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(mode));
+        }
+
+        // The spawn must still succeed and the command must actually run.
+        let out = result.expect(
+            "an unrewritable foreign bashenv must not break spawning bash \
+             (BASH_ENV must not point at a stanza we could not verify)",
+        );
+        assert!(
+            out.contains("survived-foreign-bashenv"),
+            "command should have run despite the foreign stash, got: {out}"
+        );
     }
 
     #[test]
