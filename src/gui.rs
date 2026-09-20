@@ -498,6 +498,7 @@ fn spawn_session(
 
     // Tab completion + history navigation on this tab's prompt.
     let entry_comp_cb = entry.clone();
+    let entry_cb_providers_tab: Vec<Provider> = providers.to_vec();
     let nav_for_keys = hist_nav.clone();
     let hist_for_keys = state.clone();
     let app_for_keys = app.clone();
@@ -511,7 +512,11 @@ fn spawn_session(
             }
             GDK_KEY_TAB => {
                 let cur = entry_comp_cb.get_text().unwrap_or_default();
-                if let Some(completed) = complete_idle(&cur) {
+                let completed = complete_idle(&cur).or_else(|| {
+                    let provs: Vec<Provider> = entry_cb_providers_tab.clone();
+                    crate::config::complete_model_buffer(&cur, &provs)
+                });
+                if let Some(completed) = completed {
                     entry_comp_cb.set_text(&completed);
                 }
                 true

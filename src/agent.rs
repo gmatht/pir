@@ -122,6 +122,21 @@ pub struct Agent {
     /// via `PIR_INCREMENTAL_MD=0` / `--no-incremental`. Quiet (background)
     /// turns never render incrementally regardless (nothing is drawn).
     incremental_md: bool,
+    /// Explicit-stop skill (`request_stop` tool + auto-nudge). On by default;
+    /// off via `PIR_STOP_SKILL=0` / `"stopSkill": false` / `--no-stop-skill` /
+    /// `/stop-skill off`. When on, the model ends its turn with an explicit
+    /// `request_stop` call, and text-only answers are auto-nudged (up to
+    /// [`STOP_NUDGE_MAX`] per turn) until it does.
+    stop_skill: bool,
+    /// In-flight explicit stop for this turn (set by `run_stop_tool`, consumed
+    /// after the tool batch). Reset at the start of every turn.
+    stop_hit: Option<(StopDecision, String)>,
+    /// The most recent explicit stop decision (sticky across turns; surfaced by
+    /// `/stop-skill status` and tests).
+    last_stop: Option<(StopDecision, String)>,
+    /// Auto-nudges used in the current turn (reset each turn; bounded by
+    /// [`STOP_NUDGE_MAX`]).
+    stop_nudges: usize,
     /// Cached provider list (loaded once, reused for model switches / resume).
     /// Avoids re-reading and re-parsing `~/.pi/agent/models-store.json` on every
     /// `/model` switch, resume, and `apply_persisted_model` call.
@@ -273,6 +288,43 @@ fn text_signature(text: &str) -> String {
     out
 }
 
+/// Explicit-stop decision the model can make with the `request_stop` tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopDecision {
+    /// Task finished; end the turn with a `Completed` status.
+    Complete,
+    /// Needs operator input; end the turn with an `Interrupted` status whose
+    /// reason carries the model's question, so `/unfinished` shows it.
+    NeedsInput,
+}
+
+impl StopDecision {
+    /// Parse the free vocabulary the model may use for the `reason` field.
+    pub fn parse(s: &str) -> Option<StopDecision> {
+        match s.trim().to_ascii_lowercase().replace(['-', ' '], "_").as_str() {
+            "complete" | "completed" | "done" | "finished" | "stop_complete" => {
+                Some(StopDecision::Complete)
+            }
+            "needs_input" | "need_input" | "needsinput" | "input" | "question" | "ask"
+            | "stopped_needs_input" | "stop_needs_input" => Some(StopDecision::NeedsInput),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            StopDecision::Complete => "stop-complete",
+            StopDecision::NeedsInput => "stop-needs-input",
+        }
+    }
+}
+
+/// How many auto-nudges a turn may spend before giving up and ending it: each
+/// text-only answer costs one model call, so the cap also caps the spend. 8
+/// gives the model seven chances to comply after the first miss and still
+/// keeps a stuck turn to a handful of cheap calls.
+pub const STOP_NUDGE_MAX: usize = 8;
+
 /// What `load_session` restored. The REPL (and `/fg`/`/resume`) renders
 /// [`SessionResume::banner`] so `-r` makes it clear which session came back,
 /// shows its first/last prompts and the tail of its final output, and seeds the
@@ -387,6 +439,11 @@ fn build_system_prompt(cwd: &Path) -> String {
          - job_status: Check on a long-running command that was detached\n\
          - job_kill: Stop a detached long-running command\n\
          - update_goal: Persist and update the current goal/continuation plan\n\
+         - request_stop: End your turn with an explicit stop decision, but ONLY when \
+           the work is really done (reason stop-complete) or you genuinely need \
+           the operator to answer before you can continue (reason \
+           stop-needs-input, with your question in message). If work remains, \
+           keep using tools — do NOT call this just to end a message.\n\
          \n\
          In addition to the tools above, you may have access to other custom tools depending on the project.\n",
     );
@@ -401,7 +458,13 @@ fn build_system_prompt(cwd: &Path) -> String {
          - Read before editing; prefer edit_file over write_file for changes.\n\
          - Be terse: code, commands, short answers, no preamble.\n\
          - Show file paths clearly when working with files.\n\
-         - When finished, summarize what changed in a sentence or two.\n",
+         - When finished, summarize what changed in a sentence or two.\n\
+         - End your turn with request_stop ONLY when the work is really done \
+           (reason stop-complete) or you genuinely need the operator's answer \
+           to continue (reason stop-needs-input, with your question in \
+           message). If work remains, keep using tools instead of stopping. \
+           Never end with request_stop on an unfinished task, and never answer \
+           with text alone when tools could progress the work.\n",
     );
     system.push_str(
         "\nPIR documentation (read only when the user asks about pir itself, its extensions, themes, skills, or TUI):\n\
@@ -646,12 +709,83 @@ impl Agent {
             show_thinking: true,
             auto_retry: None,
             incremental_md: config::incremental_md_default(),
+            stop_skill: config::stop_skill_default(),
+            stop_hit: None,
+            last_stop: None,
+            stop_nudges: 0,
             cached_providers,
             loop_detector: LoopDetector::new(),
             turn_started: None,
         })
     }
 
+    /// Whether the explicit-stop skill is enabled for this session.
+    pub fn stop_skill(&self) -> bool {
+        self.stop_skill
+    }
+
+    /// The most recent explicit stop decision (sticky across turns), if any.
+    pub fn last_stop(&self) -> Option<StopDecision> {
+        self.last_stop.as_ref().map(|(d, _)| *d)
+    }
+
+    /// Toggle the explicit-stop skill for this session. On (the default) the
+    /// model ends its turn with an explicit `request_stop` call, and text-only
+    /// answers are auto-nudged until it does; off restores the legacy
+    /// stop-on-first-text behaviour. Returns a status line.
+    pub fn set_stop_skill(&mut self, on: bool) -> String {
+        self.stop_skill = on;
+        if on {
+            "stop-skill: on  (model ends its turn with request_stop; text-only answers are nudged until it does)"
+        } else {
+            "stop-skill: off  (legacy stop-on-first-text behaviour)"
+        }
+        .to_string()
+    }
+
+    /// Intercept the `request_stop` tool: record the model's explicit stop
+    /// decision so the turn ends after this tool batch. Other tools fall
+    /// through to the registry. Returns `None` for non-stop tools.
+    fn run_stop_tool(&mut self, name: &str, input: &Value) -> Option<Outcome> {
+        if name != "request_stop" {
+            return None;
+        }
+        if !self.stop_skill {
+            return Some(Outcome {
+                content: "request_stop is disabled for this session (stop-skill off); text answers end the turn."
+                    .into(),
+                is_error: true,
+            });
+        }
+        let reason = input
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let Some(decision) = StopDecision::parse(reason) else {
+            return Some(Outcome {
+                content: format!(
+                    "request_stop: unknown reason '{reason}' (want stop-complete or stop-needs-input)"
+                ),
+                is_error: true,
+            });
+        };
+        let why = input
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        self.stop_hit = Some((decision, why.clone()));
+        self.last_stop = Some((decision, why.clone()));
+        Some(Outcome {
+            content: format!(
+                "stop recorded ({}){} — finishing this tool batch, then ending the turn.",
+                decision.label(),
+                if why.is_empty() { String::new() } else { format!(" {why}") }
+            ),
+            is_error: false,
+        })
+    }
     /// Inject (or refresh) the current goal snapshot into the system prompt so
     /// the model always sees the live plan without it being part of `history`.
     fn refresh_system(&mut self) {
@@ -1702,8 +1836,16 @@ impl Agent {
         // turn can't carry over into this one, and stamp the turn clock so the
         // TurnDone notification reports the real wall time (not 0.0s).
         self.loop_detector = LoopDetector::new();
+        self.stop_hit = None;
+        self.stop_nudges = 0;
         self.turn_started = Some(std::time::Instant::now());
-        let specs = self.registry.specs();
+        // When the skill is on, `request_stop` is a first-class tool the model
+        // must see in every request; when off it is hidden (and refused if the
+        // model calls it anyway, e.g. from a stale prompt).
+        let mut specs = self.registry.specs();
+        if !self.stop_skill {
+            specs.retain(|s| s.name != "request_stop");
+        }
         let tty = crate::term::is_terminal();
         // `spinner` is hoisted out of the per-message loop so the "thinking…"
         // indicator can persist *below* the agent's text (a footer) between
@@ -2116,6 +2258,39 @@ impl Agent {
             self.history.push(assistant);
 
             if calls.is_empty() {
+                // Stop skill on: a text-only answer is not a stop — auto-nudge
+                // (briefly reminding of `request_stop`) until the model asks
+                // for a stop explicitly or the nudge cap is hit. Off (legacy):
+                // stop on the first text answer, as before.
+                if self.stop_skill {
+                    if self.stop_nudges >= STOP_NUDGE_MAX {
+                        if !self.silent() {
+                            term::out(&term::dim(&format!(
+                                "· stop-skill: no request_stop after {} nudge(s) — ending turn",
+                                self.stop_nudges
+                            )));
+                        }
+                        self.registry.emit(EventKind::AgentEnd, &json!({}));
+                        self.notify.publish(self.turn_done_event(), false);
+                        if !self.silent() {
+                            self.registry.emit(EventKind::TurnEnd, &json!({ "prompt": user }));
+                            self.continuations.extend(self.registry.on_turn_end(user));
+                        }
+                        self.mark_status(SessionStatus::Completed, self.goal_pending(), "");
+                        return Ok(());
+                    }
+                    self.stop_nudges += 1;
+                    let nudge = Message::user(
+                        "Your last message had no tool calls. If the work is really done, end \
+                         your turn with an explicit request_stop call (reason stop-complete, or \
+                         stop-needs-input with your question in message). If work remains, ignore \
+                         request_stop and keep using tools instead — do NOT stop an unfinished \
+                         task. Continue now.",
+                    );
+                    log_line(&mut self.log, &nudge);
+                    self.history.push(nudge);
+                    continue;
+                }
                 self.registry.emit(EventKind::AgentEnd, &json!({}));
                 self.notify.publish(self.turn_done_event(), false);
                 if !self.silent() {
@@ -2191,7 +2366,10 @@ impl Agent {
                     }
                 let outcome = match self.run_goal_tool(name, input) {
                     Some(o) => o,
-                    None => self.registry.execute(name, input),
+                    None => match self.run_stop_tool(name, input) {
+                        Some(o) => o,
+                        None => self.registry.execute(name, input),
+                    },
                 };
                 if !self.silent() {
                     // Echo the result for the human: multi-line, but abridged so
@@ -2240,6 +2418,44 @@ impl Agent {
                     term::out(&term::dim("· turn cancelled"));
                 }
                 self.notify.publish(self.turn_done_event(), false);
+                return Ok(());
+            }
+
+            // Explicit stop: the model called `request_stop` this batch. End
+            // the turn now, with Completed for stop-complete or Interrupted
+            // (carrying the model's question) for stop-needs-input.
+            if let Some((decision, why)) = self.stop_hit.take() {
+                let (status, reason) = match decision {
+                    StopDecision::Complete => (SessionStatus::Completed, String::new()),
+                    StopDecision::NeedsInput => (
+                        SessionStatus::Interrupted,
+                        if why.is_empty() {
+                            "agent asked for input (stop-needs-input)".to_string()
+                        } else {
+                            format!("agent asked for input (stop-needs-input): {why}")
+                        },
+                    ),
+                };
+                if !self.silent() {
+                    match decision {
+                        StopDecision::Complete => {
+                            term::out(&term::dim("· stop-complete — ending turn"));
+                        }
+                        StopDecision::NeedsInput => {
+                            term::out(&term::yellow(&format!(
+                                "· stop-needs-input{} — ending turn",
+                                if why.is_empty() { String::new() } else { format!(": {why}") }
+                            )));
+                        }
+                    }
+                }
+                self.registry.emit(EventKind::AgentEnd, &json!({}));
+                self.notify.publish(self.turn_done_event(), false);
+                if !self.silent() {
+                    self.registry.emit(EventKind::TurnEnd, &json!({ "prompt": user }));
+                    self.continuations.extend(self.registry.on_turn_end(user));
+                }
+                self.mark_status(status, self.goal_pending(), &reason);
                 return Ok(());
             }
         }
@@ -2732,6 +2948,9 @@ fn describe_call(name: &str, input: &Value) -> String {
             };
             format!("goal  {action} {detail}")
         }
+        "request_stop" => {
+            format!("stop  {} {}", s("reason"), s("message"))
+        }
         other => other.to_string(),
     }
 }
@@ -2929,7 +3148,7 @@ mod prompt_parity_tests {
     #[test]
     fn tool_list_names_pir_tools() {
         let p = prompt();
-        for tool in ["read_file", "edit_file", "write_file", "list_dir", "bash", "update_goal"] {
+        for tool in ["read_file", "edit_file", "write_file", "list_dir", "bash", "update_goal", "request_stop"] {
             assert!(p.contains(tool), "tool {tool} missing from Available tools");
         }
         // pi's bare names must not appear as list entries (`- read:`); the
@@ -3084,6 +3303,71 @@ mod goal_bootstrap_tests {
         assert!(d.contains("goal"), "got {d}");
         assert!(d.contains("set_step"), "got {d}");
         assert!(d.contains("#3"), "got {d}");
+    }
+
+    #[test]
+    fn stop_decision_parses_free_vocabulary() {
+        use super::StopDecision;
+        assert_eq!(StopDecision::parse("stop-complete"), Some(StopDecision::Complete));
+        assert_eq!(StopDecision::parse("done"), Some(StopDecision::Complete));
+        assert_eq!(StopDecision::parse("STOP-NEEDS-INPUT"), Some(StopDecision::NeedsInput));
+        assert_eq!(StopDecision::parse("question"), Some(StopDecision::NeedsInput));
+        assert_eq!(StopDecision::parse("keep going"), None);
+        assert_eq!(StopDecision::Complete.label(), "stop-complete");
+        assert_eq!(StopDecision::NeedsInput.label(), "stop-needs-input");
+    }
+
+    #[test]
+    fn stop_skill_on_by_default_and_toggles() {
+        let mut a = fresh_agent();
+        assert!(a.stop_skill(), "stop skill must default on");
+        assert_eq!(a.last_stop(), None, "no stop recorded yet");
+        assert!(a.set_stop_skill(false).contains("off"));
+        assert!(!a.stop_skill());
+        let out = a.run_stop_tool(
+            "request_stop",
+            &serde_json::json!({"reason":"stop-complete"}),
+        );
+        let o = out.expect("outcome");
+        assert!(o.is_error, "disabled skill must refuse: {}", o.content);
+        assert_eq!(a.last_stop(), None, "refused stop must not record");
+        assert!(a.set_stop_skill(true).contains("on"));
+        let out = a.run_stop_tool(
+            "request_stop",
+            &serde_json::json!({"reason":"stop-complete","message":"all green"}),
+        );
+        let o = out.expect("outcome");
+        assert!(!o.is_error, "enabled skill must accept: {}", o.content);
+        assert!(o.content.contains("stop-complete"), "got {}", o.content);
+        assert_eq!(a.last_stop(), Some(super::StopDecision::Complete));
+    }
+
+    #[test]
+    fn stop_tool_rejects_unknown_reason() {
+        let mut a = fresh_agent();
+        assert!(a.stop_skill());
+        let out = a.run_stop_tool(
+            "request_stop",
+            &serde_json::json!({"reason":"keep-going"}),
+        );
+        let o = out.expect("outcome");
+        assert!(o.is_error, "unknown reason must error: {}", o.content);
+        assert_eq!(a.last_stop(), None, "rejected stop must not record");
+        // Non-stop tools fall through to the registry.
+        assert!(a.run_stop_tool("bash", &serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn needs_input_records_question() {
+        let mut a = fresh_agent();
+        let out = a.run_stop_tool(
+            "request_stop",
+            &serde_json::json!({"reason":"stop-needs-input","message":"which region?"}),
+        );
+        let o = out.expect("outcome");
+        assert!(!o.is_error, "needs-input must accept: {}", o.content);
+        assert!(o.content.contains("stop-needs-input"), "got {}", o.content);
+        assert_eq!(a.last_stop(), Some(super::StopDecision::NeedsInput));
     }
 }
 

@@ -500,16 +500,17 @@ fn security_lines(policy: &crate::security::SecurityPolicy, su_security: bool) -
 
 /// Show the settings dialog on the alternate screen. Displays the current
 /// settings (model, thinking, done-prompt color, markdown backend, incremental,
-/// full-auto). Returns `None` if not a tty.
+/// stop-skill, full-auto). Returns `None` if not a tty.
 pub fn settings_dialog(
     model: &str,
     thinking: &str,
     show_thinking: bool,
     incremental: bool,
+    stop_skill: bool,
     full_auto: bool,
 ) -> Option<()> {
     let _modal = Modal::enter()?;
-    let lines = settings_lines(model, thinking, show_thinking, incremental, full_auto);
+    let lines = settings_lines(model, thinking, show_thinking, incremental, stop_skill, full_auto);
     scroll_until_dismiss("pir — settings", &lines)
 }
 
@@ -518,6 +519,7 @@ fn settings_lines(
     thinking: &str,
     show_thinking: bool,
     incremental: bool,
+    stop_skill: bool,
     full_auto: bool,
 ) -> Vec<String> {
     use crate::term;
@@ -527,9 +529,10 @@ fn settings_lines(
     lines.push(format!("  done-prompt color: {}", term::cyan(&term::done_prompt_color_token())));
     lines.push(format!("  markdown backend: {}", term::cyan(crate::config::markdown_renderer_backend())));
     lines.push(format!("  incremental markdown: {}", if incremental { "on" } else { "off" }));
+    lines.push(format!("  stop-skill: {}", if stop_skill { "on" } else { "off" }));
     lines.push(format!("  full-auto: {}", if full_auto { term::green("on") } else { "off".to_string() }));
     lines.push(String::new());
-    lines.push(term::dim("change with /model, /thinking, /default-model, /su-security").to_string());
+    lines.push(term::dim("change with /model, /thinking, /stop-skill, /default-model, /su-security").to_string());
     lines.push(term::dim("[esc] close").to_string());
     lines
 }

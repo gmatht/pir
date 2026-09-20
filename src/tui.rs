@@ -1206,7 +1206,9 @@ fn read_idle_line(
                         crate::term::reset_quit_presses();
                     }
                     0x09 => {
-                        if let Some(completed) = complete_idle(&buf) {
+                        if let Some(completed) = complete_idle(&buf)
+                            .or_else(|| crate::config::complete_model_buffer(&buf, ctx.providers))
+                        {
                             buf = completed;
                             update_tui_typeahead(&buf, ctx.typeahead);
                             update_tui_hint(state, &buf);

@@ -2992,6 +2992,43 @@ mod tests {
         assert!(is_retryable("stream: timed out"));
     }
 
+    /// A stalled stream is retryable *only* because the caller refuses to
+    /// re-issue once output was visible (`emitted_text`/`saw_tool_calls`). This
+    /// pins that split so a future edit can't make `is_retryable` alone decide:
+    /// pre-output stalls must be replayable (a fresh connection may succeed),
+    /// while the post-output case is enforced by the caller's guard.
+    #[test]
+    fn stalled_stream_is_retryable_but_caller_gates_on_output() {
+        // The error the streaming pumps actually produce.
+        let stall = "stream: stalled (no data for 180s)";
+        assert!(
+            is_retryable(stall),
+            "a pre-output stall must be replayable (the peer may reconnect cleanly)"
+        );
+        // Cancellation stays terminal regardless of output.
+        assert!(!is_retryable("request cancelled"));
+    }
+
+    /// `rate limit exceeded` is a *transient* rate limit, not a terminal quota
+    /// error. It used to be lumped in with the fatal quota strings, which ended
+    /// the turn for a condition that a backoff would clear. It must now retry,
+    /// while the genuinely terminal quota/usage messages keep failing fast.
+    #[test]
+    fn plain_rate_limit_retries_but_quota_stays_fatal() {
+        assert!(
+            is_retryable("HTTP 429: rate limit exceeded"),
+            "a plain rate-limit 429 must be retried"
+        );
+        for fatal in [
+            "HTTP 429: you have reached your weekly usage limit",
+            "HTTP 429: quota exceeded for project",
+            "HTTP 429: insufficient_quota - check billing",
+            "HTTP 429: upgrade for higher limits",
+        ] {
+            assert!(!is_retryable(fatal), "must stay fatal: {fatal}");
+        }
+    }
+
     #[test]
     fn backoff_grows_and_caps() {
         // Serialize with the other env-sensitive retry tests (parallel test

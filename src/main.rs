@@ -175,6 +175,10 @@ OPTIONS
                        terminals / screen where raw input misbehaves
   --budget <tokens>    optional cumulative in+out token cap; turn stops (with a
                        banner) once exceeded. Off by default. Env: PIR_TOKEN_BUDGET
+  --no-stop-skill        disable the explicit-stop skill for this session
+                       (model ends its turn with request_stop; text-only
+                       answers are auto-nudged). On by default.
+                       Env: PIR_STOP_SKILL=0  Config: "stopSkill": false
 
 CONFIG (reused from pi, never modified)
   ~/.pi/models.json          providers, models, api keys ("{env:VAR}" supported)
@@ -208,6 +212,8 @@ COMMANDS
   /model* <sel>  /model-all <sel>   broadcast a model switch to ALL your open pir terminals (also sets the new default)
   /bg <text>  /jobs  /fg <id>  /clear  /usage  /exit
   /undo [all]             revert the last file edit (or all) to its pre-edit state
+  /stop-skill [on|off|default|status]   toggle the explicit-stop skill for this
+                          session (request_stop + auto-nudge; on by default)
   /sh [cmd args]         drop to a shell, or run a command via the shell
                           (shell = $PIR_SHELL or $SHELL if set, else /bin/sh on
                           unix, or pwsh/powershell/cmd on Windows)
@@ -436,6 +442,9 @@ fn main() {
     // `--no-incremental` disables in-place incremental markdown rendering
     // (same as `PIR_INCREMENTAL_MD=0`; see `Agent::set_incremental_md`).
     let mut no_incremental = false;
+    // `--no-stop-skill` disables the explicit-stop skill for this session
+    // (same as `PIR_STOP_SKILL=0`; see `config::stop_skill_default`).
+    let mut no_stop_skill = false;
 
     // Capture the invoking user's default-model selector BEFORE the privilege
     // drop (while HOME still points at the real user's ~/.pi). After the drop,
@@ -538,6 +547,7 @@ fn main() {
             }
             "--no-raw" => no_raw = true,
             "--no-incremental" => no_incremental = true,
+            "--no-stop-skill" => no_stop_skill = true,
             "--budget" => {
                 i += 1;
                 match args.get(i).and_then(|v| v.parse::<u64>().ok()) {
@@ -852,6 +862,9 @@ fn main() {
     agent.set_token_budget(budget);
     if no_incremental {
         agent.set_incremental_md(false);
+    }
+    if no_stop_skill {
+        agent.set_stop_skill(false);
     }
     term::raw::set_enabled(!no_raw);
 
@@ -2128,6 +2141,7 @@ fn handle_command(
                         agent.thinking_level().as_str(),
                         agent.show_thinking(),
                         agent.incremental_md(),
+                        agent.stop_skill(),
                         full_auto,
                     );
                 }
@@ -3053,6 +3067,49 @@ fn handle_command(
             };
             let all = rest.first().map(|s| *s == "all").unwrap_or(false);
             println!("{}", agent.undo(all));
+        }
+        "stop-skill" | "stop_skill" | "stopskill" => {
+            // `/stop-skill [on|off|default|status]`: toggle the explicit-stop
+            // skill for this session (no arg = status). `default` also persists
+            // the choice as the default for new sessions (same key
+            // `PIR_STOP_SKILL` / `stopSkill` read at startup).
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                eprintln!("pir: agent busy (turn running) — try again when idle");
+                return;
+            };
+            let arg = rest.first().copied().unwrap_or("").trim().to_ascii_lowercase();
+            match arg.as_str() {
+                "" | "status" | "state" => {
+                    println!(
+                        "stop-skill: {}  (last stop: {})",
+                        if agent.stop_skill() { "on" } else { "off" },
+                        agent.last_stop().map(|d| d.label()).unwrap_or("none yet"),
+                    );
+                    println!(
+                        "{}",
+                        term::dim("usage: /stop-skill [on|off|default|status]  (default = persist as the new default)")
+                    );
+                }
+                "on" | "enable" | "1" | "true" | "yes" => {
+                    println!("{}", agent.set_stop_skill(true));
+                }
+                "off" | "disable" | "0" | "false" | "no" => {
+                    println!("{}", agent.set_stop_skill(false));
+                }
+                "default" => {
+                    let on = agent.stop_skill();
+                    match config::set_stop_skill_default(on) {
+                        Ok(p) => println!(
+                            "stop-skill default saved: {} (to {})",
+                            if on { "on" } else { "off" },
+                            p.display()
+                        ),
+                        Err(e) => eprintln!("pir: could not persist stop-skill default: {e}"),
+                    }
+                }
+                _ => eprintln!("usage: /stop-skill [on|off|default|status]"),
+            }
         }
         "ext" => {
             // Diagnostic: list tools + slash commands currently provided by

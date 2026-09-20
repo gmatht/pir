@@ -245,6 +245,28 @@ impl ToolBackend for Builtin {
                     "required": ["action"]
                 }),
             },
+            ToolSpec {
+                name: "request_stop",
+                description: "End your turn with an explicit stop decision, but ONLY when the work \
+                              is really done (reason stop-complete) or you genuinely need the \
+                              operator to answer before you can continue (reason stop-needs-input, \
+                              with your question in message). If work remains, keep using tools \
+                              instead — do NOT call this just to end a message. A text-only answer \
+                              is nudged back so you either continue the work or stop explicitly \
+                              when truly done.",
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "reason": {
+                            "type": "string",
+                            "enum": ["stop-complete", "stop-needs-input"],
+                            "description": "stop-complete when done, stop-needs-input when blocked on the operator"
+                        },
+                        "message": { "type": "string", "description": "One-line summary (complete) or the question (needs-input)" }
+                    },
+                    "required": ["reason"]
+                }),
+            },
         ]
     }
 

@@ -67,7 +67,32 @@
 #    (glibc compatibility is backward-only: a binary built against glibc X runs
 #    on anything with glibc >= X.) TLS is already rustls (via ureq), so there is
 #    no OpenSSL version coupling either.
-#    USE: '/mnt/c/Program Files/WSL/wsl.exe' -d AlmaLinux8
+#
+# Q: Why AlmaLinux 8 AND zig, rather than one or the other?
+#    They solve different halves of the portability problem, and we need both:
+#
+#      * AlmaLinux 8 (glibc 2.28) provides the BUILD ENVIRONMENT — an old-ish
+#        glibc to compile against, plus mount privileges so the overlay/
+#        worktree tests can actually run. It is where `cargo test` executes.
+#      * zig (via `cargo-zigbuild`) supplies the LINKER STUBS for glibc 2.17,
+#        which is what actually removes the high-version symbol references.
+#
+#    Building in AlmaLinux 8 alone tops out at GLIBC_2.28 (measured: the
+#    offending symbols are GLIBC_2.18/2.25/2.27/2.28), so that binary HARD
+#    FAILS on CentOS/RHEL 7 with
+#        /lib64/libc.so.6: version `GLIBC_2.28' not found
+#    Targeting `x86_64-unknown-linux-gnu.2.17` through cargo-zigbuild pins the
+#    floor to 2.17, and the result still runs on modern hosts (verified on
+#    glibc 2.39) — one artifact, a wider range.
+#
+#    Both were verified by execution, not inference: the 2.28 binary fails on
+#    centos:7 and the 2.17 one runs there (`pir --version`, `--help`) and
+#    passes 290/293 tests in that container. The 3 failures are environmental
+#    (2 overlay tests need CAP_SYS_ADMIN to mount; 1 worktree test needs git
+#    >= 2.x, CentOS 7 ships 1.8.3) and reproduce identically regardless of how
+#    the binary was linked.
+#
+#    USE: '/mnt/c/Program Files/WSL/wsl.exe' -d AlmaLinux-8
 
 set -euo pipefail
 
@@ -109,6 +134,14 @@ set -euo pipefail
 # default bare and quote at the point of use.
 WSL_EXEC="${PIR_DEPLOY_WSL_EXEC:-/mnt/c/Program Files/WSL/wsl.exe}"
 DISTRO="${PIR_DEPLOY_DISTRO:-AlmaLinux-8}"
+# The glibc floor for the released binary. 2.17 = CentOS/RHEL 7 (and therefore
+# everything newer). Override only if you deliberately want a higher floor.
+GLIBC_TARGET="${PIR_DEPLOY_GLIBC:-2.17}"
+# Zig triple cargo-zigbuild passes to the linker. The `.2.17` suffix is what
+# selects the old glibc stubs; without it zig would link against its default.
+ZIG_TARGET="x86_64-unknown-linux-gnu.${GLIBC_TARGET}"
+# Cargo's own --target dir name (zigbuild strips the glibc suffix).
+CARGO_TARGET="x86_64-unknown-linux-gnu"
 # Remote build dir inside the distro (its own disk: the repo is unreachable
 # cross-distro, and /mnt/c is not writable by the build user).
 REMOTE_DIR="${PIR_DEPLOY_REMOTE_DIR:-/home/john/pir-deploy-build}"
@@ -125,11 +158,17 @@ WSL_AVAILABLE=1
 # Version probes (`rustc --version`) run before the source is staged, so they
 # must NOT require $REMOTE_DIR to exist — hence the `-` form. Only the build
 # commands need the pinned source directory.
+#
+# PATH: `bash -lc` reads the login profile, but the tools the zig build needs
+# are not always on it — cargo-zigbuild installs into ~/.cargo/bin and zig
+# ships as a tarball (we keep it at ~/zig, the layout cargo-zigbuild expects:
+# it runs `<dir>/zig` next to the binary). Prepend both explicitly so the
+# build works the same whether or not the profile has been set up.
 wsl_run() {
   local dir="$1"; shift
-  local pre=""
+  local pre="export PATH=\"\$HOME/.local/bin:\$HOME/zig:\$HOME/.cargo/bin:\$PATH\"; "
   if [ "$dir" != "-" ]; then
-    pre="cd '$dir' || { echo 'deploy: staged source missing in distro' >&2; exit 97; }; "
+    pre="$pre cd '$dir' || { echo 'deploy: staged source missing in distro' >&2; exit 97; }; "
   fi
   "$WSL_EXEC" -d "$DISTRO" -- bash -lc "${pre}$*"
 }
@@ -396,20 +435,40 @@ if [ "$CLIPPY" -eq 1 ]; then
   fi
 fi
 
-step "build release (cargo build --release --locked)"
-cargo build --release --locked || die "release build failed"
+step "build release (cargo zigbuild --target $ZIG_TARGET, glibc $GLIBC_TARGET floor)"
+# `cargo zigbuild` links with zig's bundled glibc stubs for the requested
+# version, which is what removes the high-version symbol references
+# (GLIBC_2.18/2.25/2.27/2.28) that plain `cargo build` leaves behind and that
+# make the binary fail to START on CentOS/RHEL 7. The tests above ran under
+# plain cargo (fast, no linker stubs needed); this step produces the artifact
+# that actually ships, and the smoke tests below run against it.
+if [ "$STAGED" -eq 1 ]; then
+  # zigbuild runs in the distro, so both zig and cargo-zigbuild must be there.
+  wsl_run "$REMOTE_DIR" "command -v cargo-zigbuild >/dev/null 2>&1 && command -v zig >/dev/null 2>&1" \
+    || die "cargo-zigbuild and zig are required in '$DISTRO' for a glibc $GLIBC_TARGET build
+       (install: cargo install cargo-zigbuild; and provide zig on PATH)"
+  cargo zigbuild --release --locked --target "$ZIG_TARGET" || die "release build failed"
+else
+  command -v cargo-zigbuild >/dev/null 2>&1 \
+    || die "cargo-zigbuild is required for a glibc $GLIBC_TARGET build
+       (install: cargo install cargo-zigbuild; and provide zig on PATH)"
+  cargo zigbuild --release --locked --target "$ZIG_TARGET" || die "release build failed"
+fi
 
 # Retrieve the artifact. When building in the distro the binary lands in ITS
 # filesystem (unreachable cross-distro), so pull it back over stdout as base64
 # — a byte-exact channel that survives the text-mode hop. Building on the host
 # needs no copy.
 EXPECT_VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([0-9.]+)".*/\1/')"
-BIN="$SRC/target/release/pir"
+# zigbuild writes to target/<cargo-triple>/release (the `.2.17` suffix is a
+# linker selector, not part of the output path).
+BIN="$SRC/target/$CARGO_TARGET/release/pir"
+REL_BIN="target/$CARGO_TARGET/release/pir"
 if [ "$STAGED" -eq 1 ]; then
   step "retrieve artifact from distro"
-  mkdir -p "$SRC/target/release"
-  if ! "$WSL_EXEC" -d "$DISTRO" -- bash -lc "base64 -w0 '$REMOTE_DIR/target/release/pir'" > "$BIN.b64"; then
-    die "could not retrieve the built binary from $DISTRO:$REMOTE_DIR/target/release/pir"
+  mkdir -p "$SRC/target/$CARGO_TARGET/release"
+  if ! "$WSL_EXEC" -d "$DISTRO" -- bash -lc "base64 -w0 '$REMOTE_DIR/$REL_BIN'" > "$BIN.b64"; then
+    die "could not retrieve the built binary from $DISTRO:$REMOTE_DIR/$REL_BIN"
   fi
   [ -s "$BIN.b64" ] || die "retrieved artifact is empty (build produced no binary?)"
   base64 -d "$BIN.b64" > "$BIN" || die "could not decode the retrieved artifact"
@@ -423,7 +482,25 @@ if [ "$STAGED" -eq 1 ]; then
 fi
 [ -x "$BIN" ] || die "binary not produced at $BIN"
 dbg "BIN=$BIN  size=$(stat -c%s "$BIN" 2>/dev/null || echo '?') bytes"
-step_done "release build at $BIN"
+
+# Verify the delivered artifact really has the glibc floor we claim. A build
+# that silently linked against the host/modern glibc would otherwise ship with
+# a note saying 2.17 while failing to start on the distros that motivated the
+# whole zig setup. The artifact's highest required symbol must be <= the floor.
+REQ_GLIBC="$(objdump -T "$BIN" 2>/dev/null \
+  | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1 | sed 's/^GLIBC_//')"
+if [ -z "$REQ_GLIBC" ]; then
+  warn "could not determine the glibc requirement of $BIN (objdump missing?) — not asserting"
+elif [ "$REQ_GLIBC" != "$GLIBC_TARGET" ] && ver_ge "$REQ_GLIBC" "$GLIBC_TARGET"; then
+  # `ver_ge a b` is true when a >= b. We want required <= target, so a
+  # requirement strictly greater than the target means zig linking did not
+  # take effect (or something re-linked against a newer libc).
+  die "artifact requires GLIBC_$REQ_GLIBC, above the $GLIBC_TARGET floor —
+       zig linking did not take effect (are zig and cargo-zigbuild in use?)"
+else
+  say "  glibc floor verified: requires <= GLIBC_$REQ_GLIBC (target $GLIBC_TARGET)"
+fi
+step_done "release build at $BIN (glibc <= ${REQ_GLIBC:-?})"
 
 # --------------------------------------------------------------- binary smoke
 step "smoke tests on built binary"

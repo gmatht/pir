@@ -3229,7 +3229,7 @@ mod tests {
             .complete("/default-model claude", "/default-model claude".len(), &ctx())
             .unwrap();
         matches.sort();
-        assert_eq!(matches, vec!["claude-fake".to_string()]);
+        assert_eq!(matches, vec!["anthropic/claude-fake".to_string()]);
         // The completion replaces only the argument (after the command + space).
         assert_eq!(start, "/default-model ".len());
     }

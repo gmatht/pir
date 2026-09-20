@@ -1274,16 +1274,17 @@ pub fn set_project_user(project: &str, user: &str, path: &str) -> Result<(), Str
 /// Return up to `limit` completion candidates for `/model` matching `prefix`
 /// (case-insensitive). Used for tab-completion and the live preview hint.
 ///
-/// The completion behaves as a natural continuation of what the user typed:
-/// when the prefix matches a model id/name we return the bare `model` id
-/// (e.g. typing `de` -> `deepseek-v4-flash`) instead of prepending the
-/// provider and producing a duplicated-looking `deollama-cloud/...`. The bare
-/// id still resolves unambiguously via [`select`]; when several providers
-/// share that model id the user gets the provider choices at selection time.
+/// Candidates are always the full `provider/model` labels, so Tab expands a
+/// short fragment to its unambiguous qualified form: typing `mu` completes to
+/// `opencode-go/muse-spark-1.` (the common prefix of the muse entries) rather
+/// than a bare `muse-spark-1.` that hides which provider it belongs to. The
+/// bare id still resolves via [`select`], but completion shows the qualified
+/// label so there is never a provider ambiguity to resolve afterwards.
 ///
-/// Only when the prefix matches the provider portion (no model id match) do we
-/// keep the full `provider/model` labels, so the user can pick a model within
-/// a specific provider.
+/// Ranking: a `provider/...` label starting with the prefix wins (rank 0),
+/// then a model id/name *starting* with the prefix (rank 1, e.g. `mu` ->
+/// `muse-spark-...`), then any other substring hit (rank 2). The sort is
+/// stable, so ties keep catalog order.
 pub fn match_models(providers: &[Provider], prefix: &str, limit: usize) -> Vec<String> {
     let p = prefix.trim().to_lowercase();
 
@@ -1318,38 +1319,100 @@ pub fn match_models(providers: &[Provider], prefix: &str, limit: usize) -> Vec<S
     let mut out: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (prov, m) in &pairs {
-        let mid = m.id.to_lowercase();
-        let name = m.name.as_deref().unwrap_or("").to_lowercase();
-        // Model-id/name match -> bare id (continuation). Otherwise keep the
-        // provider-qualified label (provider-only prefix).
-        let candidate = if mid.contains(&p) || name.contains(&p) {
-            m.id.clone()
-        } else {
-            prov.label(m)
-        };
+        // Always the provider-qualified label: Tab must expand `mu` to
+        // `opencode-go/muse-spark-1.`, never to a bare id that drops the
+        // provider. The qualified label still resolves via [`select`].
+        let candidate = prov.label(m);
         if seen.insert(candidate.clone()) {
             out.push(candidate);
         }
     }
 
-    // Prefix matches are what the user is typing (e.g. `op` -> `opencode/...`);
-    // they must outrank infix/substring matches (e.g. `anthrop**op**ic/...`,
-    // which would otherwise win merely by alphabetical order). Sort is stable,
-    // so ties keep the catalog order.
+    // Rank what the user is typing first: `provider/...` prefix hits (rank 0),
+    // then model id/name prefix hits like `mu` -> `muse-spark-...` (rank 1),
+    // then any other substring hit (rank 2, e.g. `anthrop**op**ic/...` for
+    // `op`, which previously won merely by alphabetical order). Sort is
+    // stable, so ties keep the catalog order.
     out.sort_by_key(|c| {
         let hit = c.to_lowercase();
-        // 0 = starts with the prefix (best), 1 = contains it later (fallback).
-        if hit.starts_with(&p) { 0 } else { 1 }
+        if hit.starts_with(&p) {
+            return 0;
+        }
+        // Strip the `provider/` qualifier before testing the model-id prefix:
+        // a qualified label never starts with `mu`, so check the part after
+        // the `/` (and the bare-id form can't occur here, but handle it).
+        let after_slash = hit.split('/').next_back().unwrap_or(&hit);
+        if after_slash.starts_with(&p) || hit.starts_with(&p) {
+            1
+        } else {
+            2
+        }
     });
     out.truncate(limit);
     out
 }
 
-/// Given a full candidate (e.g. a `/model` completion) and the prefix the user
-/// has already typed, return only the trailing part so an inline hint reads as
-/// a continuation of what was typed (avoids the `de` + `ollama-cloud/...`
-/// duplication). Returns `None` when the candidate isn't a direct extension of
-/// the prefix.
+/// Tab-complete a `/model` input line (`/model`, `/m`, `/default-model`,
+/// `/dm`) for the TUI/GUI front-ends, which don't use rustyline's completer.
+/// A bare `/model` or `/default-model` gains a trailing space (parity with
+/// `/thinking` -> `/thinking `); with an argument fragment the matches from
+/// [`match_models`] collapse to a single label or their longest common prefix
+/// (so `/model mu` becomes `/model opencode-go/muse-spark-1.`). Returns `None`
+/// when nothing completes (unknown command, no matches, or the fragment is
+/// already at the common prefix).
+pub fn complete_model_buffer(buf: &str, providers: &[Provider]) -> Option<String> {
+    if buf == "/model" || buf == "/default-model" {
+        return Some(format!("{buf} "));
+    }
+    let mut parts = buf.splitn(2, char::is_whitespace);
+    let cmd = parts.next().unwrap_or("");
+    let rest = parts.next()?;
+    if !matches!(cmd, "/model" | "/m" | "/default-model" | "/dm") {
+        return None;
+    }
+    let frag = rest.trim_start();
+    let matches = match_models(providers, frag, crate::term::MODEL_COMPLETION_LIMIT);
+    if matches.is_empty() {
+        return None;
+    }
+    if matches.len() == 1 {
+        return Some(format!("{cmd} {}", matches[0]));
+    }
+    let lcp = longest_common_prefix(&matches);
+    if !lcp.is_empty() && lcp != frag {
+        return Some(format!("{cmd} {lcp}"));
+    }
+    None
+}
+
+/// Longest common prefix of `strs` (empty when empty/inconsistent). Shared by
+/// [`complete_model_buffer`]; the TUI/GUI front-ends keep their own copies
+/// for command-name completion.
+fn longest_common_prefix(strs: &[String]) -> String {
+    let Some(first) = strs.first() else { return String::new() };
+    let mut end = first.len();
+    for s in strs.iter().skip(1) {
+        let mut i = 0;
+        while i < end && i < s.len() && s.as_bytes()[i] == first.as_bytes()[i] {
+            i += 1;
+        }
+        end = i;
+        if end == 0 {
+            break;
+        }
+    }
+    first[..end].to_string()
+}
+
+/// Given a `/model` completion candidate (always a `provider/model` label
+/// from [`match_models`]) and the fragment the user typed, return the ghost
+/// suffix to preview after the cursor. Only when the label literally starts
+/// with the fragment (`opencode-go/` + `muse` -> `se-spark-...`) is a suffix
+/// preview possible: rustyline hints can only *append*, never replace, so a
+/// model-id-only fragment like `mu` (whose expansion `opencode-go/muse-...`
+/// does not start with `mu`) yields `None` here — Tab completion (which
+/// *replaces* the fragment) is what expands it. Returns `None` when neither
+/// applies.
 pub fn hint_remainder(candidate: &str, prefix: &str) -> Option<String> {
     let p = prefix.trim();
     if p.is_empty() {
@@ -1358,10 +1421,9 @@ pub fn hint_remainder(candidate: &str, prefix: &str) -> Option<String> {
     let c = candidate.as_bytes();
     let q = p.as_bytes();
     if c.len() > q.len() && c[..q.len()].eq_ignore_ascii_case(q) {
-        Some(candidate[q.len()..].to_string())
-    } else {
-        None
+        return Some(candidate[q.len()..].to_string());
     }
+    None
 }
 
 /// Load the `notify` policy from `~/.pi/agent/settings.json`. Missing or
@@ -1558,6 +1620,47 @@ pub fn incremental_md_default() -> bool {
     std::env::var("PIR_INCREMENTAL_MD")
         .map(|v| v.trim() != "0")
         .unwrap_or(true)
+}
+
+/// Whether the explicit-stop skill (`request_stop` tool + auto-nudge) is on
+/// by default. On unless disabled via `PIR_STOP_SKILL=0` (also accepts
+/// `off`/`false`/`no`) or `"stopSkill": false` in
+/// `~/.pi/agent/settings.json`. `PIR_STOP_SKILL` wins when set; anything
+/// unparseable falls through to the file, then to on.
+pub fn stop_skill_default() -> bool {
+    if let Ok(v) = std::env::var("PIR_STOP_SKILL") {
+        let t = v.trim().to_ascii_lowercase();
+        if ["0", "off", "false", "no", "disable", "disabled"].contains(&t.as_str()) {
+            return false;
+        }
+        if ["1", "on", "true", "yes", "enable", "enabled"].contains(&t.as_str()) {
+            return true;
+        }
+    }
+    let p = pi_dir().join("agent").join("settings.json");
+    let raw = fs::read_to_string(p).unwrap_or_default();
+    let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    v.get("stopSkill").and_then(Value::as_bool).unwrap_or(true)
+}
+
+/// Persist the stop-skill default (writes `stopSkill` into
+/// `~/.pi/agent/settings.json`, preserving the other keys).
+pub fn set_stop_skill_default(on: bool) -> Result<PathBuf, String> {
+    let p = pi_dir().join("agent").join("settings.json");
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent).map_err(|e| settings_write_error(parent, &e))?;
+    }
+    let mut v: Value = fs::read_to_string(&p)
+        .ok()
+        .and_then(|r| serde_json::from_str(&r).ok())
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    if !v.is_object() {
+        v = Value::Object(serde_json::Map::new());
+    }
+    v.as_object_mut().unwrap().insert("stopSkill".into(), Value::Bool(on));
+    fs::write(&p, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)
+        .map_err(|e| settings_write_error(&p, &e))?;
+    Ok(p)
 }
 
 /// Markdown renderer backend used by `md::render` to turn agent replies into
@@ -1829,9 +1932,10 @@ mod select_tests {
             },
         );
         let ms = match_models(&provs, "op", 10);
-        // Model-id matches return the bare id (documented continuation
-        // behaviour) — it resolves unambiguously to the opencode provider.
-        assert_eq!(ms.first().map(String::as_str), Some("opencode-chat"));
+        // Provider-qualified labels: `/model op<Tab>` offers the full
+        // `opencode/opencode-chat` label (resolves unambiguously), and the
+        // prefix hit still ranks above the infix fallbacks.
+        assert_eq!(ms.first().map(String::as_str), Some("opencode/opencode-chat"));
         // The infix-only matches are still offered as fallbacks, just after.
         assert!(ms.iter().any(|c| c.starts_with("anthropic/")), "infix matches must remain: {ms:?}");
     }
@@ -1845,6 +1949,12 @@ mod select_tests {
     /// silently hiding models. Pin the full-provider-listing behaviour: every
     /// model of a provider must be offered when completing `provider/`, using
     /// the real 27-entry `opencode-go` id set.
+    ///
+    /// NOTE: the live catalog renamed these to bare `muse-spark-1.2` /
+    /// `muse-spark-1.3` (no `-contributor` suffix). This test keeps the
+    /// historical `-contributor` ids because it pins the truncation behaviour,
+    /// not the live names; the `mu_short_fragment_expands_to_qualified_muse`
+    /// test below uses the live ids.
     #[test]
     fn provider_prefix_completion_lists_every_model() {
         // The exact live `opencode-go` model ids, in catalog order.
@@ -1910,6 +2020,70 @@ mod select_tests {
              no longer proves the truncation bug: {capped:?}"
         );
     }
+
+    /// The `/model mu` report: typing `mu` must offer the provider-qualified
+    /// muse labels (`opencode-go/muse-spark-1.2`, `opencode-go/muse-spark-1.3`)
+    /// ranked first, and the buffer helper must expand `/model mu` to the
+    /// common prefix `/model opencode-go/muse-spark-1.`. The old matcher
+    /// returned bare ids (`muse-spark-1.3`), dropping the provider; the old
+    /// TUI/GUI completers had no `/model` branch at all.
+    #[test]
+    fn mu_short_fragment_expands_to_qualified_muse() {
+        let provs = vec![
+            Provider {
+                id: Some("anthropic".into()),
+                name: None,
+                api: Some("anthropic".into()),
+                base_url: Some("https://api.anthropic.com/v1".into()),
+                api_key: None,
+                models: vec![mk("claude-sonnet-4-5", "Claude Sonnet 4.5")],
+            },
+            Provider {
+                id: Some("opencode-go".into()),
+                name: None,
+                api: Some("openai-completions".into()),
+                base_url: Some("https://opencode.ai/zen/go/v1".into()),
+                api_key: None,
+                models: vec![
+                    mk("muse-spark-1.2", "Muse Spark 1.2"),
+                    mk("muse-spark-1.3", "Muse Spark 1.3"),
+                    mk("deepseek-v4-flash", "DeepSeek V4 Flash"),
+                ],
+            },
+        ];
+        let ms = match_models(&provs, "mu", crate::term::MODEL_COMPLETION_LIMIT);
+        // Provider-qualified, never bare ids.
+        assert!(
+            ms.contains(&"opencode-go/muse-spark-1.2".to_string()),
+            "missing qualified muse 1.2: {ms:?}"
+        );
+        assert!(
+            ms.contains(&"opencode-go/muse-spark-1.3".to_string()),
+            "missing qualified muse 1.3: {ms:?}"
+        );
+        assert!(
+            !ms.iter().any(|c| c == "muse-spark-1.2" || c == "muse-spark-1.3"),
+            "bare ids must not be offered: {ms:?}"
+        );
+        // Model-id-prefix hits rank first (ahead of any substring fallback).
+        assert_eq!(
+            ms.first().map(String::as_str),
+            Some("opencode-go/muse-spark-1.2"),
+            "muse must rank first for 'mu': {ms:?}"
+        );
+        // End to end: `/model mu` + Tab -> the common qualified prefix.
+        assert_eq!(
+            complete_model_buffer("/model mu", &provs),
+            Some("/model opencode-go/muse-spark-1.".to_string()),
+        );
+        assert_eq!(
+            complete_model_buffer("/m mu", &provs),
+            Some("/m opencode-go/muse-spark-1.".to_string()),
+        );
+        // A bare command gains a trailing space; unknown fragments stay None.
+        assert_eq!(complete_model_buffer("/model", &provs), Some("/model ".to_string()));
+        assert_eq!(complete_model_buffer("/model zzz", &provs), None);
+    }
 }
 
 /// Serializes tests that mutate process-global env (`PI_DIR` / `PIR_WT`) so
@@ -1967,6 +2141,46 @@ mod worktree_settings_tests {
         match old_backend {
             Some(v) => unsafe { std::env::set_var("PIR_HTTP_BACKEND", v) },
             None => unsafe { std::env::remove_var("PIR_HTTP_BACKEND") },
+        }
+        match old_dir {
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The stop skill is on by default; `PIR_STOP_SKILL` wins over the
+    // `stopSkill` settings.json key. Env handling mirrors the other
+    // `PIR_*` defaults (file writes go to a temp PI_DIR).
+    #[test]
+    fn stop_skill_default_env_and_file() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap();
+        let old_skill = std::env::var_os("PIR_STOP_SKILL");
+        let old_dir = std::env::var_os("PI_DIR");
+        let dir = std::env::temp_dir().join(format!("pir_stop_cfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("PI_DIR", &dir);
+            std::env::remove_var("PIR_STOP_SKILL");
+        }
+        assert!(stop_skill_default(), "default is on");
+        unsafe { std::env::set_var("PIR_STOP_SKILL", "0"); }
+        assert!(!stop_skill_default(), "env 0 disables");
+        unsafe { std::env::set_var("PIR_STOP_SKILL", "off"); }
+        assert!(!stop_skill_default(), "env off disables");
+        unsafe { std::env::remove_var("PIR_STOP_SKILL"); }
+        set_stop_skill_default(false).unwrap();
+        assert!(!stop_skill_default(), "persisted off must read back");
+        set_stop_skill_default(true).unwrap();
+        assert!(stop_skill_default(), "persisted on must read back");
+        unsafe { std::env::set_var("PIR_STOP_SKILL", "1"); }
+        assert!(stop_skill_default(), "env 1 wins over a persisted off");
+        // An unparseable env value falls through to the file (still on here).
+        unsafe { std::env::set_var("PIR_STOP_SKILL", "maybe"); }
+        assert!(stop_skill_default(), "junk env must fall through to the file");
+        match old_skill {
+            Some(v) => unsafe { std::env::set_var("PIR_STOP_SKILL", v) },
+            None => unsafe { std::env::remove_var("PIR_STOP_SKILL") },
         }
         match old_dir {
             Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
