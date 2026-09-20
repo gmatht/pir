@@ -726,10 +726,108 @@ fn read_raw_into(
     if nread == 0 {
         return RawKey::None;
     }
+    // Cursor-aware editing shared with the streaming REPL: seed MidTurn from
+    // the caller's buffer + persisted cursor, sync back after each key.
+    let mut ed = crate::term::MidTurn {
+        buf: std::mem::take(buf),
+        cursor: recall.cursor,
+        tab: recall.tab.take().map(|(s, c)| (s, c, 0)),
+    };
+    let sync_ed = |ed: &mut crate::term::MidTurn, buf: &mut String| {
+        recall.cursor = ed.cursor;
+        recall.tab = ed.tab.clone().map(|(s, c, _)| (s, c));
+        *buf = ed.buf.clone();
+        update_tui_typeahead(buf, typeahead);
+    };
     let mut pasting = false;
+    let mut esc_meta = false;
     let mut i = 0usize;
     while i < nread {
         let b = tmp[i];
+        if esc_meta {
+            esc_meta = false;
+            match b {
+                0x62 => ed.move_word(true),
+                0x66 => ed.move_word(false),
+                0x7f | 0x08 => ed.kill_word_back(),
+                c if (0x20..0x7f).contains(&c) => ed.insert(c as char),
+                _ => {}
+            }
+            sync_ed(&mut ed, buf);
+            crate::term::reset_quit_presses();
+            i += 1;
+            continue;
+        }
+        // Tab completes (same tables as idle + /model args); repeat cycles.
+        if b == 0x09 {
+            ed.tab_complete();
+            sync_ed(&mut ed, buf);
+            crate::term::reset_quit_presses();
+            i += 1;
+            continue;
+        }
+        // ctrl-a / ctrl-e / ctrl-b / ctrl-f.
+        if b == 0x01 {
+            ed.home();
+            sync_ed(&mut ed, buf);
+            crate::term::reset_quit_presses();
+            i += 1;
+            continue;
+        }
+        if b == 0x05 {
+            ed.end();
+            sync_ed(&mut ed, buf);
+            crate::term::reset_quit_presses();
+            i += 1;
+            continue;
+        }
+        if b == 0x02 {
+            ed.move_char(true);
+            sync_ed(&mut ed, buf);
+            crate::term::reset_quit_presses();
+            i += 1;
+            continue;
+        }
+        if b == 0x06 {
+            ed.move_char(false);
+            sync_ed(&mut ed, buf);
+            crate::term::reset_quit_presses();
+            i += 1;
+            continue;
+        }
+        // ctrl-k / ctrl-u / ctrl-w line kills.
+        if b == 0x0b {
+            let p = ed.pos();
+            ed.buf.truncate(p);
+            ed.cursor = Some(p);
+            ed.touch();
+            sync_ed(&mut ed, buf);
+            crate::term::reset_quit_presses();
+            recall.reset();
+            recall.cursor = ed.cursor;
+            i += 1;
+            continue;
+        }
+        if b == 0x15 {
+            ed.buf.clear();
+            ed.cursor = Some(0);
+            ed.touch();
+            sync_ed(&mut ed, buf);
+            crate::term::reset_quit_presses();
+            recall.reset();
+            recall.cursor = ed.cursor;
+            i += 1;
+            continue;
+        }
+        if b == 0x17 {
+            ed.kill_word_back();
+            sync_ed(&mut ed, buf);
+            crate::term::reset_quit_presses();
+            recall.reset();
+            recall.cursor = ed.cursor;
+            i += 1;
+            continue;
+        }
         i += 1;
         match b {
             0x0a | 0x0d => {
@@ -737,31 +835,34 @@ fn read_raw_into(
                     // Inside a paste: keep the newline as part of the line
                     // (CRLF already normalised to nothing by the CR arm).
                     if b == 0x0a {
-                        buf.push('\n');
-                        update_tui_typeahead(buf, typeahead);
+                        ed.insert('\n');
+                        sync_ed(&mut ed, buf);
                     }
                     crate::term::reset_quit_presses();
                     recall.reset();
+                    recall.cursor = ed.cursor;
                 } else {
-                    let line = std::mem::take(buf);
+                    let line = std::mem::take(&mut ed.buf);
+                    ed.cursor = None;
+                    ed.tab = None;
+                    sync_ed(&mut ed, buf);
                     crate::term::reset_quit_presses();
                     recall.reset();
                     return RawKey::Line(line);
                 }
             }
             0x7f | 0x08 => {
-                if !buf.is_empty() {
-                    buf.pop();
-                    update_tui_typeahead(buf, typeahead);
-                }
+                ed.backspace();
+                sync_ed(&mut ed, buf);
                 crate::term::reset_quit_presses();
                 recall.reset();
+                recall.cursor = ed.cursor;
             }
             0x03 => {
-                buf.clear();
-                if let Ok(mut g) = typeahead.lock() {
-                    g.clear();
-                }
+                ed.buf.clear();
+                ed.cursor = None;
+                ed.tab = None;
+                sync_ed(&mut ed, buf);
                 // Triple-press-to-quit: 1st/2nd cancel the turn (as before);
                 // the 3rd consecutive press quits instead.
                 if crate::term::note_cancel_press() {
@@ -770,43 +871,61 @@ fn read_raw_into(
                 return RawKey::Interrupt;
             }
             0x04 => {
-                buf.clear();
-                if let Ok(mut g) = typeahead.lock() {
-                    g.clear();
-                }
+                ed.buf.clear();
+                ed.cursor = None;
+                ed.tab = None;
+                sync_ed(&mut ed, buf);
                 return RawKey::Eof;
             }
             0x11 => {
                 // ctrl-q: begin quitting; a second ctrl-q force-exits.
-                buf.clear();
-                if let Ok(mut g) = typeahead.lock() {
-                    g.clear();
-                }
+                ed.buf.clear();
+                ed.cursor = None;
+                ed.tab = None;
+                sync_ed(&mut ed, buf);
                 return RawKey::Quit;
             }
             0x1b => {
                 // Esc is ambiguous: a lone Esc cancels the turn; it's also the
                 // lead byte of a CSI sequence (arrows, Home/End, F-keys:
-                // `0x1b 0x5b …`; and the bracketed-paste wrappers
-                // `ESC[200~` / `ESC[201~`). Disambiguate on the byte after this
-                // one, which is almost always already buffered in `tmp` (the
-                // whole sequence arrives in a single terminal write). Only peek
-                // the fd when `0x1b` is the last buffered byte.
-                let next_is_csi = if i < nread {
-                    tmp[i] == 0x5b
+                // `0x1b 0x5b …`; bracketed-paste wrappers `ESC[200~` /
+                // `ESC[201~`); or an alt- combo (`ESC` + key). Disambiguate on
+                // the byte after this one, which is almost always already
+                // buffered in `tmp` (the whole sequence arrives in a single
+                // terminal write). Only peek the fd when `0x1b` is the last
+                // buffered byte.
+                let next: Option<u8> = if i < nread {
+                    Some(tmp[i])
                 } else {
-                    matches!(read_byte_timeout(fd, Duration::from_millis(25)), Some(0x5b))
+                    read_byte_timeout(fd, Duration::from_millis(25))
                 };
-                if !next_is_csi {
-                    buf.clear();
-                    if let Ok(mut g) = typeahead.lock() {
-                        g.clear();
+                match next {
+                    Some(0x5b) => { /* CSI — fall through below */ }
+                    Some(0x62) | Some(0x66) | Some(0x7f) | Some(0x08) => {
+                        esc_meta = true;
+                        crate::term::reset_quit_presses();
+                        continue;
                     }
-                    // Lone Esc counts like ctrl-c: 1st/2nd cancel, 3rd quits.
-                    if crate::term::note_cancel_press() {
-                        return RawKey::Quit;
+                    Some(c) if (0x20..0x7f).contains(&c) => {
+                        ed.insert(c as char);
+                        sync_ed(&mut ed, buf);
+                        crate::term::reset_quit_presses();
+                        recall.reset();
+                        recall.cursor = ed.cursor;
+                        i += 1; // consume ESC + key
+                        continue;
                     }
-                    return RawKey::Cancel;
+                    _ => {
+                        ed.buf.clear();
+                        ed.cursor = None;
+                        ed.tab = None;
+                        sync_ed(&mut ed, buf);
+                        // Lone Esc counts like ctrl-c: 1st/2nd cancel, 3rd quits.
+                        if crate::term::note_cancel_press() {
+                            return RawKey::Quit;
+                        }
+                        return RawKey::Cancel;
+                    }
                 }
                 // We're in a CSI sequence. Check for the bracketed-paste wrapper
                 // (`ESC[200~` starts, `ESC[201~` ends). The byte after `0x5b` is
@@ -832,6 +951,7 @@ fn read_raw_into(
                 // alphabetic byte or `~`. Consume from the buffered `tmp` first
                 // so they don't leak into the printable-ASCII arm; top up any
                 // tail still on the fd.
+                let seq_start = i - 1; // include the 0x1b for classification
                 if i < nread && tmp[i] == 0x5b {
                     i += 1;
                 }
@@ -850,20 +970,60 @@ fn read_raw_into(
                 // Recalled history replaces the draft (shown in the footer).
                 if let Some(up) = arrow {
                     let hist = crate::term::session_history_lines();
+                    sync_ed(&mut ed, buf);
                     if let Some(line) = recall.step(&hist, buf, up) {
-                        buf.clear();
-                        buf.push_str(&line);
-                        update_tui_typeahead(buf, typeahead);
+                        ed.buf = line;
+                        ed.cursor = Some(ed.buf.len());
+                        ed.tab = None;
+                        sync_ed(&mut ed, buf);
+                        recall.cursor = ed.cursor;
                     }
+                } else {
+                    // Word-wise cursor motion + Home/End + Delete (mirrors
+                    // the streaming REPL).
+                    let seq = &tmp[seq_start..i.min(nread)];
+                    let is_ctrl_arrow = seq.len() >= 6
+                        && seq[1] == 0x5b && seq[2] == b'1' && seq[3] == b';'
+                        && (seq[4] == b'5' || seq[4] == b'3');
+                    let term = seq.iter().rfind(|b| b.is_ascii_alphabetic() || **b == b'~');
+                    match term {
+                        Some(b'D') if is_ctrl_arrow => ed.move_word(true),
+                        Some(b'C') if is_ctrl_arrow => ed.move_word(false),
+                        Some(b'D') => {
+                            ed.move_char(true);
+                        }
+                        Some(b'C') => {
+                            ed.move_char(false);
+                        }
+                        Some(b'H') => ed.home(),
+                        Some(b'F') => ed.end(),
+                        Some(b'~') => match seq.get(2).copied().unwrap_or(0) {
+                            b'3' => {
+                                ed.delete_fwd();
+                                recall.reset();
+                                recall.cursor = ed.cursor;
+                            }
+                            b'1' | b'7' => ed.home(),
+                            b'4' | b'8' => ed.end(),
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                    sync_ed(&mut ed, buf);
+                    // `i` already sits past the terminator; `continue` skips
+                    // the trailing `i += 1` so the byte after the sequence
+                    // is not swallowed (same fix as the streaming REPL).
+                    continue;
                 }
             }
             c if (0x20..0x7f).contains(&c) => {
-                buf.push(c as char);
-                update_tui_typeahead(buf, typeahead);
+                ed.insert(c as char);
+                sync_ed(&mut ed, buf);
                 // Typing restarts the quit gesture.
                 crate::term::reset_quit_presses();
                 // Typing abandons an in-progress history recall.
                 recall.reset();
+                recall.cursor = ed.cursor;
             }
             _ => {
                 // Other control bytes are ignored, but they are still
@@ -872,6 +1032,7 @@ fn read_raw_into(
             }
         }
     }
+    sync_ed(&mut ed, buf);
     RawKey::None
 }
 

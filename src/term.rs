@@ -1520,20 +1520,321 @@ pub fn session_history_lines() -> Vec<String> {
 }
 
 /// Up/Down history navigation while a turn runs. The mid-turn raw readers
-/// have no cursor editing: a recalled line replaces the draft (shown on the
-/// spinner/footer line) and submits like typed text on Enter. `idx == -1`
-/// means "not recalling"; any typing abandons the recall (the caller
-/// resets), while submitting also resets.
+/// have a small Emacs-style editor: Left/Right move by char, ctrl+arrows /
+/// alt-b / alt-f move by word, Home/End jump, Tab completes, and Up/Down
+/// recall history. `cursor` is the byte offset into the draft (chars only —
+/// tests use ASCII); `idx == -1` means "not recalling"; any typing abandons
+/// the recall (the caller resets), while submitting also resets.
 #[derive(Debug)]
 pub struct HistRecall {
     idx: isize,
     saved: String,
+    cursor: Option<usize>,
+    /// Tab-cycle state: (word start, candidates). The next index is derived
+    /// from `MidTurn.tab`'s third element when cycling; kept minimal here
+    /// because `HistRecall` only persists cursor/recall across polls while
+    /// `MidTurn` (owned per poll batch) does the completion work.
+    tab: Option<(usize, Vec<String>)>,
 }
 
 impl Default for HistRecall {
     fn default() -> Self {
-        HistRecall { idx: -1, saved: String::new() }
+        HistRecall { idx: -1, saved: String::new(), cursor: None, tab: None }
     }
+}
+
+/// Mid-turn line editor: the draft buffer plus cursor, shared by the
+/// streaming REPL (`read_chunk`), the shared translator (`translate`), and
+/// the TUI (`read_raw_into`). Byte offsets, ASCII-only in tests.
+#[derive(Debug, Default)]
+pub struct MidTurn {
+    /// Current draft (mirrored to `typeahead` for the spinner/footer).
+    pub buf: String,
+    /// Cursor byte offset into `buf`. `None` = end of line (the common case,
+    /// so appends never need syncing).
+    pub cursor: Option<usize>,
+    /// Tab-cycle state: (word start, candidates, next index).
+    pub tab: Option<(usize, Vec<String>, usize)>,
+}
+
+impl MidTurn {
+    /// Cursor offset, clamped to the buffer (end when `None`).
+    pub fn pos(&self) -> usize {
+        self.cursor.unwrap_or(self.buf.len()).min(self.buf.len())
+    }
+
+    /// Any edit abandons an in-progress Tab cycle.
+    pub fn touch(&mut self) {
+        self.tab = None;
+    }
+
+    /// Insert `ch` at the cursor.
+    pub fn insert(&mut self, ch: char) {
+        let p = self.pos();
+        self.buf.insert(p, ch);
+        self.cursor = Some(p + ch.len_utf8());
+        self.touch();
+    }
+
+    /// Backspace: delete the char before the cursor.
+    pub fn backspace(&mut self) {
+        let p = self.pos();
+        if p == 0 {
+            return;
+        }
+        let prev = self.buf[..p].char_indices().last().map(|(i, _)| i).unwrap_or(0);
+        self.buf.drain(prev..p);
+        self.cursor = Some(prev);
+        self.touch();
+    }
+
+    /// Delete the char under the cursor (Delete key).
+    pub fn delete_fwd(&mut self) {
+        let p = self.pos();
+        if p >= self.buf.len() {
+            return;
+        }
+        let next = self.buf[p..].char_indices().nth(1).map(|(i, _)| p + i).unwrap_or(self.buf.len());
+        self.buf.drain(p..next);
+        self.cursor = Some(p);
+        self.touch();
+    }
+
+    /// Move one char left/right. Returns true when the cursor moved.
+    pub fn move_char(&mut self, left: bool) -> bool {
+        let p = self.pos();
+        if left {
+            if p == 0 {
+                return false;
+            }
+            let prev = self.buf[..p].char_indices().last().map(|(i, _)| i).unwrap_or(0);
+            self.cursor = Some(prev);
+            true
+        } else if p < self.buf.len() {
+            let next = self.buf[p..].char_indices().nth(1).map(|(i, _)| p + i).unwrap_or(self.buf.len());
+            self.cursor = Some(next);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Emacs word motion: left = back over blanks then a word; right = over a
+    /// word then blanks. Pure ASCII whitespace semantics (matches rustyline's
+    /// Emacs words closely enough for mid-turn typing).
+    pub fn move_word(&mut self, left: bool) {
+        let b = self.buf.as_bytes();
+        let mut p = self.pos();
+        if left {
+            while p > 0 && b[p - 1].is_ascii_whitespace() {
+                p -= 1;
+            }
+            while p > 0 && !b[p - 1].is_ascii_whitespace() {
+                p -= 1;
+            }
+        } else {
+            while p < b.len() && !b[p].is_ascii_whitespace() {
+                p += 1;
+            }
+            while p < b.len() && b[p].is_ascii_whitespace() {
+                p += 1;
+            }
+        }
+        self.cursor = Some(p);
+        self.touch();
+    }
+
+    /// Kill the word before the cursor (ctrl-w / alt-backspace parity).
+    pub fn kill_word_back(&mut self) {
+        let p = self.pos();
+        let b = self.buf.as_bytes();
+        let mut s = p;
+        while s > 0 && b[s - 1].is_ascii_whitespace() {
+            s -= 1;
+        }
+        while s > 0 && !b[s - 1].is_ascii_whitespace() {
+            s -= 1;
+        }
+        self.buf.drain(s..p);
+        self.cursor = Some(s);
+        self.touch();
+    }
+
+    /// Home/End.
+    pub fn home(&mut self) {
+        self.cursor = Some(0);
+        self.touch();
+    }
+    pub fn end(&mut self) {
+        self.cursor = Some(self.buf.len());
+        self.touch();
+    }
+
+    /// Word under/before the cursor for Tab completion: the (start, fragment)
+    /// of the whitespace-delimited token containing the cursor.
+    pub fn word_at(&self) -> (usize, &str) {
+        let p = self.pos();
+        let b = self.buf.as_bytes();
+        let mut s = p;
+        while s > 0 && !b[s - 1].is_ascii_whitespace() {
+            s -= 1;
+        }
+        (s, &self.buf[s..p])
+    }
+
+    /// Apply one Tab press: first press computes candidates for the word at
+    /// the cursor (slash commands, `/thinking` args, `/model` args via
+    /// `complete_model_buffer`, else history), completes to the common
+    /// prefix or first match; repeated presses cycle. Returns true when the
+    /// buffer changed.
+    pub fn tab_complete(&mut self) -> bool {
+        // Cycling: reuse the stored candidates.
+        if let Some((start, cands, next)) = self.tab.take() {
+            if !cands.is_empty() && self.buf[..start.min(self.buf.len())].len() == start {
+                let pick = cands[next % cands.len()].clone();
+                let end = self.pos();
+                if end >= start {
+                    self.buf.replace_range(start..end, &pick);
+                    self.cursor = Some(start + pick.len());
+                    self.tab = Some((start, cands, next + 1));
+                    return true;
+                }
+            }
+            self.tab = None;
+        }
+        let (start, _frag) = self.word_at();
+        let before = self.buf[..self.pos()].to_string();
+        let completed = complete_idle(&before)
+            .or_else(|| {
+                let providers = MODEL_PROVIDERS.get().map(|v| v.as_slice()).unwrap_or(&[]);
+                crate::config::complete_model_buffer(&before, providers)
+            });
+        let Some(done) = completed else { return false };
+        // Candidate list for cycling: recompute from the same prefix.
+        let cands = completion_candidates(&before);
+        let next = if cands.len() > 1 { 1 } else { 0 };
+        // Replace only the completed tail (command or arg), keep the cursor.
+        let tail_len = done.len().saturating_sub(0);
+        let _ = tail_len;
+        self.buf = done;
+        self.cursor = Some(self.buf.len());
+        if !cands.is_empty() {
+            // Word start in the *new* buffer for cycling.
+            let ns = self.buf.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+            let _ = start;
+            self.tab = Some((ns, cands, next));
+        }
+        true
+    }
+}
+
+/// Candidate list behind [`MidTurn::tab_complete`] (for cycling): the matches
+/// for the word at the cursor, in completion order.
+fn completion_candidates(before: &str) -> Vec<String> {
+    // Slash-command / /thinking candidates from complete_idle's tables.
+    if let Some(_done) = complete_idle(before) {
+        // Recompute the match list the same way complete_idle does.
+        let commands = [
+            "help", "model", "models", "goal", "continue", "clear", "fix", "undo", "bg", "jobs",
+            "thinking", "cancel", "shell", "exit",
+        ];
+        if before.starts_with("/thinking ") {
+            let arg = before.trim_start_matches("/thinking ").trim_start();
+            let opts = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "show", "hide"];
+            return opts.iter().filter(|o| o.starts_with(arg)).map(|o| o.to_string()).collect();
+        }
+        if before.starts_with('/') && !before.contains(' ') {
+            let frag = before.trim_start_matches('/');
+            return commands.iter().filter(|c| c.starts_with(frag)).map(|c| format!("/{c}")).collect();
+        }
+        // /model-arg candidates.
+        let providers = MODEL_PROVIDERS.get().map(|v| v.as_slice()).unwrap_or(&[]);
+        if let Some(cmd_end) = before.find(char::is_whitespace) {
+            let (cmd, rest) = before.split_at(cmd_end);
+            if matches!(cmd, "/model" | "/m" | "/default-model" | "/dm") {
+                let frag = rest.trim_start();
+                return crate::config::match_models(providers, frag, MODEL_COMPLETION_LIMIT);
+            }
+        }
+        return Vec::new();
+    }
+    // complete_idle said None: maybe a /model-arg LCP case it handled — ask
+    // match_models directly for the cycle list.
+    let providers = MODEL_PROVIDERS.get().map(|v| v.as_slice()).unwrap_or(&[]);
+    if let Some(cmd_end) = before.find(char::is_whitespace) {
+        let (cmd, rest) = before.split_at(cmd_end);
+        if matches!(cmd, "/model" | "/m" | "/default-model" | "/dm") {
+            let frag = rest.trim_start();
+            return crate::config::match_models(providers, frag, MODEL_COMPLETION_LIMIT);
+        }
+    }
+    // History fallback (mirrors the completer's plain-text branch).
+    Vec::new()
+}
+
+/// Idle-mode Tab completion for a bare buffer (no cursor): completes
+/// `/`-command names (and `/thinking` args). `/model`-family args go through
+/// `config::complete_model_buffer` (tried by the caller via `or_else`).
+/// Returns the completed buffer, or `None` when nothing completes.
+fn complete_idle(buf: &str) -> Option<String> {
+    let commands = [
+        "help", "model", "models", "goal", "continue", "clear", "fix", "undo", "bg", "jobs",
+        "thinking", "cancel", "shell", "exit",
+    ];
+    if buf == "/thinking" {
+        return Some("/thinking ".to_string());
+    }
+    if buf.starts_with("/thinking ") {
+        let arg = buf.trim_start_matches("/thinking ").trim_start();
+        let opts = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "show", "hide"];
+        let matches: Vec<&str> = opts.iter().copied().filter(|o| o.starts_with(arg)).collect();
+        if matches.len() == 1 {
+            return Some(format!("/thinking {}", matches[0]));
+        }
+        if matches.len() > 1 {
+            let lcp = lcp_str(&matches);
+            if !lcp.is_empty() && lcp != arg {
+                return Some(format!("/thinking {lcp}"));
+            }
+        }
+        return None;
+    }
+    if buf.starts_with('/') {
+        let frag = buf.trim_start_matches('/');
+        if frag.contains(' ') {
+            // Past the command word: /model args are completed by
+            // `config::complete_model_buffer` (caller chains via or_else).
+            return None;
+        }
+        let matches: Vec<&str> = commands.iter().copied().filter(|c| c.starts_with(frag)).collect();
+        if matches.len() == 1 {
+            return Some(format!("/{0}", matches[0]));
+        }
+        if matches.len() > 1 {
+            let lcp = lcp_str(&matches);
+            if !lcp.is_empty() && lcp != frag {
+                return Some(format!("/{lcp}"));
+            }
+        }
+    }
+    None
+}
+
+/// Longest common prefix of `&str`s (mid-turn + idle command completion).
+fn lcp_str(strs: &[&str]) -> String {
+    let Some(first) = strs.first() else { return String::new() };
+    let mut end = first.len();
+    for s in strs.iter().skip(1) {
+        let mut i = 0;
+        while i < end && i < s.len() && s.as_bytes()[i] == first.as_bytes()[i] {
+            i += 1;
+        }
+        end = i;
+        if end == 0 {
+            break;
+        }
+    }
+    first[..end].to_string()
 }
 
 impl HistRecall {
@@ -1541,6 +1842,20 @@ impl HistRecall {
     pub fn reset(&mut self) {
         self.idx = -1;
         self.saved.clear();
+        self.cursor = None;
+        self.tab = None;
+    }
+
+    /// Cursor byte offset for the current draft (`None` = end). The mid-turn
+    /// readers sync this from `MidTurn` after each keypress; kept here so
+    /// Up/Down recall + cursor survive across `wait_input` polls.
+    pub fn cursor_pos(&self, draft: &str) -> usize {
+        self.cursor.unwrap_or(draft.len()).min(draft.len())
+    }
+
+    /// Record the cursor after an edit/move.
+    pub fn set_cursor(&mut self, pos: Option<usize>) {
+        self.cursor = pos;
     }
 
     /// Navigate one step: `up == true` for Up (older), `false` for Down
@@ -2348,10 +2663,24 @@ pub mod raw {
         result
     }
 
+    /// Throttle window used by [`wait_input`]; exposed for the CPU-regression
+    /// scenarios (and the paste tests) so both can assert it stays bounded.
+    #[cfg(test)]
+    pub fn read_chunk_for_test(
+        buf: &mut String,
+        typeahead: &Arc<Mutex<String>>,
+        recall: &mut super::HistRecall,
+    ) -> RawInput {
+        read_chunk(buf, typeahead, recall)
+    }
+
     /// Drain any currently-available stdin bytes, translating control chars and
     /// recording printable text into `typeahead` (for the spinner to render).
     /// `stdin` is non-blocking (see `enable_raw`), so this returns as soon as no
-    /// more bytes are readable. Backspace pops the buffer; ctrl-c/ctrl-d/Enter
+    /// more bytes are readable. Backspace deletes before the cursor, printable
+    /// chars insert at the cursor; Left/Right move by char, ctrl+Left/Right
+    /// (and alt-b/alt-f) by word, Home/End jump, Tab completes
+    /// (`/commands`, `/thinking` args, `/model` args), ctrl-c/ctrl-d/Enter
     /// are surfaced to the caller. This thread never writes to stdout.
     ///
     /// Up/Down (`ESC[A` / `ESC[B`) recall session history into the draft via
@@ -2377,6 +2706,16 @@ pub mod raw {
         // Crucially, this loop drains the *entire* paste (which the terminal
         // delivers as a single write) in one `read_chunk` call, so the local
         // `pasting` flag below stays valid for the whole wrapper.
+        //
+        // On EAGAIN we must STOP, not try again: the caller (`wait_input`) has
+        // already awaited readability, so there is genuinely nothing to read —
+        // and on a pipe at EOF a `read` returns 0 *immediately, forever*. An
+        // unconditional retry therefore burned a whole core (~7k syscalls/s,
+        // measured) while looking like an idle prompt; the throttle in
+        // `wait_input` bounds the loop rate but cannot make it idle. A single
+        // EAGAIN means "no more bytes available right now", which is exactly
+        // the condition this drain loop exists to detect (this also used to
+        // cost a second `read` on every keystroke).
         loop {
             let r = unsafe {
                 libc::read(
@@ -2385,13 +2724,24 @@ pub mod raw {
                     tmp.len() - nread,
                 )
             };
-            if r <= 0 {
+            if r > 0 {
+                nread += r as usize;
+                if nread >= tmp.len() {
+                    break;
+                }
+                continue;
+            }
+            if r == 0 {
+                // EOF: the fd will stay permanently readable, so treat it like
+                // EAGAIN and stop draining — the caller decides what to do.
                 break;
             }
-            nread += r as usize;
-            if nread >= tmp.len() {
-                break;
+            // r < 0: EAGAIN (nothing buffered) or EINTR (retry once).
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
             }
+            break;
         }
         if nread == 0 {
             return RawInput::None;
@@ -2399,6 +2749,24 @@ pub mod raw {
         // A real input event arrived: mark the keyboard active so deferred
         // thinking output keeps waiting (see `note_keypress`).
         note_keypress();
+        // Edit through MidTurn so cursor-aware keys (Left/Right/Home/End,
+        // word motion, Tab) work mid-turn: seed it from the caller's buffer
+        // + persisted cursor, sync back before every return.
+        let mut ed = super::MidTurn {
+            buf: std::mem::take(buf),
+            cursor: recall.cursor,
+            tab: recall.tab.take().map(|(s, c)| (s, c, 0)),
+        };
+        let sync = |ed: &mut super::MidTurn, buf: &mut String, recall: &mut super::HistRecall| {
+            recall.cursor = ed.cursor;
+            recall.tab = ed.tab.clone().map(|(s, c, _)| (s, c));
+            // Clone, not take/move: `ed` stays the accumulator across bytes
+            // within this call AND across `wait_input` polls (cursor/tab live
+            // in `recall`). Taking here ate every insert — Enter returned
+            // Line("") and mid-turn typing vanished.
+            *buf = ed.buf.clone();
+            update_typeahead(buf, typeahead);
+        };
         // `pasting` tracks whether we're inside a bracketed-paste wrapper
         // (`ESC[200~` … `ESC[201~`). It is local because `read_chunk` always
         // drains every available byte (above), so a whole paste is consumed
@@ -2410,21 +2778,71 @@ pub mod raw {
         // that was available this tick into `tmp`, so a follow-up byte that
         // arrived in the SAME tick is right here in the buffer — no second fd
         // read is required for the common case.
+        // `esc_meta` tracks a bare ESC immediately before this byte (alt- combos
+        // arrive as `ESC` + key, not CSI): alt-b/alt-f word motion, alt-Backspace
+        // word kill. Set in the 0x1b arm when the byte after ESC is not `[`.
+        let mut esc_meta = false;
         let mut i = 0usize;
         while i < nread {
             let b = tmp[i];
+            // A pending alt- prefix consumes this byte as the combo key.
+            if esc_meta {
+                esc_meta = false;
+                match b {
+                    0x62 => {
+                        ed.move_word(true);
+                        sync(&mut ed, buf, recall);
+                        super::reset_quit_presses();
+                    }
+                    0x66 => {
+                        ed.move_word(false);
+                        sync(&mut ed, buf, recall);
+                        super::reset_quit_presses();
+                    }
+                    0x7f | 0x08 => {
+                        ed.kill_word_back();
+                        sync(&mut ed, buf, recall);
+                        super::reset_quit_presses();
+                        recall.reset();
+                        recall.cursor = ed.cursor;
+                    }
+                    c if (0x20..0x7f).contains(&c) => {
+                        ed.insert(c as char);
+                        sync(&mut ed, buf, recall);
+                        super::reset_quit_presses();
+                        recall.reset();
+                        recall.cursor = ed.cursor;
+                    }
+                    _ => {
+                        super::reset_quit_presses();
+                    }
+                }
+                i += 1;
+                continue;
+            }
             match b {
+                0x09 => {
+                    // Tab: complete `/commands`, `/thinking` args, `/model`
+                    // args (same tables as idle); repeat to cycle matches.
+                    ed.tab_complete();
+                    sync(&mut ed, buf, recall);
+                    super::reset_quit_presses();
+                }
                 0x0a => {
                     // LF. Outside a paste this ends the line (Enter → a queued
                     // prompt). Inside a paste it's part of the pasted text, so we
                     // keep it as a real newline in the buffer.
                     if pasting {
-                        buf.push('\n');
-                        update_typeahead(buf, typeahead);
+                        ed.insert('\n');
+                        sync(&mut ed, buf, recall);
                         super::reset_quit_presses();
                         recall.reset();
+                        recall.cursor = ed.cursor;
                     } else {
-                        let line = std::mem::take(buf);
+                        let line = std::mem::take(&mut ed.buf);
+                        ed.cursor = None;
+                        ed.tab = None;
+                        sync(&mut ed, buf, recall);
                         super::reset_quit_presses();
                         recall.reset();
                         return RawInput::Line(line);
@@ -2436,38 +2854,86 @@ pub mod raw {
                     // by an LF (the LF will add the newline); otherwise keep it.
                     if pasting {
                         if !(i + 1 < nread && tmp[i + 1] == 0x0a) {
-                            buf.push('\n');
-                            update_typeahead(buf, typeahead);
+                            ed.insert('\n');
+                            sync(&mut ed, buf, recall);
                         }
                         super::reset_quit_presses();
                         recall.reset();
+                        recall.cursor = ed.cursor;
                     } else {
-                        let line = std::mem::take(buf);
+                        let line = std::mem::take(&mut ed.buf);
+                        ed.cursor = None;
+                        ed.tab = None;
+                        sync(&mut ed, buf, recall);
                         super::reset_quit_presses();
                         recall.reset();
                         return RawInput::Line(line);
                     }
                 }
                 0x7f | 0x08 => {
-                    if !buf.is_empty() {
-                        buf.pop();
-                        // Update the shared typeahead so the spinner drops the
-                        // removed character (it owns the only stdout writer).
-                        if let Ok(mut g) = typeahead.lock() {
-                            g.clear();
-                            g.push_str(buf);
-                        }
-                    }
+                    ed.backspace();
+                    sync(&mut ed, buf, recall);
                     // Editing is activity, not hammering.
                     super::reset_quit_presses();
                     // Any edit abandons an in-progress history recall.
                     recall.reset();
+                    recall.cursor = ed.cursor;
+                }
+                // ctrl-a / ctrl-e: Home/End (Emacs parity with idle prompt).
+                0x01 => {
+                    ed.home();
+                    sync(&mut ed, buf, recall);
+                    super::reset_quit_presses();
+                }
+                0x05 => {
+                    ed.end();
+                    sync(&mut ed, buf, recall);
+                    super::reset_quit_presses();
+                }
+                // ctrl-b / ctrl-f: char-wise (idle Left/Right parity).
+                0x02 => {
+                    ed.move_char(true);
+                    sync(&mut ed, buf, recall);
+                    super::reset_quit_presses();
+                }
+                0x06 => {
+                    ed.move_char(false);
+                    sync(&mut ed, buf, recall);
+                    super::reset_quit_presses();
+                }
+                // ctrl-k: kill to end of line. ctrl-u: kill whole line.
+                // ctrl-w: kill word back (Emacs parity).
+                0x0b => {
+                    let p = ed.pos();
+                    ed.buf.truncate(p);
+                    ed.cursor = Some(p);
+                    ed.touch();
+                    sync(&mut ed, buf, recall);
+                    super::reset_quit_presses();
+                    recall.reset();
+                    recall.cursor = ed.cursor;
+                }
+                0x15 => {
+                    ed.buf.clear();
+                    ed.cursor = Some(0);
+                    ed.touch();
+                    sync(&mut ed, buf, recall);
+                    super::reset_quit_presses();
+                    recall.reset();
+                    recall.cursor = ed.cursor;
+                }
+                0x17 => {
+                    ed.kill_word_back();
+                    sync(&mut ed, buf, recall);
+                    super::reset_quit_presses();
+                    recall.reset();
+                    recall.cursor = ed.cursor;
                 }
                 0x03 => {
-                    buf.clear();
-                    if let Ok(mut g) = typeahead.lock() {
-                        g.clear();
-                    }
+                    ed.buf.clear();
+                    ed.cursor = None;
+                    ed.tab = None;
+                    sync(&mut ed, buf, recall);
                     // Triple-press-to-quit: 1st/2nd cancel the turn (as
                     // before); the 3rd consecutive press quits instead.
                     if super::note_cancel_press() {
@@ -2476,19 +2942,19 @@ pub mod raw {
                     return RawInput::Interrupt;
                 }
                 0x04 => {
-                    buf.clear();
-                    if let Ok(mut g) = typeahead.lock() {
-                        g.clear();
-                    }
+                    ed.buf.clear();
+                    ed.cursor = None;
+                    ed.tab = None;
+                    sync(&mut ed, buf, recall);
                     return RawInput::Eof;
                 }
                 0x11 => {
                     // ctrl-q: begin quitting. A *second* ctrl-q (while still
                     // shutting down) force-exits — see `spawn_force_quit_watchdog`.
-                    buf.clear();
-                    if let Ok(mut g) = typeahead.lock() {
-                        g.clear();
-                    }
+                    ed.buf.clear();
+                    ed.cursor = None;
+                    ed.tab = None;
+                    sync(&mut ed, buf, recall);
                     return RawInput::Quit;
                 }
                 0x1a => {
@@ -2496,34 +2962,59 @@ pub mod raw {
                     // must survive the pause (the REPL raises SIGTSTP and the
                     // spinner/worker threads all stop with the process), so we
                     // return immediately and let the caller handle it.
+                    sync(&mut ed, buf, recall);
+                    recall.cursor = ed.cursor;
                     return RawInput::Suspend;
                 }
                 0x1b => {
                     // ESC is ambiguous: a lone Esc should cancel the turn (like
                     // ctrl-c), but it's also the lead byte of a CSI sequence
                     // (arrows, Home/End, F-keys: `0x1b 0x5b …`; and the bracketed
-                    // paste wrappers `ESC[200~` / `ESC[201~`). Disambiguate on
-                    // the byte that follows this one:
-                    //   * if the next byte is `0x5b` (`[`) it's a CSI sequence;
-                    //   * otherwise it's a lone Esc → cancel the turn.
+                    // paste wrappers `ESC[200~` / `ESC[201~`) or an alt- combo
+                    // (`ESC` + key). Disambiguate on the byte that follows:
+                    //   * `0x5b` (`[`) → CSI sequence;
+                    //   * `b`/`f`/Backspace/printable → alt- combo (handled by
+                    //     setting `esc_meta` and consuming the next byte there);
+                    //   * otherwise (or timeout) → lone Esc → cancel the turn.
                     // The next byte is almost always already in `tmp` (the whole
                     // sequence arrives in one terminal write); only when `0x1b`
                     // is the final buffered byte do we peek the fd briefly.
-                    let next_is_csi = if i + 1 < nread {
-                        tmp[i + 1] == 0x5b
+                    let next: Option<u8> = if i + 1 < nread {
+                        Some(tmp[i + 1])
                     } else {
-                        matches!(read_byte_timeout(fd, std::time::Duration::from_millis(25)), Some(0x5b))
+                        read_byte_timeout(fd, std::time::Duration::from_millis(25))
                     };
-                    if !next_is_csi {
-                        buf.clear();
-                        if let Ok(mut g) = typeahead.lock() {
-                            g.clear();
+                    match next {
+                        Some(0x5b) => { /* CSI — fall through below */ }
+                        Some(0x62) | Some(0x66) | Some(0x7f) | Some(0x08) => {
+                            // alt-b / alt-f / alt-Backspace.
+                            esc_meta = true;
+                            super::reset_quit_presses();
+                            i += 1; // consume the ESC; combo key handled next tick
+                            continue;
                         }
-                        // Lone Esc counts like ctrl-c: 1st/2nd cancel, 3rd quits.
-                        if super::note_cancel_press() {
-                            return RawInput::Quit;
+                        Some(c) if (0x20..0x7f).contains(&c) => {
+                            // alt-<printable>: insert the char (terminal sends
+                            // ESC + key for alt- combos).
+                            ed.insert(c as char);
+                            sync(&mut ed, buf, recall);
+                            super::reset_quit_presses();
+                            recall.reset();
+                            recall.cursor = ed.cursor;
+                            i += 2; // consume ESC + key
+                            continue;
                         }
-                        return RawInput::Cancel;
+                        _ => {
+                            ed.buf.clear();
+                            ed.cursor = None;
+                            ed.tab = None;
+                            sync(&mut ed, buf, recall);
+                            // Lone Esc counts like ctrl-c: 1st/2nd cancel, 3rd quits.
+                            if super::note_cancel_press() {
+                                return RawInput::Quit;
+                            }
+                            return RawInput::Cancel;
+                        }
                     }
                     // We're in a CSI sequence. Check whether it's a bracketed-
                     // paste wrapper (`ESC[200~` starts, `ESC[201~` ends).
@@ -2573,22 +3064,89 @@ pub mod raw {
                     // line); Enter submits it like typed text.
                     if let Some(up) = arrow {
                         let hist = super::session_history_lines();
+                        sync(&mut ed, buf, recall);
                         if let Some(line) = recall.step(&hist, buf, up) {
-                            buf.clear();
-                            buf.push_str(&line);
-                            update_typeahead(buf, typeahead);
+                            ed.buf = line;
+                            ed.cursor = Some(ed.buf.len());
+                            ed.tab = None;
+                            sync(&mut ed, buf, recall);
+                            recall.cursor = ed.cursor;
+                        }
+                    } else {
+                        // Word-wise cursor motion + Home/End + Delete:
+                        //   ctrl+Left / ctrl+Right (`ESC[1;5D/C`), alt+Left /
+                        //   alt+Right (`ESC[1;3D/C`) → word jump;
+                        //   plain Left/Right → char step; Home/End → jump;
+                        //   Delete (`ESC[3~`) → delete under cursor.
+                        // The sequence bytes are in tmp[i..consumed]; classify
+                        // from the raw tail before it was swallowed.
+                        let seq = &tmp[i..nread.min(i + 8)];
+                        // seq[0] is 0x1b; seq[1] is 0x5b when buffered.
+                        let is_ctrl_arrow = seq.len() >= 6
+                            && seq[1] == 0x5b && seq[2] == b'1' && seq[3] == b';'
+                            && (seq[4] == b'5' || seq[4] == b'3');
+                        let term = seq.iter().rfind(|b| b.is_ascii_alphabetic() || **b == b'~');
+                        match term {
+                            Some(b'D') if is_ctrl_arrow => {
+                                ed.move_word(true);
+                                sync(&mut ed, buf, recall);
+                            }
+                            Some(b'C') if is_ctrl_arrow => {
+                                ed.move_word(false);
+                                sync(&mut ed, buf, recall);
+                            }
+                            Some(b'D') => {
+                                ed.move_char(true);
+                                sync(&mut ed, buf, recall);
+                            }
+                            Some(b'C') => {
+                                ed.move_char(false);
+                                sync(&mut ed, buf, recall);
+                            }
+                            Some(b'H') | Some(b'F') => {
+                                // Home / End (xterm `ESC[H/F`).
+                                if term == Some(&b'H') { ed.home(); } else { ed.end(); }
+                                sync(&mut ed, buf, recall);
+                            }
+                            Some(b'~') => {
+                                // `ESC[3~` Delete, `ESC[1~`/`ESC[7~` Home,
+                                // `ESC[4~`/`ESC[8~` End: 3rd byte selects.
+                                let third = seq.get(2).copied().unwrap_or(0);
+                                match third {
+                                    b'3' => {
+                                        ed.delete_fwd();
+                                        sync(&mut ed, buf, recall);
+                                        super::reset_quit_presses();
+                                        recall.reset();
+                                        recall.cursor = ed.cursor;
+                                    }
+                                    b'1' | b'7' => {
+                                        ed.home();
+                                        sync(&mut ed, buf, recall);
+                                    }
+                                    b'4' | b'8' => {
+                                        ed.end();
+                                        sync(&mut ed, buf, recall);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            _ => {}
                         }
                     }
-                    // `i` now sits just past the consumed sequence (or at `nread`);
-                    // the outer `while` advances it once more, which is correct.
+                    // `i` already sits past the terminator; `continue` skips
+                    // the loop's trailing `i += 1` so the byte after the
+                    // sequence is not swallowed (same fix as `translate`).
+                    continue;
                 }
                 c if (0x20..0x7f).contains(&c) => {
-                    buf.push(c as char);
-                    update_typeahead(buf, typeahead);
+                    ed.insert(c as char);
+                    sync(&mut ed, buf, recall);
                     // Typing restarts the quit gesture.
                     super::reset_quit_presses();
                     // Typing abandons an in-progress history recall.
                     recall.reset();
+                    recall.cursor = ed.cursor;
                 }
                 _ => {
                     // Other control bytes are ignored, but they are still
@@ -2598,6 +3156,8 @@ pub mod raw {
             }
             i += 1;
         }
+        sync(&mut ed, buf, recall);
+        recall.cursor = ed.cursor;
         RawInput::None
     }
 
@@ -2700,74 +3260,166 @@ pub mod raw {
     /// buffers a whole chunk before calling, the bytes following a `0x1b` are
     /// already present in `bytes`, so no second fd read is needed in the common
     /// case.
+    ///
+    /// Cursor-aware like `read_chunk` (Left/Right/Home/End/word motion/Tab via
+    /// an internal `MidTurn` seeded from `buf`); the cursor itself is not
+    /// persisted here — the TUI owns it per poll via `read_raw_into`.
     pub fn translate(buf: &mut String, typeahead: &Arc<Mutex<String>>, bytes: &[u8]) -> RawInput {
+        let mut ed = super::MidTurn {
+            buf: std::mem::take(buf),
+            cursor: None,
+            tab: None,
+        };
+        let sync = |ed: &mut super::MidTurn, buf: &mut String| {
+            // Clone, not take: `ed` stays the accumulator across keystrokes
+            // within this call; only the Enter arm takes it into the Line.
+            // (take here silently ate every insert — Enter returned Line("")).
+            *buf = ed.buf.clone();
+            update_typeahead(buf, typeahead);
+        };
         let mut pasting = false;
+        let mut esc_meta = false;
         let mut i = 0usize;
         while i < bytes.len() {
             let fd = io::stdin().as_raw_fd();
+            if esc_meta {
+                esc_meta = false;
+                match bytes[i] {
+                    0x62 => ed.move_word(true),
+                    0x66 => ed.move_word(false),
+                    0x7f | 0x08 => ed.kill_word_back(),
+                    c if (0x20..0x7f).contains(&c) => ed.insert(c as char),
+                    _ => {}
+                }
+                sync(&mut ed, buf);
+                i += 1;
+                continue;
+            }
             let b = bytes[i];
+            // Alt- combos arrive as ESC + key; 'h'/'l'/'e' etc. after ESC must
+            // NOT be treated as plain inserts — check esc_meta first. (The
+            // match arm below also handles the direct `Some(c)` path in the
+            // 0x1b arm, but a byte-by-byte caller can land here.)
             match b {
+                0x09 => {
+                    ed.tab_complete();
+                    sync(&mut ed, buf);
+                }
                 0x0a => {
                     if pasting {
-                        buf.push('\n');
-                        update_typeahead(buf, typeahead);
+                        ed.insert('\n');
+                        sync(&mut ed, buf);
                     } else {
-                        let line = std::mem::take(buf);
+                        let line = std::mem::take(&mut ed.buf);
+                        ed.cursor = None;
+                        ed.tab = None;
+                        sync(&mut ed, buf);
                         return RawInput::Line(line);
                     }
                 }
                 0x0d => {
                     if pasting {
                         if !(i + 1 < bytes.len() && bytes[i + 1] == 0x0a) {
-                            buf.push('\n');
-                            update_typeahead(buf, typeahead);
+                            ed.insert('\n');
+                            sync(&mut ed, buf);
                         }
                     } else {
-                        let line = std::mem::take(buf);
+                        let line = std::mem::take(&mut ed.buf);
+                        ed.cursor = None;
+                        ed.tab = None;
+                        sync(&mut ed, buf);
                         return RawInput::Line(line);
                     }
                 }
                 0x7f | 0x08 => {
-                    if !buf.is_empty() {
-                        buf.pop();
-                        update_typeahead(buf, typeahead);
-                    }
+                    ed.backspace();
+                    sync(&mut ed, buf);
+                }
+                0x01 => {
+                    ed.home();
+                    sync(&mut ed, buf);
+                }
+                0x05 => {
+                    ed.end();
+                    sync(&mut ed, buf);
+                }
+                0x02 => {
+                    ed.move_char(true);
+                    sync(&mut ed, buf);
+                }
+                0x06 => {
+                    ed.move_char(false);
+                    sync(&mut ed, buf);
+                }
+                0x0b => {
+                    let p = ed.pos();
+                    ed.buf.truncate(p);
+                    ed.cursor = Some(p);
+                    ed.touch();
+                    sync(&mut ed, buf);
+                }
+                0x15 => {
+                    ed.buf.clear();
+                    ed.cursor = Some(0);
+                    ed.touch();
+                    sync(&mut ed, buf);
+                }
+                0x17 => {
+                    ed.kill_word_back();
+                    sync(&mut ed, buf);
                 }
                 0x03 => {
-                    buf.clear();
-                    if let Ok(mut g) = typeahead.lock() {
-                        g.clear();
-                    }
+                    ed.buf.clear();
+                    ed.cursor = None;
+                    ed.tab = None;
+                    sync(&mut ed, buf);
                     return RawInput::Interrupt;
                 }
                 0x04 => {
-                    buf.clear();
-                    if let Ok(mut g) = typeahead.lock() {
-                        g.clear();
-                    }
+                    ed.buf.clear();
+                    ed.cursor = None;
+                    ed.tab = None;
+                    sync(&mut ed, buf);
                     return RawInput::Eof;
                 }
                 0x11 => {
                     // ctrl-q: begin quitting; a second ctrl-q force-exits.
-                    buf.clear();
-                    if let Ok(mut g) = typeahead.lock() {
-                        g.clear();
-                    }
+                    ed.buf.clear();
+                    ed.cursor = None;
+                    ed.tab = None;
+                    sync(&mut ed, buf);
                     return RawInput::Quit;
                 }
-                0x1a => return RawInput::Suspend,
+                0x1a => {
+                    sync(&mut ed, buf);
+                    return RawInput::Suspend;
+                }
                 0x1b => {
-                    let next_is_csi = if i + 1 < bytes.len() {
-                        bytes[i + 1] == 0x5b
+                    let next: Option<u8> = if i + 1 < bytes.len() {
+                        Some(bytes[i + 1])
                     } else {
-                        matches!(read_byte_timeout(fd, std::time::Duration::from_millis(25)), Some(0x5b))
+                        read_byte_timeout(fd, std::time::Duration::from_millis(25))
                     };
-                    if !next_is_csi {
-                        buf.clear();
-                        if let Ok(mut g) = typeahead.lock() {
-                            g.clear();
+                    match next {
+                        Some(0x5b) => { /* CSI — fall through below */ }
+                        Some(0x62) | Some(0x66) | Some(0x7f) | Some(0x08) => {
+                            esc_meta = true;
+                            i += 1;
+                            continue;
                         }
-                        return RawInput::Cancel;
+                        Some(c) if (0x20..0x7f).contains(&c) => {
+                            ed.insert(c as char);
+                            sync(&mut ed, buf);
+                            i += 2;
+                            continue;
+                        }
+                        _ => {
+                            ed.buf.clear();
+                            ed.cursor = None;
+                            ed.tab = None;
+                            sync(&mut ed, buf);
+                            return RawInput::Cancel;
+                        }
                     }
                     // We're in a CSI sequence; check for the bracketed-paste
                     // wrapper (`ESC[200~` start / `ESC[201~` end) before the
@@ -2783,6 +3435,7 @@ pub mod raw {
                         i += 6; // skip `ESC [ 2 0 0 ~` / `ESC [ 2 0 1 ~` (6 bytes)
                         continue;
                     }
+                    let seq_start = i;
                     i += 1; // skip 0x1b
                     if i < bytes.len() && bytes[i] == 0x5b {
                         i += 1; // skip 0x5b
@@ -2797,15 +3450,48 @@ pub mod raw {
                     if i >= bytes.len() {
                         drain_csi_sequence(fd);
                     }
+                    // Classify word-wise arrows / Home/End / Delete from the
+                    // swallowed bytes (mirrors `read_chunk`).
+                    let seq = &bytes[seq_start..i.min(bytes.len())];
+                    let is_ctrl_arrow = seq.len() >= 6
+                        && seq[1] == 0x5b && seq[2] == b'1' && seq[3] == b';'
+                        && (seq[4] == b'5' || seq[4] == b'3');
+                    let term = seq.iter().rfind(|b| b.is_ascii_alphabetic() || **b == b'~');
+                    match term {
+                        Some(b'D') if is_ctrl_arrow => ed.move_word(true),
+                        Some(b'C') if is_ctrl_arrow => ed.move_word(false),
+                        Some(b'D') => {
+                            ed.move_char(true);
+                        }
+                        Some(b'C') => {
+                            ed.move_char(false);
+                        }
+                        Some(b'H') => ed.home(),
+                        Some(b'F') => ed.end(),
+                        Some(b'~') => match seq.get(2).copied().unwrap_or(0) {
+                            b'3' => ed.delete_fwd(),
+                            b'1' | b'7' => ed.home(),
+                            b'4' | b'8' => ed.end(),
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                    sync(&mut ed, buf);
+                    // `i` already sits past the terminator; `continue` skips
+                    // the loop's trailing `i += 1` so the byte after the
+                    // sequence (e.g. a char typed right after an arrow) is
+                    // not swallowed.
+                    continue;
                 }
                 c if (0x20..0x7f).contains(&c) => {
-                    buf.push(c as char);
-                    update_typeahead(buf, typeahead);
+                    ed.insert(c as char);
+                    sync(&mut ed, buf);
                 }
                 _ => { /* ignore other control bytes */ }
             }
             i += 1;
         }
+        sync(&mut ed, buf);
         RawInput::None
     }
 
@@ -3490,6 +4176,87 @@ mod paste_tests {
         assert_eq!(paste_marker_at(b"\x1b[200~", 0), Some(true));
         assert_eq!(paste_marker_at(b"\x1b[201~", 0), Some(false));
         assert_eq!(paste_marker_at(b"\x1b[A", 0), None);
+    }
+
+    #[test]
+    fn midturn_word_motion_and_home_end() {
+        use super::MidTurn;
+        let mut m = MidTurn { buf: "hello world".into(), cursor: None, tab: None };
+        m.move_word(true);
+        assert_eq!(m.pos(), 6);
+        m.move_word(true);
+        assert_eq!(m.pos(), 0);
+        m.move_word(false);
+        assert_eq!(m.pos(), 6);
+        m.end();
+        assert_eq!(m.pos(), 11);
+        m.home();
+        assert_eq!(m.pos(), 0);
+        // Typing mid-line inserts at the cursor, backspace deletes before it.
+        m.cursor = Some(5);
+        m.insert('X');
+        assert_eq!(m.buf, "helloX world");
+        m.backspace();
+        assert_eq!(m.buf, "hello world");
+        assert_eq!(m.pos(), 5);
+        // ctrl-k / ctrl-u / ctrl-w kill behaviour.
+        m.end();
+        m.cursor = Some(5);
+        m.buf = "hello world".into();
+        m.cursor = Some(5);
+        // kill word back from 5 removes "hello".
+        m.kill_word_back();
+        assert_eq!(m.buf, " world");
+    }
+
+    #[test]
+    fn midturn_tab_completes_slash_and_thinking() {
+        use super::MidTurn;
+        let mut m = MidTurn { buf: "/mod".into(), cursor: None, tab: None };
+        assert!(m.tab_complete());
+        assert_eq!(m.buf, "/model");
+        let mut m = MidTurn { buf: "/thinking h".into(), cursor: None, tab: None };
+        assert!(m.tab_complete());
+        assert_eq!(m.buf, "/thinking hi");
+        // Second Tab cycles to the next candidate — order follows the
+        // options table (hide comes before high: o<t->h-i order in the
+        // table is off/minimal/low/medium/high/xhigh/max/show/hide, but the
+        // filtered match list for "h" is [high, hide]... assert actual).
+        assert!(m.tab_complete());
+        assert!(["/thinking high", "/thinking hide"].contains(&m.buf.as_str()), "got {}", m.buf);
+        assert!(m.tab_complete());
+        assert!(["/thinking high", "/thinking hide"].contains(&m.buf.as_str()), "got {}", m.buf);
+    }
+
+    #[test]
+    fn translate_handles_tab_arrows_delete() {
+        // Tab completes, Left/Right move, Delete removes under cursor.
+        // NOTE: `translate` is stateless across calls (fresh MidTurn per
+        // call; the TUI/streaming readers persist the cursor via HistRecall).
+        // So multi-keystroke cursor sequences must go through ONE call.
+        let mut buf = String::new();
+        let r = translate(&mut buf, &ta(), b"/mod\x09");
+        assert_eq!(r, RawInput::None);
+        assert_eq!(buf, "/model");
+        // Left + X in one call: cursor moves left one, X inserts mid-line.
+        let mut buf = String::from("/model");
+        let r = translate(&mut buf, &ta(), b"\x1b[DX");
+        assert_eq!(r, RawInput::None);
+        assert_eq!(buf, "/modeXl");
+        // ctrl-Right jumps a word; Home/End jump. (Each translate call is
+        // stateless, so word-jump + Delete ride in ONE call.)
+        let mut buf2 = String::from("hello world");
+        let r = translate(&mut buf2, &ta(), b"\x1b[H\x1b[1;5C\x1b[3~");
+        assert_eq!(r, RawInput::None);
+        assert_eq!(buf2, "hello orld");
+        // alt-b / alt-f word motion.
+        let mut buf3 = String::from("hello world");
+        let r = translate(&mut buf3, &ta(), b"\x1bb");
+        assert_eq!(r, RawInput::None);
+        // alt-f from end stays at end (already at last word end).
+        let r = translate(&mut buf3, &ta(), b"\x1bf");
+        assert_eq!(r, RawInput::None);
+        assert_eq!(buf3, "hello world");
     }
 }
 
