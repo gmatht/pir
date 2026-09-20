@@ -115,6 +115,10 @@ fn stall_timeout() -> Duration {
 /// client run inside `smol::unblock`, bridged back to async for the shared
 /// SSE parsers; per-read wake comes from the parser-side cancel/stall race,
 /// with `timeout_read` as the backstop so a dangling pump thread always dies.
+/// `LsbCurl` is the runtime-dlopen'd host libcurl (see `lsb_curl`): no static
+/// OpenSSL/curl in the binary; TLS comes from the host's `libcurl.so.4`.
+/// Like `Ureq` it runs blocking inside `smol::unblock` and feeds the same
+/// async parsers through the `ChannelBody` pump.
 /// Selected by `PIR_HTTP_BACKEND` or the `http_backend` settings.json key
 /// (see `config::http_backend_name`); unknown values fall back to `Isahc`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -122,6 +126,7 @@ pub enum HttpBackend {
     #[default]
     Isahc,
     Ureq,
+    LsbCurl,
 }
 
 impl HttpBackend {
@@ -129,6 +134,7 @@ impl HttpBackend {
         match s.trim().to_ascii_lowercase().as_str() {
             "isahc" => Some(HttpBackend::Isahc),
             "ureq" => Some(HttpBackend::Ureq),
+            "lsbcurl" | "lsb-curl" | "curl" => Some(HttpBackend::LsbCurl),
             _ => None,
         }
     }
@@ -137,6 +143,7 @@ impl HttpBackend {
         match self {
             HttpBackend::Isahc => "isahc",
             HttpBackend::Ureq => "ureq",
+            HttpBackend::LsbCurl => "lsb-curl",
         }
     }
 }
@@ -294,6 +301,12 @@ pub struct Client {
     /// Blocking client for the `Ureq` backend (built once; `ureq::Agent` is
     /// cheap to clone per attempt). Only used when `backend` is `Ureq`.
     ureq_agent: ureq::Agent,
+    /// Runtime-dlopen'd host libcurl for the `LsbCurl` backend (built once;
+    /// `Curl` is `Send + Sync`, cheap to share per attempt via `Arc`).
+    /// `None` when the host has no loadable `libcurl.so.4` (e.g. Windows) —
+    /// selecting the backend then fails with a clear error instead of
+    /// panicking at startup.
+    lsb_curl: Option<Arc<lsb_curl::Curl>>,
     /// Selected transport; `Isahc` unless `set_backend` says otherwise.
     backend: HttpBackend,
     /// Stable per-conversation session id, sent as `x-opencode-session` on
@@ -369,6 +382,7 @@ impl Client {
             api_key,
             http: Self::build_http_client(),
             ureq_agent: Self::build_ureq_agent(),
+            lsb_curl: lsb_curl::Curl::load().ok().map(Arc::new),
             backend: HttpBackend::default(),
             session_id: None,
             fake: false,
@@ -401,7 +415,11 @@ impl Client {
     /// Auth + session + identity headers for `kind` as plain pairs — the
     /// single source both transports apply, so the two backends can never
     /// drift (a missing auth header on one path used to be a whole bug class).
-    fn request_headers(&self, kind: ApiKind) -> Vec<(String, String)> {
+    /// Pass the target model so per-model `compat.sessionAffinityFormat`
+    /// (`openai-nosession`) can suppress `x-opencode-session` for just that
+    /// model (Console Go 400s `invalid_request_error` when it is sent);
+    /// `None` keeps the legacy always-send behavior (tests, `complete`).
+    fn request_headers(&self, kind: ApiKind, model: Option<&crate::config::Model>) -> Vec<(String, String)> {
         let mut out = vec![("user-agent".to_string(), Self::user_agent())];
         match kind {
             ApiKind::Anthropic => {
@@ -412,9 +430,14 @@ impl Client {
                 out.push(("Authorization".to_string(), format!("Bearer {}", self.api_key)));
             }
         }
-        if let Some(id) = &self.session_id {
-            out.push(("x-opencode-session".to_string(), id.clone()));
-        }
+        // Per-model opt-out wins over the provider-level session id: a model
+        // whose catalog entry says `openai-nosession` never sends the header,
+        // every other model keeps sending it exactly as before.
+        let nosession = model.map(|m| m.no_session_affinity()).unwrap_or(false);
+        if let Some(id) = &self.session_id
+            && !nosession {
+                out.push(("x-opencode-session".to_string(), id.clone()));
+            }
         out
     }
 
@@ -422,16 +445,17 @@ impl Client {
         &self,
         mut builder: isahc::http::request::Builder,
         kind: ApiKind,
+        model: Option<&crate::config::Model>,
     ) -> isahc::http::request::Builder {
-        for (k, v) in self.request_headers(kind) {
+        for (k, v) in self.request_headers(kind, model) {
             builder = builder.header(&k, &v);
         }
         builder
     }
 
     /// Apply the shared headers to a blocking `ureq` request.
-    fn apply_ureq_headers(&self, mut req: ureq::Request, kind: ApiKind) -> ureq::Request {
-        for (k, v) in self.request_headers(kind) {
+    fn apply_ureq_headers(&self, mut req: ureq::Request, kind: ApiKind, model: Option<&crate::config::Model>) -> ureq::Request {
+        for (k, v) in self.request_headers(kind, model) {
             req = req.set(&k, &v);
         }
         req
@@ -527,6 +551,7 @@ impl Client {
                             .uri(&url)
                             .header("content-type", "application/json"),
                         kind,
+                        None,
                     );
                     let req = builder.body(body.to_string()).map_err(|e| format!("complete: {e}"))?;
                     let resp = self.http.send_async(req).await.map_err(http_error)?;
@@ -546,7 +571,7 @@ impl Client {
                     // body arrives at once (no streaming here by design).
                     let agent = self.ureq_agent.clone();
                     let url = url.clone();
-                    let headers = self.request_headers(kind);
+                    let headers = self.request_headers(kind, None);
                     let body_str = body.to_string();
                     let txt = smol::unblock(move || {
                         let mut req = agent.post(&url);
@@ -556,6 +581,39 @@ impl Client {
                         match req.set("content-type", "application/json").send_string(&body_str) {
                             Ok(resp) => resp.into_string().map_err(|e| format!("complete: {e}")),
                             Err(e) => Err(ureq_error(e)),
+                        }
+                    })
+                    .await?;
+                    serde_json::from_str(&txt).map_err(|e| format!("complete: {e}"))?
+                }
+                HttpBackend::LsbCurl => {
+                    // Buffered POST through the host libcurl on a worker
+                    // thread; non-2xx maps through `http_status_detail`
+                    // exactly like the other backends.
+                    let Some(curl) = self.lsb_curl.clone() else {
+                        return Err("complete: lsb-curl backend unavailable (no loadable libcurl.so.4)".to_string());
+                    };
+                    let url = url.clone();
+                    let headers = self.request_headers(kind, None);
+                    let body_str = body.to_string();
+                    let txt = smol::unblock(move || {
+                        let hrefs: Vec<(&str, &str)> =
+                            headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                        let mut all = hrefs.clone();
+                        all.push(("content-type", "application/json"));
+                        match curl.request(lsb_curl::Method::POST, &url, Some(body_str.as_bytes()), &all) {
+                            Ok(resp) => {
+                                if (200..300).contains(&resp.status) {
+                                    String::from_utf8(resp.body)
+                                        .map_err(|e| format!("complete: {e}"))
+                                } else {
+                                    Err(http_status_detail(
+                                        resp.status,
+                                        &String::from_utf8_lossy(&resp.body),
+                                    ))
+                                }
+                            }
+                            Err(e) => Err(lsbcurl_error(e)),
                         }
                     })
                     .await?;
@@ -733,6 +791,7 @@ impl Client {
                             .uri(&url)
                             .header("content-type", "application/json"),
                         kind,
+                        model_meta,
                     );
                     let req = match builder.body(body.to_string()) {
                         Ok(r) => r,
@@ -770,11 +829,48 @@ impl Client {
                     // and the pump's bounded send fails fast.
                     let agent = self.ureq_agent.clone();
                     let url = url.clone();
-                    let headers = self.request_headers(kind);
+                    let headers = self.request_headers(kind, model_meta);
                     let body_str = body.to_string();
                     future::or(
                         async {
                             match smol::unblock(move || ureq_send(&agent, &url, &headers, &body_str)).await
+                            {
+                                Ok(pump) => {
+                                    let reader: Pin<Box<dyn AsyncBufRead + Unpin + Send>> =
+                                        Box::pin(pump);
+                                    ConnectOutcome::Body(reader)
+                                }
+                                Err(e) => ConnectOutcome::Err(e),
+                            }
+                        },
+                        async {
+                            let _ = cancel_rx.recv().await;
+                            ConnectOutcome::Cancelled
+                        },
+                    )
+                    .await
+                }
+                HttpBackend::LsbCurl => {
+                    // Host libcurl on a worker thread; its write callback
+                    // feeds the same async parsers through `ChannelBody`,
+                    // with per-chunk cancel checks. A lost connect race
+                    // detaches cleanly: the receiver is dropped and the
+                    // callback's bounded send fails fast.
+                    let Some(curl) = self.lsb_curl.clone() else {
+                        return Err(
+                            "lsb-curl backend unavailable (no loadable libcurl.so.4)".to_string(),
+                        );
+                    };
+                    let url = url.clone();
+                    let headers = self.request_headers(kind, model_meta);
+                    let body_str = body.to_string();
+                    let cancel_flag = cancel.clone();
+                    future::or(
+                        async {
+                            match smol::unblock(move || {
+                                lsbcurl_send(&curl, &url, &headers, &body_str, &cancel_flag)
+                            })
+                            .await
                             {
                                 Ok(pump) => {
                                     let reader: Pin<Box<dyn AsyncBufRead + Unpin + Send>> =
@@ -1478,6 +1574,34 @@ fn ureq_error(e: ureq::Error) -> String {
     }
 }
 
+/// Map an `lsb_curl` failure to the same strings the other backends produce.
+/// `Aborted` (our chunk callback stopped the transfer) is always a
+/// cooperative cancel — the callback only aborts when the shared `cancel`
+/// flag is set or the parser went away after a cancel race was lost — so it
+/// folds into "request cancelled" like every other cancel path. libcurl
+/// timeout wordings ("Timeout was reached", "Connection timed out") already
+/// contain the substrings `is_timeout` matches for fast retries; DNS/refused
+/// messages stay bare transport errors, retryable by `is_retryable`.
+fn lsbcurl_error(e: lsb_curl::CurlError) -> String {
+    match e {
+        lsb_curl::CurlError::Aborted => "request cancelled".to_string(),
+        lsb_curl::CurlError::HttpStatus(code) => format!("HTTP {code}"),
+        e => e.to_string(),
+    }
+}
+
+/// `RequestOptions` for the `LsbCurl` backend, mirroring the timeouts the
+/// other backends enforce: 15s connect, whole-attempt total budget
+/// (`request_timeout`, 600s default), redirects followed, pir User-Agent,
+/// peer verification on (host CA bundle via libcurl defaults).
+fn lsbcurl_options() -> lsb_curl::RequestOptions {
+    let mut opts = lsb_curl::RequestOptions::default();
+    opts.connect_timeout_ms = CONNECT_TIMEOUT.as_millis() as i64;
+    opts.timeout_ms = request_timeout().map(|d| d.as_millis() as i64).unwrap_or(0);
+    opts.user_agent = Client::user_agent();
+    opts
+}
+
 /// `AsyncBufRead` over a background thread pumping a blocking (ureq) body.
 /// Chunks travel over a bounded channel (backpressure included); a transport
 /// error is sticky and surfaces at EOF, so a mid-stream cut is never
@@ -1513,6 +1637,14 @@ impl ChannelBody {
                 }
             }
         });
+        Self::from_receiver(rx)
+    }
+
+    /// Adapt an already-running chunk producer (e.g. the `LsbCurl` backend,
+    /// whose libcurl write callback feeds the channel directly from inside
+    /// `easy_perform`). Dropping the returned body closes the receiver, so
+    /// a lost cancel race detaches the producer cleanly via failed sends.
+    fn from_receiver(rx: smol::channel::Receiver<std::io::Result<Vec<u8>>>) -> Self {
         ChannelBody { rx: Box::pin(rx), buf: Vec::new(), pos: 0, failed: None }
     }
 
@@ -1614,6 +1746,67 @@ fn ureq_send(
     match req.send_string(body) {
         Ok(resp) => Ok(ChannelBody::pump(resp.into_reader())),
         Err(e) => Err(ureq_error(e)),
+    }
+}
+
+/// Blocking lsb-curl POST for the `LsbCurl` backend. Runs inside
+/// `smol::unblock` (never on the executor): libcurl's write callback feeds
+/// body chunks live over the channel while accumulating them, so the shared
+/// SSE parsers stream exactly like the other backends.
+///
+/// libcurl only reports the status *after* the transfer, so a non-2xx is
+/// discovered late: the streamed bytes are then discarded and the attempt
+/// fails with `http_status_detail(code, full_body)`. Error bodies are tiny
+/// and carry no `data:` lines, so the parsers never emit text from them —
+/// the retry loop's pre-output rules apply unchanged. Cancel is checked per
+/// chunk (prompt abort, like `CancelableReader`'s poll); a lost cancel race
+/// detaches via failed sends.
+fn lsbcurl_send(
+    curl: &std::sync::Arc<lsb_curl::Curl>,
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<ChannelBody, String> {
+    let (tx, rx) = smol::channel::bounded::<std::io::Result<Vec<u8>>>(8);
+    let mut acc: Vec<u8> = Vec::new();
+    let hrefs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let mut all = hrefs.clone();
+    all.push(("content-type", "application/json"));
+    let opts = lsbcurl_options();
+    let r = curl.request_streaming_with_options(
+        lsb_curl::Method::POST,
+        url,
+        Some(body.as_bytes()),
+        &all,
+        &opts,
+        &mut |chunk: &[u8]| {
+            if cancel.load(Ordering::SeqCst) {
+                return Ok(false); // -> CurlError::Aborted -> "request cancelled"
+            }
+            acc.extend_from_slice(chunk);
+            if tx.send_blocking(Ok(chunk.to_vec())).is_err() {
+                return Ok(false); // parser went away; detach cleanly
+            }
+            Ok(true)
+        },
+    );
+    match r {
+        Ok((status, _resp_headers)) => {
+            if (200..300).contains(&status) {
+                drop(tx); // clean EOF for the parsers
+                Ok(ChannelBody::from_receiver(rx))
+            } else {
+                drop(tx);
+                drop(rx);
+                Err(http_status_detail(status, &String::from_utf8_lossy(&acc)))
+            }
+        }
+        Err(e) => {
+            drop(tx);
+            drop(rx);
+            Err(lsbcurl_error(e))
+        }
     }
 }
 
@@ -3056,25 +3249,27 @@ mod tests {
         assert_eq!(HttpBackend::parse("isahc"), Some(HttpBackend::Isahc));
         assert_eq!(HttpBackend::parse("ureq"), Some(HttpBackend::Ureq));
         assert_eq!(HttpBackend::parse(" UREQ "), Some(HttpBackend::Ureq));
-        assert_eq!(HttpBackend::parse("curl"), None);
+        assert_eq!(HttpBackend::parse("curl"), Some(HttpBackend::LsbCurl));
+        assert_eq!(HttpBackend::parse("lsb-curl"), Some(HttpBackend::LsbCurl));
         assert_eq!(HttpBackend::parse(""), None);
         assert_eq!(HttpBackend::default(), HttpBackend::Isahc);
         assert_eq!(HttpBackend::Isahc.name(), "isahc");
         assert_eq!(HttpBackend::Ureq.name(), "ureq");
+        assert_eq!(HttpBackend::LsbCurl.name(), "lsb-curl");
     }
 
     #[test]
     fn request_headers_single_source() {
         // Both transports apply this vec: auth must never drift between them.
         let client = Client::new(ApiKind::OpenAi, "http://x", "k".to_string());
-        let h = client.request_headers(ApiKind::OpenAi);
+        let h = client.request_headers(ApiKind::OpenAi, None);
         assert!(
             h.contains(&("user-agent".to_string(), format!("pir/{}", env!("CARGO_PKG_VERSION")))),
             "user-agent present: {h:?}"
         );
         assert!(h.contains(&("Authorization".to_string(), "Bearer k".to_string())), "bearer: {h:?}");
         let a = Client::new(ApiKind::Anthropic, "http://x", "k".to_string());
-        let h = a.request_headers(ApiKind::Anthropic);
+        let h = a.request_headers(ApiKind::Anthropic, None);
         assert!(h.contains(&("x-api-key".to_string(), "k".to_string())), "api key: {h:?}");
         assert!(
             h.contains(&("anthropic-version".to_string(), "2023-06-01".to_string())),
@@ -3241,6 +3436,171 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "ureq cancel took {elapsed:?}, must be prompt"
         );
+    }
+
+    #[test]
+    fn lsbcurl_backend_streams_mock_sse() {
+        // Same mock shape as the ureq test: one SSE data frame over plain
+        // HTTP/1.1, parsed by the shared OpenAI stream parser. Skipped when
+        // the host has no loadable libcurl (e.g. Windows CI).
+        if lsb_curl::Curl::load().is_err() {
+            eprintln!("SKIP: no loadable libcurl");
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        let _srv = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            use std::io::Write as _;
+            let body = "{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi-lsbcurl\"}}]}\n\n";
+            let frame = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {body}data: [DONE]\n\n");
+            let _ = sock.write_all(frame.as_bytes());
+            let _ = sock.flush();
+            thread::sleep(Duration::from_millis(200));
+        });
+        let mut client = Client::new(ApiKind::OpenAi, &format!("http://{addr}"), "test-key".to_string());
+        client.set_backend(HttpBackend::LsbCurl);
+        let mut text = String::new();
+        let res = client.chat(
+            "test-model",
+            16,
+            "sys",
+            &[Message { role: Role::User, blocks: vec![Block::Text("hi".into())] }],
+            &[],
+            &mut |t: &str| text.push_str(t),
+            crate::config::ThinkingLevel::Off,
+            0,
+            &mut |_s: &str| {},
+            None,
+            None,
+            true,
+            None,
+            &mut |_w: &RetryWait| {},
+            &mut |_n: &str| {},
+        );
+        assert!(res.is_ok(), "lsb-curl backend must stream, got {res:?}");
+        assert!(text.contains("hi-lsbcurl"), "expected streamed text, got {text:?}");
+    }
+
+    #[test]
+    fn lsbcurl_backend_maps_error_status() {
+        // HTTP 400 is not retryable: single attempt. The status arrives
+        // *after* libcurl's transfer, so the mapper must still produce the
+        // same `HTTP 400: <api message>` string the other backends yield.
+        if lsb_curl::Curl::load().is_err() {
+            eprintln!("SKIP: no loadable libcurl");
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        let _srv = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            use std::io::Write as _;
+            let body = "{\"error\":{\"message\":\"bad key\"}}";
+            let frame = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(frame.as_bytes());
+            let _ = sock.flush();
+            thread::sleep(Duration::from_millis(200));
+        });
+        let mut client = Client::new(ApiKind::OpenAi, &format!("http://{addr}"), "test-key".to_string());
+        client.set_backend(HttpBackend::LsbCurl);
+        let mut text = String::new();
+        let res = client.chat(
+            "test-model",
+            16,
+            "sys",
+            &[Message { role: Role::User, blocks: vec![Block::Text("hi".into())] }],
+            &[],
+            &mut |t: &str| text.push_str(t),
+            crate::config::ThinkingLevel::Off,
+            0,
+            &mut |_s: &str| {},
+            None,
+            None,
+            true,
+            None,
+            &mut |_w: &RetryWait| {},
+            &mut |_n: &str| {},
+        );
+        let err = res.unwrap_err();
+        assert!(err.contains("HTTP 400"), "status mapped: {err}");
+        assert!(err.contains("bad key"), "API message kept: {err}");
+        assert!(text.is_empty(), "error body must not leak into text: {text:?}");
+    }
+
+    #[test]
+    fn lsbcurl_backend_cancel_is_prompt() {
+        // Server holds the connection open; the flag flips mid-transfer and
+        // the turn must abort promptly via the per-chunk cancel check, not
+        // hang on the socket.
+        if lsb_curl::Curl::load().is_err() {
+            eprintln!("SKIP: no loadable libcurl");
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        let _srv = thread::spawn(move || {
+            let (_sock, _) = listener.accept().expect("accept");
+            thread::sleep(Duration::from_secs(30));
+        });
+        let mut client = Client::new(ApiKind::OpenAi, &format!("http://{addr}"), "test-key".to_string());
+        client.set_backend(HttpBackend::LsbCurl);
+        let cancel = Arc::new(AtomicBool::new(false));
+        client.set_cancel(cancel.clone());
+        let cancel2 = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(250));
+            cancel2.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let res = client.chat(
+            "test-model",
+            16,
+            "sys",
+            &[Message { role: Role::User, blocks: vec![Block::Text("hi".into())] }],
+            &[],
+            &mut |_s: &str| {},
+            crate::config::ThinkingLevel::Off,
+            0,
+            &mut |_s: &str| {},
+            None,
+            None,
+            true,
+            None,
+            &mut |_w: &RetryWait| {},
+            &mut |_n: &str| {},
+        );
+        let elapsed = started.elapsed();
+        assert!(res.is_err(), "expected cancellation error, got {res:?}");
+        assert_eq!(res.unwrap_err(), "request cancelled");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "lsb-curl cancel took {elapsed:?}, must be prompt"
+        );
+    }
+
+    #[test]
+    fn lsbcurl_error_mapping() {
+        // Cooperative aborts fold into the shared cancel string; timeouts
+        // keep retryable wording; anything else passes through verbatim.
+        assert_eq!(
+            lsbcurl_error(lsb_curl::CurlError::Aborted),
+            "request cancelled"
+        );
+        let timeout = lsbcurl_error(lsb_curl::CurlError::Curl {
+            code: 28,
+            msg: "Timeout was reached".to_string(),
+        });
+        assert!(is_timeout(&timeout), "keeps timeout wording: {timeout}");
+        assert!(is_retryable(&timeout), "timeout stays retryable: {timeout}");
+        let dns = lsbcurl_error(lsb_curl::CurlError::Curl {
+            code: 6,
+            msg: "Couldn't resolve host name".to_string(),
+        });
+        assert!(is_retryable(&dns), "transport error stays retryable: {dns}");
     }
 
     #[test]
@@ -4027,6 +4387,7 @@ mod tests {
                         .uri(format!("http://{addr}/v1/chat/completions"))
                         .header("content-type", "application/json"),
                     ApiKind::OpenAi,
+                    None,
                 );
                 let req = req.body("{}").unwrap();
                 client.http.send_async(req).await
@@ -4047,6 +4408,47 @@ mod tests {
         assert!(
             sess.contains("x-opencode-session: sess-1"),
             "session header present:\n{sess}"
+        );
+    }
+
+    #[test]
+    fn nosession_model_suppresses_session_header() {
+        // `compat.sessionAffinityFormat: openai-nosession` (muse-spark):
+        // Console Go 400s `invalid_request_error` when the header is sent,
+        // so it must be dropped for exactly these models — while siblings
+        // on the same provider keep it.
+        let client = Client::new(ApiKind::OpenAiResponses, "http://x", "k".to_string());
+        let mut nosession = reasoning_model(None, &[]);
+        nosession.session_affinity_format = Some("openai-nosession".to_string());
+        let h = client.request_headers(ApiKind::OpenAiResponses, Some(&nosession));
+        assert!(
+            h.contains(&("Authorization".to_string(), "Bearer k".to_string())),
+            "auth stays: {h:?}"
+        );
+        assert!(
+            !h.iter().any(|(k, _)| k == "x-opencode-session"),
+            "nosession model must not send the header even without a session id: {h:?}"
+        );
+        // With a session id set (the opencode-go case): still suppressed.
+        let mut client = client;
+        client.set_session_id(Some("sess-1".to_string()));
+        let h = client.request_headers(ApiKind::OpenAiResponses, Some(&nosession));
+        assert!(
+            !h.iter().any(|(k, _)| k == "x-opencode-session"),
+            "nosession model must not send the header with a session id: {h:?}"
+        );
+        // A normal model on the same provider keeps the header.
+        let plain = reasoning_model(None, &[]);
+        let h = client.request_headers(ApiKind::OpenAiResponses, Some(&plain));
+        assert!(
+            h.contains(&("x-opencode-session".to_string(), "sess-1".to_string())),
+            "normal model keeps the header: {h:?}"
+        );
+        // `None` model (complete(), legacy tests): legacy always-send.
+        let h = client.request_headers(ApiKind::OpenAiResponses, None);
+        assert!(
+            h.contains(&("x-opencode-session".to_string(), "sess-1".to_string())),
+            "None model keeps legacy behavior: {h:?}"
         );
     }
 
@@ -4260,6 +4662,7 @@ mod tests {
             reasoning: true,
             thinking_format: format.map(str::to_string),
             supports_reasoning_effort: None,
+            session_affinity_format: None,
             thinking_level_map: map
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.map(str::to_string)))

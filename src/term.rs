@@ -2139,7 +2139,7 @@ pub mod raw {
     /// REPL would busy-spin at 100% CPU when stdin is closed while a turn never
     /// signals completion. The timer arm makes the wait return `None` at least
     /// this often; the caller re-loops, so typing stays responsive.
-    pub(crate) const INPUT_POLL: u64 = 80;
+    pub(crate) const INPUT_POLL: u64 = 200;
 
     /// Terminal state captured around a raw-mode session. Guarded by a Mutex so
     /// access is never via a raw `&mut` to a static (sound under the 2024
@@ -3197,6 +3197,7 @@ mod tests {
                     reasoning: false,
                     thinking_format: None,
                     supports_reasoning_effort: None,
+                    session_affinity_format: None,
                     thinking_level_map: Default::default(),
                     price_per_1k: None,
                 }],
@@ -3218,6 +3219,7 @@ mod tests {
                     reasoning: false,
                     thinking_format: None,
                     supports_reasoning_effort: None,
+                    session_affinity_format: None,
                     thinking_level_map: Default::default(),
                     price_per_1k: None,
                 }],
