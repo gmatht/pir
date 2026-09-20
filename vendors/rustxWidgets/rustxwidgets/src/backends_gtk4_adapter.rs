@@ -139,6 +139,8 @@ pub struct Entry(pub gtk4::Entry, CList);
 impl Entry {
     pub fn new() -> Self { ensure_dlopen(); Entry(gtk4::Entry::new(), new_controllers()) }
     pub fn set_text(&self, t: &str) { self.0.set_text(t); }
+    /// Clear selection / park cursor — stops the tap select-all flash.
+    pub fn select_region(&self, start: i32, end: i32) { self.0.select_region(start, end); }
     pub fn get_text(&self) -> Option<String> { Some(self.0.text().to_string()) }
     pub fn grab_focus(&self) { self.0.grab_focus(); }
     pub fn set_hexpand(&self, e: bool) { self.0.set_hexpand(e); }
@@ -225,6 +227,8 @@ impl Canvas {
     }
     pub fn set_draw_callback(&self, cb: Box<dyn FnMut(&mut dyn DrawContext, i32, i32)>) { *self.1.borrow_mut() = Some(cb); }
     pub fn queue_redraw(&self) { self.0.queue_draw(); }
+    /// Dirty-rect redraw of `(x, y, w, h)` in canvas coords.
+    pub fn queue_redraw_area(&self, x: i32, y: i32, w: i32, h: i32) { self.0.queue_draw_area(x as f64, y as f64, w as f64, h as f64); }
     pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
     pub fn set_content_size(&self, _w: i32, _h: i32) {}
     pub fn grab_focus(&self) { self.0.grab_focus(); }

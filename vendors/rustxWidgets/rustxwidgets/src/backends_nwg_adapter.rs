@@ -1357,6 +1357,15 @@ mod nwg_adapter {
                 }
             }
         }
+        /// Dirty-rect redraw of `(x, y, w, h)` in canvas coords.
+        pub fn queue_redraw_area(&self, x: i32, y: i32, w: i32, h: i32) {
+            if !self.hwnd.is_null() {
+                let r = winapi::shared::windef::RECT { left: x, top: y, right: x + w, bottom: y + h };
+                unsafe {
+                    winapi::um::winuser::InvalidateRect(self.hwnd as _, &r, 0);
+                }
+            }
+        }
         pub fn set_size_request(&self, w: i32, h: i32) {
             if !self.hwnd.is_null() {
                 unsafe {

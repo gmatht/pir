@@ -316,6 +316,8 @@ mod gtk_adapter {
     impl Entry {
         pub fn set_text(&self, text: &str) { self.inner.set_text(text); }
         pub fn get_text(&self) -> Option<String> { self.inner.get_text() }
+        /// Clear selection / park cursor — stops the tap select-all flash.
+        pub fn select_region(&self, start: i32, end: i32) { self.inner.select_region(start, end); }
         pub fn set_width_chars(&self, n: i32) { self.inner.set_width_chars(n); }
         pub fn set_size_request(&self, w: i32, h: i32) { self.inner.set_size_request(w, h); }
         pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, Error> { self.inner.connect_changed(f).map_err(|e| Error::Backend(format!("{}", e))) }
@@ -902,6 +904,11 @@ mod gtk_adapter {
 
         pub fn queue_redraw(&self) {
             self.drawing_area.queue_draw();
+        }
+
+        /// Dirty-rect redraw of `(x, y, w, h)` in canvas coords.
+        pub fn queue_redraw_area(&self, x: i32, y: i32, w: i32, h: i32) {
+            self.drawing_area.queue_draw_area(x, y, w, h);
         }
 
         pub fn set_size_request(&self, w: i32, h: i32) {

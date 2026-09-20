@@ -918,6 +918,20 @@ impl DrawingArea {
         guard_widget!(self, "DrawingArea", "queue_draw");
         if let Some(q) = self.loader.symbols.gtk_widget_queue_draw { unsafe { q(self.inner); } }
     }
+
+    /// Dirty-rect redraw: invalidate only `(x, y, w, h)` (widget coords) instead
+    /// of the whole canvas. Falls back to full `queue_draw` when the symbol is
+    /// missing (GTK3 without the symbol, headless test loader) so callers never
+    /// need a version check. Keeps a tap on one cell from repainting the whole
+    /// sheet (the tall white/yellow expose strip in the tap screenshots).
+    pub fn queue_draw_area(&self, x: i32, y: i32, w: i32, h: i32) {
+        guard_widget!(self, "DrawingArea", "queue_draw_area");
+        if let Some(q) = self.loader.symbols.gtk_widget_queue_draw_area {
+            unsafe { q(self.inner, x, y, w, h); }
+        } else if let Some(q) = self.loader.symbols.gtk_widget_queue_draw {
+            unsafe { q(self.inner); }
+        }
+    }
     pub fn set_size_request(&self, w: i32, h: i32) {
         guard_widget!(self, "DrawingArea", "set_size_request");
         if let Some(sr) = self.loader.symbols.gtk_widget_set_size_request { unsafe { sr(self.inner, w, h); } }
@@ -1500,6 +1514,20 @@ impl Entry {
         if let Some(f) = self.loader.symbols.gtk_editable_set_position { unsafe { f(self.inner, position); } }
     }
 
+    /// Clear any text selection and park the cursor at `pos` (usually 0).
+    /// Tap-prefill paths call this right after `set_text` so the freshly shown
+    /// cell editor doesn't flash GTK's pale-yellow select-all highlight (the
+    /// 255,255,204 pixels in the tap screenshots). Falls back to
+    /// `set_position` when the symbol is missing.
+    pub fn select_region(&self, start: i32, end: i32) {
+        guard_widget!(self, "Entry", "select_region");
+        if let Some(f) = self.loader.symbols.gtk_editable_select_region {
+            unsafe { f(self.inner, start, end); }
+        } else if let Some(f) = self.loader.symbols.gtk_editable_set_position {
+            unsafe { f(self.inner, end); }
+        }
+    }
+
     pub fn set_width_chars(&self, n: i32) {
         guard_widget!(self, "Entry", "set_width_chars");
         if let Some(w) = self.loader.symbols.gtk_entry_set_width_chars { unsafe { w(self.inner, n); } }
@@ -1910,6 +1938,17 @@ pub unsafe fn widget_connect_signal_bool(
 /// Queue a redraw on a widget
 pub unsafe fn widget_queue_draw(loader: &Arc<Loader>, widget: *mut c_void) {
     if let Some(q) = loader.symbols.gtk_widget_queue_draw { unsafe { q(widget); } }
+}
+
+/// Dirty-rect variant of [`widget_queue_draw`]: invalidate only `(x, y, w, h)`.
+/// Falls back to a full redraw when the symbol is missing so callers can use it
+/// unconditionally.
+pub unsafe fn widget_queue_draw_area(loader: &Arc<Loader>, widget: *mut c_void, x: i32, y: i32, w: i32, h: i32) {
+    if let Some(q) = loader.symbols.gtk_widget_queue_draw_area {
+        unsafe { q(widget, x, y, w, h); }
+    } else if let Some(q) = loader.symbols.gtk_widget_queue_draw {
+        unsafe { q(widget); }
+    }
 }
 
 /// Create a GtkGestureClick, add it to `target_widget`, and connect its `pressed` signal.

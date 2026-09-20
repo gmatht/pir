@@ -410,6 +410,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
 
                     entry.grab_focus();
+                    // No select-all flash: park the cursor with no selection
+                    // (pale-yellow 255,255,204 highlight otherwise).
+                    entry.select_region(0, 0);
                     *ee.borrow_mut() = Some(entry);
                 }
             });
@@ -424,76 +427,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ed = editing_entry.clone();
     canvas.set_draw_callback(Box::new(
         move |ctx: &mut dyn DrawContext, _w: i32, _h: i32| {
-            ctx.clear(1.0, 1.0, 1.0, 1.0);
-
-            // header areas
-            ctx.fill_rect(0.0, 0.0, CHW, ch, 0.91, 0.91, 0.91, 1.0);
-            ctx.fill_rect(
-                CHW,
-                0.0,
-                COLS as f64 * cw,
-                ch,
-                0.8,
-                0.8,
-                0.8,
-                1.0,
-            );
-            ctx.fill_rect(
-                0.0,
-                ch,
-                CHW,
-                ROWS as f64 * ch,
-                0.8,
-                0.8,
-                0.8,
-                1.0,
-            );
-
-            // grid lines
-            for c in 0..=COLS {
-                let x = CHW + c as f64 * cw;
-                ctx.stroke_rect(
-                    x, 0.0, 0.0, total_h, 0.7, 0.7, 0.7, 1.0, 0.5,
-                );
-            }
-            for r in 0..=ROWS {
-                let y = ch + r as f64 * ch;
-                ctx.stroke_rect(
-                    0.0, y, total_w, 0.0, 0.7, 0.7, 0.7, 1.0, 0.5,
-                );
-            }
-
-            // column headers
-            for c in 0..COLS {
-                let lbl = col_label(c);
-                let (xb, _, w, _) = ctx.text_extents_styled(
-                    &lbl, "monospace", 12.0, 0, 0,
-                );
-                let x = CHW + c as f64 * cw + cw / 2.0 - xb - w / 2.0;
-                ctx.draw_text(
-                    x, ch / 2.0, &lbl, "monospace", 12.0, 0.0, 0.0,
-                    0.0, 1.0,
-                );
-            }
-            // row headers
-            for r in 0..ROWS {
-                let lbl = format!("{}", r + 1);
-                let (xb, _, w, _) = ctx.text_extents_styled(
-                    &lbl, "monospace", 12.0, 0, 0,
-                );
-                let x = CHW / 2.0 - xb - w / 2.0;
-                ctx.draw_text(
-                    x,
-                    ch + r as f64 * ch + ch / 2.0,
-                    &lbl,
-                    "monospace",
-                    12.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    1.0,
-                );
-            }
+            // NOTE: no pre-overflow paint pass here: the old code painted the
+            // full background + grid + labels, then erased it all with the
+            // `clear` + header/grid pass after the overflow scan — a dead
+            // full-sheet overpaint every frame. One paint pass only, below.
 
             // overflow computation
             let t = td.borrow();

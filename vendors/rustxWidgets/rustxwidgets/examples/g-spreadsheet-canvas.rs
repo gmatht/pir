@@ -73,56 +73,11 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
         let total_w = chw + VISIBLE_COLS as f64 * cw;
         let total_h = ch + VISIBLE_ROWS as f64 * ch;
 
-        cc.set_source_rgb(1.0, 1.0, 1.0);
-        cc.rectangle(0.0, 0.0, total_w, total_h);
-        cc.fill();
-
-        cc.set_source_rgb(0.91, 0.91, 0.91);
-        cc.rectangle(0.0, 0.0, chw, ch);
-        cc.fill();
-
-        cc.set_source_rgb(0.8, 0.8, 0.8);
-        cc.rectangle(chw, 0.0, VISIBLE_COLS as f64 * cw, ch);
-        cc.fill();
-        cc.rectangle(0.0, ch, chw, VISIBLE_ROWS as f64 * ch);
-        cc.fill();
-
-        cc.set_source_rgb(0.7, 0.7, 0.7);
-        cc.set_line_width(0.5);
-        for c in 0..=VISIBLE_COLS {
-            let x = chw + c as f64 * cw;
-            cc.move_to(x, 0.0);
-            cc.line_to(x, total_h);
-            cc.stroke();
-        }
-        for r in 0..=VISIBLE_ROWS {
-            let y = ch + r as f64 * ch;
-            cc.move_to(0.0, y);
-            cc.line_to(total_w, y);
-            cc.stroke();
-        }
-
-        cc.select_font_face("monospace", 0, 1);
-        cc.set_font_size(12.0);
-        cc.set_source_rgb(0.0, 0.0, 0.0);
-        for c in 0..VISIBLE_COLS {
-            let lbl = col_to_label(c);
-            let ext = cc.text_extents(&lbl);
-            let x = chw + c as f64 * cw + cw / 2.0 - ext.x_bearing - ext.width / 2.0;
-            let y = ch / 2.0 - ext.y_bearing - ext.height / 2.0;
-            cc.move_to(x, y);
-            cc.show_text(&lbl);
-        }
-
-        cc.set_font_size(12.0);
-        for r in 0..VISIBLE_ROWS {
-            let lbl = format!("{}", r + 1);
-            let ext = cc.text_extents(&lbl);
-            let x = chw / 2.0 - ext.x_bearing - ext.width / 2.0;
-            let y = ch + r as f64 * ch + ch / 2.0 - ext.y_bearing - ext.height / 2.0;
-            cc.move_to(x, y);
-            cc.show_text(&lbl);
-        }
+        // NOTE: a first pass that painted the white background, header fills,
+        // full grid lines, and header labels used to live here — then the
+        // second pass below erased it all with another white fill. Dead work
+        // every frame (a full-sheet overpaint per tap), so it is gone; the
+        // live background/grid pass is the one after the overflow scan.
 
         let t = texts.borrow();
         let f = fmts.borrow();
@@ -473,14 +428,27 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
         move || da.queue_draw()
     });
 
+    // Dirty-rect redraw of one sheet cell: `(x, y)` is the cell's top-left in
+    // canvas coords. Tap/commit/selection moves invalidate only the old +
+    // new cells instead of the whole sheet (the tall expose strip).
+    let queue_cell_area = Rc::new({
+        let da = drawing_area.clone();
+        move |c: usize, r: usize| {
+            let x = 46 + c as i32 * CELL_W;
+            let y = CELL_H + r as i32 * CELL_H;
+            // +2px margin so the 2px selection border isn't clipped.
+            da.queue_draw_area(x - 2, y - 2, CELL_W + 4, CELL_H + 4);
+        }
+    });
+
     let commit_edit = {
         let overlay_commit = overlay.clone();
         let texts_nav = texts.clone();
         let edit_entry_nav = editing_entry.clone();
         let text_input_active = text_input_active.clone();
         let formula_e = formula_entry.clone();
-        let qr = queue_redraw.clone();
         let sel_nav = selected_coord.clone();
+        let qcell = queue_cell_area.clone();
         move || {
             let entry_opt = edit_entry_nav.borrow_mut().take();
             if let Some(e) = entry_opt {
@@ -491,10 +459,10 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Ok(mut t) = texts_nav.try_borrow_mut() {
                         if r < t.len() && c < t[r].len() { t[r][c] = new_text.clone(); }
                     }
+                    qcell(c, r);
                 }
                 formula_e.set_text(&new_text);
                 overlay_commit.remove(&e);
-                qr();
             }
         }
     };
@@ -503,7 +471,9 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
         let texts_nav = texts.clone();
         let formula_e = formula_entry.clone();
         let sel = selected_coord.clone();
-        let qr = queue_redraw.clone();
+        let qcell = queue_cell_area.clone();
+        let prev: Rc<RefCell<Option<(usize, usize)>>> = Rc::new(RefCell::new(None));
+        let prev2 = prev.clone();
         move || {
             let coord = *sel.borrow();
             if let Some((r, c)) = coord {
@@ -512,7 +482,17 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
                     formula_e.set_text(&t[r][c]);
                 }
             }
-            qr();
+            // Invalidate only what changed: the previously selected cell (to
+            // erase its border) plus the new one.
+            if let Some((pr, pc)) = *prev2.borrow() {
+                if Some((pr, pc)) != coord {
+                    qcell(pc, pr);
+                }
+            }
+            if let Some((r, c)) = coord {
+                qcell(c, r);
+            }
+            *prev2.borrow_mut() = coord;
         }
     };
 
@@ -563,6 +543,10 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
                 });
 
                 entry.grab_focus();
+                // Park the cursor with no selection: GTK flashes the entry's
+                // select-all highlight (pale yellow 255,255,204) on focus after
+                // a prefill otherwise.
+                entry.select_region(0, 0);
                 *edit_entry_nav.borrow_mut() = Some(entry);
             }
         });
@@ -579,7 +563,7 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
         let start_fn2 = start_edit.clone();
         let fmts2 = cell_formats.clone();
         let rh3 = row_heights.clone();
-        let qr = queue_redraw.clone();
+        let qcell2 = queue_cell_area.clone();
 
         let click_logic: Rc<RefCell<Option<Box<dyn FnMut(f64, f64)>>>> = Rc::new(RefCell::new(None));
         {
@@ -591,7 +575,7 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
             let start_fn = start_fn2.clone();
             let fmts = fmts2.clone();
             let rh = rh3.clone();
-            let qr2 = qr.clone();
+            let qcell = qcell2.clone();
             *click_logic.borrow_mut() = Some(Box::new(move |x: f64, y: f64| {
                 let col_hdr_w = 46;
                 let col = {
@@ -627,6 +611,7 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
                 let data_row = grid_row.saturating_sub(1);
                 if col < VISIBLE_COLS && data_row < VISIBLE_ROWS {
                     println!("Cell clicked: row={}, col={}", data_row + 1, col_to_label(col));
+                    let prev = *sel.borrow();
                     commit_fn();
                     if let Ok(mut cs) = sel.try_borrow_mut() {
                         *cs = Some((data_row, col));
@@ -640,12 +625,21 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
                         else { fe.set_text(text); }
                     }
                     drop(t);
-                    qr2();
+                    // Dirty-rect only: erase the old selection border, paint
+                    // the new one — never the whole sheet.
+                    if let Some((pr, pc)) = prev {
+                        if (pr, pc) != (data_row, col) {
+                            qcell(pc, pr);
+                        }
+                    }
+                    qcell(col, data_row);
                     if edit_e.borrow().is_none() {
                         start_fn(data_row, col);
                         if let Some(e) = edit_e.borrow().as_ref() {
                             let text = txt.borrow()[data_row][col].clone();
                             e.set_text(&text);
+                            // No select-all flash on the tap-prefilled text.
+                            e.select_region(0, 0);
                         }
                     }
                 }
@@ -684,13 +678,13 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let sel = selected_coord.clone();
         let fmts = cell_formats.clone();
-        let qr = queue_redraw.clone();
+        let qcell = queue_cell_area.clone();
         let _ = bold_btn.on_click(move || {
             if let Some((r, c)) = *sel.borrow() {
                 let mut f = fmts.borrow_mut();
                 if r < f.len() && c < f[r].len() {
                     f[r][c].0 = !f[r][c].0;
-                    qr();
+                    qcell(c, r);
                 }
             }
         });
@@ -698,13 +692,13 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let sel = selected_coord.clone();
         let fmts = cell_formats.clone();
-        let qr = queue_redraw.clone();
+        let qcell = queue_cell_area.clone();
         let _ = italic_btn.on_click(move || {
             if let Some((r, c)) = *sel.borrow() {
                 let mut f = fmts.borrow_mut();
                 if r < f.len() && c < f[r].len() {
                     f[r][c].1 = !f[r][c].1;
-                    qr();
+                    qcell(c, r);
                 }
             }
         });
@@ -712,13 +706,13 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let sel = selected_coord.clone();
         let fmts = cell_formats.clone();
-        let qr = queue_redraw.clone();
+        let qcell = queue_cell_area.clone();
         let _ = al_l_btn.on_click(move || {
             if let Some((r, c)) = *sel.borrow() {
                 let mut f = fmts.borrow_mut();
                 if r < f.len() && c < f[r].len() {
                     f[r][c].2 = 0;
-                    qr();
+                    qcell(c, r);
                 }
             }
         });
@@ -726,13 +720,13 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let sel = selected_coord.clone();
         let fmts = cell_formats.clone();
-        let qr = queue_redraw.clone();
+        let qcell = queue_cell_area.clone();
         let _ = al_c_btn.on_click(move || {
             if let Some((r, c)) = *sel.borrow() {
                 let mut f = fmts.borrow_mut();
                 if r < f.len() && c < f[r].len() {
                     f[r][c].2 = 1;
-                    qr();
+                    qcell(c, r);
                 }
             }
         });
@@ -740,13 +734,13 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let sel = selected_coord.clone();
         let fmts = cell_formats.clone();
-        let qr = queue_redraw.clone();
+        let qcell = queue_cell_area.clone();
         let _ = al_r_btn.on_click(move || {
             if let Some((r, c)) = *sel.borrow() {
                 let mut f = fmts.borrow_mut();
                 if r < f.len() && c < f[r].len() {
                     f[r][c].2 = 2;
-                    qr();
+                    qcell(c, r);
                 }
             }
         });
@@ -754,7 +748,7 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let sel = selected_coord.clone();
         let fmts = cell_formats.clone();
-        let qr = queue_redraw.clone();
+        let qcell = queue_cell_area.clone();
         let _ = hl_btn.on_click(move || {
             if let Some((r, c)) = *sel.borrow() {
                 let mut f = fmts.borrow_mut();
@@ -763,7 +757,7 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
                     f[r][c].4 = if bg == "#ffff00" { "#88ff88".into() }
                                else if bg == "#88ff88" { "#ffffff".into() }
                                else { "#ffff00".into() };
-                    qr();
+                    qcell(c, r);
                 }
             }
         });
@@ -771,7 +765,7 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let sel = selected_coord.clone();
         let fmts = cell_formats.clone();
-        let qr = queue_redraw.clone();
+        let qcell = queue_cell_area.clone();
         let _ = fg_btn.on_click(move || {
             if let Some((r, c)) = *sel.borrow() {
                 let mut f = fmts.borrow_mut();
@@ -781,7 +775,7 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
                                else if fg == "#cc0000" { "#0000cc".into() }
                                else if fg == "#0000cc" { "#006600".into() }
                                else { "#000000".into() };
-                    qr();
+                    qcell(c, r);
                 }
             }
         });
@@ -960,29 +954,9 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
-    {
-        let loader_save = loader.clone();
-        let texts_save = texts.clone();
-        let _ = save_btn.on_click(move || {
-            if let Ok(chooser) = unsafe { gtk_dynamic_loader::FileChooserNative::save(loader_save.clone(), "Save spreadsheet as", std::ptr::null_mut()) } {
-                if chooser.run() == -3 {
-                    if let Some(fname) = chooser.get_filename() {
-                        let mut out = String::new();
-                        if let Ok(t) = texts_save.try_borrow() {
-                            for row in t.iter() {
-                                for (j, val) in row.iter().enumerate() {
-                                    if j > 0 { out.push('\t'); }
-                                    out.push_str(val);
-                                }
-                                out.push('\n');
-                            }
-                        }
-                        let _ = std::fs::write(&fname, &out);
-                    }
-                }
-            }
-        });
-    }
+    // NOTE: a second identical `save_btn.on_click` block used to live here
+    // (copy/paste duplication) — it opened the Save dialog twice per click,
+    // so only one handler remains.
     let _ = quit_btn.on_click(|| std::process::exit(0));
 
     let vbox = gtk::create_box(gtk::Orientation::Vertical, 0)?;

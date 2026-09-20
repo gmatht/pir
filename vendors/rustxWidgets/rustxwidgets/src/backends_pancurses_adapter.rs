@@ -567,6 +567,8 @@ mod pancurses_adapter {
         pub fn set_size_request(&self, _w: i32, _h: i32) {}
         pub fn set_content_size(&self, _w: i32, _h: i32) {}
         pub fn queue_redraw(&self) {}
+        /// Dirty-rect redraw — same full-canvas no-op as `queue_redraw` here.
+        pub fn queue_redraw_area(&self, _x: i32, _y: i32, _w: i32, _h: i32) {}
         pub fn set_draw_callback(&self, _cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) {}
         pub fn on_click(&self, _cb: Box<dyn FnMut(f64, f64)>) {}
         pub fn on_key(&self, _cb: Box<dyn FnMut(u32) -> bool>) {}

@@ -463,6 +463,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
 
                     entry.grab_focus();
+                    // No select-all flash: park the cursor with no selection
+                    // (pale-yellow 255,255,204 highlight otherwise).
+                    entry.select_region(0, 0);
                     *ee.borrow_mut() = Some(entry);
                 }
             });

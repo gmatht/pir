@@ -109,6 +109,9 @@ macro_rules! common_types_mod {
         impl Entry {
             pub fn set_text(&self, text: &str) { self.inner.set_text(text); }
             pub fn get_text(&self) -> Option<String> { self.inner.get_text() }
+            /// Clear selection / park cursor — stops the tap select-all flash.
+            /// No-op on backends without text selection.
+            pub fn select_region(&self, _start: i32, _end: i32) {}
             pub fn grab_focus(&self) { self.inner.grab_focus(); }
             pub fn set_hexpand(&self, expand: bool) { self.inner.set_hexpand(expand); }
             pub fn set_vexpand(&self, expand: bool) { self.inner.set_vexpand(expand); }
@@ -133,6 +136,9 @@ macro_rules! common_types_mod {
         impl Canvas {
             pub fn set_draw_callback(&self, cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) { self.inner.set_draw_callback(cb); }
             pub fn queue_redraw(&self) { self.inner.queue_redraw(); }
+            /// Dirty-rect redraw: invalidate only `(x, y, w, h)` in canvas
+            /// coords. No-op on non-GTK backends (they redraw fully per call).
+            pub fn queue_redraw_area(&self, x: i32, y: i32, w: i32, h: i32) { self.inner.queue_redraw_area(x, y, w, h); }
             pub fn set_size_request(&self, w: i32, h: i32) { self.inner.set_size_request(w, h); }
             pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) { self.inner.on_click(cb); }
             pub fn set_content_size(&self, w: i32, h: i32) { self.inner.set_content_size(w, h); }
