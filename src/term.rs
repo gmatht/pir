@@ -923,6 +923,7 @@ const SLASH_HELP: &[(&str, &str, &str)] = &[
     ("/models", "", "list available models"),
     ("/project", "init", "create the ai_<project> user (root)"),
     ("/rebuild", "", "cargo build and exec the fresh binary"),
+    ("/reexec", "", "exec the current binary in place (pick up a new build at $0)"),
     ("/reload", "", "re-read models.json + settings.json without restarting"),
     ("/resume", "<idx|fragment>", "resume an unfinished session"),
     ("/sessions", "", "list recent sessions"),
@@ -1738,7 +1739,7 @@ fn completion_candidates(before: &str) -> Vec<String> {
         // Recompute the match list the same way complete_idle does.
         let commands = [
             "help", "model", "models", "goal", "continue", "clear", "fix", "undo", "bg", "jobs",
-            "thinking", "cancel", "shell", "exit",
+            "thinking", "cancel", "shell", "exit", "reload", "reexec",
         ];
         if before.starts_with("/thinking ") {
             let arg = before.trim_start_matches("/thinking ").trim_start();
@@ -1781,7 +1782,7 @@ fn completion_candidates(before: &str) -> Vec<String> {
 fn complete_idle(buf: &str) -> Option<String> {
     let commands = [
         "help", "model", "models", "goal", "continue", "clear", "fix", "undo", "bg", "jobs",
-        "thinking", "cancel", "shell", "exit",
+        "thinking", "cancel", "shell", "exit", "reload", "reexec",
     ];
     if buf == "/thinking" {
         return Some("/thinking ".to_string());
@@ -4121,6 +4122,17 @@ mod command_help_hint_tests {
         // the user is still typing).
         let partial = command_help_hint("/relo").expect("prefix must resolve");
         assert!(partial.contains("re-read"), "got: {partial:?}");
+    }
+
+    // `/reexec` execs the binary at $0 with the same args — discoverable next
+    // to `/reload`, and unambiguous against it (`/re` prefix offers both).
+    #[test]
+    fn reexec_is_discoverable() {
+        let hint = command_help_hint("/reexec").expect("expected a hint for /reexec");
+        assert!(
+            hint.contains("$0") || hint.contains("exec"),
+            "the hint must explain that /reexec execs the current binary: {hint:?}"
+        );
     }
 
     // `/help` itself is suppressed (its description is the command list); an

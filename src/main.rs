@@ -228,6 +228,7 @@ COMMANDS
                           guard hook + .gitattributes; jj-aware). Run it if you see
                           the "no commit guard hook" startup warning on an existing repo
   /rebuild                cargo build + exec the fresh binary (unix)
+  /reexec                 exec the current binary in place, same args (pick up a new build at $0; unix)
   /autoclean [on|off|status]   fix all errors/warnings/failing tests; with no arg
                           run one cleanup pass now, `on`/`off` toggle cleaning
                           automatically after every prompt
@@ -3054,6 +3055,20 @@ fn handle_command(
             // current session intact.
             rebuild_and_exec();
         }
+        "reexec" => {
+            // Exec the *current* binary in place (no build): picks up a new
+            // build someone else installed at $0 (deploy script, `cargo
+            // install`, manual copy) without losing your place. Refuses while
+            // a turn runs — exec would orphan the worker and its session
+            // state. Session itself survives via the persisted log (resume
+            // with `pir -r` / `/resume` if the new process doesn't pick it
+            // up automatically).
+            if fg_running {
+                eprintln!("pir: a turn is running — finish or /cancel it first, then /reexec");
+                return;
+            }
+            reexec_self();
+        }
         "sh" | "shell" => {
             // Drop down to an interactive shell (`/sh`), or run a single command
             // and return (`/sh COMMAND ARG1 ARG2 …`). The shell inherits the
@@ -3608,6 +3623,35 @@ fn rebuild_and_exec() {
 #[cfg(not(unix))]
 fn rebuild_and_exec() {
     eprintln!("pir: /rebuild (exec) is only supported on unix");
+}
+
+/// `/reexec` — replace this process with the binary at `$0`
+/// (`std::env::current_exe`), forwarding the original argv. No build: this is
+/// for picking up a new binary someone else installed over the running one
+/// (deploy script, `cargo install`, manual `cp`). Unix-only: `exec` replaces
+/// the process image in place, so the new `pir` inherits the same
+/// stdio/terminal and keeps the user's place; the session itself persists via
+/// the session log. Like `/rebuild`, the caller must refuse while a turn runs.
+#[cfg(unix)]
+fn reexec_self() {
+    use std::os::unix::process::CommandExt;
+    match std::env::current_exe() {
+        Ok(bin) => {
+            eprintln!("{} re-execing {}…", term::dim("·"), bin.display());
+            // `exec` does not return on success.
+            let err = std::process::Command::new(&bin).args(std::env::args().skip(1)).exec();
+            // Only reached if exec fails.
+            die(&format!("reexec: failed to restart {}: {}", bin.display(), err));
+        }
+        Err(e) => {
+            eprintln!("{} cannot find current binary: {}", term::red("error:"), e);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn reexec_self() {
+    eprintln!("pir: /reexec (exec) is only supported on unix");
 }
 
 /// Collapse `$HOME` to `~` in a path for a compact display, leaving other

@@ -49,7 +49,7 @@ const GDK_KEY_Q: u32 = 0x71;
 fn complete_idle(buf: &str) -> Option<String> {
     let commands = [
         "help", "model", "models", "goal", "continue", "clear", "fix", "undo", "bg", "jobs",
-        "thinking", "cancel", "shell", "exit", "usage", "sessions", "reload",
+        "thinking", "cancel", "shell", "exit", "usage", "sessions", "reload", "reexec",
     ];
     // `/thinking <arg>` sub-argument completion.
     if buf.starts_with("/thinking ") {
@@ -1014,7 +1014,7 @@ fn handle_command(
     match cmd {
         "h" | "help" => {
             s.push(ConvKind::System,
-                "commands: /help /model <sel> /models /goal [obj] /continue /clear /undo /reload\n\
+                "commands: /help /model <sel> /models /goal [obj] /continue /clear /undo /reload /reexec\n\
                  \x20  /cancel  /thinking  /sessions  /usage  /exit  /quit",
             );
         }

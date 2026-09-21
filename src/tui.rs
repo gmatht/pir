@@ -1074,7 +1074,7 @@ fn update_tui_hint(state: &mut TuiState, buf: &str) {
 fn complete_idle(buf: &str) -> Option<String> {
     let commands = [
         "help", "model", "models", "goal", "continue", "clear", "fix", "undo", "bg", "jobs",
-        "thinking", "cancel", "shell", "exit",
+        "thinking", "cancel", "shell", "exit", "reload", "reexec",
     ];
     if buf == "/thinking" {
         return Some("/thinking ".to_string());
@@ -1766,6 +1766,9 @@ fn handle_command(
         "rebuild" => {
             state.push(ConvKind::System, "· /rebuild is only available in the streaming REPL");
         }
+        "reexec" => {
+            state.push(ConvKind::System, "· /reexec is only available in the streaming REPL");
+        }
         "exit" | "quit" | "q" => std::process::exit(0),
         other => state.push(ConvKind::Error, &format!("unknown command /{other} — try /help")),
     }
@@ -1773,7 +1776,8 @@ fn handle_command(
 
 const HELP_TUI: &str = "\
 commands: /help /model <sel> /models /goal [obj] /continue /clear /finished /fix /undo [all] \
-/bg <text> /jobs /cancel
+/bg <text> /jobs /cancel /reload
+/reexec  exec the current binary in place (streaming REPL only; TUI/GUI must restart manually)
 /sh [cmd args]  drop to a shell, or run a command via $SHELL (sh -c)
                /sh -u [user] starts it as another user (default: the invoking user)
 Esc or ctrl-c cancels the running turn; ctrl-d quits; lines ending in & run in the background";
