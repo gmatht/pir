@@ -409,6 +409,20 @@ impl Client {
     /// "no opinion" by the caller. Honours `PIR_STALL_TIMEOUT_SECS`/the cancel
     /// flag like the streaming path, so a stuck provider can't hang the turn.
     pub fn complete(&self, model: &str, system: &str, prompt: &str) -> Result<String, String> {
+        self.complete_with(model, system, prompt, 12)
+    }
+
+    /// Like [`Client::complete`], but with an explicit output-token budget.
+    /// The 12-token default is sized for one-word verdicts (the goal/retry
+    /// classifiers); a real generation (e.g. `/compact`'s session summary)
+    /// needs room to write, so callers pass their own budget.
+    pub fn complete_with(
+        &self,
+        model: &str,
+        system: &str,
+        prompt: &str,
+        max_out: u32,
+    ) -> Result<String, String> {
         if self.fake {
             let _ = (model, system, prompt);
             return Ok("fake ok".to_string());
@@ -428,7 +442,7 @@ impl Client {
                 format!("{}/messages", self.base_url),
                 json!({
                     "model": model,
-                    "max_tokens": 12,
+                    "max_tokens": max_out,
                     "stream": false,
                     "system": system,
                     "messages": [{ "role": "user", "content": prompt }],
@@ -444,7 +458,7 @@ impl Client {
                     json!({
                         "model": model,
                         "stream": false,
-                        max_key: 12,
+                        max_key: max_out,
                         "messages": [
                             { "role": "system", "content": system },
                             { "role": "user", "content": prompt },
@@ -465,6 +479,7 @@ impl Client {
                             { "role": "system", "content": system },
                             { "role": "user", "content": prompt },
                         ],
+                        "max_output_tokens": max_out,
                         "stream": false,
                     }),
                 )
@@ -652,23 +667,21 @@ impl Client {
                 return Err("request cancelled".to_string());
             }
             let send_start = Instant::now();
-            // The host-libcurl transfer runs blocking on a worker thread;
-            // reads are bounded by the streaming stall watchdog + cancel
-            // flag, so a slow/"thinking" provider is never cut off mid-stream.
-            // Race the transfer against the cancel channel so a cancel pressed
-            // while still waiting on the socket is honoured instantly: the
-            // smol reactor wakes the moment `cancel_tx` fires, no polling.
-            // The transfer yields a boxed async buffered reader the shared
-            // SSE parsers consume, so transport never leaks downstream.
+            // Host libcurl runs on its own thread (spawned by `lsbcurl_send`)
+            // and feeds the shared SSE parsers through `ChannelBody` with
+            // per-chunk cancel checks. `lsbcurl_send` returns as soon as the
+            // transfer is *started*, so the parser drains the body while the
+            // transfer is still running — the fix for the bounded-channel
+            // deadlock where the producer blocked before the reader existed.
+            // Reads are bounded by the streaming stall watchdog + cancel flag,
+            // so a slow/"thinking" provider is never cut off mid-stream.
             enum ConnectOutcome {
-                Body(Pin<Box<dyn AsyncBufRead + Unpin + Send>>),
-                Cancelled,
+                /// A live stream body plus the producer's terminal-status slot.
+                /// libcurl reports the HTTP status only after the transfer, so
+                /// the status is consulted once the parser has drained the body.
+                Body(Pin<Box<dyn AsyncBufRead + Unpin + Send>>, TransferFinish),
                 Err(String),
             }
-            // Host libcurl on a worker thread; its write callback feeds the
-            // shared SSE parsers through `ChannelBody`, with per-chunk cancel
-            // checks. A lost connect race detaches cleanly: the receiver is
-            // dropped and the callback's bounded send fails fast.
             let Some(curl) = self.lsb_curl.clone() else {
                 return Err(
                     "lsb-curl backend unavailable (no loadable libcurl.so.4)".to_string(),
@@ -678,27 +691,15 @@ impl Client {
             let headers = self.request_headers(kind, model_meta);
             let body_str = body.to_string();
             let cancel_flag = cancel.clone();
-            let outcome = future::or(
-                async {
-                    match smol::unblock(move || {
-                        lsbcurl_send(&curl, &url, &headers, &body_str, &cancel_flag)
-                    })
-                    .await
-                    {
-                        Ok(pump) => {
-                            let reader: Pin<Box<dyn AsyncBufRead + Unpin + Send>> =
-                                Box::pin(pump);
-                            ConnectOutcome::Body(reader)
-                        }
-                        Err(e) => ConnectOutcome::Err(e),
-                    }
-                },
-                async {
-                    let _ = cancel_rx.recv().await;
-                    ConnectOutcome::Cancelled
-                },
-            )
-            .await;
+            // Non-blocking: just starts the transfer thread. A spawn failure
+            // (resource exhaustion) is the only up-front error.
+            let outcome = match lsbcurl_send(&curl, &url, &headers, &body_str, &cancel_flag) {
+                Ok((pump, finish)) => {
+                    let reader: Pin<Box<dyn AsyncBufRead + Unpin + Send>> = Box::pin(pump);
+                    ConnectOutcome::Body(reader, finish)
+                }
+                Err(e) => ConnectOutcome::Err(e),
+            };
             // All three failure sources — a transport error, a non-2xx
             // status, or a stream parse failure — fold into the attempt
             // `result` below so every one goes through the same retry
@@ -711,9 +712,8 @@ impl Client {
             let mut first_think_ms: Option<u128> = None;
             let mut first_text_ms: Option<u128> = None;
             let result: Result<(Message, Usage), String> = match outcome {
-                ConnectOutcome::Cancelled => return Err("request cancelled".to_string()),
                 ConnectOutcome::Err(e) => Err(e),
-                ConnectOutcome::Body(mut reader) => {
+                ConnectOutcome::Body(mut reader, finish) => {
                     // Phase timing for PIR_DEBUG: stamp the first reasoning
                     // and first text token instants (relative to this
                     // attempt's send), distinguishing "thinking dribbled"
@@ -732,7 +732,7 @@ impl Client {
                         }
                         on_text(t);
                     };
-                    match kind {
+                    let stream_res = match kind {
                         ApiKind::Anthropic => {
                             stream_anthropic(
                                 &mut reader,
@@ -769,6 +769,17 @@ impl Client {
                             )
                             .await
                         }
+                    };
+                    // libcurl only learns the HTTP status after the transfer
+                    // ends. A non-2xx is therefore discovered here, after the
+                    // parser drained the (data-less) error body: discard
+                    // whatever it parsed and fail with the exact
+                    // `http_status_detail` string, preserving the bare
+                    // `HTTP 4xx` prefix that `is_retryable` and the
+                    // `misrouted` hint match on.
+                    match finish.lock().unwrap().take() {
+                        Some(err) => Err(err),
+                        None => stream_res,
                     }
                 }
             };
@@ -1550,65 +1561,87 @@ impl smol::io::AsyncBufRead for ChannelBody {
     }
 }
 
-/// Blocking lsb-curl POST. Runs inside `smol::unblock`
-/// (never on the executor): libcurl's write callback feeds
-/// body chunks live over the channel while accumulating them, so the shared
-/// SSE parsers stream exactly like the other backends.
+/// Terminal result of a background lsb-curl transfer, shared with `chat`.
+/// libcurl reports the HTTP status only after the transfer completes, so the
+/// SSE parser can reach EOF before the status is known; `chat` reads this
+/// afterwards and, for a non-2xx, replaces the parsed result with the exact
+/// `http_status_detail` error. `None` means the transfer is still running or
+/// ended 2xx; `Some(msg)` is the error to surface.
+type TransferFinish = Arc<Mutex<Option<String>>>;
+
+/// Start a streaming lsb-curl POST on a dedicated thread and return its
+/// [`ChannelBody`] immediately, so the shared SSE parsers can drain the body
+/// *while* libcurl is still running.
 ///
-/// libcurl only reports the status *after* the transfer, so a non-2xx is
-/// discovered late: the streamed bytes are then discarded and the attempt
-/// fails with `http_status_detail(code, full_body)`. Error bodies are tiny
-/// and carry no `data:` lines, so the parsers never emit text from them —
-/// the retry loop's pre-output rules apply unchanged. Cancel is checked per
-/// chunk (prompt abort, like `CancelableReader`'s poll); a lost cancel race
-/// detaches via failed sends.
+/// This early return is load-bearing. libcurl's write callback feeds body
+/// chunks over a bounded channel, and the reader is the only consumer; if the
+/// body were returned only after `request_streaming_with_options` (as it once
+/// was), the callback would block forever in `send_blocking` once the channel
+/// filled, deadlocking any response that needed more than eight write
+/// callbacks — i.e. any real SSE stream — and leaving the turn stuck on
+/// "thinking" with the unread response parked in the socket. See
+/// `lsbcurl_backend_streams_many_chunks_without_deadlock`.
+///
+/// libcurl only reports the status *after* the transfer, so a non-2xx cannot
+/// fail the call up-front: the status is recorded in the returned
+/// [`TransferFinish`] slot for `chat` to consult once the parser has drained
+/// the (tiny, `data:`-less) error body. Cancel is checked per chunk; a lost
+/// reader drops the receiver and the callback detaches via a failed send.
 fn lsbcurl_send(
     curl: &std::sync::Arc<lsb_curl::Curl>,
     url: &str,
     headers: &[(String, String)],
     body: &str,
     cancel: &Arc<AtomicBool>,
-) -> Result<ChannelBody, String> {
+) -> Result<(ChannelBody, TransferFinish), String> {
     let (tx, rx) = smol::channel::bounded::<std::io::Result<Vec<u8>>>(8);
-    let mut acc: Vec<u8> = Vec::new();
-    let hrefs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let mut all = hrefs.clone();
-    all.push(("content-type", "application/json"));
-    let opts = lsbcurl_options();
-    let r = curl.request_streaming_with_options(
-        lsb_curl::Method::POST,
-        url,
-        Some(body.as_bytes()),
-        &all,
-        &opts,
-        &mut |chunk: &[u8]| {
-            if cancel.load(Ordering::SeqCst) {
-                return Ok(false); // -> CurlError::Aborted -> "request cancelled"
-            }
-            acc.extend_from_slice(chunk);
-            if tx.send_blocking(Ok(chunk.to_vec())).is_err() {
-                return Ok(false); // parser went away; detach cleanly
-            }
-            Ok(true)
-        },
-    );
-    match r {
-        Ok((status, _resp_headers)) => {
-            if (200..300).contains(&status) {
-                drop(tx); // clean EOF for the parsers
-                Ok(ChannelBody::from_receiver(rx))
-            } else {
-                drop(tx);
-                drop(rx);
-                Err(http_status_detail(status, &String::from_utf8_lossy(&acc)))
-            }
-        }
-        Err(e) => {
-            drop(tx);
-            drop(rx);
-            Err(lsbcurl_error(e))
-        }
-    }
+    let finish: TransferFinish = Arc::new(Mutex::new(None));
+    let finish_prod = finish.clone();
+    let curl = curl.clone();
+    let url = url.to_string();
+    let headers = headers.to_vec();
+    let body = body.to_string();
+    let cancel = cancel.clone();
+    thread::Builder::new()
+        .name("lsb-curl-stream".to_string())
+        .spawn(move || {
+            let hrefs: Vec<(&str, &str)> =
+                headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let mut all = hrefs.clone();
+            all.push(("content-type", "application/json"));
+            let opts = lsbcurl_options();
+            let mut acc: Vec<u8> = Vec::new();
+            let r = curl.request_streaming_with_options(
+                lsb_curl::Method::POST,
+                &url,
+                Some(body.as_bytes()),
+                &all,
+                &opts,
+                &mut |chunk: &[u8]| {
+                    if cancel.load(Ordering::SeqCst) {
+                        return Ok(false); // -> CurlError::Aborted -> "request cancelled"
+                    }
+                    acc.extend_from_slice(chunk);
+                    if tx.send_blocking(Ok(chunk.to_vec())).is_err() {
+                        return Ok(false); // parser went away; detach cleanly
+                    }
+                    Ok(true)
+                },
+            );
+            // Publish the terminal status *before* closing the channel so a
+            // reader that observes EOF is guaranteed to see it.
+            let terminal = match r {
+                Ok((status, _resp_headers)) if (200..300).contains(&status) => None,
+                Ok((status, _resp_headers)) => {
+                    Some(http_status_detail(status, &String::from_utf8_lossy(&acc)))
+                }
+                Err(e) => Some(lsbcurl_error(e)),
+            };
+            *finish_prod.lock().unwrap() = terminal;
+            drop(tx); // clean EOF for the parsers
+        })
+        .map_err(|e| format!("lsb-curl stream thread: {e}"))?;
+    Ok((ChannelBody::from_receiver(rx), finish))
 }
 
 /// True when an error represents a network timeout (read/connect). Used to
@@ -3219,6 +3252,86 @@ mod tests {
         );
         assert!(res.is_ok(), "lsb-curl backend must stream, got {res:?}");
         assert!(text.contains("hi-lsbcurl"), "expected streamed text, got {text:?}");
+    }
+
+    #[test]
+    fn lsbcurl_backend_streams_many_chunks_without_deadlock() {
+        // Regression for the bounded-channel deadlock that made a real turn
+        // look like it was "thinking" forever.
+        //
+        // The producer used to send body chunks into a `bounded(8)` channel
+        // from inside libcurl's write callback, while the `ChannelBody` owning
+        // the only receiver was not returned until the whole transfer had
+        // finished. Once eight chunks filled the channel the callback blocked
+        // in `send_blocking` forever, so `easy_perform` never returned, the SSE
+        // parser never ran, and the unread response sat in the socket until the
+        // user gave up. `lsbcurl_backend_streams_mock_sse` missed it because it
+        // writes one tiny frame (a single callback).
+        //
+        // libcurl caps one write callback at CURL_MAX_WRITE_SIZE (16 KiB) with
+        // the default buffer size, so a 256 KiB body is guaranteed to need more
+        // than eight callbacks even if the client socket buffers all of it.
+        if lsb_curl::Curl::load().is_err() {
+            eprintln!("SKIP: no loadable libcurl");
+            return;
+        }
+        const PAYLOAD: usize = 256 * 1024; // > 8 x 16 KiB -> > 8 write callbacks
+        assert!(PAYLOAD > 8 * 16 * 1024, "must exceed the channel capacity");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        let _srv = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            drain_request(&mut sock);
+            use std::io::Write as _;
+            // One SSE frame whose `content` delta is a single huge string (no
+            // newlines), then the terminator. The huge line forces libcurl to
+            // deliver many chunks.
+            let content = "A".repeat(PAYLOAD);
+            let frame = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n\
+                 data: {{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\
+                 \"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\
+                 \"content\":\"{content}\"}}}}]}}\n\n\
+                 data: [DONE]\n\n"
+            );
+            let _ = sock.write_all(frame.as_bytes());
+            let _ = sock.flush();
+            // Hold the connection open briefly so the client drains the body.
+            thread::sleep(Duration::from_millis(200));
+        });
+        // Run the turn on a worker and bound the wait: on the old code it
+        // deadlocked, and the test must fail (not hang the suite) when it does.
+        let (done_tx, done_rx) = mpsc::channel();
+        let _worker = thread::spawn(move || {
+            let mut client =
+                Client::new(ApiKind::OpenAi, &format!("http://{addr}"), "test-key".to_string());
+            client.set_backend(HttpBackend::LsbCurl);
+            let mut text = String::new();
+            let res = client.chat(
+                "test-model",
+                16,
+                "sys",
+                &[Message { role: Role::User, blocks: vec![Block::Text("hi".into())] }],
+                &[],
+                &mut |t: &str| text.push_str(t),
+                crate::config::ThinkingLevel::Off,
+                0,
+                &mut |_s: &str| {},
+                None,
+                None,
+                true,
+                None,
+                &mut |_w: &RetryWait| {},
+                &mut |_n: &str| {},
+            );
+            let _ = done_tx.send((res, text));
+        });
+        let (res, text) = done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("lsb-curl stream deadlocked: no result within 30s");
+        assert!(res.is_ok(), "lsb-curl backend must stream, got {res:?}");
+        assert_eq!(text.len(), PAYLOAD, "all streamed bytes must arrive");
+        assert!(text.bytes().all(|b| b == b'A'), "streamed payload must be intact");
     }
 
     #[test]
