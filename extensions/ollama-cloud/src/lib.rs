@@ -28,7 +28,6 @@
 use crate::config::ollama_cloud_api_key;
 use crate::plugin::{CommandSpec, Outcome, Registry, ToolBackend, ToolSpec};
 use serde_json::{json, Value};
-use std::io::Read as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -219,45 +218,41 @@ fn ollama_request(
     body: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let url = format!("{}{}", OLLAMA_BASE, endpoint);
-    // ureq 2.x: attach native-tls explicitly (mirrors crate::provider).
-    let connector = std::sync::Arc::new(
-        native_tls::TlsConnector::new().map_err(|e| format!("ollama_cloud: TLS init failed: {e}"))?,
-    );
-    let agent = ureq::AgentBuilder::new()
-        .tls_connector(connector)
-        .timeout(WEB_TOOLS_TIMEOUT)
-        .build();
-    let req = agent
-        .request(method, &url)
-        .set("Authorization", &format!("Bearer {key}"))
-        .set("Content-Type", "application/json");
-    let resp = if method.eq_ignore_ascii_case("POST") {
-        req.send_json(body)
+    // Host libcurl (no static TLS): auth via header pairs, same timeout the
+    // package uses (15s). `lsb_json` maps non-2xx through `http_status_detail`
+    // and reports empty 200 bodies as "empty body" errors, both handled below.
+    let method = if method.eq_ignore_ascii_case("POST") {
+        lsb_curl::Method::POST
     } else {
-        req.call()
+        lsb_curl::Method::GET
     };
-    match resp {
-        Ok(r) => r
-            .into_json::<serde_json::Value>()
-            .map_err(|e| format!("ollama_cloud: bad JSON from {endpoint}: {e}"))
-            .or_else(|e| {
-                // Some endpoints (e.g. /api/usage) return a 200 with no body or a
-                // non-JSON body; tolerate that and return an empty object so the
-                // caller's shape check can decide.
-                if e.to_string().contains("empty body")
-                    || e.to_string().contains("empty response")
-                {
-                    Ok(json!({}))
-                } else {
-                    Err(e)
-                }
-            }),
-        Err(ureq::Error::Status(code, r)) => {
-            let mut b = String::new();
-            let _ = r.into_reader().take(1024).read_to_string(&mut b);
-            let detail = crate::provider::http_status_detail(code, &b);
-            Err(format!("ollama_cloud {endpoint}: {detail}"))
+    let bearer = format!("Bearer {key}");
+    let headers = [("Authorization", bearer.as_str()), ("Content-Type", "application/json")];
+    let body_json = if matches!(method, lsb_curl::Method::POST) { Some(&body) } else { None };
+    match crate::provider::lsb_json(
+        method,
+        &url,
+        &headers,
+        body_json,
+        Duration::from_secs(15),
+        WEB_TOOLS_TIMEOUT,
+    ) {
+        Ok(v) => {
+            if v.is_null() {
+                // Tolerate empty/null 200s (e.g. /api/usage with no body) so
+                // the caller's shape check can decide, as before.
+                Ok(json!({}))
+            } else {
+                Ok(v)
+            }
         }
+        Err(e) if e.contains("empty body") => {
+            // Some endpoints (e.g. /api/usage) return a 200 with no body;
+            // tolerate that and return an empty object so the caller's shape
+            // check can decide.
+            Ok(json!({}))
+        }
+        Err(e) if e.starts_with("HTTP ") => Err(format!("ollama_cloud {endpoint}: {e}")),
         Err(e) => Err(format!("ollama_cloud {endpoint}: {e}")),
     }
 }

@@ -583,7 +583,7 @@ pub fn about_dialog() -> Option<()> {
             option_env!("LTO").unwrap_or("?")),
         format!("license: {}", term::dim("GPL-3.0")),
         String::new(),
-        term::dim("deps: pulldown-cmark · streamdown-parser · rustyline · ureq · smol · crossterm").to_string(),
+        term::dim("deps: pulldown-cmark · streamdown-parser · rustyline · lsb-curl · smol · crossterm").to_string(),
         String::new(),
         term::dim("[esc] close").to_string(),
     ];

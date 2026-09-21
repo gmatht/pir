@@ -206,6 +206,14 @@ impl LoopDetector {
     /// text loop). A model that repeats a short preamble while reading
     /// different files is progressing and must never be flagged.
     fn observe(&mut self, tool_sig: &str, text_sig: &str) -> bool {
+        // Empty observations (a stalled stream yielding `(empty response)`
+        // with no tools) carry no signal: neither repeating nor progressing.
+        // Counting them lets three consecutive stall retries trip the *tool*
+        // signal (empty == empty) and kill a turn the stop-skill nudge path
+        // would otherwise recover. Skip them without touching the counters.
+        if tool_sig.is_empty() && text_sig.is_empty() {
+            return false;
+        }
         // Tool signal: fire when the identical batch repeats MAX_REPEATS times.
         let tool_repeating = self.prev_tool.as_deref() == Some(tool_sig);
         if tool_repeating {
@@ -949,6 +957,41 @@ impl Agent {
         Ok(())
     }
 
+    /// Re-read the model catalog from disk and refresh the agent's cached copy
+    /// (`/reload`). The catalog is otherwise loaded once in [`Agent::new`], so
+    /// editing `~/.pi/models.json` (adding a provider, a key, a new model) had
+    /// no effect until pir was restarted.
+    ///
+    /// The *active* model is re-resolved against the fresh catalog by label:
+    /// if the same `provider/model` still exists, its definition is replaced
+    /// (so edits to context size, prices, `max_tokens`, … take effect
+    /// immediately); if it vanished, the switch is left alone and reported, so
+    /// a reload can never silently move the user onto a different model.
+    ///
+    /// Returns `(providers_loaded, active_model_refreshed)`.
+    pub fn reload_catalog(&mut self) -> (usize, bool) {
+        let fresh = match crate::config::load_providers() {
+            Ok(p) if !p.is_empty() => p,
+            // Keep the working catalog rather than emptying it on a transient
+            // read failure (the store may be unreadable mid-write).
+            _ => return (self.cached_providers.len(), false),
+        };
+        let n = fresh.len();
+        let label = format!("{}/{}", self.provider.pid(), self.model.id);
+        let refreshed = match crate::config::select(&fresh, &label) {
+            Ok((p, m)) => {
+                let (p, m) = (p.clone(), m.clone());
+                // Replace the provider/model definitions in place. `switch`
+                // also rebuilds the HTTP client, so changed base_url / headers
+                // / auth from the store are picked up too.
+                self.switch(p, m).is_ok()
+            }
+            Err(_) => false,
+        };
+        self.cached_providers = fresh;
+        (n, refreshed)
+    }
+
     /// Persist the active provider/model to a sidecar (`<log>.model`) so the
     /// choice survives a resume. Silent if there's no log (one-shot).
     fn persist_model(&self) {
@@ -984,6 +1027,76 @@ impl Agent {
 
     pub fn clear(&mut self) {
         self.history.clear();
+    }
+
+    /// Whether the history fits (token-wise) without trimming
+    pub fn needs_compaction(&self) -> bool {
+        let ctx = self.model.context.unwrap_or(200_000) as usize;
+        let out_reserve = self.model.max_tokens.unwrap_or(8192) as usize;
+        let sys_reserve = 2_000;
+        let budget = ctx
+            .saturating_sub(out_reserve)
+            .saturating_sub(sys_reserve)
+            .max(8192);
+        approx_tokens(&self.history) > budget
+    }
+
+    pub fn compact(&mut self) -> String {
+        if self.history.is_empty() {
+            return "nothing to compact (no history)".to_string();
+        }
+        let before_tokens = approx_tokens(&self.history);
+        let sys = self.system.clone();
+        let msgs: Vec<Message> = self.history.clone();
+        let mut transcript = String::new();
+        for m in &msgs {
+            let role = match m.role {
+                Role::User => "User",
+                Role::Assistant => "Assistant",
+            };
+            let text = m.text();
+            if !text.trim().is_empty() {
+                transcript.push_str(&format!("{role}: {text}\n"));
+            }
+            for (_, name, input) in m.tool_uses() {
+                transcript.push_str(&format!("{role} called tool `{name}` with {input}\n"));
+            }
+            for b in &m.blocks {
+                if let Block::ToolResult { content, is_error, .. } = b {
+                    let tag = if *is_error { "Tool error" } else { "Tool result" };
+                    transcript.push_str(&format!("{tag}: {content}\n"));
+                }
+            }
+        }
+        if transcript.is_empty() {
+            return "nothing to compact (empty conversation)".to_string();
+        }
+        let compact_prompt = format!(
+            "Summarize the following coding session so far in a concise but complete way. \
+             Include: the user's goal(s), key decisions, files touched, important code/commands, \
+             current state, and any pending work. Do not include any preamble or meta commentary.\n\n{}",
+            transcript
+        );
+        match self.client.complete(&self.model.id, &sys, &compact_prompt) {
+            Ok(summary) if !summary.trim().is_empty() => {
+                let s = summary.trim().to_string();
+                self.history.clear();
+                self.history.push(Message::user(&format!(
+                    "[pir: conversation compacted — summary of earlier context]\n\n{s}"
+                )));
+                let after_tokens = approx_tokens(&self.history);
+                term::out(&term::dim(&format!(
+                    "[pir: compacted history ({} → {} tokens est.)]",
+                    before_tokens, after_tokens
+                )));
+                format!(
+                    "history compacted ({} → {} tokens est.) — kept a summary of the conversation",
+                    before_tokens, after_tokens
+                )
+            }
+            Ok(_) => "compaction produced empty summary; history unchanged".to_string(),
+            Err(e) => format!("compaction failed: {e} (history unchanged)"),
+        }
     }
 
     /// Set the cumulative token budget (in+out, in tokens). Off by default;
@@ -2863,7 +2976,8 @@ fn make_client(provider: &Provider, cancel: Arc<AtomicBool>) -> Result<Client, S
     // the whole response arrives.
     client.set_cancel(cancel);
     // HTTP transport for the streaming core: `PIR_HTTP_BACKEND` or the
-    // `http_backend` settings.json key (`"isahc"` default, `"ureq"`).
+    // `http_backend` settings.json key (single-transport build — every
+    // known name resolves to host libcurl; see HttpBackend::parse).
     // Unknown values fall back to the default rather than failing startup.
     if let Some(name) = config::http_backend_name()
         && let Some(backend) = crate::provider::HttpBackend::parse(&name) {
@@ -3112,6 +3226,123 @@ fn session_dir() -> PathBuf {
 /// system prompt keeps pi's *shape* (Available tools, Guidelines,
 /// <project_context>, Current working directory) with pir's *content*
 /// (identity, PIR docs, pir tool names, terse rules) — and never pi's.
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+
+    fn test_provider(id: &str, model_id: &str) -> Provider {
+        Provider {
+            id: Some(id.to_string()),
+            name: None,
+            base_url: Some("http://127.0.0.1:9".to_string()),
+            api_key: Some("k".to_string()),
+            api: Some("openai".to_string()),
+            models: vec![crate::config::Model {
+                id: model_id.to_string(),
+                name: None,
+                context: Some(1000),
+                max_tokens: Some(100),
+                api_override: None,
+                url_override: None,
+                no_reasoning_effort: false,
+                reasoning: false,
+                thinking_format: None,
+                supports_reasoning_effort: None,
+                session_affinity_format: None,
+                thinking_level_map: Default::default(),
+                price_per_1k: None,
+            }],
+        }
+    }
+
+    fn test_agent() -> Agent {
+        // `Agent::new` reads the real store; override the cache + active
+        // model with test fixtures instead.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let p = test_provider("p1", "m1");
+        let m = p.models[0].clone();
+        let mut a = Agent::new(
+            p.clone(),
+            m.clone(),
+            false,
+            true,
+            std::sync::Arc::new(crate::notify::NotifyBus::new(
+                crate::notify::NotifyPolicy::default(),
+            )),
+            None,
+            cancel,
+            Arc::new(Mutex::new(String::new())),
+        )
+        .expect("test agent builds");
+        a.cached_providers = vec![p];
+        a
+    }
+
+    #[test]
+    fn reload_keeps_working_catalog_on_unreadable_store() {
+        // Point PI_DIR at an empty dir so load_providers fails: reload must
+        // keep the working catalog (count unchanged) and report not-refreshed,
+        // never empty the cache.
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("pir_reload_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("PI_DIR");
+        // SAFETY: test-only env mutation, serialized by TEST_ENV_LOCK.
+        unsafe { std::env::set_var("PI_DIR", &dir); }
+        let mut a = test_agent();
+        let before = a.cached_providers.len();
+        let (n, refreshed) = a.reload_catalog();
+        match old {
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(n, before, "unreadable store must keep the working catalog");
+        assert!(!refreshed, "nothing refreshed when the store is unreadable");
+        assert_eq!(a.model.id, "m1", "active model untouched");
+    }
+
+    #[test]
+    fn reload_never_moves_active_model_off_label() {
+        // A fresh catalog lacking the active model: reload reports
+        // not-refreshed and leaves provider/model alone (no silent move).
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("pir_reload2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let agent_dir = dir.join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("models-store.json"),
+            serde_json::json!({
+                "providers": [{
+                    "id": "other",
+                    "baseUrl": "http://127.0.0.1:9",
+                    "apiKey": "k",
+                    "api": "openai",
+                    "models": [{ "id": "othermodel" }]
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let old = std::env::var_os("PI_DIR");
+        // SAFETY: test-only env mutation, serialized by TEST_ENV_LOCK.
+        unsafe { std::env::set_var("PI_DIR", &dir); }
+        let mut a = test_agent();
+        let (n, refreshed) = a.reload_catalog();
+        match old {
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(n, 1, "fresh catalog has one provider");
+        assert!(!refreshed, "vanished model must not refresh");
+        assert_eq!(a.provider.pid(), "p1", "provider untouched");
+        assert_eq!(a.model.id, "m1", "model untouched");
+    }
+}
+
 #[cfg(test)]
 mod prompt_parity_tests {
     use super::build_system_prompt;
@@ -3427,6 +3658,41 @@ mod notice_log_tests {
             "user+assistant around the notice must still pair: {dump}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The false loop-detector trip: three consecutive stalled-stream
+    /// `(empty response)` observations (empty tool sig + empty text sig)
+    /// fired the detector and killed a live turn, even though every real
+    /// observation before and after was distinct. Empty observations carry
+    /// no signal and must be skipped without touching the counters, so the
+    /// stop-skill nudge path gets its chance to recover the turn.
+    #[test]
+    fn empty_observations_never_trip_the_detector() {
+        let mut d = super::LoopDetector::new();
+        // Two distinct real observations first (the working-turn shape).
+        assert!(!d.observe("bash\x01a", "checking x"));
+        assert!(!d.observe("bash\x01b", "checking y"));
+        // Three consecutive empties (stalled stream): must not fire.
+        assert!(!d.observe("", ""));
+        assert!(!d.observe("", ""));
+        assert!(!d.observe("", ""));
+        // Work resumes with distinct tools: still must not fire.
+        assert!(!d.observe("bash\x01c", "checking z"));
+        assert!(!d.observe("bash\x01d", "checking w"));
+    }
+
+    /// The guard itself must still fire: three genuinely identical tool
+    /// batches (or texts with no tools) still trip it.
+    #[test]
+    fn identical_batches_still_trip_the_detector() {
+        let mut d = super::LoopDetector::new();
+        assert!(!d.observe("read\x01f", "looking"));
+        assert!(!d.observe("read\x01f", "looking"));
+        assert!(d.observe("read\x01f", "looking"), "identical batch x3 must trip");
+        let mut d = super::LoopDetector::new();
+        assert!(!d.observe("", "same sentence"));
+        assert!(!d.observe("", "same sentence"));
+        assert!(d.observe("", "same sentence"), "identical text x3 must trip");
     }
 }
 

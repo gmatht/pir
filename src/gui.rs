@@ -49,7 +49,7 @@ const GDK_KEY_Q: u32 = 0x71;
 fn complete_idle(buf: &str) -> Option<String> {
     let commands = [
         "help", "model", "models", "goal", "continue", "clear", "fix", "undo", "bg", "jobs",
-        "thinking", "cancel", "shell", "exit", "usage", "sessions",
+        "thinking", "cancel", "shell", "exit", "usage", "sessions", "reload",
     ];
     // `/thinking <arg>` sub-argument completion.
     if buf.starts_with("/thinking ") {
@@ -1014,7 +1014,7 @@ fn handle_command(
     match cmd {
         "h" | "help" => {
             s.push(ConvKind::System,
-                "commands: /help /model <sel> /models /goal [obj] /continue /clear /undo\n\
+                "commands: /help /model <sel> /models /goal [obj] /continue /clear /undo /reload\n\
                  \x20  /cancel  /thinking  /sessions  /usage  /exit  /quit",
             );
         }
@@ -1035,6 +1035,26 @@ fn handle_command(
         "clear" => {
             s.clear();
             s.push(ConvKind::System, "pir · GTK GUI");
+        }
+        "reload" => {
+            // Same in-process refresh as the streaming REPL: catalog +
+            // policy + ext commands, no build/exec (see main handle_command).
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                s.push(ConvKind::System, "· agent busy (turn running) — try again when idle");
+                return;
+            };
+            let (n, refreshed) = agent.reload_catalog();
+            let label = agent.label();
+            let policy = crate::security::load_policy();
+            let policy_note = agent.apply_security_policy(&policy);
+            let cmds = agent.registry_command_names();
+            crate::term::set_extension_commands(cmds);
+            s.push(
+                ConvKind::System,
+                &format!("· reloaded: {n} provider(s), model {label}{} | policy: {policy_note}",
+                    if refreshed { " (refreshed)" } else { " (kept — no longer in catalog)" }),
+            );
         }
         "thinking" => {
             let mut g = agent_slot.lock().unwrap();

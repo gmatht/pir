@@ -394,17 +394,40 @@ fn tiny_request(
     (url, body)
 }
 
-/// Auth (+ identity) headers for a tiny call.
-fn tiny_headers(req: ureq::Request, api_kind: config::ApiKind, api_key: &str) -> ureq::Request {
-    let req = req.set("user-agent", &user_agent());
+/// Auth header pairs for a tiny call (user-agent + per-kind auth).
+/// Replaces the old ureq request-builder version: headers are now plain
+/// pairs handed to [`crate::provider::lsb_json`] (host libcurl, no static TLS).
+fn tiny_headers<'a>(api_kind: config::ApiKind, api_key: &'a str, ua: &'a str, bearer: &'a str) -> Vec<(&'a str, &'a str)> {
+    let mut headers: Vec<(&str, &str)> = vec![("user-agent", ua)];
     match api_kind {
-        config::ApiKind::Anthropic => req
-            .set("x-api-key", api_key)
-            .set("anthropic-version", "2023-06-01"),
+        config::ApiKind::Anthropic => {
+            headers.push(("x-api-key", api_key));
+            headers.push(("anthropic-version", "2023-06-01"));
+        }
         config::ApiKind::OpenAi | config::ApiKind::OpenAiResponses => {
-            req.set("Authorization", &format!("Bearer {api_key}"))
+            headers.push(("Authorization", bearer));
         }
     }
+    headers
+}
+
+/// POST `body` JSON to `url` with the tiny-call auth headers, via the host
+/// libcurl (no static TLS). Returns the parsed JSON or `None` on any failure
+/// — callers treat that as "skip", never as a hard error. Timeouts mirror
+/// the old ureq agents (15s connect / 30s total).
+fn tiny_post(url: &str, api_kind: config::ApiKind, api_key: &str, body: &Value) -> Option<Value> {
+    let ua = user_agent();
+    let bearer = format!("Bearer {api_key}");
+    let headers = tiny_headers(api_kind, api_key, &ua, &bearer);
+    crate::provider::lsb_json(
+        lsb_curl::Method::POST,
+        url,
+        &headers,
+        Some(body),
+        Duration::from_secs(15),
+        Duration::from_secs(30),
+    )
+    .ok()
 }
 
 /// Extract the reply text from a tiny-call response object, per API kind
@@ -459,19 +482,7 @@ fn call_light(system: &str, user: &str) -> Option<String> {
 
     let (url, body) = tiny_request(&base_url, api_kind, &model_id, 12, system, user);
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(15))
-        .timeout_read(Duration::from_secs(30))
-        .timeout_write(Duration::from_secs(15))
-        .build();
-    let req = tiny_headers(agent.post(&url), api_kind, &api_key);
-    let resp = match req.send_json(body) {
-        Ok(r) => r,
-        Err(_) => return None,
-    };
-    let Ok(v) = serde_json::from_reader::<_, Value>(resp.into_reader()) else {
-        return None;
-    };
+    let v = tiny_post(&url, api_kind, &api_key, &body)?;
     let raw = tiny_text(api_kind, &v)?;
     let t = raw.trim().to_lowercase();
     Some(
@@ -633,23 +644,11 @@ fn generate_title(
     let system = "You name coding-agent conversations. Reply with ONE short title of at most 6 words that captures what the user is working on. No quotes, no 'Title:', no trailing punctuation. Examples: 'Fix parser crash on empty input', 'Add retry to upload tool', 'Refactor session picker'.";
     let user = format!("Recent prompts in this conversation:\n{joined}\n\nTitle:");
 
-    let (url, body) = tiny_request(&base_url, api_kind, &model_id, 24, system, &user);
+    let (url, body) = tiny_request(base_url, api_kind, model_id, 24, system, &user);
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(15))
-        .timeout_read(Duration::from_secs(30))
-        .timeout_write(Duration::from_secs(15))
-        .build();
-    let req = tiny_headers(agent.post(&url), api_kind, &api_key);
     // The light model is fire-and-forget; a single attempt is enough. If it
     // fails (rate-limited, offline, etc.) we just don't get a title this time.
-    let resp = match req.send_json(body) {
-        Ok(r) => r,
-        Err(_) => return None,
-    };
-    let Ok(v) = serde_json::from_reader::<_, Value>(resp.into_reader()) else {
-        return None;
-    };
+    let v = tiny_post(&url, api_kind, api_key, &body)?;
 
     let raw = tiny_text(api_kind, &v)?;
     let title = clean_title(&raw);

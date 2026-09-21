@@ -9,9 +9,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 pulldown-cmark = { version = "0.13", default-features = false }   # default CommonMark/GFM parser used to render agent markdown output (zero heavy deps; no cli/getopts)
 comrak = { version = "0.54", default-features = false, optional = true }   # optional heavier CommonMark/GFM backend (feature `comrak-backend`)
-isahc = { version = "2", default-features = false, features = ["static-curl", "native-tls"] }  # async HTTP client (smol-driven); vendored curl + system OpenSSL via native-tls
-ureq = { version = "2", default-features = false, features = ["json", "native-tls"] }   # retained: used by notify/titler/ollama-cloud (not the streaming worker loop)
-native-tls = "0.2"                               # TLS provider for ureq in those modules
 rustyline = "14"                               # line editing: history + cursor nav + completer
 libc = "0.2"                                     # uid/gid drop for per-project users
 smol = "2"                                       # async runtime: event-driven stdin wait while a turn runs
@@ -52,13 +49,13 @@ crossterm = "0.28"
 # a plain `cargo build` works with no rustxWidgets present.
 rustxwidgets = { path = "rustxWidgets/rustxwidgets", version = "0.1.0", default-features = false, optional = true }
 synoptic = "2"                                        # regex-based syntax highlighter for fenced code blocks (unicode-aware)
-
-# Static OpenSSL everywhere except Windows (schannel there): portable
-# binaries must not link the host libssl (AlmaLinux 8 ships 1.1, Ubuntu
-# 24.04 ships 3.x). The `vendored` feature builds OpenSSL from source
-# (openssl-src) once per target; the release binaries carry their own TLS.
-[target.'cfg(not(windows))'.dependencies]
-openssl-sys = { version = "0.9", features = ["vendored"] }
+# Runtime-dlopen'd libcurl HTTP client (vendored from lsb_dynamic_loader):
+# TLS comes from the host's libcurl.so.4, so the binary carries no static
+# OpenSSL/curl. Vendored under vendor/ (like native-windows-gui) because
+# upstream resolves `lsb-loader` via its own workspace, which cargo can't
+# inherit across repo boundaries — the vendored copy retargets it at the
+# sibling vendored crate (see vendor/lsb-curl/Cargo.toml).
+lsb-curl = { path = "vendor/lsb-curl" }
 
 [features]
 # Full-screen TUI REPL: a real layout engine (no hand-rolled ANSI block)

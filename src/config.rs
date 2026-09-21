@@ -1018,9 +1018,11 @@ pub fn worktrees_default() -> bool {
 }
 
 /// Selected HTTP transport backend (`http_backend` in
-/// `~/.pi/agent/settings.json`: `"isahc"` or `"ureq"`). `PIR_HTTP_BACKEND`
-/// wins when set. Returns the raw value for the caller to parse; `None`
-/// (or anything unparseable) means the default backend.
+/// `~/.pi/agent/settings.json`, historically `"isahc"` or `"ureq"`).
+/// `PIR_HTTP_BACKEND` wins when set. Returns the raw value for the caller
+/// to parse; `None` (or anything unparseable) means the default backend.
+/// Single-transport build: every known name resolves to `LsbCurl` (host
+/// libcurl via lsb-curl) — see `provider::HttpBackend::parse`.
 pub fn http_backend_name() -> Option<String> {
     if let Ok(v) = std::env::var("PIR_HTTP_BACKEND")
         && !v.trim().is_empty() {
@@ -1406,7 +1408,21 @@ pub fn complete_model_buffer(buf: &str, providers: &[Provider]) -> Option<String
     if matches.len() == 1 {
         return Some(format!("{cmd} {}", matches[0]));
     }
-    let lcp = longest_common_prefix(&matches);
+    // Complete within the top-ranked provider group only: `match_models`
+    // ranks one provider's hits first (catalog order), but the LCP over the
+    // *whole* list can collapse across providers (e.g. `mu` hits opencode,
+    // opencode-go and openrouter, whose LCP is just `open`). Completing to
+    // that would walk the user's fragment backwards. Instead take the LCP of
+    // the leading run that shares the first hit's provider, so `/model mu`
+    // becomes `/model opencode-go/muse-spark-1.` (or whichever provider
+    // ranks first in this catalog).
+    let first_provider = matches[0].split('/').next().unwrap_or("");
+    let group_len = matches
+        .iter()
+        .take_while(|m| m.split('/').next().unwrap_or("") == first_provider)
+        .count()
+        .max(1);
+    let lcp = longest_common_prefix(&matches[..group_len]);
     if !lcp.is_empty() && lcp != frag {
         return Some(format!("{cmd} {lcp}"));
     }
@@ -2112,6 +2128,67 @@ mod select_tests {
         // A bare command gains a trailing space; unknown fragments stay None.
         assert_eq!(complete_model_buffer("/model", &provs), Some("/model ".to_string()));
         assert_eq!(complete_model_buffer("/model zzz", &provs), None);
+    }
+
+    /// The live `/model mu` report: with three providers sharing the `mu`
+    /// substring (opencode, opencode-go, openrouter), the LCP over *all*
+    /// matches is just `open` — completing to that would walk the user's
+    /// fragment backwards. The buffer helper must complete within the
+    /// top-ranked provider group only, so `/model mu` expands toward the
+    /// first provider's muse entries, never to `/model open`.
+    #[test]
+    fn mu_across_providers_never_collapses_to_open() {
+        let provs = vec![
+            Provider {
+                id: Some("opencode".into()),
+                name: None,
+                api: Some("openai".into()),
+                base_url: Some("https://opencode.ai/v1".into()),
+                api_key: None,
+                models: vec![
+                    mk("muse-spark-1.2", "Muse Spark 1.2"),
+                    mk("muse-spark-1.3", "Muse Spark 1.3"),
+                ],
+            },
+            Provider {
+                id: Some("opencode-go".into()),
+                name: None,
+                api: Some("openai-completions".into()),
+                base_url: Some("https://opencode.ai/zen/go/v1".into()),
+                api_key: None,
+                models: vec![
+                    mk("muse-spark-1.2-contributor", "Muse Spark 1.2 Contributor"),
+                    mk("muse-spark-1.3-contributor", "Muse Spark 1.3 Contributor"),
+                ],
+            },
+            Provider {
+                id: Some("openrouter".into()),
+                name: None,
+                api: Some("openai".into()),
+                base_url: Some("https://openrouter.ai/api/v1".into()),
+                api_key: None,
+                models: vec![
+                    mk("meta/muse-spark-1.2", "Meta: Muse Spark 1.2"),
+                    mk("meta/muse-spark-1.3", "Meta: Muse Spark 1.3"),
+                ],
+            },
+        ];
+        let got = complete_model_buffer("/model mu", &provs)
+            .expect("/model mu must complete with multi-provider muse hits");
+        assert!(
+            got != "/model open",
+            "must not collapse across providers to 'open': got {got}"
+        );
+        assert!(
+            got.starts_with("/model opencode/muse-spark-1."),
+            "must complete within the top-ranked provider group: got {got}"
+        );
+        // The full match list still spans all three providers (nothing
+        // hidden); only the Tab expansion is scoped.
+        let ms = match_models(&provs, "mu", crate::term::MODEL_COMPLETION_LIMIT);
+        assert!(ms.iter().any(|c| c.starts_with("opencode/")));
+        assert!(ms.iter().any(|c| c.starts_with("opencode-go/")));
+        assert!(ms.iter().any(|c| c.starts_with("openrouter/")));
     }
 }
 

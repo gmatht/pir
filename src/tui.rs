@@ -365,6 +365,9 @@ fn run_inner(
                     if s.is_empty() {
                         // ignored
                     } else if let Some(cmd) = s.strip_prefix('/') {
+                        // Record slash commands too (e.g. `/goal ...`), so
+                        // they recall via history like plain prompts do.
+                        term::push_history(s);
                         handle_command(ctx, &mut state, cmd, &mut fg_handle, &mut pending);
                     } else if s == "&" {
                         // A bare `&` typed *while a turn runs* detaches the
@@ -457,6 +460,9 @@ fn run_inner(
                         continue;
                     }
                     if let Some(cmd) = input.strip_prefix('/') {
+                        // Record slash commands too (e.g. `/goal ...`), so
+                        // they recall via history like plain prompts do.
+                        term::push_history(&input);
                         handle_command(ctx, &mut state, cmd, &mut fg_handle, &mut pending);
                     } else if input.ends_with('&') && !input.trim_end_matches('&').is_empty() {
                         let prompt = input.trim_end_matches('&').trim().to_string();

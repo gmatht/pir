@@ -8,6 +8,8 @@
 
 mod agent;
 mod config;
+mod cpu_probe;
+mod cpu_scenarios_tests;
 mod fake;
 mod goal;
 mod md;
@@ -589,7 +591,9 @@ fn main() {
     // status sidecar) and reap spawned children if the parent pane dies.
     install_death_tracking();
 
-    let providers = match config::load_providers() {
+    // Mutable so `/reload` can refresh the catalog in place (the REPL loop and
+    // the background-job spawner both read this list).
+    let mut providers = match config::load_providers() {
         Ok(p) if !p.is_empty() => p,
         Ok(_) => die("~/.pi/models.json contains no providers"),
         Err(e) => die(&e),
@@ -1263,7 +1267,7 @@ fn main() {
                             handle_command(
                                 cmd,
                                 &agent_slot,
-                                &providers,
+                                &mut providers,
                                 &mut jobs,
                                 full_auto,
                                 &bus,
@@ -1278,7 +1282,7 @@ fn main() {
                         handle_command(
                             slash_cmd,
                             &agent_slot,
-                            &providers,
+                            &mut providers,
                             &mut jobs,
                             full_auto,
                             &bus,
@@ -1544,7 +1548,7 @@ fn main() {
                 handle_command(
                     cmd,
                     &agent_slot,
-                    &providers,
+                    &mut providers,
                     &mut jobs,
                     full_auto,
                     &bus,
@@ -1567,7 +1571,7 @@ fn main() {
             continue;
         }
         if let Some(cmd) = input.strip_prefix('/') {
-            handle_command(cmd, &agent_slot, &providers, &mut jobs, full_auto, &bus, &fg_cancel, false, &current_ctx);
+            handle_command(cmd, &agent_slot, &mut providers, &mut jobs, full_auto, &bus, &fg_cancel, false, &current_ctx);
         } else if bg {
             jobs.spawn_prompt(input.to_string(), &current_ctx, bus.clone());
         } else {
@@ -2020,7 +2024,7 @@ fn menu_session_rows() -> Vec<(modal::SessionRow, PathBuf)> {
 fn handle_command(
     cmd: &str,
     agent_slot: &AgentSlot,
-    providers: &[Provider],
+    providers: &mut Vec<Provider>,
     jobs: &mut BackgroundJobs,
     full_auto: bool,
     bus: &SharedBus,
@@ -2498,7 +2502,7 @@ fn handle_command(
                         term::read_answer("provider id: ")
                     } else {
                         println!("{}", term::bold("providers (from your model catalog):"));
-                        for p in providers {
+                        for p in providers.iter() {
                             println!("  - {}", p.pid());
                         }
                         for id in config::stored_auth_providers() {
@@ -2979,6 +2983,69 @@ fn handle_command(
                 }
                 _other => eprintln!("usage: /autoclean [on|off|status]   (no arg = run one cleanup pass now)"),
             }
+        }
+        "reload" => {
+            // Re-read the on-disk configuration without restarting: the model
+            // catalog (`~/.pi/models.json` / `models-store.json`), the notify
+            // policy, and the per-session settings that are read lazily from
+            // `~/.pi/agent/settings.json`. Editing those files used to require
+            // a full restart (or, for the catalog, a lucky `/model` that
+            // happened to re-read); `/reload` makes it explicit.
+            if fg_running {
+                eprintln!("pir: a turn is running — finish or /cancel it first, then /reload");
+                return;
+            }
+            // 1. Catalog + active model definition. `providers` (the slice the
+            //    REPL loop and the background-job spawner use) is refreshed in
+            //    place so later `/model`, `/bg` and `&` lines see the new list.
+            let (n, refreshed) = {
+                let mut g = agent_slot.lock().unwrap();
+                let Some(agent) = g.as_mut() else {
+                    eprintln!("pir: agent busy — try again when idle");
+                    return;
+                };
+                let (n, refreshed) = agent.reload_catalog();
+                // Mirror the agent's (possibly updated) active model into the
+                // shared background-job context so `/bg` uses the same one.
+                if let Ok(mut ctx) = current_ctx.lock() {
+                    ctx.0 = agent.provider();
+                    ctx.1 = agent.model();
+                }
+                (n, refreshed)
+            };
+            if let Ok(fresh) = config::load_providers()
+                && !fresh.is_empty() {
+                    *providers = fresh;
+                }
+            term::set_model_providers(providers);
+            println!(
+                "{} reloaded {} provider(s) from {}",
+                term::green("✓"),
+                n,
+                config::pi_dir().join("agent").join("models.json").display()
+            );
+            if refreshed {
+                let label = {
+                    let g = agent_slot.lock().unwrap();
+                    g.as_ref().map(|a| a.label()).unwrap_or_default()
+                };
+                println!("  {} active model refreshed: {}", term::dim("·"), label);
+            } else {
+                println!(
+                    "  {} active model not in the reloaded catalog — unchanged (pick one with /model)",
+                    term::dim("·")
+                );
+            }
+            // 2. Notify policy (bell / desktop / feed) — rebuilt from settings
+            //    so a changed `notify` block takes effect now.
+            bus.reload_policy(config::load_notify_policy());
+            // 3. Settings read lazily per use (titler light model, done-prompt
+            //    colour, worktree default, http backend, prices) need no cache
+            //    busting; note them so the user knows the reload covered them.
+            println!(
+                "  {} settings.json reloaded (notify policy, light model, colours, worktrees)",
+                term::dim("·")
+            );
         }
         "rebuild" => {
             // Recompile from source and, on success, replace this process with the

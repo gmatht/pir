@@ -912,6 +912,7 @@ const SLASH_HELP: &[(&str, &str, &str)] = &[
     ("/fg", "<id>", "bring a background job to the foreground"),
     ("/goal", "[objective]", "start or show the current goal"),
     ("/help", "", "show all commands"),
+    ("/compact", "", "show compact help"),
     ("/jobs", "", "list background jobs"),
     ("/login", "<provider>", "store an API key for a provider"),
     ("/logout", "<provider>", "remove a stored provider credential"),
