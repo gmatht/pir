@@ -384,9 +384,36 @@ pub fn expand_env(s: &str) -> Option<String> {
     }
 }
 
+/// pir's config/state root (`<home>/.pi`).
+///
+/// Precedence:
+///   1. `PI_DIR` — explicit override (tests, portable installs).
+///   2. `PIR_INVOKING_HOME/.pi` — the *operator's* home, snapshotted at startup
+///      before any privilege drop or HOME rewrite.
+///   3. `$HOME/.pi` — plain fallback (no snapshot: non-unix, tests, early boot).
+///
+/// Why the invoking home outranks `$HOME`: pir's own config and state
+/// (models-store.json, auth.json, settings.json, sessions/, projects.json)
+/// belong to the OPERATOR, not to the sandbox account whose only job is to run
+/// the agent's commands. Once `$HOME` has been rewritten to `ai_X` — by an
+/// explicit `-u/--as` drop, by `sudo -u ai_X pir`, or by a re-exec that
+/// inherited such an environment — resolving through `$HOME` silently swaps in
+/// the sandbox user's own `~/.pi`. That store is often a near-empty stub (an
+/// `auth.json` with a key but no `models-store.json`), which surfaces as
+/// `models-store.json not found. Falling back to auth.json` followed by
+/// `provider 'opencode-go' has no baseUrl` — i.e. a config-shaped failure that
+/// looks like a code bug but is really "we read the wrong home".
+///
+/// Sandbox-local state that genuinely must follow the sandbox user (its
+/// `security.toml`, and per-project session logs) is resolved by explicit path
+/// elsewhere — see `security::global_defaults_file` / `load_policy` and
+/// `user::session_dir_for` — so it is unaffected by this precedence.
 pub fn pi_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("PI_DIR") {
         return PathBuf::from(d);
+    }
+    if let Some(h) = std::env::var_os("PIR_INVOKING_HOME") {
+        return PathBuf::from(h).join(".pi");
     }
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -2589,8 +2616,9 @@ mod worktree_settings_tests {
 
         let old_home = std::env::var_os("HOME");
         let old_pidir = std::env::var_os("PI_DIR");
-        // `PI_DIR` wins over `HOME` in `pi_dir()`, so clear it to exercise the
-        // HOME-derived path this test is about.
+        let old_invoker_home = std::env::var_os("PIR_INVOKING_HOME");
+        // `PI_DIR` wins over everything in `pi_dir()`, so clear it to exercise
+        // the home-derived path this test is about.
         unsafe { std::env::remove_var("PI_DIR"); }
 
         // --- Pre-drop: running as the invoking user (HOME=/root-like). ---
@@ -2605,9 +2633,15 @@ mod worktree_settings_tests {
                     .any(|m| m.id == "muse-spark-1.3-contributor")
         });
 
-        // --- Post-drop: `become_user` rewrote HOME to the sandbox account. ---
+        // --- Snapshot the invoker's home, as `main` does at startup ---
+        // This is the fix for the "/reexec inherited the sandbox HOME" bug:
+        // pir stays the invoking identity, so its config root must keep
+        // resolving to the operator's home even after HOME is rewritten.
+        unsafe { std::env::set_var("PIR_INVOKING_HOME", &invoker_home); }
+
+        // --- Post-drop: HOME rewritten to the sandbox account. ---
         unsafe { std::env::set_var("HOME", &sandbox_home); }
-        let post_drop = load_providers().expect("sandbox store must load");
+        let post_drop = load_providers().expect("store must load");
         let post_has_muse = post_drop.iter().any(|p| {
             p.pid() == "opencode-go"
                 && p.models
@@ -2624,6 +2658,10 @@ mod worktree_settings_tests {
             Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
             None => unsafe { std::env::remove_var("PI_DIR") },
         }
+        match old_invoker_home {
+            Some(v) => unsafe { std::env::set_var("PIR_INVOKING_HOME", v) },
+            None => unsafe { std::env::remove_var("PIR_INVOKING_HOME") },
+        }
         let _ = std::fs::remove_dir_all(&root);
 
         // The whole point: the pre-drop read IS the invoking user's authority.
@@ -2632,13 +2670,15 @@ mod worktree_settings_tests {
             "pre-drop load must read the INVOKING user's store (HOME-derived), \
              so opencode-go/muse-spark-1.3-contributor is present"
         );
-        // And the sandbox store genuinely lacks it — proving the drop is what
-        // changes the answer (a regression that read the sandbox store first
-        // would fail the assertion above, not silently pass).
+        // THE REGRESSION: with the invoker's home snapshotted, a rewritten HOME
+        // (sandbox drop / inherited environment / re-exec) must NOT swap in the
+        // sandbox user's near-empty store. Before the fix this read the sandbox
+        // stub — auth.json with no models-store.json — which surfaced as
+        // "models-store.json not found … provider 'opencode-go' has no baseUrl".
         assert!(
-            !post_has_muse,
-            "the sandbox ai_ user's stub store has no opencode-go, so this test \
-             actually discriminates between the two paths"
+            post_has_muse,
+            "a rewritten HOME must not shadow the invoking user's store: \
+             config::pi_dir() must prefer PIR_INVOKING_HOME over $HOME"
         );
     }
 

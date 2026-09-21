@@ -16,6 +16,35 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
+/// Explain a persisted per-session su-security choice that contradicts the
+/// project's current policy. Returns `None` when they agree (nothing to say).
+///
+/// Split out as a pure function so the precedence rule is unit-testable without
+/// building a whole `Agent`: the persisted sidecar wins, but the operator is
+/// always told, and told how to change it.
+pub(crate) fn su_security_override_notice(
+    persisted: bool,
+    policy_on: bool,
+    sidecar: &str,
+) -> Option<String> {
+    if persisted == policy_on {
+        return None;
+    }
+    Some(if persisted {
+        format!(
+            "su-security ON for this session (persisted in {sidecar}) — overriding this project's \
+             user-security = false, so agent commands are confined. \
+             Run /su-security off <reason> to allow them the invoking identity."
+        )
+    } else {
+        format!(
+            "su-security OFF for this session (persisted in {sidecar}) — overriding this project's \
+             user-security = true, so agent commands run as the invoking user. \
+             Run /su-security on to re-confine them."
+        )
+    })
+}
+
 /// Process-wide "kill every detached job" switch, created by the first
 /// `Agent::new` and shared with every backend via
 /// `Registry::set_job_kill_handle`. The REPL flips it when the user presses
@@ -1121,24 +1150,31 @@ impl Agent {
         self.security.as_ref().map(|c| c.policy.clone())
     }
 
+    /// Flip the live su-security flag and wire the authority bash consults.
+    /// While su-security is off, bash must NOT drop to `ai_X` (the drop reads
+    /// this env), so the agent can act as the invoking user.
+    fn set_su_security_flag(&mut self, enabled: bool) {
+        self.su_security_enabled = enabled;
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe {
+            if enabled {
+                std::env::remove_var("PIR_AGENT_AS_INVOKER");
+            } else {
+                std::env::set_var("PIR_AGENT_AS_INVOKER", "1");
+            }
+        }
+    }
+
     /// Set the local su-security authorization for this session. Returns the
     /// reason it was recorded at (for audit). `reason` is required when turning
     /// the boundary OFF, because disabling it lets the agent act with the
     /// invoking user's full authority for this session.
     pub fn set_su_security(&mut self, enabled: bool, reason: &str) -> String {
-        self.su_security_enabled = enabled;
         // Wire the authority: while su-security is off, bash must NOT drop to
         // `ai_X` (drop_to_agent_user reads this env) so the agent can act as
         // the invoking user (root). The reason is recorded in the response.
-        if enabled {
-            // SAFETY: edition 2024 marks env mutation unsafe; pir confines
-            // it to startup config and explicit session toggles.
-            unsafe { std::env::remove_var("PIR_AGENT_AS_INVOKER"); }
-        } else {
-            // SAFETY: edition 2024 marks env mutation unsafe; pir confines
-            // it to startup config and explicit session toggles.
-            unsafe { std::env::set_var("PIR_AGENT_AS_INVOKER", "1"); }
-        }
+        self.set_su_security_flag(enabled);
         let note = if reason.trim().is_empty() {
             "(no reason given)".to_string()
         } else {
@@ -1253,26 +1289,51 @@ impl Agent {
         }
     }
 
-    /// Load a previously persisted su-security choice (from `<log>.susec`) for
-    /// a resumed session. Returns true if a value was restored.
-    pub fn apply_persisted_su_security(&mut self) -> bool {
-        let Some(p) = self.log_path.as_ref() else { return false };
-        match std::fs::read_to_string(p.with_extension("susec")) {
-            Ok(s) => {
-                self.su_security_enabled = s.trim() == "1";
-                if self.su_security_enabled {
-                    // SAFETY: edition 2024 marks env mutation unsafe; pir confines
-                    // it to startup config and explicit session toggles.
-                    unsafe { std::env::remove_var("PIR_AGENT_AS_INVOKER"); }
-                } else {
-                    // SAFETY: edition 2024 marks env mutation unsafe; pir confines
-                    // it to startup config and explicit session toggles.
-                    unsafe { std::env::set_var("PIR_AGENT_AS_INVOKER", "1"); }
-                }
-                true
-            }
-            Err(_) => false,
+    /// Drop the persisted su-security sidecar. Called when the operator changes
+    /// the *policy* (`security.user-security`) rather than the session: a
+    /// sidecar recorded under the old policy is stale, and leaving it behind
+    /// would quietly keep overriding the new setting on every resume.
+    pub fn clear_persisted_su_security(&mut self) {
+        if let Some(p) = &self.log_path {
+            let _ = std::fs::remove_file(p.with_extension("susec"));
         }
+    }
+
+    /// Load a previously persisted su-security choice (from `<log>.susec`) for
+    /// a resumed session. Returns `Some(notice)` when the persisted value
+    /// CONTRADICTS the operator's current policy (so the caller can surface it),
+    /// `None` when it agrees with the policy or there is nothing persisted.
+    ///
+    /// The sidecar exists so a per-session `/su-security off <reason>` survives
+    /// a resume — the operator authorised the escalation for *that* work and
+    /// shouldn't have to re-authorise on every restart. What it must NOT do is
+    /// silently veto an explicit `security.user-security` setting: previously
+    /// this method unconditionally clobbered `PIR_AGENT_AS_INVOKER`, so a
+    /// session whose sidecar said "1" re-enabled confinement (agent commands
+    /// dropped to `ai_X`) even after the operator turned user-security off —
+    /// with no indication of why.
+    ///
+    /// Precedence now: the persisted per-session choice still wins (it is the
+    /// more specific, operator-made decision), but a contradiction is reported
+    /// loudly and offers the fix, so the setting never appears to be ignored.
+    pub fn apply_persisted_su_security(&mut self) -> Option<String> {
+        let p = self.log_path.clone()?;
+        let Ok(s) = std::fs::read_to_string(p.with_extension("susec")) else {
+            return None;
+        };
+        let persisted = s.trim() == "1";
+        self.set_su_security_flag(persisted);
+        // Report a contradiction with the current policy so the operator is
+        // never left guessing why their `user-security` setting appears ignored.
+        let policy_on = self
+            .security_policy()
+            .map(|p| p.user_security)
+            .unwrap_or(true);
+        su_security_override_notice(
+            persisted,
+            policy_on,
+            &p.with_extension("susec").display().to_string(),
+        )
     }
 
     /// Current reasoning / "extended thinking" level for this session.
@@ -3755,5 +3816,71 @@ mod output_echo_tests {
         let shown = abridge_output(&"x".repeat(1000));
         assert!(shown.ends_with('…'), "long line must be clipped: {shown}");
         assert_eq!(shown.chars().count(), super::OUTPUT_LINE_CHARS);
+    }
+}
+
+#[cfg(test)]
+mod su_security_precedence_tests {
+    use super::su_security_override_notice;
+
+    /// The persisted per-session choice wins over the policy — it is the more
+    /// specific, operator-made decision — but it must never do so *silently*.
+    #[test]
+    fn contradicting_policy_is_reported_both_ways() {
+        // Session says "off" (act as invoker), project policy says confine.
+        let n = su_security_override_notice(false, true, "/tmp/s.susec")
+            .expect("off-over-true must be reported");
+        assert!(n.contains("su-security OFF"), "{n}");
+        assert!(n.contains("user-security = true"), "{n}");
+        // The operator is told how to fix it, not just that something is wrong.
+        assert!(n.contains("/su-security on"), "{n}");
+
+        // Session says "on" (confine), project policy says act as invoker.
+        let n = su_security_override_notice(true, false, "/tmp/s.susec")
+            .expect("on-over-false must be reported");
+        assert!(n.contains("su-security ON"), "{n}");
+        assert!(n.contains("user-security = false"), "{n}");
+        assert!(n.contains("/su-security off"), "{n}");
+    }
+
+    /// The common case: the sidecar agreed with the policy when it was written.
+    /// Nothing to announce — the operator asked for this and got it.
+    #[test]
+    fn agreement_is_silent() {
+        assert!(su_security_override_notice(true, true, "/tmp/s.susec").is_none());
+        assert!(su_security_override_notice(false, false, "/tmp/s.susec").is_none());
+    }
+
+    /// The sidecar path is surfaced so a confused operator can inspect/remove
+    /// the file that is overriding their setting.
+    #[test]
+    fn notice_names_the_sidecar_path() {
+        let n = su_security_override_notice(false, true, "/tmp/x.log.susec").unwrap();
+        assert!(n.contains("/tmp/x.log.susec"), "{n}");
+    }
+}
+
+#[cfg(test)]
+mod su_security_sidecar_tests {
+    use std::path::PathBuf;
+
+    /// The sidecar name is derived from the session log by extension swap, and
+    /// `clear_persisted_su_security` must remove exactly that file — the policy
+    /// change path relies on it to invalidate a stale override.
+    #[test]
+    fn sidecar_is_derived_from_log_and_cleared() {
+        let dir = std::env::temp_dir().join(format!("pir_susec_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("s.123.log");
+        let sidecar = log.with_extension("susec");
+        std::fs::write(&sidecar, "0").unwrap();
+        assert!(sidecar.exists());
+
+        // Mirrors `clear_persisted_su_security` with the same derivation.
+        let p: PathBuf = log.clone();
+        std::fs::remove_file(p.with_extension("susec")).unwrap();
+        assert!(!sidecar.exists(), "stale override must be gone");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

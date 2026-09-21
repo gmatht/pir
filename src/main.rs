@@ -658,15 +658,14 @@ fn main() {
     // loaded but *before* the agent (and any tool) runs. On non-unix this is a
     // no-op. All `bash`/file tools then execute as that user automatically.
     //
-    // IMPORTANT: `become_user` rewrites `HOME` to the target (sandbox) user's
-    // real home, so `config::pi_dir()` now points at `~<user>/.pi`. We therefore
-    // resolve the *default* model **after** this drop (see below): the startup
-    // read and the `/default-model` write must consult the same settings file,
-    // otherwise the choice is silently lost on restart — the early read used to
-    // happen under the invoking user's HOME while the write happened under the
-    // (dropped-to) sandbox user's HOME.
+    // NOTE: on the normal path this block NO LONGER drops the whole process.
+    // `pir` keeps the invoking identity and only the *agent's commands* are
+    // confined, at exec time (see the `set_agent_exec_user` call below). The
+    // whole-process drop survives solely for an explicit `-u/--as <user>`
+    // request, where the operator asked for it.
     #[cfg(unix)]
     let resolved_user: Option<String> = 'resolved: {
+        let explicit_as = as_user.is_some();
         let target = as_user.clone().unwrap_or_else(|| {
             crate::config::resolve_project_user(None, project_name.as_deref())
         });
@@ -707,19 +706,19 @@ fn main() {
         // grants; here it is honoured at startup so a session started with
         // user-security disabled never drops to `ai_X`/`nobody` in the first
         // place.
+        //
+        // Read by explicit PATH rather than by temporarily rewriting `$HOME`:
+        // `config::pi_dir()` deliberately prefers `PIR_INVOKING_HOME` (the
+        // operator's home) so a sandbox HOME can never shadow pir's own config,
+        // which means a HOME swap no longer redirects the policy lookup at all.
+        // The two files consulted are the target's own `security.toml` (session)
+        // and the operator's global defaults (fallback) — exactly the pair
+        // `load_policy()` resolves in the normal case.
         let target_home = crate::user::home_of(&target);
         let policy = match &target_home {
             Some(h) => {
-                let prev = std::env::var_os("HOME");
-                // SAFETY: edition 2024 marks env mutation unsafe; pir confines
-                // it to startup config and explicit session toggles.
-                unsafe { std::env::set_var("HOME", h); }
-                let p = crate::security::load_policy();
-                match prev {
-                    Some(p) => unsafe { std::env::set_var("HOME", p) },
-                    None => unsafe { std::env::remove_var("HOME") },
-                }
-                p
+                let session_file = h.join(".pi").join("agent").join("security.toml");
+                crate::security::load_policy_for(&session_file, &crate::security::global_defaults_file())
             }
             None => crate::security::load_policy(),
         };
@@ -727,24 +726,51 @@ fn main() {
             // SAFETY: edition 2024 marks env mutation unsafe; pir confines
             // it to startup config and explicit session toggles.
             unsafe { std::env::set_var("PIR_AGENT_AS_INVOKER", "1"); }
-            // Keep the sandbox user's HOME so config (security.toml, models)
-            // stays consistent with the operator's /menu edits; the process
-            // itself stays the invoking identity (no `become_user` drop).
-            if let Some(h) = &target_home {
-                // SAFETY: edition 2024 marks env mutation unsafe; pir confines
-                // it to startup config and explicit session toggles.
-                unsafe { std::env::set_var("HOME", h); }
-            }
+            // NOTE: HOME is deliberately NOT rewritten to the sandbox user's
+            // here. The process stays the invoking identity, so `config::pi_dir()`
+            // (models-store, auth, settings, sessions) must keep resolving to the
+            // operator's own ~/.pi — rewriting HOME made the sandbox user's
+            // (smaller) store shadow it. The sandbox user's security.toml is
+            // still read explicitly, by path, just above.
             None
-        } else {
+        } else if explicit_as {
+            // Explicit `-u/--as <user>` from a privileged caller: the operator
+            // asked for the whole process to run as that user, so perform the
+            // full drop (and arm it for the agent's commands too).
+            crate::user::set_agent_exec_user(&target);
             match crate::user::become_user(&target) {
                 Ok(()) => Some(target),
                 Err(e) => {
-                    // No sandbox user (fresh dir, never `pir project init`):
-                    // bricking the session here is hostile — the operator asked
-                    // for an agent, not a user-provisioning errand. Run as the
-                    // invoking user (== user-security off, behaviorally) with a
-                    // loud warning, so confinement remains opt-in via init.
+                    eprintln!("pir: {e} — running as the invoking user");
+                    // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+                    // it to startup config and explicit session toggles.
+                    unsafe { std::env::set_var("PIR_AGENT_AS_INVOKER", "1"); }
+                    None
+                }
+            }
+        } else {
+            // USER-SECURITY ON (the default per-project path): confine the
+            // *agent's commands*, not the pir process. `pir` deliberately stays
+            // the INVOKING identity (root) so config, sessions, the REPL and the
+            // file tools keep working in the operator's own ~/.pi — and so an
+            // early whole-process drop can't hand our config reads to the
+            // sandbox user's (smaller, sometimes provider-less) store. That
+            // mismatch was the "models-store.json not found … provider
+            // 'opencode-go' has no baseUrl" class of bug.
+            //
+            // Confinement is applied at the LAST possible moment: `bash`
+            // commands drop in the child's `before_exec` (see
+            // `drop_to_agent_user`), and `!` / `/sh` route through
+            // `spawn_shell_as`, which does the same. Recording the target here
+            // is what arms that machinery; without it `agent_exec_user()` is
+            // `None` and both paths silently run unconfined.
+            crate::user::set_agent_exec_user(&target);
+            // Still adopt the target's own identity/toolchain when we are
+            // ALREADY it (`sudo -u ai_X pir`) — nothing to drop in that case.
+            match crate::user::become_user_if_already_sandboxed(&target) {
+                Ok(true) => Some(target),
+                Ok(false) => None,
+                Err(e) => {
                     eprintln!(
                         "pir: {e} — running as the invoking user WITHOUT command confinement (create it with `pir project init` for sandboxing)"
                     );
@@ -758,6 +784,25 @@ fn main() {
     };
     #[cfg(not(unix))]
     let resolved_user: Option<String> = as_user.clone();
+
+    // Startup ownership reap: hand any root-owned VCS metadata (`.git`/`.jj`)
+    // under the launch dir back to the project's agent user. `pir project init`
+    // chowns the tree it sees, but a nested repo / vendored checkout / fresh
+    // clone created LATER stays root-owned — and the dropped agent then hits
+    // "Permission denied" on every git write, which reads like a mysterious
+    // sandbox rule but is ordinary Unix ownership (`.git` root:root 0755,
+    // working tree ai_X, no capabilities to override). Repairing it here means
+    // the agent never gets stranded mid-task; `/fix` performs the same reap on
+    // demand. Root-only and best-effort (silent when there is nothing to do, so
+    // a clean project starts as quietly as before).
+    #[cfg(unix)]
+    if crate::user::agent_exec_user().is_some() {
+        let launch_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let notes = crate::project::reap_vcs_metadata_to_agent_user(&launch_cwd);
+        for n in &notes {
+            eprintln!("{}", crate::term::dim(&format!("[pir] {n}")));
+        }
+    }
 
     // Resolve the model. Priority: explicit -m/PI_MODEL on the INVOKING
     // user's command line, then the invoking user's settings.json (captured in
@@ -900,7 +945,9 @@ fn main() {
         if agent.apply_persisted_model() {
             // (model restored silently; the startup banner below shows it)
         }
-        agent.apply_persisted_su_security();
+        if let Some(notice) = agent.apply_persisted_su_security() {
+            println!("{} {}", term::yellow("⚠"), notice);
+        }
         agent.apply_persisted_thinking();
     }
 
@@ -2083,7 +2130,9 @@ fn resume_into(agent: &mut Agent, path: &PathBuf) {
         println!("{}", term::dim(&resumed.summary));
     }
     agent.apply_persisted_model();
-    agent.apply_persisted_su_security();
+    if let Some(notice) = agent.apply_persisted_su_security() {
+        println!("{} {}", term::yellow("⚠"), notice);
+    }
     agent.apply_persisted_thinking();
     if agent.goal_snapshot().is_some() {
         agent.attach_goal(path);
@@ -2228,6 +2277,11 @@ fn handle_command(
                                             .to_string()
                                     };
                                     println!("{}", agent.set_su_security(policy.user_security, &reason));
+                                    // The policy itself changed, so the per-session
+                                    // sidecar from the old policy is stale — drop it
+                                    // or it would keep overriding the new setting on
+                                    // every resume of this session.
+                                    agent.clear_persisted_su_security();
                                 }
                             }
                             // Push the quarantine flags (and level/apt/network/ask/read)
@@ -2750,7 +2804,9 @@ fn handle_command(
             };
             agent.clear();
             let resumed = agent.load_session(&log);
-            agent.apply_persisted_su_security();
+            if let Some(notice) = agent.apply_persisted_su_security() {
+                println!("{} {}", term::yellow("⚠"), notice);
+            }
             agent.apply_persisted_thinking();
             jobs.mark_joined(id);
             println!("{} foregrounded job #{} from {}", term::bold("·"), id, log.display());

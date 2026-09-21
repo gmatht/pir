@@ -381,6 +381,14 @@ pub fn set_agent_exec_user(user: &str) {
     *AGENT_EXEC_USER.lock().unwrap() = Some(user.to_string());
 }
 
+/// Clear the recorded agent exec user (tests only). Lets a test prove the
+/// no-op path — that nothing drops/chowns when no sandbox user is armed —
+/// without leaking state into sibling tests in the same binary.
+#[cfg(test)]
+pub fn clear_agent_exec_user_for_test() {
+    *AGENT_EXEC_USER.lock().unwrap() = None;
+}
+
 /// The `ai_*` user agent bash commands should run as, if one was configured.
 pub fn agent_exec_user() -> Option<String> {
     AGENT_EXEC_USER.lock().unwrap().clone()
@@ -388,6 +396,52 @@ pub fn agent_exec_user() -> Option<String> {
 
 /// Drop privileges to the given user (unix only). Call *after* config and
 /// providers are loaded but *before* the agent is built and any tool runs.
+#[cfg(unix)]
+/// Switch the whole process to `user` ONLY when that is already the situation
+/// or the operator explicitly asked for it — never as a side effect of "a
+/// sandbox user exists for this project".
+///
+/// The normal launch path must keep `pir` as the INVOKING identity: config,
+/// sessions, the REPL and the file tools all run as the operator, and only the
+/// agent's commands are confined (at exec time, via
+/// [`set_agent_exec_user`]/[`drop_to_agent_user`]). Dropping here would hand
+/// every config read to the sandbox user's `~/.pi` — the store mismatch behind
+/// the "models-store.json not found … has no baseUrl" bug class.
+///
+/// Returns `Ok(true)` when the process now IS `user` (so callers can report it
+/// as the execution user), `Ok(false)` when the process deliberately stayed the
+/// invoking identity, and `Err` when an explicit switch was requested but could
+/// not be performed.
+///
+/// Two cases still switch:
+///   * we are ALREADY that user (`sudo -u ai_X pir`, `su ai_X -c pir`): nothing
+///     to drop, but still point the toolchain at `ai_X`'s own dirs;
+///   * an explicit `--as <user>` / `-u <user>` was requested *and* we hold root
+///     — the caller asked for the whole process to be that user, which is the
+///     documented `pir -u ai_X` launch shape.
+#[cfg(unix)]
+pub fn become_user_if_already_sandboxed(user: &str) -> Result<bool, String> {
+    let (uid, _gid) = lookup_user(user)?;
+    let euid = unsafe { libc::geteuid() };
+    // Already the target identity: adopt its toolchain env, nothing to drop.
+    if euid == uid {
+        ensure_home_dir(user);
+        apply_toolchain_env(user);
+        return Ok(true);
+    }
+    // Root with a sandbox target: STAY root (the invoking identity). The target
+    // is armed as the *exec* user by the caller instead.
+    Ok(false)
+}
+
+/// Switch the whole process to `user` (unix only). Call *after* config and
+/// providers are loaded but *before* the agent is built and any tool runs.
+///
+/// NOTE: this is the WHOLE-PROCESS drop, kept for the launch shapes that
+/// genuinely want it (`sudo -u ai_X pir` is handled by the euid==uid branch; an
+/// explicit `pir -u <user>` from root uses the setuid branch). The default
+/// per-project confinement does NOT call this — it arms
+/// [`set_agent_exec_user`] so only the agent's commands drop, at exec time.
 #[cfg(unix)]
 pub fn become_user(user: &str) -> Result<(), String> {
     let (uid, gid) = lookup_user(user)?;
@@ -1293,6 +1347,74 @@ mod accessibility_tests {
         assert_eq!(
             find_free_subid_range(&[(100_000, 100_000)], 65_536),
             200_000
+        );
+    }
+
+    /// The privilege-drop boundary: arming the agent exec user must NOT change
+    /// the current process's identity. That is the whole point of the late-drop
+    /// design — `pir` itself stays the invoking identity (so config, sessions,
+    /// the REPL and the file tools act as the operator), and only the commands
+    /// the model spawns drop, in their child `before_exec`.
+    ///
+    /// This pins the regression where the *whole process* dropped early via
+    /// `become_user`, which rewrote HOME and pointed `config::pi_dir()` at the
+    /// sandbox user's near-empty store ("models-store.json not found … provider
+    /// 'opencode-go' has no baseUrl").
+    #[cfg(unix)]
+    #[test]
+    fn arming_agent_exec_user_does_not_drop_the_process() {
+        // A real sandbox account from this host, if one exists; otherwise use a
+        // name that cannot resolve (the arming call stores the name verbatim and
+        // must not need the account to exist).
+        let user = ["ai_pir", "ai_rpi", "ai_lsl-usb"]
+            .into_iter()
+            .find(|u| lookup_user(u).is_ok())
+            .unwrap_or("ai_nonexistent_test_user")
+            .to_string();
+
+        let before = unsafe { libc::geteuid() };
+        let before_gid = unsafe { libc::getegid() };
+
+        set_agent_exec_user(&user);
+        assert_eq!(
+            agent_exec_user().as_deref(),
+            Some(user.as_str()),
+            "arming must record the exec user"
+        );
+
+        // The process identity is unchanged: no setuid/setgid happened.
+        assert_eq!(
+            unsafe { libc::geteuid() },
+            before,
+            "arming the exec user must not change the effective uid"
+        );
+        assert_eq!(
+            unsafe { libc::getegid() },
+            before_gid,
+            "arming the exec user must not change the effective gid"
+        );
+
+        // Clean up so a later test in this binary sees no armed user (the
+        // `drop_to_agent_user` "no-op when nothing is armed" contract).
+        *AGENT_EXEC_USER.lock().unwrap() = None;
+    }
+
+    /// `drop_to_agent_user` is a no-op when no exec user is armed, so a plain
+    /// (unsandboxed) `pir` spawns commands as its own identity rather than
+    /// failing every `bash` call.
+    #[cfg(unix)]
+    #[test]
+    fn drop_is_noop_when_no_agent_user_armed() {
+        *AGENT_EXEC_USER.lock().unwrap() = None;
+        assert!(
+            drop_to_agent_user().is_ok(),
+            "an unarmed drop must succeed as a no-op"
+        );
+        let euid = unsafe { libc::geteuid() };
+        assert_eq!(
+            unsafe { libc::geteuid() },
+            euid,
+            "a no-op drop must not change identity"
         );
     }
 }

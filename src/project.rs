@@ -333,6 +333,18 @@ pub fn fix_git_setup(repo: &Path) -> String {
     }
     let root = repo_root(repo);
     let mut lines = Vec::new();
+    // Ownership first: a root-owned `.git` (nested repo created after
+    // `pir project init`) makes every git write fail for the dropped agent with
+    // an EPERM/Permission-denied that looks like a sandbox rule but is ordinary
+    // Unix ownership. Reap the metadata to the project user before touching
+    // hooks/config, so the hook install below can actually write.
+    #[cfg(unix)]
+    {
+        let mut reaped = reap_vcs_metadata_to_agent_user(&root);
+        if !reaped.is_empty() {
+            lines.append(&mut reaped);
+        }
+    }
     // The repo's `.git` sits inside the project write-quarantine overlay when
     // the agent is in a worktree; suspend it briefly so the hook + git config
     // land on the *real* `.git` (they must apply to the whole repo and all
@@ -386,6 +398,81 @@ pub fn fix_git_setup(repo: &Path) -> String {
     lines.join("\n")
 }
 
+/// Hand the repo's VCS metadata directories back to the per-project agent user.
+///
+/// The failure this repairs: `pir project init` chowns the project tree to
+/// `ai_<project>`, but the agent's commands run as that user while the *repo
+/// metadata* can still be root-owned — either because the tree was never a
+/// registered project, or (the subtle case) because a nested repo / `.git` was
+/// created by root **after** init ran. The agent then sees
+/// `chmod 777 .git → EPERM`, `touch .git/… → Permission denied`, and reports it
+/// as a mysterious "sandbox rule on .git" — when it is ordinary Unix ownership:
+/// `.git` is root-owned 0755, the working tree is `ai_X`, and the dropped agent
+/// has no capabilities to override it.
+///
+/// Scoped to the VCS metadata (`.git` dirs / `.jj`), never the working tree
+/// (which init already owns), and only when an agent exec user is configured.
+/// Best-effort: failures are reported, never fatal.
+#[cfg(unix)]
+pub fn reap_vcs_metadata_to_agent_user(repo: &Path) -> Vec<String> {
+    let mut notes = Vec::new();
+    let Some(user) = crate::user::agent_exec_user() else {
+        return notes;
+    };
+    // Reaping is only meaningful (and only possible) as root.
+    if unsafe { libc::geteuid() } != 0 {
+        return notes;
+    }
+    let Ok((uid, gid)) = crate::user::lookup_user(&user) else {
+        return notes;
+    };
+    // Collect `.git` dirs (and jj's `.jj`) at the repo root and in nested
+    // repos, skipping the huge build/checkout subtrees. Depth-bounded so a
+    // monorepo can't turn this into a full-disk walk.
+    use std::os::unix::fs::MetadataExt as _;
+    let mut targets: Vec<std::path::PathBuf> = Vec::new();
+    collect_vcs_dirs(repo, 0, &mut targets);
+    for t in targets {
+        let root_owned = std::fs::metadata(&t).map(|m| m.uid() == 0).unwrap_or(false);
+        if !root_owned {
+            continue;
+        }
+        // Recursive chown of the metadata dir only.
+        let status = std::process::Command::new("chown")
+            .args(["-R", &format!("{user}:{user}"), t.to_string_lossy().as_ref()])
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                notes.push(format!("✓ reaped {} to {user} (was root-owned)", t.display()));
+            }
+            _ => notes.push(format!("✗ could not chown {} to {user}", t.display())),
+        }
+    }
+    let _ = (uid, gid);
+    notes
+}
+
+/// Depth-bounded walk collecting `.git`/`.jj` metadata dirs.
+#[cfg(unix)]
+fn collect_vcs_dirs(dir: &Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
+    const SKIP: &[&str] = &["target", "node_modules", ".venv", "dist", "build", ".cargo"];
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let p = e.path();
+        if !p.is_dir() {
+            continue;
+        }
+        if name == ".git" || name == ".jj" {
+            out.push(p);
+            continue; // do not descend into metadata
+        }
+        if depth < 4 && !SKIP.contains(&name.as_str()) {
+            collect_vcs_dirs(&p, depth + 1, out);
+        }
+    }
+}
+
 /// jj doesn't invoke git hooks. Configure a jj `commit` hook (via repo-local
 /// `jj config set --repo`) that runs the same size/binary guard. jj exposes the
 /// change via `$JJ_REPO_PATH`; we approximate using `git` on the colocated repo.
@@ -412,5 +499,89 @@ fn fix_jj_setup(repo: &Path) -> String {
             )
         }
         _ => "✗ jj repo: could not set jj commit hook (is `jj` configured?). Under jj, git's .git/hooks/pre-commit is ignored, so a guard must be a jj hook.".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod reap_owner_tests {
+    /// A root-owned `.git` (e.g. a nested repo created after `pir project init`
+    /// chowned the tree) makes every git write fail for the dropped agent with
+    /// EPERM/Permission-denied — an ordinary-ownership failure that reads like
+    /// a sandbox rule. The reap must hand it back to the agent user.
+    #[cfg(unix)]
+    #[test]
+    fn reap_collects_nested_vcs_dirs() {
+        use std::os::unix::fs::MetadataExt as _;
+        let base = std::env::temp_dir().join(format!("pir_reap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("nested")).unwrap();
+        std::fs::create_dir_all(base.join("nested").join(".git")).unwrap();
+        // A skipped build dir must not contribute its (hypothetical) metadata.
+        std::fs::create_dir_all(base.join("target").join(".git")).unwrap();
+
+        let mut found = Vec::new();
+        super::collect_vcs_dirs(&base, 0, &mut found);
+        let names: Vec<String> = found.iter().map(|p| p.display().to_string()).collect();
+        assert!(
+            names.iter().any(|n| n.contains("nested/.git")),
+            "nested metadata must be collected: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("target/.git")),
+            "build dirs must be skipped: {names:?}"
+        );
+        // With no agent exec user armed, the reap is a no-op (never chowns).
+        crate::user::clear_agent_exec_user_for_test();
+        assert!(
+            super::reap_vcs_metadata_to_agent_user(&base).is_empty(),
+            "no exec user -> nothing reaped"
+        );
+        let _ = std::fs::metadata(base.join("nested").join(".git")).map(|m| m.uid());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod reap_owner_real_tests {
+    /// End-to-end: a root-owned nested `.git` is chowned to the armed agent
+    /// user (the uu-ffi failure), and a non-root-owned one is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn reap_chowns_root_owned_vcs_to_agent_user() {
+        use std::os::unix::fs::MetadataExt as _;
+        // Needs root to chown; skip otherwise (the contract is root-only).
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP: not root");
+            return;
+        }
+        let Some((user, uid)) = ["ai_pir", "ai_rpi", "ai_coreutils"]
+            .into_iter()
+            .find_map(|u| crate::user::lookup_user(u).ok().map(|(id, _)| (u.to_string(), id)))
+        else {
+            eprintln!("SKIP: no sandbox user on this host");
+            return;
+        };
+
+        let base = std::env::temp_dir().join(format!("pir_reap_e2e_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let git = base.join("nested").join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        // Root-owned (this process is root), tree itself left as-is.
+        assert_eq!(std::fs::metadata(&git).unwrap().uid(), 0, "precondition: root-owned");
+
+        crate::user::set_agent_exec_user(&user);
+        let notes = super::reap_vcs_metadata_to_agent_user(&base);
+        crate::user::clear_agent_exec_user_for_test();
+
+        assert_eq!(
+            std::fs::metadata(&git).unwrap().uid(),
+            uid,
+            "the reap must hand root-owned .git to the agent user; notes={notes:?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("reaped")),
+            "should report the reap: {notes:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
