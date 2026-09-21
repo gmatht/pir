@@ -4685,7 +4685,7 @@ mod nonunix_term {
             Paste(String),
             Other(u32),
         }
-        pub fn wait_input(buf: &mut String, ta: &Arc<Mutex<String>>, done: &smol::channel::Receiver<()>) -> RawInput {
+        pub fn wait_input(buf: &mut String, ta: &Arc<Mutex<String>>, done: &smol::channel::Receiver<()>, _recall: &mut crate::term::HistRecall) -> RawInput {
             loop {
                 // Wake the moment the foreground turn finishes, even when no key
                 // is pressed. Without this the REPL stays parked inside this call

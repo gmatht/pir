@@ -1402,14 +1402,32 @@ fn lsbcurl_error(e: lsb_curl::CurlError) -> String {
     }
 }
 
+/// Convert a `Duration` to the timeout unit the vendored `lsb-curl` expects.
+///
+/// libcurl's `CURLOPT_*TIMEOUT_MS` is a `long`, which is 64-bit on LP64 Unix but
+/// **32-bit on Windows** (LLP64). `lsb_curl::RequestOptions` mirrors that with
+/// `libc::c_long`, so a hardcoded `as i64` fails to compile for Windows
+/// targets. Going through `c_long` keeps one expression correct everywhere.
+/// Saturating: a budget beyond `c_long::MAX` ms (~292M years on 64-bit, ~24 days
+/// on 32-bit) is clamped rather than wrapping negative, which libcurl would
+/// read as "no timeout".
+fn as_curl_long(d: Duration) -> libc::c_long {
+    let ms = d.as_millis();
+    if ms > libc::c_long::MAX as u128 {
+        libc::c_long::MAX
+    } else {
+        ms as libc::c_long
+    }
+}
+
 /// `RequestOptions` for the `LsbCurl` backend, mirroring the timeouts the
 /// other backends enforce: 15s connect, whole-attempt total budget
 /// (`request_timeout`, 600s default), redirects followed, pir User-Agent,
 /// peer verification on (host CA bundle via libcurl defaults).
 fn lsbcurl_options() -> lsb_curl::RequestOptions {
     lsb_curl::RequestOptions {
-        connect_timeout_ms: CONNECT_TIMEOUT.as_millis() as i64,
-        timeout_ms: request_timeout().map(|d| d.as_millis() as i64).unwrap_or(0),
+        connect_timeout_ms: as_curl_long(CONNECT_TIMEOUT),
+        timeout_ms: request_timeout().map(as_curl_long).unwrap_or(0),
         user_agent: Client::user_agent(),
         ..lsb_curl::RequestOptions::default()
     }
@@ -1439,8 +1457,8 @@ pub(crate) fn lsb_json(
 ) -> Result<Value, String> {
     let curl = lsb_curl::Curl::load().map_err(|e| format!("lsb-curl load: {e}"))?;
     let opts = lsb_curl::RequestOptions {
-        connect_timeout_ms: connect.as_millis() as i64,
-        timeout_ms: total.as_millis() as i64,
+        connect_timeout_ms: as_curl_long(connect),
+        timeout_ms: as_curl_long(total),
         user_agent: Client::user_agent(),
         ..lsb_curl::RequestOptions::default()
     };
@@ -3483,6 +3501,21 @@ mod tests {
         assert_eq!(max_attempts(), None);
         assert!(retry_backoff(1, false) > retry_backoff(0, false));
         assert!(retry_backoff(1, true) > retry_backoff(0, true));
+    }
+
+    #[test]
+    fn curl_timeouts_convert_to_c_long() {
+        // Regression for the Windows cross-build: libcurl's timeout options are
+        // `long` (32-bit on Windows, 64-bit on LP64 Unix), so the conversion must
+        // go through `c_long` rather than a hardcoded `i64`.
+        assert_eq!(as_curl_long(Duration::from_millis(0)), 0);
+        assert_eq!(as_curl_long(Duration::from_secs(15)), 15_000);
+        assert_eq!(as_curl_long(CONNECT_TIMEOUT), 15_000);
+        // Values beyond `c_long::MAX` saturate instead of wrapping negative
+        // (a negative value would read as "no timeout" to libcurl).
+        let enormous = Duration::from_millis(u64::MAX);
+        assert_eq!(as_curl_long(enormous), libc::c_long::MAX);
+        assert!(as_curl_long(enormous) > 0);
     }
 
     #[test]
