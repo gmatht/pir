@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 /// Discriminator for the kind of event, kept separate from the (shared)
@@ -325,8 +325,12 @@ impl NotifyPolicy {
 /// sees notifications from *all* sessions — foreground and background — on the
 /// one screen they're watching.
 pub struct NotifyBus {
-    policy: NotifyPolicy,
-    external: NotifierHub,
+    /// Policy + its wired-up external notifiers, behind an `RwLock` so
+    /// `/reload` can swap in a freshly loaded settings.json `notify` block
+    /// without restarting pir. The lock is only ever *contended* in principle:
+    /// publishers take a read lock (uncontended, cheap) and only `/reload` —
+    /// dispatched from the idle prompt — takes the write lock.
+    config: RwLock<(NotifyPolicy, NotifierHub)>,
     /// Bounded recent-event log for on-screen rendering. Guarded so background
     /// agents can append concurrently with the REPL draining it.
     feed: Mutex<Vec<AgentEvent>>,
@@ -337,7 +341,11 @@ impl NotifyBus {
     /// Build a bus from a policy, wiring up the enabled external notifiers.
     pub fn new(policy: NotifyPolicy) -> Self {
         let external = NotifierHub::from_policy(&policy);
-        NotifyBus { policy, external, feed: Mutex::new(Vec::new()), max_feed: 64 }
+        NotifyBus {
+            config: RwLock::new((policy, external)),
+            feed: Mutex::new(Vec::new()),
+            max_feed: 64,
+        }
     }
 
     /// Load the policy from settings and build a bus.
@@ -345,21 +353,45 @@ impl NotifyBus {
         NotifyBus::new(config::load_notify_policy())
     }
 
+    /// Swap in a freshly loaded policy (`/reload`), rebuilding the external
+    /// notifier hub so a changed `notify` block in settings.json takes effect
+    /// without restarting pir. The on-screen feed is *kept* — reloading config
+    /// must not discard notifications the user hasn't seen yet.
+    pub fn reload_policy(&self, policy: NotifyPolicy) {
+        let external = NotifierHub::from_policy(&policy);
+        match self.config.write() {
+            Ok(mut g) => *g = (policy, external),
+            // A poisoned lock means a publisher panicked mid-fire; the policy
+            // is still structurally sound, so recover rather than dropping the
+            // user's `/reload` on the floor.
+            Err(e) => *e.into_inner() = (policy, external),
+        }
+    }
+
     /// Publish an event. Fires external notifiers (gated by policy) and appends
     /// to the on-screen feed (gated by policy for screen). `oneshot` marks an
     /// exit-time event (one-shot / background completion).
     pub fn publish(&self, event: AgentEvent, oneshot: bool) {
-        if self.policy.allows(&event, oneshot, false) {
-            self.external.fire(&event);
+        // One read lock for both gates + the fire, so a concurrent `/reload`
+        // can never interleave a policy swap halfway through publishing.
+        let g = match self.config.read() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let (policy, external) = &*g;
+        if policy.allows(&event, oneshot, false) {
+            external.fire(&event);
         }
-        if self.policy.allows(&event, oneshot, true)
-            && let Ok(mut feed) = self.feed.lock() {
+        if policy.allows(&event, oneshot, true) {
+            drop(g);
+            if let Ok(mut feed) = self.feed.lock() {
                 feed.push(event);
                 if feed.len() > self.max_feed {
                     let drop = feed.len() - self.max_feed;
                     feed.drain(0..drop);
                 }
             }
+        }
     }
 
     /// Drain pending on-screen notifications, returning them for the caller to
@@ -372,8 +404,13 @@ impl NotifyBus {
         }
     }
 
-    pub fn policy(&self) -> &NotifyPolicy {
-        &self.policy
+    /// The current policy, cloned. Used by the REPL to show/report the active
+    /// notification settings (and asserted by the `/reload` tests).
+    pub fn policy(&self) -> NotifyPolicy {
+        match self.config.read() {
+            Ok(g) => g.0.clone(),
+            Err(e) => e.into_inner().0.clone(),
+        }
     }
 }
 
@@ -635,17 +672,16 @@ impl Notifier for Webhook {
             "summary": e.summary(),
         });
         std::thread::spawn(move || {
-            // The default ureq agent has no TLS backend (we disabled the default
-            // rustls feature in favour of native-tls), so an HTTPS webhook URL
-            // would fail with "no TLS backend configured". Attach the system
-            // OpenSSL connector explicitly.
-            let connector = std::sync::Arc::new(
-                native_tls::TlsConnector::new().expect("native-tls init (system OpenSSL) failed"),
+            // Webhook POST via the host libcurl (no static TLS): TLS comes
+            // from the host's libcurl.so.4. Best-effort fire-and-forget.
+            let _ = crate::provider::lsb_json(
+                lsb_curl::Method::POST,
+                &url,
+                &[],
+                Some(&payload),
+                Duration::from_secs(15),
+                Duration::from_secs(30),
             );
-            let agent = ureq::AgentBuilder::new()
-                .tls_connector(connector)
-                .build();
-            let _ = agent.post(&url).send_json(payload);
         });
     }
 }
@@ -682,4 +718,63 @@ pub fn render_feed(events: &[AgentEvent]) -> String {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod reload_policy_tests {
+    use super::*;
+
+    fn ev() -> AgentEvent {
+        AgentEvent::turn_done(Duration::from_secs(1), 0, 0, "proj".into(), "hi".into())
+    }
+
+    // `/reload` swaps the policy in place, and the *new* policy governs the
+    // external-notifier gate immediately (no restart). The on-screen feed is
+    // policy-independent, so the swap is observed through `policy()` plus the
+    // `allows()` gate that `publish` consults for external delivery.
+    #[test]
+    fn reload_policy_takes_effect_immediately() {
+        let bus = NotifyBus::new(NotifyPolicy::default());
+        // Default: `when: background`, `min_seconds: 8` — a 1s foreground
+        // turn-done is not worth an external ping.
+        assert!(
+            !bus.policy().allows(&ev(), false, false),
+            "default policy must not fire an external ping for a short foreground turn"
+        );
+
+        // Reload to "always / 0s": the very same event now passes the gate.
+        let mut p = NotifyPolicy::default();
+        p.when = "always".into();
+        p.min_seconds = 0;
+        bus.reload_policy(p);
+        assert_eq!(bus.policy().when, "always", "reload must swap the policy");
+        assert_eq!(bus.policy().min_seconds, 0);
+        assert!(
+            bus.policy().allows(&ev(), false, false),
+            "after reload the new policy must govern external delivery"
+        );
+    }
+
+    // The on-screen feed always records non-idle events, and a reload must not
+    // discard notifications already queued (the user has not seen them yet).
+    #[test]
+    fn reload_policy_preserves_pending_notifications() {
+        let bus = NotifyBus::new(NotifyPolicy::default());
+        bus.publish(ev(), false);
+        assert_eq!(bus.drain_feed().len(), 1, "turn-done reaches the screen feed");
+
+        bus.publish(ev(), false);
+        // Reload to a *stricter* policy: the queued event must survive.
+        let mut strict = NotifyPolicy::default();
+        strict.on = "error".into();
+        bus.reload_policy(strict);
+        assert_eq!(
+            bus.drain_feed().len(),
+            1,
+            "reload must not discard notifications already in the feed"
+        );
+        // And the feed is still policy-independent for non-idle events.
+        bus.publish(ev(), false);
+        assert_eq!(bus.drain_feed().len(), 1, "screen feed ignores the `on` gate");
+    }
 }
