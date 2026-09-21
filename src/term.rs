@@ -923,6 +923,7 @@ const SLASH_HELP: &[(&str, &str, &str)] = &[
     ("/models", "", "list available models"),
     ("/project", "init", "create the ai_<project> user (root)"),
     ("/rebuild", "", "cargo build and exec the fresh binary"),
+    ("/reload", "", "re-read models.json + settings.json without restarting"),
     ("/resume", "<idx|fragment>", "resume an unfinished session"),
     ("/sessions", "", "list recent sessions"),
     ("/sh", "[cmd args]", "drop to a shell, or run a command via $SHELL"),
@@ -1530,12 +1531,12 @@ pub fn session_history_lines() -> Vec<String> {
 pub struct HistRecall {
     idx: isize,
     saved: String,
-    cursor: Option<usize>,
+    pub cursor: Option<usize>,
     /// Tab-cycle state: (word start, candidates). The next index is derived
     /// from `MidTurn.tab`'s third element when cycling; kept minimal here
     /// because `HistRecall` only persists cursor/recall across polls while
     /// `MidTurn` (owned per poll batch) does the completion work.
-    tab: Option<(usize, Vec<String>)>,
+    pub tab: Option<(usize, Vec<String>)>,
 }
 
 impl Default for HistRecall {
@@ -4104,6 +4105,22 @@ mod command_help_hint_tests {
         )]);
         let hint = command_help_hint("/ollama-webtools").expect("expected a hint");
         assert!(hint.contains("search the web via Ollama"), "got: {hint:?}");
+    }
+
+    // `/reload` re-reads `.pi` (models.json + settings.json) without a restart.
+    // It must be discoverable in the inline hint, since the whole point is that
+    // users can find it instead of restarting pir to pick up a config edit.
+    #[test]
+    fn reload_is_discoverable() {
+        let hint = command_help_hint("/reload").expect("expected a hint for /reload");
+        assert!(
+            hint.contains("re-read") && hint.contains("settings.json"),
+            "the hint must explain that /reload re-reads config: {hint:?}"
+        );
+        // A partial prefix resolves to it too (that is what the REPL shows while
+        // the user is still typing).
+        let partial = command_help_hint("/relo").expect("prefix must resolve");
+        assert!(partial.contains("re-read"), "got: {partial:?}");
     }
 
     // `/help` itself is suppressed (its description is the command list); an

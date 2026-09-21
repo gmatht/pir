@@ -1242,6 +1242,65 @@ mod gui_completion_tests {
     }
 
     #[test]
+    fn tab_completes_model_args_end_to_end() {
+        // The GUI chains `complete_idle(...).or_else(complete_model_buffer)`:
+        // command-name completion handles the command word, the model buffer
+        // handles the argument. Pin the combined behaviour with the live muse
+        // ids so `/model mu` keeps expanding to the qualified prefix.
+        fn muse_providers() -> Vec<Provider> {
+            vec![Provider {
+                id: Some("opencode-go".into()),
+                name: None,
+                api: Some("openai-completions".into()),
+                base_url: Some("https://opencode.ai/zen/go/v1".into()),
+                api_key: None,
+                models: vec![
+                    crate::config::Model {
+                        id: "muse-spark-1.2".into(),
+                        name: Some("Muse Spark 1.2".into()),
+                        context: Some(1000),
+                        max_tokens: None,
+                        api_override: None,
+                        url_override: None,
+                        no_reasoning_effort: false,
+                        reasoning: false,
+                        thinking_format: None,
+                        supports_reasoning_effort: None,
+                        session_affinity_format: None,
+                        thinking_level_map: Default::default(),
+                        price_per_1k: None,
+                    },
+                    crate::config::Model {
+                        id: "muse-spark-1.3".into(),
+                        name: Some("Muse Spark 1.3".into()),
+                        context: Some(1000),
+                        max_tokens: None,
+                        api_override: None,
+                        url_override: None,
+                        no_reasoning_effort: false,
+                        reasoning: false,
+                        thinking_format: None,
+                        supports_reasoning_effort: None,
+                        session_affinity_format: None,
+                        thinking_level_map: Default::default(),
+                        price_per_1k: None,
+                    },
+                ],
+            }]
+        }
+        let provs = muse_providers();
+        let tab = |buf: &str| {
+            complete_idle(buf).or_else(|| crate::config::complete_model_buffer(buf, &provs))
+        };
+        assert_eq!(tab("/model mu"), Some("/model opencode-go/muse-spark-1.".to_string()));
+        assert_eq!(tab("/m mu"), Some("/m opencode-go/muse-spark-1.".to_string()));
+        assert_eq!(tab("/model"), Some("/model ".to_string()));
+        assert_eq!(tab("/model zzz"), None);
+        // Command-word completion still wins before the argument.
+        assert_eq!(tab("/mod"), Some("/model".to_string()));
+    }
+
+    #[test]
     fn tab_completes_thinking_arg() {
         assert_eq!(complete_idle("/thinking hig"), Some("/thinking high".to_string()));
         assert_eq!(complete_idle("/thinking off"), Some("/thinking off".to_string())); // full match

@@ -734,17 +734,21 @@ fn read_raw_into(
     }
     // Cursor-aware editing shared with the streaming REPL: seed MidTurn from
     // the caller's buffer + persisted cursor, sync back after each key.
+    // (Inline closure, not a `sync_ed` helper: the closure would borrow
+    // `recall` for the whole loop and block `recall.reset()` calls below.)
     let mut ed = crate::term::MidTurn {
         buf: std::mem::take(buf),
         cursor: recall.cursor,
         tab: recall.tab.take().map(|(s, c)| (s, c, 0)),
     };
-    let sync_ed = |ed: &mut crate::term::MidTurn, buf: &mut String| {
-        recall.cursor = ed.cursor;
-        recall.tab = ed.tab.clone().map(|(s, c, _)| (s, c));
-        *buf = ed.buf.clone();
-        update_tui_typeahead(buf, typeahead);
-    };
+    macro_rules! sync_ed {
+        () => {{
+            recall.cursor = ed.cursor;
+            recall.tab = ed.tab.clone().map(|(s, c, _)| (s, c));
+            *buf = ed.buf.clone();
+            update_tui_typeahead(buf, typeahead);
+        }};
+    }
     let mut pasting = false;
     let mut esc_meta = false;
     let mut i = 0usize;
@@ -759,7 +763,7 @@ fn read_raw_into(
                 c if (0x20..0x7f).contains(&c) => ed.insert(c as char),
                 _ => {}
             }
-            sync_ed(&mut ed, buf);
+            sync_ed!();
             crate::term::reset_quit_presses();
             i += 1;
             continue;
@@ -767,7 +771,7 @@ fn read_raw_into(
         // Tab completes (same tables as idle + /model args); repeat cycles.
         if b == 0x09 {
             ed.tab_complete();
-            sync_ed(&mut ed, buf);
+            sync_ed!();
             crate::term::reset_quit_presses();
             i += 1;
             continue;
@@ -775,28 +779,28 @@ fn read_raw_into(
         // ctrl-a / ctrl-e / ctrl-b / ctrl-f.
         if b == 0x01 {
             ed.home();
-            sync_ed(&mut ed, buf);
+            sync_ed!();
             crate::term::reset_quit_presses();
             i += 1;
             continue;
         }
         if b == 0x05 {
             ed.end();
-            sync_ed(&mut ed, buf);
+            sync_ed!();
             crate::term::reset_quit_presses();
             i += 1;
             continue;
         }
         if b == 0x02 {
             ed.move_char(true);
-            sync_ed(&mut ed, buf);
+            sync_ed!();
             crate::term::reset_quit_presses();
             i += 1;
             continue;
         }
         if b == 0x06 {
             ed.move_char(false);
-            sync_ed(&mut ed, buf);
+            sync_ed!();
             crate::term::reset_quit_presses();
             i += 1;
             continue;
@@ -807,7 +811,7 @@ fn read_raw_into(
             ed.buf.truncate(p);
             ed.cursor = Some(p);
             ed.touch();
-            sync_ed(&mut ed, buf);
+            sync_ed!();
             crate::term::reset_quit_presses();
             recall.reset();
             recall.cursor = ed.cursor;
@@ -818,7 +822,7 @@ fn read_raw_into(
             ed.buf.clear();
             ed.cursor = Some(0);
             ed.touch();
-            sync_ed(&mut ed, buf);
+            sync_ed!();
             crate::term::reset_quit_presses();
             recall.reset();
             recall.cursor = ed.cursor;
@@ -827,7 +831,7 @@ fn read_raw_into(
         }
         if b == 0x17 {
             ed.kill_word_back();
-            sync_ed(&mut ed, buf);
+            sync_ed!();
             crate::term::reset_quit_presses();
             recall.reset();
             recall.cursor = ed.cursor;
@@ -842,7 +846,7 @@ fn read_raw_into(
                     // (CRLF already normalised to nothing by the CR arm).
                     if b == 0x0a {
                         ed.insert('\n');
-                        sync_ed(&mut ed, buf);
+                        sync_ed!();
                     }
                     crate::term::reset_quit_presses();
                     recall.reset();
@@ -851,7 +855,7 @@ fn read_raw_into(
                     let line = std::mem::take(&mut ed.buf);
                     ed.cursor = None;
                     ed.tab = None;
-                    sync_ed(&mut ed, buf);
+                    sync_ed!();
                     crate::term::reset_quit_presses();
                     recall.reset();
                     return RawKey::Line(line);
@@ -859,7 +863,7 @@ fn read_raw_into(
             }
             0x7f | 0x08 => {
                 ed.backspace();
-                sync_ed(&mut ed, buf);
+                sync_ed!();
                 crate::term::reset_quit_presses();
                 recall.reset();
                 recall.cursor = ed.cursor;
@@ -868,7 +872,7 @@ fn read_raw_into(
                 ed.buf.clear();
                 ed.cursor = None;
                 ed.tab = None;
-                sync_ed(&mut ed, buf);
+                sync_ed!();
                 // Triple-press-to-quit: 1st/2nd cancel the turn (as before);
                 // the 3rd consecutive press quits instead.
                 if crate::term::note_cancel_press() {
@@ -880,7 +884,7 @@ fn read_raw_into(
                 ed.buf.clear();
                 ed.cursor = None;
                 ed.tab = None;
-                sync_ed(&mut ed, buf);
+                sync_ed!();
                 return RawKey::Eof;
             }
             0x11 => {
@@ -888,7 +892,7 @@ fn read_raw_into(
                 ed.buf.clear();
                 ed.cursor = None;
                 ed.tab = None;
-                sync_ed(&mut ed, buf);
+                sync_ed!();
                 return RawKey::Quit;
             }
             0x1b => {
@@ -914,7 +918,7 @@ fn read_raw_into(
                     }
                     Some(c) if (0x20..0x7f).contains(&c) => {
                         ed.insert(c as char);
-                        sync_ed(&mut ed, buf);
+                        sync_ed!();
                         crate::term::reset_quit_presses();
                         recall.reset();
                         recall.cursor = ed.cursor;
@@ -925,7 +929,7 @@ fn read_raw_into(
                         ed.buf.clear();
                         ed.cursor = None;
                         ed.tab = None;
-                        sync_ed(&mut ed, buf);
+                        sync_ed!();
                         // Lone Esc counts like ctrl-c: 1st/2nd cancel, 3rd quits.
                         if crate::term::note_cancel_press() {
                             return RawKey::Quit;
@@ -976,12 +980,12 @@ fn read_raw_into(
                 // Recalled history replaces the draft (shown in the footer).
                 if let Some(up) = arrow {
                     let hist = crate::term::session_history_lines();
-                    sync_ed(&mut ed, buf);
+                    sync_ed!();
                     if let Some(line) = recall.step(&hist, buf, up) {
                         ed.buf = line;
                         ed.cursor = Some(ed.buf.len());
                         ed.tab = None;
-                        sync_ed(&mut ed, buf);
+                        sync_ed!();
                         recall.cursor = ed.cursor;
                     }
                 } else {
@@ -1015,7 +1019,7 @@ fn read_raw_into(
                         },
                         _ => {}
                     }
-                    sync_ed(&mut ed, buf);
+                    sync_ed!();
                     // `i` already sits past the terminator; `continue` skips
                     // the trailing `i += 1` so the byte after the sequence
                     // is not swallowed (same fix as the streaming REPL).
@@ -1024,7 +1028,7 @@ fn read_raw_into(
             }
             c if (0x20..0x7f).contains(&c) => {
                 ed.insert(c as char);
-                sync_ed(&mut ed, buf);
+                sync_ed!();
                 // Typing restarts the quit gesture.
                 crate::term::reset_quit_presses();
                 // Typing abandons an in-progress history recall.
@@ -1038,7 +1042,7 @@ fn read_raw_into(
             }
         }
     }
-    sync_ed(&mut ed, buf);
+    sync_ed!();
     RawKey::None
 }
 
@@ -1795,6 +1799,65 @@ mod tui_completion_tests {
     #[test]
     fn tab_does_not_complete_past_command_word() {
         assert_eq!(complete_idle("/model xyz"), None);
+    }
+
+    #[test]
+    fn tab_completes_model_args_end_to_end() {
+        // The TUI chains `complete_idle(...).or_else(complete_model_buffer)`:
+        // command-name completion handles the command word, the model buffer
+        // handles the argument. Pin the combined behaviour with the live muse
+        // ids so `/model mu` keeps expanding to the qualified prefix.
+        fn muse_providers() -> Vec<Provider> {
+            vec![Provider {
+                id: Some("opencode-go".into()),
+                name: None,
+                api: Some("openai-completions".into()),
+                base_url: Some("https://opencode.ai/zen/go/v1".into()),
+                api_key: None,
+                models: vec![
+                    crate::config::Model {
+                        id: "muse-spark-1.2".into(),
+                        name: Some("Muse Spark 1.2".into()),
+                        context: Some(1000),
+                        max_tokens: None,
+                        api_override: None,
+                        url_override: None,
+                        no_reasoning_effort: false,
+                        reasoning: false,
+                        thinking_format: None,
+                        supports_reasoning_effort: None,
+                        session_affinity_format: None,
+                        thinking_level_map: Default::default(),
+                        price_per_1k: None,
+                    },
+                    crate::config::Model {
+                        id: "muse-spark-1.3".into(),
+                        name: Some("Muse Spark 1.3".into()),
+                        context: Some(1000),
+                        max_tokens: None,
+                        api_override: None,
+                        url_override: None,
+                        no_reasoning_effort: false,
+                        reasoning: false,
+                        thinking_format: None,
+                        supports_reasoning_effort: None,
+                        session_affinity_format: None,
+                        thinking_level_map: Default::default(),
+                        price_per_1k: None,
+                    },
+                ],
+            }]
+        }
+        let provs = muse_providers();
+        let tab = |buf: &str| {
+            complete_idle(buf).or_else(|| crate::config::complete_model_buffer(buf, &provs))
+        };
+        assert_eq!(tab("/model mu"), Some("/model opencode-go/muse-spark-1.".to_string()));
+        assert_eq!(tab("/m mu"), Some("/m opencode-go/muse-spark-1.".to_string()));
+        assert_eq!(tab("/model"), Some("/model ".to_string()));
+        assert_eq!(tab("/model zzz"), None);
+        // Command-word completion still wins before the argument.
+        assert_eq!(tab("/mod"), Some("/model".to_string()));
     }
 
     #[test]
