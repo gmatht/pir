@@ -83,6 +83,9 @@ pub fn run(
     // from the caller drives the streaming REPL's separate loop and is unused here.)
     let (tui_done_tx, tui_done_rx) = smol::channel::bounded::<()>(1);
 
+    let reexec_seen = std::sync::atomic::AtomicU64::new(
+        crate::config::read_reexec_broadcast().map(|b| b.generation).unwrap_or(0),
+    );
     let ctx = TuiCtx {
         agent_slot,
         fg_cancel,
@@ -94,6 +97,7 @@ pub fn run(
         done_rx: tui_done_rx,
         full_auto,
         running_as_agent,
+        reexec_seen: &reexec_seen,
     };
 
     match run_inner(&mut term, &ctx) {
@@ -135,6 +139,9 @@ struct TuiCtx<'a> {
     done_rx: smol::channel::Receiver<()>,
     full_auto: bool,
     running_as_agent: bool,
+    /// Re-exec broadcast generation seen at startup (durable fallback for a
+    /// missed SIGUSR1); updated as newer generations are honoured.
+    reexec_seen: &'a std::sync::atomic::AtomicU64,
 }
 
 /// Conversation entries shown in the top pane. Tool activity is folded into the
@@ -330,6 +337,32 @@ fn run_inner(
         // ---- Render ----
         let running = fg_handle.is_some();
         state.running = running;
+        // Deferred self re-exec (SIGUSR1 from `/reexec all`, or the reexec
+        // broadcast file). Only when idle: `running` means the worker owns
+        // the agent — exec would orphan it. Mid-turn instances defer until
+        // the turn ends, exactly like `/model*`.
+        // NOTE: this intentionally bypasses the broadcast-file path — SIGUSR1
+        // is the wakeup; the file is only how `/reexec all` discovers pids.
+        #[cfg(unix)]
+        if !running && crate::reexec_requested() {
+            crate::clear_reexec_request();
+            state.push(ConvKind::System, "· reexec requested — restarting…");
+            crate::reexec_self();
+        }
+        // Durable fallback: a reexec broadcast generation newer than startup
+        // (missed SIGUSR1 while mid-turn/suspended) re-execs here, idle only.
+        #[cfg(unix)]
+        if !running {
+            let seen = ctx.reexec_seen.load(std::sync::atomic::Ordering::SeqCst);
+            if let Some(b) = crate::config::read_reexec_broadcast()
+                && b.generation > seen
+                && b.generation != 0
+                && b.by_pid != std::process::id() as u64 {
+                    ctx.reexec_seen.store(b.generation, std::sync::atomic::Ordering::SeqCst);
+                    state.push(ConvKind::System, "· reexec broadcast — restarting…");
+                    crate::reexec_self();
+                }
+        }
         let now = Instant::now();
         if now.duration_since(state.last_tick) >= Duration::from_millis(80) || !running {
             state.last_tick = now;

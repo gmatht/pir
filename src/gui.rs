@@ -171,6 +171,9 @@ struct GuiState {
     /// submitted prompt, so Arrow-Up recalls previous prompts like the
     /// terminal REPLs.
     history: Vec<String>,
+    /// Re-exec broadcast generation seen at startup (durable fallback for a
+    /// missed SIGUSR1); updated as newer generations are honoured.
+    reexec_seen: u64,
 }
 
 impl GuiState {
@@ -183,6 +186,9 @@ impl GuiState {
             status: "idle".into(),
             show_thinking: true,
             history: Vec::new(),
+            reexec_seen: crate::config::read_reexec_broadcast()
+                .map(|b| b.generation)
+                .unwrap_or(0),
         }
     }
 
@@ -793,6 +799,29 @@ fn drain_once(
     // Turn finished? Join it and start the next queued prompt or go idle.
     // We detect completion by checking whether the agent is back in the slot
     // AND `running` is still set (the worker returns the agent on completion).
+    // Deferred self re-exec (SIGUSR1 from `/reexec all`, or the reexec
+    // broadcast file): only when idle (agent back in slot, no turn running).
+    // GTK has no exec-safe teardown issue here — `app.quit()` unwinds the
+    // main loop first would be ideal, but exec replaces the image anyway.
+    #[cfg(unix)]
+    if !s.running {
+        let mut wants_reexec = false;
+        if crate::reexec_requested() {
+            crate::clear_reexec_request();
+            wants_reexec = true;
+        } else if let Some(b) = crate::config::read_reexec_broadcast()
+            && b.generation > s.reexec_seen
+            && b.generation != 0
+            && b.by_pid != std::process::id() as u64 {
+                s.reexec_seen = b.generation;
+                wants_reexec = true;
+            }
+        if wants_reexec {
+            s.push(ConvKind::System, "· reexec requested — restarting…");
+            sync_textview(widgets, &s);
+            crate::reexec_self();
+        }
+    }
     if s.running {
         let slot = agent_slot.lock().unwrap();
         let back = slot.as_ref().is_some();

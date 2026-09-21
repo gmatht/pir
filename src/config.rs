@@ -1657,6 +1657,58 @@ pub fn publish_model_broadcast(label: &str) -> Option<u64> {
     }
 }
 
+/// Path of the cross-instance re-exec broadcast file.
+pub fn reexec_broadcast_path() -> PathBuf {
+    pi_dir().join("agent").join("reexec-broadcast.json")
+}
+
+/// The current re-exec broadcast, if any and well-formed.
+pub fn read_reexec_broadcast() -> Option<ReexecBroadcast> {
+    let raw = fs::read_to_string(reexec_broadcast_path()).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    Some(ReexecBroadcast {
+        generation: v.get("generation").and_then(Value::as_u64).unwrap_or(0),
+        by_pid: v.get("byPid").and_then(Value::as_u64).unwrap_or(0),
+        ts: v.get("ts").and_then(Value::as_u64).unwrap_or(0),
+    })
+}
+
+/// A single re-exec broadcast event published by `/reexec all`.
+#[derive(Clone, Debug)]
+pub struct ReexecBroadcast {
+    /// Monotonic counter so watchers can detect "new since I last applied".
+    pub generation: u64,
+    /// PID of the `pir` that originated the broadcast (so it can ignore itself).
+    pub by_pid: u64,
+    /// Epoch seconds when it was published.
+    pub ts: u64,
+}
+
+/// Publish a re-exec broadcast event, stamping it with the current process
+/// pid and a `generation` one greater than any previously recorded. Returns
+/// the generation written. Best-effort: a write failure yields `None`.
+/// The file is the durable record (so an instance that missed the SIGUSR1 —
+/// mid-turn, suspended, slow poll — still re-execs when it next goes idle);
+/// the signal is the fast wakeup.
+pub fn publish_reexec_broadcast() -> Option<u64> {
+    let p = reexec_broadcast_path();
+    if let Some(parent) = p.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let prev = read_reexec_broadcast().map(|b| b.generation).unwrap_or(0);
+    let generation = prev + 1;
+    let payload = json!({
+        "generation": generation,
+        "byPid": std::process::id(),
+        "ts": crate::term::epoch(),
+    });
+    if fs::write(&p, serde_json::to_string_pretty(&payload).unwrap_or_default()).is_ok() {
+        Some(generation)
+    } else {
+        None
+    }
+}
+
 
 /// Default for incremental (in-place) markdown rendering. Enabled unless
 /// explicitly disabled via `PIR_INCREMENTAL_MD=0` (see `Agent::set_incremental_md`).
@@ -2781,5 +2833,50 @@ mod worktree_settings_tests {
             m.session_affinity_format = Some(v.to_string());
             assert!(!m.no_session_affinity(), "{v:?} must keep the header");
         }
+    }
+
+    #[test]
+    fn reexec_broadcast_roundtrips_generation_and_pid() {
+        // `/reexec all` durability: publish bumps the generation, stamps our
+        // pid, and reads back; a second publish bumps again. Uses an isolated
+        // PI_DIR so the real broadcast file is never touched.
+        let _env = TEST_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("pir_reexec_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let old = std::env::var_os("PI_DIR");
+        // SAFETY: test-only env mutation, serialized by TEST_ENV_LOCK.
+        unsafe { std::env::set_var("PI_DIR", &dir); }
+        assert!(read_reexec_broadcast().is_none(), "no broadcast initially");
+        let g1 = publish_reexec_broadcast().expect("first publish writes");
+        assert_eq!(g1, 1);
+        let b1 = read_reexec_broadcast().expect("read back");
+        assert_eq!(b1.generation, 1);
+        assert_eq!(b1.by_pid, std::process::id() as u64, "originator pid stamped");
+        let g2 = publish_reexec_broadcast().expect("second publish writes");
+        assert_eq!(g2, 2, "generation is monotonic");
+        assert_eq!(read_reexec_broadcast().unwrap().generation, 2);
+        match old {
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reexec_broadcast_ignores_own_echo_and_stale_generations() {
+        // Watcher semantics: own pid echoes and generation <= seen are
+        // ignored — only a newer generation from another pid applies. This
+        // pins the contract the REPL/TUI/GUI idle loops implement.
+        let me = std::process::id() as u64;
+        let seen = 5u64;
+        let own = ReexecBroadcast { generation: 6, by_pid: me, ts: 0 };
+        let stale = ReexecBroadcast { generation: 5, by_pid: 999, ts: 0 };
+        let old = ReexecBroadcast { generation: 3, by_pid: 999, ts: 0 };
+        let fresh = ReexecBroadcast { generation: 6, by_pid: 999, ts: 0 };
+        let applies = |b: &ReexecBroadcast| b.generation > seen && b.generation != 0 && b.by_pid != me;
+        assert!(!applies(&own), "own echo ignored");
+        assert!(!applies(&stale), "stale generation ignored");
+        assert!(!applies(&old), "old generation ignored");
+        assert!(applies(&fresh), "newer generation from another pid applies");
     }
 }

@@ -89,6 +89,48 @@ pub fn set_active_child_pgid(pgid: i32) {
     *ACTIVE_CHILD_PGID.lock().unwrap() = Some(pgid);
 }
 
+/// Set by the SIGUSR1 handler: another `pir` (via `/reexec all`) asks this
+/// instance to re-exec its own binary when it next reaches an idle point.
+/// Async-signal-safe by construction — the handler only stores `1`; the REPL
+/// idle loops poll [`reexec_requested`] (and clear it) when no turn runs, so
+/// exec never fires mid-turn or inside a signal handler. Unix-only; on
+/// non-unix the flag simply never gets set.
+#[cfg(unix)]
+static REEXEC_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// True when a SIGUSR1 re-exec was requested since the last check.
+#[cfg(unix)]
+pub fn reexec_requested() -> bool {
+    REEXEC_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Clear a pending SIGUSR1 re-exec request (after honouring it).
+#[cfg(unix)]
+pub fn clear_reexec_request() {
+    REEXEC_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Install the SIGUSR1 handler for `/reexec all`: set [`REEXEC_REQUESTED`]
+/// and return. Installed early (next to [`install_death_tracking`); SIGUSR1
+/// otherwise keeps its default terminate disposition. Best-effort like the
+/// death handler — a failed install just means this instance ignores the
+/// signal. The handler does nothing but store `1` (async-signal-safe: no
+/// allocation, no locks, no I/O).
+#[cfg(unix)]
+fn install_reexec_handler() {
+    extern "C" fn on_usr1(_signo: libc::c_int) {
+        REEXEC_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    unsafe {
+        if libc::signal(libc::SIGUSR1, on_usr1 as *const () as libc::sighandler_t)
+            == libc::SIG_ERR
+        {
+            // ignore — handler install failed for this signal
+        }
+    }
+}
+
 /// Install the death-provenance signal handler and PR_SET_PDEATHSIG. Best-
 /// effort: any failure is silently ignored (we must never refuse to start).
 fn install_death_tracking() {
@@ -591,6 +633,11 @@ fn main() {
     // can record *what* terminates us (item: SIGTERM/SIGHUP provenance in the
     // status sidecar) and reap spawned children if the parent pane dies.
     install_death_tracking();
+    // SIGUSR1 → deferred self re-exec (`/reexec all` from another terminal).
+    // Installed early so no window exists where the default disposition
+    // (terminate) could kill us instead of flagging.
+    #[cfg(unix)]
+    install_reexec_handler();
 
     // Mutable so `/reload` can refresh the catalog in place (the REPL loop and
     // the background-job spawner both read this list).
@@ -1103,6 +1150,18 @@ fn main() {
         std::process::id(),
         pending_model.clone(),
     );
+    // Re-exec broadcast (`/reexec all`): same file+watcher shape as `/model*`,
+    // but the payload is just a generation — no label to resolve. The watcher
+    // sets the pending flag; the idle loop below re-execs when no turn runs
+    // (mid-turn defers, exactly like a model broadcast). SIGUSR1 is the fast
+    // wakeup for the same event; the file is the durable fallback.
+    let reexec_seen = config::read_reexec_broadcast().map(|b| b.generation).unwrap_or(0);
+    let pending_reexec: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    let _reexec_watcher = spawn_reexec_broadcast_watcher(
+        reexec_seen,
+        std::process::id(),
+        pending_reexec.clone(),
+    );
 
     // Running foreground turn state.
     let mut fg_handle: Option<JoinHandle<()>> = None;
@@ -1481,6 +1540,18 @@ fn main() {
         if tasks_running > 0 {
             term::out(&term::dim(&format!("#tasks running: {} · Idle\n", tasks_running)));
         }
+        // Deferred self re-exec (SIGUSR1 from `/reexec all` in another
+        // terminal, or our own reexec broadcast echo). Only when idle: a turn
+        // is never running here (fg_handle is None — the mid-turn branch
+        // above `continue`s), but background jobs may be; exec orphans them
+        // the same way a manual restart would, so just go.
+        #[cfg(unix)]
+        if reexec_requested() || pending_reexec.lock().unwrap().clone() {
+            clear_reexec_request();
+            *pending_reexec.lock().unwrap() = false;
+            term::out(&term::dim("· reexec requested — restarting…\n"));
+            reexec_self();
+        }
         // Apply any cross-instance model switch queued by the broadcast watcher
         // (from a `/model*` in another terminal). We only do this while idle, so
         // a mid-turn instance defers until it returns here — including after an
@@ -1742,6 +1813,40 @@ fn spawn_model_broadcast_watcher(
 }
 
 type AgentSlot = Arc<Mutex<Option<Agent>>>;
+
+/// Spawn the cross-instance re-exec broadcast watcher. Polls
+/// `~/.pi/agent/reexec-broadcast.json` every [`BROADCAST_POLL`]; when a newer
+/// generation (than `last_seen`) appears that *this* process didn't originate,
+/// it sets `pending_reexec` so the REPL re-execs as soon as it is idle (a
+/// running turn defers, exactly like `/model*`). `self_pid` ignores our own
+/// broadcast. Best-effort: read/parse errors are silently skipped. This is the
+/// durable fallback for the SIGUSR1 fast wakeup — an instance that was
+/// mid-turn, suspended, or slow-polling when the signal arrived still re-execs
+/// when it next goes idle.
+fn spawn_reexec_broadcast_watcher(
+    last_seen: u64,
+    self_pid: u32,
+    pending_reexec: Arc<Mutex<bool>>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut seen = last_seen;
+        loop {
+            thread::sleep(BROADCAST_POLL);
+            let Some(b) = config::read_reexec_broadcast() else { continue };
+            if b.generation <= seen || b.generation == 0 {
+                continue;
+            }
+            if b.by_pid == self_pid as u64 {
+                seen = b.generation;
+                continue;
+            }
+            seen = b.generation;
+            if let Ok(mut pending) = pending_reexec.lock() {
+                *pending = true;
+            }
+        }
+    })
+}
 
 /// Persistent "autoclean after every prompt" toggle, flipped by `/autoclean on|off`.
 static AUTOCLEAN_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -3062,9 +3167,15 @@ fn handle_command(
             // a turn runs — exec would orphan the worker and its session
             // state. Session itself survives via the persisted log (resume
             // with `pir -r` / `/resume` if the new process doesn't pick it
-            // up automatically).
+            // up automatically). `/reexec all` also signals every other
+            // running `pir` of this user (SIGUSR1 + broadcast file) so the
+            // whole fleet restarts, then re-execs this instance too.
             if fg_running {
                 eprintln!("pir: a turn is running — finish or /cancel it first, then /reexec");
+                return;
+            }
+            if rest.first().is_some_and(|s| *s == "all") {
+                reexec_all();
                 return;
             }
             reexec_self();
@@ -3632,8 +3743,9 @@ fn rebuild_and_exec() {
 /// the process image in place, so the new `pir` inherits the same
 /// stdio/terminal and keeps the user's place; the session itself persists via
 /// the session log. Like `/rebuild`, the caller must refuse while a turn runs.
+/// `pub` so the TUI idle loop can honour a deferred SIGUSR1 request.
 #[cfg(unix)]
-fn reexec_self() {
+pub fn reexec_self() {
     use std::os::unix::process::CommandExt;
     match std::env::current_exe() {
         Ok(bin) => {
@@ -3652,6 +3764,91 @@ fn reexec_self() {
 #[cfg(not(unix))]
 fn reexec_self() {
     eprintln!("pir: /reexec (exec) is only supported on unix");
+}
+
+/// `/reexec all` — restart every running `pir` of this user, including this
+/// instance. Two channels, belt and suspenders:
+///
+/// 1. Broadcast file (`~/.pi/agent/reexec-broadcast.json`, same shape as the
+///    `/model*` file): the durable record, so an instance that is mid-turn,
+///    suspended, or slow-polling still re-execs when it next goes idle. The
+///    per-frontend watchers (streaming REPL, TUI, GUI) pick it up like they
+///    do `/model*`.
+/// 2. SIGUSR1 to every other live `pir` pid found in this user's session
+///    sidecars: the fast wakeup — an idle instance re-execs on its next loop
+///    iteration instead of waiting for the next broadcast poll.
+///
+/// Only same-user instances are ever signalled (pids come from our own
+/// `~/.pi` session files, and `kill` fails across users anyway). Each target
+/// is probed with `kill(pid, 0)` first and skipped unless alive; signal
+/// failures (raced exit, sandbox `ai_*` permission) are counted and reported,
+/// never fatal. The originator re-execs itself last via [`reexec_self`], so a
+/// failed signal round still restarts at least this terminal.
+#[cfg(unix)]
+fn reexec_all() {
+    use std::os::unix::process::CommandExt as _;
+    let me = std::process::id();
+    // Durable record first, so even targets we fail to signal still pick it
+    // up when they next go idle.
+    let generation = config::publish_reexec_broadcast();
+    // Discover other instances: every session sidecar with a live pid that
+    // isn't us. Sidecars live under `~/.pi/agent/sessions/*.status.json`
+    // (see `session::status_path`); only our own user's dir is scanned.
+    let sessions = config::pi_dir().join("agent").join("sessions");
+    let mut targets: Vec<u32> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&sessions) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            if !p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".status.json")) {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(&p) else { continue };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
+            let Some(pid) = v.get("pid").and_then(|x| x.as_u64()).map(|x| x as u32) else { continue };
+            if pid == 0 || pid == me {
+                continue;
+            }
+            // Alive right now? (`kill(pid, 0)` probes without signalling.)
+            if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+                continue;
+            }
+            if !targets.contains(&pid) {
+                targets.push(pid);
+            }
+        }
+    }
+    let mut signalled = 0usize;
+    let mut failed = 0usize;
+    for pid in &targets {
+        // SIGUSR1 → the target's handler only sets REEXEC_REQUESTED; it
+        // re-execs itself when idle, never mid-turn.
+        if unsafe { libc::kill(*pid as libc::pid_t, libc::SIGUSR1) } == 0 {
+            signalled += 1;
+        } else {
+            failed += 1;
+        }
+    }
+    match generation {
+        Some(g) => eprintln!(
+            "{} /reexec all (generation {g}): signalled {signalled} other instance(s){} — re-execing self…",
+            term::dim("·"),
+            if failed > 0 { format!(", {failed} signal(s) failed (see broadcast file fallback)") } else { String::new() },
+        ),
+        None => eprintln!(
+            "{} /reexec all: broadcast file unwritable; signalled {signalled} other instance(s){} — re-execing self…",
+            term::dim("·"),
+            if failed > 0 { format!(", {failed} failed") } else { String::new() },
+        ),
+    }
+    reexec_self();
+}
+
+#[cfg(not(unix))]
+fn reexec_all() {
+    eprintln!("pir: /reexec all is only supported on unix");
 }
 
 /// Collapse `$HOME` to `~` in a path for a compact display, leaving other
