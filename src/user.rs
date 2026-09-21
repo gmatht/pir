@@ -20,6 +20,83 @@ use std::path::{Path, PathBuf};
 use std::os::unix::fs::MetadataExt;
 use std::sync::Mutex;
 
+/// Set the real/effective/saved uid triple, portably across the unixes we
+/// support.
+///
+/// Linux has `setresuid(ruid, euid, suid)`, which sets all three independently
+/// — that is *the* reason `pir` can hold a saved root (`setresuid(uid, uid, 0)`)
+/// to let a human-invoked `/sh -u` switch back later. macOS and the BSDs have
+/// no `setresuid`, only the older `setreuid(ruid, euid)`: setting the real uid
+/// implicitly sets the saved uid to match. So on Darwin we call `setreuid`
+/// twice — first to the target (which also parks saved at the target), then to
+/// `(target, saved)` to re-establish the saved root the caller asked for. The
+/// end state matches Linux whenever the process is entitled to it; when it is
+/// not, the second call fails and we report the error exactly as Linux would.
+///
+/// Returns 0 on success, -1 on failure (mirroring the libc convention so the
+/// two call sites below can share their existing `!= 0` checks).
+#[cfg(unix)]
+fn set_res_ids(ruid: u32, euid: u32, suid: u32) -> libc::c_int {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::setresuid(ruid, euid, suid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        // No setresuid: emulate the (ruid, euid, suid) request with setreuid.
+        // Step 1 parks real/effective/saved at (euid, euid); step 2 restores
+        // the requested real/saved pair (a no-op when suid == euid).
+        if libc::setreuid(euid, euid) != 0 {
+            return -1;
+        }
+        if ruid == euid && suid == euid {
+            return 0;
+        }
+        libc::setreuid(ruid, suid)
+    }
+}
+
+/// Set the real/effective/saved gid triple — the `set_res_ids` twin, using
+/// `setresgid` on Linux and `setregid` elsewhere.
+#[cfg(unix)]
+fn set_res_gids(rgid: u32, egid: u32, sgid: u32) -> libc::c_int {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::setresgid(rgid, egid, sgid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        if libc::setregid(egid, egid) != 0 {
+            return -1;
+        }
+        if rgid == egid && sgid == egid {
+            return 0;
+        }
+        libc::setregid(rgid, sgid)
+    }
+}
+
+/// Read the real/effective/saved uid triple. Linux has `getresuid`; elsewhere
+/// (macOS/BSD) only the real and effective uids are queryable, and the saved
+/// uid is not exposed — report the effective uid there. That is the truthful
+/// answer for the "can I still escalate?" question the caller asks: a process
+/// that could not preserve root has `suid == euid` in practice, so treating
+/// saved as effective reports "cannot escalate", which is correct.
+#[cfg(unix)]
+fn get_res_uids() -> (u32, u32, u32) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let (mut r, mut e, mut s) = (0u32, 0u32, 0u32);
+        libc::getresuid(&mut r, &mut e, &mut s);
+        (r, e, s)
+    }
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        let e = libc::geteuid();
+        (libc::getuid(), e, e)
+    }
+}
+
 /// Name of the user with the given uid, best-effort.
 #[cfg(unix)]
 pub fn name_of_uid(uid: u32) -> Option<String> {
@@ -480,10 +557,10 @@ pub fn become_user(user: &str) -> Result<(), String> {
         if libc::setgroups(0, std::ptr::null()) != 0 {
             return Err(format!("failed to clear groups for '{user}'"));
         }
-        if libc::setresgid(gid, gid, 0) != 0 {
+        if set_res_gids(gid, gid, 0) != 0 {
             return Err(format!("failed to setresgid to '{user}'"));
         }
-        if libc::setresuid(uid, uid, 0) != 0 {
+        if set_res_ids(uid, uid, 0) != 0 {
             return Err(format!("failed to setresuid to '{user}'"));
         }
     }
@@ -509,10 +586,10 @@ pub fn drop_to_current_identity() -> Result<(), std::io::Error> {
     unsafe {
         let euid = libc::geteuid();
         let egid = libc::getegid();
-        if libc::setresuid(euid, euid, euid) != 0 {
+        if set_res_ids(euid, euid, euid) != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        if libc::setresgid(egid, egid, egid) != 0 {
+        if set_res_gids(egid, egid, egid) != 0 {
             return Err(std::io::Error::last_os_error());
         }
         let _ = libc::setgroups(0, std::ptr::null());
@@ -576,10 +653,10 @@ pub fn drop_to_agent_user() -> Result<(), std::io::Error> {
         // current identity instead of failing it. A hard failure here turned
         // every `bash` spawn into "Operation not permitted".
         let _ = libc::setgroups(0, std::ptr::null());
-        if libc::setresgid(gid, gid, gid) != 0 {
+        if set_res_gids(gid, gid, gid) != 0 {
             return Ok(());
         }
-        if libc::setresuid(uid, uid, uid) != 0 {
+        if set_res_ids(uid, uid, uid) != 0 {
             return Ok(());
         }
     }
@@ -719,7 +796,7 @@ pub fn spawn_shell_as(
     // which collapsed r/e/s to the sandbox user) cannot escalate, and we say
     // so clearly.
     let (mut ruid, mut euid, mut suid) = (0u32, 0u32, 0u32);
-    unsafe { libc::getresuid(&mut ruid, &mut euid, &mut suid); }
+    (ruid, euid, suid) = get_res_uids();
     if euid != 0 && suid != 0 {
         eprintln!(
             "pir: not privileged — cannot start a shell as another user (re-run as root, \
@@ -1269,6 +1346,31 @@ pub fn session_dir_for(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
 #[cfg(all(test, unix))]
 mod accessibility_tests {
     use super::*;
+
+    /// The portable credential helpers must agree with the platform's own view
+    /// of the current process. On Linux they call `setresuid`/`getresuid`; on
+    /// macOS/BSD they emulate with `setreuid`. Getting this wrong is a security
+    /// bug, so assert the observable invariant on every platform: re-applying
+    /// the *current* identity is a permitted no-op that changes nothing.
+    #[test]
+    fn res_id_helpers_roundtrip_current_identity() {
+        let (ruid, euid, suid) = get_res_uids();
+        // The caller's identity must be readable and self-consistent: on Linux
+        // getresuid fills all three, elsewhere saved mirrors effective.
+        assert_eq!(ruid, unsafe { libc::getuid() });
+        assert_eq!(euid, unsafe { libc::geteuid() });
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(suid, euid, "no getresuid off Linux: saved must report as effective");
+
+        // Re-setting the identity we already hold must succeed (it is the
+        // documented no-op case in both implementations) and leave us where we
+        // are — this is what `drop_to_current_identity` relies on.
+        assert_eq!(set_res_ids(euid, euid, euid), 0, "re-setting current uid must succeed");
+        assert_eq!(set_res_gids(unsafe { libc::getegid() }, unsafe { libc::getegid() },
+                                unsafe { libc::getegid() }), 0,
+                   "re-setting current gid must succeed");
+        assert_eq!(unsafe { libc::geteuid() }, euid, "identity must not change");
+    }
 
     // `can_traverse` must report true for a 0700 dir owned by the user (the common "sandbox user owns the project" case) and false when neither
     // owner/group/other grants execute.

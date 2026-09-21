@@ -138,6 +138,14 @@ fn install_death_tracking() {
     {
         // If our parent (the tmux pane / shell) dies, ask the kernel to send us
         // SIGHUP so we tear down cleanly instead of lingering.
+        //
+        // `prctl(PR_SET_PDEATHSIG)` is Linux-only: macOS/BSD have no equivalent
+        // (the nearest thing is a kqueue NOTE_EXIT watch on the parent pid, or
+        // simply re-checking `getppid()`), so on those platforms we skip the
+        // request. The SIGHUP handler below is still installed, and callers that
+        // receive a SIGHUP from elsewhere (an explicit `kill`, a terminal
+        // hangup) tear down exactly as on Linux.
+        #[cfg(target_os = "linux")]
         unsafe {
             let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGHUP);
         }

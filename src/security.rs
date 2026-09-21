@@ -1802,6 +1802,10 @@ pub fn queue_request(d: &Denial) {
 // Submodules (platform-specific)
 // ===========================================================================
 
+/// Unix backend for the security module: the path-heuristic `Platform` impl and
+/// the headless deferred-denial queue. Deliberately free of Linux-specific
+/// syscalls (no namespaces, no `setresuid`), so plain `unix` is the right gate
+/// and macOS/Darwin gets it too.
 #[cfg(unix)]
 pub mod unix;
 /// Auto-approve / auto-deny rules for the `/quarantine` review.
@@ -1814,23 +1818,165 @@ pub mod windows;
 pub mod privilege;
 /// Overlayfs-backed write quarantine: stage the agent's writes into an overlay
 /// `upperdir` so the real filesystem is untouched until the operator reviews +
-/// applies them. On by default when the launcher can mount (root). Unix-only
-/// (overlayfs / mount namespaces); not compiled on Windows yet.
-#[cfg(unix)]
+/// applies them. On by default when the launcher can mount (root).
+///
+/// **Linux-only.** It is built on mount namespaces (`unshare`, `CLONE_NEWNS`,
+/// `MS_PRIVATE`/`MS_REC`) which Linux has and the other unixes do not: macOS
+/// has no `unshare`/`CLONE_NEW*` at all. Gating on `target_os = "linux"`
+/// rather than a blanket `unix` keeps macOS from picking up Linux syscalls it
+/// cannot compile (let alone run) — see the truthful stub just below.
+#[cfg(target_os = "linux")]
 pub mod overlay;
 
-/// Windows stub for the overlayfs write-quarantine: mount namespaces don't
-/// exist here, so no overlay is ever engaged. Inert-but-truthful shims keep
-/// the cross-platform policy UI compiling; every predicate reports the real
-/// state (inactive), and teardown is a no-op success.
-#[cfg(not(unix))]
+/// Stub for the overlayfs write-quarantine on every platform that lacks Linux
+/// mount namespaces (Windows, macOS). No overlay is ever engaged, so the shims
+/// stay inert-but-truthful: every predicate reports the real state (inactive)
+/// and teardown is a no-op success. This keeps the cross-platform policy UI
+/// compiling without pretending the sandbox is available — the banner reports
+/// "not physically engaged" rather than silently claiming protection.
+#[cfg(not(target_os = "linux"))]
 pub mod overlay {
-    pub struct Quarantine;
-    impl Quarantine {
-        pub fn staged(&self) -> Vec<std::path::PathBuf> {
-            Vec::new()
+    use std::path::PathBuf;
+
+    /// Mirrors the Linux backend's error type so callers compile unchanged.
+    /// Nothing here ever constructs one: every fallible operation on a
+    /// platform without mount namespaces is an intentional no-op success.
+    #[derive(Debug)]
+    pub enum OverlayError {
+        Unsupported(String),
+    }
+
+    impl std::fmt::Display for OverlayError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                OverlayError::Unsupported(s) => write!(f, "overlay unsupported: {s}"),
+            }
         }
     }
+
+    /// Truthful engagement report. Every field is false: no quarantine is ever
+    /// physically mounted without Linux mount namespaces.
+    #[derive(Default, Clone, Copy)]
+    pub struct Engagement;
+    impl Engagement {
+        pub fn any(&self) -> bool {
+            false
+        }
+        pub fn engaged_list(&self) -> String {
+            "none".to_string()
+        }
+    }
+
+    /// The inert stand-in for a mounted quarantine. It carries no trees and no
+    /// staging dir because nothing is ever staged — the security model falls
+    /// back to the in-process (Yellow/ask) guard instead.
+    #[derive(Default)]
+    pub struct Quarantine;
+
+    impl Quarantine {
+        /// Policy-independent constructor, mirroring the Linux signature so
+        /// callers compile unchanged. The policy is deliberately ignored: on a
+        /// platform without mount namespaces there is no way to honour it, and
+        /// pretending otherwise would be a security lie.
+        pub fn from_policy(_policy: &crate::security::SecurityPolicy) -> Quarantine {
+            Quarantine
+        }
+
+        /// No mount namespaces: mounting is an explicit, reported failure so
+        /// the caller takes its "quarantine unavailable" branch and warns the
+        /// operator instead of silently recording success.
+        pub fn mount(&mut self) -> Result<usize, OverlayError> {
+            Err(OverlayError::Unsupported(
+                "mount namespaces are Linux-only".to_string(),
+            ))
+        }
+
+        /// Always "not physically engaged" — the honest answer, so the banner
+        /// never claims protection this platform cannot provide.
+        pub fn manifest(&self) -> String {
+            "(write-quarantine not supported on this platform)".to_string()
+        }
+        pub fn apply(&self) -> Result<usize, OverlayError> {
+            Ok(0)
+        }
+        pub fn discard(&self) -> Result<(), OverlayError> {
+            Ok(())
+        }
+        pub fn teardown(&self) -> Result<(), OverlayError> {
+            Ok(())
+        }
+        pub fn staged(&self) -> Vec<PathBuf> {
+            Vec::new()
+        }
+        pub fn staged_count(&self) -> usize {
+            0
+        }
+    }
+
+    pub fn quarantine_engagement() -> Engagement {
+        Engagement
+    }
+
+    /// No mount namespaces here: entering one is a reported failure, which is
+    /// exactly how the callers interpret it (they skip the quarantine path).
+    pub fn enter_private_mount_ns() -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "mount namespaces are Linux-only",
+        ))
+    }
+
+    pub fn overlay_available() -> bool {
+        false
+    }
+    pub fn home_quarantine_wanted() -> bool {
+        false
+    }
+    pub fn project_quarantine_wanted() -> bool {
+        false
+    }
+
+    pub fn mount_home_quarantine() -> Result<(), OverlayError> {
+        Ok(())
+    }
+    pub fn mount_project_quarantine(_root: &std::path::Path, _whitelist: &std::path::Path) -> Result<(), OverlayError> {
+        Ok(())
+    }
+
+    pub fn set_active(_q: Quarantine) {}
+    pub fn with_active<T>(_: impl FnOnce(&mut Quarantine) -> T) -> Option<T> {
+        None
+    }
+
+    pub fn manifest_active() -> String {
+        "(write-quarantine not supported on this platform)".to_string()
+    }
+    pub fn apply_active() -> Result<usize, OverlayError> {
+        Ok(0)
+    }
+    pub fn discard_active() -> Result<(), OverlayError> {
+        Ok(())
+    }
+    pub fn teardown_active() -> Result<(), String> {
+        Ok(())
+    }
+    pub fn quarantine_status() -> String {
+        "write-quarantine unavailable: this platform has no mount-namespace support".to_string()
+    }
+
+    pub fn container_manifest() -> String {
+        "(no container quarantine)".to_string()
+    }
+    pub fn container_entry_path(_idx: usize) -> Option<PathBuf> {
+        None
+    }
+    pub fn container_apply(_only: Option<usize>) -> Result<(usize, usize), OverlayError> {
+        Ok((0, 0))
+    }
+    pub fn container_discard(_only: Option<usize>) -> Result<usize, OverlayError> {
+        Ok(0)
+    }
+
     pub fn container_engaged() -> bool {
         false
     }
@@ -1843,10 +1989,20 @@ pub mod overlay {
     pub fn project_quarantine_engaged() -> bool {
         false
     }
-    pub fn with_active<T>(_: impl FnOnce(&Quarantine) -> T) -> Option<T> {
-        None
+
+    pub fn project_active_manifest() -> String {
+        "(no project quarantine)".to_string()
     }
-    pub fn teardown_active() -> Result<(), String> {
+    pub fn project_active_apply() -> Result<usize, OverlayError> {
+        Ok(0)
+    }
+    pub fn project_active_discard() -> Result<(), OverlayError> {
+        Ok(())
+    }
+    pub fn project_active_suspend() -> Result<(), OverlayError> {
+        Ok(())
+    }
+    pub fn project_active_resume() -> Result<(), OverlayError> {
         Ok(())
     }
     pub fn project_active_staged_count() -> usize {
@@ -1863,7 +2019,7 @@ pub mod overlay {
 /// the no-driver staging manifest store. Used by the security banner so it
 /// never claims "quarantine on" merely because the config flag is set.
 pub fn quarantine_engaged_surface() -> (bool, String) {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         let e = overlay::quarantine_engagement();
         if e.any() {
@@ -1872,10 +2028,17 @@ pub fn quarantine_engaged_surface() -> (bool, String) {
             (false, "none".into())
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
         let on = crate::security::windows::staging::staging_engaged();
         if on { (true, "staging".into()) } else { (false, "none".into()) }
+    }
+    // Non-Linux unixes (macOS/Darwin): no mount namespaces to mount an overlay
+    // into, so the quarantine is never physically engaged. Report that plainly
+    // rather than echoing the config flag.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        (false, "none".into())
     }
 }
 
