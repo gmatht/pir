@@ -453,18 +453,24 @@ impl Client {
                 if !url.ends_with("/chat/completions") && !url.contains('?') {
                     url.push_str("/chat/completions");
                 }
-                (
-                    url,
-                    json!({
-                        "model": model,
-                        "stream": false,
-                        max_key: max_out,
-                        "messages": [
-                            { "role": "system", "content": system },
-                            { "role": "user", "content": prompt },
-                        ],
-                    }),
-                )
+                // Build the object with an explicit `Map` so `max_key` is
+                // inserted as the *value* of the variable ("max_tokens" for
+                // classic models, "max_completion_tokens" for o-series/gpt-5).
+                // A bare `max_key:` inside `json!` emits a literal "max_key"
+                // field, silently dropping the output cap (the bug this fixes);
+                // `openai_request` already builds its body this `Map` way.
+                let mut obj = Map::new();
+                obj.insert("model".into(), json!(model));
+                obj.insert(max_key.into(), json!(max_out));
+                obj.insert("stream".into(), json!(false));
+                obj.insert(
+                    "messages".into(),
+                    json!([
+                        { "role": "system", "content": system },
+                        { "role": "user", "content": prompt },
+                    ]),
+                );
+                (url, Value::Object(obj))
             }
             ApiKind::OpenAiResponses => {
                 let mut url = self.base_url.trim_end_matches('/').to_string();
@@ -4105,6 +4111,83 @@ mod tests {
             "both lines appended: {body:?}"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn complete_with_uses_the_real_max_tokens_key() {
+        // Regression: the OpenAI branch of `complete_with` built its body with
+        // a bare `max_key: max_out` inside `json!`. In serde_json that is a
+        // literal key, so the request went out as `"max_key": 77` and the real
+        // cap (`max_tokens` / `max_completion_tokens`) was never sent — the
+        // provider silently used its default. Capture the body off the wire and
+        // assert the provider-specific key is present and the placeholder gone.
+        if lsb_curl::Curl::load().is_err() {
+            eprintln!("SKIP: no loadable libcurl");
+            return;
+        }
+        use std::io::{Read as _, Write as _};
+        fn captured_body(model: &str) -> String {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().unwrap().to_string();
+            let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+            let cap_srv = captured.clone();
+            let srv = thread::spawn(move || {
+                let (mut sock, _) = listener.accept().expect("accept");
+                sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let head_end = loop {
+                    let n = sock.read(&mut tmp).expect("read");
+                    if n == 0 {
+                        break 0;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(p) = find_subslice(&buf, b"\r\n\r\n") {
+                        break p + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                while buf.len() < head_end + len {
+                    let n = sock.read(&mut tmp).expect("read body");
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                *cap_srv.lock().unwrap() = buf[head_end..].to_vec();
+                let body = br#"{"choices":[{"message":{"content":"ok"}}]}"#;
+                let _ = sock.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = sock.write_all(body);
+                let _ = sock.flush();
+            });
+            let client = Client::new(ApiKind::OpenAi, &format!("http://{addr}"), "k".to_string());
+            let out = client.complete_with(model, "sys", "hi", 77);
+            assert!(out.is_ok(), "complete_with must succeed: {out:?}");
+            srv.join().expect("server");
+            String::from_utf8_lossy(&captured.lock().unwrap()).to_string()
+        }
+
+        let classic = captured_body("gpt-4o-mini");
+        assert!(classic.contains("\"max_tokens\":77"), "classic body: {classic}");
+        assert!(!classic.contains("max_key"), "placeholder leaked: {classic}");
+
+        let reasoning = captured_body("o3-mini");
+        assert!(
+            reasoning.contains("\"max_completion_tokens\":77"),
+            "o-series body: {reasoning}"
+        );
+        assert!(!reasoning.contains("max_key"), "placeholder leaked: {reasoning}");
     }
 
     #[test]
