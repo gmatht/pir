@@ -1,0 +1,21 @@
+[package]
+name = "lsb-curl"
+version = "0.1.0"
+edition = "2021"
+description = "Runtime-loaded libcurl (libcurl.so.4) HTTP/HTTPS client wrapper for LSB compatibility"
+license = "MIT"
+
+[dependencies]
+# NOTE (vendored): upstream uses `lsb-loader = { workspace = true }`
+# (easyp-subtree workspace). The vendored copy points at the sibling
+# vendored crate instead so pir builds without that workspace.
+lsb-loader = { path = "../lsb-loader" }
+thiserror = "1.0"
+
+[lib]
+name = "lsb_curl"
+path = "src/lib.rs"
+
+[[test]]
+name = "http"
+path = "tests/http.rs"

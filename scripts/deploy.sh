@@ -520,10 +520,16 @@ $BIN --help >/dev/null 2>&1 || die "--help exited non-zero"
 say "  --help ok"
 
 # With no API key the provider/config path must fail gracefully (no panic).
+# Run against a THROWAWAY PI_DIR with no catalog: otherwise this dev box's
+# own ~/.pi (which may carry a usable provider — e.g. a local/fake entry) lets
+# the one-shot *succeed*, and the guard fires on a perfectly healthy binary.
+# A scratch dir guarantees "no credentials, no providers" is actually tested.
 rc=0
+SMOKE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pir-smoke.XXXXXX")"
 dbg "spawning one-shot with no API key (expect graceful non-zero exit, no panic)"
-env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u PI_MODEL \
+env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u PI_MODEL PI_DIR="$SMOKE_DIR" \
   bash -c "echo '' | '$BIN' >/dev/null 2>&1" || rc=$?
+rm -rf "$SMOKE_DIR"
 if [ "$rc" -eq 0 ]; then
   die "one-shot with no API key unexpectedly succeeded (expected graceful failure)"
 fi
