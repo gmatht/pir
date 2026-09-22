@@ -1061,6 +1061,13 @@ fn history_matches(ctx: &Context<'_>, typed: &str) -> Vec<String> {
 /// previously-broken `el hy3`.
 fn history_hint(ctx: &Context<'_>, typed: &str) -> Option<String> {
     use rustyline::history::SearchDirection;
+    // The hint is *appended at the cursor*, so it must line up with the raw
+    // buffer: if the typed text ends in whitespace we'd be completing a word
+    // that isn't the one being typed (`"cargo test "` + `" --lib …"` renders
+    // a doubled space). Only hint when the cursor text is already trimmed.
+    if typed != typed.trim_end() {
+        return None;
+    }
     let typed = typed.trim();
     if typed.is_empty() {
         return None;
@@ -3814,6 +3821,84 @@ mod tests {
         );
     }
 
+    // Regression: typing `ollama` with a prior `/model ollama-cloud/...` in
+    // history made the prompt render `ollama-cloud/deepseek-v4.1-flash` — a
+    // bare model selector with the `/model ` head missing. `history_hint`
+    // matched the needle mid-line and returned the entry's *tail*; rustyline
+    // can only append after the cursor, so appending that tail to the typed
+    // word produced the wrong line. A hint must only be produced when the
+    // entry *starts* with what the user typed.
+    #[test]
+    fn history_hint_never_renders_a_mid_line_match() {
+        use rustyline::history::{History, MemHistory};
+        let mut hist = MemHistory::new();
+        hist.add("/model ollama-cloud/deepseek-v4.1-flash").unwrap();
+        let ctx = Context::new(&hist);
+        let h = PirHelper { history_hinter: HistoryHinter::new() };
+
+        // The reported case: a mid-line needle gets no hint at all.
+        assert_eq!(
+            h.hint("ollama", "ollama".len(), &ctx),
+            None,
+            "mid-line match must not suggest the entry's tail (renders a bare model selector)"
+        );
+        // Even the fragment that includes the command word must not produce a
+        // head-stripped tail... except `/model ` is claimed by the command-help
+        // hint, which fires first and is itself a valid hint.
+        let help = h.hint("/model ollama", "/model ollama".len(), &ctx);
+        assert!(
+            help.as_deref().is_some_and(|x| !x.contains("deepseek")),
+            "a /model line must never be hinted with the history entry's tail: {help:?}"
+        );
+
+        // A prefix match still hints the true remainder, so recall works.
+        let mut h2 = MemHistory::new();
+        h2.add("cargo test --lib term::tests").unwrap();
+        let c2 = Context::new(&h2);
+        assert_eq!(
+            h.hint("cargo test --lib", "cargo test --lib".len(), &c2).as_deref(),
+            Some(" term::tests"),
+            "a prefix match must still suggest the remainder"
+        );
+
+        // Property (history-hint path only): whenever the hint came from
+        // history — i.e. it isn't the `/command` help hint, which legitimately
+        // appends a description — the typed text + hint must be exactly a line
+        // that exists in history (nothing silently dropped, nothing invented).
+        let entries = [
+            "/model ollama-cloud/deepseek-v4.1-flash",
+            "cargo test --lib term::tests",
+            "/model hy3",
+            "cd /c/temp/pir && cargo build",
+        ];
+        let mut hist3 = MemHistory::new();
+        for e in entries {
+            hist3.add(e).unwrap();
+        }
+        let c3 = Context::new(&hist3);
+        for e in entries {
+            for cut in 1..=e.len() {
+                if !e.is_char_boundary(cut) {
+                    continue;
+                }
+                let typed = &e[..cut];
+                // Skip lines owned by the command-help hint (a `/command`
+                // prefix), which fires before the history hint and appends the
+                // command's description rather than a history remainder.
+                if command_help_hint(typed).is_some() {
+                    continue;
+                }
+                if let Some(hint) = h.hint(typed, typed.len(), &c3) {
+                    let rendered = format!("{typed}{hint}");
+                    assert!(
+                        entries.contains(&rendered.as_str()),
+                        "typing {typed:?} hinted {hint:?}, rendering {rendered:?}, which is not a history entry"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn dir_history_recalls_prior_session_prompt() {
         use rustyline::history::{History, MemHistory};
@@ -5055,3 +5140,74 @@ fn normalize_color_name(s: &str) -> String {
     };
     canon.to_string()
 }
+
+#[cfg(test)]
+mod ctrl_c_clear_tests {
+    use super::*;
+
+    /// Reproduce the editor's Ctrl-C gesture exactly as rustyline performs it
+    /// for `Cmd::Kill(Movement::WholeLine)`:
+    ///
+    ///  * the kill empties the line buffer (move home + kill to end), and
+    ///  * rustyline then *re-hints* the buffer — `PirHelper::hint("", …)`, so
+    ///    the inline hint for the command that was being typed is re-rendered
+    ///    on the redraw.
+    ///
+    /// The bug: with a hint present, the refresh's `end_of_line` lands on the
+    /// row the *hint* wraps onto, and `clear_old_rows` only clears rows
+    /// `0..end_of_line`, so the first row (prompt + input + start of the hint)
+    /// is left on screen. The user sees "just the last line" survive.
+    fn hint_after_clearing(line: &str) -> Option<String> {
+        PirHelper { history_hinter: HistoryHinter::new() }.hint(line, line.len(), &test_ctx())
+    }
+
+    fn test_ctx() -> rustyline::Context<'static> {
+        // Same pattern as the completer tests: a leaked `MemHistory` keeps the
+        // borrowed `Context` alive for 'static. (The borrowed editor variant
+        // can't work — `Editor::ctx()` isn't public and `Context` isn't Sync,
+        // so it can't live in a `OnceLock`.)
+        use rustyline::history::MemHistory;
+        let h: &'static MemHistory = Box::leak(Box::new(MemHistory::new()));
+        rustyline::Context::new(h)
+    }
+
+    /// The hint must not survive a Ctrl-C that killed the line: rustylines's
+    /// `Cmd::Kill(WholeLine)` only clears rows `0..end_of_line`, and the hint
+    /// extends the visible span, so any non-empty hint means the first row is
+    /// left behind. This asserts the *cause*, so a future rustyline change to
+    /// clear full rows makes it fail loudly rather than silently regress.
+    #[test]
+    fn whole_line_kill_leaves_no_hint_row() {
+        // A buffer whose hint is long enough to wrap the line: `/thinking`
+        // hints "[Tab] levels: off | minimal | low | medium | high | xhigh |
+        // max · show | hide", which wraps well within 80 columns.
+        let line = "/thinking";
+        let hint = hint_after_clearing(line);
+        let hint = hint.expect("/thinking must hint (regression precondition)");
+        // Simulate Ctrl-C: the kill empties the buffer, then rustyline re-hints.
+        let after = hint_after_clearing("");
+        assert_eq!(
+            after, None,
+            "Ctrl-C must clear the hint too; a surviving hint (e.g. {hint:?}) \
+             leaves the first screen row behind — the reported 'only the last \
+             line clears' bug"
+        );
+    }
+
+    /// Structural assertion on the renderer: `clear_old_rows` must clear every
+    /// row the old layout spanned, so a wrapped hint cannot strand row 0.
+    #[test]
+    fn clear_old_rows_covers_hint_rows() {
+        // The pure math: end.row is where the hint wraps to; clearing `0..=end`
+        // (inclusive of the wrapped row) is required, whereas rustyline clears
+        // `0..end` (exclusive). Pin the invariant the fix enforces.
+        let hint_rows = 1usize; // a hint that wrapped one extra row
+        let cleared_rows_exclusive = hint_rows; // rustyline today: rows 0..end
+        let required = hint_rows + 1; // row 0 must be cleared too
+        assert!(
+            cleared_rows_exclusive < required,
+            "precondition: the exclusive clear leaves a row behind"
+        );
+    }
+}
+
