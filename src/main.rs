@@ -1784,7 +1784,30 @@ pub(crate) fn run_foreground_turn(
     let quiet_handle = quiet_handle.clone();
     thread::spawn(move || {
         cancel.store(false, Ordering::SeqCst);
-        let mut a = slot.lock().unwrap().take().expect("agent present");
+        // The agent must be in the slot. If it isn't, another foreground turn
+        // is still running: two launches raced, or the previous worker's
+        // `done.try_send` was lost (the bounded channel was full) so the REPL
+        // never waited for it to put the agent back. Panicking here kills this
+        // worker *and* leaves the racing turn to finish into a slot that then
+        // gets emptied again — every later prompt panics. So wait briefly for
+        // the owner to return the agent; only give up (loudly, and without
+        // consuming an agent we don't own) if it never does.
+        let mut a = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if let Some(a) = slot.lock().unwrap().take() {
+                    break a;
+                }
+                if std::time::Instant::now() >= deadline {
+                    eprintln!(
+                        "pir: cannot start turn: another turn still owns the agent (dropping this prompt)"
+                    );
+                    let _ = done.send(());
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
         // Hand the worker the shared quiet switch so the REPL can detach this
         // turn to the background mid-flight without owning the agent.
         a.set_quiet_handle(quiet_handle);
@@ -1793,9 +1816,16 @@ pub(crate) fn run_foreground_turn(
             Err(e) => a.error_event(e),
         };
         a.notify_on_exit(ev);
+        // Return the agent *before* signalling `done`: the REPL may launch the
+        // next turn the instant it sees the wake, and that turn must find the
+        // agent in the slot. The channel is bounded(1) with the REPL draining
+        // eagerly; if it *is* full (a stale, unread tick), block on the next
+        // tick instead of `try_send`-and-drop — a lost wake means the REPL
+        // never joins this handle and never learns the agent is free again.
         *slot.lock().unwrap() = Some(a);
-        // Wake the REPL's event-driven wait so it joins this handle immediately.
-        let _ = done.try_send(());
+        if done.try_send(()).is_err() {
+            let _ = done.send(());
+        }
     })
 }
 
