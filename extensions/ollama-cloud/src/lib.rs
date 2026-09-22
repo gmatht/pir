@@ -538,17 +538,32 @@ mod tests {
         // SAFETY: edition 2024 marks env mutation unsafe; pir confines
         // it to startup config and explicit session toggles.
         unsafe { std::env::remove_var("OLLAMA_API_KEY"); }
-        // Ensure no auth.json / ollama-cloud.json in HOME during the test.
+        // Ensure no auth.json / ollama-cloud.json is found during the test.
+        // `config::pi_dir()` now prefers `PI_DIR` then `PIR_INVOKING_HOME` over
+        // `$HOME` (so a sandbox HOME can't shadow the operator's config), so a
+        // HOME swap alone no longer isolates the lookup — clear all three.
+        let old_pidir = std::env::var_os("PI_DIR");
+        let old_invoker = std::env::var_os("PIR_INVOKING_HOME");
         let dir = std::env::temp_dir().join("pir-test-no-ollama");
         let _ = std::fs::create_dir_all(&dir);
         // SAFETY: edition 2024 marks env mutation unsafe; pir confines
         // it to startup config and explicit session toggles.
-        unsafe { std::env::set_var("HOME", &dir); }
+        unsafe {
+            std::env::remove_var("PI_DIR");
+            std::env::remove_var("PIR_INVOKING_HOME");
+            std::env::set_var("HOME", &dir);
+        }
         let r = show_usage();
+        // Restore before asserting so a failure can't leak env into other tests.
+        match old_pidir {
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        match old_invoker {
+            Some(v) => unsafe { std::env::set_var("PIR_INVOKING_HOME", v) },
+            None => unsafe { std::env::remove_var("PIR_INVOKING_HOME") },
+        }
         assert!(r.is_error);
         assert!(r.content.contains("No Ollama Cloud API key"), "got: {}", r.content);
-        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
-        // it to startup config and explicit session toggles.
-        unsafe { std::env::set_var("HOME", "/"); } // harmless restore (tests don't depend on it)
     }
 }
