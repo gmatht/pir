@@ -1648,6 +1648,11 @@ fn main() {
             term::set_prefill(&partial);
         }
         let res = term::read_line("❯ ");
+        // Ctrl-C cleared the line, but rustyline's relative-row redraw can
+        // leave the tail of the inline hint behind when the cursor drifted
+        // off its bookkeeping; wipe the idle zone absolutely so nothing from
+        // the previous prompt/hint survives. See [`term::clear_input_zone`].
+        term::clear_input_zone();
         match res {
             None => {
                 println!();

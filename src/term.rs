@@ -536,6 +536,51 @@ pub fn erase_footer() {
     let _ = out.flush();
 }
 
+/// Clear the idle input zone with absolute addressing, so no stale hint line
+/// survives a Ctrl-C.
+///
+/// rustyline's `refresh_line` clears the *previous* layout by relative motion
+/// (`ESC[1B`/`ESC[A`) and `ESC[K`, which assumes the hardware cursor is still
+/// exactly where that layout left it. pir breaks that assumption every idle
+/// tick: [`draw_footer`] saves/restores the cursor around its own write and
+/// [`open_input_zone`] re-parks the cursor, so when the user pauses mid-typing
+/// the cursor can sit a row off from where rustyline thinks it is. The clear
+/// then lands one row short and the tail of the inline hint (e.g.
+/// `/thinking`'s `<level> [show|hide] — …`) stays on screen while the prompt
+/// above it is redrawn — the reported "Ctrl-C only clears the last line".
+///
+/// Rather than depend on rustyline's internal cursor bookkeeping, we wipe the
+/// rows the idle zone can occupy from the *last* one upwards with absolute
+/// `ESC[<row>;1H ESC[2K` moves. The prompt line is redrawn immediately after
+/// by the next `open_input_zone`/footer pass. No-op without a tty.
+pub fn clear_input_zone() {
+    if !is_terminal() {
+        return;
+    }
+    let h = terminal_height();
+    let mut out = io::stdout();
+    let _ = out.write_all(input_zone_clear_seq(h).as_bytes());
+    let _ = out.flush();
+}
+
+/// Bytes that erase the idle input zone for a screen `h` rows tall: absolute
+/// `ESC[<row>;1H ESC[2K` for every row from the prompt row to the bottom.
+/// Pure, so [`clear_input_zone`]'s contract is testable without a tty.
+///
+/// The idle zone is the top hrule, the prompt (which can wrap over several
+/// rows once an inline hint follows it), and the footer on the bottom row.
+/// Wiping down to the last row is what removes a wrapped hint tail; absolute
+/// addressing is what makes it independent of where rustyline thinks the
+/// cursor is (see [`clear_input_zone`]).
+fn input_zone_clear_seq(h: usize) -> String {
+    let prompt_row = h.saturating_sub(1).max(1);
+    let mut buf = String::new();
+    for row in prompt_row..=h {
+        buf.push_str(&format!("\x1b[{row};1H\x1b[2K"));
+    }
+    buf
+}
+
 /// Query the current cursor row (1-based) via DSR `\x1b[6n`. Returns `None`
 /// when the terminal doesn't answer within a short window (or stdin isn't a
 /// tty). Used by the REPL to decide whether the prompt needs pushing up so the
@@ -5142,72 +5187,33 @@ fn normalize_color_name(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod ctrl_c_clear_tests {
-    use super::*;
-
-    /// Reproduce the editor's Ctrl-C gesture exactly as rustyline performs it
-    /// for `Cmd::Kill(Movement::WholeLine)`:
+mod clear_input_zone_tests {
+    /// `clear_input_zone` must wipe every row the idle input zone can occupy,
+    /// from the prompt row down to the bottom row, using absolute addressing.
+    /// This is the fix for "Ctrl-C only clears the last line": rustyline's
+    /// relative-row redraw can leave the wrapped tail of the inline hint on
+    /// screen (e.g. `/thinking`'s `<level> [show|hide] — …`), so the caller
+    /// wipes the zone itself instead of trusting rustyline's cursor math.
     ///
-    ///  * the kill empties the line buffer (move home + kill to end), and
-    ///  * rustyline then *re-hints* the buffer — `PirHelper::hint("", …)`, so
-    ///    the inline hint for the command that was being typed is re-rendered
-    ///    on the redraw.
-    ///
-    /// The bug: with a hint present, the refresh's `end_of_line` lands on the
-    /// row the *hint* wraps onto, and `clear_old_rows` only clears rows
-    /// `0..end_of_line`, so the first row (prompt + input + start of the hint)
-    /// is left on screen. The user sees "just the last line" survive.
-    fn hint_after_clearing(line: &str) -> Option<String> {
-        PirHelper { history_hinter: HistoryHinter::new() }.hint(line, line.len(), &test_ctx())
-    }
+    /// The sequence is pure (no I/O), so assert on the real helper's bytes.
+    use super::input_zone_clear_seq as zone_clear_seq;
 
-    fn test_ctx() -> rustyline::Context<'static> {
-        // Same pattern as the completer tests: a leaked `MemHistory` keeps the
-        // borrowed `Context` alive for 'static. (The borrowed editor variant
-        // can't work — `Editor::ctx()` isn't public and `Context` isn't Sync,
-        // so it can't live in a `OnceLock`.)
-        use rustyline::history::MemHistory;
-        let h: &'static MemHistory = Box::leak(Box::new(MemHistory::new()));
-        rustyline::Context::new(h)
-    }
-
-    /// The hint must not survive a Ctrl-C that killed the line: rustylines's
-    /// `Cmd::Kill(WholeLine)` only clears rows `0..end_of_line`, and the hint
-    /// extends the visible span, so any non-empty hint means the first row is
-    /// left behind. This asserts the *cause*, so a future rustyline change to
-    /// clear full rows makes it fail loudly rather than silently regress.
     #[test]
-    fn whole_line_kill_leaves_no_hint_row() {
-        // A buffer whose hint is long enough to wrap the line: `/thinking`
-        // hints "[Tab] levels: off | minimal | low | medium | high | xhigh |
-        // max · show | hide", which wraps well within 80 columns.
-        let line = "/thinking";
-        let hint = hint_after_clearing(line);
-        let hint = hint.expect("/thinking must hint (regression precondition)");
-        // Simulate Ctrl-C: the kill empties the buffer, then rustyline re-hints.
-        let after = hint_after_clearing("");
-        assert_eq!(
-            after, None,
-            "Ctrl-C must clear the hint too; a surviving hint (e.g. {hint:?}) \
-             leaves the first screen row behind — the reported 'only the last \
-             line clears' bug"
-        );
+    fn wipes_prompt_row_through_bottom() {
+        // A 24-row screen: the prompt sits on row 23 and the footer on row 24,
+        // so both must be erased (a hint can wrap onto row 24).
+        let seq = zone_clear_seq(24);
+        assert!(seq.contains("\x1b[23;1H\x1b[2K"), "prompt row not cleared: {seq:?}");
+        assert!(seq.contains("\x1b[24;1H\x1b[2K"), "bottom row not cleared: {seq:?}");
+        // Absolute addressing only — no relative motion that could drift.
+        assert!(!seq.contains("\x1b[A") && !seq.contains("\x1b[B"), "relative motion in {seq:?}");
     }
 
-    /// Structural assertion on the renderer: `clear_old_rows` must clear every
-    /// row the old layout spanned, so a wrapped hint cannot strand row 0.
     #[test]
-    fn clear_old_rows_covers_hint_rows() {
-        // The pure math: end.row is where the hint wraps to; clearing `0..=end`
-        // (inclusive of the wrapped row) is required, whereas rustyline clears
-        // `0..end` (exclusive). Pin the invariant the fix enforces.
-        let hint_rows = 1usize; // a hint that wrapped one extra row
-        let cleared_rows_exclusive = hint_rows; // rustyline today: rows 0..end
-        let required = hint_rows + 1; // row 0 must be cleared too
-        assert!(
-            cleared_rows_exclusive < required,
-            "precondition: the exclusive clear leaves a row behind"
-        );
+    fn tiny_screen_never_emits_row_zero() {
+        // row 0 would be an invalid CUP target; the clamp keeps it at 1.
+        let seq = zone_clear_seq(1);
+        assert!(seq.contains("\x1b[1;1H\x1b[2K"), "got {seq:?}");
+        assert!(!seq.contains("\x1b[0;"), "emitted an invalid row 0: {seq:?}");
     }
 }
-
