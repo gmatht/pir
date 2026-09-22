@@ -1086,9 +1086,28 @@ fn history_hint(ctx: &Context<'_>, typed: &str) -> Option<String> {
         if e.trim().is_empty() {
             continue;
         }
-        // Find the *first* occurrence of the needle anywhere in the line, then
-        // suggest the remainder *after that match* — not after the line start.
+        // Find the *first* occurrence of the needle anywhere in the line.
+        //
+        // rustyline can only *append* the hint after the cursor, so the hint
+        // has to be "everything of the entry that is not already on screen".
+        // The entry was matched mid-line (`ollama` inside
+        // `/model ollama-cloud/deepseek-v4.1-flash`), and the text *before*
+        // the match is missing from the buffer just as much as the text after
+        // it. Returning only `get(pos + typed.len()..)` therefore rendered the
+        // entry's tail (`-cloud/deepseek-v4.1-flash`) appended to the typed
+        // word, so the visible line read `ollama-cloud/deepseek-v4.1-flash` —
+        // the `/model ` head was silently dropped.
+        //
+        // Only suggest when the *head* of the entry is what the user is
+        // typing (i.e. the match starts where their text does): then the
+        // remainder is exactly the missing tail and appending it reproduces
+        // the whole entry. For a mid-line match we cannot express the missing
+        // head as an append, so decline (Tab-completion, which *replaces* the
+        // fragment, is the right affordance there — see `history_matches`).
         if let Some(pos) = e.to_ascii_lowercase().find(&needle) {
+            if pos != 0 {
+                return None;
+            }
             if let Some(rest) = e.get(pos + typed.len()..)
                 && !rest.is_empty() {
                     return Some(rest.to_string());
@@ -3820,10 +3839,22 @@ mod tests {
             matches.contains(&"/model hy3".to_string()),
             "expected /model hy3 in completions, got: {matches:?}"
         );
-        // Inline hint: typing `hy` should suggest `3` (remainder after the
-        // match inside `/model hy3`), not `el hy3`.
+        // Inline hint: a mid-line match must NOT be hinted. rustyline can only
+        // *append* after the cursor, so the only thing it could suggest for a
+        // match inside `/model hy3` is the tail (`3`) — which renders the line
+        // as `hy3` and silently drops the `/model ` head. Tab-completion above
+        // is the affordance that *replaces* the fragment, so the hint declines.
         let hint = h.hint("hy", "hy".len(), &ctx);
-        assert_eq!(hint.as_deref(), Some("3"), "got hint: {hint:?}");
+        assert_eq!(hint.as_deref(), None, "mid-line match must not hint: {hint:?}");
+        // A hint is only produced when the entry *starts* with the typed text,
+        // so appending the remainder reproduces the whole entry. (`/model …`
+        // lines can't be used here: `command_help_hint` owns any `/model`
+        // prefix and runs first, so use a plain free-form entry.)
+        let mut hist2 = MemHistory::new();
+        hist2.add("cargo test --lib term::tests").unwrap();
+        let ctx2 = Context::new(&hist2);
+        let hint = h.hint("cargo test --lib", "cargo test --lib".len(), &ctx2);
+        assert_eq!(hint.as_deref(), Some(" term::tests"), "prefix match should hint: {hint:?}");
         // Cleanup: reset global state and remove temp files.
         super::DIR_HISTORY_DIR.with(|d| *d.borrow_mut() = None);
         super::DIR_HISTORY.with(|c| *c.borrow_mut() = None);
