@@ -1,3 +1,18 @@
 /target
 /build
 /.pir
+
+# Local scratch from debugging sessions (not part of the project).
+# Kept out of `git status` so real changes stand out; nothing here is
+# referenced by the build or tests.
+/.resume/
+/.tmp/
+/www/
+/canary
+/canary.txt
+/null
+/mypy.py
+/thinkblanks.py
+/raven.log*
+/raven.stderr*
+/TODO.txt
