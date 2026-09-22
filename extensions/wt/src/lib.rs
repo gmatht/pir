@@ -1930,9 +1930,34 @@ mod tests {
                 .spawn()
                 .unwrap()
         };
-        std::thread::sleep(std::time::Duration::from_millis(150));
 
-        // Holder B should be refused immediately (-w 0 => no wait).
+        // Wait until A *actually holds* the lock, instead of sleeping a guessed
+        // interval. A fixed 150ms was a race: under load `flock` had not yet
+        // acquired (or even reached) the lock when B ran, so B won it and the
+        // test failed intermittently. Poll instead — `flock -n` fails while A
+        // holds it, so the first refusal is proof A is in.
+        let mut held = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            let probe = Command::new("flock")
+                .args(["-x", "-n"])
+                .arg(&lock)
+                .arg("true")
+                .status()
+                .unwrap();
+            if !probe.success() {
+                held = true; // someone (A) is holding it
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            held,
+            "holder A never acquired {lock:?} (the flock under test did not start)"
+        );
+
+        // Holder B should be refused immediately (-w 0 => no wait). This is now
+        // deterministic: A provably holds the lock above.
         let b = Command::new("flock")
             .args(["-x", "-w", "0"])
             .arg(&lock)
