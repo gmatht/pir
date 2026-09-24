@@ -95,6 +95,88 @@ pub fn config_path() -> PathBuf {
     crate::config::pi_dir().join("agent").join("mcp.json")
 }
 
+/// Ready-made server declarations an operator can opt into by name.
+///
+/// These are *suggestions*, not defaults. A default-on server would spawn a
+/// Node process and need the network on every launch — a Context7 cold start
+/// measured 24s here, against a ~1 MB idle footprint that is the whole point of
+/// pir. So nothing here is activated until the operator asks for it.
+///
+/// `pub` so `/mcp init <name>` can write one out and the docs can list them.
+pub fn starters() -> &'static [(&'static str, &'static str, &'static str, &'static [&'static str])] {
+    // (name, description, command, args)
+    &[
+        (
+            "context7",
+            "Up-to-date library documentation (React, Next.js, etc). No API key needed; \
+             first run fetches the server via npx and can take ~20s.",
+            "npx",
+            &["-y", "@upstash/context7-mcp"],
+        ),
+        (
+            "filesystem",
+            "Read/write files under a directory tree (narrower than pir's own tools, \
+             but useful for a scoped sandbox).",
+            "npx",
+            &["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+        ),
+    ]
+}
+
+/// Render the starter servers as a ready-to-paste `mcp.json`, for
+/// `/mcp init [name...]`. With no names, every starter is included.
+pub fn starter_config(names: &[String]) -> Result<String, String> {
+    let all = starters();
+    let chosen: Vec<&(&str, &str, &str, &[&str])> = if names.is_empty() {
+        all.iter().collect()
+    } else {
+        let mut v = Vec::new();
+        for n in names {
+            match all.iter().find(|(name, ..)| name == n) {
+                Some(s) => v.push(s),
+                None => {
+                    let known: Vec<&str> = all.iter().map(|(n, ..)| *n).collect();
+                    return Err(format!(
+                        "unknown MCP starter '{n}' (available: {})",
+                        known.join(", ")
+                    ));
+                }
+            }
+        }
+        v
+    };
+    let mut servers = serde_json::Map::new();
+    for (name, _desc, command, args) in chosen {
+        servers.insert(
+            name.to_string(),
+            json!({ "command": command, "args": args }),
+        );
+    }
+    serde_json::to_string_pretty(&json!({ "servers": servers }))
+        .map_err(|e| format!("could not render the config: {e}"))
+}
+
+/// Write a starter config, creating the parent directory. Refuses to overwrite
+/// an existing file — silently replacing a hand-written server list would be a
+/// hostile thing to do.
+pub fn write_starter_config(path: &Path, names: &[String]) -> Result<String, String> {
+    if path.exists() {
+        return Err(format!(
+            "{} already exists — edit it by hand (or move it aside) rather than having pir \
+             overwrite your server list",
+            path.display()
+        ));
+    }
+    let text = starter_config(names)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, format!("{text}\n"))
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok(text)
+}
+
 /// Load server declarations. A missing file is an empty list (the feature is
 /// simply not configured), never an error.
 pub fn load_config(path: &Path) -> Vec<ServerConfig> {
@@ -538,6 +620,68 @@ mod tests {
         let cfgs = load_config(&p);
         assert_eq!(cfgs.len(), 1);
         assert_eq!(cfgs[0].name, "good");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    /// Starters are suggestions, never defaults: nothing is written until the
+    /// operator asks, and an existing config is never clobbered.
+    #[test]
+    fn starter_config_is_opt_in_and_never_overwrites() {
+        let d = std::env::temp_dir().join(format!("pir_mcp_starter_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let path = d.join("agent").join("mcp.json");
+
+        // Nothing exists yet: writing one starter produces valid JSON naming it.
+        let text = write_starter_config(&path, &["context7".to_string()]).expect("write starter");
+        assert!(path.is_file(), "the config must be written");
+        let cfgs = load_config(&path);
+        assert_eq!(cfgs.len(), 1);
+        assert_eq!(cfgs[0].name, "context7");
+        assert_eq!(cfgs[0].command, "npx");
+        assert!(cfgs[0].args.iter().any(|a| a.contains("context7-mcp")), "{:?}", cfgs[0].args);
+        assert!(text.contains("context7"), "the rendered text should be shown: {text}");
+
+        // Writing again must refuse rather than replace a hand-edited list.
+        let err = write_starter_config(&path, &[]).unwrap_err();
+        assert!(err.contains("already exists"), "got: {err}");
+        assert!(err.contains("overwrite"), "must explain why: {err}");
+        // ...and the original is untouched.
+        assert_eq!(load_config(&path).len(), 1);
+
+        // No names = every starter.
+        let p2 = d.join("agent2").join("mcp.json");
+        write_starter_config(&p2, &[]).expect("all starters");
+        assert_eq!(load_config(&p2).len(), starters().len());
+
+        // An unknown name is rejected with the valid list.
+        let err = write_starter_config(&d.join("x.json"), &["nope".to_string()]).unwrap_err();
+        assert!(err.contains("unknown MCP starter"), "got: {err}");
+        assert!(err.contains("context7"), "must list what is available: {err}");
+        // And nothing was written by the failed attempt.
+        assert!(!d.join("x.json").exists(), "a rejected name must not create a file");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn every_starter_renders_a_valid_config() {
+        // Each declared starter must produce a config pir can actually load —
+        // a starter that doesn't parse would be a trap.
+        let text = starter_config(&[]).expect("render");
+        let v: Value = serde_json::from_str(&text).expect("valid JSON");
+        let servers = v.get("servers").and_then(|s| s.as_object()).expect("servers object");
+        assert!(!servers.is_empty());
+        for (name, spec) in servers {
+            assert!(spec.get("command").and_then(|c| c.as_str()).is_some(), "{name} has no command");
+            assert!(spec.get("args").and_then(|a| a.as_array()).is_some(), "{name} has no args");
+        }
+        // And the loader agrees with the renderer.
+        let d = std::env::temp_dir().join(format!("pir_mcp_render_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        let p = d.join("mcp.json");
+        std::fs::write(&p, &text).unwrap();
+        assert_eq!(load_config(&p).len(), servers.len());
         let _ = std::fs::remove_dir_all(&d);
     }
 

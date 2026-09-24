@@ -451,6 +451,27 @@ At startup each server is spawned, handshaken (`initialize` →
 `notifications/initialized`) and asked for its tools (`tools/list`). `/mcp`
 lists the configured servers and the tools actually available this session.
 
+### Starter servers — opt-in, never default
+
+`/mcp init [name...]` writes a config for a known server (or all of them), and
+refuses to touch an existing `mcp.json` — silently replacing a hand-written
+server list would be a hostile thing to do. `/mcp` with no config lists what is
+available:
+
+| starter | what it gives you |
+|---|---|
+| `context7` | up-to-date library documentation (React, Next.js, …). No API key needed — it publishes `resolve-library-id` and `query-docs`. |
+| `filesystem` | read/write under one directory tree, for a scoped sandbox |
+
+**Nothing is enabled by default, deliberately.** A default-on server spawns a
+child process and needs the network on *every* launch, including sessions that
+never touch it. Measured here: Context7 takes **~24s** to start cold (npx has to
+fetch the package) and ~8s warm, which sits on the critical path before the
+first prompt — against a ~1 MB idle footprint that is the entire point of pir.
+It also adds a runtime-fetched, unpinned third-party dependency to every launch.
+So it is a one-command opt-in, discovered via `/mcp`, at zero cost to anyone who
+does not want it.
+
 ### Failure policy
 
 Starting a server is *untrusted work* — it may not be installed, may crash, may

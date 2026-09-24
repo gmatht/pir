@@ -347,6 +347,8 @@ COMMANDS
   /undo [all]             revert the last file edit (or all) to its pre-edit state
   /mcp                   list configured MCP servers and the tools they provide
                           (configure in ~/.pi/agent/mcp.json; PIR_MCP=0 disables)
+  /mcp init [name...]    write a starter config (e.g. context7 for library docs);
+                          nothing is enabled by default — a server costs startup time
   /checkpoints            list the rewindable turn boundaries (one per turn)
   /rewind <#>             restore the working tree AND the conversation to a
                           checkpoint: every file that turn changed goes back,
@@ -3671,15 +3673,45 @@ fn handle_command(
                 return;
             }
             let path = crate::mcp::config_path();
+            // `/mcp init [name...]` — write a starter config. Opt-in by design:
+            // a default-on server would spawn Node and need the network on every
+            // launch, which is the opposite of pir's footprint argument.
+            if rest.first().copied() == Some("init") {
+                let names: Vec<String> = rest.iter().skip(1).map(|s| s.to_string()).collect();
+                match crate::mcp::write_starter_config(&path, &names) {
+                    Ok(text) => {
+                        println!("{}", term::green(&format!("wrote {}", path.display())));
+                        println!("{text}");
+                        println!(
+                            "{}",
+                            term::dim("restart pir to connect (the server is spawned at startup)")
+                        );
+                    }
+                    Err(e) => eprintln!("pir: {e}"),
+                }
+                return;
+            }
             let servers = crate::mcp::load_config(&path);
             if servers.is_empty() {
                 println!(
                     "{}",
                     term::dim(&format!(
-                        "no MCP servers configured. Create {} with:\n  {{\"servers\": {{\"name\": {{\"command\": \"npx\", \"args\": [\"-y\", \"@modelcontextprotocol/server-filesystem\", \"/tmp\"]}}}}}}",
+                        "no MCP servers configured. Configure {} with either:\n  \
+                         /mcp init                (write every starter server)\n  \
+                         /mcp init context7       (just Context7: library docs, no API key)\n  \
+                         or hand-write {{\"servers\": {{\"name\": {{\"command\": \"npx\", \"args\": [\"...\"]}}}}}}",
                         path.display()
                     ))
                 );
+                println!("{}", term::dim("available starters:"));
+                for (name, desc, command, args) in crate::mcp::starters() {
+                    println!(
+                        "  {}  {}",
+                        term::cyan(name),
+                        term::dim(&format!("{command} {}", args.join(" ")))
+                    );
+                    println!("      {desc}");
+                }
                 return;
             }
             println!("{}", term::bold(&format!("{} MCP server(s) configured in {}", servers.len(), path.display())));
