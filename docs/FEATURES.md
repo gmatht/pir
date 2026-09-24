@@ -252,6 +252,7 @@ running in the foreground in this build.
 | UTF-8 text | returned as-is |
 | gzip (`.gz`, `1f 8b` magic) | decompressed via `gzip -dc`, returned as text |
 | PDF (`%PDF-`) | text extracted via `pdftotext` (poppler-utils) |
+| Jupyter notebook (`.ipynb`) | rendered as readable cells: each cell's source in a fenced block, its outputs, and its errors — binary outputs (images, PDFs) are named rather than dumped as base64 |
 | anything binary | **described** instead of failing: size, detected kind, and a hex/ASCII preview of the first 256 bytes |
 
 The old behaviour — "stream did not contain valid UTF-8" — told the model

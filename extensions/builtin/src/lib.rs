@@ -1113,9 +1113,106 @@ fn decode_for_reading(path: &str, bytes: &[u8]) -> Result<String, String> {
     if bytes.starts_with(b"%PDF-") {
         return pdf_to_text(path, bytes);
     }
+    // A Jupyter notebook is UTF-8 JSON, so it would otherwise be returned as a
+    // wall of escaped JSON strings — readable by a parser, not by a model.
+    if path.to_ascii_lowercase().ends_with(".ipynb")
+        && let Ok(text) = std::str::from_utf8(bytes)
+    {
+        return Ok(notebook_to_text(text).unwrap_or_else(|| text.to_string()));
+    }
     match std::str::from_utf8(bytes) {
         Ok(s) if !s.contains('\0') => Ok(s.to_string()),
         _ => Ok(describe_binary(path, bytes)),
+    }
+}
+
+/// Render a Jupyter notebook (`.ipynb`) as readable markdown-ish text: each
+/// cell's source, plus its outputs reduced to text.
+///
+/// Dependency-free — a notebook *is* JSON (`{"cells": [...]}`), so this is a
+/// parse and a walk rather than a format implementation. Returns `None` when the
+/// document doesn't look like a notebook (no `cells` array), so the caller falls
+/// back to showing the raw file instead of swallowing it.
+fn notebook_to_text(json_text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json_text).ok()?;
+    let cells = v.get("cells")?.as_array()?;
+    let mut out = String::new();
+    if let Some(lang) = v
+        .get("metadata")
+        .and_then(|m| m.get("kernelspec"))
+        .and_then(|k| k.get("language"))
+        .and_then(|l| l.as_str())
+    {
+        out.push_str(&format!("(Jupyter notebook, {lang})"));
+    } else {
+        out.push_str("(Jupyter notebook)");
+    }
+    let nbformat = v.get("nbformat").and_then(|n| n.as_u64()).unwrap_or(0);
+    if nbformat > 0 {
+        out.push_str(&format!(" nbformat {nbformat}"));
+    }
+    out.push('\n');
+
+    for (i, cell) in cells.iter().enumerate() {
+        let kind = cell.get("cell_type").and_then(|c| c.as_str()).unwrap_or("");
+        // `source` is an array of lines in every real notebook, but a bare
+        // string is legal, so accept both.
+        let source = joined_text(cell.get("source"));
+        out.push_str(&format!("\n── cell {} ({kind}) ──\n", i + 1));
+        if source.trim().is_empty() {
+            out.push_str("(empty)\n");
+        } else {
+            let fence = if kind == "code" { "python" } else { "text" };
+            out.push_str(&format!("```{fence}\n{}\n```\n", source.trim_end()));
+        }
+        // Outputs: keep the text, drop the binary blobs (an image output is a
+        // base64 string that would swamp the file and mean nothing as text).
+        let mut outputs: Vec<String> = Vec::new();
+        for o in cell.get("outputs").and_then(|o| o.as_array()).into_iter().flatten() {
+            let direct = joined_text(o.get("text"));
+            if !direct.trim().is_empty() {
+                outputs.push(direct.trim_end().to_string());
+            }
+            // `data` holds rich outputs; `text/plain` is the readable one.
+            if let Some(d) = o.get("data") {
+                let plain = joined_text(d.get("text/plain"));
+                if !plain.trim().is_empty() {
+                    outputs.push(plain.trim_end().to_string());
+                }
+                // Say what we skipped rather than silently dropping it.
+                for mime in d.as_object().map(|m| m.keys()).into_iter().flatten() {
+                    if mime.starts_with("image/") || mime == "application/pdf" {
+                        outputs.push(format!("[{mime} output omitted]"));
+                    }
+                }
+            }
+            if let Some(name) = o.get("ename").and_then(|e| e.as_str()) {
+                let value = o.get("evalue").and_then(|e| e.as_str()).unwrap_or("");
+                outputs.push(format!("ERROR: {name}: {value}"));
+            }
+        }
+        if !outputs.is_empty() {
+            out.push_str("output:\n");
+            for o in outputs {
+                for line in o.lines() {
+                    out.push_str(&format!("  {line}\n"));
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// A notebook's `source`/`text` field: an array of lines, or a bare string.
+fn joined_text(v: Option<&serde_json::Value>) -> String {
+    match v {
+        Some(serde_json::Value::Array(lines)) => lines
+            .iter()
+            .filter_map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join(""),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        _ => String::new(),
     }
 }
 
@@ -3007,6 +3104,75 @@ trailer<</Root 1 0 R>>\n%%EOF\n";
                 "must explain the situation: {out}"
             );
         }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+
+    #[test]
+    fn notebook_is_rendered_as_readable_cells() {
+        let d = tmp("nb");
+        let nb = r##"{
+          "nbformat": 4,
+          "metadata": {"kernelspec": {"language": "python"}},
+          "cells": [
+            {"cell_type": "markdown", "source": ["# Title\n", "some prose\n"]},
+            {"cell_type": "code", "source": ["x = 1\n", "print(x)\n"],
+             "outputs": [{"output_type": "stream", "text": ["1\n"]}]},
+            {"cell_type": "code", "source": ["plot()"],
+             "outputs": [{"output_type": "display_data",
+                          "data": {"image/png": "iVBORw0KGgo=", "text/plain": ["<Figure>"]}}]},
+            {"cell_type": "code", "source": ["boom()"],
+             "outputs": [{"output_type": "error", "ename": "ValueError", "evalue": "bad input"}]},
+            {"cell_type": "code", "source": []}
+          ]
+        }"##;
+        let p = d.join("nb.ipynb");
+        fs::write(&p, nb).unwrap();
+        let out = read(&p);
+        assert!(out.contains("Jupyter notebook, python"), "got: {out}");
+        assert!(out.contains("cell 1 (markdown)"), "got: {out}");
+        assert!(out.contains("# Title"), "markdown cell body missing: {out}");
+        assert!(out.contains("```python"), "code cells must be fenced: {out}");
+        assert!(out.contains("print(x)"), "code source missing: {out}");
+        assert!(out.contains("output:"), "outputs must be shown: {out}");
+        assert!(out.contains("1\n") || out.contains("  1"), "stream output missing: {out}");
+        // A binary output is described, never dumped as base64.
+        assert!(out.contains("[image/png output omitted]"), "got: {out}");
+        assert!(!out.contains("iVBORw0KGgo"), "base64 must not be included: {out}");
+        assert!(out.contains("<Figure>"), "text/plain fallback should appear: {out}");
+        // Errors surface with their message.
+        assert!(out.contains("ERROR: ValueError: bad input"), "got: {out}");
+        // An empty cell is labelled rather than silently skipped.
+        assert!(out.contains("cell 5 (code)"), "got: {out}");
+        assert!(out.contains("(empty)"), "got: {out}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn notebook_with_a_bare_string_source_is_accepted() {
+        // `source` is normally an array of lines, but a bare string is legal.
+        let d = tmp("nbstr");
+        let nb = r#"{"nbformat":4,"cells":[{"cell_type":"code","source":"y = 2"}]}"#;
+        let p = d.join("b.ipynb");
+        fs::write(&p, nb).unwrap();
+        let out = read(&p);
+        assert!(out.contains("y = 2"), "got: {out}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_non_notebook_ipynb_falls_back_to_raw_text() {
+        // Something named .ipynb that is not a notebook must still be readable
+        // rather than being swallowed whole.
+        let d = tmp("nbbad");
+        let p = d.join("weird.ipynb");
+        fs::write(&p, "not json at all\n").unwrap();
+        let out = read(&p);
+        assert!(out.contains("not json at all"), "got: {out}");
+        // Valid JSON without a `cells` array is also not a notebook.
+        fs::write(&p, r#"{"something":"else"}"#).unwrap();
+        let out = read(&p);
+        assert!(out.contains("something"), "got: {out}");
         let _ = fs::remove_dir_all(&d);
     }
 
