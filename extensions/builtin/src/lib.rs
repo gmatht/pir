@@ -494,7 +494,7 @@ impl ToolBackend for Builtin {
                             "enum": ["stop-complete", "stop-needs-input"],
                             "description": "stop-complete when done, stop-needs-input when blocked on the operator"
                         },
-                        "message": { "type": "string", "description": "One-line summary (complete) or the question (needs-input)" }
+                        "message": { "type": "string", "description": "Summary (complete) or the question (needs-input). Plain markdown is welcome: keep a short one-line headline first, then details on their own lines — paragraphs, '- ' bullets, and fenced code blocks all render. Use it for anything longer than a sentence instead of one dense run-on line." }
                     },
                     "required": ["reason"]
                 }),

@@ -558,6 +558,10 @@ fn build_system_prompt(cwd: &Path) -> String {
          - Be terse: code, commands, short answers, no preamble.\n\
          - Show file paths clearly when working with files.\n\
          - When finished, summarize what changed in a sentence or two.\n\
+         - request_stop's `message` is rendered as markdown on its own lines, so \
+           a non-trivial summary does not have to be one dense sentence: lead \
+           with a one-line headline, then use blank lines, '- ' bullets and \
+           fenced code blocks for the details.\n\
          - End your turn with request_stop ONLY when the work is really done \
            (reason stop-complete) or you genuinely need the operator's answer \
            to continue (reason stop-needs-input, with your question in \
@@ -970,11 +974,23 @@ impl Agent {
         self.stop_hit = Some((decision, why.clone()));
         self.last_stop = Some((decision, why.clone()));
         Some(Outcome {
-            content: format!(
-                "stop recorded ({}){} — finishing this tool batch, then ending the turn.",
-                decision.label(),
-                if why.is_empty() { String::new() } else { format!(" {why}") }
-            ),
+            content: if why.is_empty() {
+                format!(
+                    "stop recorded ({}) — finishing this tool batch, then ending the turn.",
+                    decision.label()
+                )
+            } else {
+                // Echo the message back verbatim, after a one-line ack. A
+                // model that writes a multi-line summary (headline, bullets,
+                // code fence) gets it rendered as written to the operator —
+                // previously it was flattened onto the ack line, which made
+                // anything longer than a sentence unreadable.
+                format!(
+                    "stop recorded ({}) — finishing this tool batch, then ending the turn.\n\
+                     message:\n{why}",
+                    decision.label()
+                )
+            },
             is_error: false,
         })
     }
@@ -3311,11 +3327,15 @@ impl Agent {
                             term::out(&term::dim("· stop-complete — ending turn"));
                         }
                         StopDecision::NeedsInput => {
-                            term::out(&term::yellow(&format!(
-                                "· stop-needs-input{} — ending turn",
-                                if why.is_empty() { String::new() } else { format!(": {why}") }
-                            )));
+                            term::out(&term::yellow("· stop-needs-input — ending turn"));
                         }
+                    }
+                    // Render the model's message as its own block (markdown, so
+                    // headings/bullets/code fences survive). Previously it was
+                    // glued onto the single status line, which turned any real
+                    // summary into an unreadable run-on sentence.
+                    if !why.is_empty() {
+                        term::out(&crate::md::render(&why, term::color_enabled()));
                     }
                 }
                 self.registry.emit(EventKind::AgentEnd, &json!({}));
@@ -5168,6 +5188,42 @@ mod goal_bootstrap_tests {
         assert!(!o.is_error, "enabled skill must accept: {}", o.content);
         assert!(o.content.contains("stop-complete"), "got {}", o.content);
         assert_eq!(a.last_stop(), Some(super::StopDecision::Complete));
+    }
+
+    #[test]
+    fn stop_tool_preserves_a_multiline_message() {
+        let mut a = fresh_agent();
+        assert!(a.stop_skill());
+        let msg = "## headline\n\n- step one\n- step two\n\n```\ncode block\n```";
+        let out = a.run_stop_tool(
+            "request_stop",
+            &serde_json::json!({"reason":"stop-complete","message": msg}),
+        );
+        let o = out.expect("outcome");
+        assert!(!o.is_error, "got {}", o.content);
+        // The ack stays one line; the operator's message is echoed verbatim
+        // below it, newlines and all — not flattened onto the ack.
+        assert!(o.content.starts_with("stop recorded (stop-complete)"), "got {}", o.content);
+        assert!(o.content.contains(msg), "message must survive unflattened: {}", o.content);
+        assert!(
+            o.content.contains("\n## headline\n"),
+            "headline must stay on its own line: {}",
+            o.content
+        );
+    }
+
+    #[test]
+    fn stop_tool_omits_message_block_when_empty() {
+        let mut a = fresh_agent();
+        assert!(a.stop_skill());
+        let out = a.run_stop_tool(
+            "request_stop",
+            &serde_json::json!({"reason":"stop-complete"}),
+        );
+        let o = out.expect("outcome");
+        assert!(!o.is_error, "got {}", o.content);
+        assert!(!o.content.contains("message:"), "no empty message block: {}", o.content);
+        assert!(o.content.ends_with("ending the turn."), "got {}", o.content);
     }
 
     #[test]
