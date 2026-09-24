@@ -353,7 +353,58 @@ Commands:
 
 ---
 
-## 10. Environment variables added
+## 10. Session checkpoints and rewind
+
+`/undo` reverts a single `write_file`/`edit_file`, by hashing that file's pre-edit
+contents into a sidecar. That handles an accidental edit, but not the case that
+actually hurts: a **turn** that went wrong — three edits and a command — and needs
+unwinding as a unit.
+
+A **checkpoint** is opened at the start of every turn. It captures each file the
+turn modifies, *once per file per turn* (before the turn's first modification of
+that file), plus the conversation length at the turn boundary. Files are stored
+as full snapshots, and the index is persisted next to the transcript:
+
+```
+<session>.checkpoints.json     the index
+<session>.ckpt/cp<N>/…         per-checkpoint file snapshots
+```
+
+Rewinding restores **two things that must move together**:
+
+* the **working tree** — every file the turn changed goes back to its pre-turn
+  contents, and files the turn *created* are removed (a rewind of "I wrote a new
+  module and it was wrong" must delete it, not leave an empty file);
+* the **conversation** — history is truncated to where the turn began, so the
+  model stops reasoning about work that has been undone.
+
+Restoring only the files is what makes an ordinary undo confusing: the tree is
+back but the model still believes it made those edits and builds on them.
+
+```
+/checkpoints       # list the rewoundable turns (#1, #2, …) with file counts
+/rewind <#>        # restore the tree and the conversation to that turn
+/rewind            # same as /checkpoints
+```
+
+Because the index is on disk, rewind works **across a crash or a `pir -c`
+resume** — which is exactly when you most want it. Ids are never reused after a
+reload, and rewinding to `#N` discards every checkpoint after it (they describe a
+future that no longer exists).
+
+**What a rewind does not do.** Only files the agent modified through its own file
+tools are captured. Side effects of `bash` are deliberately out of scope — there
+is no way to know what a shell command touched without a filesystem snapshot
+facility, and pretending otherwise would make rewind untrustworthy. A turn that
+ran a command is marked, and the rewind result says plainly that those effects
+are *not* undone.
+
+History is capped at the last 50 turns; older checkpoints and their snapshots are
+pruned, so a long session's checkpoint directory stays in the low megabytes.
+
+---
+
+## 11. Environment variables added
 
 | variable | effect |
 |---|---|
@@ -374,7 +425,7 @@ Commands:
 
 ---
 
-## 11. Slash commands added
+## 12. Slash commands added
 
 | command | effect |
 |---|---|
@@ -384,6 +435,8 @@ Commands:
 | `/plan list` / `/plan show [name]` / `/plan dir` | saved plans |
 | `/plan <task>` | enter plan mode with the task pre-filled |
 | `/taste [list\|remember\|forget\|find\|path]` | manage recorded preferences |
+| `/checkpoints` | list the rewindable turn boundaries |
+| `/rewind <#>` | restore the tree and the conversation to a checkpoint |
 
 `/plan`, `/skills` and `/scratchpad` are all registered in the `match cmd`
 dispatch in `src/main.rs`, so tab-completion picks them up automatically (the

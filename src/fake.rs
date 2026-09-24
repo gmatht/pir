@@ -10,6 +10,8 @@
 //! FAKE: markup            — stream a markdown sample in paced chunks
 //! FAKE: echo <text>       — stream <text> back slowly, then end
 //! FAKE: sleep <secs>      — emit a real `bash` tool call `sleep N` (1..=120)
+//! FAKE: write <path> <text>  — emit a real `write_file` tool call (the path
+//!                              must not contain spaces)
 //! FAKE: type <ch> <cps> <secs> — stream <ch> at <cps> chars/sec for <secs>s
 //! FAKE: think <text>      — stream <text> as reasoning chunks (on_think)
 //! ```
@@ -34,6 +36,9 @@ pub enum Directive {
     Echo(String),
     /// Real `bash` tool call `sleep <secs>` (clamped 1..=120).
     Sleep(u64),
+    /// Real `write_file` tool call. Lets an offline test drive the file tools
+    /// (and therefore the checkpoint/undo paths) without a network model.
+    Write { path: String, text: String },
     /// Stream `ch` at `cps` chars/sec for `secs` seconds (clamped).
     Type { ch: char, cps: u64, secs: u64 },
     /// Stream reasoning text through the thinking channel (paced chunks).
@@ -58,6 +63,14 @@ pub fn parse_directives(text: &str) -> Vec<Directive> {
             "markup" => out.push(Directive::Markup),
             "think" if !args.is_empty() => out.push(Directive::Think(args.to_string())),
             "echo" if !args.is_empty() => out.push(Directive::Echo(args.to_string())),
+            "write" => {
+                if let Some((path, text)) = args.split_once(char::is_whitespace)
+                    && !path.is_empty()
+                    && !text.trim().is_empty()
+                {
+                    out.push(Directive::Write { path: path.to_string(), text: text.trim().to_string() });
+                }
+            }
             "sleep" => {
                 if let Ok(secs) = args.parse::<u64>() {
                     out.push(Directive::Sleep(secs.clamp(1, 120)));
@@ -188,6 +201,17 @@ pub fn fake_chat(
                 emit_paced(&chunks, Duration::from_millis(100), on_text, cancel)?;
                 text.push_str(e);
             }
+            Directive::Write { path, text: body } => {
+                let ack = format!("fake: writing {path}…\n");
+                on_text(&ack);
+                text.push_str(&ack);
+                blocks.push(Block::ToolUse {
+                    id: format!("fake-tool-{tool_n}"),
+                    name: "write_file".to_string(),
+                    input: serde_json::json!({"path": path, "content": body}),
+                });
+                tool_n += 1;
+            }
             Directive::Sleep(secs) => {
                 let ack = format!("fake: running `sleep {secs}`…\n");
                 on_text(&ack);
@@ -264,6 +288,15 @@ mod fake_tests {
         assert!(parse_directives("just chatting").is_empty());
         // clamps, not rejects
         assert_eq!(parse_directives("FAKE: sleep 9999"), vec![Directive::Sleep(120)]);
+        // `write` drives the real `write_file` tool, so an offline test can
+        // exercise the file tools and the checkpoint/undo paths.
+        assert_eq!(
+            parse_directives("FAKE: write /tmp/x.txt hello world"),
+            vec![Directive::Write { path: "/tmp/x.txt".into(), text: "hello world".into() }]
+        );
+        // Malformed forms are skipped, never guessed at.
+        assert!(parse_directives("FAKE: write").is_empty());
+        assert!(parse_directives("FAKE: write /tmp/x.txt").is_empty());
         assert_eq!(
             parse_directives("FAKE: type ab 0 0"),
             vec![Directive::Type { ch: 'a', cps: 1, secs: 1 }]

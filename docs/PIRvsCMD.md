@@ -70,6 +70,13 @@ is a major advantage but it lacks several automation-oriented features.
   later session's system prompt. Re-recording reinforces rather than
   duplicates; `/taste` manages them.
 
+- **Session checkpoints and rewind** — a checkpoint opens at every turn,
+  capturing each file the turn touches (once, before its first edit) plus the
+  conversation length. `/rewind <#>` restores the working tree *and* truncates
+  the conversation, so the model stops building on undone work; it persists
+  across a crash or resume. Shell side effects are explicitly out of scope and
+  the result says so.
+
 See [FEATURES.md](FEATURES.md) for the full documentation of these.
 
 ---

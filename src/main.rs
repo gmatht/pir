@@ -8,6 +8,7 @@
 
 mod agent;
 mod askuser;
+mod checkpoint;
 mod config;
 mod cpu_probe;
 mod cpu_scenarios_tests;
@@ -343,6 +344,12 @@ COMMANDS
   /model* <sel>  /model-all <sel>   broadcast a model switch to ALL your open pir terminals (also sets the new default)
   /bg <text>  /jobs  /fg <id>  /clear  /usage  /exit
   /undo [all]             revert the last file edit (or all) to its pre-edit state
+  /checkpoints            list the rewindable turn boundaries (one per turn)
+  /rewind <#>             restore the working tree AND the conversation to a
+                          checkpoint: every file that turn changed goes back,
+                          files it created are removed, and the model's history
+                          is truncated so it no longer sees the undone work
+                          (shell side effects are NOT undone; the result says so)
   /scratchpad [ls|clear]  show the per-session scratch directory (exported to
                           tools as $PIR_SCRATCHPAD); `ls` lists it, `clear` empties it
   /skills [name]         list discovered skills (project .pir/skills, user
@@ -3785,6 +3792,34 @@ fn handle_command(
                     },
                     Err(e) => eprintln!("pir: {e}"),
                 },
+            }
+        }
+        "checkpoints" | "ckpt" => {
+            // `/checkpoints` — list the rewindable turn boundaries recorded for
+            // this session (Feature 8).
+            let g = agent_slot.lock().unwrap();
+            match g.as_ref() {
+                Some(agent) => println!("{}", agent.checkpoints_listing()),
+                None => eprintln!("pir: agent busy (turn running) — try again when idle"),
+            }
+        }
+        "rewind" => {
+            // `/rewind <#>` — restore the working tree AND the conversation to a
+            // turn boundary. Bare `/rewind` lists what is available.
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                eprintln!("pir: agent busy (turn running) — try again when idle");
+                return;
+            };
+            let Some(arg) = rest.first() else {
+                println!("{}", agent.checkpoints_listing());
+                return;
+            };
+            // Accept `#3` as well as `3`.
+            let id = arg.trim_start_matches('#').parse::<usize>();
+            match id {
+                Ok(n) => println!("{}", agent.rewind(n)),
+                Err(_) => eprintln!("pir: usage: /rewind <#>  (see /checkpoints)"),
             }
         }
         "undo" => {

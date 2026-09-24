@@ -130,6 +130,10 @@ pub struct Agent {
     /// a banner. Off by default (None) — opt in via `--budget N` or
     /// `PIR_TOKEN_BUDGET`.
     token_budget: Option<u64>,
+    /// Rewindable turn checkpoints for this session (Feature 8). Loaded from
+    /// `<session>.checkpoints.json` so rewind works across a resume. `None`
+    /// before the first turn, or when the session has no transcript.
+    checkpoints: Option<crate::checkpoint::Store>,
     /// Per-session undo stack of (target, backup) pairs. Before `write_file` /
     /// `edit_file` run, the previous file contents are snapshotted to a sidecar
     /// under `.pir/undo/`; `/undo` restores the most recent snapshot. Only file
@@ -530,6 +534,7 @@ fn build_system_prompt(cwd: &Path) -> String {
          - web_fetch: Fetch a public http/https URL and return its readable text\n\
          - web_search: Search the web (provider-independent) for titles, URLs and snippets\n\
          - remember: Record a durable preference so it applies in later sessions\n\
+         (rewind: the operator can restore a turn's files and your conversation with /rewind)\n\
          - job_status: Check on a long-running command that was detached\n\
          - job_kill: Stop a detached long-running command\n\
          - update_goal: Persist and update the current goal/continuation plan\n\
@@ -798,6 +803,9 @@ impl Agent {
         // dir name matches the transcript) and swept of stale dirs at the same
         // time. A failure is non-fatal: the agent simply runs without one.
         let _scratchpad = crate::scratchpad::init(log_path.as_deref());
+        // Rewindable turn checkpoints (Feature 8), loaded from the sidecar next
+        // to the transcript so a resume can rewind work done before it.
+        let checkpoints = crate::checkpoint::Store::load_opt(log_path.as_deref());
         let _ = crate::scratchpad::sweep_old();
         // Seed the bundled skills (the `locate` skill, and any future ones) into
         // the config skills root on first run. Idempotent and never
@@ -833,6 +841,7 @@ impl Agent {
             last_prompt: String::new(),
             continuations: Vec::new(),
             token_budget: None,
+            checkpoints,
             undo_stack: Vec::new(),
             su_security_enabled: user_security,
             plan_mode: false,
@@ -2626,6 +2635,11 @@ impl Agent {
         self.stop_hit = None;
         self.stop_nudges = 0;
         self.turn_started = Some(std::time::Instant::now());
+        // Open a rewind checkpoint (Feature 8) at the turn boundary. Recorded
+        // *before* the turn can touch anything, and keyed to the history length
+        // at this moment so a rewind can also truncate the conversation back to
+        // a state consistent with the restored files.
+        self.open_checkpoint(user);
         // When the skill is on, `request_stop` is a first-class tool the model
         // must see in every request; when off it is hidden (and refused if the
         // model calls it anyway, e.g. from a stale prompt).
@@ -3186,7 +3200,17 @@ impl Agent {
                 if (name == "write_file" || name == "edit_file")
                     && let Some(p) = input.get("path").and_then(Value::as_str) {
                         self.checkpoint_file(Path::new(p));
+                        // Also capture it into this turn's checkpoint (Feature 8),
+                        // so the whole turn can be rewound as a unit. Captured
+                        // once per file per turn, before the first modification —
+                        // see `capture`.
+                        self.checkpoint_capture(Path::new(p));
                     }
+                // A turn that ran a shell command has side effects a rewind
+                // cannot undo; record that so the rewind result says so.
+                if name == "bash" {
+                    self.checkpoint_note_bash();
+                }
                 let outcome = match self.run_goal_tool(name, input) {
                     Some(o) => o,
                     None => match self.run_subagent_tool(name, input) {
@@ -3470,6 +3494,105 @@ impl Agent {
         if std::fs::write(&backup, &src).is_ok() {
             self.undo_stack.push((path.to_path_buf(), backup));
         }
+    }
+
+    /// Open a rewind checkpoint for a new turn (Feature 8). No-op when the
+    /// session has no transcript to key the index off (a one-shot run without a
+    /// log), because checkpoints are persisted next to the log.
+    fn open_checkpoint(&mut self, prompt: &str) {
+        let Some(log) = self.log_path.clone() else { return };
+        let mut store = crate::checkpoint::Store::load(&log);
+        store.begin(prompt, self.history.len(), term::epoch());
+        store.prune(&log);
+        let _ = store.save(&log);
+        self.checkpoints = Some(store);
+    }
+
+    /// Capture a file's pre-edit contents into the current turn's checkpoint.
+    /// Best-effort: a checkpoint that cannot be written must never block an
+    /// edit, and `/undo` still covers the single-file case.
+    fn checkpoint_capture(&mut self, path: &Path) {
+        let Some(log) = self.log_path.clone() else { return };
+        if let Some(store) = self.checkpoints.as_mut() {
+            let _ = store.capture(&log, path);
+            let _ = store.save(&log);
+        }
+    }
+
+    /// Note that the current turn ran a shell command, whose side effects a
+    /// rewind cannot undo.
+    fn checkpoint_note_bash(&mut self) {
+        let Some(log) = self.log_path.clone() else { return };
+        if let Some(store) = self.checkpoints.as_mut() {
+            store.note_bash();
+            let _ = store.save(&log);
+        }
+    }
+
+    /// Number of rewindable turns recorded for this session.
+    pub fn checkpoint_count(&self) -> usize {
+        self.checkpoints.as_ref().map(|s| s.checkpoints.len()).unwrap_or(0)
+    }
+
+    /// Human-readable checkpoint listing for `/checkpoints`.
+    pub fn checkpoints_listing(&self) -> String {
+        match &self.checkpoints {
+            Some(s) => s.listing(),
+            None => "(no checkpoints for this session — it has no transcript to key them off)"
+                .to_string(),
+        }
+    }
+
+    /// Rewind the working tree and the conversation to checkpoint `id`
+    /// (Feature 8). Returns a status line.
+    ///
+    /// Both halves move together on purpose: restoring the files while leaving
+    /// the model's history intact is what makes an ordinary undo so confusing —
+    /// the tree is back but the model still believes it made those edits and
+    /// keeps building on them.
+    pub fn rewind(&mut self, id: usize) -> String {
+        let Some(log) = self.log_path.clone() else {
+            return "cannot rewind: this session has no transcript to key checkpoints off".to_string();
+        };
+        let Some(mut store) = self.checkpoints.take().or_else(|| Some(crate::checkpoint::Store::load(&log))) else {
+            return "cannot rewind: checkpoint store unavailable".to_string();
+        };
+        let (cp, report) = match store.rewind(&log, id) {
+            Ok(x) => x,
+            Err(e) => {
+                self.checkpoints = Some(store);
+                return e;
+            }
+        };
+        // Truncate history to where the turn began, then record the truncation
+        // in the transcript so a resumed session doesn't replay the undone work.
+        let mut dropped = 0usize;
+        if cp.history_len <= self.history.len() {
+            dropped = self.history.len() - cp.history_len;
+            self.history.truncate(cp.history_len);
+            // The turn's own user prompt is still in history; drop it too, so
+            // the model doesn't see a question whose answer it no longer has.
+            if matches!(self.history.last().map(|m| m.role), Some(crate::types::Role::User))
+                && self.history.last().map(|m| m.text() == cp.prompt).unwrap_or(false)
+            {
+                self.history.pop();
+                dropped += 1;
+            }
+        }
+        // The single-file undo stack points at snapshots for edits that no
+        // longer exist; clearing it avoids `/undo` restoring a stale file on top
+        // of the rewound tree.
+        self.undo_stack.clear();
+        // Drop the goal's stale progress notes for the same reason.
+        let mut report = report;
+        report.history_dropped = dropped;
+        store.save(&log).ok();
+        self.checkpoints = Some(store);
+        log_notice(
+            &mut self.log,
+            &format!("[pir] rewound to checkpoint #{} ({} file(s) restored)", cp.id, report.restored),
+        );
+        report.render(&cp)
     }
 
     fn undo_dir(&self) -> PathBuf {
@@ -4795,6 +4918,182 @@ mod goal_bootstrap_tests {
             None => unsafe { std::env::remove_var("PI_DIR") },
         }
         let _ = std::fs::remove_dir_all(&cfg);
+    }
+
+
+    /// F8: a turn's checkpoint must be opened at the boundary and capture each
+    /// file once, before the first modification of that file.
+    #[test]
+    fn checkpoint_opens_per_turn_and_captures_once() {
+        let dir = std::env::temp_dir().join(format!("pir_ckpt_agent_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("session.jsonl");
+        std::fs::write(&log, "{}\n").unwrap();
+        let target = dir.join("a.txt");
+        std::fs::write(&target, "v0\n").unwrap();
+
+        let mut a = fresh_agent();
+        a.log_path = Some(log.clone());
+        a.checkpoints = Some(crate::checkpoint::Store::load(&log));
+
+        a.open_checkpoint("first task");
+        assert_eq!(a.checkpoint_count(), 1);
+        a.checkpoint_capture(&target);
+        std::fs::write(&target, "v1\n").unwrap();
+        // A second capture in the same turn must not overwrite the snapshot.
+        a.checkpoint_capture(&target);
+        std::fs::write(&target, "v2\n").unwrap();
+        assert_eq!(
+            a.checkpoints.as_ref().unwrap().checkpoints[0].files.len(),
+            1,
+            "one snapshot per file per turn"
+        );
+
+        // A new turn opens its own checkpoint.
+        a.open_checkpoint("second task");
+        assert_eq!(a.checkpoint_count(), 2);
+
+        // Rewind the first: the file goes back to v0 and the second checkpoint
+        // is discarded with it.
+        let msg = a.rewind(1);
+        assert!(msg.contains("rewound to checkpoint #1"), "got: {msg}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "v0\n");
+        assert_eq!(a.checkpoint_count(), 0, "later checkpoints are discarded too");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F8: rewind must truncate the conversation, not just the files — the whole
+    /// point is that the model stops reasoning about undone work.
+    #[test]
+    fn rewind_truncates_history_to_the_turn_boundary() {
+        let dir = std::env::temp_dir().join(format!("pir_ckpt_hist_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("session.jsonl");
+        std::fs::write(&log, "{}\n").unwrap();
+
+        let mut a = fresh_agent();
+        a.log_path = Some(log.clone());
+        a.checkpoints = Some(crate::checkpoint::Store::load(&log));
+
+        // Simulate two completed turns of history.
+        a.history.push(crate::types::Message::user("old question"));
+        a.history.push(crate::types::Message::user("the one we undo"));
+        let before = a.history.len();
+        a.open_checkpoint("the one we undo");
+        a.history.push(crate::types::Message::user("assistant reply about it"));
+
+        let msg = a.rewind(1);
+        assert!(a.history.len() < before + 1, "history must shrink: {}", a.history.len());
+        assert_eq!(a.history.len(), 1, "only the pre-turn history survives");
+        assert_eq!(a.history[0].text(), "old question");
+        assert!(msg.contains("truncated"), "must report the truncation: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F8: a session with no transcript cannot persist checkpoints, and must say
+    /// so rather than silently pretending rewind is available.
+    #[test]
+    fn checkpoint_without_a_transcript_is_reported_honestly() {
+        let mut a = fresh_agent();
+        a.log_path = None;
+        a.checkpoints = None;
+        assert_eq!(a.checkpoint_count(), 0);
+        assert!(a.checkpoints_listing().contains("no checkpoints"), "got: {}", a.checkpoints_listing());
+        let msg = a.rewind(1);
+        assert!(msg.contains("cannot rewind"), "got: {msg}");
+    }
+
+    /// F8: a rewind whose turn ran `bash` must warn that shell side effects are
+    /// not undone, so the operator never assumes a complete restore.
+    #[test]
+    fn rewind_warns_about_shell_side_effects() {
+        let dir = std::env::temp_dir().join(format!("pir_ckpt_bash_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("session.jsonl");
+        std::fs::write(&log, "{}\n").unwrap();
+        let target = dir.join("a.txt");
+        std::fs::write(&target, "v0\n").unwrap();
+
+        let mut a = fresh_agent();
+        a.log_path = Some(log.clone());
+        a.checkpoints = Some(crate::checkpoint::Store::load(&log));
+        a.open_checkpoint("run something");
+        a.checkpoint_capture(&target);
+        a.checkpoint_note_bash();
+        std::fs::write(&target, "v1\n").unwrap();
+
+        let msg = a.rewind(1);
+        assert!(msg.contains("NOT undone"), "must warn: {msg}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "v0\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    /// F8 end-to-end: a real turn drives `write_file` through the tool loop, and
+    /// a rewind restores the file to what it was before that turn. This is the
+    /// test that proves the checkpoint is actually wired into the tool path
+    /// (unit tests on the store only prove the store works).
+    #[test]
+    fn rewind_undoes_a_real_turn_that_wrote_a_file() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os("PIR_FAKE_MODEL");
+        // SAFETY: test-local env mutation under the shared env lock.
+        unsafe { std::env::set_var("PIR_FAKE_MODEL", "1"); }
+
+        let dir = std::env::temp_dir().join(format!("pir_ckpt_e2e_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("session.jsonl");
+        std::fs::write(&log, "{}\n").unwrap();
+        let target = dir.join("written.txt");
+        std::fs::write(&target, "BEFORE\n").unwrap();
+
+        let providers = crate::config::load_providers().expect("providers");
+        let (p, m) = crate::config::select(&providers, "fake/slow").expect("fake provider");
+        let mut a = Agent::new(
+            p.clone(),
+            m.clone(),
+            true,
+            true, // quiet
+            crate::notify::shared_bus(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(String::new())),
+        )
+        .expect("agent");
+        a.log_path = Some(log.clone());
+        a.checkpoints = Some(crate::checkpoint::Store::load(&log));
+
+        // A real turn; the fake model emits a `write_file` tool call.
+        a.turn(&format!("FAKE: write {} REWRITTEN", target.display()))
+            .expect("turn runs");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "REWRITTEN",
+            "the turn must actually have written the file"
+        );
+        assert_eq!(a.checkpoint_count(), 1, "the turn opened a checkpoint");
+        assert!(
+            !a.checkpoints.as_ref().unwrap().checkpoints[0].files.is_empty(),
+            "the write must have been captured"
+        );
+
+        // Rewind: the file goes back to its pre-turn contents.
+        let msg = a.rewind(1);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "BEFORE\n",
+            "rewind must restore the pre-turn contents (msg: {msg})"
+        );
+
+        match old {
+            Some(v) => unsafe { std::env::set_var("PIR_FAKE_MODEL", v) },
+            None => unsafe { std::env::remove_var("PIR_FAKE_MODEL") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
