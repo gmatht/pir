@@ -1,0 +1,6 @@
+automated linting. E.g. llvm static analysis.
+automated prompts.
+   Anything else we should do? Report only.
+
+Log model used.
+Automated commit messages from prompt.
