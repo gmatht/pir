@@ -40,14 +40,33 @@ struct Server {
     tools: Vec<mcp::McpTool>,
 }
 
-struct Mcp {
+/// What the background thread produces.
+struct Connected {
     servers: Vec<Server>,
-    /// Problems from startup, surfaced once in the banner so the operator knows
-    /// a server they configured did not come up.
     problems: Vec<String>,
-    /// Lazily-built specs, cached: `specs()` is called on every turn and the
-    /// tool list does not change mid-session.
-    cached_specs: Option<Vec<ToolSpec>>,
+}
+
+/// MCP backend that **connects in the background**.
+///
+/// Starting a server means spawning a process and waiting for a handshake — and
+/// for an `npx`-launched server, fetching it first (measured: Context7 is ~24s
+/// cold). Doing that during startup would put all of it on the critical path
+/// before the first prompt, for every session, including ones that never call an
+/// MCP tool.
+///
+/// So the extension registers immediately with **no tools**, spawns a thread that
+/// connects, and adopts the tools when they arrive. `specs()` is called afresh
+/// each turn (see `Agent::turn`), so the tools appear as soon as they are ready
+/// — typically before the first turn finishes, and certainly before a model
+/// could miss them. A session that never uses MCP pays nothing.
+struct Mcp {
+    /// Populated by the background thread. `None` until it finishes.
+    connected: std::sync::Arc<std::sync::Mutex<Option<Connected>>>,
+    /// Built once the tools arrive, then reused (they cannot change mid-session:
+    /// a server that dies is not respawned).
+    cache: std::sync::Arc<std::sync::Mutex<Option<Vec<ToolSpec>>>>,
+    /// Set once the operator has been told what happened.
+    reported: bool,
 }
 
 pub fn register(reg: &mut Registry) {
@@ -60,11 +79,29 @@ pub fn register(reg: &mut Registry) {
         // Nothing configured is the normal case: stay invisible.
         return;
     }
-    reg.add(Box::new(Mcp::connect(configs, &path)));
+    reg.add(Box::new(Mcp::start_background(configs, path)));
 }
 
 impl Mcp {
-    fn connect(configs: Vec<mcp::ServerConfig>, path: &std::path::Path) -> Mcp {
+    /// Register immediately; connect on a thread.
+    fn start_background(configs: Vec<mcp::ServerConfig>, path: std::path::PathBuf) -> Mcp {
+        let connected = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let slot = connected.clone();
+        std::thread::spawn(move || {
+            let result = Self::connect(configs, &path);
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(result);
+            }
+        });
+        Mcp {
+            connected,
+            cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            reported: false,
+        }
+    }
+
+    /// The actual connect, run on the background thread.
+    fn connect(configs: Vec<mcp::ServerConfig>, path: &std::path::Path) -> Connected {
         let mut servers = Vec::new();
         let mut problems = Vec::new();
         for cfg in configs {
@@ -73,12 +110,8 @@ impl Mcp {
                     Ok(tools) if !tools.is_empty() => {
                         servers.push(Server { client, tools });
                     }
-                    Ok(_) => {
-                        problems.push(format!("{}: server offers no tools", cfg.name));
-                    }
-                    Err(e) => {
-                        problems.push(format!("{}: {e}", cfg.name));
-                    }
+                    Ok(_) => problems.push(format!("{}: server offers no tools", cfg.name)),
+                    Err(e) => problems.push(format!("{}: {e}", cfg.name)),
                 },
                 Err(e) => problems.push(format!("{}: {e}", cfg.name)),
             }
@@ -86,17 +119,25 @@ impl Mcp {
         if !problems.is_empty() {
             problems.push(format!("(configured in {})", path.display()));
         }
-        Mcp { servers, problems, cached_specs: None }
+        Connected { servers, problems }
+    }
+
+    /// Run `f` against the connected servers, if the background thread has
+    /// finished. Returns `None` while still connecting.
+    fn with_servers<T>(&self, f: impl FnOnce(&mut Vec<Server>) -> T) -> Option<T> {
+        let mut g = self.connected.lock().ok()?;
+        let c = g.as_mut()?;
+        Some(f(&mut c.servers))
     }
 
     /// All tools, flattened. `ToolSpec` holds `&'static str`, so the name and
-    /// description must be interned — we leak them once per server at startup.
-    /// That is deliberate and bounded: it happens a handful of times per session
-    /// for a fixed set of names, and it is what lets MCP tools appear in the
-    /// same list as the built-ins without changing the ABI.
-    fn specs(&self) -> Vec<ToolSpec> {
+    /// description must be interned — we leak them once per server, when the
+    /// connection arrives. That is deliberate and bounded: a handful of strings
+    /// per session for a fixed set of names, and it is what lets MCP tools
+    /// appear in the same list as the built-ins without changing the ABI.
+    fn build_specs(servers: &[Server]) -> Vec<ToolSpec> {
         let mut out = Vec::new();
-        for s in &self.servers {
+        for s in servers {
             let server = s.client.server_name();
             for t in &s.tools {
                 let name: &'static str = Box::leak(mcp::qualified_name(server, &t.name).into_boxed_str());
@@ -124,53 +165,87 @@ impl ToolBackend for Mcp {
     }
 
     fn specs(&self) -> Vec<ToolSpec> {
-        if let Some(c) = &self.cached_specs {
+        // Reuse the built list once the servers are in.
+        if let Ok(g) = self.cache.lock()
+            && let Some(c) = g.as_ref()
+        {
             return c.clone();
         }
-        self.specs()
+        // Empty until the background connect finishes: that is the point — it
+        // must never block the turn.
+        let Ok(mut g) = self.connected.lock() else { return Vec::new() };
+        let Some(c) = g.as_mut() else { return Vec::new() };
+        let built = Self::build_specs(&c.servers);
+        drop(g);
+        if let Ok(mut cg) = self.cache.lock() {
+            *cg = Some(built.clone());
+        }
+        built
     }
 
     fn run(&mut self, name: &str, input: &Value) -> Outcome {
         let Some((server, tool)) = mcp::split_qualified(name) else {
             return Outcome::err(format!("mcp: '{name}' is not an MCP tool name"));
         };
-        // The name the model called is the *sanitized* one, so match through the
-        // same transformation rather than against the raw server/tool names.
-        let idx = self
-            .servers
-            .iter()
-            .position(|s| mcp::qualified_name(s.client.server_name(), "x") == format!("mcp__{server}__x"));
-        let Some(idx) = idx else {
-            return Outcome::err(format!("mcp: no connected server named '{server}'"));
-        };
-        let s = &mut self.servers[idx];
-        let Some(t) = s
-            .tools
-            .iter()
-            .find(|t| mcp::qualified_name("x", &t.name) == format!("mcp__x__{tool}"))
-        else {
-            return Outcome::err(format!("mcp: server '{server}' has no tool '{tool}'"));
-        };
-        let real_tool = t.name.clone();
-        match s.client.call_tool(&real_tool, input) {
-            Ok(text) => Outcome::ok(text),
-            Err(e) => Outcome::err(format!("mcp {server}/{real_tool}: {e}")),
+        // A tool can only be called once it has been advertised, so the servers
+        // are normally connected by now. This only fires if the model called an
+        // MCP tool from a stale list while the connect was still in flight.
+        let still_connecting = self.connected.lock().map(|g| g.is_none()).unwrap_or(false);
+        let out = self.with_servers(|servers| {
+            let idx = servers.iter().position(|s| {
+                mcp::qualified_name(s.client.server_name(), "x") == format!("mcp__{server}__x")
+            });
+            let Some(idx) = idx else {
+                return Outcome::err(format!("mcp: no connected server named '{server}'"));
+            };
+            let s = &mut servers[idx];
+            let Some(t) = s
+                .tools
+                .iter()
+                .find(|t| mcp::qualified_name("x", &t.name) == format!("mcp__x__{tool}"))
+            else {
+                return Outcome::err(format!("mcp: server '{server}' has no tool '{tool}'"));
+            };
+            let real_tool = t.name.clone();
+            match s.client.call_tool(&real_tool, input) {
+                Ok(text) => Outcome::ok(text),
+                Err(e) => Outcome::err(format!("mcp {server}/{real_tool}: {e}")),
+            }
+        });
+        match out {
+            Some(o) => o,
+            None if still_connecting => Outcome::err(
+                "mcp: the MCP servers are still starting (this is a one-off cost — an npx \
+                 server may be downloading). Try again in a moment."
+                    .to_string(),
+            ),
+            None => Outcome::err(format!("mcp: no connected server named '{server}'")),
         }
     }
 
-    /// Report startup problems once, so a misconfigured server is visible
-    /// without being fatal.
+    /// Report what happened, once, **after** the background connect finishes.
+    ///
+    /// Returns `None` while still connecting: `startup_report` runs before the
+    /// first prompt on the critical path, so it must not wait. The tools appear
+    /// on their own when they arrive, and this reports the outcome whenever it
+    /// is next asked.
     fn startup_report(&mut self) -> Option<String> {
-        if self.problems.is_empty() {
+        if self.reported {
             return None;
         }
-        let tool_count: usize = self.servers.iter().map(|s| s.tools.len()).sum();
+        let mut g = self.connected.lock().ok()?;
+        let c = g.as_mut()?; // `None` = still connecting
+        self.reported = true;
+        if c.problems.is_empty() {
+            return None; // a clean start stays silent
+        }
+        let tool_count: usize = c.servers.iter().map(|s| s.tools.len()).sum();
         let mut s = format!(
             "[mcp] {tool_count} tool(s) from {} server(s); {} problem(s):",
-            self.servers.len(),
-            self.problems.len()
+            c.servers.len(),
+            c.problems.len()
         );
-        for p in &self.problems {
+        for p in &c.problems {
             s.push_str(&format!("\n       {p}"));
         }
         Some(s)
@@ -179,7 +254,11 @@ impl ToolBackend for Mcp {
     /// Shut every server down. `Client::drop` kills the process group, so an
     /// `npx` wrapper and the node process under it both go.
     fn on_exit(&mut self) {
-        self.servers.clear();
+        if let Ok(mut g) = self.connected.lock()
+            && let Some(c) = g.as_mut()
+        {
+            c.servers.clear();
+        }
     }
 }
 
@@ -231,10 +310,29 @@ mod tests {
         }
     }
 
+    /// Connect eagerly for tests: `start_background` is the production path, but
+    /// assertions about published tools need the connect to have finished. This
+    /// is the same `connect` the background thread runs, just awaited.
+    fn connected_mcp(configs: Vec<mcp::ServerConfig>, path: &std::path::Path) -> Mcp {
+        let connected = std::sync::Arc::new(std::sync::Mutex::new(Some(Mcp::connect(configs, path))));
+        Mcp { connected, cache: std::sync::Arc::new(std::sync::Mutex::new(None)), reported: false }
+    }
+
+    /// Wait for a backgrounded extension to finish connecting (bounded).
+    fn wait_connected(ext: &mut Mcp) {
+        for _ in 0..1000 {
+            if ext.connected.lock().map(|g| g.is_some()).unwrap_or(false) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("MCP connect did not finish in time");
+    }
+
     #[test]
     fn tools_from_a_real_server_are_published_and_callable() {
         let Some(f) = Fixture::new("pub") else { return };
-        let mut ext = Mcp::connect(f.configs(), &f.dir.join("mcp.json"));
+        let mut ext = connected_mcp(f.configs(), &f.dir.join("mcp.json"));
 
         let specs = ext.specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name).collect();
@@ -258,7 +356,7 @@ mod tests {
     #[test]
     fn unknown_names_and_servers_fail_with_a_useful_message() {
         let Some(f) = Fixture::new("unknown") else { return };
-        let mut ext = Mcp::connect(f.configs(), &f.dir.join("mcp.json"));
+        let mut ext = connected_mcp(f.configs(), &f.dir.join("mcp.json"));
         let out = ext.run("bash", &serde_json::json!({}));
         assert!(out.is_error);
         assert!(out.content.contains("not an MCP tool name"), "got: {}", out.content);
@@ -273,7 +371,7 @@ mod tests {
     #[test]
     fn a_remote_error_is_surfaced_as_a_tool_error() {
         let Some(f) = Fixture::new("err") else { return };
-        let mut ext = Mcp::connect(f.configs(), &f.dir.join("mcp.json"));
+        let mut ext = connected_mcp(f.configs(), &f.dir.join("mcp.json"));
         let out = ext.run("mcp__test__fail", &serde_json::json!({}));
         assert!(out.is_error, "got: {}", out.content);
         assert!(out.content.contains("always fails"), "got: {}", out.content);
@@ -293,7 +391,7 @@ mod tests {
         )
         .unwrap();
         drop(f);
-        let mut ext = Mcp::connect(mcp::load_config(&dir.join("mcp.json")), &dir.join("mcp.json"));
+        let mut ext = connected_mcp(mcp::load_config(&dir.join("mcp.json")), &dir.join("mcp.json"));
         // No tools, but the object is usable.
         assert!(ext.specs().is_empty());
         let report = ext.startup_report().expect("a problem must be reported");
@@ -308,16 +406,61 @@ mod tests {
     #[test]
     fn no_problems_means_no_banner() {
         let Some(f) = Fixture::new("quiet") else { return };
-        let mut ext = Mcp::connect(f.configs(), &f.dir.join("mcp.json"));
+        let mut ext = connected_mcp(f.configs(), &f.dir.join("mcp.json"));
         assert!(ext.startup_report().is_none(), "a clean start must be silent");
     }
 
     #[test]
     fn on_exit_shuts_the_servers_down() {
         let Some(f) = Fixture::new("exit") else { return };
-        let mut ext = Mcp::connect(f.configs(), &f.dir.join("mcp.json"));
+        let mut ext = connected_mcp(f.configs(), &f.dir.join("mcp.json"));
         assert!(!ext.specs().is_empty());
         ext.on_exit();
-        assert!(ext.servers.is_empty(), "servers must be dropped");
+        let empty = ext.with_servers(|s| s.is_empty()).unwrap_or(false);
+        assert!(empty, "servers must be dropped");
+    }
+
+    /// The production path: `register` must return immediately and the tools
+    /// must appear once the background connect finishes. This is what keeps a
+    /// slow server (an npx download can take ~24s) off the startup path.
+    #[test]
+    fn connecting_happens_in_the_background_not_at_startup() {
+        let Some(f) = Fixture::new("bg") else { return };
+        let ext = Mcp::start_background(f.configs(), f.dir.join("mcp.json"));
+        // Not connected yet (or, on a fast machine, already done) — either way
+        // this must not block.
+        let t0 = std::time::Instant::now();
+        let _ = ext.specs();
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(500),
+            "specs() must never wait for a connection, took {:?}",
+            t0.elapsed()
+        );
+        let mut ext = ext;
+        wait_connected(&mut ext);
+        let names: Vec<String> = ext.specs().iter().map(|s| s.name.to_string()).collect();
+        assert!(names.iter().any(|n| n == "mcp__test__echo"), "got: {names:?}");
+        // And it is actually callable once connected.
+        let out = ext.run("mcp__test__echo", &serde_json::json!({"text": "bg ok"}));
+        assert!(!out.is_error, "got: {}", out.content);
+        assert_eq!(out.content, "bg ok");
+    }
+
+    /// A call made while the connect is still in flight gets a clear, actionable
+    /// error rather than a hang or a confusing "no such server".
+    #[test]
+    fn a_call_before_connecting_says_so() {
+        // No fixture needed: this one is never connected at all.
+        let ext = Mcp {
+            connected: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            reported: false,
+        };
+        let mut ext = ext;
+        let out = ext.run("mcp__test__echo", &serde_json::json!({"text": "x"}));
+        assert!(out.is_error);
+        assert!(out.content.contains("still starting"), "got: {}", out.content);
+        // And the banner stays silent while connecting (it must not block).
+        assert!(ext.startup_report().is_none());
     }
 }

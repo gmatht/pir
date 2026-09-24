@@ -463,14 +463,20 @@ available:
 | `context7` | up-to-date library documentation (React, Next.js, …). No API key needed — it publishes `resolve-library-id` and `query-docs`. |
 | `filesystem` | read/write under one directory tree, for a scoped sandbox |
 
-**Nothing is enabled by default, deliberately.** A default-on server spawns a
-child process and needs the network on *every* launch, including sessions that
-never touch it. Measured here: Context7 takes **~24s** to start cold (npx has to
-fetch the package) and ~8s warm, which sits on the critical path before the
-first prompt — against a ~1 MB idle footprint that is the entire point of pir.
-It also adds a runtime-fetched, unpinned third-party dependency to every launch.
-So it is a one-command opt-in, discovered via `/mcp`, at zero cost to anyone who
-does not want it.
+**Connecting happens in the background.** The extension registers immediately
+with no tools, spawns a thread that starts the servers and handshakes, and
+adopts the tools when they arrive (`specs()` is rebuilt each turn, so they appear
+as soon as they are ready). A slow server therefore costs nothing at startup:
+with Context7 configured and a *cold* npx cache, time-to-first-prompt measured
+**0.7s**, where connecting eagerly would have been ~24s. A call made in the
+narrow window before the connect finishes returns a clear "still starting"
+message rather than hanging.
+
+**Nothing is enabled by default, deliberately** — not for latency any more, but
+for cost: a server still spawns a child process and needs network access on
+*every* launch, including sessions that never call an MCP tool. It is a
+one-command opt-in (`/mcp init context7`), discovered via `/mcp`, at zero cost
+to anyone who does not want it.
 
 ### Failure policy
 

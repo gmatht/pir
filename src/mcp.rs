@@ -97,10 +97,12 @@ pub fn config_path() -> PathBuf {
 
 /// Ready-made server declarations an operator can opt into by name.
 ///
-/// These are *suggestions*, not defaults. A default-on server would spawn a
-/// Node process and need the network on every launch — a Context7 cold start
-/// measured 24s here, against a ~1 MB idle footprint that is the whole point of
-/// pir. So nothing here is activated until the operator asks for it.
+/// These are *suggestions*, not defaults: nothing is spawned until the operator
+/// asks. That is a deliberate cost decision, and it is cheap to keep — the
+/// connection now happens on a background thread, so a slow server (an npx
+/// download can take ~20s) no longer delays the first prompt, but it still costs
+/// a child process and network access on every launch, which a session that
+/// never calls an MCP tool should not pay.
 ///
 /// `pub` so `/mcp init <name>` can write one out and the docs can list them.
 pub fn starters() -> &'static [(&'static str, &'static str, &'static str, &'static [&'static str])] {
@@ -108,8 +110,8 @@ pub fn starters() -> &'static [(&'static str, &'static str, &'static str, &'stat
     &[
         (
             "context7",
-            "Up-to-date library documentation (React, Next.js, etc). No API key needed; \
-             first run fetches the server via npx and can take ~20s.",
+            "Up-to-date library documentation (React, Next.js, etc). No API key needed. \
+             Connects in the background, so it does not delay the first prompt.",
             "npx",
             &["-y", "@upstash/context7-mcp"],
         ),
