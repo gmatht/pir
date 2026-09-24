@@ -1937,10 +1937,14 @@ mod tests {
         // test failed intermittently. Poll instead — `flock -n` fails while A
         // holds it, so the first refusal is proof A is in.
         //
-        // The budget is generous because each poll forks two processes and the
-        // suite is documented as contention-bound (see `scripts/deploy.sh`): on a
-        // machine saturated by unrelated CPU work, scheduling the spawned
-        // `flock`/`true` pair can take seconds.
+        // The budget is a little more generous than the original 10s because each
+        // poll forks two processes and the suite is documented as
+        // contention-bound (see `scripts/deploy.sh`): on a machine saturated by
+        // unrelated CPU work, scheduling the spawned `flock`/`true` pair takes
+        // longer. It is deliberately NOT raised further: when this test fails for
+        // an environmental reason, a long deadline only makes the suite slower to
+        // report it. 20s is enough to absorb scheduling delay while still failing
+        // promptly if `flock` genuinely cannot run here.
         //
         // Deliberately does NOT inspect A's exit status. `flock` forks (or execs)
         // the `sleep`, so A can legitimately be reaped while the grandchild still
@@ -1948,7 +1952,7 @@ mod tests {
         // was strictly worse than the original. The lock probe below is the only
         // reliable proof that A is in.
         let mut held = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while std::time::Instant::now() < deadline {
             let probe = Command::new("flock")
                 .args(["-x", "-n"])
@@ -1964,8 +1968,8 @@ mod tests {
         }
         assert!(
             held,
-            "holder A never acquired {lock:?} within 60s (the flock under test did not start, \
-             or the machine is too loaded to schedule it)"
+            "holder A never acquired {lock:?} within 20s (the flock under test did not start, \
+             or this machine cannot run it reliably alongside the rest of the suite)"
         );
 
         // Holder B should be refused immediately (-w 0 => no wait). This is now

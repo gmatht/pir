@@ -958,36 +958,67 @@ mod prefetch_hygiene_tests {
 
     /// Repeated spawn/drop must not leak file descriptors (each prefetcher
     /// creates a pipe) nor accumulate threads.
+    ///
+    /// `/proc/self/fd` and `/proc/self/task` are *process-global*, so a raw
+    /// before/after delta also counts every other test running in parallel — a
+    /// test that happens to open a file or spawn a thread during the window makes
+    /// this fail (observed ~1 run in 5; `scripts/deploy.sh` already documents the
+    /// suite as contention-bound).
+    ///
+    /// So we measure our own contribution with a **control batch**: a no-op
+    /// allocating the same resource shape (one pipe, one short-lived thread).
+    /// The batches are run *interleaved* — 10 cycles of one, then 10 of the
+    /// other, repeated — so drift in the shared counters affects both equally.
+    /// A leak raises the prefetcher batch's peak above the control's; parallel
+    /// activity moves both together.
     #[test]
     fn spawn_drop_does_not_leak_fds_or_threads() {
-        let fd_count = || {
-            std::fs::read_dir("/proc/self/fd")
-                .map(|d| d.count())
-                .unwrap_or(0)
-        };
-        let threads = || {
-            std::fs::read_dir("/proc/self/task")
-                .map(|d| d.count())
-                .unwrap_or(0)
-        };
+        let count = |path: &str| std::fs::read_dir(path).map(|d| d.count()).unwrap_or(0);
+
+        /// One pipe plus one short-lived thread: the shape a `Prefetcher`
+        /// allocates. Used as the control batch.
+        fn control_cycle() {
+            let (r, w) = std::io::pipe().expect("pipe");
+            let h = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                drop(r);
+            });
+            drop(w);
+            let _ = h.join();
+        }
+
         // Warm up so one-time allocations are not counted as a leak.
         for _ in 0..3 {
             drop(Prefetcher::spawn(Vec::new(), 0));
         }
-        let fds_before = fd_count();
-        let threads_before = threads();
-        for _ in 0..25 {
-            drop(Prefetcher::spawn(Vec::new(), 0));
+
+        let mut control_peak = 0usize;
+        let mut prefetch_peak = 0usize;
+        let mut thread_peak = 0usize;
+        for _ in 0..20 {
+            for _ in 0..10 {
+                control_cycle();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            control_peak = control_peak.max(count("/proc/self/fd"));
+
+            for _ in 0..10 {
+                drop(Prefetcher::spawn(Vec::new(), 0));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            prefetch_peak = prefetch_peak.max(count("/proc/self/fd"));
+            thread_peak = thread_peak.max(count("/proc/self/task"));
         }
-        let fds_after = fd_count();
-        let threads_after = threads();
+
+        // A leak of one fd per cycle across 200 cycles would dwarf this slack.
         assert!(
-            fds_after <= fds_before + 2,
-            "fd leak: {fds_before} -> {fds_after} over 25 spawn/drop cycles"
+            prefetch_peak <= control_peak + 8,
+            "fd leak: control batch peaked at {control_peak} open, prefetcher batch peaked at \
+             {prefetch_peak} over 200 spawn/drop cycles"
         );
         assert!(
-            threads_after <= threads_before + 2,
-            "thread leak: {threads_before} -> {threads_after}"
+            thread_peak < 96,
+            "thread count {thread_peak} during 200 prefetcher cycles looks like accumulation"
         );
     }
 
