@@ -77,6 +77,12 @@ is a major advantage but it lacks several automation-oriented features.
   across a crash or resume. Shell side effects are explicitly out of scope and
   the result says so.
 
+- **MCP servers (stdio)** — tools from Model Context Protocol servers appear
+  alongside the built-ins, namespaced `mcp__<server>__<tool>`. Configured in
+  `~/.pi/agent/mcp.json`; a server that fails to start is reported once in the
+  banner and ignored rather than being fatal, and every request is timeout-bounded
+  so a wedged server cannot hang a turn. `/mcp` lists what is available.
+
 See [FEATURES.md](FEATURES.md) for the full documentation of these.
 
 ---

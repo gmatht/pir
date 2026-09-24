@@ -416,7 +416,73 @@ pruned, so a long session's checkpoint directory stays in the low megabytes.
 
 ---
 
-## 11. Environment variables added
+## 11. MCP servers (Model Context Protocol, stdio)
+
+pir can use tools from **MCP servers** — external programs that speak JSON-RPC
+2.0 over their own stdin/stdout. They appear to the model exactly like built-in
+tools, namespaced `mcp__<server>__<tool>`.
+
+```
+pir  ──spawn──►  server (child process)
+ ├── stdin  ────►  {"jsonrpc":"2.0","id":1,"method":"tools/list"}\n
+ └── stdout ◄────  {"jsonrpc":"2.0","id":1,"result":{"tools":[...]}}\n
+```
+
+### Configuration
+
+`~/.pi/agent/mcp.json` (or `<config>/agent/mcp.json`); the `mcpServers`
+spelling used by other clients is accepted too, so a config can be copied here
+unchanged:
+
+```json
+{
+  "servers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+      "env": { "FOO": "bar" },
+      "cwd": "/tmp"
+    }
+  }
+}
+```
+
+At startup each server is spawned, handshaken (`initialize` →
+`notifications/initialized`) and asked for its tools (`tools/list`). `/mcp`
+lists the configured servers and the tools actually available this session.
+
+### Failure policy
+
+Starting a server is *untrusted work* — it may not be installed, may crash, may
+hang. None of that may stop pir from running:
+
+- a server that fails to start is reported **once, in the startup banner**, then
+  ignored for the session; its tools simply do not exist;
+- a server that dies later is **not respawned** mid-session (a crash loop would
+  burn a turn each time) — calls against it return a clear error;
+- every request has a timeout (`PIR_MCP_TIMEOUT_SECS`, default 120s), so a wedged
+  server can never hang a turn;
+- nothing is written to a pipe without that timeout applying to the wait.
+
+`PIR_MCP=0` disables the feature entirely — no process is spawned at all.
+
+### Details worth knowing
+
+- **Tool names are sanitized** (`mcp__my-server__read_file`): two servers cannot
+  collide, and the model can see where a tool came from.
+- **Servers run in their own process group** and are killed with it on exit, so
+  an `npx` wrapper and the node process under it both go — no orphaned servers.
+- **Non-text content is named, not dumped**: an MCP tool returning an image
+  yields `[image content: image/png]` rather than a base64 blob, for the same
+  reason `read_file` describes images rather than inlining them.
+- **Noisy servers are tolerated.** A server that logs to stdout (against the
+  spec, but common) does not break the protocol — non-JSON lines are skipped.
+- Only **stdio** is implemented. Remote/hosted servers would need HTTP+SSE,
+  which is separable and not done.
+
+---
+
+## 12. Environment variables added
 
 | variable | effect |
 |---|---|
@@ -434,10 +500,12 @@ pruned, so a long session's checkpoint directory stays in the low megabytes.
 | `PIR_WEB_ALLOW` | hosts exempt from the web SSRF address check (`*` for all) |
 | `PIR_WEB_NET_TESTS` | run the opt-in live network tests |
 | `PI_DIR` | relocates the config dir, and with it the global taste/skills/plans stores |
+| `PIR_MCP` | `0` disables MCP entirely (no server is spawned) |
+| `PIR_MCP_TIMEOUT_SECS` | per-request MCP timeout (default 120) |
 
 ---
 
-## 12. Slash commands added
+## 13. Slash commands added
 
 | command | effect |
 |---|---|
@@ -447,6 +515,7 @@ pruned, so a long session's checkpoint directory stays in the low megabytes.
 | `/plan list` / `/plan show [name]` / `/plan dir` | saved plans |
 | `/plan <task>` | enter plan mode with the task pre-filled |
 | `/taste [list\|remember\|forget\|find\|path]` | manage recorded preferences |
+| `/mcp` | list configured MCP servers and their available tools |
 | `/checkpoints` | list the rewindable turn boundaries |
 | `/rewind <#>` | restore the tree and the conversation to a checkpoint |
 

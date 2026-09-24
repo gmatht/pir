@@ -14,6 +14,7 @@ mod cpu_probe;
 mod cpu_scenarios_tests;
 mod fake;
 mod goal;
+mod mcp;
 mod md;
 mod notify;
 mod picker;
@@ -344,6 +345,8 @@ COMMANDS
   /model* <sel>  /model-all <sel>   broadcast a model switch to ALL your open pir terminals (also sets the new default)
   /bg <text>  /jobs  /fg <id>  /clear  /usage  /exit
   /undo [all]             revert the last file edit (or all) to its pre-edit state
+  /mcp                   list configured MCP servers and the tools they provide
+                          (configure in ~/.pi/agent/mcp.json; PIR_MCP=0 disables)
   /checkpoints            list the rewindable turn boundaries (one per turn)
   /rewind <#>             restore the working tree AND the conversation to a
                           checkpoint: every file that turn changed goes back,
@@ -3655,6 +3658,49 @@ fn handle_command(
                             }
                         }
                         None => eprintln!("pir: agent busy (turn running) — try again when idle"),
+                    }
+                }
+            }
+        }
+        "mcp" => {
+            // `/mcp` — show the configured MCP servers, whether MCP is enabled,
+            // and any startup problems, without holding the live clients (the
+            // registry owns those).
+            if !crate::mcp::enabled() {
+                println!("{}", term::dim("MCP is disabled (PIR_MCP=0) — no server is started"));
+                return;
+            }
+            let path = crate::mcp::config_path();
+            let servers = crate::mcp::load_config(&path);
+            if servers.is_empty() {
+                println!(
+                    "{}",
+                    term::dim(&format!(
+                        "no MCP servers configured. Create {} with:\n  {{\"servers\": {{\"name\": {{\"command\": \"npx\", \"args\": [\"-y\", \"@modelcontextprotocol/server-filesystem\", \"/tmp\"]}}}}}}",
+                        path.display()
+                    ))
+                );
+                return;
+            }
+            println!("{}", term::bold(&format!("{} MCP server(s) configured in {}", servers.len(), path.display())));
+            for c in &servers {
+                println!("  {} {}", term::cyan(&c.name), term::dim(&format!("{} {}", c.command, c.args.join(" "))));
+            }
+            // Show the tools the model actually has, which reflects what started
+            // successfully — more useful than re-probing and spawning duplicates.
+            let g = agent_slot.lock().unwrap();
+            if let Some(a) = g.as_ref() {
+                let tools: Vec<String> = a
+                    .registry_spec_names()
+                    .into_iter()
+                    .filter(|n| n.starts_with("mcp__"))
+                    .collect();
+                if tools.is_empty() {
+                    println!("{}", term::yellow("  (no MCP tools are available this session — check /mcp output at startup)"));
+                } else {
+                    println!("{}", term::dim(&format!("  {} tool(s) available:", tools.len())));
+                    for t in tools {
+                        println!("    {t}");
                     }
                 }
             }
