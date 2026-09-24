@@ -253,7 +253,18 @@ running in the foreground in this build.
 | gzip (`.gz`, `1f 8b` magic) | decompressed via `gzip -dc`, returned as text |
 | PDF (`%PDF-`) | text extracted via `pdftotext` (poppler-utils) |
 | Jupyter notebook (`.ipynb`) | rendered as readable cells: each cell's source in a fenced block, its outputs, and its errors — binary outputs (images, PDFs) are named rather than dumped as base64 |
-| anything binary | **described** instead of failing: size, detected kind, and a hex/ASCII preview of the first 256 bytes |
+| Office doc (`.docx`/`.xlsx`/`.pptx`) | text extracted from the ZIP-of-XML container (via `unzip`), paragraphs/rows on their own lines, entities decoded; the other parts are listed so a multi-sheet workbook isn't silently truncated to sheet 1 |
+| image (png/jpg/gif/bmp/webp/ico) | **described**: format, intrinsic dimensions (parsed from the header, no decode), size, path, and how to hand it to a vision model or an OCR tool |
+| anything else binary | **described** instead of failing: size, detected kind, and a hex/ASCII preview of the first 256 bytes |
+
+### Why images are described, not inlined
+
+Returning a PNG as base64 in a tool result would be actively harmful: a 1 MB
+image is ~1.4 MB of base64, a large fraction of a context window spent on data
+most configured models cannot interpret. The file stays on disk. A
+vision-capable model reads it by path; anything else gets the dimensions and a
+pointer at `base64 -w0`, ImageMagick or tesseract. If a model's catalog entry
+ever declares vision support, this is the place to branch on it.
 
 The old behaviour — "stream did not contain valid UTF-8" — told the model
 nothing. Now a PNG comes back as "binary file — not UTF-8 text: 7614 bytes, looks

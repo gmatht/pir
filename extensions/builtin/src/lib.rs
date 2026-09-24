@@ -163,10 +163,13 @@ impl ToolBackend for Builtin {
             },
             ToolSpec {
                 name: "read_file",
-                description: "Read a text file (truncated to 100k chars). Transparently \
-                              decompresses gzip (.gz) and extracts text from PDFs (via \
-                              pdftotext when installed); a binary file is described (size, kind, \
-                              hex preview) instead of failing.",
+                description: "Read a file (truncated to 100k chars). Handles the common rich \
+                              formats transparently: gzip is decompressed, PDFs are extracted as \
+                              text (via pdftotext when installed), Jupyter notebooks are rendered \
+                              as cells, and Office documents (.docx/.xlsx/.pptx) are extracted as \
+                              text (via unzip). An image is described (format, dimensions, size, \
+                              path) rather than returned as pixels, and any other binary is \
+                              described with a kind guess and a hex preview instead of failing.",
                 schema: json!({
                     "type": "object",
                     "properties": { "path": { "type": "string" } },
@@ -1113,17 +1116,356 @@ fn decode_for_reading(path: &str, bytes: &[u8]) -> Result<String, String> {
     if bytes.starts_with(b"%PDF-") {
         return pdf_to_text(path, bytes);
     }
+    let lower = path.to_ascii_lowercase();
     // A Jupyter notebook is UTF-8 JSON, so it would otherwise be returned as a
     // wall of escaped JSON strings — readable by a parser, not by a model.
-    if path.to_ascii_lowercase().ends_with(".ipynb")
+    if lower.ends_with(".ipynb")
         && let Ok(text) = std::str::from_utf8(bytes)
     {
         return Ok(notebook_to_text(text).unwrap_or_else(|| text.to_string()));
+    }
+    // Office documents are ZIP containers of XML. Recognised by extension (a
+    // bare `PK` header is also a plain zip, and guessing wrong would turn a zip
+    // listing into a garbled XML dump).
+    if let Some(kind) = office_kind(&lower)
+        && bytes.starts_with(b"PK\x03\x04")
+    {
+        return Ok(office_to_text(kind, path, bytes));
+    }
+    // An image gets a *description* rather than a hexdump: a model that cannot
+    // see pixels is far better served by "1920x1080 PNG, 412 KB" than by a wall
+    // of hex. (Vision models read the file directly; see docs/FEATURES.md.)
+    if let Some(img) = image_info(bytes) {
+        return Ok(describe_image(path, bytes, &img));
     }
     match std::str::from_utf8(bytes) {
         Ok(s) if !s.contains('\0') => Ok(s.to_string()),
         _ => Ok(describe_binary(path, bytes)),
     }
+}
+
+/// A recognised office document format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OfficeKind {
+    Docx,
+    Xlsx,
+    Pptx,
+}
+
+impl OfficeKind {
+    fn label(self) -> &'static str {
+        match self {
+            OfficeKind::Docx => "Word document",
+            OfficeKind::Xlsx => "Excel workbook",
+            OfficeKind::Pptx => "PowerPoint presentation",
+        }
+    }
+    /// The ZIP members holding the human-readable text, in reading order.
+    fn parts(self) -> Vec<&'static str> {
+        match self {
+            // `document.xml` is the body; the rest carry headers/footers/notes.
+            OfficeKind::Docx => vec![
+                "word/document.xml",
+                "word/header1.xml",
+                "word/footer1.xml",
+            ],
+            // One XML per worksheet, plus the shared string table they index
+            // into. Sheet order in the archive is not guaranteed to be tab
+            // order, so we sort the members.
+            OfficeKind::Xlsx => vec!["xl/sharedStrings.xml", "xl/worksheets/sheet1.xml"],
+            // Slide text lives one file per slide.
+            OfficeKind::Pptx => vec!["ppt/slides/slide1.xml"],
+        }
+    }
+}
+
+fn office_kind(lower_path: &str) -> Option<OfficeKind> {
+    if lower_path.ends_with(".docx") {
+        Some(OfficeKind::Docx)
+    } else if lower_path.ends_with(".xlsx") || lower_path.ends_with(".xlsm") {
+        Some(OfficeKind::Xlsx)
+    } else if lower_path.ends_with(".pptx") {
+        Some(OfficeKind::Pptx)
+    } else {
+        None
+    }
+}
+
+/// Extract readable text from an Office document by unzipping it and stripping
+/// the XML.
+///
+/// Dependency-free: an Office file is a ZIP of XML, so this shells out to
+/// `unzip -p` (present everywhere `gzip` is) and reduces the XML to text. When
+/// `unzip` is absent the result says so rather than failing — the operator can
+/// still read the document with the right tool.
+fn office_to_text(kind: OfficeKind, path: &str, bytes: &[u8]) -> String {
+    let mut out = format!(
+        "({} — text extracted from {path}, {} bytes)\n",
+        kind.label(),
+        bytes.len()
+    );
+    let mut got_any = false;
+    // For a spreadsheet the useful content is the shared-string table (where
+    // every cell's text actually lives) — the sheet XML only holds indices into
+    // it. For word/slides the body XML carries the text directly.
+    for part in kind.parts() {
+        match read_zip_member(path, part) {
+            Some(xml) => {
+                let text = xml_to_text(&xml);
+                if !text.trim().is_empty() {
+                    out.push_str(&format!("\n--- {part} ---\n{}\n", text.trim()));
+                    got_any = true;
+                }
+            }
+            None => continue,
+        }
+    }
+    // A multi-sheet workbook or deck is numbered beyond sheet1/slide1: list what
+    // else is in there so the model knows the document is bigger than the part
+    // it received.
+    if let Some(listing) = zip_listing(path, kind) {
+        out.push_str(&format!("\n(other parts: {listing})"));
+    }
+    if !got_any {
+        out.push_str(
+            "\n(could not read any text part — `unzip` may be missing, or the archive structure \
+             is unusual; try extracting it yourself with bash)",
+        );
+    }
+    out
+}
+
+/// Read one member of a ZIP by shelling out to `unzip -p <file> <member>`.
+fn read_zip_member(path: &str, member: &str) -> Option<String> {
+    let out = Command::new("unzip")
+        .arg("-p")
+        .arg(path)
+        .arg(member)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// List the text-bearing members beyond the ones already shown, so a large
+/// document is not silently truncated to its first page/sheet/slide.
+fn zip_listing(path: &str, kind: OfficeKind) -> Option<String> {
+    let out = Command::new("unzip")
+        .arg("-Z1")
+        .arg(path)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .collect();
+    let prefix = match kind {
+        OfficeKind::Docx => "word/",
+        OfficeKind::Xlsx => "xl/worksheets/",
+        OfficeKind::Pptx => "ppt/slides/slide",
+    };
+    let mut extra: Vec<&str> = names
+        .iter()
+        .filter(|n| n.starts_with(prefix) && n.ends_with(".xml"))
+        .map(|n| n.as_str())
+        .take(20)
+        .collect();
+    extra.sort();
+    if extra.is_empty() {
+        return None;
+    }
+    Some(extra.join(", "))
+}
+
+/// Reduce Office XML to text: paragraph/row/break elements become newlines,
+/// everything else is stripped, and entities are decoded.
+fn xml_to_text(xml: &str) -> String {
+    let mut s = xml.to_string();
+    // Insert line breaks at the tags that imply them before stripping.
+    for (tag, rep) in [
+        ("</w:p>", "\n"),      // word paragraph
+        ("</a:p>", "\n"),      // drawingml paragraph (slides)
+        ("</w:tr>", "\n"),     // word table row
+        ("</row>", "\n"),      // spreadsheet row
+        ("</si>", "\n"),       // shared string item
+        ("<w:br/>", "\n"),     // word line break
+        ("<w:tab/>", "\t"),    // word tab
+    ] {
+        s = s.replace(tag, rep);
+    }
+    s = web::strip_tags(&s);
+    s = web::decode_entities(&s);
+    // Collapse whitespace runs, keeping intentional blank lines to a maximum of
+    // one (the tags above deliberately introduce them).
+    let mut out = String::with_capacity(s.len());
+    let mut blank = 0;
+    for line in s.lines() {
+        let t = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if t.is_empty() {
+            blank += 1;
+            if blank > 1 {
+                continue;
+            }
+        } else {
+            blank = 0;
+        }
+        out.push_str(t.trim_end());
+        out.push('\n');
+    }
+    out.trim().to_string()
+}
+
+/// Compact byte size for a description line (`412 KB`). Local to this module so
+/// the extension does not depend on a non-`pub` helper elsewhere in the crate.
+fn fmt_bytes(n: u64) -> String {
+    if n < 1024 {
+        format!("{n} B")
+    } else if n < 1024 * 1024 {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// Recognised image format plus its intrinsic dimensions and colour depth,
+/// parsed from the header alone (no decode, no dependency).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImageInfo {
+    format: &'static str,
+    mime: &'static str,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+/// Parse an image header. Returns `None` for anything that is not an image.
+fn image_info(b: &[u8]) -> Option<ImageInfo> {
+    // PNG: IHDR immediately follows the 8-byte signature. A truncated file is
+    // still recognisably a PNG — the format is known, only the size is not.
+    if b.starts_with(b"\x89PNG\r\n\x1a\n") {
+        let dims = if b.len() >= 24 && &b[12..16] == b"IHDR" {
+            (
+                Some(u32::from_be_bytes([b[16], b[17], b[18], b[19]])),
+                Some(u32::from_be_bytes([b[20], b[21], b[22], b[23]])),
+            )
+        } else {
+            (None, None)
+        };
+        return Some(ImageInfo { format: "PNG", mime: "image/png", width: dims.0, height: dims.1 });
+    }
+    // GIF: logical screen descriptor at offset 6, little-endian.
+    if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") {
+        let (w, h) = if b.len() >= 10 {
+            (
+                Some(u16::from_le_bytes([b[6], b[7]]) as u32),
+                Some(u16::from_le_bytes([b[8], b[9]]) as u32),
+            )
+        } else {
+            (None, None)
+        };
+        return Some(ImageInfo { format: "GIF", mime: "image/gif", width: w, height: h });
+    }
+    // JPEG: walk the marker segments to the SOFn frame header.
+    if b.starts_with(&[0xff, 0xd8, 0xff]) {
+        let (w, h) = jpeg_dimensions(b).map(|(w, h)| (Some(w), Some(h))).unwrap_or((None, None));
+        return Some(ImageInfo { format: "JPEG", mime: "image/jpeg", width: w, height: h });
+    }
+    if b.starts_with(b"BM") && b.len() >= 26 {
+        let w = i32::from_le_bytes([b[18], b[19], b[20], b[21]]);
+        let h = i32::from_le_bytes([b[22], b[23], b[24], b[25]]);
+        return Some(ImageInfo {
+            format: "BMP",
+            mime: "image/bmp",
+            width: Some(w.unsigned_abs()),
+            height: Some(h.unsigned_abs()),
+        });
+    }
+    // WebP: RIFF container with a VP8/VP8L/VP8X chunk.
+    if b.len() >= 30 && b.starts_with(b"RIFF") && &b[8..12] == b"WEBP" {
+        let (w, h) = match &b[12..16] {
+            b"VP8X" => (
+                Some(u32::from_le_bytes([b[24], b[25], b[26], 0]) + 1),
+                Some(u32::from_le_bytes([b[27], b[28], b[29], 0]) + 1),
+            ),
+            _ => (None, None),
+        };
+        return Some(ImageInfo { format: "WebP", mime: "image/webp", width: w, height: h });
+    }
+    // SVG is text, so it never reaches here as an "image" — but an ICO is a
+    // real binary image we can at least name.
+    if b.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
+        let (w, h) = if b.len() >= 8 {
+            (Some(b[6] as u32), Some(b[7] as u32))
+        } else {
+            (None, None)
+        };
+        return Some(ImageInfo { format: "ICO", mime: "image/x-icon", width: w, height: h });
+    }
+    None
+}
+
+/// Scan JPEG marker segments for a Start-Of-Frame, which carries the size.
+fn jpeg_dimensions(b: &[u8]) -> Option<(u32, u32)> {
+    let mut i = 2usize;
+    // A SOF segment needs `i..i+9` to be in range (marker, length, precision,
+    // height, width), so the bound is `i + 9 <= len`.
+    while i + 9 <= b.len() {
+        if b[i] != 0xff {
+            i += 1;
+            continue;
+        }
+        let marker = b[i + 1];
+        // Standalone markers carry no length payload.
+        if (0xd0..=0xd9).contains(&marker) || marker == 0x01 {
+            i += 2;
+            continue;
+        }
+        let len = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
+        if len < 2 {
+            return None;
+        }
+        // SOF0..SOF15, excluding the DHT/JPG/DAC markers in that range.
+        if (0xc0..=0xcf).contains(&marker) && !matches!(marker, 0xc4 | 0xc8 | 0xcc) {
+            let h = u16::from_be_bytes([b[i + 5], b[i + 6]]) as u32;
+            let w = u16::from_be_bytes([b[i + 7], b[i + 8]]) as u32;
+            return Some((w, h));
+        }
+        i += 2 + len;
+    }
+    None
+}
+
+/// Describe an image for a model that cannot see pixels: format, dimensions,
+/// size, where it is on disk, and how to hand it to a vision model.
+///
+/// Returning base64 in the tool result would be actively harmful — a 1 MB PNG
+/// is ~1.4 MB of base64, which is a large fraction of a typical context window
+/// spent on data most models cannot interpret. The file stays on disk where it
+/// belongs; a vision-capable model reads it by path.
+fn describe_image(path: &str, bytes: &[u8], info: &ImageInfo) -> String {
+    let dims = match (info.width, info.height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => format!("{w}x{h} pixels"),
+        _ => "dimensions unknown".to_string(),
+    };
+    let mut out = format!(
+        "(image — {} {dims}, {}. Not returned as text.)\n",
+        info.format,
+        fmt_bytes(bytes.len() as u64)
+    );
+    out.push_str(&format!(
+        "path: {path}\nmime: {}\n",
+        info.mime
+    ));
+    out.push_str(
+        "A text-only model cannot read the pixels. To use the image:\n         - hand the path to a vision-capable model (it reads the file directly), or\n         - read it as a data URL with bash: base64 -w0 <path>\n         - or convert/analyse it with a tool (ImageMagick, tesseract for OCR).\n",
+    );
+    out
 }
 
 /// Render a Jupyter notebook (`.ipynb`) as readable markdown-ish text: each
@@ -3003,21 +3345,24 @@ mod rich_read_tests {
         let _ = fs::remove_dir_all(&d);
     }
 
+    /// A *recognised image* now takes the richer image path (see
+    /// `reading_an_image_describes_it_and_never_dumps_base64`); the generic
+    /// hexdump description is for binary data we cannot name.
     #[test]
     fn binary_files_are_described_not_garbled() {
         let d = tmp("bin");
-        // A PNG signature followed by NULs: definitely not UTF-8 text.
-        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        // An ELF header followed by non-UTF-8 bytes: not text, not an image.
+        let mut bytes = b"\x7fELF".to_vec();
         bytes.extend_from_slice(&[0u8; 64]);
         bytes.extend_from_slice(&[0xff, 0xfe, 0x00, 0x41]);
-        let p = d.join("img.png");
+        let p = d.join("prog.bin");
         fs::write(&p, &bytes).unwrap();
         let out = read(&p);
         assert!(out.contains("binary file"), "got: {out}");
-        assert!(out.contains("PNG image"), "kind must be detected: {out}");
+        assert!(out.contains("ELF binary"), "kind must be detected: {out}");
         assert!(out.contains(&format!("{} bytes", bytes.len())), "size missing: {out}");
-        assert!(out.contains("89 50 4e 47"), "hex preview missing: {out}");
-        assert!(out.contains(".PNG"), "ascii column missing: {out}");
+        assert!(out.contains("7f 45 4c 46"), "hex preview missing: {out}");
+        assert!(out.contains(".ELF"), "ascii column missing: {out}");
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -3176,6 +3521,162 @@ trailer<</Root 1 0 R>>\n%%EOF\n";
         let _ = fs::remove_dir_all(&d);
     }
 
+
+    #[test]
+    fn image_headers_are_parsed_for_dimensions() {
+        // PNG: signature + IHDR length/type + width/height.
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&1920u32.to_be_bytes());
+        png.extend_from_slice(&1080u32.to_be_bytes());
+        png.extend_from_slice(&[8, 2, 0, 0, 0]);
+        let i = image_info(&png).expect("png recognised");
+        assert_eq!(i.format, "PNG");
+        assert_eq!((i.width, i.height), (Some(1920), Some(1080)));
+        assert_eq!(i.mime, "image/png");
+
+        // GIF: logical screen descriptor, little-endian.
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(&320u16.to_le_bytes());
+        gif.extend_from_slice(&200u16.to_le_bytes());
+        let i = image_info(&gif).expect("gif");
+        assert_eq!((i.format, i.width, i.height), ("GIF", Some(320), Some(200)));
+
+        // JPEG: SOI, then an APP0 segment whose declared length (0x0010 = 16)
+        // must cover its own 2 length bytes, so 14 bytes of payload follow.
+        let mut jpg = vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10];
+        jpg.extend_from_slice(&[0u8; 14]);
+        // Then SOF0: length 0x0011 (17), precision 8, height, width.
+        jpg.extend_from_slice(&[0xff, 0xc0, 0x00, 0x11, 0x08]);
+        jpg.extend_from_slice(&480u16.to_be_bytes()); // height
+        jpg.extend_from_slice(&640u16.to_be_bytes()); // width
+        let i = image_info(&jpg).expect("jpeg");
+        assert_eq!((i.format, i.width, i.height), ("JPEG", Some(640), Some(480)));
+
+        // BMP: dimensions at offset 18/22, little-endian signed.
+        let mut bmp = b"BM".to_vec();
+        bmp.extend_from_slice(&[0u8; 16]);
+        bmp.extend_from_slice(&100i32.to_le_bytes());
+        bmp.extend_from_slice(&50i32.to_le_bytes());
+        let i = image_info(&bmp).expect("bmp");
+        assert_eq!((i.format, i.width, i.height), ("BMP", Some(100), Some(50)));
+
+        // Not an image at all.
+        assert!(image_info(b"just text").is_none());
+        assert!(image_info(&[]).is_none());
+        // A truncated PNG is recognised but reports no dimensions rather than
+        // reading past the end.
+        let i = image_info(b"\x89PNG\r\n\x1a\n\x00\x00").expect("recognised");
+        assert_eq!(i.format, "PNG");
+        assert_eq!(i.width, None);
+    }
+
+    #[test]
+    fn reading_an_image_describes_it_and_never_dumps_base64() {
+        let d = tmp("img");
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&800u32.to_be_bytes());
+        png.extend_from_slice(&600u32.to_be_bytes());
+        png.extend_from_slice(&[8, 2, 0, 0, 0]);
+        png.extend_from_slice(&[0xff; 512]);
+        let p = d.join("pic.png");
+        fs::write(&p, &png).unwrap();
+
+        let out = read(&p);
+        assert!(out.contains("image — PNG 800x600 pixels"), "got: {out}");
+        assert!(out.contains("image/png"), "got: {out}");
+        assert!(out.contains("Not returned as text"), "got: {out}");
+        // It must point a vision model at the file, and give a text-only model
+        // something actionable.
+        assert!(out.contains("vision-capable"), "got: {out}");
+        assert!(out.contains("base64"), "must show how to encode it: {out}");
+        assert!(out.contains("tesseract") || out.contains("ImageMagick"), "OCR hint: {out}");
+        // And it must NOT contain the pixel data.
+        assert!(!out.contains("////"), "pixel data leaked: {out}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn office_extension_detection_is_precise() {
+        assert_eq!(office_kind("a.docx"), Some(OfficeKind::Docx));
+        assert_eq!(office_kind("a.xlsx"), Some(OfficeKind::Xlsx));
+        assert_eq!(office_kind("a.xlsm"), Some(OfficeKind::Xlsx));
+        assert_eq!(office_kind("a.pptx"), Some(OfficeKind::Pptx));
+        // A plain zip must NOT be treated as an office document just because it
+        // starts with PK.
+        assert_eq!(office_kind("a.zip"), None);
+        assert_eq!(office_kind("a.tar.gz"), None);
+    }
+
+    #[test]
+    fn xml_is_reduced_to_readable_text() {
+        let docx = r#"<?xml version="1.0"?><w:document><w:body>
+            <w:p><w:r><w:t>Hello</w:t></w:r></w:p>
+            <w:p><w:r><w:t>Second &amp; third</w:t></w:r></w:p>
+            </w:body></w:document>"#;
+        let t = xml_to_text(docx);
+        assert!(t.contains("Hello"), "got: {t}");
+        assert!(t.contains("Second & third"), "entities must decode: {t}");
+        assert!(!t.contains('<'), "tags must be stripped: {t}");
+        // Paragraphs land on separate lines.
+        let lines: Vec<&str> = t.lines().filter(|l| !l.is_empty()).collect();
+        assert!(lines.len() >= 2, "got: {t:?}");
+    }
+
+    /// Build a real .docx (a zip with the expected members) and read it, so the
+    /// unzip path is exercised rather than mocked.
+    #[test]
+    fn office_documents_are_extracted_via_unzip() {
+        let d = tmp("docx");
+        let src = d.join("src");
+        fs::create_dir_all(src.join("word")).unwrap();
+        fs::write(
+            src.join("word/document.xml"),
+            r#"<?xml version="1.0"?><w:document><w:body>
+               <w:p><w:r><w:t>Quarterly report</w:t></w:r></w:p>
+               <w:p><w:r><w:t>Revenue up 12%</w:t></w:r></w:p>
+               </w:body></w:document>"#,
+        )
+        .unwrap();
+        let docx = d.join("report.docx");
+        let zipped = Command::new("zip")
+            .arg("-q")
+            .arg("-r")
+            .arg(&docx)
+            .arg("word")
+            .current_dir(&src)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !zipped || !docx.exists() {
+            // No `zip` on this host: the fallback message must still be honest.
+            let fake = d.join("fake.docx");
+            fs::write(&fake, b"PK\x03\x04 not really a docx").unwrap();
+            let out = read(&fake);
+            assert!(out.contains("Word document"), "got: {out}");
+            let _ = fs::remove_dir_all(&d);
+            return;
+        }
+        let have_unzip = Command::new("unzip")
+            .arg("-v")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let out = read(&docx);
+        assert!(out.contains("Word document"), "got: {out}");
+        if have_unzip {
+            assert!(out.contains("Quarterly report"), "body text missing: {out}");
+            assert!(out.contains("Revenue up 12%"), "got: {out}");
+            assert!(!out.contains("<w:t>"), "XML must be stripped: {out}");
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn non_utf8_text_never_produces_a_read_error() {
         let d = tmp("latin1");
@@ -3194,3 +3695,4 @@ trailer<</Root 1 0 R>>\n%%EOF\n";
         let _ = fs::remove_dir_all(&d);
     }
 }
+

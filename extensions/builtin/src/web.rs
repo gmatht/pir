@@ -497,7 +497,7 @@ pub fn html_to_text(html: &str) -> String {
 
 /// Remove every remaining tag (an incomplete pass is fine: the text is a
 /// summary, not a faithful render).
-fn strip_tags(s: &str) -> String {
+pub(crate) fn strip_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut depth = 0usize;
     for c in s.chars() {
@@ -512,7 +512,7 @@ fn strip_tags(s: &str) -> String {
 }
 
 /// Decode the handful of HTML entities that actually matter for readability.
-fn decode_entities(s: &str) -> String {
+pub(crate) fn decode_entities(s: &str) -> String {
     let mut out = s.to_string();
     for (from, to) in [
         ("&amp;", "&"),
