@@ -241,6 +241,51 @@ Guarantees:
 `run_in_background` is accepted for compatibility and reported honestly as
 running in the foreground in this build.
 
+### Concurrent fan-out
+
+Delegation keeps the parent's *context* small; a batch of tasks keeps its
+*wall clock* small too. Pass `tasks: [...]` instead of a single `prompt` and
+the children run concurrently, returning one merged report:
+
+```
+agent({ tasks: [
+  { prompt: "Where is auth handled? Report paths + line numbers",
+    subagent_type: "explore", description: "auth" },
+  { prompt: "Where are migrations run from?",
+    subagent_type: "explore", description: "migrations" },
+  { prompt: "Where is the retry loop?",
+    subagent_type: "explore", description: "retries" }
+] })
+```
+
+- **One writer.** Children stay quiet and each writes only to its own session
+  log; the batch driver owns the single report, so concurrently-finishing
+  children cannot interleave on the terminal or race on a shared buffer.
+- **Submission order.** The merged report lists tasks in the order you passed
+  them, not the order they finished — so it reads the same every run.
+- **Per-child deadlines.** One wedged child is marked timed-out for that task
+  only; the rest of the batch still returns usable reports.
+- **Capped at 8 tasks**, so a fan-out cannot accidentally open fifty concurrent
+  provider requests.
+
+### Choosing a sub-agent's model
+
+`explore`/`plan` tasks accept a `model` selector (e.g.
+`cerebras/gpt-oss-120b`) so a high-fan-out read-only sweep can run on a
+cheaper, faster model:
+
+```
+agent({ prompt: "List every call site of `parse_config`",
+        subagent_type: "explore", model: "cerebras/gpt-oss-120b" })
+```
+
+This is a safety boundary, not just a preference: because `explore`/`plan` run
+read-only, a weaker model there cannot change anything, so delegation down is
+safe. **`general` ignores `model` and inherits the parent's** — a subtly wrong
+`general` child writes code, and that is the one failure mode worth paying for
+the strong model to avoid. An unresolvable selector falls back to the parent's
+model and says so in the report.
+
 ---
 
 ## 7. Richer file reading

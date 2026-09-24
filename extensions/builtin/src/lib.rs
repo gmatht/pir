@@ -272,20 +272,34 @@ impl ToolBackend for Builtin {
                               search + report), 'plan' (read-only approach + plan_write), 'general' \
                               (full capability, inherits your security posture). The sub-agent \
                               cannot ask the operator anything, so give it a self-contained, \
-                              unambiguous prompt.",
+                              unambiguous prompt. Pass `tasks: [...]` instead of a single `prompt` \
+                              to run several sub-agents CONCURRENTLY and get one merged report — \
+                              use it for independent sweeps ('where is auth handled', 'where are \
+                              migrations', 'where is the retry loop') so they overlap instead of \
+                              running one after another. Set `model` on an explore/plan task to run \
+                              it on a cheaper/faster model; general always inherits yours.",
                 schema: json!({
                     "type": "object",
                     "properties": {
-                        "prompt": { "type": "string", "description": "The complete task for the sub-agent (it cannot see your conversation)" },
+                        "prompt": { "type": "string", "description": "The complete task for the sub-agent (it cannot see your conversation). Use either `prompt` (one task) or `tasks` (many, run concurrently) — not both." },
                         "description": { "type": "string", "description": "Short 3-5 word label for this delegation" },
                         "subagent_type": {
                             "type": "string",
                             "enum": ["explore", "plan", "general"],
                             "description": "explore = read-only recon; plan = read-only planning; general = full capability (default)"
                         },
+                        "model": {
+                            "type": "string",
+                            "description": "Optional provider/model selector (e.g. 'cerebras/gpt-oss-120b') for this sub-agent. Honoured only for explore/plan (read-only) tasks, where a cheaper/faster model is safe because the child cannot change anything; ignored for general, which inherits your model. Unresolvable selectors fall back to your model with a note."
+                        },
+                        "tasks": {
+                            "type": "array",
+                            "description": "Run several sub-agents concurrently (up to 8) and return one merged report in submission order. Each entry is an object with the same fields as a single call (prompt, description, subagent_type, model).",
+                            "items": { "type": "object" }
+                        },
                         "run_in_background": { "type": "boolean", "description": "Accepted for compatibility; not supported in this build" }
                     },
-                    "required": ["prompt"]
+                    "required": []
                 }),
             },
             ToolSpec {

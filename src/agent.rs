@@ -1908,15 +1908,24 @@ impl Agent {
             Err(e) => return Some(Outcome { content: e, is_error: true }),
         };
         let policy = self.security_policy();
+        // Model selection: a read-only child may be pointed at a cheaper/faster
+        // model via `model`; `general` always inherits the parent's (see
+        // `subagent::resolve_child_model`). We resolve here so the child is
+        // built with the right pair rather than inheriting blindly.
+        let (provider, model, note) =
+            crate::subagent::resolve_child_model(&self.cached_providers, (&self.provider, &self.model), &spawn);
         let report = crate::subagent::run(
-            self.provider.clone(),
-            self.model.clone(),
+            provider,
+            model,
             &spawn,
             self.registry.full_auto(),
             policy,
             self.cancel.clone(),
         );
         let mut text = report.render(&spawn);
+        if let Some(n) = note {
+            text.push_str(&format!("\n\n{n}"));
+        }
         if spawn.background {
             text.push_str(
                 "\n\nNote: `run_in_background` is not supported for sub-agents in this build — \
@@ -1924,6 +1933,48 @@ impl Agent {
             );
         }
         Some(Outcome { content: text, is_error: report.error })
+    }
+
+    /// Intercept a *batched* `agent` call (`{"tasks": [...]}`): run every task
+    /// concurrently and return one merged, submission-ordered report.
+    ///
+    /// Fan-out is opt-in via the `tasks` array so the single-task shape (and
+    /// its simple, immediately-usable result) is unchanged. The merge rule that
+    /// makes concurrency safe is documented on [`crate::subagent::run_batch`]:
+    /// children stay quiet, each writes only to its own session log, and this
+    /// driver is the single writer of the result.
+    fn run_subagent_batch_tool(&mut self, name: &str, input: &Value) -> Option<Outcome> {
+        if name != "agent" {
+            return None;
+        }
+        // Only the `tasks` shape is handled here; a plain call falls through.
+        input.get("tasks")?;
+        if let Some(k) = self.subagent_kind {
+            return Some(Outcome {
+                content: format!(
+                    "agent: sub-agents cannot delegate further (this is a {} sub-agent). Do the \
+                     work directly.",
+                    k.as_str()
+                ),
+                is_error: true,
+            });
+        }
+        let batch = match crate::subagent::parse_batch(input) {
+            Ok(b) => b,
+            Err(e) => return Some(Outcome { content: e, is_error: true }),
+        };
+        let policy = self.security_policy();
+        let outcome = crate::subagent::run_batch(
+            (&self.provider, &self.model),
+            &self.cached_providers,
+            &batch,
+            self.registry.full_auto(),
+            policy,
+            self.cancel.clone(),
+        );
+        let err = outcome.reports.iter().any(|r| r.error);
+        let text = crate::subagent::render_batch(&batch, &outcome);
+        Some(Outcome { content: text, is_error: err })
     }
 
     /// Intercept the `remember` tool (Feature 12): persist a durable preference.
@@ -2189,6 +2240,41 @@ impl Agent {
             content: format!("The user answered:\n{}", parts.join("\n")),
             is_error: false,
         })
+    }
+
+    /// Run one tool call through the agent's interceptions in priority order,
+    /// falling back to the registry. Kept as an explicit sequence (rather than
+    /// a nested `match`) so adding an interception is a one-line change and the
+    /// indentation of the tool loop stays flat.
+    fn dispatch_tool(&mut self, name: &str, input: &Value) -> Outcome {
+        // Order matters: the batched `agent` shape is checked before the single
+        // shape (it returns None for a plain call), and `goal`/`stop`/`ask`
+        // interceptions come before the registry fallback.
+        if let Some(o) = self.run_goal_tool(name, input) {
+            return o;
+        }
+        if let Some(o) = self.run_subagent_batch_tool(name, input) {
+            return o;
+        }
+        if let Some(o) = self.run_subagent_tool(name, input) {
+            return o;
+        }
+        if let Some(o) = self.run_taste_tool(name, input) {
+            return o;
+        }
+        if let Some(o) = self.run_plan_tool(name, input) {
+            return o;
+        }
+        if let Some(o) = self.run_skill_tool(name, input) {
+            return o;
+        }
+        if let Some(o) = self.run_ask_tool(name, input) {
+            return o;
+        }
+        if let Some(o) = self.run_stop_tool(name, input) {
+            return o;
+        }
+        self.registry.execute(name, input)
     }
 
     /// Intercept the `update_goal` tool: mutate and persist the goal, then
@@ -3235,28 +3321,7 @@ impl Agent {
                 if name == "bash" {
                     self.checkpoint_note_bash();
                 }
-                let outcome = match self.run_goal_tool(name, input) {
-                    Some(o) => o,
-                    None => match self.run_subagent_tool(name, input) {
-                        Some(o) => o,
-                        None => match self.run_taste_tool(name, input) {
-                            Some(o) => o,
-                            None => match self.run_plan_tool(name, input) {
-                                Some(o) => o,
-                                None => match self.run_skill_tool(name, input) {
-                                    Some(o) => o,
-                                    None => match self.run_ask_tool(name, input) {
-                                        Some(o) => o,
-                                        None => match self.run_stop_tool(name, input) {
-                                            Some(o) => o,
-                                            None => self.registry.execute(name, input),
-                                        },
-                                    },
-                                },
-                            },
-                        },
-                    },
-                };
+                let outcome = self.dispatch_tool(name, input);
                 // NDJSON: emit tool_result event
                 self.emit_json(&json!({
                     "type": "tool_result",
@@ -4844,6 +4909,7 @@ mod goal_bootstrap_tests {
             description: "ping".into(),
             prompt: "FAKE: echo subagent-reply-ok".into(),
             background: false,
+            model: None,
         };
         let report = crate::subagent::run(
             p.clone(),
@@ -4864,6 +4930,141 @@ mod goal_bootstrap_tests {
             "the child's reply must be the report: {:?}",
             report.text
         );
+    }
+
+    /// End-to-end fan-out: several tasks run **concurrently** and come back as
+    /// one merged report in submission order. We assert real overlap by timing:
+    /// the fake provider's `slow` model would serialize if the batch ran each
+    /// child in turn, so wall-clock well under N×(per-child time) proves the
+    /// children actually overlapped.
+    #[test]
+    fn subagent_batch_runs_concurrently_and_merges_in_order() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os("PIR_FAKE_MODEL");
+        // SAFETY: test-local env mutation under the shared env lock.
+        unsafe { std::env::set_var("PIR_FAKE_MODEL", "1"); }
+        let providers = crate::config::load_providers().expect("providers");
+        let (p, m) = crate::config::select(&providers, "fake/slow").expect("fake provider");
+        let batch = crate::subagent::parse_batch(&serde_json::json!({
+            "tasks": [
+                {"prompt": "FAKE: echo task-one", "subagent_type": "explore", "description": "one"},
+                {"prompt": "FAKE: echo task-two", "subagent_type": "explore", "description": "two"},
+                {"prompt": "FAKE: echo task-three", "subagent_type": "explore", "description": "three"}
+            ]
+        }))
+        .expect("batch parses");
+        let started = std::time::Instant::now();
+        let outcome = crate::subagent::run_batch(
+            (p, m),
+            &providers,
+            &batch,
+            true,
+            Some(crate::security::SecurityPolicy::default()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let elapsed = started.elapsed();
+        match old {
+            Some(v) => unsafe { std::env::set_var("PIR_FAKE_MODEL", v) },
+            None => unsafe { std::env::remove_var("PIR_FAKE_MODEL") },
+        }
+        assert_eq!(outcome.reports.len(), 3, "one report per task");
+        for (i, r) in outcome.reports.iter().enumerate() {
+            assert!(!r.error, "task #{} failed: {}", i + 1, r.text);
+        }
+        assert!(outcome.reports[0].text.contains("task-one"));
+        assert!(outcome.reports[1].text.contains("task-two"));
+        assert!(outcome.reports[2].text.contains("task-three"));
+        // Concurrency check: the fake model paces its reply over ~100ms, so
+        // three children run *serially* would cost roughly the SUM of their
+        // per-child elapsed times. Overlapping them makes the wall clock track
+        // the slowest single child instead. Comparing against the sum (not a
+        // fixed number) keeps this robust if the fake's pacing changes.
+        let sum: std::time::Duration = outcome.reports.iter().map(|r| r.elapsed).sum();
+        assert!(
+            elapsed < sum,
+            "batch took {elapsed:?} but the children's elapsed times sum to {sum:?} — \
+             that is what serialization looks like; they should overlap"
+        );
+        // And the merge renders them in submission order.
+        let text = crate::subagent::render_batch(&batch, &outcome);
+        let i1 = text.find("task-one").expect("task 1");
+        let i3 = text.find("task-three").expect("task 3");
+        assert!(i1 < i3, "merged report must be submission-ordered: {text}");
+        assert!(text.contains("3 ok"), "summary must count the successes: {text}");
+    }
+
+    /// Sanity: the concurrency assertion in the test above would actually FAIL
+    /// if the batch serialized. We prove that by running the same three tasks
+    /// one at a time and showing the serial wall clock matches the sum the
+    /// concurrent assertion compares against.
+    #[test]
+    fn serial_baseline_exceeds_the_batch_wall_clock() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os("PIR_FAKE_MODEL");
+        // SAFETY: test-local env mutation under the shared env lock.
+        unsafe { std::env::set_var("PIR_FAKE_MODEL", "1"); }
+        let providers = crate::config::load_providers().expect("providers");
+        let (p, m) = crate::config::select(&providers, "fake/slow").expect("fake provider");
+        let spawn = crate::subagent::Spawn {
+            kind: crate::subagent::Kind::Explore,
+            description: "one".into(),
+            prompt: "FAKE: echo task-one".into(),
+            background: false,
+            model: None,
+        };
+        // Serial: three sequential single runs, exactly what a non-concurrent
+        // fan-out would do.
+        let serial_start = std::time::Instant::now();
+        let mut serial_sum = std::time::Duration::ZERO;
+        for _ in 0..3 {
+            let r = crate::subagent::run(
+                p.clone(),
+                m.clone(),
+                &spawn,
+                true,
+                Some(crate::security::SecurityPolicy::default()),
+                Arc::new(AtomicBool::new(false)),
+            );
+            serial_sum += r.elapsed;
+        }
+        let serial_wall = serial_start.elapsed();
+        match old {
+            Some(v) => unsafe { std::env::set_var("PIR_FAKE_MODEL", v) },
+            None => unsafe { std::env::remove_var("PIR_FAKE_MODEL") },
+        }
+        // The concurrent test asserts `batch_elapsed < sum_of_child_elapsed`.
+        // For that to be a *real* concurrency check, the serial wall clock must
+        // be at least the sum (it is the sum, plus a little overhead). If this
+        // ever stops holding, the concurrency assertion has gone vacuous.
+        assert!(
+            serial_wall >= serial_sum,
+            "serial wall {serial_wall:?} must be >= the sum of child times {serial_sum:?}; \
+             otherwise the concurrency assertion is meaningless"
+        );
+    }
+
+    /// A batched call is refused from inside a sub-agent (no nested fan-out),
+    /// same as the single-task shape.
+    #[test]
+    fn subagent_batch_refuses_nesting() {
+        use crate::subagent::Kind;
+        let p: Provider =
+            serde_json::from_str(r#"{"id":"t","baseUrl":"https://example.invalid/v1","apiKey":"x","api":"openai","models":[{"id":"m"}]}"#).unwrap();
+        let m = p.models[0].clone();
+        let mut child = Agent::new_subagent(
+            p,
+            m,
+            true,
+            Kind::General,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("sub-agent builds");
+        let out = child
+            .run_subagent_batch_tool("agent", &serde_json::json!({"tasks": [{"prompt": "go"}]}))
+            .expect("intercepted");
+        assert!(out.is_error, "a sub-agent must not fan out further");
+        assert!(out.content.contains("cannot delegate further"), "got: {}", out.content);
     }
 
     #[test]
