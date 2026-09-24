@@ -246,10 +246,8 @@ fn parse_frontmatter(path: &Path) -> (Option<String>, String) {
                         name = Some(v);
                     }
                 }
-                "description" | "summary" | "when" | "when_to_use" => {
-                    if !v.is_empty() {
-                        description = v;
-                    }
+                "description" | "summary" | "when" | "when_to_use" if !v.is_empty() => {
+                    description = v;
                 }
                 _ => {}
             }

@@ -134,7 +134,7 @@ pub fn ask(q: &Question) -> std::option::Option<Answer> {
     // running it: a modal blocks for as long as the operator takes to answer,
     // and holding the lock that long would serialise every question (and poison
     // it if the renderer ever panicked).
-    let Some(renderer) = renderer() else { return None };
+    let renderer = renderer()?;
     // A channel pair carries the question to the renderer thread and the answer
     // back. The renderer runs on its own thread so a modal implementation (which
     // reads keys from the tty) never blocks the agent's tool loop directly.

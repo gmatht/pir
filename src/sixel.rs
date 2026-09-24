@@ -444,7 +444,7 @@ pub fn render_banner(side_lines: &[String]) -> Option<String> {
     if rows > 1 {
         out.push_str(&format!("\x1b[{}A", rows - 1));
     }
-    out.push_str("\r");
+    out.push('\r');
     let gap = 2usize;
     let indent = cols + gap;
     let avail = term_w.saturating_sub(indent).max(20);

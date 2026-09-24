@@ -158,10 +158,10 @@ impl Prefetcher {
                         }
                         // Wake the UI: it is parked in poll(stdin) and would
                         // otherwise not repaint until the next keystroke.
-                        if let Some(n) = &notify {
-                            if let Ok(mut f) = n.try_clone() {
-                                let _ = f.write_all(b"p");
-                            }
+                        if let Some(n) = &notify
+                            && let Ok(mut f) = n.try_clone()
+                        {
+                            let _ = f.write_all(b"p");
                         }
                     }
                 })

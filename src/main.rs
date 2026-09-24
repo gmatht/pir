@@ -1761,7 +1761,7 @@ fn main() {
         // above `continue`s), but background jobs may be; exec orphans them
         // the same way a manual restart would, so just go.
         #[cfg(unix)]
-        if reexec_requested() || pending_reexec.lock().unwrap().clone() {
+        if reexec_requested() || *pending_reexec.lock().unwrap() {
             clear_reexec_request();
             *pending_reexec.lock().unwrap() = false;
             term::out(&term::dim("· reexec requested — restarting…\n"));
@@ -1967,7 +1967,7 @@ pub(crate) fn run_foreground_turn(
                     eprintln!(
                         "pir: cannot start turn: another turn still owns the agent (dropping this prompt)"
                     );
-                    let _ = done.send(());
+                    let _ = done.send_blocking(());
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1989,7 +1989,12 @@ pub(crate) fn run_foreground_turn(
         // never joins this handle and never learns the agent is free again.
         *slot.lock().unwrap() = Some(a);
         if done.try_send(()).is_err() {
-            let _ = done.send(());
+            // The channel is full: block until the REPL drains it rather than
+            // dropping the wake. `send_blocking` is the synchronous counterpart
+            // of the async `send` — using the async one here (the previous
+            // `let _ = done.send(())`) merely *built* the future and dropped it
+            // un-awaited, so the wake was never delivered at all.
+            let _ = done.send_blocking(());
         }
     })
 }

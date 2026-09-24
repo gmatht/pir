@@ -63,12 +63,12 @@ fn fd_lock() -> std::sync::MutexGuard<'static, ()> {
 enum FakeStdin {
     /// Pipe whose write end is closed: `readable()` is true *forever* and
     /// `read()` returns 0. This is the exact EOF shape that spun at 100% CPU.
-    PipeAtEof,
+    AtEof,
     /// Pipe whose write end is held open but nothing is ever written: the
     /// reactor blocks (0% CPU) and the drain finds EAGAIN.
-    PipeOpenSilent,
+    OpenSilent,
     /// Pipe pre-filled with `bytes`, write end closed. Every read then hits EOF.
-    PipeWith(Vec<u8>),
+    WithBytes(Vec<u8>),
 }
 
 /// Installs `fake` as fd 0 for the lifetime of the guard, restoring the real
@@ -82,16 +82,16 @@ impl StdinGuard {
     fn install(fake: FakeStdin) -> StdinGuard {
         let saved = unsafe { OwnedFd::from_raw_fd(libc::dup(0)) };
         let (reader, writer) = match fake {
-            FakeStdin::PipeAtEof => {
+            FakeStdin::AtEof => {
                 let (r, w) = pipe().expect("pipe");
                 drop(w);
                 (r, None)
             }
-            FakeStdin::PipeOpenSilent => {
+            FakeStdin::OpenSilent => {
                 let (r, w) = pipe().expect("pipe");
                 (r, Some(w))
             }
-            FakeStdin::PipeWith(bytes) => {
+            FakeStdin::WithBytes(bytes) => {
                 let (r, w) = pipe().expect("pipe");
                 write_all(w.as_raw_fd(), &bytes).expect("seed pipe");
                 drop(w);
@@ -172,7 +172,7 @@ fn pending_turn() -> smol::channel::Receiver<()> {
 #[test]
 fn wait_input_turn_running_stdin_at_eof_stays_idle() {
     let _serial = fd_lock();
-    let _guard = StdinGuard::install(FakeStdin::PipeAtEof);
+    let _guard = StdinGuard::install(FakeStdin::AtEof);
     set_nonblocking(0);
     let ta = typeahead();
     let done = pending_turn();
@@ -195,7 +195,7 @@ fn wait_input_turn_running_stdin_at_eof_stays_idle() {
 #[test]
 fn wait_input_turn_running_stdin_open_and_idle_stays_idle() {
     let _serial = fd_lock();
-    let _guard = StdinGuard::install(FakeStdin::PipeOpenSilent);
+    let _guard = StdinGuard::install(FakeStdin::OpenSilent);
     set_nonblocking(0);
     let ta = typeahead();
 
@@ -221,7 +221,7 @@ fn wait_input_turn_running_stdin_open_and_idle_stays_idle() {
 #[test]
 fn wait_input_typed_ahead_line_is_cheap() {
     let _serial = fd_lock();
-    let _guard = StdinGuard::install(FakeStdin::PipeWith(b"queued prompt\n".to_vec()));
+    let _guard = StdinGuard::install(FakeStdin::WithBytes(b"queued prompt\n".to_vec()));
     set_nonblocking(0);
     let ta = typeahead();
     let done = pending_turn();
@@ -247,7 +247,7 @@ fn wait_input_typed_ahead_line_is_cheap() {
 #[test]
 fn read_chunk_on_silent_fd_is_cheap() {
     let _serial = fd_lock();
-    let _guard = StdinGuard::install(FakeStdin::PipeOpenSilent);
+    let _guard = StdinGuard::install(FakeStdin::OpenSilent);
     set_nonblocking(0);
     let ta = typeahead();
     assert_idle_cpu("read_chunk on a silent non-blocking fd (one tick)", || {
@@ -263,7 +263,7 @@ fn read_chunk_on_silent_fd_is_cheap() {
 #[test]
 fn read_chunk_on_eof_fd_is_cheap() {
     let _serial = fd_lock();
-    let _guard = StdinGuard::install(FakeStdin::PipeAtEof);
+    let _guard = StdinGuard::install(FakeStdin::AtEof);
     set_nonblocking(0);
     let ta = typeahead();
     assert_idle_cpu("read_chunk on an EOF fd (one tick)", || {
@@ -280,7 +280,7 @@ fn read_chunk_on_eof_fd_is_cheap() {
 #[test]
 fn lone_escape_peek_terminates_cheaply() {
     let _serial = fd_lock();
-    let _guard = StdinGuard::install(FakeStdin::PipeWith(vec![0x1b]));
+    let _guard = StdinGuard::install(FakeStdin::WithBytes(vec![0x1b]));
     set_nonblocking(0);
     let ta = typeahead();
     let done = pending_turn();
@@ -304,7 +304,7 @@ fn lone_escape_peek_terminates_cheaply() {
 #[test]
 fn translate_control_byte_burst_is_cheap() {
     let _serial = fd_lock();
-    let _guard = StdinGuard::install(FakeStdin::PipeAtEof);
+    let _guard = StdinGuard::install(FakeStdin::AtEof);
     let mut stream: Vec<u8> = Vec::new();
     for _ in 0..8 {
         stream.extend_from_slice(b"\x1b[A"); // Up
@@ -338,10 +338,7 @@ fn idle_poll_window_and_budget_are_bounded() {
         crate::term::raw::INPUT_POLL <= 250,
         "a >250ms window would visibly lag typing"
     );
-    assert!(
-        CPU_BUDGET_PCT < 100.0,
-        "CPU_BUDGET_PCT must sit below a full core, got {CPU_BUDGET_PCT}"
-    );
+    const _: () = assert!(CPU_BUDGET_PCT < 100.0, "CPU_BUDGET_PCT must sit below a full core");
 }
 
 /// The measurement harness itself must actually work: a deliberate spin has to

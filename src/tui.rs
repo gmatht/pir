@@ -291,45 +291,45 @@ fn run_inner(
 
         // If the foreground turn finished, join it and either start the next
         // queued prompt or return to idle.
-        if let Some(h) = fg_handle.as_ref() {
-            if h.is_finished() {
-                let h = fg_handle.take().unwrap();
-                let _ = h.join();
-                if let Some(a) = ctx.agent_slot.lock().unwrap().as_ref() {
-                    state.usage = format!(
-                        "{} in / {} out tokens",
-                        fmt_tok(a.usage.input),
-                        fmt_tok(a.usage.output)
-                    );
+        if let Some(h) = fg_handle.as_ref()
+            && h.is_finished()
+        {
+            let h = fg_handle.take().unwrap();
+            let _ = h.join();
+            if let Some(a) = ctx.agent_slot.lock().unwrap().as_ref() {
+                state.usage = format!(
+                    "{} in / {} out tokens",
+                    fmt_tok(a.usage.input),
+                    fmt_tok(a.usage.output)
+                );
+            }
+            if let Some(next) = pending.drain(..).next() {
+                if let Ok(mut g) = ctx.typeahead.lock() {
+                    g.clear();
                 }
-                if let Some(next) = pending.drain(..).next() {
+                hist_recall.reset();
+                fg_handle = Some(spawn_turn(ctx, next));
+            } else {
+                let follow = {
+                    let mut g = ctx.agent_slot.lock().unwrap();
+                    match g.as_mut() {
+                        Some(a) => a.take_continuations(),
+                        None => Vec::new(),
+                    }
+                };
+                if let Some(next) = follow.into_iter().next() {
                     if let Ok(mut g) = ctx.typeahead.lock() {
                         g.clear();
                     }
                     hist_recall.reset();
                     fg_handle = Some(spawn_turn(ctx, next));
                 } else {
-                    let follow = {
-                        let mut g = ctx.agent_slot.lock().unwrap();
-                        match g.as_mut() {
-                            Some(a) => a.take_continuations(),
-                            None => Vec::new(),
-                        }
-                    };
-                    if let Some(next) = follow.into_iter().next() {
-                        if let Ok(mut g) = ctx.typeahead.lock() {
-                            g.clear();
-                        }
-                        hist_recall.reset();
-                        fg_handle = Some(spawn_turn(ctx, next));
-                    } else {
-                        state.running = false;
-                        state.status = "idle".into();
-                        // A turn finished and nothing was queued/continued: we're
-                        // awaiting the user's first keystroke, so the footer shows
-                        // the configured "done" placeholder until they type.
-                        state.awaiting_input = true;
-                    }
+                    state.running = false;
+                    state.status = "idle".into();
+                    // A turn finished and nothing was queued/continued: we're
+                    // awaiting the user's first keystroke, so the footer shows
+                    // the configured "done" placeholder until they type.
+                    state.awaiting_input = true;
                 }
             }
         }
@@ -1500,11 +1500,11 @@ fn drain_session_log(log: PathBuf, state: &mut TuiState) -> usize {
         if role == "user" {
             kind = ConvKind::User;
             for b in blocks.into_iter().flatten() {
-                if b.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
-                        text.push_str(t);
-                        text.push('\n');
-                    }
+                if b.get("type").and_then(|t| t.as_str()) == Some("text")
+                    && let Some(t) = b.get("text").and_then(|t| t.as_str())
+                {
+                    text.push_str(t);
+                    text.push('\n');
                 }
             }
         } else if role == "assistant" {

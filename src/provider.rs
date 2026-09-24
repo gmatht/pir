@@ -1954,7 +1954,7 @@ fn sse_kind_chat(v: &Value) -> &'static str {
         if delta.get("tool_calls").is_some() {
             return "tool";
         }
-        let has = |k: &str| delta.get(k).and_then(Value::as_str).map_or(false, |s| !s.is_empty());
+        let has = |k: &str| delta.get(k).and_then(Value::as_str).is_some_and(|s| !s.is_empty());
         if has("content") {
             return "text";
         }
@@ -3299,8 +3299,11 @@ mod tests {
             eprintln!("SKIP: no loadable libcurl");
             return;
         }
-        const PAYLOAD: usize = 256 * 1024; // > 8 x 16 KiB -> > 8 write callbacks
-        assert!(PAYLOAD > 8 * 16 * 1024, "must exceed the channel capacity");
+        // > 8 x 16 KiB -> more than 8 write callbacks. Expressed as a type-level
+        // `const` assertion so it is checked by the compiler rather than by a
+        // runtime `assert!` on a constant (which clippy flags as always-true).
+        const PAYLOAD: usize = 256 * 1024;
+        const _: () = assert!(PAYLOAD > 8 * 16 * 1024); // must exceed the channel capacity
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().unwrap().to_string();
         let _srv = thread::spawn(move || {
@@ -4287,7 +4290,7 @@ mod tests {
         let head = head.split("\r\n\r\n").next().unwrap_or("").to_lowercase();
         for enc in ["gzip", "deflate", "br", "zstd"] {
             assert!(
-                !head.contains(&format!("accept-encoding:").to_string()) || !head.contains(enc),
+                !head.contains("accept-encoding:") || !head.contains(enc),
                 "must not advertise compressed encoding '{enc}':\n{head}"
             );
         }

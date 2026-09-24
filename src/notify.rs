@@ -743,9 +743,7 @@ mod reload_policy_tests {
         );
 
         // Reload to "always / 0s": the very same event now passes the gate.
-        let mut p = NotifyPolicy::default();
-        p.when = "always".into();
-        p.min_seconds = 0;
+        let p = NotifyPolicy { when: "always".into(), min_seconds: 0, ..Default::default() };
         bus.reload_policy(p);
         assert_eq!(bus.policy().when, "always", "reload must swap the policy");
         assert_eq!(bus.policy().min_seconds, 0);
@@ -765,8 +763,7 @@ mod reload_policy_tests {
 
         bus.publish(ev(), false);
         // Reload to a *stricter* policy: the queued event must survive.
-        let mut strict = NotifyPolicy::default();
-        strict.on = "error".into();
+        let strict = NotifyPolicy { on: "error".into(), ..Default::default() };
         bus.reload_policy(strict);
         assert_eq!(
             bus.drain_feed().len(),

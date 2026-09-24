@@ -1579,11 +1579,8 @@ fn wildcard(pat: &[u8], s: &[u8]) -> bool {
                 i += 1;
                 continue;
             }
-        } else if p < pat.len() && pat[p] == b'?' && !at_sep {
-            p += 1;
-            i += 1;
-            continue;
-        } else if p < pat.len() && pat[p] == c {
+        } else if p < pat.len() && ((pat[p] == b'?' && !at_sep) || pat[p] == c) {
+            // `?` matches any non-separator; a literal matches itself.
             p += 1;
             i += 1;
             continue;
@@ -1726,12 +1723,12 @@ fn fallback_grep(
                     if context > 0 {
                         let lo = i.saturating_sub(context);
                         let hi = (i + context + 1).min(file_lines.len());
-                        for j in lo..hi {
+                        for (j, ctx_line) in file_lines.iter().enumerate().take(hi).skip(lo) {
                             let sep = if j == i { ':' } else { '-' };
                             if numbers {
-                                hits.push(format!("{rel}{sep}{}{sep}{}", j + 1, file_lines[j]));
+                                hits.push(format!("{rel}{sep}{}{sep}{}", j + 1, ctx_line));
                             } else {
-                                hits.push(format!("{rel}{sep}{}", file_lines[j]));
+                                hits.push(format!("{rel}{sep}{}", ctx_line));
                             }
                         }
                     } else if numbers {

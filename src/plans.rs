@@ -100,7 +100,7 @@ pub fn list() -> Vec<(String, PathBuf, std::time::SystemTime)> {
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         out.push((stem, p, modified));
     }
-    out.sort_by(|a, b| b.2.cmp(&a.2));
+    out.sort_by_key(|a| std::cmp::Reverse(a.2));
     out
 }
 

@@ -140,7 +140,7 @@ pub fn guard_url(url: &str) -> Result<(), String> {
             ));
         }
     }
-    if allow_star() || allow_list().iter().any(|h| host == *h) {
+    if allow_star() || allow_list().contains(&host) {
         return Ok(());
     }
     // Resolve and check every address.
