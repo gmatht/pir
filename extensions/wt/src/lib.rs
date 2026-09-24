@@ -1940,16 +1940,16 @@ mod tests {
         // The budget is generous because each poll forks two processes and the
         // suite is documented as contention-bound (see `scripts/deploy.sh`): on a
         // machine saturated by unrelated CPU work, scheduling the spawned
-        // `flock`/`true` pair can take seconds. We also distinguish "A died"
-        // from "A was never scheduled", so a real failure says which.
+        // `flock`/`true` pair can take seconds.
+        //
+        // Deliberately does NOT inspect A's exit status. `flock` forks (or execs)
+        // the `sleep`, so A can legitimately be reaped while the grandchild still
+        // holds the lock — treating that as "A died" reported a false failure and
+        // was strictly worse than the original. The lock probe below is the only
+        // reliable proof that A is in.
         let mut held = false;
-        let mut a_exited: Option<std::process::ExitStatus> = None;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while std::time::Instant::now() < deadline {
-            if let Ok(Some(st)) = a.try_wait() {
-                a_exited = Some(st);
-                break;
-            }
             let probe = Command::new("flock")
                 .args(["-x", "-n"])
                 .arg(&lock)
@@ -1961,9 +1961,6 @@ mod tests {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        if let Some(st) = a_exited {
-            panic!("holder A exited early ({st}) without holding {lock:?}");
         }
         assert!(
             held,
