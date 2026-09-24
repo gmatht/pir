@@ -938,6 +938,132 @@ pub fn thinking_picker(
     }
 }
 
+/// Show an `ask_user_question` dialog on the alternate screen and return the
+/// operator's answer (Feature 3). One question per dialog: a header title, the
+/// question body (wrapped), the option list (with descriptions), and a hint
+/// footer. Number keys jump straight to an option; arrows + Enter select.
+/// For multi-select, Space toggles and Enter confirms.
+///
+/// When the question has no options this becomes a free-text entry dialog, so
+/// a model can still ask an open question. Returns `None` if the terminal
+/// isn't a tty (the caller then falls back to a line prompt).
+pub fn question_dialog(q: &crate::askuser::Question) -> Option<crate::askuser::Answer> {
+    use crate::askuser::Answer;
+    let _modal = Modal::enter()?;
+    if q.options.is_empty() {
+        // Free-text: reuse the secret-entry loop but echo the text (this is not
+        // a credential, so masking would be hostile).
+        let mut buf = String::new();
+        loop {
+            let mut lines = wrap_lines(&q.question, 72);
+            lines.push(String::new());
+            lines.push(format!("  {}", if buf.is_empty() { "(type your answer)".to_string() } else { buf.clone() }));
+            lines.push(String::new());
+            lines.push(crate::term::dim("[enter] submit  [esc] dismiss  [backspace] delete").to_string());
+            draw_box(&format!("pir — {}", q.header), &lines);
+            match read_key()? {
+                Key::Enter => return Some(Answer::Text(buf)),
+                Key::Esc | Key::CtrlC => return Some(Answer::Dismissed),
+                Key::Char('\u{8}') => {
+                    buf.pop();
+                }
+                Key::Char(c) if !c.is_control() => buf.push(c),
+                _ => {}
+            }
+        }
+    }
+
+    let multi = q.multi_select;
+    let mut selected = 0usize;
+    let mut checked: Vec<bool> = vec![false; q.options.len()];
+    loop {
+        let mut lines = wrap_lines(&q.question, 72);
+        lines.push(String::new());
+        for (i, o) in q.options.iter().enumerate() {
+            let cursor = if i == selected { "▸" } else { " " };
+            let box_ = if multi {
+                if checked[i] { "[x] " } else { "[ ] " }
+            } else {
+                ""
+            };
+            lines.push(format!("{cursor} {i}) {box_}{}", o.label));
+            if !o.description.is_empty() {
+                for l in wrap_lines(&o.description, 64) {
+                    lines.push(format!("      {}", crate::term::dim(&l)));
+                }
+            }
+        }
+        lines.push(String::new());
+        let hint = if multi {
+            "[space] toggle  [enter] confirm  [1-9] toggle  [esc] dismiss"
+        } else {
+            "[enter] choose  [1-9] choose  [esc] dismiss"
+        };
+        lines.push(crate::term::dim(hint).to_string());
+        draw_box(&format!("pir — {}", q.header), &lines);
+        let key = match read_key() {
+            Some(k) => k,
+            None => return Some(Answer::Dismissed),
+        };
+        match key {
+            Key::Up | Key::Char('k') => selected = selected.saturating_sub(1),
+            Key::Down | Key::Char('j') => selected = (selected + 1).min(q.options.len() - 1),
+            Key::Char(' ') if multi => checked[selected] = !checked[selected],
+            Key::Char(c @ '1'..='9') => {
+                let idx = (c as usize) - ('1' as usize);
+                if idx < q.options.len() {
+                    if multi {
+                        checked[idx] = !checked[idx];
+                    } else {
+                        return Some(Answer::Chosen(vec![q.options[idx].label.clone()]));
+                    }
+                }
+            }
+            Key::Enter | Key::Right => {
+                if multi {
+                    let chosen: Vec<String> = q
+                        .options
+                        .iter()
+                        .zip(checked.iter())
+                        .filter(|(_, c)| **c)
+                        .map(|(o, _)| o.label.clone())
+                        .collect();
+                    return Some(Answer::Chosen(chosen));
+                }
+                return Some(Answer::Chosen(vec![q.options[selected].label.clone()]));
+            }
+            Key::Esc | Key::CtrlC | Key::CtrlD => return Some(Answer::Dismissed),
+            _ => {}
+        }
+    }
+}
+
+/// Wrap `text` to at most `width` visible characters per line, preserving
+/// explicit newlines. Used by the question dialog so a long question or option
+/// description doesn't run off the box.
+fn wrap_lines(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for para in text.split('\n') {
+        let mut line = String::new();
+        for word in para.split_whitespace() {
+            if line.is_empty() {
+                line.push_str(word);
+            } else if line.chars().count() + 1 + word.chars().count() <= width {
+                line.push(' ');
+                line.push_str(word);
+            } else {
+                out.push(std::mem::take(&mut line));
+                line.push_str(word);
+            }
+        }
+        out.push(line);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
 /// Show a masked secret-entry dialog on the alternate screen and return the
 /// typed value. The key is shown as `••••` and never touches the normal screen
 /// or scrollback. Returns `None` if the terminal isn't a tty (caller falls back

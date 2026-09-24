@@ -19,6 +19,12 @@ use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+/// Provider-independent web tools (`web_search` / `web_fetch`), Feature 10.
+/// Included by path because `build.rs` only links `extensions/*/src/lib.rs`,
+/// but the code is substantial enough to deserve its own file.
+#[path = "web.rs"]
+mod web;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +39,18 @@ pub fn register(reg: &mut Registry) {
         reg.abort.clone(),
         Arc::new(AtomicBool::new(false)),
     )));
+}
+
+/// How long the escalation / self-kill confirmation waits for the operator to
+/// press a key before giving up. Long enough that a human reading the warning
+/// always gets to answer; overridable (`PIR_CONFIRM_TIMEOUT_SECS`) so tests and
+/// scripted environments can bound it instead of blocking for two minutes.
+fn priv_prompt_timeout_secs() -> u64 {
+    std::env::var("PIR_CONFIRM_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(120)
 }
 
 struct Builtin {
@@ -65,8 +83,7 @@ struct Builtin {
 }
 
 impl Builtin {
-    fn new(cwd: PathBuf, abort: Arc<AtomicBool>, quiet: Arc<AtomicBool>) -> Self {
-        Builtin {
+    fn new(cwd: PathBuf, abort: Arc<AtomicBool>, quiet: Arc<AtomicBool>) -> Self {        Builtin {
             cwd,
             jobs: Vec::new(),
             next_job: 1,
@@ -146,7 +163,10 @@ impl ToolBackend for Builtin {
             },
             ToolSpec {
                 name: "read_file",
-                description: "Read a UTF-8 text file (truncated to 100k chars).",
+                description: "Read a text file (truncated to 100k chars). Transparently \
+                              decompresses gzip (.gz) and extracts text from PDFs (via \
+                              pdftotext when installed); a binary file is described (size, kind, \
+                              hex preview) instead of failing.",
                 schema: json!({
                     "type": "object",
                     "properties": { "path": { "type": "string" } },
@@ -186,6 +206,215 @@ impl ToolBackend for Builtin {
                     "type": "object",
                     "properties": { "path": { "type": "string", "description": "Defaults to ." } },
                     "required": []
+                }),
+            },
+            ToolSpec {
+                name: "glob",
+                description: "Find files by name/path glob pattern, newest-modified first. \
+                              Backed by ripgrep (`rg --files`) when installed, so it respects \
+                              .gitignore and skips hidden files; falls back to a built-in \
+                              recursive walk. Returns paths relative to the search root, one per \
+                              line, with a `[pir] truncated` marker when `limit` cuts the list.",
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Glob to match against the path relative to `path`, e.g. \
+                                            '**/*.rs', 'src/*.toml', '*.md'. `**` matches any \
+                                            number of directories, `*` any run of chars, `?` one char."
+                        },
+                        "path": { "type": "string", "description": "Root directory to search (default: cwd)" },
+                        "limit": { "type": "integer", "description": "Max paths to return (default 100, max 2000)" },
+                        "offset": { "type": "integer", "description": "Skip this many matches before returning (default 0)" }
+                    },
+                    "required": ["pattern"]
+                }),
+            },
+            ToolSpec {
+                name: "grep",
+                description: "Search file contents with a regular expression (ripgrep-backed). \
+                              Respects .gitignore, skips binaries, and filters out credential/secret \
+                              paths. Prefer this over `bash` for content searches — it is faster and \
+                              returns structured, citable output.",
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "description": "Rust/regex syntax pattern to search for" },
+                        "path": { "type": "string", "description": "File or directory to search (default: cwd)" },
+                        "glob": { "type": "string", "description": "Only search files matching this glob, e.g. '*.rs'" },
+                        "type": { "type": "string", "description": "Only search files of this rg type, e.g. 'rust', 'py' (see `rg --type-list`)" },
+                        "output_mode": {
+                            "type": "string",
+                            "enum": ["content", "files_with_matches", "count"],
+                            "description": "content = matching lines with numbers (default); files_with_matches = paths only; count = per-file match counts"
+                        },
+                        "case_insensitive": { "type": "boolean", "description": "Case-insensitive match (-i)" },
+                        "line_numbers": { "type": "boolean", "description": "Prefix each hit with its line number (-n; on by default for content mode)" },
+                        "context": { "type": "integer", "description": "Lines of context to show around each hit (-C)" },
+                        "head_limit": { "type": "integer", "description": "Max result lines to return (default 250, max 2000)" },
+                        "offset": { "type": "integer", "description": "Skip this many result lines before returning (default 0)" },
+                        "multiline": { "type": "boolean", "description": "Allow the pattern to span lines (-U)" }
+                    },
+                    "required": ["pattern"]
+                }),
+            },
+            ToolSpec {
+                name: "agent",
+                description: "Delegate a task to a sub-agent with its own context window and return \
+                              only its report. Use it when a job would otherwise flood your context \
+                              with file reads and tool round-trips (broad exploration, 'find every \
+                              X and summarise', a self-contained sub-task) or when you want a \
+                              read-only reconnaissance/planning pass. Types: 'explore' (read-only \
+                              search + report), 'plan' (read-only approach + plan_write), 'general' \
+                              (full capability, inherits your security posture). The sub-agent \
+                              cannot ask the operator anything, so give it a self-contained, \
+                              unambiguous prompt.",
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "prompt": { "type": "string", "description": "The complete task for the sub-agent (it cannot see your conversation)" },
+                        "description": { "type": "string", "description": "Short 3-5 word label for this delegation" },
+                        "subagent_type": {
+                            "type": "string",
+                            "enum": ["explore", "plan", "general"],
+                            "description": "explore = read-only recon; plan = read-only planning; general = full capability (default)"
+                        },
+                        "run_in_background": { "type": "boolean", "description": "Accepted for compatibility; not supported in this build" }
+                    },
+                    "required": ["prompt"]
+                }),
+            },
+            ToolSpec {
+                name: "remember",
+                description: "Record a durable preference (a 'taste') so it is applied in this and \
+                              every later session. Use it when the operator states a lasting \
+                              preference, corrects you in a way that generalises, or you learn \
+                              something about how this project must be worked (a required flag, a \
+                              formatter, a convention). Do NOT record one-off task details or \
+                              anything already covered by AGENTS.md. Re-recording an existing \
+                              preference reinforces it rather than duplicating it.",
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "text": { "type": "string", "description": "The preference as one imperative line, e.g. \"Never commit without asking\"" },
+                        "evidence": { "type": "string", "description": "Why: the prompt, correction, or observation behind it" },
+                        "scope": {
+                            "type": "string",
+                            "enum": ["project", "user"],
+                            "description": "project = this repo only (default); user = every project"
+                        },
+                        "confidence": { "type": "number", "description": "0.0-1.0 (default 0.6); raise it for an explicit operator instruction" }
+                    },
+                    "required": ["text"]
+                }),
+            },
+            ToolSpec {
+                name: "plan_write",
+                description: "Record a plan for the operator to approve (only meaningful in plan \
+                              mode). Writes the markdown plan to the plans directory and asks the \
+                              operator to approve it; on approval you leave plan mode and may \
+                              implement, otherwise you stay read-only and should revise. A good \
+                              plan states the goal, the approach, the files to touch, the risks, \
+                              and how the result will be verified.",
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "content": { "type": "string", "description": "The full plan, as markdown" },
+                        "name": { "type": "string", "description": "Short plan name (defaults to a timestamped name from the task)" }
+                    },
+                    "required": ["content"]
+                }),
+            },
+            ToolSpec {
+                name: "load_skill",
+                description: "Load a skill's full instructions into context. Skills are \
+                              specialised procedures listed in your system prompt (name + \
+                              description). Call this with a skill's name *before* doing work \
+                              that the skill covers; the body is returned as the tool result. \
+                              Call it with no name (or 'all') to list every available skill.",
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Skill name (or a unique prefix). Omit to list all skills." }
+                    },
+                    "required": []
+                }),
+            },
+            ToolSpec {
+                name: "ask_user_question",
+                description: "Ask the operator a structured question and wait for their answer. \
+                              Use it when a decision genuinely blocks progress and you cannot \
+                              infer the answer (a preference, an ambiguous requirement, a \
+                              choice between materially different approaches). Prefer asking \
+                              over guessing on such decisions; do NOT use it for things you can \
+                              determine yourself by reading the code. Returns the chosen \
+                              option(s) or the typed answer as the tool result. In a headless/ \
+                              background session (no operator attached) the tool reports that \
+                              no one can answer — make the most reasonable assumption, state it, \
+                              and continue.",
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "questions": {
+                            "type": "array",
+                            "description": "One to four questions to ask at once.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "question": { "type": "string", "description": "The full question to display" },
+                                    "header": { "type": "string", "description": "Short label / dialog title (max ~12 chars)" },
+                                    "options": {
+                                        "type": "array",
+                                        "description": "Selectable answers. Omit for a free-text question.",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "label": { "type": "string", "description": "Option text shown to the user" },
+                                                "description": { "type": "string", "description": "Optional explanation of the option" }
+                                            },
+                                            "required": ["label"]
+                                        }
+                                    },
+                                    "multiSelect": { "type": "boolean", "description": "Allow more than one option to be selected" }
+                                },
+                                "required": ["question"]
+                            }
+                        }
+                    },
+                    "required": ["questions"]
+                }),
+            },
+            ToolSpec {
+                name: "web_fetch",
+                description: "Fetch a URL over http/https and return its readable text (HTML is \
+                              reduced to text, with links kept as 'text <url>'). Use it to read \
+                              documentation, an issue, or a changelog from the web. Only public \
+                              http/https URLs are allowed (no localhost/LAN/cloud-metadata — the \
+                              SSRF guard refuses those).",
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "Absolute http:// or https:// URL" },
+                        "raw": { "type": "boolean", "description": "Return the response body unmodified instead of reducing HTML to text (default false)" },
+                        "max_bytes": { "type": "integer", "description": "Cap the response body in bytes (default 2 MiB)" }
+                    },
+                    "required": ["url"]
+                }),
+            },
+            ToolSpec {
+                name: "web_search",
+                description: "Search the web and return result titles, URLs and snippets. \
+                              Provider-independent (no Ollama Cloud key needed): uses the endpoint \
+                              in PIR_WEB_SEARCH_URL, or DuckDuckGo's HTML page by default. Use \
+                              web_fetch to read anything it finds.",
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "The search query" },
+                        "max_results": { "type": "integer", "description": "Maximum hits to return (default 8, max 25)" }
+                    },
+                    "required": ["query"]
                 }),
             },
             ToolSpec {
@@ -277,6 +506,15 @@ impl ToolBackend for Builtin {
             "write_file" => self.write_file(input),
             "edit_file" => self.edit_file(input),
             "list_dir" => list_dir(input, &self.cwd),
+            "glob" => self.glob(input),
+            "grep" => self.grep(input),
+            "web_fetch" => do_web_fetch(input),
+            "web_search" => do_web_search(input),
+            "ask_user_question" => Err("ask_user_question is handled by the agent turn loop, not the builtin backend".into()),
+            "load_skill" => Err("load_skill is handled by the agent turn loop, not the builtin backend".into()),
+            "plan_write" => Err("plan_write is handled by the agent turn loop, not the builtin backend".into()),
+            "remember" => Err("remember is handled by the agent turn loop, not the builtin backend".into()),
+            "agent" => Err("agent is handled by the agent turn loop, not the builtin backend".into()),
             "job_status" => self.job_status(input),
             "job_kill" => self.job_kill(input),
             other => Err(format!("unknown tool '{other}'")),
@@ -299,13 +537,29 @@ impl Builtin {
         // command runs, even in full-auto (correctness/safety beats
         // unattendedness for a command that can terminate every other session).
         if let Some(why) = Self::dangerous_kill_reason(command) {
-            let answer = term::read_answer(&format!(
+            let prompt = format!(
                 "{} this command looks like it would kill pir processes ({why}). Run it anyway? [y]es / [n]o (default no) ",
                 term::yellow("⚠")
-            ));
-            match answer.as_str() {
-                "y" | "yes" => {}
-                _ => return Ok("[denied] refusing to run a self-targeting kill command".into()),
+            );
+            // Same terminal caveat as escalation: the REPL owns stdin in raw
+            // mode, so read the operator's key from the tty directly. A real
+            // "n" (or no answer at all) refuses; only "y" runs it.
+            if crate::term::tty_available() {
+                match crate::term::prompt_key(&prompt, priv_prompt_timeout_secs()) {
+                    Some('y') => {}
+                    Some(_) => {
+                        return Ok("[denied] refusing to run a self-targeting kill command".into());
+                    }
+                    None => {
+                        return Ok("[denied] refusing to run a self-targeting kill command (no approval given)".into());
+                    }
+                }
+            } else {
+                let answer = term::read_answer(&prompt);
+                match answer.as_str() {
+                    "y" | "yes" => {}
+                    _ => return Ok("[denied] refusing to run a self-targeting kill command".into()),
+                }
             }
         }
         // Guard #2: privilege escalation (`sudo`/`su`/...). `sudo` prompts for a
@@ -396,20 +650,47 @@ impl Builtin {
     /// prompt, and still verify the password isn't required so the command
     /// won't hang on `/dev/tty`.
     fn request_priv_escalation(&self, command: &str, what: String) -> Result<(), String> {
-        if io::stdin().is_terminal() {
-            let answer = term::read_answer(&format!(
+        self.request_priv_escalation_timeout(command, what, priv_prompt_timeout_secs())
+    }
+
+    /// Same as [`Self::request_priv_escalation`], but with an explicit prompt
+    /// timeout so tests can bound it without touching process-wide env vars
+    /// (which race when cargo runs tests in parallel).
+    fn request_priv_escalation_timeout(
+        &self,
+        command: &str,
+        what: String,
+        secs: u64,
+    ) -> Result<(), String> {
+        // A human is present when *either* stdin or `/dev/tty` is a terminal.
+        // This matters because the agent's worker thread runs while the REPL
+        // owns stdin in raw, non-canonical, non-blocking mode: `is_terminal()`
+        // on the raw fd can read as "not a tty" (or the blocking read simply
+        // can't see the keypress), which used to make us skip the prompt
+        // entirely and auto-deny. The operator never got to answer.
+        if io::stdin().is_terminal() || crate::term::tty_available() {
+            let prompt = format!(
                 "{} escalate privilege ({})? [y]es / [n]o (default no) ",
                 term::yellow("⚠"),
                 what
-            ));
-            match answer.as_str() {
-                "y" | "yes" => {}
-                _ => return Err("[denied] user declined to escalate privilege".into()),
+            );
+            let answer = crate::term::prompt_key(&prompt, secs);
+            match answer {
+                // A real keypress: only y/yes approves, anything else denies.
+                Some(c) => {
+                    if c != 'y' {
+                        return Err("[denied] user declined to escalate privilege".into());
+                    }
+                }
+                // No human answered (timeout/EOF): never pretend they said no,
+                // and never escalate unattended — refuse with the fallback path.
+                None => {
+                    return Err(Self::refusal_without_approval(&what, secs));
+                }
             }
         }
-        // Either unattended (no tty, refused-by-default is handled above only
-        // for the prompt; here we must still check passwordless), or approved.
-        // In either case, refuse to run if a password prompt would block us.
+        // Either unattended (no tty at all), or the human approved. In both
+        // cases, refuse to run if a password prompt would block us.
         if self.sudo_is_passwordless(command) {
             return Ok(());
         }
@@ -419,6 +700,19 @@ impl Builtin {
              rootreq flow (`request_root`), or run the command yourself in a shell where sudo is \
              passwordless (NOPASSWD in sudoers)."
         ))
+    }
+
+    /// The refusal shown when a prompt was raised but nobody answered within
+    /// `secs`. Deliberately worded "no answer", never "user declined": pir must
+    /// not attribute a decision to an operator who was never given the chance
+    /// to make one (the exact bug this change fixes). Kept free of I/O so the
+    /// wording can be unit-tested without touching a live terminal.
+    fn refusal_without_approval(what: &str, secs: u64) -> String {
+        format!(
+            "[denied] no answer within {secs}s — refusing to escalate ({what}) without explicit \
+             approval. Re-run when you can answer the prompt, or escalate out-of-band via the \
+             rootreq flow (`request_root`)."
+        )
     }
 
     /// Non-interactively probe whether `sudo` for this command needs a password.
@@ -468,6 +762,135 @@ impl Builtin {
         // `pir` is the dangerous shape; `kill <pid>` of is allowed
         // (that's normal job control). We only flag killall already covered.
         None
+    }
+
+    /// `glob` — find files by path pattern. ripgrep-backed (`rg --files`) when
+    /// available so .gitignore is honoured and the walk is parallel; otherwise
+    /// a built-in recursive walk that applies the same gitignore-ish skips.
+    fn glob(&mut self, input: &serde_json::Value) -> Result<String, String> {
+        let pattern = input["pattern"].as_str().ok_or("glob: missing 'pattern'")?;
+        let root = self.search_root(input.get("path").and_then(|v| v.as_str()));
+        let limit = input["limit"].as_u64().unwrap_or(100).clamp(1, MAX_MATCHES) as usize;
+        let offset = input["offset"].as_u64().unwrap_or(0) as usize;
+
+        // ripgrep path: `rg --files` streams every file it would search (it
+        // already applies .gitignore + hidden-file rules), then we match the
+        // glob ourselves. Doing the globbing in-process rather than passing
+        // `-g` keeps the semantics identical to the fallback walk (a `-g`
+        // pattern is anchored differently than a relative path match).
+        let mut all: Vec<String> = match rg_files(&root) {
+            Some(files) => files
+                .into_iter()
+                .filter(|f| glob_match(pattern, f))
+                .collect(),
+            None => walk_files(&root)
+                .into_iter()
+                .filter(|f| glob_match(pattern, f))
+                .collect(),
+        };
+        // Newest-modified first: the file an agent is asking for by glob is
+        // almost always the one it just touched, and a stable order makes the
+        // tool deterministic when mtimes tie.
+        all.sort_by(|a, b| {
+            let ka = mtime_key(&root.join(a));
+            let kb = mtime_key(&root.join(b));
+            kb.cmp(&ka).then_with(|| a.cmp(b))
+        });
+        all.retain(|f| !is_secret_path(f));
+        Ok(paginate(&all, limit, offset, "paths"))
+    }
+
+    /// `grep` — regex content search. ripgrep-backed; if `rg` is missing we
+    /// fall back to the `regex` crate over the walked file set so the tool
+    /// still works on a bare host (slower, but never a hard failure).
+    fn grep(&mut self, input: &serde_json::Value) -> Result<String, String> {
+        let pattern = input["pattern"].as_str().ok_or("grep: missing 'pattern'")?;
+        if pattern.is_empty() {
+            return Err("grep: 'pattern' must not be empty".into());
+        }
+        let root = self.search_root(input.get("path").and_then(|v| v.as_str()));
+        let mode = input["output_mode"].as_str().unwrap_or("content");
+        let head_limit = input["head_limit"].as_u64().unwrap_or(250).clamp(1, MAX_MATCHES) as usize;
+        let offset = input["offset"].as_u64().unwrap_or(0) as usize;
+        let ci = input["case_insensitive"].as_bool().unwrap_or(false);
+        let multiline = input["multiline"].as_bool().unwrap_or(false);
+        // Line numbers default on for content mode (that is what makes a hit
+        // citable); explicit `"line_numbers": false` turns them off.
+        let numbers = input["line_numbers"].as_bool().unwrap_or(mode == "content");
+        let context = input["context"].as_u64().unwrap_or(0) as usize;
+
+        // rg flag set, shared by all modes.
+        let mut args: Vec<String> = vec!["--color=never".into(), "--no-heading".into()];
+        // Never descend the trees the fallback walk skips: ripgrep only knows
+        // about *gitignored* paths, and `node_modules`/`target` are usually not
+        // in .gitignore even though searching them is pure noise (and slow).
+        for d in SEARCH_SKIP_DIRS {
+            args.push("--glob".into());
+            args.push(format!("!**/{d}/**"));
+        }
+        if ci {
+            args.push("-i".into());
+        }
+        if multiline {
+            args.push("-U".into());
+        }
+        if let Some(g) = input["glob"].as_str() {
+            args.push("-g".into());
+            args.push(g.to_string());
+        }
+        if let Some(t) = input["type"].as_str() {
+            args.push("-t".into());
+            args.push(t.to_string());
+        }
+        match mode {
+            "files_with_matches" => args.push("-l".into()),
+            "count" => args.push("-c".into()),
+            _ => {
+                if numbers {
+                    args.push("-n".into());
+                }
+                if context > 0 {
+                    args.push("-C".into());
+                    args.push(context.to_string());
+                }
+            }
+        }
+        args.push("--".into());
+        args.push(pattern.to_string());
+        args.push(root.display().to_string());
+
+        let raw = match run_rg(&root, &args) {
+            SearchOutcome::Ok(s) | SearchOutcome::NoMatches(s) => s,
+            SearchOutcome::Missing => fallback_grep(&root, pattern, mode, ci, numbers, context)?,
+            SearchOutcome::Error(e) => return Err(format!("grep: {e}")),
+        };
+
+        // rg prints absolute paths for an absolute root; make the output
+        // readable by stripping the root prefix (matching how `glob` returns
+        // root-relative paths).
+        let mut lines: Vec<String> = raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| strip_root(l, &root))
+            .filter(|l| !is_secret_path(l))
+            .collect();
+        if mode == "content" && numbers && context == 0 {
+            // Keep only the hit lines when a context-less numbered search was
+            // requested — rg already did that, so this only guards against a
+            // stray separator line.
+            lines.retain(|l| !l.starts_with("--"));
+        }
+        Ok(paginate(&lines, head_limit, offset, "result lines"))
+    }
+
+    /// Resolve a search root: an explicit `path` (file or dir) relative to the
+    /// live cwd, else the live cwd itself (never the stale launch anchor).
+    fn search_root(&self, path: Option<&str>) -> PathBuf {
+        let base = if self.cwd.is_dir() { self.cwd.clone() } else { PathBuf::from(".") };
+        match path {
+            Some(p) if !p.trim().is_empty() => base.join(p),
+            _ => base,
+        }
     }
 
     fn write_file(&mut self, input: &serde_json::Value) -> Result<String, String> {
@@ -609,11 +1032,256 @@ impl Builtin {
     }
 }
 
+/// `web_fetch` — GET a URL and return usable text (Feature 10).
+fn do_web_fetch(input: &serde_json::Value) -> Result<String, String> {
+    let url = input["url"].as_str().ok_or("web_fetch: missing 'url'")?;
+    let raw = input["raw"].as_bool().unwrap_or(false);
+    let max = input["max_bytes"].as_u64().unwrap_or(0) as usize;
+    let fetched = web::fetch(url, max)?;
+    let mut out = format!("{} (HTTP {})\n", fetched.url, fetched.status);
+    if fetched.status >= 400 {
+        out.push_str("(the server reported an error; the body is shown below anyway)\n");
+    }
+    let body = if raw {
+        fetched.body.clone()
+    } else {
+        let text = web::html_to_text(&fetched.body);
+        if text.trim().is_empty() {
+            fetched.body.clone()
+        } else {
+            text
+        }
+    };
+    out.push_str(&body);
+    if fetched.truncated {
+        out.push_str("\n… [pir] body truncated at the byte cap (raise max_bytes for more)");
+    }
+    crate::plugin::truncate(&mut out, 30_000);
+    Ok(out)
+}
+
+/// `web_search` — query the configured search endpoint (Feature 10).
+fn do_web_search(input: &serde_json::Value) -> Result<String, String> {
+    let query = input["query"].as_str().ok_or("web_search: missing 'query'")?;
+    let max = input["max_results"].as_u64().unwrap_or(8).clamp(1, 25) as usize;
+    let hits = web::search(query, max)?;
+    if hits.is_empty() {
+        return Ok(format!(
+            "No results parsed for '{query}'. The endpoint ({}) may have changed its markup or \
+             be blocking this client — set PIR_WEB_SEARCH_URL to a SearXNG instance \
+             (…/search?q={{query}}&format=json), or fetch a known URL directly with web_fetch.",
+            web::search_endpoint()
+        ));
+    }
+    let mut out = format!("{} result(s) for '{query}':\n", hits.len());
+    for (i, h) in hits.iter().enumerate() {
+        out.push_str(&format!("{}. {}\n   {}\n", i + 1, h.title, h.url));
+        if !h.snippet.is_empty() {
+            out.push_str(&format!("   {}\n", h.snippet));
+        }
+    }
+    out.push_str("\nUse web_fetch on any URL above to read it in full.");
+    crate::plugin::truncate(&mut out, 20_000);
+    Ok(out)
+}
+
 fn read_file(input: &serde_json::Value) -> Result<String, String> {
     let path = input["path"].as_str().ok_or("read_file: missing 'path'")?;
-    let mut text = fs::read_to_string(path).map_err(|e| format!("read_file {path}: {e}"))?;
+    let bytes = fs::read(path).map_err(|e| format!("read_file {path}: {e}"))?;
+    let mut text = decode_for_reading(path, &bytes)?;
     crate::plugin::truncate(&mut text, 100_000);
     Ok(text)
+}
+
+/// Turn raw file bytes into the most useful text we can, without new
+/// dependencies (Feature 9, "rich reading" — the parts that need no crates).
+///
+/// Order:
+///  1. **gzip** — magic `1f 8b`: decompress via the system `gzip -dc`
+///     (universally present) and read the result as text.
+///  2. **PDF** — `%PDF-` header: extract text with `pdftotext` when installed
+///     (poppler-utils); otherwise say so and suggest the installer.
+///  3. **UTF-8 text** — the common case; returned as-is.
+///  4. **Binary** — anything else (or text containing NUL bytes): instead of the
+///     useless "stream did not contain valid UTF-8" from `read_to_string`, give
+///     a short *description* — size, detected kind, and a hex preview of the
+///     first bytes — which is what lets a model decide what to do next.
+fn decode_for_reading(path: &str, bytes: &[u8]) -> Result<String, String> {
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        return gunzip_to_text(path, bytes);
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return pdf_to_text(path, bytes);
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(s) if !s.contains('\0') => Ok(s.to_string()),
+        _ => Ok(describe_binary(path, bytes)),
+    }
+}
+
+/// Decompress a gzip stream by piping it through the system `gzip -dc`.
+/// Dependency-free (no flate2) and exactly right on every host that has gzip,
+/// which is every host that produced a `.gz` in the first place.
+fn gunzip_to_text(path: &str, bytes: &[u8]) -> Result<String, String> {
+    use std::io::Write;
+    let _ = path;
+    let gz = bytes.to_vec();
+    let mut child = match Command::new("gzip")
+        .arg("-dc")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(format!(
+                "(gzip file: {} bytes; could not run `gzip -dc` ({e}) to decompress it — install \
+                 gzip or decompress it yourself with bash)",
+                gz.len()
+            ));
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        // Ignore a broken pipe: `gzip -dc` may exit early on a truncated stream
+        // and the error we care about is on stderr.
+        let _ = stdin.write_all(&gz);
+    }
+    let out = child.wait_with_output().map_err(|e| format!("gzip: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Ok(format!(
+            "(gzip file: {} bytes; `gzip -dc` failed: {})",
+            gz.len(),
+            err.trim()
+        ));
+    }
+    let raw = out.stdout;
+    let len = raw.len();
+    match String::from_utf8(raw) {
+        Ok(s) => Ok(format!("(decompressed from gzip)\n{s}")),
+        Err(_) => Ok(format!(
+            "(gzip file decompressed to {len} bytes of non-UTF-8 data — it is not text)"
+        )),
+    }
+}
+
+/// Extract PDF text via `pdftotext` (poppler-utils) when available.
+fn pdf_to_text(path: &str, bytes: &[u8]) -> Result<String, String> {
+    // `pdftotext <in> -` streams the text to stdout; no temp file needed.
+    match Command::new("pdftotext")
+        .arg(path)
+        .arg("-")
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout).to_string();
+            if text.trim().is_empty() {
+                Ok(format!(
+                    "(PDF: {} bytes; pdftotext extracted no text — it may be a scanned image, \
+                     which needs OCR)",
+                    bytes.len()
+                ))
+            } else {
+                Ok(format!("(text extracted from PDF)\n{text}"))
+            }
+        }
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            Ok(format!(
+                "(PDF: {} bytes; pdftotext failed: {} — install poppler-utils (`apt install \
+                 poppler-utils`) to read PDFs)",
+                bytes.len(),
+                err.trim()
+            ))
+        }
+        Err(_) => Ok(format!(
+            "(PDF: {} bytes; `pdftotext` is not installed. Install poppler-utils \
+             (`apt install poppler-utils` or the equivalent) to extract its text.)",
+            bytes.len()
+        )),
+    }
+}
+
+/// A compact, honest description of a file we will not return as text: size, a
+/// best-guess kind from the magic bytes, and a hex/ASCII preview of the head.
+fn describe_binary(path: &str, bytes: &[u8]) -> String {
+    let kind = detect_kind(bytes);
+    let mut out = format!(
+        "(binary file — not UTF-8 text: {} bytes, looks like {kind}. Use bash for byte-level \
+         work, or the appropriate tool for this format.)\n",
+        bytes.len()
+    );
+    out.push_str(&format!("first bytes of {path}:\n"));
+    out.push_str(&hex_preview(&bytes[..bytes.len().min(256)], 16));
+    out
+}
+
+/// Best-effort file-type guess from the leading bytes. Deliberately small: the
+/// point is to let the model recognise "this is an image/a zip/a database"
+/// rather than to be `file(1)`.
+fn detect_kind(b: &[u8]) -> &'static str {
+    let starts = |sig: &[u8]| b.starts_with(sig);
+    if starts(b"\x89PNG\r\n\x1a\n") {
+        "a PNG image"
+    } else if starts(&[0xff, 0xd8, 0xff]) {
+        "a JPEG image"
+    } else if starts(b"GIF8") {
+        "a GIF image"
+    } else if starts(b"PK\x03\x04") {
+        "a ZIP archive (or a docx/xlsx/jar)"
+    } else if starts(b"\x7fELF") {
+        "an ELF binary"
+    } else if starts(b"MZ") {
+        "a Windows executable"
+    } else if starts(b"SQLite format 3") {
+        "a SQLite database"
+    } else if starts(b"\x1f\x8b") {
+        "gzip data"
+    } else if starts(b"BZh") {
+        "bzip2 data"
+    } else if starts(b"\x28\xb5\x2f\xfd") {
+        "zstd data"
+    } else if starts(b"OggS") {
+        "an Ogg stream"
+    } else if starts(b"RIFF") {
+        "a RIFF container (wav/avi/webp)"
+    } else if starts(b"%!PS") {
+        "PostScript"
+    } else if starts(&[0x00, 0x00, 0x01, 0x00]) {
+        "an ICO image"
+    } else if starts(b"BM") {
+        "a BMP image"
+    } else if b.iter().take(512).all(|c| c.is_ascii() || *c >= 0x80) && b.contains(&0) {
+        "binary data with embedded NULs"
+    } else {
+        "binary data"
+    }
+}
+
+/// Render up to `max` bytes as classic `offset  hex  |ascii|` rows.
+fn hex_preview(b: &[u8], width: usize) -> String {
+    let mut out = String::new();
+    for (row, chunk) in b.chunks(width).enumerate() {
+        let mut hex = String::new();
+        let mut ascii = String::new();
+        for (i, byte) in chunk.iter().enumerate() {
+            hex.push_str(&format!("{byte:02x} "));
+            if i + 1 == width / 2 {
+                hex.push(' ');
+            }
+            ascii.push(if byte.is_ascii_graphic() || *byte == b' ' { *byte as char } else { '.' });
+        }
+        out.push_str(&format!(
+            "{:08x}  {:<width$} |{}|\n",
+            row * width,
+            hex,
+            ascii,
+            width = width * 3 + 1
+        ));
+    }
+    out
 }
 
 fn list_dir(input: &serde_json::Value, anchor: &Path) -> Result<String, String> {
@@ -637,7 +1305,457 @@ fn list_dir(input: &serde_json::Value, anchor: &Path) -> Result<String, String> 
     Ok(entries.join("\n"))
 }
 
-/// Poll granularity for the command wait/clock loops. These used fixed
+/// Upper bound on matches a single `glob`/`grep` call will materialize before
+/// pagination. Keeps a pathological `**/*` on a huge tree from building a
+/// million-entry Vec.
+const MAX_MATCHES: u64 = 2000;
+
+/// Directories a search never descends into (the fallback walk's gitignore-ish
+/// skip list; ripgrep applies `.gitignore` itself). Skipping `.git` is not
+/// just a speed win — descending it produces nothing but noise (and the
+/// occasional secret file).
+const SEARCH_SKIP_DIRS: &[&str] = &[
+    ".git", ".hg", ".svn", ".jj", "node_modules", "target", "vendor", ".venv", "venv",
+    "__pycache__", ".mypy_cache", ".pytest_cache", ".gradle", "dist", "build", ".idea", ".tox",
+];
+
+/// Refuse to surface a credential/secret path in search *results*, matching the
+/// security module's `is_secret` classification. Reads are default-open, but a
+/// tree-wide search must not become a way to enumerate keys the operator asked
+/// the guard to keep out of the model's context (`read: guarded-secrets`).
+fn is_secret_path(p: &str) -> bool {
+    let s = p.to_ascii_lowercase();
+    let comp = |c: &str| s.contains(&format!("/{c}/")) || s.contains(&format!("\\{c}\\"));
+    comp(".ssh")
+        || comp(".aws")
+        || comp(".gnupg")
+        || comp(".config/gh")
+        || comp(".config/gcloud")
+        || comp(".mozilla")
+        || comp(".config/google-chrome")
+        || s.ends_with(".pem")
+        || s.ends_with(".key")
+        || s.contains("id_rsa")
+        || s.contains("id_ed25519")
+}
+
+enum SearchOutcome {
+    /// ripgrep ran and produced output.
+    Ok(String),
+    /// ripgrep ran with exit status 1: valid search, no matches.
+    NoMatches(String),
+    /// `rg` is not installed.
+    Missing,
+    /// ripgrep failed for a real reason (bad regex, unreadable path).
+    Error(String),
+}
+
+/// Run ripgrep with `args` (pattern + root are pushed by the caller).
+/// Returns [`SearchOutcome::Missing`] when the binary is absent so the caller
+/// can use its in-process fallback.
+fn run_rg(cwd: &Path, args: &[String]) -> SearchOutcome {
+    let mut cmd = Command::new("rg");
+    cmd.args(args);
+    cmd.current_dir(cwd);
+    cmd.stdin(Stdio::null());
+    let out = match cmd.output() {
+        Ok(o) => o,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return SearchOutcome::Missing,
+        Err(e) => return SearchOutcome::Error(format!("could not run rg: {e}")),
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    match out.status.code() {
+        Some(0) => SearchOutcome::Ok(stdout),
+        Some(1) => SearchOutcome::NoMatches(stdout),
+        _ => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let err = err.trim();
+            SearchOutcome::Error(if err.is_empty() { "ripgrep failed".into() } else { err.to_string() })
+        }
+    }
+}
+
+/// `rg --files` listing for `root`, root-relative. `None` when rg is absent.
+fn rg_files(root: &Path) -> Option<Vec<String>> {
+    let mut args = vec![
+        "--files".to_string(),
+        "--color=never".to_string(),
+    ];
+    for d in SEARCH_SKIP_DIRS {
+        args.push("--glob".to_string());
+        args.push(format!("!**/{d}/**"));
+    }
+    args.push(root.display().to_string());
+    match run_rg(root, &args) {
+        SearchOutcome::Ok(s) | SearchOutcome::NoMatches(s) => Some(
+            s.lines()
+                .map(|l| strip_root(l, root))
+                .filter(|l| !l.is_empty())
+                .take(MAX_MATCHES as usize)
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Built-in recursive file walk used when ripgrep is unavailable. Applies
+/// [`SEARCH_SKIP_DIRS`], never follows symlinks (no cycles), and caps at
+/// [`MAX_MATCHES`]. Returns root-relative paths.
+fn walk_files(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    walk_into(root, root, 0, &mut out);
+    out
+}
+
+fn walk_into(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
+    if depth > 32 || out.len() >= MAX_MATCHES as usize {
+        return;
+    }
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        if out.len() >= MAX_MATCHES as usize {
+            return;
+        }
+        let name = e.file_name().to_string_lossy().to_string();
+        let Ok(ft) = e.file_type() else { continue };
+        let p = e.path();
+        if ft.is_dir() {
+            if SEARCH_SKIP_DIRS.contains(&name.as_str()) || name.starts_with('.') && name.len() > 1 {
+                continue;
+            }
+            walk_into(root, &p, depth + 1, out);
+        } else if ft.is_file() {
+            // Hidden *files* are skipped too (rg's default), except the
+            // well-known dotfiles an agent legitimately wants.
+            let hidden = name.starts_with('.');
+            let wanted_dot = matches!(
+                name.as_str(),
+                ".gitignore" | ".gitattributes" | ".env.example" | ".editorconfig" | ".dockerignore"
+            );
+            if hidden && !wanted_dot {
+                continue;
+            }
+            if let Ok(rel) = p.strip_prefix(root) {
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+}
+
+/// Make an rg output line root-relative: strip a leading `./` and the absolute
+/// root prefix, so `grep`/`glob` output is consistent regardless of how the
+/// search root was spelled.
+fn strip_root(line: &str, root: &Path) -> String {
+    let root_s = root.to_string_lossy().replace('\\', "/");
+    let root_trim = root_s.trim_end_matches('/');
+    let mut l = line.replace('\\', "/");
+    if !root_trim.is_empty()
+        && let Some(rest) = l.strip_prefix(&format!("{root_trim}/")) {
+            l = rest.to_string();
+        }
+    l.strip_prefix("./").unwrap_or(&l).to_string()
+}
+
+/// Match a `/`-separated relative path against a glob pattern.
+///
+/// Supports `**` (any number of path segments, including zero), `*` (any run of
+/// characters *within* a segment), `?` (one character within a segment), and
+/// character classes `[abc]` / `[!abc]`. A pattern with no `/` is matched
+/// against the file *name* as well as the whole relative path, so `"*.rs"`
+/// behaves the way everyone expects (any .rs file anywhere below the root).
+fn glob_match(pattern: &str, path: &str) -> bool {
+    let pat = pattern.trim().trim_start_matches("./");
+    let path = path.trim_start_matches("./");
+    if pat.is_empty() {
+        return false;
+    }
+    if glob_segments(pat.as_bytes(), path.as_bytes()) {
+        return true;
+    }
+    if !pat.contains('/')
+        && let Some(name) = path.rsplit('/').next() {
+            return glob_segments(pat.as_bytes(), name.as_bytes());
+        }
+    false
+}
+
+/// Globbing with `**` crossing `/`. Split at `**` boundaries so each chunk is
+/// matched against a contiguous span; within a chunk `*`/`?` never cross `/`.
+///
+/// `**` may match zero or more *whole segments*, so `**/*.rs` matches
+/// `main.rs`, `src/main.rs` and `a/b/main.rs` alike — the segment after `**`
+/// is tried against every suffix that starts at a segment boundary.
+fn glob_segments(pat: &[u8], path: &[u8]) -> bool {
+    // Fast path: no `**` anywhere -> plain segment-wise match.
+    if !contains_double_star(pat) {
+        return wildcard(pat, path);
+    }
+    // Split on the first `**`. The chunk before it must match a *prefix* of the
+    // path (segment-aligned, so a trailing `/` is dropped); the chunk after it
+    // must match the remainder — and, because `**` may consume whole segments,
+    // the remainder may start at any segment boundary.
+    let idx = find_double_star(pat).expect("contains_double_star checked above");
+    let before = trim_double_star_left(&pat[..idx]);
+    let mut after = &pat[idx + 2..];
+    after = after.strip_prefix(b"/").unwrap_or(after);
+    // `**/` swallows the separator on both sides: try `after` against the path
+    // itself and every suffix that begins a segment.
+    let starts: Vec<usize> = std::iter::once(0)
+        .chain(
+            path.iter()
+                .enumerate()
+                .filter(|(_, c)| **c == b'/')
+                .map(|(i, _)| i + 1),
+        )
+        .collect();
+    for start in starts.iter().copied() {
+        if start > path.len() {
+            continue;
+        }
+        let (head, rest) = path.split_at(start);
+        // `head` ends with `/` (except for start 0); drop it for matching.
+        let head_trim = head.strip_suffix(b"/").unwrap_or(head);
+        if !wildcard(before, head_trim) {
+            continue;
+        }
+        if after.is_empty() {
+            return true;
+        }
+        // The `**` itself consumes whole segments of what follows, so `after`
+        // must be tried against every boundary-aligned suffix of `rest` —
+        // including `rest` itself (zero further segments consumed).
+        if glob_segments(after, rest) {
+            return true;
+        }
+        for cut in starts.iter().copied().filter(|c| *c > start && *c <= path.len()) {
+            let suffix = &path[cut..];
+            if glob_segments(after, suffix) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Drop a trailing `/` from the chunk before a `**` (`src/**/x` -> `src`), so
+/// the `/` that separates it from the `**` is not matched as a path character.
+fn trim_double_star_left(chunk: &[u8]) -> &[u8] {
+    chunk.strip_suffix(b"/").unwrap_or(chunk)
+}
+
+fn contains_double_star(pat: &[u8]) -> bool {
+    find_double_star(pat).is_some()
+}
+
+fn find_double_star(pat: &[u8]) -> Option<usize> {
+    pat.windows(2).position(|w| w == b"**")
+}
+
+/// Classic `*`/`?`/`[…]` wildcard match over a byte slice. `*` never crosses a
+/// `/` separator (the caller splits on segments), but `?` may match any single
+/// character including `/` only when the pattern is being used name-wise —
+/// callers always pass separator-free spans, so a literal `/` in `s` simply
+/// fails to match `*`/`?`.
+fn wildcard(pat: &[u8], s: &[u8]) -> bool {
+    // `*` and `?` never consume a `/`: that is what keeps `src/*.rs` from
+    // matching `src/deep/mod.rs`. Crossing directories is `**`'s job, handled
+    // by `glob_segments` above. (When the caller matches a bare *name* pattern
+    // against a file name, `s` contains no separator at all, so this rule is
+    // invisible there.)
+    let (mut p, mut i) = (0usize, 0usize);
+    let (mut star, mut mark) = (None::<usize>, 0usize);
+    while i < s.len() {
+        let c = s[i];
+        // A `/` in the input can only be consumed by a literal `/` in the
+        // pattern (or be the tail matched by an enclosing `**`); every
+        // wildcard branch below refuses it.
+        let at_sep = c == b'/';
+        if p < pat.len() && pat[p] == b'[' {
+            if let Some((set, next)) = parse_class(&pat[p..])
+                && !at_sep
+                && set.matches(c)
+            {
+                p += next;
+                i += 1;
+                continue;
+            }
+        } else if p < pat.len() && pat[p] == b'?' && !at_sep {
+            p += 1;
+            i += 1;
+            continue;
+        } else if p < pat.len() && pat[p] == c {
+            p += 1;
+            i += 1;
+            continue;
+        } else if p < pat.len() && pat[p] == b'*' && !(at_sep && star == Some(p)) {
+            // A starred wildcard only consumes non-separators; at a separator
+            // a fresh `*` matches the empty string and we move past it.
+            if !at_sep {
+                star = Some(p);
+                mark = i;
+            }
+            p += 1;
+            continue;
+        }
+        // No direct match: backtrack to the last `*`, extending what it ate by
+        // one (non-separator) character.
+        match star {
+            Some(star_pos) if i < s.len() && !at_sep => {
+                p = star_pos + 1;
+                mark += 1;
+                i = mark;
+            }
+            _ => return false,
+        }
+    }
+    while p < pat.len() && pat[p] == b'*' {
+        p += 1;
+    }
+    p == pat.len()
+}
+
+/// Parse a `[...]` character class at the start of `pat`, returning the class
+/// and how many bytes it consumed. `None` when the class is unterminated (the
+/// `[` is then treated as a literal by the caller's normal path).
+fn parse_class(pat: &[u8]) -> Option<(CharClass, usize)> {
+    let mut i = 1;
+    let negate = matches!(pat.get(1), Some(b'!') | Some(b'^'));
+    if negate {
+        i = 2;
+    }
+    let mut singles: Vec<u8> = Vec::new();
+    let mut ranges: Vec<(u8, u8)> = Vec::new();
+    let mut first = true;
+    while i < pat.len() {
+        let c = pat[i];
+        if c == b']' && !first {
+            return Some((CharClass { negate, singles, ranges }, i + 1));
+        }
+        first = false;
+        if i + 2 < pat.len() && pat[i + 1] == b'-' && pat[i + 2] != b']' {
+            ranges.push((c, pat[i + 2]));
+            i += 3;
+        } else {
+            singles.push(c);
+            i += 1;
+        }
+    }
+    None
+}
+
+struct CharClass {
+    negate: bool,
+    singles: Vec<u8>,
+    ranges: Vec<(u8, u8)>,
+}
+
+impl CharClass {
+    fn matches(&self, c: u8) -> bool {
+        let hit = self.singles.contains(&c) || self.ranges.iter().any(|&(a, b)| c >= a && c <= b);
+        hit != self.negate
+    }
+}
+
+/// Sort key: newest modification first. A missing mtime sorts last (epoch 0).
+fn mtime_key(p: &Path) -> u64 {
+    fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Apply `offset`/`limit` to a list of lines and render it as the tool result,
+/// with an explicit note about what was cut so the model knows to page.
+fn paginate(lines: &[String], limit: usize, offset: usize, what: &str) -> String {
+    if lines.is_empty() {
+        return "(no matches)".to_string();
+    }
+    let start = offset.min(lines.len());
+    let end = (start + limit).min(lines.len());
+    let mut out = lines[start..end].join("\n");
+    let shown = end - start;
+    if start > 0 || end < lines.len() {
+        out.push_str(&format!(
+            "\n… [pir] showing {shown} of {} {what} (offset {offset}, limit {limit}); \
+             raise limit/offset to page",
+            lines.len()
+        ));
+    } else {
+        out.push_str(&format!("\n… [pir] {shown} {what}"));
+    }
+    crate::plugin::truncate(&mut out, 30_000);
+    out
+}
+
+/// In-process `grep` fallback for hosts without ripgrep (or when spawning it
+/// failed): walk the tree and apply the `regex` crate. Slower and without
+/// gitignore awareness, but it keeps the tool usable everywhere.
+fn fallback_grep(
+    root: &Path,
+    pattern: &str,
+    mode: &str,
+    ci: bool,
+    numbers: bool,
+    context: usize,
+) -> Result<String, String> {
+    let re = regex::RegexBuilder::new(pattern)
+        .case_insensitive(ci)
+        .multi_line(true)
+        .build()
+        .map_err(|e| format!("bad regex: {e}"))?;
+    let mut hits: Vec<String> = Vec::new();
+    for rel in walk_files(root) {
+        if is_secret_path(&rel) {
+            continue;
+        }
+        let full = root.join(&rel);
+        let Ok(text) = fs::read_to_string(&full) else { continue };
+        let file_lines: Vec<&str> = text.lines().collect();
+        let mut count = 0usize;
+        for (i, line) in file_lines.iter().enumerate() {
+            if !re.is_match(line) {
+                continue;
+            }
+            count += 1;
+            match mode {
+                "files_with_matches" => break,
+                "count" => {}
+                _ => {
+                    if context > 0 {
+                        let lo = i.saturating_sub(context);
+                        let hi = (i + context + 1).min(file_lines.len());
+                        for j in lo..hi {
+                            let sep = if j == i { ':' } else { '-' };
+                            if numbers {
+                                hits.push(format!("{rel}{sep}{}{sep}{}", j + 1, file_lines[j]));
+                            } else {
+                                hits.push(format!("{rel}{sep}{}", file_lines[j]));
+                            }
+                        }
+                    } else if numbers {
+                        hits.push(format!("{rel}:{}:{}", i + 1, line));
+                    } else {
+                        hits.push(format!("{rel}:{line}"));
+                    }
+                }
+            }
+        }
+        match mode {
+            "files_with_matches" if count > 0 => hits.push(rel),
+            "count" if count > 0 => hits.push(format!("{rel}:{count}")),
+            _ => {}
+        }
+        if hits.len() >= MAX_MATCHES as usize {
+            break;
+        }
+    }
+    Ok(hits.join("\n"))
+}
+
+/// Poll granularity for the command wait/clock loops.
+/// These used fixed
 /// 250-500 ms sleeps, so an ESC/ctrl-c could sit unnoticed for half a second
 /// before the kill even started (the "tool cancelling takes >99 ms" report).
 /// Slicing at this interval bounds that latency while each slice costs only a
@@ -1436,6 +2554,161 @@ mod esc_tests {
 }
 
 #[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("pir_search_{}_{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("src/deep")).unwrap();
+        fs::write(d.join("src/main.rs"), "fn main() {\n    let x = 1;\n}\n").unwrap();
+        fs::write(d.join("src/deep/mod.rs"), "pub fn helper() {}\n// needle here\n").unwrap();
+        fs::write(d.join("README.md"), "# hi\nneedle in docs\n").unwrap();
+        fs::write(d.join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(d.join("ignored.txt"), "needle should be ignored\n").unwrap();
+        fs::create_dir_all(d.join("node_modules")).unwrap();
+        fs::write(d.join("node_modules/x.js"), "needle in deps\n").unwrap();
+        // ripgrep only honours .gitignore inside a repository, so make the
+        // fixture one. (Both rg paths and the fallback walk skip node_modules
+        // regardless.)
+        let git = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&d)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = git;
+        d
+    }
+
+    fn builtin(dir: &Path) -> Builtin {
+        Builtin::new(
+            dir.to_path_buf(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    #[test]
+    fn glob_matches_starstar_and_name_pattern() {
+        assert!(glob_match("**/*.rs", "src/main.rs"));
+        assert!(glob_match("**/*.rs", "src/deep/mod.rs"));
+        assert!(!glob_match("**/*.rs", "README.md"));
+        // A bare name pattern matches at any depth.
+        assert!(glob_match("*.rs", "src/deep/mod.rs"));
+        assert!(!glob_match("*.md", "src/main.rs"));
+        // `**` may match zero segments.
+        assert!(glob_match("src/**/*.rs", "src/main.rs"));
+        assert!(glob_match("src/**", "src/main.rs"));
+        // Anchored patterns stay anchored.
+        assert!(glob_match("src/*.rs", "src/main.rs"));
+        assert!(!glob_match("src/*.rs", "src/deep/mod.rs"));
+        // `?` and character classes.
+        assert!(glob_match("src/mai?.rs", "src/main.rs"));
+        assert!(!glob_match("src/mai?.rs", "src/mai.rs"));
+        assert!(glob_match("*.r[si]", "src/main.rs"));
+        assert!(!glob_match("*.r[!s]", "src/main.rs"));
+    }
+
+    #[test]
+    fn glob_tool_returns_paths_and_respects_skips() {
+        let d = tmpdir("glob");
+        let mut b = builtin(&d);
+        let out = b.glob(&json!({ "pattern": "**/*.rs" })).expect("glob");
+        assert!(out.contains("src/main.rs"), "got: {out}");
+        assert!(out.contains("src/deep/mod.rs"), "got: {out}");
+        assert!(!out.contains("README.md"), "got: {out}");
+        // node_modules is never descended (both rg and the fallback skip it).
+        assert!(!out.contains("node_modules"), "got: {out}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn glob_paginates_with_limit_and_offset() {
+        let d = tmpdir("page");
+        let mut b = builtin(&d);
+        let all = b.glob(&json!({ "pattern": "**/*.rs", "limit": 100 })).unwrap();
+        assert!(all.contains("2 paths"), "got: {all}");
+        let first = b.glob(&json!({ "pattern": "**/*.rs", "limit": 1 })).unwrap();
+        assert!(first.contains("showing 1 of 2"), "got: {first}");
+        let second = b.glob(&json!({ "pattern": "**/*.rs", "limit": 1, "offset": 1 })).unwrap();
+        assert!(second.contains("showing 1 of 2"), "got: {second}");
+        // The two pages must not overlap.
+        let a = first.lines().next().unwrap().to_string();
+        let c = second.lines().next().unwrap().to_string();
+        assert_ne!(a, c, "offset must advance past the first page");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn grep_finds_content_and_skips_ignored_and_deps() {
+        let d = tmpdir("grep");
+        let mut b = builtin(&d);
+        let out = b.grep(&json!({ "pattern": "needle" })).expect("grep");
+        assert!(out.contains("src/deep/mod.rs"), "got: {out}");
+        assert!(out.contains("README.md"), "got: {out}");
+        // .gitignore'd file and node_modules must both be excluded.
+        assert!(!out.contains("ignored.txt"), "got: {out}");
+        assert!(!out.contains("node_modules"), "got: {out}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn grep_modes_and_flags() {
+        let d = tmpdir("modes");
+        let mut b = builtin(&d);
+        // files_with_matches: paths only.
+        let files = b
+            .grep(&json!({ "pattern": "needle", "output_mode": "files_with_matches" }))
+            .unwrap();
+        assert!(!files.contains(":needle"), "files mode must not print content: {files}");
+        // count: per-file counts.
+        let counts = b
+            .grep(&json!({ "pattern": "needle", "output_mode": "count" }))
+            .unwrap();
+        assert!(counts.lines().any(|l| l.ends_with(":1")), "got: {counts}");
+        // case-insensitive.
+        let ci = b
+            .grep(&json!({ "pattern": "NEEDLE", "case_insensitive": true }))
+            .unwrap();
+        assert!(ci.contains("needle"), "got: {ci}");
+        let cs = b.grep(&json!({ "pattern": "NEEDLE" })).unwrap();
+        assert_eq!(cs, "(no matches)", "case-sensitive search should miss: {cs}");
+        // glob filter.
+        let only_md = b
+            .grep(&json!({ "pattern": "needle", "glob": "*.md" }))
+            .unwrap();
+        assert!(only_md.contains("README.md"), "got: {only_md}");
+        assert!(!only_md.contains("mod.rs"), "got: {only_md}");
+        // context lines.
+        let ctx = b
+            .grep(&json!({ "pattern": "helper", "context": 1 }))
+            .unwrap();
+        assert!(ctx.contains("needle here"), "context line missing: {ctx}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn grep_rejects_empty_pattern() {
+        let d = tmpdir("empty");
+        let mut b = builtin(&d);
+        assert!(b.grep(&json!({ "pattern": "" })).is_err());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn secret_paths_are_filtered_out_of_results() {
+        let d = tmpdir("sec");
+        fs::create_dir_all(d.join(".ssh")).unwrap();
+        fs::write(d.join(".ssh/id_rsa"), "needle secret\n").unwrap();
+        let mut b = builtin(&d);
+        let out = b.grep(&json!({ "pattern": "needle" })).unwrap();
+        assert!(!out.contains("id_rsa"), "secret path leaked: {out}");
+        let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
 mod priv_escalation_tests {
     use super::*;
 
@@ -1484,5 +2757,256 @@ mod priv_escalation_tests {
         // Just assert it returns promptly and deterministically; the actual
         // value depends on the test-runner's sudoers, not the code.
         let _ = b.sudo_is_passwordless("sudo ls");
+    }
+
+    /// The regression this module exists for: `tty_available()` must be true
+    /// whenever the process can reach an interactive terminal, so an escalation
+    /// prompt actually waits for the operator. This test only asserts the
+    /// *decision contract* that was broken — we must never claim the operator
+    /// declined when no keypress arrived. It never actually blocks: it stubs
+    /// out the tty-availability question by checking the wording produced for a
+    /// no-answer, which is the message the old code could not produce (it
+    /// always said "user declined").
+    #[test]
+    fn no_answer_is_not_reported_as_a_decline() {
+        // The refusal produced when nobody answers must name `no answer`, not
+        // fabricate `user declined`. This is the exact wording regression.
+        let b = Builtin::new(
+            PathBuf::from("."),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        // Directly exercise the prompt's timeout branch with a 0-length wait by
+        // pointing it at an unreadable "terminal": `/dev/tty` may exist for a
+        // test harness, so we instead assert the *source contract* that the
+        // no-answer arm exists by running the non-tty refusal (which is the
+        // path taken when no human can be reached).
+        if crate::term::tty_available() {
+            // A terminal exists but the test runner can't safely consume the
+            // operator's real keystrokes; assert the message wording via the
+            // helper that builds it rather than blocking on /dev/tty.
+            let msg = Builtin::refusal_without_approval("sudo as root", 1);
+            assert!(
+                !msg.contains("user declined"),
+                "must not fabricate a denial by the operator: {msg}"
+            );
+            assert!(
+                msg.contains("no answer") || msg.contains("refusing to escalate"),
+                "expected an explicit no-answer refusal, got: {msg}"
+            );
+        } else {
+            // No terminal at all: the non-tty refusal must point at the
+            // out-of-band escalation path, never claim the user said no.
+            let msg = b
+                .request_priv_escalation_timeout("sudo true", "sudo as root".to_string(), 1)
+                .expect_err("must refuse without a terminal");
+            assert!(!msg.contains("user declined"), "got: {msg}");
+            assert!(msg.contains("refusing to escalate"), "got: {msg}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tool_spec_tests {
+    use super::*;
+
+    /// The tool list the model sees must contain the features added here, and
+    /// the dispatch must handle every name it advertises (an advertised-but-
+    /// undispatchable tool is a silent trap for the model).
+    #[test]
+    fn specs_include_new_tools_and_all_are_dispatchable() {
+        let mut b = Builtin::new(
+            PathBuf::from("."),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let names: Vec<&str> = b.specs().iter().map(|s| s.name).collect();
+        for want in ["glob", "grep", "ask_user_question", "load_skill", "plan_write", "agent", "remember"] {
+            assert!(names.contains(&want), "tool {want} missing from specs: {names:?}");
+        }
+        // Every advertised tool must produce something other than "unknown
+        // tool" (an empty `{}` input is enough: the tool may complain about
+        // missing args, but it must be reachable). `update_goal`, `request_stop`
+        // and `ask_user_question` are advertised here but *intercepted by the
+        // agent turn loop* (they need the agent's goal store / stop state /
+        // REPL channel), so they are excluded — `Agent` has its own tests that
+        // every one of them is dispatched there.
+        let agent_intercepted = ["update_goal", "request_stop", "ask_user_question", "load_skill", "plan_write", "agent", "remember"];
+        for spec in b.specs() {
+            if agent_intercepted.contains(&spec.name) {
+                continue;
+            }
+            let out = b.run(spec.name, &json!({}));
+            assert!(
+                !out.content.contains("unknown tool"),
+                "{} is advertised but not dispatched: {}",
+                spec.name,
+                out.content
+            );
+        }
+    }
+
+    #[test]
+    fn ask_spec_shape_matches_what_the_tool_accepts() {
+        let b = Builtin::new(
+            PathBuf::from("."),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let spec = b.specs().into_iter().find(|s| s.name == "ask_user_question").expect("spec");
+        let props = &spec.schema["properties"];
+        assert!(props.get("questions").is_some(), "schema must expose 'questions'");
+        let item = &props["questions"]["items"];
+        assert!(item["properties"].get("question").is_some());
+        assert!(item["properties"].get("header").is_some());
+        assert!(item["properties"].get("options").is_some());
+        assert!(item["properties"].get("multiSelect").is_some());
+    }
+}
+
+#[cfg(test)]
+mod rich_read_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("pir_richread_{}_{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn read(path: &Path) -> String {
+        read_file(&json!({ "path": path.to_string_lossy() })).expect("read_file")
+    }
+
+    #[test]
+    fn plain_text_is_returned_unchanged() {
+        let d = tmp("text");
+        let p = d.join("a.txt");
+        fs::write(&p, "hello\nworld\n").unwrap();
+        assert_eq!(read(&p), "hello\nworld\n");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn binary_files_are_described_not_garbled() {
+        let d = tmp("bin");
+        // A PNG signature followed by NULs: definitely not UTF-8 text.
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&[0u8; 64]);
+        bytes.extend_from_slice(&[0xff, 0xfe, 0x00, 0x41]);
+        let p = d.join("img.png");
+        fs::write(&p, &bytes).unwrap();
+        let out = read(&p);
+        assert!(out.contains("binary file"), "got: {out}");
+        assert!(out.contains("PNG image"), "kind must be detected: {out}");
+        assert!(out.contains(&format!("{} bytes", bytes.len())), "size missing: {out}");
+        assert!(out.contains("89 50 4e 47"), "hex preview missing: {out}");
+        assert!(out.contains(".PNG"), "ascii column missing: {out}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn detects_common_magic_bytes() {
+        assert_eq!(detect_kind(b"PK\x03\x04rest"), "a ZIP archive (or a docx/xlsx/jar)");
+        assert_eq!(detect_kind(b"\x7fELFrest"), "an ELF binary");
+        assert_eq!(detect_kind(b"SQLite format 3\0"), "a SQLite database");
+        assert_eq!(detect_kind(b"\x1f\x8b\x08"), "gzip data");
+        assert_eq!(detect_kind(b"\xff\xd8\xff\xe0"), "a JPEG image");
+        assert_eq!(detect_kind(b"GIF89a"), "a GIF image");
+        assert_eq!(detect_kind(&[0x00, 0x00, 0x01, 0x00]), "an ICO image");
+        assert_eq!(detect_kind(b"BM\x00\x00"), "a BMP image");
+        assert_eq!(detect_kind(b"\x00\x01\x02\x03"), "binary data with embedded NULs");
+    }
+
+    #[test]
+    fn hex_preview_format_is_stable() {
+        let h = hex_preview(b"ABCD", 4);
+        // Width 4 splits the hex column in half, so the group separator lands
+        // between B and C — the format is deliberate and worth pinning.
+        assert!(h.starts_with("00000000  41 42  43 44"), "got: {h}");
+        assert!(h.contains("|ABCD|"), "got: {h}");
+        let h16 = hex_preview(b"ABCDEFGHIJKLMNOP", 16);
+        assert!(h16.starts_with("00000000  41 42 43 44 45 46 47 48  49 4a 4b 4c 4d 4e 4f 50"), "got: {h16}");
+        assert!(h16.contains("|ABCDEFGHIJKLMNOP|"), "got: {h16}");
+    }
+
+    #[test]
+    fn gzip_is_transparently_decompressed() {
+        let d = tmp("gz");
+        let p = d.join("note.txt.gz");
+        // Compress with the real gzip, so the fixture is a genuine stream.
+        let plain = d.join("note.txt");
+        fs::write(&plain, "compressed payload\n").unwrap();
+        let ok = Command::new("gzip")
+            .arg("-k")
+            .arg("-f")
+            .arg(&plain)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok || !p.exists() {
+            // No gzip on this host: the fallback message must still be honest.
+            let fake = d.join("fake.gz");
+            fs::write(&fake, b"\x1f\x8bnot really gzip").unwrap();
+            let out = read(&fake);
+            assert!(out.contains("gzip"), "got: {out}");
+            let _ = fs::remove_dir_all(&d);
+            return;
+        }
+        let out = read(&p);
+        assert!(out.contains("decompressed from gzip"), "got: {out}");
+        assert!(out.contains("compressed payload"), "payload missing: {out}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn pdf_is_extracted_when_pdftotext_is_present() {
+        let d = tmp("pdf");
+        let p = d.join("doc.pdf");
+        // A minimal one-page PDF whose content stream draws the text "PIRPDF".
+        let body = "%PDF-1.4\n\
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n\
+2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n\
+3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 300 100]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n\
+4 0 obj<</Length 44>>stream\nBT /F1 24 Tf 20 40 Td (PIRPDF) Tj ET\nendstream endobj\n\
+5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n\
+trailer<</Root 1 0 R>>\n%%EOF\n";
+        fs::write(&p, body).unwrap();
+        let out = read(&p);
+        if out.contains("PIRPDF") {
+            // pdftotext is installed and parsed our fixture: the text must come
+            // back without any warning prefix.
+            assert!(out.contains("text extracted from PDF"), "got: {out}");
+            assert!(!out.contains("(PDF:"), "a successful extraction must not warn: {out}");
+        } else {
+            // Either pdftotext is absent or it could not parse our hand-rolled
+            // fixture; both must produce an honest, actionable message rather
+            // than a UTF-8 error.
+            assert!(out.contains("PDF"), "got: {out}");
+            assert!(
+                out.contains("pdftotext") || out.contains("scanned image"),
+                "must explain the situation: {out}"
+            );
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn non_utf8_text_never_produces_a_read_error() {
+        let d = tmp("latin1");
+        // Latin-1 bytes with no NUL: invalid UTF-8, but not really "binary".
+        fs::write(d.join("l.txt"), b"caf\xe9 au lait\n").unwrap();
+        let out = read(&d.join("l.txt"));
+        assert!(out.contains("binary file"), "got: {out}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn missing_file_is_still_an_error() {
+        let d = tmp("missing");
+        let err = read_file(&json!({ "path": d.join("nope").to_string_lossy() })).unwrap_err();
+        assert!(err.contains("read_file"), "got: {err}");
+        let _ = fs::remove_dir_all(&d);
     }
 }

@@ -62,6 +62,30 @@ pub fn job_kill_flag() -> Option<Arc<AtomicBool>> {
 
 use std::sync::{Arc, Mutex};
 
+/// Output format for agent sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// Human-readable terminal output (default).
+    Plain,
+    /// NDJSON events emitted to stdout for machine consumption.
+    Json,
+}
+
+impl OutputFormat {
+    pub fn is_json(self) -> bool {
+        self == OutputFormat::Json
+    }
+}
+
+/// Emit a single NDJSON line to stdout. In JSON mode, all structured events
+/// go through here. Flushing is immediate so consumers can parse incrementally.
+pub(crate) fn ndjson_emit(event: &serde_json::Value) {
+    if let Ok(line) = serde_json::to_string(event) {
+        println!("{line}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+}
+
 pub struct Agent {
     pub provider: Provider,
     pub model: Model,
@@ -120,6 +144,14 @@ pub struct Agent {
     /// touched). Persisted next to the session log so a resumed session keeps
     /// its choice.
     su_security_enabled: bool,
+    /// Whether this session is in **plan mode** (Feature 5): read/search only,
+    /// no writes and no commands. Persisted next to the session log (`.plan`)
+    /// so a resumed session keeps the posture — resuming into a half-written
+    /// plan must not silently re-arm the ability to edit the repo.
+    plan_mode: bool,
+    /// When this agent is a sub-agent (Feature 6), which kind it is. Drives the
+    /// extra system-prompt preamble and the tool-list filtering.
+    subagent_kind: Option<crate::subagent::Kind>,
     /// OS-abstracted security guardrail (the `security` module). When `Some`,
     /// every tool call is pre-checked against it via [`SecurityContext::check`]
     /// ( default-open / configurable; writes scoped to this project;
@@ -157,6 +189,10 @@ pub struct Agent {
     /// `request_stop` call, and text-only answers are auto-nudged (up to
     /// [`STOP_NUDGE_MAX`] per turn) until it does.
     stop_skill: bool,
+    /// Output format for this session. `Plain` (default) is human-readable
+    /// terminal output; `Json` emits NDJSON events to stdout for machine
+    /// consumption (headless / CI use). Set via `--output-format json`.
+    output_format: OutputFormat,
     /// In-flight explicit stop for this turn (set by `run_stop_tool`, consumed
     /// after the tool batch). Reset at the start of every turn.
     stop_hit: Option<(StopDecision, String)>,
@@ -455,6 +491,16 @@ pub(crate) fn context_files(cwd: &Path) -> Vec<(PathBuf, String)> {
 /// Build the base system prompt (prompt/output parity with pi's *shape*,
 /// pir's *content* — see docs/PROMPT_PARITY.md §2). Both constructors share
 /// it; goal state is appended separately by `refresh_system`.
+/// Clip a plan body for display inside the approval dialog (the full document
+/// is on disk and in the tool result; the dialog only needs enough to judge).
+fn clip_for_dialog(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
+    format!("{}…\n\n(full plan is in the saved file)", &s[..cut])
+}
+
 fn build_system_prompt(cwd: &Path) -> String {
     let mut system = String::from(
         "You are pir, a minimal terminal coding agent (a lightweight Rust \
@@ -473,6 +519,17 @@ fn build_system_prompt(cwd: &Path) -> String {
          - write_file: Create or overwrite a file\n\
          - edit_file: Replace exactly one occurrence of old_string with new_string\n\
          - list_dir: List the entries of a directory (non-recursive)\n\
+         - glob: Find files by path glob (e.g. '**/*.rs'), newest-modified first\n\
+         - grep: Regex content search (ripgrep-backed; respects .gitignore)\n\
+         - ask_user_question: Pause and ask the operator a structured question (when a\n\
+           decision genuinely blocks progress); returns their answer as the tool result\n\
+         - load_skill: Load a skill's full instructions (skills are listed in the Skills\n\
+           section below) before doing work the skill covers\n\
+         - plan_write: In plan mode, record a markdown plan for the operator to approve\n\
+         - agent: Delegate a self-contained task to a sub-agent and get back only its report\n\
+         - web_fetch: Fetch a public http/https URL and return its readable text\n\
+         - web_search: Search the web (provider-independent) for titles, URLs and snippets\n\
+         - remember: Record a durable preference so it applies in later sessions\n\
          - job_status: Check on a long-running command that was detached\n\
          - job_kill: Stop a detached long-running command\n\
          - update_goal: Persist and update the current goal/continuation plan\n\
@@ -526,6 +583,23 @@ fn build_system_prompt(cwd: &Path) -> String {
         system.push_str("</project_context>\n");
     }
     system.push_str(&format!("\nCurrent working directory: {}\n", cwd.display()));
+    // The per-session scratchpad (Feature 2): a writable area outside the repo
+    // for intermediate artifacts. Injected only when one exists, so a session
+    // that couldn't create it doesn't advertise a path that isn't there.
+    if let Some(sp) = crate::scratchpad::current() {
+        system.push_str(&format!(
+            "Scratchpad: {} (exported as $PIR_SCRATCHPAD) — use it for intermediate files, \
+             generated fixtures and logs; never write scratch files into the repo itself.\n",
+            sp.display()
+        ));
+    }
+    // Skills catalog (Feature 4): names + one-line descriptions only. The full
+    // instruction body is pulled in on demand via `load_skill`, which is what
+    // keeps a dozen detailed procedures from costing context on every request.
+    system.push_str(&crate::skills::catalog(&crate::skills::discover(cwd)));
+    // Taste (Feature 12): durable preferences recorded by the agent or the
+    // operator, injected so they survive into every later session.
+    system.push_str(&crate::taste::catalog(&crate::taste::load_all(cwd)));
     system
 }
 
@@ -623,7 +697,15 @@ impl Agent {
             // (tests construct Agents directly; mounting would shadow the test
             // host and poison the process-global quarantine flags).
             #[cfg(all(not(test), unix))]
-            {
+            if std::env::var_os("PIR_SUBAGENT").is_none() {
+                // The quarantine is set up once, by the *launcher*. A sub-agent
+                // runs in the same process, so re-entering a private mount
+                // namespace / re-mounting the overlays for it is both pointless
+                // and actively harmful (it would try to overlay /etc a second
+                // time in a namespace it cannot leave, and can kill the child
+                // outright). `PIR_SUBAGENT` is set for the duration of a child's
+                // construction, so the child simply inherits the parent's
+                // already-established posture.
                 // Scope every overlay we mount to THIS agent's private mount
                 // namespace (see enter_private_mount_ns) so we quarantine the
                 // agent's writes only, never the host's. If we can't get a private
@@ -710,6 +792,18 @@ impl Agent {
 
         let (log, log_path) = open_log(resume_from);
 
+        // Per-session scratch directory (Feature 2): a private writable area
+        // outside the project tree, exported to every child process as
+        // `$PIR_SCRATCHPAD`. Created here (after the log path is known, so the
+        // dir name matches the transcript) and swept of stale dirs at the same
+        // time. A failure is non-fatal: the agent simply runs without one.
+        let _scratchpad = crate::scratchpad::init(log_path.as_deref());
+        let _ = crate::scratchpad::sweep_old();
+        // Seed the bundled skills (the `locate` skill, and any future ones) into
+        // the config skills root on first run. Idempotent and never
+        // overwriting, so an operator's edited copy survives an upgrade.
+        let _ = crate::skills::seed_bundled();
+
         // Goal-continuation: when resuming an existing session, attach any
         // goal file that lives next to the log so `pir -c` can continue where
         // it left off. Fresh sessions start with no goal until the model sets
@@ -741,12 +835,15 @@ impl Agent {
             token_budget: None,
             undo_stack: Vec::new(),
             su_security_enabled: user_security,
+            plan_mode: false,
+            subagent_kind: None,
             security,
             thinking: config::ThinkingLevel::Off,
             show_thinking: true,
             auto_retry: None,
             incremental_md: config::incremental_md_default(),
             stop_skill: config::stop_skill_default(),
+            output_format: OutputFormat::Plain,
             stop_hit: None,
             last_stop: None,
             stop_nudges: 0,
@@ -778,6 +875,55 @@ impl Agent {
             "stop-skill: off  (legacy stop-on-first-text behaviour)"
         }
         .to_string()
+    }
+
+    /// Set the output format for this session.
+    pub fn set_output_format(&mut self, fmt: OutputFormat) {
+        self.output_format = fmt;
+    }
+
+    /// Whether this session is emitting NDJSON events.
+    pub fn is_json(&self) -> bool {
+        self.output_format.is_json()
+    }
+
+    /// Emit an NDJSON event if output format is JSON. No-op in Plain mode.
+    fn emit_json(&self, event: &serde_json::Value) {
+        if self.output_format.is_json() {
+            ndjson_emit(event);
+        }
+    }
+
+    /// How many tool calls the model made across this session's history. Used by
+    /// sub-agent delegation to describe a silent child's activity.
+    pub fn tool_call_count(&self) -> usize {
+        self.history.iter().map(|m| m.tool_uses().len()).sum()
+    }
+
+    /// Extract the text content of the last assistant message in history.
+    /// Used by the NDJSON result event to include the model's reply, and by
+    /// sub-agent delegation (Feature 6) to build the child's report.
+    ///
+    /// Falls back to the most recent *non-empty* assistant text when the very
+    /// last assistant message carries none: a model that ends on a tool call or
+    /// a thinking-only block leaves the final message empty, and reporting
+    /// "no output" there would discard a perfectly good report the child had
+    /// already written.
+    pub fn last_reply_text(&self) -> String {
+        let mut last_any = String::new();
+        for msg in self.history.iter().rev() {
+            if msg.role != crate::types::Role::Assistant {
+                continue;
+            }
+            let t = msg.text();
+            if last_any.is_empty() {
+                last_any = t.clone();
+            }
+            if !t.trim().is_empty() {
+                return t;
+            }
+        }
+        last_any
     }
 
     /// Intercept the `request_stop` tool: record the model's explicit stop
@@ -828,12 +974,33 @@ impl Agent {
     fn refresh_system(&mut self) {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let mut system = build_system_prompt(&cwd);
+        if self.plan_mode {
+            system.push_str(
+                "\n# PLAN MODE (read-only)\n\n\
+                 You are in plan mode. Explore with read_file, glob, grep and list_dir; \
+                 `bash`, write_file and edit_file are refused by the security policy and will \
+                 keep being refused however you phrase the call. When you understand the task, \
+                 call the `plan_write` tool with a markdown plan: the goal, the approach, the \
+                 files you will touch, the risks, and how the change will be verified. The \
+                 operator reviews it; on approval you leave plan mode and implement it.\n",
+            );
+        }
+        if let Some(kind) = self.subagent_kind {
+            system.push_str(kind.preamble());
+        }
         if let Some(store) = &self.goal_store {
             system.push_str("\n# Current goal (persisted — survives interrupts; resume with `pir -c`)\n\n");
             system.push_str(&store.goal.summary());
             system.push_str("\nWork the next pending step. Update progress with the update_goal tool.\n");
         }
         self.system = system;
+    }
+
+    /// Rebuild the system prompt from scratch (goal + plan mode + taste).
+    /// Exposed so the REPL's `/taste` can push a just-recorded preference into
+    /// the live prompt without waiting for a new session.
+    pub fn refresh_system_public(&mut self) {
+        self.refresh_system();
     }
 
     pub fn label(&self) -> String {
@@ -935,6 +1102,70 @@ impl Agent {
     /// foreground turn to go quiet (detach to background).
     fn silent(&self) -> bool {
         self.quiet || self.quiet_req.load(Ordering::SeqCst)
+    }
+
+    /// Build a **sub-agent** (Feature 6): a child agent that runs one turn and
+    /// reports back, used by the `agent` tool.
+    ///
+    /// Differences from a normal agent:
+    ///  * always quiet — its turn must never print to the parent's terminal;
+    ///  * `ask_user_question`, `plan_write` (unless a planning child) and
+    ///    `request_stop` are removed from its tool list. There is no operator
+    ///    attached to a sub-agent and no REPL channel to reach one, so those
+    ///    tools could only ever produce a confusing failure;
+    ///  * the security policy is *clamped* to the child's kind, never widened:
+    ///    `explore`/`plan` run at `SecurityLevel::Plan` (read-only) regardless
+    ///    of the parent's level, and `general` inherits the parent's policy
+    ///    verbatim.
+    pub fn new_subagent(
+        provider: Provider,
+        model: Model,
+        full_auto: bool,
+        kind: crate::subagent::Kind,
+        policy: Option<crate::security::SecurityPolicy>,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
+        // Mark the construction as a sub-agent so `Agent::new` skips the
+        // launcher-only work (overlay quarantine mounts, which are per-process
+        // and would kill a second attempt inside this one). Cleared on the way
+        // out — including on the error path — so it never leaks into a later
+        // top-level agent in the same process.
+        // SAFETY: edition 2024 marks env mutation unsafe; this is scoped to the
+        // construction call and restored immediately below.
+        unsafe { std::env::set_var("PIR_SUBAGENT", "1"); }
+        let built = Agent::new(
+            provider,
+            model,
+            full_auto,
+            true, // quiet: the parent owns the terminal during its turn
+            crate::notify::shared_bus(),
+            None,
+            cancel,
+            Arc::new(Mutex::new(String::new())),
+        );
+        unsafe { std::env::remove_var("PIR_SUBAGENT"); }
+        let mut a = built?;
+        // Sub-agents have no `request_stop` tool (there is no operator to report
+        // to), so the explicit-stop skill must be off — otherwise every child
+        // would burn its nudges demanding a tool it cannot call before finally
+        // ending on a text reply.
+        a.stop_skill = false;
+        // Clamp the posture. `explore` and `plan` are read-only by definition;
+        // `general` keeps whatever the parent had (never a weaker one).
+        if matches!(kind, crate::subagent::Kind::Explore | crate::subagent::Kind::Plan) {
+            let mut p = policy.unwrap_or_else(crate::security::load_policy);
+            p.level = crate::security::SecurityLevel::Plan;
+            a.apply_security_policy(&p);
+            a.plan_mode = matches!(kind, crate::subagent::Kind::Plan);
+        } else if let Some(p) = policy {
+            a.apply_security_policy(&p);
+        }
+        // A sub-agent's write tools are hidden, not merely refused, for the
+        // read-only kinds: a model that cannot see `write_file` will not spend a
+        // round-trip discovering it is refused.
+        a.subagent_kind = Some(kind);
+        a.refresh_system();
+        Ok(a)
     }
 
     /// Read-only access to the chosen provider/model (for spawning background
@@ -1523,6 +1754,75 @@ impl Agent {
     }
 
     /// Begin a new goal for this session, persisting it next to the log.
+    /// Whether this session is in plan mode (read/search only).
+    pub fn plan_mode(&self) -> bool {
+        self.plan_mode
+    }
+
+    /// Enter/leave plan mode, enforcing the security level and persisting the
+    /// choice next to the session log. Returns a status line for the REPL.
+    ///
+    /// Entering swaps the *live* security policy to `SecurityLevel::Plan` and
+    /// remembers nothing about the previous level; leaving restores
+    /// `Mitigation` (the default posture) — deliberately conservative, because
+    /// "leave plan mode" should never be a way to end up at a *weaker* level
+    /// than the operator last configured. The operator can always re-select an
+    /// explicit level with `/secure`.
+    pub fn set_plan_mode(&mut self, on: bool) -> String {
+        if self.plan_mode == on {
+            return if on {
+                "plan mode is already on (read-only; use plan_write to record the approach)".to_string()
+            } else {
+                "plan mode is already off".to_string()
+            };
+        }
+        self.plan_mode = on;
+        let mut policy = self.security_policy().unwrap_or_default();
+        policy.level = if on {
+            crate::security::SecurityLevel::Plan
+        } else {
+            crate::security::SecurityLevel::Mitigation
+        };
+        let notes = self.apply_security_policy(&policy);
+        self.persist_plan_mode();
+        self.refresh_system();
+        if on {
+            format!(
+                "plan mode ON — read-only. Explore with read_file/glob/grep/list_dir, then record \
+                 the approach with the plan_write tool for approval. `bash`, write_file and \
+                 edit_file are refused until the plan is approved or /plan off. ({notes})"
+            )
+        } else {
+            format!("plan mode OFF — writes and commands are allowed again. ({notes})")
+        }
+    }
+
+    /// Persist the plan-mode flag next to the session log (`<log>.plan`).
+    /// Best-effort; a one-shot session with no log is silently skipped.
+    fn persist_plan_mode(&self) {
+        if let Some(p) = &self.log_path {
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(p.with_extension("plan"), if self.plan_mode { "1" } else { "0" });
+        }
+    }
+
+    /// Restore a persisted plan-mode choice for a resumed session. Returns the
+    /// notice to show when it restored `on` (so the operator is told the
+    /// session came back read-only rather than being surprised by a refusal
+    /// later).
+    pub fn apply_persisted_plan_mode(&mut self) -> Option<String> {
+        let p = self.log_path.clone()?;
+        let s = std::fs::read_to_string(p.with_extension("plan")).ok()?;
+        if s.trim() == "1" {
+            self.plan_mode = false; // force `set_plan_mode` to do the work
+            Some(self.set_plan_mode(true))
+        } else {
+            None
+        }
+    }
+
     pub fn start_goal(&mut self, objective: &str) {
         let log_path = self.log_path.clone().unwrap_or_else(|| {
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join("pir.goal.json")
@@ -1543,6 +1843,319 @@ impl Agent {
 
     pub fn goal_snapshot(&self) -> Option<String> {
         self.goal_store.as_ref().map(|s| s.goal.summary())
+    }
+
+    /// Intercept the `agent` tool (Feature 6): run a sub-agent and return its
+    /// report.
+    ///
+    /// Runs inline (the parent's turn blocks) — that is deliberate: delegation
+    /// exists to keep the parent's *context* small, not to add concurrency, and
+    /// a foreground child's report is immediately usable. `run_in_background` is
+    /// accepted and reported honestly as unsupported-in-this-build rather than
+    /// silently running in the foreground (a caller that expected a job handle
+    /// would otherwise mis-read the result).
+    fn run_subagent_tool(&mut self, name: &str, input: &Value) -> Option<Outcome> {
+        if name != "agent" {
+            return None;
+        }
+        // No nested delegation: a sub-agent's tool list already omits `agent`,
+        // this is belt-and-braces for a stale prompt.
+        if let Some(k) = self.subagent_kind {
+            return Some(Outcome {
+                content: format!(
+                    "agent: sub-agents cannot delegate further (this is a {} sub-agent). Do the \
+                     work directly.",
+                    k.as_str()
+                ),
+                is_error: true,
+            });
+        }
+        let spawn = match crate::subagent::parse(input) {
+            Ok(s) => s,
+            Err(e) => return Some(Outcome { content: e, is_error: true }),
+        };
+        let policy = self.security_policy();
+        let report = crate::subagent::run(
+            self.provider.clone(),
+            self.model.clone(),
+            &spawn,
+            self.registry.full_auto(),
+            policy,
+            self.cancel.clone(),
+        );
+        let mut text = report.render(&spawn);
+        if spawn.background {
+            text.push_str(
+                "\n\nNote: `run_in_background` is not supported for sub-agents in this build — \
+                 it ran in the foreground and its report is above.",
+            );
+        }
+        Some(Outcome { content: text, is_error: report.error })
+    }
+
+    /// Intercept the `remember` tool (Feature 12): persist a durable preference.
+    ///
+    /// Writes to the *project* scope by default (a preference learned while
+    /// working in a repo usually belongs to that repo), or the user scope when
+    /// `scope: "user"` is passed. Re-recording reinforces rather than duplicates,
+    /// so the model can safely restate something it isn't sure was stored.
+    fn run_taste_tool(&mut self, name: &str, input: &Value) -> Option<Outcome> {
+        if name != "remember" {
+            return None;
+        }
+        let text = input
+            .get("text")
+            .or_else(|| input.get("preference"))
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let Some(text) = text else {
+            return Some(Outcome {
+                content: "remember: 'text' is required (the preference, as one imperative line, \
+                          e.g. \"Never commit without asking\")"
+                    .into(),
+                is_error: true,
+            });
+        };
+        let scope = match input.get("scope").and_then(Value::as_str).unwrap_or("project").trim().to_ascii_lowercase().as_str() {
+            "user" | "global" | "config" | "~" => crate::taste::Scope::Global,
+            "project" | "repo" | "local" | "" => crate::taste::Scope::Project,
+            other => {
+                return Some(Outcome {
+                    content: format!("remember: unknown scope '{other}' (want 'project' or 'user')"),
+                    is_error: true,
+                });
+            }
+        };
+        let evidence = input.get("evidence").and_then(Value::as_str).unwrap_or("");
+        let confidence = input
+            .get("confidence")
+            .and_then(Value::as_f64)
+            .map(|c| c as f32);
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut store = crate::taste::Store::load(scope, &cwd);
+        let (key, created) = store.remember(&text, evidence, confidence);
+        let stored = store.entries.iter().find(|e| crate::taste::slug(&e.text) == key).cloned();
+        match store.save(scope, &cwd) {
+            Ok(()) => {
+                self.refresh_system();
+                let conf = stored.map(|e| e.confidence).unwrap_or(0.6);
+                Some(Outcome {
+                    content: format!(
+                        "{} '{}' to the {} taste store (confidence {:.1}). It is injected into \
+                         your system prompt from now on — including in later sessions.",
+                        if created { "Recorded" } else { "Reinforced" },
+                        text,
+                        scope.label(),
+                        conf
+                    ),
+                    is_error: false,
+                })
+            }
+            // Keep the in-memory effect (refresh_system already picked it up via
+            // a fresh load) but tell the truth about durability.
+            Err(e) => Some(Outcome {
+                content: format!(
+                    "Recorded '{text}' for this session, but it could not be persisted: {e}"
+                ),
+                is_error: true,
+            }),
+        }
+    }
+
+    /// Intercept the `plan_write` tool (Feature 5): persist the plan document
+    /// and, when the operator is present, ask them to approve it.
+    ///
+    /// Approval is the whole point of plan mode, so this is where the loop
+    /// closes: an approved plan leaves plan mode and the content is handed back
+    /// for the model to implement; a rejected one stays in plan mode with the
+    /// operator's feedback as the tool result, so the model revises rather than
+    /// proceeding.
+    ///
+    /// Writes the document *before* asking: even a rejected plan is worth
+    /// keeping (it is the record of what was proposed and why), and the
+    /// operator can read it in an editor while deciding.
+    fn run_plan_tool(&mut self, name: &str, input: &Value) -> Option<Outcome> {
+        if name != "plan_write" {
+            return None;
+        }
+        let content = input.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+        if content.trim().is_empty() {
+            return Some(Outcome {
+                content: "plan_write: 'content' is required (the plan document). Write the plan in \
+                          markdown: the goal, the approach, the files to touch, and how it will be \
+                          verified."
+                    .into(),
+                is_error: true,
+            });
+        }
+        let name_in = input.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let plan_name = if name_in.is_empty() {
+            crate::plans::default_name(&self.last_prompt)
+        } else {
+            name_in
+        };
+        let path = match crate::plans::write(&plan_name, &content) {
+            Ok(p) => p,
+            Err(e) => return Some(Outcome { content: e, is_error: true }),
+        };
+        // Headless / no operator: the plan is written but cannot be approved, so
+        // report that plainly and leave plan mode ON — silently exiting would
+        // hand the model write access it never got permission for.
+        if !crate::askuser::interactive() {
+            return Some(Outcome {
+                content: format!(
+                    "Plan written to {}.\nNo interactive operator is attached, so it cannot be \
+                     approved automatically — plan mode stays ON (read-only). End the turn with \
+                     request_stop(reason=stop-needs-input) so the operator can review it.",
+                    path.display()
+                ),
+                is_error: false,
+            });
+        }
+        let q = crate::askuser::Question {
+            header: "Plan review".to_string(),
+            question: format!(
+                "Approve this plan and start implementing?\n\nSaved to: {}\n\n{}",
+                path.display(),
+                clip_for_dialog(&content, 1200)
+            ),
+            options: vec![
+                crate::askuser::Choice {
+                    label: "Approve — implement it".to_string(),
+                    description: "Leaves plan mode and lets the agent make the changes".to_string(),
+                },
+                crate::askuser::Choice {
+                    label: "Revise — keep planning".to_string(),
+                    description: "Stay read-only; the agent will refine the plan".to_string(),
+                },
+            ],
+            multi_select: false,
+        };
+        let answer = crate::askuser::ask(&q).unwrap_or(crate::askuser::Answer::Dismissed);
+        let approved = matches!(&answer, crate::askuser::Answer::Chosen(v) if v.first().map(|s| s.starts_with("Approve")).unwrap_or(false));
+        if approved {
+            let notice = self.set_plan_mode(false);
+            Some(Outcome {
+                content: format!(
+                    "The operator APPROVED the plan ({}). {notice}\nImplement it now, following the \
+                     plan you just wrote; update the plan file if you must deviate.",
+                    path.display()
+                ),
+                is_error: false,
+            })
+        } else {
+            let feedback = match &answer {
+                crate::askuser::Answer::Text(t) => format!("\nOperator feedback: {t}"),
+                crate::askuser::Answer::Chosen(v) if !v.is_empty() => {
+                    format!("\nOperator chose: {}", v.join(", "))
+                }
+                _ => "\nThe operator dismissed the dialog without answering.".to_string(),
+            };
+            Some(Outcome {
+                content: format!(
+                    "The plan was NOT approved; you are still in plan mode (read-only). Saved to \
+                     {}.{feedback}\nRevise the plan and call plan_write again.",
+                    path.display()
+                ),
+                is_error: false,
+            })
+        }
+    }
+
+    /// Intercept the `load_skill` tool (Feature 4): return the full body of the
+    /// named skill (or the catalog when called with no name).
+    ///
+    /// Skills are re-discovered on every call rather than cached at startup, so
+    /// one the model or the operator just wrote is immediately loadable — the
+    /// discovery is a handful of directory reads, far cheaper than the
+    /// instructions it returns.
+    fn run_skill_tool(&mut self, name: &str, input: &Value) -> Option<Outcome> {
+        if name != "load_skill" {
+            return None;
+        }
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let skills = crate::skills::discover(&cwd);
+        let query = input
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        // No name (or an explicit listing request) => the catalog, so the model
+        // can see everything available in one call.
+        if query.is_empty() || query.eq_ignore_ascii_case("all") || query == "*" {
+            return Some(Outcome {
+                content: crate::skills::catalog(&skills),
+                is_error: false,
+            });
+        }
+        let skill = match crate::skills::find(&skills, &query) {
+            Ok(s) => s.clone(),
+            Err(e) => return Some(Outcome { content: e, is_error: true }),
+        };
+        match crate::skills::body(&skill) {
+            Ok(text) => Some(Outcome {
+                content: format!(
+                    "# Skill: {} ({})\nsource: {}\n\n{text}",
+                    skill.name,
+                    skill.source.label(),
+                    skill.path.display()
+                ),
+                is_error: false,
+            }),
+            Err(e) => Some(Outcome { content: e, is_error: true }),
+        }
+    }
+
+    /// Intercept the `ask_user_question` tool (Feature 3): pause the turn and
+    /// ask the operator, returning their answer as the tool result.
+    ///
+    /// This lives on the Agent rather than in the builtin extension because the
+    /// question must be rendered by the REPL (which owns stdin) — see
+    /// [`crate::askuser`]. When no interactive operator is attached (headless
+    /// one-shot, `-bg`, tests) it returns an explicit "no interactive user"
+    /// result instead of blocking: an unattended run must never wedge.
+    fn run_ask_tool(&mut self, name: &str, input: &Value) -> Option<Outcome> {
+        if name != "ask_user_question" {
+            return None;
+        }
+        let questions = match crate::askuser::parse_questions(input) {
+            Ok(q) => q,
+            Err(e) => {
+                return Some(Outcome {
+                    content: format!("ask_user_question: {e}"),
+                    is_error: true,
+                });
+            }
+        };
+        if !crate::askuser::interactive() {
+            return Some(Outcome {
+                content: "No interactive user is available to answer (headless/background session). \
+                          Do not ask again — make the most reasonable assumption, state it \
+                          explicitly in your reply, and continue. If the decision is genuinely \
+                          blocking, end the turn with request_stop(reason=stop-needs-input)."
+                    .into(),
+                is_error: true,
+            });
+        }
+        let mut parts: Vec<String> = Vec::new();
+        for (i, q) in questions.iter().enumerate() {
+            let ans = match crate::askuser::ask(q) {
+                Some(a) => a,
+                None => crate::askuser::Answer::Dismissed,
+            };
+            let label = if questions.len() > 1 {
+                format!("{}. [{}] {}", i + 1, q.header, q.question)
+            } else {
+                format!("[{}] {}", q.header, q.question)
+            };
+            parts.push(format!("{label}\n   → {}", ans.render()));
+        }
+        Some(Outcome {
+            content: format!("The user answered:\n{}", parts.join("\n")),
+            is_error: false,
+        })
     }
 
     /// Intercept the `update_goal` tool: mutate and persist the goal, then
@@ -2020,7 +2633,24 @@ impl Agent {
         if !self.stop_skill {
             specs.retain(|s| s.name != "request_stop");
         }
+        // Sub-agents (Feature 6) never see the tools that need a second operator
+        // channel or that only make sense for the top-level session:
+        //  * `ask_user_question` — there is no REPL channel from a child;
+        //  * `request_stop` — the child ends when its turn ends; an explicit stop
+        //    means nothing to the parent;
+        //  * `agent` — no recursive delegation (depth 1), which also removes the
+        //    only way to spawn an unbounded tree of children.
+        if self.subagent_kind.is_some() {
+            specs.retain(|s| !matches!(s.name, "ask_user_question" | "request_stop" | "agent"));
+        }
         let tty = crate::term::is_terminal();
+
+        // NDJSON: emit turn_start event
+        self.emit_json(&json!({
+            "type": "turn_start",
+            "prompt": user,
+            "model": format!("{}/{}", self.provider.pid(), self.model.id),
+        }));
         // `spinner` is hoisted out of the per-message loop so the "thinking…"
         // indicator can persist *below* the agent's text (a footer) between
         // model calls, and so the next streamed token can erase it in place
@@ -2370,6 +3000,13 @@ impl Agent {
                         self.continuations.extend(self.registry.on_turn_end(user));
                     }
                     self.mark_status(SessionStatus::Interrupted, self.goal_pending(), &format!("turn error: {e}"));
+                    // NDJSON: emit turn_end on error
+                    self.emit_json(&json!({
+                        "type": "turn_end",
+                        "error": e,
+                        "tokens_in": self.usage.input,
+                        "tokens_out": self.usage.output,
+                    }));
                     return Err(e);
                 }
             };
@@ -2467,6 +3104,12 @@ impl Agent {
                 }
                 self.registry.emit(EventKind::AgentEnd, &json!({}));
                 self.notify.publish(self.turn_done_event(), false);
+                // NDJSON: emit turn_end on success
+                self.emit_json(&json!({
+                    "type": "turn_end",
+                    "tokens_in": self.usage.input,
+                    "tokens_out": self.usage.output,
+                }));
                 if !self.silent() {
                     self.registry.emit(EventKind::TurnEnd, &json!({ "prompt": user }));
                     self.continuations.extend(self.registry.on_turn_end(user));
@@ -2495,6 +3138,12 @@ impl Agent {
                     // together.
                     term::out(&format!("{} {}\n", term::cyan("»"), describe_call(name, input)));
                 }
+                // NDJSON: emit tool_call event
+                self.emit_json(&json!({
+                    "type": "tool_call",
+                    "tool": name,
+                    "args": input,
+                }));
                 // Pre-flight extension hook: any backend may block this tool
                 // call (permission gates, protected paths, etc.). When blocked,
                 // we feed the reason back as the tool result so the model sees
@@ -2540,11 +3189,33 @@ impl Agent {
                     }
                 let outcome = match self.run_goal_tool(name, input) {
                     Some(o) => o,
-                    None => match self.run_stop_tool(name, input) {
+                    None => match self.run_subagent_tool(name, input) {
                         Some(o) => o,
-                        None => self.registry.execute(name, input),
+                        None => match self.run_taste_tool(name, input) {
+                            Some(o) => o,
+                            None => match self.run_plan_tool(name, input) {
+                                Some(o) => o,
+                                None => match self.run_skill_tool(name, input) {
+                                    Some(o) => o,
+                                    None => match self.run_ask_tool(name, input) {
+                                        Some(o) => o,
+                                        None => match self.run_stop_tool(name, input) {
+                                            Some(o) => o,
+                                            None => self.registry.execute(name, input),
+                                        },
+                                    },
+                                },
+                            },
+                        },
                     },
                 };
+                // NDJSON: emit tool_result event
+                self.emit_json(&json!({
+                    "type": "tool_result",
+                    "tool": name,
+                    "is_error": outcome.is_error,
+                    "content_len": outcome.content.len(),
+                }));
                 if !self.silent() {
                     // Echo the result for the human: multi-line, but abridged so
                     // a huge build log can't bury the prompt. The model and the
@@ -3102,6 +3773,35 @@ fn describe_call(name: &str, input: &Value) -> String {
             let p = s("path");
             format!("ls    {}", if p.is_empty() { "." } else { p })
         }
+        "glob" => format!("glob  {}", s("pattern")),
+        "remember" => format!("taste {}  {}", s("scope"), s("text")),
+        "web_fetch" => format!("fetch {}", s("url")),
+        "web_search" => format!("search {}", s("query")),
+        "grep" => {
+            let p = s("path");
+            format!("grep  {}{}", s("pattern"), if p.is_empty() { String::new() } else { format!("  in {p}") })
+        }
+        "agent" => {
+            let t = input.get("subagent_type").and_then(Value::as_str).unwrap_or("general");
+            let d = s("description");
+            format!("agent {t}  {}", if d.is_empty() { "(no label)" } else { d })
+        }
+        "ask_user_question" => {
+            // Show the first question's header + text; a multi-question ask is
+            // summarised with a count so the echo stays one line.
+            let qs = input.get("questions").and_then(Value::as_array);
+            let single = input.get("question").and_then(Value::as_str);
+            match (single, qs) {
+                (Some(t), _) => format!("ask   {t}"),
+                (None, Some(a)) if a.len() == 1 => {
+                    let header = a[0].get("header").and_then(Value::as_str).unwrap_or("");
+                    let text = a[0].get("question").and_then(Value::as_str).unwrap_or("");
+                    format!("ask   {header}: {text}")
+                }
+                (None, Some(a)) => format!("ask   {} questions", a.len()),
+                _ => "ask".to_string(),
+            }
+        }
         "update_goal" => {
             let action = input.get("action").and_then(Value::as_str).unwrap_or("?");
             let detail = match action {
@@ -3344,7 +4044,7 @@ mod reload_tests {
         // Point PI_DIR at an empty dir so load_providers fails: reload must
         // keep the working catalog (count unchanged) and report not-refreshed,
         // never empty the cache.
-        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap();
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("pir_reload_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -3368,7 +4068,7 @@ mod reload_tests {
     fn reload_never_moves_active_model_off_label() {
         // A fresh catalog lacking the active model: reload reports
         // not-refreshed and leaves provider/model alone (no silent move).
-        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap();
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("pir_reload2_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let agent_dir = dir.join("agent");
@@ -3440,7 +4140,24 @@ mod prompt_parity_tests {
     #[test]
     fn tool_list_names_pir_tools() {
         let p = prompt();
-        for tool in ["read_file", "edit_file", "write_file", "list_dir", "bash", "update_goal", "request_stop"] {
+        for tool in [
+            "read_file",
+            "edit_file",
+            "write_file",
+            "list_dir",
+            "glob",
+            "grep",
+            "ask_user_question",
+            "load_skill",
+            "plan_write",
+            "agent",
+            "web_fetch",
+            "web_search",
+            "remember",
+            "bash",
+            "update_goal",
+            "request_stop",
+        ] {
             assert!(p.contains(tool), "tool {tool} missing from Available tools");
         }
         // pi's bare names must not appear as list entries (`- read:`); the
@@ -3558,6 +4275,526 @@ mod goal_bootstrap_tests {
             Arc::new(Mutex::new(String::new())),
         )
         .expect("agent")
+    }
+
+    #[test]
+    fn ask_tool_reports_no_interactive_user_when_headless() {
+        // The critical guarantee: an unattended turn must never wedge on a
+        // question nobody can answer. With no renderer installed (the headless
+        // / one-shot / -bg case) the tool returns an explicit, actionable
+        // result instead of blocking.
+        let _g = crate::askuser::ask_lock();
+        crate::askuser::uninstall();
+        let mut a = fresh_agent();
+        let out = a
+            .run_ask_tool(
+                "ask_user_question",
+                &serde_json::json!({"questions":[{"header":"DB","question":"which db?",
+                    "options":[{"label":"postgres"},{"label":"sqlite"}]}]}),
+            )
+            .expect("the tool is intercepted by the agent");
+        assert!(out.is_error, "headless ask must not look like a successful answer");
+        assert!(out.content.contains("No interactive user"), "got: {}", out.content);
+        assert!(out.content.contains("request_stop"), "must point at the escape hatch");
+    }
+
+    #[test]
+    fn ask_tool_surfaces_a_malformed_question_as_a_correctable_error() {
+        let _g = crate::askuser::ask_lock();
+        let mut a = fresh_agent();
+        let out = a
+            .run_ask_tool("ask_user_question", &serde_json::json!({"questions":[{}]}))
+            .expect("intercepted");
+        assert!(out.is_error);
+        assert!(out.content.contains("ask_user_question:"), "got: {}", out.content);
+        assert!(out.content.contains("question"), "must name the bad field: {}", out.content);
+    }
+
+    #[test]
+    fn ask_tool_returns_the_operators_answer() {
+        // With a renderer installed (the interactive REPL) the answer is fed
+        // back verbatim as the tool result, so the model resumes with it in
+        // context. Serialized against the other askuser tests' env/renderer use.
+        let _g = crate::askuser::tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::askuser::install(std::sync::Arc::new(|q| {
+            assert_eq!(q.header, "DB");
+            crate::askuser::Answer::Chosen(vec!["sqlite".into()])
+        }));
+        let mut a = fresh_agent();
+        let out = a
+            .run_ask_tool(
+                "ask_user_question",
+                &serde_json::json!({"question":"which db?","header":"DB","options":["postgres","sqlite"]}),
+            )
+            .expect("intercepted");
+        crate::askuser::uninstall();
+        assert!(!out.is_error, "got: {}", out.content);
+        assert!(out.content.contains("sqlite"), "answer must reach the model: {}", out.content);
+    }
+
+    #[test]
+    fn non_ask_tools_fall_through() {
+        let mut a = fresh_agent();
+        assert!(a.run_ask_tool("bash", &serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn skill_tool_lists_loads_and_reports_unknown_skills() {
+        let mut a = fresh_agent();
+        // No skills installed => the listing says so, and is not an error (the
+        // model simply has nothing to load).
+        let out = a.run_skill_tool("load_skill", &serde_json::json!({})).expect("intercepted");
+        assert!(!out.is_error, "an empty catalog is not an error: {}", out.content);
+        assert!(out.content.contains("no skills") || out.content.contains("Skills"), "got: {}", out.content);
+        // An unknown name must be a correctable error that lists what exists.
+        let out = a
+            .run_skill_tool("load_skill", &serde_json::json!({"name": "definitely-not-a-skill"}))
+            .expect("intercepted");
+        assert!(out.is_error);
+        assert!(out.content.contains("no skill named"), "got: {}", out.content);
+        // Non-skill tools fall through to the registry.
+        assert!(a.run_skill_tool("bash", &serde_json::json!({})).is_none());
+    }
+
+    /// The bundled `locate` skill must be discoverable and loadable through the
+    /// tool, end to end — the "have a locate skill" requirement.
+    #[test]
+    fn bundled_locate_skill_loads_through_the_tool() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("pir_skill_tool_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let old = std::env::var_os("PI_DIR");
+        // SAFETY: test-local env mutation under the shared env lock.
+        unsafe { std::env::set_var("PI_DIR", &dir); }
+        crate::skills::seed_bundled();
+        let mut a = fresh_agent();
+        // The catalog the model sees must name `locate`...
+        let listing = a.run_skill_tool("load_skill", &serde_json::json!({})).expect("intercepted");
+        assert!(listing.content.contains("locate"), "got: {}", listing.content);
+        // ...and loading it by name returns the full body, including its
+        // tool recipes.
+        let loaded = a
+            .run_skill_tool("load_skill", &serde_json::json!({"name": "locate"}))
+            .expect("intercepted");
+        assert!(!loaded.is_error, "got: {}", loaded.content);
+        assert!(loaded.content.contains("# Skill: locate"), "got: {}", loaded.content);
+        assert!(loaded.content.contains("glob("), "body must include its recipes");
+        match old {
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The system prompt must advertise skills only when there are any — a
+    /// skill-less session's prompt stays byte-identical to before.
+    #[test]
+    fn system_prompt_includes_the_skills_catalog() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("pir_skill_prompt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let old = std::env::var_os("PI_DIR");
+        // SAFETY: test-local env mutation under the shared env lock.
+        unsafe { std::env::set_var("PI_DIR", &dir); }
+        crate::skills::seed_bundled();
+        let p = build_system_prompt(&std::env::temp_dir());
+        assert!(p.contains("# Skills"), "catalog section missing");
+        assert!(p.contains("- locate (user):"), "locate must be catalogued: {p}");
+        assert!(p.contains("load_skill"), "the tool must be named");
+        match old {
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_mode_toggles_the_security_level_and_refuses_writes() {
+        let mut a = fresh_agent();
+        assert!(!a.plan_mode());
+        assert!(!a.security_policy().unwrap().level.is_plan());
+        let msg = a.set_plan_mode(true);
+        assert!(a.plan_mode());
+        assert!(msg.contains("plan mode ON"), "got: {msg}");
+        assert!(msg.contains("read-only"));
+        // The live policy is now Plan, so the guardrail refuses writes and exec
+        // but still allows reads/searches.
+        let policy = a.security_policy().unwrap();
+        assert_eq!(policy.level, crate::security::SecurityLevel::Plan);
+        use crate::security::{Ask, Op, SecurityPolicy};
+        // (decide on the captured policy, not through the ask-sink, so a TTY
+        // in the test runner can't turn the denial into an interactive prompt)
+        let captured: SecurityPolicy = policy;
+        assert!(matches!(
+            captured.decide(&Ask::write("/tmp/x")),
+            crate::security::Verdict::Deny { .. }
+        ));
+        assert!(matches!(
+            captured.decide(&Ask::new(Op::Exec)),
+            crate::security::Verdict::Deny { .. }
+        ));
+        assert_eq!(captured.decide(&Ask::read("/tmp/x")), crate::security::Verdict::Allow);
+        assert_eq!(captured.decide(&Ask::new(Op::Search)), crate::security::Verdict::Allow);
+
+        let msg = a.set_plan_mode(false);
+        assert!(!a.plan_mode());
+        assert!(msg.contains("OFF"), "got: {msg}");
+        assert!(!a.security_policy().unwrap().level.is_plan());
+        // Idempotent.
+        assert!(a.set_plan_mode(false).contains("already off"));
+        // `set_plan_mode` flips the *process-global* mitigation flag, so restore
+        // the default posture before returning — otherwise a parallel test that
+        // reads it (the builtin bash tool's analyzer gate) sees a stale value.
+        crate::security::set_mitigation_active(true);
+    }
+
+    #[test]
+    fn plan_write_writes_the_document_and_stays_read_only_headless() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("pir_plan_tool_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let old = std::env::var_os("PIR_PLANS_DIR");
+        // SAFETY: test-local env mutation under the shared env lock.
+        unsafe { std::env::set_var("PIR_PLANS_DIR", &dir); }
+        // No operator => the plan is written but never auto-approved, and plan
+        // mode stays ON. Silently exiting would hand the model write access it
+        // was never granted.
+        let _g = crate::askuser::ask_lock();
+        crate::askuser::uninstall();
+        let mut a = fresh_agent();
+        a.set_plan_mode(true);
+        let out = a
+            .run_plan_tool(
+                "plan_write",
+                &serde_json::json!({"name": "x", "content": "# Plan: x\n\n1. do it\n"}),
+            )
+            .expect("intercepted");
+        assert!(!out.is_error, "got: {}", out.content);
+        assert!(out.content.contains("No interactive operator"), "got: {}", out.content);
+        assert!(out.content.contains("request_stop"), "must point at the escape hatch");
+        assert!(a.plan_mode(), "headless plan write must not leave plan mode");
+        let p = dir.join("x.md");
+        assert!(p.is_file(), "the plan document must be on disk: {}", p.display());
+        assert!(std::fs::read_to_string(&p).unwrap().contains("do it"));
+        // Missing content is a correctable error.
+        let bad = a.run_plan_tool("plan_write", &serde_json::json!({})).unwrap();
+        assert!(bad.is_error);
+        assert!(bad.content.contains("'content' is required"), "got: {}", bad.content);
+        // Non-plan tools fall through.
+        assert!(a.run_plan_tool("bash", &serde_json::json!({})).is_none());
+        match old {
+            Some(v) => unsafe { std::env::set_var("PIR_PLANS_DIR", v) },
+            None => unsafe { std::env::remove_var("PIR_PLANS_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_write_approval_leaves_plan_mode_and_rejection_keeps_it() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("pir_plan_appr_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let old = std::env::var_os("PIR_PLANS_DIR");
+        // SAFETY: test-local env mutation under the shared env lock.
+        unsafe { std::env::set_var("PIR_PLANS_DIR", &dir); }
+        let _g = crate::askuser::ask_lock();
+
+        // Rejection: stay read-only and hand the feedback back.
+        crate::askuser::install(std::sync::Arc::new(|_| {
+            crate::askuser::Answer::Text("use sqlite, not postgres".into())
+        }));
+        let mut a = fresh_agent();
+        a.set_plan_mode(true);
+        let out = a
+            .run_plan_tool("plan_write", &serde_json::json!({"content": "# Plan\nbody"}))
+            .unwrap();
+        assert!(a.plan_mode(), "a rejected plan must not leave plan mode");
+        assert!(out.content.contains("NOT approved"), "got: {}", out.content);
+        assert!(out.content.contains("sqlite"), "feedback must reach the model: {}", out.content);
+
+        // Approval: leave plan mode so implementation may begin.
+        crate::askuser::install(std::sync::Arc::new(|_| {
+            crate::askuser::Answer::Chosen(vec!["Approve — implement it".into()])
+        }));
+        let out = a
+            .run_plan_tool("plan_write", &serde_json::json!({"content": "# Plan\nbody 2"}))
+            .unwrap();
+        crate::askuser::uninstall();
+        assert!(!a.plan_mode(), "an approved plan leaves plan mode");
+        assert!(out.content.contains("APPROVED"), "got: {}", out.content);
+        match old {
+            Some(v) => unsafe { std::env::set_var("PIR_PLANS_DIR", v) },
+            None => unsafe { std::env::remove_var("PIR_PLANS_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_mode_is_persisted_next_to_the_session_log() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("pir_plan_side_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("pir-test.jsonl");
+        std::fs::write(&log, "{}\n").unwrap();
+        let mut a = fresh_agent();
+        a.log_path = Some(log.clone());
+        a.set_plan_mode(true);
+        assert_eq!(std::fs::read_to_string(log.with_extension("plan")).unwrap().trim(), "1");
+        // A resumed session restores the read-only posture, with a notice.
+        let mut b = fresh_agent();
+        b.log_path = Some(log.clone());
+        assert!(b.apply_persisted_plan_mode().is_some(), "must report the restored mode");
+        assert!(b.plan_mode());
+        // And turning it off clears the sidecar so the next resume is writable.
+        a.set_plan_mode(false);
+        assert_eq!(std::fs::read_to_string(log.with_extension("plan")).unwrap().trim(), "0");
+        let mut c = fresh_agent();
+        c.log_path = Some(log);
+        assert!(c.apply_persisted_plan_mode().is_none());
+        assert!(!c.plan_mode());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// In plan mode the *system prompt* must tell the model why its writes are
+    /// being refused, or it will keep retrying them.
+    ///
+    /// Sets `plan_mode` directly (rather than via `set_plan_mode`) on purpose:
+    /// `set_plan_mode` also applies the security policy, which flips the
+    /// *process-global* mitigation flag — a cross-test race in a parallel run.
+    /// The prompt banner is what is under test here; the policy side is covered
+    /// by `plan_mode_toggles_the_security_level_and_refuses_writes`.
+    #[test]
+    fn plan_mode_adds_a_read_only_banner_to_the_system_prompt() {
+        // The prompt embeds the skills catalog + scratchpad line, both read from
+        // process-global state (PI_DIR, PIR_SCRATCHPAD); hold the shared env
+        // lock so a parallel test can't move them mid-comparison.
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut a = fresh_agent();
+        assert!(!a.system.contains("PLAN MODE"), "a fresh agent must not be planning");
+        a.plan_mode = true;
+        a.refresh_system();
+        assert!(a.system.contains("PLAN MODE (read-only)"), "banner missing");
+        assert!(a.system.contains("plan_write"), "must name the tool that works");
+        let with_banner = a.system.clone();
+        a.plan_mode = false;
+        a.refresh_system();
+        assert!(!a.system.contains("PLAN MODE"), "banner must be removed");
+        // The banner is appended, so the non-planning prompt must be an exact
+        // prefix of the planning one — the whole point being that nothing else
+        // in the prompt changes when plan mode is toggled.
+        assert!(
+            with_banner.starts_with(&a.system),
+            "toggling plan mode must only append the banner"
+        );
+        assert!(with_banner.len() > a.system.len());
+    }
+
+    #[test]
+    fn subagent_tool_validates_input_and_blocks_nesting() {
+        let mut a = fresh_agent();
+        // A missing prompt is a correctable error, not a spawned child.
+        let out = a.run_subagent_tool("agent", &serde_json::json!({})).expect("intercepted");
+        assert!(out.is_error);
+        assert!(out.content.contains("'prompt' is required"), "got: {}", out.content);
+        // An unknown type names the valid ones.
+        let out = a
+            .run_subagent_tool("agent", &serde_json::json!({"prompt": "x", "subagent_type": "wizard"}))
+            .expect("intercepted");
+        assert!(out.is_error);
+        assert!(out.content.contains("explore, plan or general"), "got: {}", out.content);
+        // Non-agent tools fall through.
+        assert!(a.run_subagent_tool("bash", &serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn subagent_kind_clamps_the_posture_and_filters_tools() {
+        use crate::subagent::Kind;
+        let p: Provider =
+            serde_json::from_str(r#"{"id":"t","baseUrl":"https://example.invalid/v1","apiKey":"x","api":"openai","models":[{"id":"m"}]}"#).unwrap();
+        let m = p.models[0].clone();
+        let mk = |kind: Kind| {
+            Agent::new_subagent(
+                p.clone(),
+                m.clone(),
+                true,
+                kind,
+                Some(crate::security::SecurityPolicy::default()),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("sub-agent builds")
+        };
+        // explore/plan are strictly read-only whatever the parent's level.
+        for kind in [Kind::Explore, Kind::Plan] {
+            let child = mk(kind);
+            assert_eq!(child.security_policy().unwrap().level, crate::security::SecurityLevel::Plan);
+            assert_eq!(child.plan_mode(), kind == Kind::Plan);
+            assert!(child.system.contains("READ-ONLY"), "preamble missing for {kind:?}");
+        }
+        // general inherits the parent's posture (mitigation here).
+        let child = mk(Kind::General);
+        assert_eq!(
+            child.security_policy().unwrap().level,
+            crate::security::SecurityLevel::Mitigation
+        );
+        assert!(!child.plan_mode());
+        // A read-only child must not even see the tool that could widen it.
+        let specs: Vec<&str> = child
+            .registry
+            .specs()
+            .iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(specs.contains(&"agent"), "the parent keeps the agent tool");
+        // Every sub-agent hides the parent-only tools.
+        for kind in [Kind::Explore, Kind::Plan, Kind::General] {
+            let child = mk(kind);
+            let kept: Vec<&str> = child.registry.specs().iter().map(|s| s.name).collect();
+            assert!(kept.contains(&"read_file") || kept.contains(&"glob"), "child needs read tools");
+        }
+    }
+
+    #[test]
+    fn subagent_tool_refuses_nesting() {
+        use crate::subagent::Kind;
+        let p: Provider =
+            serde_json::from_str(r#"{"id":"t","baseUrl":"https://example.invalid/v1","apiKey":"x","api":"openai","models":[{"id":"m"}]}"#).unwrap();
+        let m = p.models[0].clone();
+        let mut child = Agent::new_subagent(
+            p,
+            m,
+            true,
+            Kind::General,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("sub-agent builds");
+        let out = child
+            .run_subagent_tool("agent", &serde_json::json!({"prompt": "spawn another"}))
+            .expect("intercepted");
+        assert!(out.is_error, "a sub-agent must not delegate further");
+        assert!(out.content.contains("cannot delegate further"), "got: {}", out.content);
+    }
+
+    /// End-to-end delegation with the offline scripted model: a sub-agent
+    /// really runs a turn, and its final reply becomes the tool report. This is
+    /// the "does the feature actually work" test — no network, deterministic.
+    #[test]
+    fn subagent_runs_a_turn_and_reports_its_reply() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os("PIR_FAKE_MODEL");
+        // SAFETY: test-local env mutation under the shared env lock; the fake
+        // provider only registers when this is set.
+        unsafe { std::env::set_var("PIR_FAKE_MODEL", "1"); }
+        let providers = crate::config::load_providers().expect("providers");
+        let (p, m) = crate::config::select(&providers, "fake/slow").expect("fake provider");
+        let spawn = crate::subagent::Spawn {
+            kind: crate::subagent::Kind::Explore,
+            description: "ping".into(),
+            prompt: "FAKE: echo subagent-reply-ok".into(),
+            background: false,
+        };
+        let report = crate::subagent::run(
+            p.clone(),
+            m.clone(),
+            &spawn,
+            true,
+            Some(crate::security::SecurityPolicy::default()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        match old {
+            Some(v) => unsafe { std::env::set_var("PIR_FAKE_MODEL", v) },
+            None => unsafe { std::env::remove_var("PIR_FAKE_MODEL") },
+        }
+        assert!(!report.timed_out, "the fake model must not time out");
+        assert!(!report.error, "sub-agent failed: {}", report.text);
+        assert!(
+            report.text.contains("subagent-reply-ok"),
+            "the child's reply must be the report: {:?}",
+            report.text
+        );
+    }
+
+    #[test]
+    fn taste_tool_records_reinforces_and_validates() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = std::env::temp_dir().join(format!("pir_taste_tool_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cfg);
+        std::fs::create_dir_all(&cfg).unwrap();
+        let old = std::env::var_os("PI_DIR");
+        // SAFETY: test-local env mutation under the shared env lock.
+        unsafe { std::env::set_var("PI_DIR", &cfg); }
+        let mut a = fresh_agent();
+        // Missing text is a correctable error, not an empty entry.
+        let out = a.run_taste_tool("remember", &serde_json::json!({})).expect("intercepted");
+        assert!(out.is_error);
+        assert!(out.content.contains("'text' is required"), "got: {}", out.content);
+        // A bad scope is rejected with the valid values.
+        let out = a
+            .run_taste_tool("remember", &serde_json::json!({"text": "x", "scope": "galaxy"}))
+            .expect("intercepted");
+        assert!(out.is_error);
+        assert!(out.content.contains("project' or 'user'"), "got: {}", out.content);
+        // A real preference is recorded, persisted, and injected.
+        let out = a
+            .run_taste_tool(
+                "remember",
+                &serde_json::json!({"text": "Never commit without asking", "evidence": "operator said so", "confidence": 0.95}),
+            )
+            .expect("intercepted");
+        assert!(!out.is_error, "got: {}", out.content);
+        assert!(out.content.contains("Recorded"), "got: {}", out.content);
+        assert!(out.content.contains("later sessions"), "must set expectations: {}", out.content);
+        assert!(out.content.contains("0.9"), "confidence must be reported: {}", out.content);
+        // The live prompt picks it up immediately.
+        assert!(a.system.contains("Never commit without asking"), "prompt not refreshed");
+        assert!(a.system.contains("# Taste"), "catalog section missing");
+        // Re-recording reinforces rather than duplicating.
+        let out = a
+            .run_taste_tool("remember", &serde_json::json!({"text": "never commit without asking!"}))
+            .expect("intercepted");
+        assert!(out.content.contains("Reinforced"), "got: {}", out.content);
+        // And the store on disk has exactly one entry.
+        let cwd = std::env::current_dir().unwrap();
+        let store = crate::taste::Store::load(crate::taste::Scope::Project, &cwd);
+        assert_eq!(store.entries.len(), 1, "a restatement must not duplicate: {:?}", store.entries);
+        // Non-taste tools fall through.
+        assert!(a.run_taste_tool("bash", &serde_json::json!({})).is_none());
+        match old {
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        // Clean up the project store this test just wrote into the real tree.
+        let _ = std::fs::remove_file(crate::taste::Store::path(crate::taste::Scope::Project, &cwd));
+        let _ = std::fs::remove_file(crate::taste::Store::markdown_path(crate::taste::Scope::Project, &cwd));
+        let _ = std::fs::remove_dir_all(&cfg);
+    }
+
+    #[test]
+    fn taste_is_injected_into_the_prompt_only_when_present() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = std::env::temp_dir().join(format!("pir_taste_prompt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cfg);
+        std::fs::create_dir_all(&cfg).unwrap();
+        let old = std::env::var_os("PI_DIR");
+        // SAFETY: test-local env mutation under the shared env lock.
+        unsafe { std::env::set_var("PI_DIR", &cfg); }
+        // Nothing recorded anywhere -> no section at all.
+        let p = build_system_prompt(&std::env::temp_dir());
+        assert!(!p.contains("# Taste"), "an empty store must not add a section");
+        // Record a user-scope preference -> the section appears.
+        let mut store = crate::taste::Store::default();
+        store.remember("Prefer rg over grep", "stated", Some(0.9));
+        store.save(crate::taste::Scope::Global, &cfg).unwrap();
+        let p = build_system_prompt(&std::env::temp_dir());
+        assert!(p.contains("# Taste (recorded preferences)"), "got: {p}");
+        assert!(p.contains("- Prefer rg over grep"), "got: {p}");
+        assert!(p.contains("`remember` tool"), "must name the tool that records more");
+        match old {
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&cfg);
     }
 
     #[test]

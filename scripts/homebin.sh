@@ -16,10 +16,23 @@ DEST=~/bin/pir
 TARGET=x86_64-unknown-linux-gnu.2.17
 # `zig` may live outside a minimal PATH (snap / pip bundle); fall back
 # to well-known locations before giving up.
-if ! command -v zig >/dev/null 2>&1; then
-    for z in /snap/bin/zig /usr/local/bin/zig-pip "$HOME/.local/bin/python-zig"; do
-        if [ -x "$z" ]; then
-            export PATH="$(dirname "$z"):$PATH"
+if ! command -v zig >/dev/null 2>&1 || ! zig version >/dev/null 2>&1; then
+    # Remove broken zig entries from PATH before searching.
+    # Snap's zig is commonly broken (disconnected mount); strip /snap/bin
+    # so cargo-zigbuild doesn't rediscover it after we set up a working one.
+    PATH=$(echo "$PATH" | tr ':' '\n' | grep -v '^/snap/bin$' | paste -sd:)
+    export PATH
+    for z in /usr/local/bin/zig-pip "$HOME/.local/bin/python-zig" /snap/bin/zig; do
+        if [ -x "$z" ] && "$z" version >/dev/null 2>&1; then
+            # If the binary isn't named "zig", symlink it into ~/bin so
+            # cargo-zigbuild (which searches PATH for "zig") can find it.
+            if [ "$(basename "$z")" != "zig" ]; then
+                mkdir -p "$HOME/bin"
+                ln -sf "$z" "$HOME/bin/zig"
+                export PATH="$HOME/bin:$PATH"
+            else
+                export PATH="$(dirname "$z"):$PATH"
+            fi
             break
         fi
     done

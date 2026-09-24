@@ -377,6 +377,7 @@ pub fn resolve_unfinished(token: &str) -> Option<PathBuf> {
 /// session, the first user prompt, the last user prompt, and the tail of the
 /// model's last thinking + response. Cheap: a single linear scan of the
 /// (typically small) session log.
+#[derive(Debug, Clone)]
 pub struct SessionPreview {
     pub turns: usize,
     pub first_prompt: String,

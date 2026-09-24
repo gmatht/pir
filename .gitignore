@@ -16,3 +16,8 @@
 /raven.log*
 /raven.stderr*
 /TODO.txt
+
+# Command Code's own agent state (plans, taste, settings). Not part of pir's
+# source tree; ignoring it keeps `git status` about real changes and lets the
+# auto-commit tool stage cleanly.
+/.commandcode/

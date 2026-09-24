@@ -812,14 +812,127 @@ pub fn highlight(s: &str) -> String {
     format!("\x1b[96m{s}\x1b[0m")
 }
 
-#[cfg(unix)]
-#[cfg(unix)]
 pub fn read_answer(prompt: &str) -> String {
     eprint!("{prompt} ");
     let _ = io::stderr().flush();
     let mut s = String::new();
     let _ = io::stdin().read_line(&mut s);
     s.trim().to_lowercase()
+}
+
+/// Read a **single keypress** (one byte, no Enter, no line editing) from the
+/// *controlling terminal*, with a bounded timeout, and return it lowercased.
+///
+/// Why this exists: confirmation prompts raised from inside tool execution
+/// (privilege escalation, self-kill) run on the agent's worker thread while the
+/// REPL thread owns the terminal in raw, non-canonical, non-blocking mode
+/// (`term::raw::enable_raw`). In that state:
+///
+///   * `stdin` reads return `EAGAIN` (not the user's key) — so a
+///     `read_line`-based prompt sees EOF/empty input and the caller
+///     self-denies before the operator can answer. That is the "it said I
+///     denied while I never got a chance" bug.
+///   * `crossterm`'s `event::read` would work (it flips the fd to blocking),
+///     but it would also steal a keypress the REPL's own wait loop wants, and
+///     a full-screen modal is heavyweight for a y/n.
+///
+/// So we read straight from `/dev/tty` (always the interactive terminal, never
+/// a pipe), one byte at a time, waiting up to `timeout` for *each* byte before
+/// giving up, and restore the terminal attributes afterwards because the fd is
+/// shared with the parent's stdin. Returns `None` when there is no terminal, on
+/// timeout, or on EOF — callers must treat `None` as "no human answered", never
+/// as a "no" from the human.
+#[cfg(unix)]
+pub fn wait_tty_answer(timeout: std::time::Duration) -> Option<char> {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::OpenOptions::new().read(true).open("/dev/tty").ok()?;
+    let fd = f.as_raw_fd();
+    let mut orig: libc::termios = unsafe { std::mem::zeroed() };
+    let have_orig = unsafe { libc::tcgetattr(fd, &mut orig) } == 0;
+    if have_orig {
+        // Read one byte at a time, no echo, VMIN=1 so a blocking `poll`-guarded
+        // read never returns 0 spuriously.
+        let mut raw = orig;
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+        unsafe {
+            libc::tcsetattr(fd, libc::TCSANOW, &raw);
+        }
+    }
+    let result = {
+        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+        let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if ready <= 0 {
+            None
+        } else {
+            let mut b: u8 = 0;
+            let n = unsafe { libc::read(fd, &mut b as *mut u8 as *mut libc::c_void, 1) };
+            if n == 1 {
+                let c_bytes = [b];
+                std::str::from_utf8(&c_bytes).ok().and_then(|s| s.chars().next())
+            } else {
+                None
+            }
+        }
+    };
+    if have_orig {
+        unsafe {
+            libc::tcsetattr(fd, libc::TCSANOW, &orig);
+        }
+    }
+    result.map(|c| c.to_ascii_lowercase())
+}
+
+/// Non-unix fallback: read a line from stdin (best effort).
+#[cfg(not(unix))]
+pub fn wait_tty_answer(timeout: std::time::Duration) -> Option<char> {
+    let _ = timeout;
+    let mut s = String::new();
+    let _ = io::stdin().read_line(&mut s);
+    s.trim().chars().next().map(|c| c.to_ascii_lowercase())
+}
+
+/// Whether an interactive terminal is available to ask the operator a
+/// question, even when stdin is currently owned in raw mode by the REPL. True
+/// when either stdin or `/dev/tty` is a tty. Used to decide *whether to prompt*
+/// — never to infer an answer.
+pub fn tty_available() -> bool {
+    if io::stdin().is_terminal() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        if std::fs::OpenOptions::new().read(true).open("/dev/tty").is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Show `prompt` and wait for a single keypress (no Enter needed), up to
+/// `secs` seconds, returning the lowercased key. Prints the prompt to stderr so
+/// it never pollutes piped stdout (matching `read_answer`), and echoes the key
+/// plus a newline so the answer is visible in the transcript.
+///
+/// Returns `None` only for "no human answered" (no tty / timeout / EOF). This
+/// is deliberately distinct from `Some('n')` so callers can tell a real denial
+/// apart from an absent operator — the whole point of the fix.
+pub fn prompt_key(prompt: &str, secs: u64) -> Option<char> {
+    eprint!("{prompt}");
+    let _ = io::stderr().flush();
+    let ans = wait_tty_answer(std::time::Duration::from_secs(secs));
+    match ans {
+        Some(c) => {
+            eprintln!("{c}");
+            Some(c)
+        }
+        None => {
+            eprintln!("(no answer)");
+            None
+        }
+    }
 }
 
 /// Read a line from the terminal with echo disabled (for secrets such as API
@@ -4084,6 +4197,59 @@ mod tests {
         assert_eq!(matches, vec!["anthropic/claude-fake".to_string()]);
         // The completion replaces only the argument (after the command + space).
         assert_eq!(start, "/default-model ".len());
+    }
+
+    /// Regression for the "escalation auto-denied before I could answer" bug.
+    ///
+    /// The old prompt read stdin with `read_line` while the REPL owned fd 0 in
+    /// raw, non-blocking mode, so it never saw the operator's keypress and the
+    /// caller self-denied. `wait_tty_answer` reads `/dev/tty` directly. This
+    /// drives it over a real pty: a child process (whose controlling terminal
+    /// IS the pty slave) calls `wait_tty_answer`, the parent types `y`, and the
+    /// child must receive it. If the read regressed to stdin-with-EAGAIN this
+    /// would time out instead.
+    #[cfg(unix)]
+    #[test]
+    fn wait_tty_answer_reads_a_key_from_the_controlling_terminal() {
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+        // `forkpty` gives the child a controlling tty and makes /dev/tty in
+        // the child resolve to it. We only use the child to *answer*, so this
+        // stays a tiny, self-contained probe.
+        let mut master: libc::c_int = -1;
+        // SAFETY: standard forkpty usage; we close the fds we own afterwards.
+        let pid = unsafe {
+            libc::forkpty(
+                &mut master,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(pid >= 0, "forkpty failed");
+        if pid == 0 {
+            // Child: /dev/tty is the pty slave. Wait for a key and exit with a
+            // distinctive status the parent asserts on.
+            let got = wait_tty_answer(std::time::Duration::from_secs(5));
+            let code = match got {
+                Some('y') => 0,
+                Some(_) => 1,
+                None => 2,
+            };
+            std::process::exit(code);
+        }
+        // Parent: give the child a moment to open /dev/tty, then type `y`.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let mut w = unsafe { std::fs::File::from_raw_fd(master) };
+        let _ = w.write_all(b"y");
+        let _ = w.flush();
+        // Wait for the child and check its exit status.
+        let mut status: libc::c_int = 0;
+        // SAFETY: waitpid on our own child.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        let exited = libc::WIFEXITED(status);
+        let code = if exited { libc::WEXITSTATUS(status) } else { -1 };
+        assert_eq!(code, 0, "wait_tty_answer did not receive the 'y' key (status {status})");
     }
 }
 

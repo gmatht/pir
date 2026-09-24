@@ -49,6 +49,13 @@ pub enum Op {
     Read,
     Write,
     Exec,
+    /// A *search*: reading a directory tree to find files/matches (the `glob`
+    /// and `grep` tools), as opposed to a single known-path `Read`. Treated
+    /// exactly like `Read` (default-open) — it never writes, never executes,
+    /// and never reaches the network; the distinct variant exists so a policy
+    /// can log/rate-limit searches separately and so the tool is never
+    /// mistaken for an `Exec` (which a `bash -c 'rg …'` would be).
+    Search,
     Connect,
     Bind,
     Apt,
@@ -62,6 +69,7 @@ impl Op {
             Op::Read => "read".into(),
             Op::Write => "write".into(),
             Op::Exec => "exec".into(),
+            Op::Search => "search".into(),
             Op::Connect => "connect".into(),
             Op::Bind => "bind".into(),
             Op::Apt => "apt".into(),
@@ -125,6 +133,10 @@ pub enum Parcel {
     /// works on a branch and submits a pull request instead. The blast radius
     /// message tells the agent exactly how.
     GuardRepoGit,
+    /// Plan mode refused a state-changing operation. Low risk (nothing
+    /// happened) but the message must tell the model how to proceed, which is
+    /// what this parcel's `blast_radius` is for.
+    PlanMode,
     Custom(String),
 }
 
@@ -152,6 +164,7 @@ impl Parcel {
             Parcel::GuardSystem => "guard-system".into(),
             Parcel::GuardTestOracle => "guard-test-oracle".into(),
             Parcel::GuardRepoGit => "guard-repo-git".into(),
+            Parcel::PlanMode => "plan-mode".into(),
             Parcel::Custom(s) => format!("custom:{s}"),
         }
     }
@@ -181,6 +194,9 @@ impl Parcel {
             Parcel::GuardRepoGit => {
                 "rewrite repo history/refs/hooks directly — instead commit on a branch and submit a pull request (e.g. `git push -u origin <branch>` then `gh pr create`, or `pir submit`)"
             }
+            Parcel::PlanMode => {
+                "plan mode is read-only: explore with read_file/glob/grep/list_dir, then record the approach with the plan_write tool (which the operator approves). To implement directly, leave plan mode first with /plan off or by approving the plan"
+            }
             Parcel::Custom(_) => "a right we didn't anticipate — review carefully",
         }
     }
@@ -193,7 +209,8 @@ impl Parcel {
             | Parcel::ScratchRw
             | Parcel::CacheRw
             | Parcel::NetNone
-            | Parcel::NoCaps => Risk::Low,
+            | Parcel::NoCaps
+            | Parcel::PlanMode => Risk::Low,
             Parcel::SecretRead { .. }
             | Parcel::ConfigStaging
             | Parcel::NetWebSearch
@@ -226,6 +243,13 @@ pub enum SecurityLevel {
     Sandbox,
     Strict,
     Worktree,
+    /// Plan mode (Feature 5): the agent may read and search freely but must not
+    /// write files or run commands. It explores, writes a plan document with the
+    /// `plan_write` tool, and the operator approves it — after which the session
+    /// returns to its previous level and implementation begins. This is a
+    /// *workflow* posture more than a confinement one: its purpose is to keep
+    /// the agent from acting before the approach is agreed.
+    Plan,
     /// Mitigation-level security (docs/MITIGATION_LEVEL_SECURITY.md): the
     /// command analyzer rewrites dangerous-but-legitimate commands into
     /// reversible / narrower / two-phase / race-safe equivalents, denies RED
@@ -244,6 +268,7 @@ impl SecurityLevel {
             "sandbox" => Some(SecurityLevel::Sandbox),
             "strict" => Some(SecurityLevel::Strict),
             "worktree" => Some(SecurityLevel::Worktree),
+            "plan" | "planning" | "plan-mode" | "planmode" => Some(SecurityLevel::Plan),
             "mitigation" | "mitigate" | "mitigating" => Some(SecurityLevel::Mitigation),
             "guard" => Some(SecurityLevel::Guard),
             "off" | "none" | "disabled" => Some(SecurityLevel::Off),
@@ -258,13 +283,19 @@ impl SecurityLevel {
                 | SecurityLevel::Strict
                 | SecurityLevel::Worktree
                 | SecurityLevel::Mitigation
+                | SecurityLevel::Plan
         )
+    }
+    /// True in plan mode: reads/searches allowed, writes and commands refused.
+    pub fn is_plan(self) -> bool {
+        matches!(self, SecurityLevel::Plan)
     }
     pub fn as_str(self) -> &'static str {
         match self {
             SecurityLevel::Sandbox => "sandbox",
             SecurityLevel::Strict => "strict",
             SecurityLevel::Worktree => "worktree",
+            SecurityLevel::Plan => "plan",
             SecurityLevel::Mitigation => "mitigation",
             SecurityLevel::Guard => "guard",
             SecurityLevel::Off => "off",
@@ -567,7 +598,24 @@ impl SecurityPolicy {
                         }
                 Verdict::Allow
             }
+            // Searches are reads of a *tree* rather than one known path, so the
+            // per-path secret classification cannot be applied up front (the
+            // hits are discovered by the tool). They are allowed wherever reads
+            // are — the builtin tools filter guarded/secret paths out of their
+            // own results (see `extensions/builtin`), so a search never becomes
+            // a way around `GuardedSecrets`.
+            Op::Search => Verdict::Allow,
             Op::Write => {
+                // Plan mode (Feature 5): no file may be written, in or out of
+                // the project. The plan document itself is written by the
+                // agent's `plan_write` tool, which bypasses this check on
+                // purpose — it is the one write plan mode exists to allow.
+                if self.level.is_plan() {
+                    return Verdict::Deny {
+                        parcel: Parcel::PlanMode,
+                        risk: Risk::Low,
+                    };
+                }
                 // When an overlayfs write-quarantine is mounted (the project
                 // overlay and/or the system-tree overlay over /var, /etc, ...),
                 // the overlay itself intercepts the write and stages it (visible
@@ -602,6 +650,16 @@ impl SecurityPolicy {
                 }
                 Verdict::Allow
             }
+            // Plan mode: reads/searches are open (handled above), but nothing
+            // may change state. `bash` is denied wholesale — a shell is the
+            // easiest way to write a file, and permitting "read-only commands"
+            // would require trusting a shell parser. The refusal names the two
+            // exits (`plan_write`, or leaving plan mode) so the model does not
+            // just retry something else.
+            Op::Exec if self.level.is_plan() => Verdict::Deny {
+                parcel: Parcel::PlanMode,
+                risk: Risk::Low,
+            },
             Op::Exec => Verdict::Allow,
             Op::Connect => match self.network {
                 NetworkMode::On => Verdict::Allow,
@@ -1011,6 +1069,16 @@ impl SecurityContext {
                 ts: epoch(),
             };
             self.policy.record_denial(denial.clone());
+            // Plan mode (Feature 5) is a *workflow* decision, not a permission
+            // the operator forgot to grant: the whole point is that the agent
+            // explores before acting. Offering "[o] allow once" here would let
+            // a single stray keypress turn "show me your plan first" into "go
+            // ahead and edit the repo", which is exactly the guarantee plan mode
+            // exists to give. So we refuse outright and never surface the ask —
+            // the exits are `plan_write` (approve the plan) or `/plan off`.
+            if matches!(parcel, Parcel::PlanMode) {
+                return Verdict::Deny { parcel: parcel.clone(), risk: *risk };
+            }
             // Windows: when the in-process guardrail denies a write and the
             // write-quarantine staging backend was initialised at startup,
             // record the *intent* so the operator can review it via
@@ -2150,9 +2218,57 @@ mod tests {
         assert!(!is_repo_git(Path::new("/home/me/project/src/git_util.rs")));
     }
 
+    /// The `glob`/`grep` tools run under `Op::Search`: read-only and allowed
+    /// whatever the read posture, so a search can never be refused for being
+    /// mistaken for an `Exec`, and never *silently* widens `GuardedSecrets`
+    /// (the tools filter secret paths out of their own hits).
     #[test]
-    fn parse_levels_and_modes() {
-        assert_eq!(SecurityLevel::parse("guard"), Some(SecurityLevel::Guard));
+    fn search_op_is_allowed_like_a_read() {
+        let open = SecurityPolicy::default();
+        assert_eq!(open.decide(&Ask::new(Op::Search)), Verdict::Allow);
+        let guarded = SecurityPolicy { read: ReadMode::GuardedSecrets, ..Default::default() };
+        assert_eq!(guarded.decide(&Ask::new(Op::Search)), Verdict::Allow);
+        assert_eq!(Op::Search.verb(), "search");
+        // Even `off`-level sessions must allow a search (nothing to deny).
+        let off = SecurityPolicy { level: SecurityLevel::Off, ..Default::default() };
+        assert_eq!(off.decide(&Ask::new(Op::Search)), Verdict::Allow);
+    }
+
+    /// Plan mode (Feature 5) is a workflow posture: reads/searches stay open,
+    /// writes and commands are refused with a parcel that explains the two ways
+    /// forward. It must never be a way to *weaken* the other guards.
+    #[test]
+    fn plan_level_refuses_writes_and_exec_but_allows_reads() {
+        let plan = SecurityPolicy { level: SecurityLevel::Plan, ..Default::default() };
+        assert_eq!(plan.level.as_str(), "plan");
+        assert!(plan.level.is_plan());
+        assert!(plan.level.guards_writes());
+        assert!(matches!(
+            plan.decide(&Ask::write("/home/me/project/src/main.rs")),
+            Verdict::Deny { parcel: Parcel::PlanMode, .. }
+        ));
+        assert!(matches!(
+            plan.decide(&Ask::new(Op::Exec)),
+            Verdict::Deny { parcel: Parcel::PlanMode, .. }
+        ));
+        assert_eq!(plan.decide(&Ask::read("/home/me/project/src/main.rs")), Verdict::Allow);
+        assert_eq!(plan.decide(&Ask::new(Op::Search)), Verdict::Allow);
+        // The refusal tells the model how to proceed, which is the whole point
+        // of a Low-risk workflow deny (otherwise it just retries).
+        let parcel = Parcel::PlanMode;
+        assert!(parcel.blast_radius().contains("plan_write"), "{:?}", parcel.blast_radius());
+        assert_eq!(parcel.default_risk(), Risk::Low);
+        assert_eq!(parcel.id(), "plan-mode");
+        // Parsing round-trips, and the level is not confused with the others.
+        assert_eq!(SecurityLevel::parse("plan"), Some(SecurityLevel::Plan));
+        assert_eq!(SecurityLevel::parse("planning"), Some(SecurityLevel::Plan));
+        assert!(!SecurityLevel::Mitigation.is_plan());
+        assert!(!SecurityLevel::Plan.is_worktree());
+        assert!(!SecurityLevel::Plan.is_mitigation());
+    }
+
+    #[test]
+    fn parse_levels_and_modes() {        assert_eq!(SecurityLevel::parse("guard"), Some(SecurityLevel::Guard));
         assert_eq!(AptMode::parse("stage"), Some(AptMode::Stage));
         assert_eq!(NetworkMode::parse("allowlist"), Some(NetworkMode::AllowList));
         assert_eq!(AskMode::parse("auto-no"), Some(AskMode::AutoNo));
@@ -2164,7 +2280,7 @@ mod tests {
     // throwaway PI_DIR so the real config is untouched).
     #[test]
     fn save_policy_roundtrips_through_load_policy() {
-        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap();
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("pir_pol_cfg_{}", std::process::id()));
         let old = std::env::var_os("PI_DIR");
         // SAFETY: edition 2024 marks env mutation unsafe; pir confines
@@ -2194,7 +2310,7 @@ mod tests {
     /// save→load roundtrip (verified with a throwaway PI_DIR).
     #[test]
     fn user_security_roundtrips_through_load_policy() {
-        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap();
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("pir_pol_user_{}", std::process::id()));
         let old = std::env::var_os("PI_DIR");
         // SAFETY: edition 2024 marks env mutation unsafe; pir confines

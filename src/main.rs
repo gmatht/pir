@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 mod agent;
+mod askuser;
 mod config;
 mod cpu_probe;
 mod cpu_scenarios_tests;
@@ -15,11 +16,16 @@ mod goal;
 mod md;
 mod notify;
 mod picker;
+mod plans;
 mod plugin;
 mod project;
 mod provider;
+mod scratchpad;
 mod session;
 mod sixel;
+mod skills;
+mod subagent;
+mod taste;
 mod term;
 mod types;
 mod user;
@@ -47,6 +53,7 @@ use crate::agent::Agent;
 use crate::config::Provider;
 use crate::config::Model;
 use crate::notify::SharedBus;
+use serde_json::json;
 use std::io::BufRead;
 use std::io::IsTerminal;
 #[cfg(unix)]
@@ -129,6 +136,74 @@ fn install_reexec_handler() {
             // ignore — handler install failed for this signal
         }
     }
+}
+
+/// Install the REPL's `ask_user_question` renderer (Feature 3).
+///
+/// The agent's turn runs on a worker thread and cannot read stdin, so the
+/// question is handed *back* to this (main) thread's renderer via
+/// [`crate::askuser::ask`]. On a tty we use the alternate-screen dialog; when
+/// the terminal can't host a modal (or `PIR_NO_MODAL=1`), we fall back to a
+/// numbered line prompt so a piped/scripted session still works.
+///
+/// Installed before the first prompt; installing again replaces the previous
+/// renderer (tests rely on that).
+fn install_ask_renderer() {
+    crate::askuser::install(std::sync::Arc::new(|q| {
+        use crate::askuser::Answer;
+        if !std::env::var_os("PIR_NO_MODAL").is_some()
+            && crate::term::is_terminal()
+            && let Some(a) = crate::modal::question_dialog(q) {
+                return a;
+            }
+        // Line-prompt fallback: print the question and read a reply. This is
+        // also the path taken inside a screen/tmux pane where the alternate
+        // screen misbehaves.
+        eprintln!("{} {}", crate::term::yellow("?"), crate::term::bold(&q.header));
+        eprintln!("{}", q.question);
+        if q.options.is_empty() {
+            let ans = crate::term::read_answer("  answer: ");
+            return if ans.trim().is_empty() { Answer::Dismissed } else { Answer::Text(ans) };
+        }
+        for (i, o) in q.options.iter().enumerate() {
+            if o.description.is_empty() {
+                eprintln!("  {}) {}", i + 1, o.label);
+            } else {
+                eprintln!("  {}) {} — {}", i + 1, o.label, crate::term::dim(&o.description));
+            }
+        }
+        let hint = if q.multi_select {
+            "  choice (comma-separated numbers, or text) [default: none]: "
+        } else {
+            "  choice (number, or text) [default: none]: "
+        };
+        let ans = crate::term::read_answer(hint);
+        let ans = ans.trim();
+        if ans.is_empty() {
+            return Answer::Dismissed;
+        }
+        // Numbers select options; anything else is free text.
+        let mut chosen: Vec<String> = Vec::new();
+        let mut all_numeric = true;
+        for tok in ans.split(',') {
+            match tok.trim().parse::<usize>() {
+                Ok(n) if n >= 1 && n <= q.options.len() => chosen.push(q.options[n - 1].label.clone()),
+                _ => {
+                    all_numeric = false;
+                    break;
+                }
+            }
+        }
+        if all_numeric && !chosen.is_empty() {
+            if q.multi_select {
+                Answer::Chosen(chosen)
+            } else {
+                Answer::Chosen(vec![chosen.remove(0)])
+            }
+        } else {
+            Answer::Text(ans.to_string())
+        }
+    }));
 }
 
 /// Install the death-provenance signal handler and PR_SET_PDEATHSIG. Best-
@@ -231,6 +306,10 @@ OPTIONS
                        (model ends its turn with request_stop; text-only
                        answers are auto-nudged). On by default.
                        Env: PIR_STOP_SKILL=0  Config: "stopSkill": false
+  --output-format <fmt>  'text' (default) or 'json'. In json mode, NDJSON
+                       events are emitted to stdout: turn_start, tool_call,
+                       tool_result, turn_end, result (with exit code + text).
+                       Suppresses terminal output. For headless / CI use.
 
 CONFIG (reused from pi, never modified)
   ~/.pi/models.json          providers, models, api keys ("{env:VAR}" supported)
@@ -264,6 +343,33 @@ COMMANDS
   /model* <sel>  /model-all <sel>   broadcast a model switch to ALL your open pir terminals (also sets the new default)
   /bg <text>  /jobs  /fg <id>  /clear  /usage  /exit
   /undo [all]             revert the last file edit (or all) to its pre-edit state
+  /scratchpad [ls|clear]  show the per-session scratch directory (exported to
+                          tools as $PIR_SCRATCHPAD); `ls` lists it, `clear` empties it
+  /skills [name]         list discovered skills (project .pir/skills, user
+                          ~/.pi/skills); with a name, print that skill's full text
+  /plan [on|off|status]   plan mode: the agent explores read-only and records the
+                          approach with its plan_write tool for your approval
+  /plan list              list saved plans (~/.pi/agent/plans)
+  /plan show [name]       print a saved plan
+  /plan <task>            enter plan mode and pre-fill the task as the next prompt
+  /taste [list]          show recorded preferences (injected into every prompt)
+  /taste remember <text> record one yourself (project scope, high confidence)
+  /taste forget <text>   remove one
+  /taste find <text>     search them
+  /taste path            where the taste stores live
+
+  The agent has provider-independent web tools too: `web_fetch` reads a public
+  http/https URL as text and `web_search` finds results (set PIR_WEB_SEARCH_URL
+  to a SearXNG template; PIR_WEB_ALLOW=host lifts the SSRF guard for a host).
+
+  The agent can also delegate with its `agent` tool: a sub-agent gets its own
+  context window and returns only a report (types: explore = read-only recon,
+  plan = read-only planning, general = full capability).
+
+  When the agent needs a decision from you it calls its ask_user_question tool:
+  a picker (or a numbered line prompt) appears, and your answer is returned to
+  the model so it can carry on. In a headless/background session there is no one
+  to answer, so the tool reports that and the model proceeds on its own.
   /stop-skill [on|off|default|status]   toggle the explicit-stop skill for this
                           session (request_stop + auto-nudge; on by default)
   /sh [cmd args]         drop to a shell, or run a command via the shell
@@ -498,6 +604,8 @@ fn main() {
     // `--no-stop-skill` disables the explicit-stop skill for this session
     // (same as `PIR_STOP_SKILL=0`; see `config::stop_skill_default`).
     let mut no_stop_skill = false;
+    // `--output-format json` enables NDJSON event output for headless/CI use.
+    let mut output_format = crate::agent::OutputFormat::Plain;
 
     // Capture the invoking user's default-model selector BEFORE the privilege
     // drop (while HOME still points at the real user's ~/.pi). After the drop,
@@ -601,6 +709,14 @@ fn main() {
             "--no-raw" => no_raw = true,
             "--no-incremental" => no_incremental = true,
             "--no-stop-skill" => no_stop_skill = true,
+            "--output-format" => {
+                i += 1;
+                match args.get(i).map(|s| s.as_str()) {
+                    Some("json") => output_format = crate::agent::OutputFormat::Json,
+                    Some("text") => output_format = crate::agent::OutputFormat::Plain,
+                    _ => die("--output-format takes 'text' or 'json'"),
+                }
+            }
             "--budget" => {
                 i += 1;
                 match args.get(i).and_then(|v| v.parse::<u64>().ok()) {
@@ -904,6 +1020,14 @@ fn main() {
         Ok(a) => a,
         Err(e) => die(&e),
     };
+    // Apply output format (--output-format json for headless/CI use).
+    agent.set_output_format(output_format);
+    // In JSON mode, suppress terminal colors and the spinner so NDJSON
+    // events are the only stdout output.
+    if output_format.is_json() {
+        term::set_color(false);
+        agent.set_quiet(true);
+    }
     // Snapshot the session log path now: the worker *takes* the agent out of
     // its slot while a turn runs, so quit paths during a turn (ctrl-c/ctrl-q)
     // can't read it from the slot — this copy stays available everywhere.
@@ -954,6 +1078,11 @@ fn main() {
             // (model restored silently; the startup banner below shows it)
         }
         if let Some(notice) = agent.apply_persisted_su_security() {
+            println!("{} {}", term::yellow("⚠"), notice);
+        }
+        // A resumed session that was planning comes back read-only, so the
+        // operator is told up front instead of hitting a refusal later.
+        if let Some(notice) = agent.apply_persisted_plan_mode() {
             println!("{} {}", term::yellow("⚠"), notice);
         }
         agent.apply_persisted_thinking();
@@ -1012,11 +1141,30 @@ fn main() {
         return;
     }
     if !prompt.is_empty() {
-        match agent.turn(&prompt.join(" ")) {
-            Ok(()) => agent.notify_on_exit(agent.turn_done_event()),
-            Err(e) => agent.notify_on_exit(agent.error_event(e)),
+        let result = agent.turn(&prompt.join(" "));
+        let exit = match &result {
+            Ok(()) => {
+                agent.notify_on_exit(agent.turn_done_event());
+                ExitCode::Success
+            }
+            Err(e) => {
+                let code = classify_error(e);
+                agent.notify_on_exit(agent.error_event(e.clone()));
+                code
+            }
+        };
+        // NDJSON: emit final result event with exit code and full text.
+        if output_format.is_json() {
+            let text = agent.last_reply_text();
+            crate::agent::ndjson_emit(&json!({
+                "type": "result",
+                "exit": exit as i32,
+                "text": text,
+                "tokens_in": agent.usage.input,
+                "tokens_out": agent.usage.output,
+            }));
         }
-        return;
+        std::process::exit(exit as i32)
     }
 
     // Full-screen TUI REPL (only when the `tui` feature AND
@@ -1090,6 +1238,12 @@ fn main() {
         eprintln!("pir: --tui requires the `tui` feature (build with --features tui)");
     }
 
+    // Interactive REPL: install the `ask_user_question` renderer before the
+    // first prompt. Deliberately NOT installed for one-shot / `-bg` runs, where
+    // there is no operator at the keyboard — the tool then reports "no
+    // interactive user" instead of blocking on a question nobody sees.
+    install_ask_renderer();
+
     println!("{}", term::bold("pir"));
     // Collect the startup status lines. They print to the right of the sixel
     // logo when sixel is available, or plainly below when it isn't — the same
@@ -1123,6 +1277,12 @@ fn main() {
     }
     if let Some(p) = &agent.log_path {
         side_lines.push(term::dim(&format!("session log: {}", p.display())));
+    }
+    // Per-session scratch directory (Feature 2): show it so the operator knows
+    // where the agent is allowed to dump intermediate files, and so they can
+    // `cd $PIR_SCRATCHPAD` to inspect them.
+    if crate::scratchpad::current().is_some() {
+        side_lines.push(term::dim(&crate::scratchpad::describe()));
     }
     // pi parity: startup header names the loaded context files.
     {
@@ -2174,6 +2334,9 @@ fn resume_into(agent: &mut Agent, path: &PathBuf) {
     }
     agent.apply_persisted_model();
     if let Some(notice) = agent.apply_persisted_su_security() {
+        println!("{} {}", term::yellow("⚠"), notice);
+    }
+    if let Some(notice) = agent.apply_persisted_plan_mode() {
         println!("{} {}", term::yellow("⚠"), notice);
     }
     agent.apply_persisted_thinking();
@@ -3351,6 +3514,274 @@ fn handle_command(
                 None => eprintln!("pir: agent busy (turn running) — try again when idle"),
             }
         }
+        "scratchpad" | "scratch" => {
+            // `/scratchpad` — show (and optionally open) the per-session scratch
+            // directory. With `ls` list its contents; with no arg report the
+            // path + size. The dir is exported to every child process as
+            // `$PIR_SCRATCHPAD`, so this is primarily a discoverability aid.
+            let Some(dir) = crate::scratchpad::current() else {
+                eprintln!(
+                    "pir: no scratchpad for this session (could not create one under {} — check \
+                     /tmp permissions or set PIR_SCRATCHPAD_DIR)",
+                    crate::scratchpad::root().display()
+                );
+                return;
+            };
+            match rest.first().copied() {
+                Some("ls" | "list") => {
+                    println!("{}", term::dim(&crate::scratchpad::describe()));
+                    match std::fs::read_dir(&dir) {
+                        Ok(rd) => {
+                            let mut names: Vec<String> = rd
+                                .flatten()
+                                .map(|e| {
+                                    let n = e.file_name().to_string_lossy().to_string();
+                                    if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                                        format!("{n}/")
+                                    } else {
+                                        n
+                                    }
+                                })
+                                .collect();
+                            names.sort();
+                            if names.is_empty() {
+                                println!("(empty)");
+                            } else {
+                                for n in names {
+                                    println!("  {n}");
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("pir: cannot read {}: {e}", dir.display()),
+                    }
+                }
+                Some("clear" | "clean") => {
+                    // Remove the *contents* but keep the directory (and its env
+                    // var) so the session keeps a working scratchpad.
+                    let mut removed = 0usize;
+                    if let Ok(rd) = std::fs::read_dir(&dir) {
+                        for e in rd.flatten() {
+                            let p = e.path();
+                            let ok = if p.is_dir() {
+                                std::fs::remove_dir_all(&p).is_ok()
+                            } else {
+                                std::fs::remove_file(&p).is_ok()
+                            };
+                            if ok {
+                                removed += 1;
+                            }
+                        }
+                    }
+                    println!("{} cleared {removed} entr{} from {}", term::dim("·"), if removed == 1 { "y" } else { "ies" }, dir.display());
+                }
+                _ => println!("{}", crate::scratchpad::describe()),
+            }
+        }
+        "plan" => {
+            // `/plan` — plan mode (Feature 5). Bare `/plan <task>` enters plan
+            // mode; `on`/`off` toggle it; `status` reports; `show [name]` prints
+            // a saved plan; `list` lists them. Plans live in
+            // ~/.pi/agent/plans and survive the session.
+            match rest.first().copied() {
+                Some("on") => {
+                    let mut g = agent_slot.lock().unwrap();
+                    match g.as_mut() {
+                        Some(agent) => println!("{}", agent.set_plan_mode(true)),
+                        None => eprintln!("pir: agent busy (turn running) — try again when idle"),
+                    }
+                }
+                Some("off") => {
+                    let mut g = agent_slot.lock().unwrap();
+                    match g.as_mut() {
+                        Some(agent) => println!("{}", agent.set_plan_mode(false)),
+                        None => eprintln!("pir: agent busy (turn running) — try again when idle"),
+                    }
+                }
+                Some("status") => {
+                    let g = agent_slot.lock().unwrap();
+                    match g.as_ref() {
+                        Some(agent) if agent.plan_mode() => {
+                            println!("{} plan mode ON (read-only; plan_write to record the approach)", term::green("·"))
+                        }
+                        Some(_) => println!("{} plan mode off", term::dim("·")),
+                        None => eprintln!("pir: agent busy (turn running) — try again when idle"),
+                    }
+                }
+                Some("list" | "ls") => println!("{}", crate::plans::listing()),
+                Some("show" | "cat") => {
+                    let name = rest.get(1).copied().unwrap_or("");
+                    if name.is_empty() {
+                        println!("{}", crate::plans::listing());
+                    } else {
+                        match crate::plans::read(name) {
+                            Ok(text) => println!("{text}"),
+                            Err(e) => eprintln!("pir: {e}"),
+                        }
+                    }
+                }
+                Some("dir") => println!("{}", crate::plans::dir().display()),
+                _ => {
+                    // Anything else is a task description: enter plan mode and
+                    // queue it as the prompt, so `/plan add retries` does the
+                    // obvious thing in one step.
+                    let task = rest.join(" ");
+                    let mut g = agent_slot.lock().unwrap();
+                    match g.as_mut() {
+                        Some(agent) => {
+                            println!("{}", agent.set_plan_mode(true));
+                            if task.is_empty() {
+                                println!(
+                                    "{}",
+                                    term::dim("describe the task and the agent will plan it, e.g. /plan add exponential backoff to the retry loop")
+                                );
+                            } else {
+                                println!(
+                                    "{}",
+                                    term::dim(&format!("planning: {task} — send it as a prompt, or press enter on it now"))
+                                );
+                                term::set_prefill(&task);
+                            }
+                        }
+                        None => eprintln!("pir: agent busy (turn running) — try again when idle"),
+                    }
+                }
+            }
+        }
+        "taste" => {
+            // `/taste` — durable recorded preferences (Feature 12). Bare lists
+            // them; `remember`/`forget`/`find` manage them; `path` shows where
+            // they live so the operator can edit or version them.
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            match rest.first().copied() {
+                None | Some("list" | "ls") => println!("{}", crate::taste::listing(&crate::taste::load_all(&cwd))),
+                Some("path" | "dir") => {
+                    for scope in [crate::taste::Scope::Global, crate::taste::Scope::Project] {
+                        println!("{}: {}", scope.label(), crate::taste::Store::path(scope, &cwd).display());
+                    }
+                }
+                Some("find" | "grep") => {
+                    let needle = rest.get(1..).map(|r| r.join(" ")).unwrap_or_default();
+                    let all = crate::taste::load_all(&cwd);
+                    let hits = crate::taste::find(&all, &needle);
+                    if hits.is_empty() {
+                        println!("{}", term::dim(&format!("no recorded preference matches '{needle}'")));
+                    } else {
+                        for e in hits {
+                            println!(
+                                "[{:.1}] ({}) {}",
+                                e.entry.confidence,
+                                e.scope.label(),
+                                e.entry.text
+                            );
+                            if !e.entry.evidence.is_empty() {
+                                println!("      {}", term::dim(&e.entry.evidence));
+                            }
+                        }
+                    }
+                }
+                Some("remember" | "add") => {
+                    let text = rest.get(1..).map(|r| r.join(" ")).unwrap_or_default();
+                    if text.trim().is_empty() {
+                        eprintln!("pir: usage: /taste remember <preference text>");
+                        return;
+                    }
+                    let mut store = crate::taste::Store::load(crate::taste::Scope::Project, &cwd);
+                    let (_, created) = store.remember(&text, "recorded by the operator via /taste", Some(0.9));
+                    match store.save(crate::taste::Scope::Project, &cwd) {
+                        Ok(()) => {
+                            println!(
+                                "{} {} '{}' (project taste, confidence 0.9)",
+                                term::green("·"),
+                                if created { "recorded" } else { "reinforced" },
+                                text
+                            );
+                            // Push it into the live prompt too.
+                            let mut g = agent_slot.lock().unwrap();
+                            if let Some(a) = g.as_mut() {
+                                a.refresh_system_public();
+                            }
+                        }
+                        Err(e) => eprintln!("pir: {e}"),
+                    }
+                }
+                Some("forget" | "rm" | "remove") => {
+                    let text = rest.get(1..).map(|r| r.join(" ")).unwrap_or_default();
+                    if text.trim().is_empty() {
+                        eprintln!("pir: usage: /taste forget <slug or fragment>");
+                        return;
+                    }
+                    // Search both scopes; the project store wins if both match.
+                    let mut done = false;
+                    for scope in [crate::taste::Scope::Project, crate::taste::Scope::Global] {
+                        let mut store = crate::taste::Store::load(scope, &cwd);
+                        if let Ok(removed) = store.forget(&text) {
+                            match store.save(scope, &cwd) {
+                                Ok(()) => {
+                                    println!("{} forgot '{}' ({})", term::green("·"), removed.text, scope.label());
+                                    let mut g = agent_slot.lock().unwrap();
+                                    if let Some(a) = g.as_mut() {
+                                        a.refresh_system_public();
+                                    }
+                                }
+                                Err(e) => eprintln!("pir: {e}"),
+                            }
+                            done = true;
+                            break;
+                        }
+                    }
+                    if !done {
+                        eprintln!("pir: no recorded preference matches '{text}'");
+                    }
+                }
+                Some(other) => {
+                    eprintln!(
+                        "pir: unknown /taste subcommand '{other}'. Try: /taste [list], remember <text>, forget <text>, find <text>, path"
+                    );
+                }
+            }
+        }
+        "skills" | "skill" => {
+            // `/skills` — list the discovered skills (and where each came from),
+            // or `/skills <name>` to print one in full. The model gets the same
+            // catalog through its system prompt and loads bodies with the
+            // `load_skill` tool; this is for the operator to see/edit them.
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let skills = crate::skills::discover(&cwd);
+            match rest.first().copied() {
+                None => {
+                    if skills.is_empty() {
+                        println!(
+                            "{}",
+                            term::dim(&format!(
+                                "no skills found. Add one at {}/.pir/skills/<name>/SKILL.md \
+                                 or {}",
+                                cwd.display(),
+                                crate::config::pi_dir().join("agent/skills").display()
+                            ))
+                        );
+                    } else {
+                        println!("{}", term::bold(&format!("{} skill(s) available", skills.len())));
+                        for s in &skills {
+                            println!(
+                                "  {} {} {}",
+                                term::cyan(&s.name),
+                                term::dim(&format!("[{}]", s.source.label())),
+                                s.description
+                            );
+                            println!("      {}", term::dim(&s.path.display().to_string()));
+                        }
+                        println!("{}", term::dim("load one in the model's context with the load_skill tool, or: /skills <name>"));
+                    }
+                }
+                Some(name) => match crate::skills::find(&skills, name) {
+                    Ok(s) => match crate::skills::body(s) {
+                        Ok(text) => println!("{}\n\n{text}", term::bold(&format!("# {} ({})", s.name, s.source.label()))),
+                        Err(e) => eprintln!("pir: {e}"),
+                    },
+                    Err(e) => eprintln!("pir: {e}"),
+                },
+            }
+        }
         "undo" => {
             let mut g = agent_slot.lock().unwrap();
             let Some(agent) = g.as_mut() else {
@@ -3748,6 +4179,74 @@ fn fmt_tok(n: u64) -> String {
     } else {
         n.to_string()
     }
+}
+
+/// Structured exit codes for headless / CI use. When `--output-format json`
+/// is active, the final NDJSON `result` event carries this code; in all modes,
+/// the process exits with the numeric value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum ExitCode {
+    /// Turn completed successfully.
+    Success = 0,
+    /// General / unknown error.
+    General = 1,
+    /// Auth failure (401, invalid API key).
+    Auth = 3,
+    /// Permission denied (security guardrail blocked the turn).
+    Permission = 4,
+    /// Rate limit (429) or quota exceeded — retry later.
+    RateLimit = 5,
+    /// Network / transport error (connection refused, timeout, DNS).
+    Network = 6,
+    /// API server error (5xx).
+    ServerError = 7,
+    /// Model produced no usable response.
+    NoResponse = 9,
+    /// Turn was cancelled (Ctrl-C / ESC).
+    Interrupted = 130,
+}
+
+/// Classify a turn error string into a structured exit code. The error
+/// strings come from `provider.rs` and are bare text — this function
+/// pattern-matches on the same substrings that `is_retryable()` uses.
+fn classify_error(error: &str) -> ExitCode {
+    if error == "request cancelled" {
+        return ExitCode::Interrupted;
+    }
+    let l = error.to_lowercase();
+    if l.contains("usage limit")
+        || l.contains("weekly usage")
+        || l.contains("quota exceeded")
+        || l.contains("quota_exceeded")
+        || l.contains("insufficient_quota")
+        || l.contains("upgrade for higher limits")
+        || l.contains("billing")
+    {
+        return ExitCode::RateLimit;
+    }
+    if error.starts_with("HTTP 401") || error.contains("invalid_api_key") || l.contains("unauthorized") {
+        return ExitCode::Auth;
+    }
+    if error.starts_with("HTTP 429") {
+        return ExitCode::RateLimit;
+    }
+    if error.starts_with("HTTP 500")
+        || error.starts_with("HTTP 502")
+        || error.starts_with("HTTP 503")
+        || error.starts_with("HTTP 504")
+    {
+        return ExitCode::ServerError;
+    }
+    if error.contains("misrouted") {
+        return ExitCode::Network;
+    }
+    // Transport-layer failures (connection, timeout, DNS).
+    if !error.starts_with("HTTP ") {
+        return ExitCode::Network;
+    }
+    // Other HTTP 4xx or unknown.
+    ExitCode::General
 }
 
 fn die(msg: &str) -> ! {
@@ -4210,7 +4709,7 @@ mod main_tests {
     /// assert by name, not by count).
     #[test]
     fn scan_finds_global_dir_sessions() {
-        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap();
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("pir_scan_{}", std::process::id()));
         let sdir = dir.join("agent").join("sessions");
         std::fs::create_dir_all(&sdir).unwrap();

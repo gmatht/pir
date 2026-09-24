@@ -20,7 +20,6 @@
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 #[cfg(unix)]
-use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -55,6 +54,188 @@ extern "C" fn on_winch(_sig: i32) {
     RESIZED.store(true, Ordering::SeqCst);
 }
 
+/// Background preview prefetcher.
+///
+/// The picker paints synchronously and `read_preview` parses a whole transcript
+/// (tens of ms for a multi-MB session), so scanning a row on demand stalls the
+/// UI for exactly as long as that scan takes. This worker fills the cache ahead
+/// of the user instead: it scans rows in a priority order that follows the
+/// selection, so the preview is already warm by the time a row is highlighted.
+///
+/// Priority is a *hint*, not a contract — the drawing path still computes any
+/// missing preview synchronously, so a wrong guess costs nothing but the work
+/// already done.
+struct Prefetcher {
+    /// Row index -> finished preview. Shared with the UI thread.
+    cache: Arc<Mutex<HashMap<usize, SessionPreview>>>,
+    /// Rows the worker should scan, nearest-to-selection first. The UI replaces
+    /// this on every selection change; the worker re-reads it after each row so
+    /// a new selection takes effect promptly.
+    queue: Arc<Mutex<Vec<usize>>>,
+    /// Set on drop so the worker stops instead of scanning every remaining
+    /// transcript after the user has already resumed a session.
+    stop: Arc<AtomicBool>,
+    /// Write end of the notification pipe. The worker writes one byte per
+    /// published preview, waking the UI's `poll` immediately.
+    ///
+    /// A self-pipe rather than a timed poll: the picker already parks in
+    /// `poll(stdin, -1)` for zero idle CPU, and a polling timeout would trade
+    /// that away (a 50ms tick measures ~0.24% of a core) to learn about
+    /// something we can simply be told. `None` if the pipe could not be created,
+    /// in which case the UI falls back to a bounded poll timeout.
+    notify_tx: Option<Arc<std::fs::File>>,
+    /// Read end of that pipe, polled alongside stdin.
+    notify_rx: Option<Arc<std::fs::File>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Prefetcher {
+    /// Spawn a worker over `paths`, starting at `selected`.
+    fn spawn(paths: Vec<std::path::PathBuf>, selected: usize) -> Prefetcher {
+        let cache: Arc<Mutex<HashMap<usize, SessionPreview>>> = Arc::new(Mutex::new(HashMap::new()));
+        let queue: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(order_from(&paths, selected)));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Notification pipe: worker writes, UI reads. Non-blocking on the write
+        // side so a saturated pipe (many previews, no reads) can never wedge the
+        // worker — a dropped notification only costs one late repaint, and the
+        // next one wakes the UI anyway.
+        let notify_tx;
+        let notify_rx;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::FromRawFd;
+            let mut fds = [0i32; 2];
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
+                unsafe {
+                    let flags = libc::fcntl(fds[1], libc::F_GETFL);
+                    let _ = libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+                notify_tx = Some(Arc::new(unsafe { std::fs::File::from_raw_fd(fds[1]) }));
+                notify_rx = Some(Arc::new(unsafe { std::fs::File::from_raw_fd(fds[0]) }));
+            } else {
+                notify_tx = None;
+                notify_rx = None;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            notify_tx = None;
+            notify_rx = None;
+        }
+
+        let handle = {
+            let cache = Arc::clone(&cache);
+            let queue = Arc::clone(&queue);
+            let stop = Arc::clone(&stop);
+            let notify = notify_tx.clone();
+            let paths = Arc::new(paths);
+            std::thread::Builder::new()
+                .name("pir-preview-prefetch".to_string())
+                .spawn(move || {
+                    use std::io::Write;
+                    while !stop.load(Ordering::SeqCst) {
+                        // Take the next row the UI cares about. Popping here (vs
+                        // iterating a snapshot) is what lets a fresh selection
+                        // preempt the remainder of the old one.
+                        let next = queue.lock().ok().and_then(|mut q| q.pop());
+                        let Some(idx) = next else { break };
+                        if stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        // Skip if the UI already produced it (raced us).
+                        let already = cache.lock().map(|c| c.contains_key(&idx)).unwrap_or(true);
+                        if already {
+                            continue;
+                        }
+                        let Some(path) = paths.get(idx) else { continue };
+                        let preview = read_preview(path);
+                        if stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        if let Ok(mut c) = cache.lock() {
+                            c.insert(idx, preview);
+                        }
+                        // Wake the UI: it is parked in poll(stdin) and would
+                        // otherwise not repaint until the next keystroke.
+                        if let Some(n) = &notify {
+                            if let Ok(mut f) = n.try_clone() {
+                                let _ = f.write_all(b"p");
+                            }
+                        }
+                    }
+                })
+                .ok()
+        };
+        Prefetcher { cache, queue, stop, notify_tx, notify_rx, handle }
+    }
+
+    /// Re-target the worker at a new selection: scan `selected` first, then the
+    /// rows just below it, then the rows just above. Replaces any pending work
+    /// so a held-down arrow key does not queue up every row it passed through.
+    fn retarget(&self, paths_len: usize, selected: usize) {
+        if let Ok(mut q) = self.queue.lock() {
+            *q = order_from_len(paths_len, selected);
+        }
+    }
+
+    /// A finished preview for `idx`, if the worker (or a previous synchronous
+    /// scan) has one. Does not block.
+    fn get(&self, idx: usize) -> Option<SessionPreview> {
+        self.cache.lock().ok()?.get(&idx).cloned()
+    }
+
+    /// Publish a preview computed on the UI thread so the worker skips it.
+    fn put(&self, idx: usize, preview: SessionPreview) {
+        if let Ok(mut c) = self.cache.lock() {
+            c.insert(idx, preview);
+        }
+    }
+}
+
+impl Drop for Prefetcher {
+    fn drop(&mut self) {
+        // Abandon any remaining rows: the user has picked (or cancelled), so
+        // scanning the rest of a 25-session backlog would only burn I/O.
+        self.stop.store(true, Ordering::SeqCst);
+        // Empty the queue too, so a worker blocked on `lock()` sees the stop
+        // flag at its next check rather than draining the backlog first.
+        if let Ok(mut q) = self.queue.lock() {
+            q.clear();
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Scan order for `selected`: the highlighted row first, then outward (down
+/// before up, matching where an arrow key is most likely to go next).
+fn order_from(paths: &[std::path::PathBuf], selected: usize) -> Vec<usize> {
+    order_from_len(paths.len(), selected)
+}
+
+fn order_from_len(len: usize, selected: usize) -> Vec<usize> {
+    // Build the desired *scan* order explicitly, then reverse it: the queue is
+    // consumed with `pop()` (last element first). Priority is
+    // selected, +1, -1, +2, -2, … so the row the user is looking at is scanned
+    // first and the likely next move (Down) precedes the unlikely one (Up).
+    let mut scan: Vec<usize> = Vec::with_capacity(len + 1);
+    scan.push(selected);
+    let mut d = 1usize;
+    while selected + d < len || d <= selected {
+        if selected + d < len {
+            scan.push(selected + d); // below first (Down is the common move)
+        }
+        if d <= selected {
+            scan.push(selected - d);
+        }
+        d += 1;
+    }
+    scan.reverse();
+    scan
+}
+
 /// Run the interactive picker over `items` (already sorted newest-first, index
 /// 0 = newest). Returns `PickResult::Cancel` when stdin is not a terminal or
 /// the user bails out. Blocks in raw mode for the duration; restores the
@@ -65,8 +246,10 @@ pub fn pick_session(items: &[PickItem]) -> PickResult {
         return PickResult::Cancel;
     }
     let mut selected = 0usize;
-    // Previews are a per-file scan; cache them as the user visits rows.
-    let mut preview_cache: HashMap<usize, SessionPreview> = HashMap::new();
+    // Previews are a per-file scan; the worker fills this ahead of the user and
+    // the draw path falls back to a synchronous scan for anything still cold.
+    let paths: Vec<std::path::PathBuf> = items.iter().map(|i| i.path.clone()).collect();
+    let prefetch = Prefetcher::spawn(paths, selected);
 
     // Enter raw mode (separate save slot from the REPL's running-turn raw) and
     // hide the cursor while we draw.
@@ -82,12 +265,25 @@ pub fn pick_session(items: &[PickItem]) -> PickResult {
     let mut drawn_rows: usize = 0;
 
     let result = loop {
-        let preview = preview_cache
-            .entry(selected)
-            .or_insert_with(|| read_preview(&items[selected].path));
-        draw(items, selected, preview, &mut drawn_rows);
+        // Prefer a prefetched preview; fall back to computing it here so the
+        // first paint after launch (or a fast scroll past the worker) is never
+        // blank. Only a cold cache pays the scan.
+        let preview = match prefetch.get(selected) {
+            Some(p) => p,
+            None => {
+                let p = read_preview(&items[selected].path);
+                prefetch.put(selected, p.clone());
+                p
+            }
+        };
+        draw(items, selected, &preview, &mut drawn_rows);
 
-        match wait_key() {
+        // Re-target the worker at wherever the selection now is, so its next
+        // scans are the rows the user is about to look at rather than whatever
+        // was queued when the picker opened.
+        prefetch.retarget(items.len(), selected);
+
+        match wait_key(prefetch.notify_rx.as_deref()) {
             Key::Up | Key::Char('k') => {
                 selected = selected.saturating_sub(1);
             }
@@ -111,6 +307,8 @@ pub fn pick_session(items: &[PickItem]) -> PickResult {
             // Terminal resized while idling: fall through so the loop redraws
             // with the new layout.
             Key::Resize => {}
+            // A prefetched preview landed: fall through and redraw with it.
+            Key::Repaint => {}
             Key::Char(c) if c.is_ascii_digit() => {
                 // Jump to the 1-based index if it exists.
                 let n = (c as u32 as usize).saturating_sub(1);
@@ -350,30 +548,42 @@ enum Key {
     PageUp,
     PageDown,
     Resize,
+    /// Not a keypress: the background prefetcher published a preview and the
+    /// pane should be redrawn. Handled as a no-op by the picker loop (which
+    /// redraws unconditionally each iteration).
+    Repaint,
     Char(char),
     None,
 }
 
-/// Block until a keypress is available (or the terminal is resized),
-/// translating arrow keys / control sequences via the shared CSI-aware
-/// `term::raw::translate_picker`. This is what lets the picker idle instead of
-/// spinning: `poll()` parks the process with zero wakeups until stdin is
-/// readable or SIGWINCH interrupts it (EINTR), so no CPU is burned and no
-/// repaint happens until there is something to show.
+/// Block until a keypress is available, the terminal is resized, or the
+/// prefetcher has a preview ready, translating arrow keys / control sequences
+/// via the shared CSI-aware `term::raw::translate_picker`. This is what lets
+/// the picker idle instead of spinning: `poll()` parks the process with **no
+/// timeout** until stdin is readable, SIGWINCH interrupts it (EINTR), or the
+/// worker writes to its notification pipe — so no CPU is burned and no repaint
+/// happens until there is something to show.
 #[cfg(unix)]
-fn wait_key() -> Key {
+fn wait_key(notify_rx: Option<&std::fs::File>) -> Key {
+    use std::os::unix::io::AsRawFd as _;
     let fd = io::stdin().as_raw_fd();
     if RESIZED.swap(false, Ordering::SeqCst) {
         // A resize may have landed while we were processing the last key.
         return Key::Resize;
     }
     loop {
-        let mut pfd = [libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        }];
-        let r = unsafe { libc::poll(pfd.as_mut_ptr(), 1, -1) };
+        // Park on stdin AND the prefetcher's notification pipe. With no timeout
+        // at all, the picker keeps its zero-idle-CPU property: it wakes only for
+        // a real keypress, a resize, or a freshly prefetched preview.
+        let mut pfd = [
+            libc::pollfd { fd, events: libc::POLLIN, revents: 0 },
+            libc::pollfd {
+                fd: notify_rx.map(|f| f.as_raw_fd()).unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let r = unsafe { libc::poll(pfd.as_mut_ptr(), 2, -1) };
         if r < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
@@ -389,6 +599,28 @@ fn wait_key() -> Key {
         }
         if r == 0 {
             continue; // can't happen with an infinite timeout
+        }
+        // A prefetched preview landed before (or instead of) a keypress: drain
+        // the notification byte and repaint.
+        if pfd[1].revents & libc::POLLIN != 0 {
+            if let Some(f) = notify_rx {
+                let mut b = [0u8; 64];
+                let n = unsafe {
+                    libc::read(
+                        f.as_raw_fd(),
+                        b.as_mut_ptr() as *mut libc::c_void,
+                        b.len(),
+                    )
+                };
+                let _ = n; // drain; contents are irrelevant
+                // If the user typed at the same moment, prefer the keystroke
+                // (fall through) — but only redraw now if stdin is quiet.
+                if pfd[0].revents & libc::POLLIN == 0 {
+                    return Key::Repaint;
+                }
+            } else {
+                return Key::Repaint;
+            }
         }
         break; // stdin is readable
     }
@@ -482,3 +714,292 @@ fn translate_result(res: &term::raw::RawInput, buf: &str) -> Key {
 
 #[cfg(not(unix))]
 pub fn pick_session(_items: &[PickItem]) -> PickResult { PickResult::Resume(0) }
+
+#[cfg(test)]
+mod prefetch_tests {
+    use super::*;
+
+    /// The queue is consumed with `pop()` (last element first), so the
+    /// *highlighted* row must be pushed last to be scanned first.
+    #[test]
+    fn order_scans_selection_first() {
+        let o = order_from_len(10, 0);
+        assert_eq!(*o.last().unwrap(), 0, "highlighted row must be scanned first");
+
+        let o = order_from_len(10, 5);
+        assert_eq!(*o.last().unwrap(), 5);
+
+        let o = order_from_len(10, 9);
+        assert_eq!(*o.last().unwrap(), 9);
+    }
+
+    #[test]
+    fn order_covers_every_row_exactly_once() {
+        for len in 1..12usize {
+            for sel in 0..len {
+                let o = order_from_len(len, sel);
+                let mut sorted = o.clone();
+                sorted.sort_unstable();
+                let expect: Vec<usize> = (0..len).collect();
+                assert_eq!(sorted, expect, "len={len} sel={sel} must cover all rows once");
+            }
+        }
+    }
+
+    /// After the highlighted row, the next candidate should be the row *below*
+    /// it (where Down goes), not the one above.
+    #[test]
+    fn order_prefers_down_then_up() {
+        // Pop order: last pushed first. Build the pop sequence explicitly.
+        let o = order_from_len(10, 4);
+        let pop_order: Vec<usize> = o.iter().rev().cloned().collect();
+        assert_eq!(pop_order[0], 4, "highlighted first");
+        assert_eq!(pop_order[1], 5, "then the row below (Down)");
+        assert_eq!(pop_order[2], 3, "then the row above (Up)");
+    }
+
+    #[test]
+    fn order_handles_selection_at_both_ends() {
+        // Selection at 0: no rows above, so it walks downward only.
+        let o = order_from_len(4, 0);
+        let pops: Vec<usize> = o.iter().rev().cloned().collect();
+        assert_eq!(pops, vec![0, 1, 2, 3]);
+
+        // Selection at the last row: walks upward only.
+        let o = order_from_len(4, 3);
+        let pops: Vec<usize> = o.iter().rev().cloned().collect();
+        assert_eq!(pops, vec![3, 2, 1, 0]);
+    }
+
+    /// A single-row list must not produce duplicates or panic.
+    #[test]
+    fn order_single_row() {
+        assert_eq!(order_from_len(1, 0), vec![0]);
+        assert_eq!(order_from_len(0, 0), vec![0]);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod prefetch_integration_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn big_session(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        // ~2 MB: enough that a cold scan is measurable but the test stays fast.
+        let mut s = String::new();
+        let filler = "z".repeat(4096);
+        for i in 0..40 {
+            s.push_str(&format!(
+                "{{\"role\":\"user\",\"blocks\":[{{\"type\":\"text\",\"text\":\"prompt {i}\"}}]}}\n"
+            ));
+            s.push_str(&format!(
+                "{{\"role\":\"assistant\",\"blocks\":[{{\"type\":\"tool_use\",\"id\":\"t{i}\",\"name\":\"bash\",\"input\":{{}}}}]}}\n"
+            ));
+            s.push_str(&format!(
+                "{{\"role\":\"user\",\"blocks\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"t{i}\",\"content\":\"{filler}\"}}]}}\n"
+            ));
+            s.push_str(&format!(
+                "{{\"role\":\"assistant\",\"blocks\":[{{\"type\":\"text\",\"text\":\"answer {i}\"}}]}}\n"
+            ));
+        }
+        let p = dir.join(name);
+        std::fs::write(&p, s).unwrap();
+        p
+    }
+
+    /// The worker must populate the cache without the UI ever scanning.
+    #[test]
+    fn prefetcher_fills_cache_in_background() {
+        let d = std::env::temp_dir().join(format!("pir_pf_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        let paths: Vec<_> = (0..4).map(|i| big_session(&d, &format!("s{i}.jsonl"))).collect();
+
+        let pf = Prefetcher::spawn(paths.clone(), 2);
+        // Wait for the highlighted row (2) to land, as the picker would.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut got = false;
+        while Instant::now() < deadline {
+            if pf.get(2).is_some() {
+                got = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(got, "prefetcher never produced the highlighted row's preview");
+        let p = pf.get(2).unwrap();
+        assert_eq!(p.turns, 40);
+        assert_eq!(p.first_prompt, "prompt 0");
+        assert_eq!(p.last_prompt, "prompt 39");
+        drop(pf);
+        for p in &paths {
+            let _ = std::fs::remove_file(p);
+        }
+        let _ = std::fs::remove_dir(&d);
+    }
+
+    /// Once warm, a lookup must be essentially free — that is the whole point:
+    /// the picker's arrow-key repaint no longer waits on a parse.
+    #[test]
+    fn cached_lookup_is_fast_and_correct() {
+        let d = std::env::temp_dir().join(format!("pir_pf2_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        let path = big_session(&d, "one.jsonl");
+
+        let cold = Instant::now();
+        let direct = read_preview(&path);
+        let cold_ms = cold.elapsed().as_secs_f64() * 1000.0;
+
+        let pf = Prefetcher::spawn(vec![path.clone()], 0);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline && pf.get(0).is_none() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let warm = Instant::now();
+        let cached = pf.get(0).expect("prefetched");
+        let warm_ms = warm.elapsed().as_secs_f64() * 1000.0;
+
+        // Identical content...
+        assert_eq!(cached.turns, direct.turns);
+        assert_eq!(cached.first_prompt, direct.first_prompt);
+        assert_eq!(cached.last_prompt, direct.last_prompt);
+        assert_eq!(cached.last_output, direct.last_output);
+        // ...and obtained without re-reading the file.
+        println!("cold scan {cold_ms:.1}ms vs cached lookup {warm_ms:.4}ms");
+        assert!(
+            warm_ms < 1.0,
+            "cached lookup should be sub-millisecond, took {warm_ms:.3}ms"
+        );
+        drop(pf);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&d);
+    }
+
+    /// Dropping the picker must stop the worker promptly rather than let it
+    /// grind through the rest of a large backlog.
+    #[test]
+    fn drop_stops_the_worker() {
+        let d = std::env::temp_dir().join(format!("pir_pf3_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        let paths: Vec<_> = (0..8).map(|i| big_session(&d, &format!("m{i}.jsonl"))).collect();
+        let pf = Prefetcher::spawn(paths.clone(), 0);
+        let t = Instant::now();
+        drop(pf); // must join without waiting for 8 full scans
+        let took = t.elapsed();
+        assert!(took < Duration::from_secs(10), "drop took {took:?}");
+        for p in &paths {
+            let _ = std::fs::remove_file(p);
+        }
+        let _ = std::fs::remove_dir(&d);
+    }
+}
+
+
+#[cfg(all(test, unix))]
+mod prefetch_notify_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// The worker must wake a blocked `poll` on its notification pipe: that is
+    /// what makes a preview appear without waiting for a keystroke, and what
+    /// lets the picker keep `poll(.., -1)` (zero idle CPU) instead of a polling
+    /// timeout.
+    #[test]
+    fn worker_wakes_a_blocked_poll() {
+        use std::os::unix::io::AsRawFd as _;
+        let d = std::env::temp_dir().join(format!("pir_notify_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        // A session big enough that the scan cannot finish before we park.
+        let mut s = String::new();
+        let filler = "q".repeat(8192);
+        for i in 0..300 {
+            s.push_str(&format!(
+                "{{\"role\":\"assistant\",\"blocks\":[{{\"type\":\"text\",\"text\":\"a{i}\"}}]}}\n"
+            ));
+            s.push_str(&format!(
+                "{{\"role\":\"user\",\"blocks\":[{{\"type\":\"tool_result\",\"content\":\"{filler}\"}}]}}\n"
+            ));
+        }
+        let p = d.join("big.jsonl");
+        std::fs::write(&p, s).unwrap();
+
+        let pf = Prefetcher::spawn(vec![p.clone()], 0);
+        let rx = pf.notify_rx.as_ref().expect("notification pipe");
+
+        // Park exactly as wait_key does; the worker must wake us.
+        let mut pfd = [libc::pollfd { fd: rx.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
+        let t = Instant::now();
+        let r = unsafe { libc::poll(pfd.as_mut_ptr(), 1, 10_000) }; // 10s ceiling
+        let waited = t.elapsed();
+        assert_eq!(r, 1, "expected the worker to make the pipe readable");
+        assert!(pfd[0].revents & libc::POLLIN != 0);
+        assert!(waited < Duration::from_secs(10), "must wake via the pipe, not the timeout");
+        println!("worker woke the poll after {waited:?}");
+
+        drop(pf);
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir(&d);
+    }
+
+    /// With the pipe in place the picker must not need a polling timeout, so an
+    /// idle picker parks indefinitely. Assert the pipe exists (the mechanism
+    /// the zero-idle-CPU property now depends on).
+    #[test]
+    fn notification_pipe_is_created() {
+        let pf = Prefetcher::spawn(Vec::new(), 0);
+        assert!(pf.notify_tx.is_some(), "write end must exist");
+        assert!(pf.notify_rx.is_some(), "read end must exist");
+        drop(pf);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod prefetch_hygiene_tests {
+    use super::*;
+
+    /// Repeated spawn/drop must not leak file descriptors (each prefetcher
+    /// creates a pipe) nor accumulate threads.
+    #[test]
+    fn spawn_drop_does_not_leak_fds_or_threads() {
+        let fd_count = || {
+            std::fs::read_dir("/proc/self/fd")
+                .map(|d| d.count())
+                .unwrap_or(0)
+        };
+        let threads = || {
+            std::fs::read_dir("/proc/self/task")
+                .map(|d| d.count())
+                .unwrap_or(0)
+        };
+        // Warm up so one-time allocations are not counted as a leak.
+        for _ in 0..3 {
+            drop(Prefetcher::spawn(Vec::new(), 0));
+        }
+        let fds_before = fd_count();
+        let threads_before = threads();
+        for _ in 0..25 {
+            drop(Prefetcher::spawn(Vec::new(), 0));
+        }
+        let fds_after = fd_count();
+        let threads_after = threads();
+        assert!(
+            fds_after <= fds_before + 2,
+            "fd leak: {fds_before} -> {fds_after} over 25 spawn/drop cycles"
+        );
+        assert!(
+            threads_after <= threads_before + 2,
+            "thread leak: {threads_before} -> {threads_after}"
+        );
+    }
+
+    /// An empty backlog (or a fully-cached one) must not spin: the worker exits
+    /// when the queue drains, rather than busy-looping on an empty Vec.
+    #[test]
+    fn worker_exits_when_queue_is_empty() {
+        let pf = Prefetcher::spawn(Vec::new(), 0);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Cache stays empty and get() still answers promptly.
+        assert!(pf.get(0).is_none());
+        drop(pf);
+    }
+}
+

@@ -2285,7 +2285,7 @@ mod worktree_settings_tests {
     // `pi_dir()` honours in tests); verify the roundtrip and the true default.
     #[test]
     fn worktrees_default_roundtrip() {
-        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap();
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("pir_wt_cfg_{}", std::process::id()));
         let old = std::env::var_os("PI_DIR");
         // SAFETY: edition 2024 marks env mutation unsafe; pir confines
@@ -2308,7 +2308,7 @@ mod worktree_settings_tests {
     // writes go to a temp dir so the real user config is never touched.
     #[test]
     fn http_backend_name_env_and_file() {
-        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap();
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let old_backend = std::env::var_os("PIR_HTTP_BACKEND");
         let old_dir = std::env::var_os("PI_DIR");
         let dir = std::env::temp_dir().join(format!("pir_http_cfg_{}", std::process::id()));
@@ -2339,7 +2339,7 @@ mod worktree_settings_tests {
     // `PIR_*` defaults (file writes go to a temp PI_DIR).
     #[test]
     fn stop_skill_default_env_and_file() {
-        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap();
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let old_skill = std::env::var_os("PIR_STOP_SKILL");
         let old_dir = std::env::var_os("PI_DIR");
         let dir = std::env::temp_dir().join(format!("pir_stop_cfg_{}", std::process::id()));
@@ -2437,7 +2437,7 @@ mod worktree_settings_tests {
     /// the catalog itself was fine.
     #[test]
     fn model_api_override_survives_store_load() {
-        let _env = TEST_ENV_LOCK.lock().unwrap();
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("pir_apiovr_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let agent = dir.join("agent");
@@ -2508,7 +2508,7 @@ mod worktree_settings_tests {
     /// degrades to the auth fallback and model switching stops resolving.
     #[test]
     fn seeded_catalog_survives_unreadable_store() {
-        let _env = TEST_ENV_LOCK.lock().unwrap();
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // A store path that cannot be read (a directory, not a file).
         let dir = std::env::temp_dir().join(format!("pir_seed_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2564,7 +2564,7 @@ mod worktree_settings_tests {
     /// never shadows it.
     #[test]
     fn pre_drop_load_reads_invoking_user_store_not_sandbox() {
-        let _env = TEST_ENV_LOCK.lock().unwrap();
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("pir_homedrop_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
 
@@ -2880,7 +2880,7 @@ mod worktree_settings_tests {
         // `/reexec all` durability: publish bumps the generation, stamps our
         // pid, and reads back; a second publish bumps again. Uses an isolated
         // PI_DIR so the real broadcast file is never touched.
-        let _env = TEST_ENV_LOCK.lock().unwrap();
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("pir_reexec_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let old = std::env::var_os("PI_DIR");
