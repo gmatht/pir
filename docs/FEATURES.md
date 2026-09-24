@@ -479,6 +479,13 @@ hang. None of that may stop pir from running:
   spec, but common) does not break the protocol — non-JSON lines are skipped.
 - Only **stdio** is implemented. Remote/hosted servers would need HTTP+SSE,
   which is separable and not done.
+- **MCP calls are gated as `Exec`.** An MCP tool runs code inside a spawned
+  server process, so it can read files, reach the network and write anywhere —
+  it is not a read. It is therefore subject to the security policy like `bash`
+  is: allowed under the default posture, refused in plan mode. (Without this the
+  whole MCP surface bypassed the guardrail, which mattered most in plan mode,
+  where a `mcp__x__delete_file` call would otherwise have changed state under a
+  posture whose entire purpose is that nothing does.)
 
 ---
 

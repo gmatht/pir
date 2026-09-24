@@ -1095,6 +1095,14 @@ impl Agent {
                 Ask::write(path).with_reason("write a file")
             }
             "list_dir" => Ask::new(Op::Read).with_reason("list a directory"),
+            // An MCP tool runs inside a spawned server process — it can read
+            // files, reach the network and write anywhere, so it is an `Exec`,
+            // not a read. Without this the whole MCP surface bypassed the
+            // policy, which mattered most in plan mode: `mcp__x__delete_file`
+            // would have sailed straight through a posture whose entire purpose
+            // is that nothing changes state.
+            n if n.starts_with("mcp__") => Ask::new(Op::Exec)
+                .with_reason("call an MCP tool (runs in a server process)"),
             "bash" => {
                 // The default posture is "run all commands": the write-quarantine
                 // is enforced by the overlayfs layer (syscall-level), not by this
@@ -5114,6 +5122,45 @@ mod goal_bootstrap_tests {
             None => unsafe { std::env::remove_var("PIR_FAKE_MODEL") },
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    /// An MCP tool runs code in a spawned server process, so it is gated as an
+    /// `Exec`. Before this, MCP names never reached the policy at all — which
+    /// mattered most in plan mode, where a state-changing MCP tool would have
+    /// been allowed through a posture whose whole point is "change nothing".
+    #[test]
+    fn mcp_calls_are_gated_by_the_security_policy() {
+        let mut a = fresh_agent();
+        // Plan mode: a write-capable MCP tool must be refused.
+        a.plan_mode = true;
+        let mut policy = a.security_policy().unwrap_or_default();
+        policy.level = crate::security::SecurityLevel::Plan;
+        a.apply_security_policy(&policy);
+        let blocked = a.security_preflight(
+            "mcp__filesystem__delete_file",
+            &serde_json::json!({"path": "/important"}),
+        );
+        let (reason, _) = blocked.expect("an MCP call must be gated, not silently allowed");
+        assert!(reason.contains("plan-mode"), "got: {reason}");
+        // A built-in read is still fine in plan mode, so the gate is not blanket.
+        assert!(
+            a.security_preflight("read_file", &serde_json::json!({"path": "/tmp/x"})).is_none(),
+            "reads stay allowed in plan mode"
+        );
+        // Restore the default posture (a process-global flag) for other tests.
+        crate::security::set_mitigation_active(true);
+    }
+
+    #[test]
+    fn mcp_calls_are_allowed_in_the_default_posture() {
+        // The default posture is "run all commands", so an MCP call must NOT be
+        // blocked there — otherwise the feature would be dead on arrival.
+        let a = fresh_agent();
+        assert!(
+            a.security_preflight("mcp__demo__echo", &serde_json::json!({"text": "hi"})).is_none(),
+            "MCP calls must work under the default policy"
+        );
     }
 
     #[test]
