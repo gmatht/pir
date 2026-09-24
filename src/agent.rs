@@ -4531,7 +4531,6 @@ mod goal_bootstrap_tests {
 
     #[test]
     fn plan_mode_is_persisted_next_to_the_session_log() {
-        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("pir_plan_side_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -4566,10 +4565,11 @@ mod goal_bootstrap_tests {
     /// by `plan_mode_toggles_the_security_level_and_refuses_writes`.
     #[test]
     fn plan_mode_adds_a_read_only_banner_to_the_system_prompt() {
-        // The prompt embeds the skills catalog + scratchpad line, both read from
-        // process-global state (PI_DIR, PIR_SCRATCHPAD); hold the shared env
-        // lock so a parallel test can't move them mid-comparison.
-        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Deliberately does NOT take the shared env lock: the assertion is a
+        // prefix comparison, so concurrent changes to the prompt's volatile tail
+        // (the skills catalog / scratchpad line) cannot affect it. Taking the
+        // lock here would only lengthen the queue other env-sensitive tests wait
+        // in — the suite's documented parallelism ceiling is contention, not CPU.
         let mut a = fresh_agent();
         assert!(!a.system.contains("PLAN MODE"), "a fresh agent must not be planning");
         a.plan_mode = true;

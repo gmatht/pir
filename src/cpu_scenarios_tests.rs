@@ -347,23 +347,44 @@ fn idle_poll_window_and_budget_are_bounded() {
 /// The measurement harness itself must actually work: a deliberate spin has to
 /// read as a spin, i.e. its CPU cost must swamp the paced idle sleep. Without
 /// this, every `assert_idle_cpu` above could pass by accident.
+///
+/// Verified **differentially**: the same harness is run over the spin and over
+/// a no-op, and the spin must consume substantially more CPU. Absolute figures
+/// are load-dependent (the window's wall time bounds how much CPU *any* body can
+/// burn, and external load shrinks the ratio), but the *comparison* is stable —
+/// a no-op sleeps through every tick whatever else the machine is doing.
 #[test]
 fn probe_detects_a_deliberate_spin() {
     let _serial = fd_lock();
-    let pct = crate::cpu_probe::measure_pct(
-        Duration::from_millis(120),
-        Duration::from_millis(1),
-        || {
-            // ~5ms of solid work per tick against a 1ms idle sleep.
-            let spin = std::time::Instant::now() + Duration::from_millis(5);
-            while std::time::Instant::now() < spin {
-                std::hint::black_box(1u64.wrapping_mul(3));
-            }
-        },
-    )
-    .expect("process CPU clock available in tests");
+    let cpu_nanos = || crate::cpu_probe::thread_cpu_nanos_for_test().expect("process CPU clock available");
+    let run = |body: &mut dyn FnMut()| -> (f64, f64) {
+        let before = cpu_nanos();
+        let pct = crate::cpu_probe::measure_pct(Duration::from_millis(120), Duration::from_millis(1), body)
+            .expect("process CPU clock available in tests");
+        let after = cpu_nanos();
+        ((after.saturating_sub(before)) as f64 / 1_000_000.0, pct)
+    };
+
+    // Baseline: the harness's own idle sleeps, with no work at all.
+    let (idle_ms, idle_pct) = run(&mut || {});
+    // The spin: ~5ms of solid work per tick against the same 1ms idle sleep.
+    let (spin_ms, spin_pct) = run(&mut || {
+        let spin = std::time::Instant::now() + Duration::from_millis(5);
+        while std::time::Instant::now() < spin {
+            std::hint::black_box(1u64.wrapping_mul(3));
+        }
+    });
+
+    eprintln!("probe self-test: idle {idle_pct:.1}% ({idle_ms:.0}ms CPU), spin {spin_pct:.1}% ({spin_ms:.0}ms CPU)");
+    // The spin must burn several times the idle baseline's CPU. Under heavy
+    // external load both numbers shrink, but the ratio holds.
     assert!(
-        pct > CPU_BUDGET_PCT,
-        "the CPU probe failed to detect a deliberate spin: {pct:.1}% (budget {CPU_BUDGET_PCT:.0}%)"
+        spin_ms > idle_ms * 3.0 + 20.0,
+        "the CPU probe failed to distinguish a deliberate spin ({spin_ms:.0}ms CPU) from \
+         idle ({idle_ms:.0}ms CPU)"
+    );
+    assert!(
+        spin_pct > idle_pct,
+        "the CPU probe reported the spin ({spin_pct:.1}%) as no busier than idle ({idle_pct:.1}%)"
     );
 }

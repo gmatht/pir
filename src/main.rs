@@ -4384,7 +4384,6 @@ fn reexec_self() {
 /// failed signal round still restarts at least this terminal.
 #[cfg(unix)]
 fn reexec_all() {
-    use std::os::unix::process::CommandExt as _;
     let me = std::process::id();
     // Durable record first, so even targets we fail to signal still pick it
     // up when they next go idle.

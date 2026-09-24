@@ -53,6 +53,15 @@ pub const SAMPLES: usize = 3;
 
 /// CPU time (user + system) consumed by **this thread**, in nanoseconds.
 /// Returns `None` when no platform clock is available.
+/// The calling thread's consumed CPU time in nanoseconds, or `None` where the
+/// platform has no thread CPU clock. Exposed for the probe's own self-test,
+/// which asserts on *CPU time consumed* rather than the CPU/wall ratio (the
+/// ratio collapses when the thread is descheduled under external load).
+#[cfg(test)]
+pub(crate) fn thread_cpu_nanos_for_test() -> Option<u64> {
+    thread_cpu_nanos()
+}
+
 fn thread_cpu_nanos() -> Option<u64> {
     // Linux: precise, per-thread.
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };

@@ -1936,9 +1936,20 @@ mod tests {
         // acquired (or even reached) the lock when B ran, so B won it and the
         // test failed intermittently. Poll instead — `flock -n` fails while A
         // holds it, so the first refusal is proof A is in.
+        //
+        // The budget is generous because each poll forks two processes and the
+        // suite is documented as contention-bound (see `scripts/deploy.sh`): on a
+        // machine saturated by unrelated CPU work, scheduling the spawned
+        // `flock`/`true` pair can take seconds. We also distinguish "A died"
+        // from "A was never scheduled", so a real failure says which.
         let mut held = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut a_exited: Option<std::process::ExitStatus> = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while std::time::Instant::now() < deadline {
+            if let Ok(Some(st)) = a.try_wait() {
+                a_exited = Some(st);
+                break;
+            }
             let probe = Command::new("flock")
                 .args(["-x", "-n"])
                 .arg(&lock)
@@ -1949,11 +1960,15 @@ mod tests {
                 held = true; // someone (A) is holding it
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if let Some(st) = a_exited {
+            panic!("holder A exited early ({st}) without holding {lock:?}");
         }
         assert!(
             held,
-            "holder A never acquired {lock:?} (the flock under test did not start)"
+            "holder A never acquired {lock:?} within 60s (the flock under test did not start, \
+             or the machine is too loaded to schedule it)"
         );
 
         // Holder B should be refused immediately (-w 0 => no wait). This is now

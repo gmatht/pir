@@ -795,8 +795,7 @@ pub fn spawn_shell_as(
     // a process that has neither euid 0 nor suid 0 (e.g. `sudo -u ai_X pir`,
     // which collapsed r/e/s to the sandbox user) cannot escalate, and we say
     // so clearly.
-    let (mut ruid, mut euid, mut suid) = (0u32, 0u32, 0u32);
-    (ruid, euid, suid) = get_res_uids();
+    let (_ruid, euid, suid) = get_res_uids();
     if euid != 0 && suid != 0 {
         eprintln!(
             "pir: not privileged — cannot start a shell as another user (re-run as root, \
@@ -1361,6 +1360,10 @@ mod accessibility_tests {
         assert_eq!(euid, unsafe { libc::geteuid() });
         #[cfg(not(target_os = "linux"))]
         assert_eq!(suid, euid, "no getresuid off Linux: saved must report as effective");
+        // On Linux `suid` is only read by the assertion above; keep it live so
+        // the platform-specific use is explicit rather than an unused binding.
+        #[cfg(target_os = "linux")]
+        let _ = suid;
 
         // Re-setting the identity we already hold must succeed (it is the
         // documented no-op case in both implementations) and leave us where we
