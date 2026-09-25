@@ -814,6 +814,13 @@ impl Agent {
         // dir name matches the transcript) and swept of stale dirs at the same
         // time. A failure is non-fatal: the agent simply runs without one.
         let _scratchpad = crate::scratchpad::init(log_path.as_deref());
+        // Cgroup housekeeping, for the same reason as the scratch sweep below:
+        // a `pir` that was SIGKILLed leaves its session slice and command
+        // cgroups behind, and a leaked cgroup *holding a limit* is worse than
+        // no cgroups at all (it makes the next run unaccounted). Only empty
+        // cgroups are removed, so a concurrently running session is never
+        // disturbed.
+        let _ = crate::resource::sweep_stale();
         // Rewindable turn checkpoints (Feature 8), loaded from the sidecar next
         // to the transcript so a resume can rewind work done before it.
         let checkpoints = crate::checkpoint::Store::load_opt(log_path.as_deref());

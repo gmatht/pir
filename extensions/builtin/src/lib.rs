@@ -128,6 +128,13 @@ struct Job {
     err: Arc<Mutex<Vec<u8>>>,
     drain_out: JoinHandle<()>,
     drain_err: JoinHandle<()>,
+    /// The command's resource cgroup, kept alive exactly as long as the job.
+    /// Dropping it removes the cgroup directory, so a detached job's limits
+    /// and accounting stay valid for the whole time it runs — and a finished
+    /// job leaves nothing behind. (Not read directly: the guard's *effect* is
+    /// its lifetime.)
+    #[allow(dead_code)]
+    cgroup: Option<crate::resource::CommandCgroup>,
 }
 
 impl ToolBackend for Builtin {
@@ -2256,7 +2263,27 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
     // (e.g. the worktree extension) can `cd` the agent into a linked worktree
     // and have bash honor it. Falls back to `b.cwd` if the process cwd is gone.
     let live_cwd = std::env::current_dir().unwrap_or_else(|_| b.cwd.clone());
-    let mut child = spawn_shell(command, &live_cwd)?;
+    // Resource limits (memory/PIDs) are applied by placing the command in a
+    // cgroup, joined in the child's `pre_exec` before the uid drop. The guard
+    // owns the cgroup directory and removes it on drop, so the cgroup's
+    // lifetime is structurally tied to the command's — including across the
+    // detach-into-a-Job path below.
+    let session_key = crate::resource::session_key();
+    let (mut child, resource_cgroup) = spawn_shell_limited(command, &live_cwd, Some(&session_key))?;
+    // The limits the poll loop enforces. Recomputed here rather than returned
+    // from the spawn so the *reported* budget always matches what the cgroup
+    // was actually given.
+    let host_now = crate::resource::HostMem::read().unwrap_or_default();
+    let mut limits = crate::resource::limits_for_session(&host_now, &session_key);
+    // Reflect what the kernel actually got: `enforce` is the posture we asked
+    // for, `enforced` is whether a limit was really written. Reporting the
+    // *intent* as enforcement would be dishonest in exactly the case that
+    // matters (a container where the write silently failed).
+    if let Some(cg) = resource_cgroup.as_ref() {
+        let really_enforced = cg.enforced;
+        limits.enforce = really_enforced;
+    }
+    let mut guard = crate::resource::Guard::new(limits, resource_cgroup);
     // Shared, capped output buffers drained on background threads so the pipe
     // never blocks and a detached job can be polled for partial output.
     let out_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(64 * 1024)));
@@ -2322,6 +2349,10 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
     let abort = b.abort.clone();
     let deadline = Instant::now() + TIMEOUT;
     let next_check_in = Instant::now() + check_in;
+    // Set when the resource guard killed the command; becomes part of the
+    // tool result so the model learns *why* it died (an unexplained SIGKILL
+    // makes it retry the same command forever).
+    let mut resource_status: Option<String> = None;
     // Kill the whole process group of the child (item: child is in its own
     // group via process_group(0)), so shell pipelines / subcommands die too,
     // and so cancelling a runaway command never takes pir down with it.
@@ -2354,6 +2385,21 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
                     kill_tree(&mut child);
                     break None;
                 }
+                // Resource guard: memory / PID / host-pressure checks, on the
+                // same tick as everything else (no extra thread). A kill here
+                // is *deliberate and pre-OOM*: it happens before the kernel's
+                // OOM killer or a swap-thrash collapse, and carries a message
+                // the model can act on.
+                if let Some(reason) = guard.observe(true) {
+                    let msg = guard.kill_message(&reason, command);
+                    // Same bounded TERM→KILL escalation as every other kill
+                    // path (never a blocking wait: a D-state child can survive
+                    // SIGKILL for a long time, and blocking here wedges the
+                    // whole REPL).
+                    kill_tree(&mut child);
+                    resource_status = Some(msg);
+                    break None;
+                }
                 if Instant::now() >= next_check_in {
                     // Detach: hand the running command to the model as a job
                     // so it can keep working and decide later (poll with
@@ -2377,6 +2423,7 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
                         err: err_buf,
                         drain_out,
                         drain_err,
+                        cgroup: guard.take_cgroup(),
                     });
                     return Ok(format!(
                         "[detached] command still running after {}; it is now background job #{}. \
@@ -2422,7 +2469,49 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
         Some(s) if s.success() => {}
         Some(s) => text.push_str(&format!("\n[exit code {}]", s.code().unwrap_or(-1))),
         None if abort.load(Ordering::SeqCst) => text.push_str("\n[pir] command aborted by user (ESC/ctrl-c)"),
+        // A resource kill is not a timeout and not a user abort: say which one
+        // it was, because the model's next move differs entirely (retry smaller
+        // vs. stop). Falling through to the generic "timed out" wording here
+        // would be actively misleading — the command did not run out of time,
+        // it was stopped at a memory budget.
+        None if resource_status.is_some() => {}
         None => text.push_str(&format!("\n[pir] timed out after {}s, killed", TIMEOUT.as_secs())),
+    }
+    // The resource guard's verdict: why the command was killed, what its budget
+    // was and where that number came from, and a hint for the common causes.
+    // This is the whole point of the feature being *legible* — an unexplained
+    // SIGKILL (exit 137) makes a model retry the same command forever.
+    //
+    // The message replaces the bare exit status: when the *kernel* killed the
+    // command, `try_wait` reports a signal death with no code, which used to
+    // surface as "[exit code -1]" — technically true and completely useless to
+    // a model deciding whether to retry.
+    if let Some(msg) = &resource_status {
+        if !text.trim().is_empty() {
+            text.push('\n');
+        }
+        text.push_str(msg);
+        if let Some(peak) = guard.peak_note() {
+            text.push_str(&format!("{peak}\n"));
+        }
+    } else if let Some(note) = guard.success_note() {
+        // Success, but the command came close to its ceiling: report the peak so
+        // the operator can raise the budget *before* the next failure rather
+        // than after it.
+        if !text.trim().is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&note);
+    }
+    // Host pressure that did not justify a kill is still worth saying: it
+    // explains a slow run and tells the model the box is not its fault.
+    if resource_status.is_none()
+        && let Some(note) = &guard.not_blamed_note
+    {
+        if !text.trim().is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!("[pir] {note}"));
     }
     // In-process capability-deny detection (the chosen lightweight option;
     // docs/SECURITY_INTENT.md §6). Runs ONCE per command, after it exits —
@@ -2679,6 +2768,70 @@ fi
 "#;
 
 fn spawn_shell(command: &str, cwd: &Path) -> Result<std::process::Child, String> {
+    spawn_shell_limited(command, cwd, None).map(|(c, _)| c)
+}
+
+/// Spawn a shell command, optionally placing it in a resource-limited cgroup.
+///
+/// The cgroup is created **in the parent** (so the parent can write its limits
+/// and later read its accounting) and joined **in the child's `pre_exec`**,
+/// before the uid drop: the child is single-threaded at that point (the only
+/// race-free window to write `cgroup.procs`), and after the drop to `ai_X` the
+/// write would fail EACCES.
+///
+/// Returns the child plus the [`CommandCgroup`] guard, whose `Drop` removes the
+/// cgroup directory. The guard must be kept alive for as long as the command
+/// can run — including when the command is detached into a `Job` — so the
+/// caller stores it alongside the child.
+#[cfg(unix)]
+fn spawn_shell_limited(
+    command: &str,
+    cwd: &Path,
+    session_key: Option<&str>,
+) -> Result<(std::process::Child, Option<crate::resource::CommandCgroup>), String> {
+    let cgroup = match session_key {
+        Some(key) => {
+            let host = crate::resource::HostMem::read().unwrap_or_default();
+            let limits = crate::resource::limits_for_session(&host, key);
+            match crate::resource::create_command_cgroup(
+                key,
+                limits.memory_bytes,
+                limits.pids,
+                limits.enforce,
+            ) {
+                Ok(cg) => cg,
+                // A cgroup we cannot create must never stop the command: the
+                // poll-based guard and the host-pressure check still run.
+                Err(e) => {
+                    eprintln!(
+                        "{}",
+                        crate::term::dim(&format!("[pir] resource limits unavailable: {e}"))
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let cg_for_child = cgroup.as_ref().map(|cg| cg.dir().to_path_buf());
+    let child = spawn_shell_inner(command, cwd, cg_for_child)?;
+    Ok((child, cgroup))
+}
+
+#[cfg(not(unix))]
+fn spawn_shell_limited(
+    command: &str,
+    cwd: &Path,
+    _session_key: Option<&str>,
+) -> Result<(std::process::Child, Option<crate::resource::CommandCgroup>), String> {
+    spawn_shell_inner(command, cwd, None).map(|c| (c, None))
+}
+
+fn spawn_shell_inner(
+    command: &str,
+    cwd: &Path,
+    cgroup_dir: Option<std::path::PathBuf>,
+) -> Result<std::process::Child, String> {
     // Hard-kill behind every `timeout`: GNU `timeout` alone sends only
     // SIGTERM, so a child that ignores/traps TERM (or is wedged) survives the
     // model's `timeout 120 cargo test`, keeps the stdout pipe open, and hangs
@@ -2727,6 +2880,24 @@ fn spawn_shell(command: &str, cwd: &Path) -> Result<std::process::Child, String>
             let path = std::env::temp_dir().join("pir-timeout/bashenv");
             if path.is_file() {
                 c.env("BASH_ENV", path);
+            }
+        }
+        // Resource limits: join the command's cgroup in the child, BEFORE the
+        // uid drop. `pre_exec` runs after fork and before exec while the child
+        // is still single-threaded — the only window where writing
+        // `cgroup.procs` is race-free — and after dropping to `ai_X` the write
+        // would fail EACCES, so the order here is load-bearing.
+        #[cfg(unix)]
+        if let Some(dir) = cgroup_dir.clone() {
+            let procs = dir.join("cgroup.procs");
+            unsafe {
+                c.pre_exec(move || {
+                    use std::io::Write;
+                    // Our own pid in the child is the process that will exec.
+                    let mut f = std::fs::OpenOptions::new().write(true).open(&procs)?;
+                    f.write_all(std::process::id().to_string().as_bytes())?;
+                    Ok(())
+                });
             }
         }
         // Confine this command to the per-project `ai_X` sandbox user. This is

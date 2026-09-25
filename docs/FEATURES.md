@@ -561,7 +561,66 @@ hang. None of that may stop pir from running:
 
 ---
 
-## 12. Environment variables added
+## 12. Resource limits for agent commands
+
+Every `bash` command the agent runs is placed in its own **cgroup**, with memory
+and process ceilings, and killed *before* the host OOMs or a swap collapse makes
+the machine unresponsive. Full design and measurements:
+[`RESOURCE_LIMITS.md`](RESOURCE_LIMITS.md).
+
+**The limits are advisory by default.** A `cargo build` that legitimately needs
+30 GB must be allowed to take 30 GB, and a static number cannot tell that apart
+from a leak heading for 30 GB — OOM pressure is *exceptional*, multi-GB builds
+are *ordinary*. So a command's cgroup is created and **measured** but no hard
+kernel ceiling is written, and commands are stopped only when the host is
+genuinely in danger.
+
+| knob | default | effect |
+|---|---|---|
+| per-command ceiling | `max(60% of RAM, 4 GiB)` | deliberately loose: ~38 GiB on a 64 GiB box, so a 30 GB build fits. Not clamped by current free memory |
+| session ceiling | `max(90% of RAM, ceiling + 1 GiB)` | bounds the aggregate of commands + jobs + sub-agents; stays above the per-command ceiling |
+| enforcement | **off** unless `MemAvailable < max(10%, 1 GiB)`, swap >50% used, or an explicit override | the ceiling becomes a hard kernel limit only under real pressure |
+| `memory.soft_limit_in_bytes` | the ceiling, always | reclaim *preference* under pressure — it can never kill, so heavy work proceeds while the kernel still prefers our cache |
+| swap allowance | `0` per command (when armed), `256 MiB` per session | overshoot kills immediately instead of thrashing |
+| `pids.max` | 1024–4096 by host size | a fork cascade cannot exhaust the host PID table |
+| CPU | **not limited** | a build *should* use every core; capping it silently would make every build 20× slower |
+
+The ceilings are **derived from the host** (and from the container's own limit,
+so a container-limited `pir` does not imagine it has the host's RAM), and
+`/limits` shows where each number came from *and* which posture is live —
+"advisory — commands are measured; the ceiling is not a kill line" versus
+"ARMED — the host is under pressure".
+
+Two things make this more than a limit:
+
+* **It is legible.** A killed command comes back with its budget, the basis for
+  that number, the peak, whether the host was in danger, and a hint for the
+  common causes (`-j$(nproc)`, `xargs -P`, node leaks). An unexplained SIGKILL
+  (exit 137) makes a model retry the same command forever. A command that
+  *succeeded* near its ceiling reports its peak too, so the operator can raise
+  the budget before the next failure rather than after it.
+* **It asks whether the task is to blame.** When the host is under pressure the
+  guard compares how fast the tool's memory is growing against how fast the host
+  is losing available memory. A task whose usage is flat while the host drains is
+  **not** killed — it gets a note saying another consumer is growing, and the
+  *next* command's budget shrinks instead. A wrong kill destroys a correct
+  `cargo build` and reads as flakiness, so the asymmetry favours not killing.
+  The one exception is the hard floor (`MemAvailable < 5% of RAM, min 512 MiB`),
+  where the box is about to OOM *something* and the command is stopped for host
+  protection — explicitly labelled as **not** an accusation.
+
+`/limits` reports the detected hierarchy, the budgets, the enforcement mode and
+the live host state. On a host with no usable cgroup memory controller it says
+**"detection only"** rather than pretending: commands are then measured and
+host-pressure checked, but not kernel-limited.
+
+Knobs: `PIR_RESOURCE_MEMORY_MIB` (sets a ceiling **and** arms it),
+`PIR_RESOURCE_ENFORCE=1` (arm on a healthy host), `PIR_RESOURCE_PIDS`,
+`PIR_CGROUP=0` (disable).
+
+---
+
+## 13. Environment variables added
 
 | variable | effect |
 |---|---|
@@ -581,6 +640,10 @@ hang. None of that may stop pir from running:
 | `PI_DIR` | relocates the config dir, and with it the global taste/skills/plans stores |
 | `PIR_MCP` | `0` disables MCP entirely (no server is spawned) |
 | `PIR_MCP_TIMEOUT_SECS` | per-request MCP timeout (default 120) |
+| `PIR_RESOURCE_MEMORY_MIB` | per-command memory budget (overrides the host-derived value) |
+| `PIR_RESOURCE_PIDS` | per-command process ceiling (overrides the host-derived value) |
+| `PIR_CGROUP` | `0` disables cgroups entirely (detection + host guard only) |
+| `PIR_RESOURCE_ENFORCE` | `1` arms kernel enforcement even on a healthy host |
 
 ---
 
@@ -595,6 +658,7 @@ hang. None of that may stop pir from running:
 | `/plan <task>` | enter plan mode with the task pre-filled |
 | `/taste [list\|remember\|forget\|find\|path]` | manage recorded preferences |
 | `/mcp` | list configured MCP servers and their available tools |
+| `/limits` (or `/resources`) | show the resource limits, their basis, and the detected cgroup backend |
 | `/checkpoints` | list the rewindable turn boundaries |
 | `/rewind <#>` | restore the tree and the conversation to a checkpoint |
 

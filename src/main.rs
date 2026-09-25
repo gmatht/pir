@@ -23,6 +23,7 @@ mod plugin;
 mod project;
 mod provider;
 mod scratchpad;
+mod resource;
 mod session;
 mod sixel;
 mod skills;
@@ -314,12 +315,19 @@ OPTIONS
                        Suppresses terminal output. For headless / CI use.
 
 CONFIG (reused from pi, never modified)
-  ~/.pi/models.json          providers, models, api keys ("{env:VAR}" supported)
-  ~/.pi/agent/settings.json  optional default model ("defaultModel" / "defaultProvider")
+  ~/.pi/agent/models-store.json  providers, models, api keys ("{env:VAR}" supported)
+  ~/.pi/agent/settings.json     optional default model ("defaultModel" / "defaultProvider")
   ~/.pi/agent/AGENTS.md (global) + AGENTS.md/CLAUDE.md walking up from cwd
-                          (AGENTS.override.md wins per dir) appended to the system prompt
-  ~/.pi/agent/sessions/      pir session transcripts + goal files (pir-*.jsonl/.goal.json)
-  ~/.pi/agent/projects.json  project -> execution-user mappings (set by `pir project init`)
+                           (AGENTS.override.md wins per dir) appended to the system prompt
+  ~/.pi/agent/sessions/        pir session transcripts + goal files (pir-*.jsonl/.goal.json)
+  ~/.pi/agent/projects.json    project -> execution-user mappings (set by `pir project init`)
+
+SPACE BUNNY ALPHA (free preview)
+  Space Bunny Alpha is available through either route when its key is configured:
+    pir -m openrouter/stealth/space-bunny-alpha       (OPENROUTER_API_KEY or auth.json `openrouter`)
+    pir -m commandcode/stealth/space-bunny-alpha     (CMD_API_KEY / COMMANDCODE_API_KEY or auth.json `commandcode`)
+  Both routes expose 1M context and up to 524,288 output tokens. Reasoning is mandatory;
+  OpenRouter uses nested `reasoning: {effort}`, while Command Code uses `reasoning_effort`.
 
 PER-PROJECT USERS
   `pir project init` creates a non-login user ai_<project> owning the cwd so
@@ -355,6 +363,14 @@ COMMANDS
                           files it created are removed, and the model's history
                           is truncated so it no longer sees the undone work
                           (shell side effects are NOT undone; the result says so)
+  /limits                show the resource limits on agent commands (memory,
+                          pids, swap), where each number came from, and whether
+                          the limit is armed. Commands are *measured* in a
+                          cgroup by default and killed only when the host is
+                          actually in danger — a build needing tens of GB is
+                          meant to succeed. Knobs: PIR_RESOURCE_MEMORY_MIB
+                          (ceiling + arms it), PIR_RESOURCE_ENFORCE=1,
+                          PIR_RESOURCE_PIDS, PIR_CGROUP=0 (disable)
   /scratchpad [ls|clear]  show the per-session scratch directory (exported to
                           tools as $PIR_SCRATCHPAD); `ls` lists it, `clear` empties it
   /skills [name]         list discovered skills (project .pir/skills, user
@@ -779,7 +795,7 @@ fn main() {
     // the background-job spawner both read this list).
     let mut providers = match config::load_providers() {
         Ok(p) if !p.is_empty() => p,
-        Ok(_) => die("~/.pi/models.json contains no providers"),
+        Ok(_) => die("~/.pi/agent/models-store.json contains no providers"),
         Err(e) => die(&e),
     };
     // Snapshot the pre-drop catalog for later `load_providers()` calls
@@ -2872,7 +2888,7 @@ fn handle_command(
             // pick one. On success the key is saved and — if that provider is
             // already in the live model catalog — the agent switches to its
             // first model so the credential is live immediately. Environment
-            // variables (`{env:VAR}` in models.json) take precedence over stored
+            // variables (`{env:VAR}` in models-store.json) take precedence over stored
             // keys, exactly as at startup.
             if fg_running {
                 eprintln!("pir: a turn is running — finish or /cancel it first, then /login");
@@ -2944,7 +2960,7 @@ fn handle_command(
         "logout" => {
             // Remove a stored credential from ~/.pi/agent/auth.json (pi's
             // `/logout`, which only touches the auth file — environment-variable
-            // and models.json config are untouched). With no argument we list
+            // and models-store.json config are untouched). With no argument we list
             // what's stored; with one we remove that provider's entry.
             let stored = config::stored_auth_providers();
             let provider_id = match rest.first().copied() {
@@ -3371,8 +3387,8 @@ fn handle_command(
         }
         "reload" => {
             // Re-read the on-disk configuration without restarting: the model
-            // catalog (`~/.pi/models.json` / `models-store.json`), the notify
-            // policy, and the per-session settings that are read lazily from
+            // catalog (`~/.pi/agent/models-store.json`), the notify policy, and
+            // the per-session settings that are read lazily from
             // `~/.pi/agent/settings.json`. Editing those files used to require
             // a full restart (or, for the catalog, a lucky `/model` that
             // happened to re-read); `/reload` makes it explicit.
@@ -3407,7 +3423,7 @@ fn handle_command(
                 "{} reloaded {} provider(s) from {}",
                 term::green("✓"),
                 n,
-                config::pi_dir().join("agent").join("models.json").display()
+                config::pi_dir().join("agent").join("models-store.json").display()
             );
             if refreshed {
                 let label = {
@@ -3530,6 +3546,32 @@ fn handle_command(
                 ),
                 None => eprintln!("pir: agent busy (turn running) — try again when idle"),
             }
+        }
+        "limits" | "resources" => {
+            // `/limits` — what the agent's commands are actually bounded by.
+            // Reports the detected cgroup hierarchy, the budgets and *where
+            // they came from*, and the live host state, so an operator can see
+            // both the policy and the machine it is derived from. The honest
+            // "detection only" case matters here: on a host with no usable
+            // controller, saying so is the whole value of the command.
+            let host = crate::resource::HostMem::read().unwrap_or_default();
+            let l = crate::resource::limits_for_session(&host, &crate::resource::session_key());
+            println!("{}", crate::resource::describe(&host));
+            if l.backend == crate::resource::Backend::None {
+                println!(
+                    "{}",
+                    term::yellow(
+                        "  note: no cgroup memory controller here — commands are measured and \
+                         host-pressure checked, but not kernel-limited."
+                    )
+                );
+            }
+            println!(
+                "{}",
+                term::dim(
+                    "  knobs: PIR_RESOURCE_MEMORY_MIB, PIR_RESOURCE_PIDS, PIR_CGROUP=0 disables"
+                )
+            );
         }
         "scratchpad" | "scratch" => {
             // `/scratchpad` — show (and optionally open) the per-session scratch
