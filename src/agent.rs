@@ -206,6 +206,13 @@ pub struct Agent {
     /// Auto-nudges used in the current turn (reset each turn; bounded by
     /// [`STOP_NUDGE_MAX`]).
     stop_nudges: usize,
+    /// The user prompt that the current in-turn nudge was already issued for.
+    /// The nudge is itself logged as a `user` message, so a *resumed* session
+    /// replays it; this remembers which prompt it belongs to and suppresses a
+    /// second nudge for that same prompt (otherwise a resumed run answers the
+    /// replayed nudge instead of the operator, and ends every turn —
+    /// "pir keeps exiting").
+    stop_nudged_for_prompt: Option<String>,
     /// Cached provider list (loaded once, reused for model switches / resume).
     /// Avoids re-reading and re-parsing `~/.pi/agent/models-store.json` on every
     /// `/model` switch, resume, and `apply_persisted_model` call.
@@ -860,6 +867,7 @@ impl Agent {
             stop_hit: None,
             last_stop: None,
             stop_nudges: 0,
+            stop_nudged_for_prompt: None,
             cached_providers,
             loop_detector: LoopDetector::new(),
             turn_started: None,
@@ -1252,7 +1260,7 @@ impl Agent {
 
     /// Re-read the model catalog from disk and refresh the agent's cached copy
     /// (`/reload`). The catalog is otherwise loaded once in [`Agent::new`], so
-    /// editing `~/.pi/models.json` (adding a provider, a key, a new model) had
+    /// editing `~/.pi/agent/models-store.json` (adding a provider, a key, a new model) had
     /// no effect until pir was restarted.
     ///
     /// The *active* model is re-resolved against the fresh catalog by label:
@@ -3214,7 +3222,32 @@ impl Agent {
                         self.mark_status(SessionStatus::Completed, self.goal_pending(), "");
                         return Ok(());
                     }
+                    // A turn that only *looks* text-only because it is being
+                    // resumed is the trap this guards: a resumed session's
+                    // history already contains this very nudge (it is logged
+                    // as a `user` message, see `log_line(&mut self.log, &nudge)`
+                    // below), so the model tends to answer the *nudge* rather
+                    // than the operator's prompt, and each such answer ends the
+                    // turn — observed as pir "randomly exiting" every turn on
+                    // `pir -r`. Only nudge when the model has not already been
+                    // nudged since the last real user prompt.
+                    if self.stop_nudged_for_prompt.as_deref() == Some(&user[..]) {
+                        if !self.silent() {
+                            term::out(&term::dim(
+                                "· stop-skill: this prompt was already nudged — ending turn",
+                            ));
+                        }
+                        self.registry.emit(EventKind::AgentEnd, &json!({}));
+                        self.notify.publish(self.turn_done_event(), false);
+                        if !self.silent() {
+                            self.registry.emit(EventKind::TurnEnd, &json!({ "prompt": user }));
+                            self.continuations.extend(self.registry.on_turn_end(user));
+                        }
+                        self.mark_status(SessionStatus::Completed, self.goal_pending(), "");
+                        return Ok(());
+                    }
                     self.stop_nudges += 1;
+                    self.stop_nudged_for_prompt = Some(user.to_string());
                     let nudge = Message::user(
                         "Your last message had no tool calls. If the work is really done, end \
                          your turn with an explicit request_stop call (reason stop-complete, or \
@@ -3877,7 +3910,7 @@ fn make_client(provider: &Provider, cancel: Arc<AtomicBool>) -> Result<Client, S
     // The model is unknown at construction time; per-model overrides are
     // re-applied per-call (see `chat`). Here we resolve the provider-level
     // defaults, falling back to the first model's override when the provider
-    // itself has no baseUrl (e.g. a stored OpenCode key with no models.json).
+    // itself has no baseUrl (e.g. a stored OpenCode key with no models-store.json).
     let kind = provider
         .models
         .first()
