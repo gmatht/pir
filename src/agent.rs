@@ -2144,6 +2144,25 @@ impl Agent {
                 is_error: false,
             })
         } else {
+            // A timeout is not a rejection: the operator never answered, so
+            // telling the model "the operator dismissed the dialog" (and then
+            // "Revise the plan and call plan_write again") is what produced the
+            // loop where the agent re-submitted plan after plan while the
+            // operator was never given a chance to respond. Report it honestly
+            // and drop the "revise and resubmit" instruction for this case.
+            if answer == crate::askuser::Answer::TimedOut {
+                return Some(Outcome {
+                    content: format!(
+                        "No approval decision: the plan approval dialog timed out before the \
+                         operator answered — this is NOT a rejection, and it is NOT approval. \
+                         You are still in plan mode (read-only). Saved to {}. Do not immediately \
+                         re-submit the plan. State that you are waiting on approval and end the \
+                         turn with request_stop(reason=stop-needs-input).",
+                        path.display()
+                    ),
+                    is_error: true,
+                });
+            }
             let feedback = match &answer {
                 crate::askuser::Answer::Text(t) => format!("\nOperator feedback: {t}"),
                 crate::askuser::Answer::Chosen(v) if !v.is_empty() => {
@@ -2239,17 +2258,41 @@ impl Agent {
             });
         }
         let mut parts: Vec<String> = Vec::new();
+        let mut timed_out = false;
         for (i, q) in questions.iter().enumerate() {
             let ans = match crate::askuser::ask(q) {
                 Some(a) => a,
+                // No renderer/EOF: treat as an explicit dismissal, not a timeout
+                // (nobody was ever going to answer — `interactive()` above should
+                // have caught this, so this is a belt-and-braces fallback).
                 None => crate::askuser::Answer::Dismissed,
             };
+            if ans == crate::askuser::Answer::TimedOut {
+                timed_out = true;
+            }
             let label = if questions.len() > 1 {
                 format!("{}. [{}] {}", i + 1, q.header, q.question)
             } else {
                 format!("[{}] {}", q.header, q.question)
             };
             parts.push(format!("{label}\n   → {}", ans.render()));
+        }
+        // A timeout is *not* an answer. Say so plainly, and tell the model what
+        // to do about it — otherwise it reads "the user answered: … (dismissed)"
+        // and concludes the operator actively rejected the question.
+        if timed_out {
+            let plural = if questions.len() > 1 { "s" } else { "" };
+            return Some(Outcome {
+                content: format!(
+                    "No answer: the question{plural} timed out before the operator responded. This is \
+                     NOT a decision by the operator — they never answered. Do not ask again or \
+                     re-ask the same question. Make the most reasonable assumption, state it \
+                     explicitly, and continue (or end the turn with \
+                     request_stop(reason=stop-needs-input) if the decision is genuinely blocking).\n{}",
+                    parts.join("\n")
+                ),
+                is_error: true,
+            });
         }
         Some(Outcome {
             content: format!("The user answered:\n{}", parts.join("\n")),
@@ -3296,6 +3339,20 @@ impl Agent {
                 ));
             }
             for (id, name, input) in &calls {
+                // Cancellation check *per tool*, not just per batch. The model
+                // may request several tools at once; previously ESC was only
+                // noticed at the loop top, so every remaining tool in the batch
+                // still ran (each with its own kill grace / drain budget) before
+                // the turn could end — the "cancelling takes seconds" report.
+                // Bail out before starting the next one.
+                if self.cancel.load(Ordering::SeqCst) {
+                    results.blocks.push(Block::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: "[pir] cancelled by user before this tool ran".to_string(),
+                        is_error: true,
+                    });
+                    continue;
+                }
                 if !self.silent() {
                     // Trailing `\n` so back-to-back tool calls (and their
                     // results) each start on their own line instead of running

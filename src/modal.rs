@@ -20,7 +20,8 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use std::io::{self, Write};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The previously drawn modal frame (its vertical extent + exact bytes sent).
@@ -116,27 +117,77 @@ impl Drop for Modal {
     }
 }
 
-/// Read a single key from the terminal (blocking). Returns `None` on EOF or a
-/// read error. Translates crossterm events into the [`Key`] enum.
+/// The abandonment flag of the currently-installed ask, if any. Set by
+/// [`set_abort_flag`] before the renderer runs. Kept as an `Arc` so clones are
+/// cheap and no raw pointers are involved.
+static ABORT: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
+
+/// Install the abandonment flag the ask renderer should poll. Called by
+/// [`crate::askuser::ask`] before it invokes the renderer; the flag is the
+/// caller's, so a timeout can be observed by the dialog itself.
+pub fn set_abort_flag(flag: Arc<AtomicBool>) {
+    *ABORT.lock().unwrap_or_else(|e| e.into_inner()) = Some(flag);
+}
+
+/// Forget the current ask's abandonment flag. Called by [`crate::askuser::ask`]
+/// once it has returned, so a timed-out question cannot make a *later*
+/// unrelated dialog (the menus, pickers and other `read_key` users) close
+/// itself the instant it opens — the flag belongs to one question, not to the
+/// process.
+pub fn clear_abort_flag() {
+    *ABORT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// True when the current ask has been abandoned (the caller timed out). The
+/// modal loops check this so an abandoned dialog closes itself.
+pub fn aborted() -> bool {
+    ABORT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|f| f.load(Ordering::SeqCst))
+        .unwrap_or(false)
+}
+
+/// Read a single key from the terminal (blocking). Returns `None` on EOF, a
+/// read error, or when the ask has been abandoned (see [`aborted`]), which the
+/// callers treat as "dismiss" so an abandoned dialog returns promptly instead
+/// of blocking forever on the alternate screen.
+///
+/// The read is polled rather than fully blocking so an abandonment is noticed
+/// within [`ABORT_POLL`] even when the operator never presses a key.
 pub fn read_key() -> Option<Key> {
     loop {
-        match event::read() {
-            Ok(Event::Key(KeyEvent { code, modifiers, kind, .. })) => {
-                // Ignore key-release events: a release (e.g. the Enter key-up
-                // that follows submitting `/menu`) must never be treated as a
-                // press — that made the menu skip straight to the first item.
-                // Press and Repeat are both accepted (holding a key repeats).
-                if kind == KeyEventKind::Release {
-                    continue;
-                }
-                return Some(translate_key(code, modifiers));
-            }
-            Ok(Event::Resize(_, _)) => return Some(Key::Resize),
-            Ok(_) => continue, // mouse / focus / paste: ignore
-            Err(_) => return None,
+        if aborted() {
+            return None;
         }
+        if event::poll(ABORT_POLL).unwrap_or(false) {
+            match event::read() {
+                Ok(Event::Key(KeyEvent { code, modifiers, kind, .. })) => {
+                    // Ignore key-release events: a release (e.g. the Enter key-up
+                    // that follows submitting `/menu`) must never be treated as a
+                    // press — that made the menu skip straight to the first item.
+                    // Press and Repeat are both accepted (holding a key repeats).
+                    if kind == KeyEventKind::Release {
+                        continue;
+                    }
+                    return Some(translate_key(code, modifiers));
+                }
+                Ok(Event::Resize(_, _)) => return Some(Key::Resize),
+                Ok(_) => continue, // mouse / focus / paste: ignore
+                Err(_) => return None,
+            }
+        }
+        // Timed out waiting for a key: loop to re-check the abort flag. This is
+        // the only reason the poll is bounded — a plain blocking `event::read`
+        // would sit in the read forever after the caller gave up.
     }
 }
+
+/// How long [`read_key`] waits for a key before re-checking the abandonment
+/// flag. Small enough that an abandoned dialog closes imperceptibly fast,
+/// large enough not to spin.
+const ABORT_POLL: Duration = Duration::from_millis(100);
 
 fn translate_key(code: KeyCode, mods: KeyModifiers) -> Key {
     use KeyCode::*;

@@ -2268,13 +2268,35 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
     // owns the cgroup directory and removes it on drop, so the cgroup's
     // lifetime is structurally tied to the command's — including across the
     // detach-into-a-Job path below.
+    //
+    // Skipped under `cfg(test)`: `cargo test` runs every case as a thread of one
+    // process and spawns children from many of them concurrently, and a
+    // *grandchild* that outlives its test inherits the membership — which then
+    // makes an unrelated later test wait on a process it never started (an
+    // earlier version of this code wedged the whole suite that way, and it also
+    // made tests contend on the shared cgroup tree). The feature is exercised
+    // by the dedicated probes in `crate::resource`, which spawn their own
+    // processes; the tests here only care about kill/timeout semantics.
+    #[cfg(not(test))]
     let session_key = crate::resource::session_key();
-    let (mut child, resource_cgroup) = spawn_shell_limited(command, &live_cwd, Some(&session_key))?;
+    #[cfg(not(test))]
+    let (mut child, resource_cgroup) =
+        spawn_shell_limited(command, &live_cwd, Some(&session_key))?;
+    #[cfg(test)]
+    let (mut child, resource_cgroup): (
+        std::process::Child,
+        Option<crate::resource::CommandCgroup>,
+    ) = (spawn_shell(command, &live_cwd)?, None);
     // The limits the poll loop enforces. Recomputed here rather than returned
     // from the spawn so the *reported* budget always matches what the cgroup
-    // was actually given.
+    // was actually given. Under `cfg(test)` there is no cgroup (see above), so
+    // the guard is built from a zero-limit keyless set: it still provides the
+    // host-pressure check but never reports a budget it does not have.
     let host_now = crate::resource::HostMem::read().unwrap_or_default();
+    #[cfg(not(test))]
     let mut limits = crate::resource::limits_for_session(&host_now, &session_key);
+    #[cfg(test)]
+    let mut limits = crate::resource::limits_for_session(&host_now, "cfg-test");
     // Reflect what the kernel actually got: `enforce` is the posture we asked
     // for, `enforced` is whether a limit was really written. Reporting the
     // *intent* as enforcement would be dishonest in exactly the case that
@@ -2360,6 +2382,11 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
     let kill_tree = |child: &mut std::process::Child| {
         kill_process_tree(child);
     };
+    // Forceful variant for an interactive ESC/ctrl-c: SIGKILL immediately, no
+    // SIGTERM grace window (see `kill_process_tree_force`).
+    let kill_tree_force = |child: &mut std::process::Child| {
+        kill_process_tree_force(child);
+    };
     let status = loop {
         // ESC/ctrl-c hard-abort: if the user asked to cancel the command, kill
         // the child immediately and stop — no waiting for it to exit on its own.
@@ -2368,7 +2395,12 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
         // running, holding output pipes and wedging later commands/jobs).
         if abort.load(Ordering::SeqCst) {
             b.kill_all_jobs();
-            kill_tree(&mut child);
+            // Interactive cancel: the operator asked for this to stop NOW, so
+            // skip the 500ms SIGTERM grace and SIGKILL the group straight away.
+            // Waiting out the grace is pure latency on the exact gesture the
+            // user is hammering the key about (the "cancelling is SO SLOW"
+            // report); background sweeps below keep the polite ordering.
+            kill_tree_force(&mut child);
             break None;
         }
         if b.job_kill.swap(false, Ordering::SeqCst) {
@@ -2451,7 +2483,21 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
     // Bounded joins: if something outside the group still holds the pipe (an
     // orphaned `cmd &` from the command string), don't block the REPL forever
     // waiting for EOF — abandon the drain thread instead.
-    let drains_done = join_drain(drain_out) && join_drain(drain_err);
+    //
+    // On an interactive abort we have just SIGKILLed the group, so there is
+    // nothing left to drain: waiting even the 500ms budget would be dead time
+    // on the cancel path. The pipes may still be held by an orphan outside the
+    // group, which is exactly why we never join them unboundedly here.
+    let interrupted = abort.load(Ordering::SeqCst);
+    let drains_done = if interrupted {
+        // Detach without waiting: the group is dead; only orphans remain, and
+        // they must not delay the operator's cancel.
+        detach_drain(drain_out);
+        detach_drain(drain_err);
+        false
+    } else {
+        join_drain(drain_out) && join_drain(drain_err)
+    };
     let out = out_buf.lock().unwrap().clone();
     let err = err_buf.lock().unwrap().clone();
     let _ = drains_done;
@@ -2585,16 +2631,48 @@ fn copy_capped(r: &mut impl Read, buf: &Arc<Mutex<Vec<u8>>>) {
 ///
 /// Returns the child's exit status (reaped exactly once, here).
 pub(crate) fn kill_process_tree(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
+    kill_process_tree_with(child, false)
+}
+
+/// As [`kill_process_tree`], but `force` skips the SIGTERM grace period and
+/// sends SIGKILL straight away.
+///
+/// This exists for the **interactive cancel** path (ESC / ctrl-c): there the
+/// operator has explicitly asked for the work to stop *now*, and waiting up to
+/// 500ms for a well-behaved child to honour SIGTERM is pure added latency on
+/// the thing the user is hammering the key about. Background sweeps
+/// (`kill_all_jobs`, timeouts) keep the polite TERM-then-KILL ordering.
+pub(crate) fn kill_process_tree_force(
+    child: &mut std::process::Child,
+) -> Option<std::process::ExitStatus> {
+    kill_process_tree_with(child, true)
+}
+
+fn kill_process_tree_with(
+    child: &mut std::process::Child,
+    force: bool,
+) -> Option<std::process::ExitStatus> {
     #[cfg(unix)]
     {
         let pgid = child.id() as i32;
-        // Negative pid => signal the whole group; TERM first so well-behaved
+        // Negative pid => signal the whole group. TERM first so well-behaved
         // children can flush, then a bounded grace period, then KILL for
-        // anything still alive. Errors ignored (already exited / reparented /
-        // group gone).
+        // anything still alive. An interactive cancel skips straight to KILL.
+        // Errors ignored (already exited / reparented / group gone).
         unsafe {
-            let _ = libc::kill(-pgid, libc::SIGTERM);
+            if force {
+                let _ = libc::kill(-pgid, libc::SIGKILL);
+            } else {
+                let _ = libc::kill(-pgid, libc::SIGTERM);
+            }
         }
+        // A forced kill has no grace window: poll only briefly for the reap so
+        // the common case returns immediately, without a half-second stall.
+        let grace = if force {
+            std::time::Duration::from_millis(0)
+        } else {
+            std::time::Duration::from_millis(500)
+        };
         // Overall budget for the whole kill dance. Every wait below is a
         // *polling* try_wait — never a blocking `child.wait()` — because a
         // SIGKILLed child that is stuck in an uninterruptible sleep (D state,
@@ -2602,7 +2680,7 @@ pub(crate) fn kill_process_tree(child: &mut std::process::Child) -> Option<std::
         // wait would hold `job_kill` forever and wedge the agent loop/REPL
         // (the "job_kill then silence" hang). We reap exactly once, whenever
         // try_wait first reports the child gone, and give up after the budget.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let deadline = std::time::Instant::now() + grace;
         loop {
             match child.try_wait() {
                 // TERM (or KILL) landed: this try_wait already reaped the child.
@@ -2633,6 +2711,7 @@ pub(crate) fn kill_process_tree(child: &mut std::process::Child) -> Option<std::
     }
     #[cfg(not(unix))]
     {
+        let _ = force;
         let _ = child.kill();
         child.wait().ok()
     }
@@ -2643,6 +2722,16 @@ pub(crate) fn kill_process_tree(child: &mut std::process::Child) -> Option<std::
 /// join forever and wedge the agent loop. Returns true if the thread finished
 /// in time; if not, it is detached and will die with the process (output
 /// already captured stays in the shared buffer).
+/// Drop a drain thread's handle without joining it. Used on the interactive
+/// cancel path, where the process group has just been SIGKILLed: the thread
+/// will observe EOF and exit on its own, and waiting for it would only add
+/// latency to the operator's ESC. Deliberately *not* a `join` — an orphan
+/// outside the group can hold the pipe open indefinitely, which is the whole
+/// reason the non-abort path bounds its join.
+fn detach_drain(h: JoinHandle<()>) {
+    drop(h);
+}
+
 fn join_drain(h: JoinHandle<()>) -> bool {
     // JoinHandle has no timed join on stable; poll `is_finished()` and join
     // only once the thread is done (join then returns immediately). If the
@@ -2998,6 +3087,39 @@ mod esc_tests {
         assert!(last_out.contains("aborted by user"), "got: {last_out}");
     }
 
+    /// The interactive-cancel path must SIGKILL immediately instead of waiting
+    /// out the SIGTERM grace window. A command that *ignores* SIGTERM would
+    /// previously keep the `cancelling turn…` spinner up for the full 500ms
+    /// grace before the SIGKILL escalation; now ESC kills it at once.
+    #[test]
+    fn interactive_abort_does_not_wait_for_term_grace() {
+        let mut best = Duration::MAX;
+        let mut last_out = String::new();
+        for _ in 0..3 {
+            let abort = Arc::new(AtomicBool::new(false));
+            let mut b =
+                Builtin::new(PathBuf::from("."), abort.clone(), Arc::new(AtomicBool::new(false)));
+            // `trap '' TERM` makes the shell ignore SIGTERM, so the old code
+            // path had to sit out the whole grace period before escalating.
+            // A bare `trap ... TERM; ` then `sleep 30` in the group.
+            let handle =
+                std::thread::spawn(move || run_shell(&mut b, "trap '' TERM; sleep 30"));
+            std::thread::sleep(Duration::from_millis(300));
+            let t0 = Instant::now();
+            abort.store(true, Ordering::SeqCst);
+            last_out = handle.join().unwrap().expect("run_shell result");
+            best = best.min(t0.elapsed());
+        }
+        // The grace window alone is 500ms; a SIGKILL-first cancel must beat it
+        // comfortably even on a loaded box. 400ms leaves headroom below the old
+        // floor while still being an unambiguous regression tripwire.
+        assert!(
+            best < Duration::from_millis(400),
+            "interactive abort took {best:?} — it is still waiting out the SIGTERM grace \
+             instead of SIGKILLing immediately"
+        );
+        assert!(last_out.contains("aborted by user"), "got: {last_out}");
+    }
     #[test]
     fn no_abort_completes() {
         // Without abort, a fast command runs to completion and reports success.

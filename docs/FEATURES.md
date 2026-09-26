@@ -110,7 +110,9 @@ ask_user_question({
   to state its assumption and continue (or end with
   `request_stop(reason=stop-needs-input)`). It never blocks.
 - `PIR_ASK_TIMEOUT_SECS` bounds the wait for an interactive answer (default
-  120s); a timeout is reported as "dismissed", never as a silent default.
+  120s). A timeout is reported as `TimedOut` — **distinct from "dismissed"** —
+  and the abandoned dialog is signalled to tear itself down, so a question
+  nobody answered never leaves a modal on screen owning the keyboard.
 
 Threading: a turn runs on a worker thread while the REPL owns stdin, so the
 question travels back to the REPL over a channel (`src/askuser.rs`) and the
@@ -628,7 +630,7 @@ Knobs: `PIR_RESOURCE_MEMORY_MIB` (sets a ceiling **and** arms it),
 | `PIR_SCRATCHPAD_DIR` | root for scratch dirs |
 | `PIR_SCRATCHPAD_KEEP` | don't sweep stale scratch dirs |
 | `PIR_SCRATCHPAD_TTL_DAYS` | stale-scratch lifetime (default 30) |
-| `PIR_ASK_TIMEOUT_SECS` | how long `ask_user_question` waits for an answer (default 120) |
+| `PIR_ASK_TIMEOUT_SECS` | how long `ask_user_question` waits for an answer (default 120); on timeout the dialog is closed and the result is `TimedOut` |
 | `PIR_NO_MODAL` | never use the alternate-screen dialog; use line prompts |
 | `PIR_SKILLS_NOSEED` | don't write the bundled skills into the config dir |
 | `PIR_PLANS_DIR` | where plan documents live (default `<config>/agent/plans`) |
