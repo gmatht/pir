@@ -30,6 +30,10 @@
 #      * Lint gate (errors fail, warnings warn): `cargo clippy --locked` —
 #        correctness/deny lints (e.g. `never_loop`, panic-in-const) block the
 #        deploy; plain warnings are surfaced but non-fatal.
+#      * Cross-target check: `cargo check --target x86_64-pc-windows-gnu` —
+#        the only thing that catches a wrong `#[cfg(unix)]` gate, which a
+#        host-only build cannot see. Skipped with a warning if the target's std
+#        is not installed; opt out entirely with --no-portable-check.
 #      * Binary smoke tests against the freshly built artifact:
 #          - `--version` prints `pir <semver>`;
 #          - `--help` exits 0;
@@ -224,6 +228,10 @@ WITH_PROJECT_INIT=0
 TEST_ONLY=0
 TESTS=1
 CLIPPY=1
+# Cross-target `cargo check` for a non-unix target (see the gate below). On by
+# default: it is the only thing that can catch a wrong `#[cfg(unix)]` gate, and
+# it costs seconds. Opt out with --no-portable-check.
+PORTABLE=1
 VERBOSE=0
 DEBUG=0
 
@@ -247,6 +255,7 @@ while [ $# -gt 0 ]; do
     --with-project-init) WITH_PROJECT_INIT=1; shift ;;
     --test-only)     TEST_ONLY=1; shift ;;
     --no-clippy)     CLIPPY=0; shift ;;
+    --no-portable-check) PORTABLE=0; shift ;;
     --no-tests)      TESTS=0; shift ;;
     --fast)          TESTS=0; CLIPPY=0; shift ;;
     --verbose|-v)    VERBOSE=1; shift ;;
@@ -432,6 +441,32 @@ if [ "$CLIPPY" -eq 1 ]; then
     step_done "clippy clean"
   else
     warn "cargo-clippy not installed; skipping lint gate"
+  fi
+fi
+
+# ------------------------------------------------------------ cross-target check
+# pir is built and run on Linux but must keep *compiling* for Windows: the
+# `#[cfg(unix)]` gating in picker.rs / resource.rs is easy to get wrong, and a
+# gate that only builds the host target cannot see it. Twelve such errors
+# (ungated `libc::geteuid`, an ungated `AtomicBool` static, a unix-only picker
+# entry point called unconditionally from main) survived for a long time
+# precisely because nothing checked a second target.
+#
+# This is a `check`, not a `build`: it type-checks without linking or running,
+# so it needs no Windows toolchain and costs seconds. Missing target std is a
+# warning, not a failure — the point is to catch cfg mistakes, not to guarantee
+# a Windows release artifact.
+if [ "$PORTABLE" -eq 1 ]; then
+  step "cross-target check (cargo check for a non-unix target)"
+  _WT="x86_64-pc-windows-gnu"
+  if rustup target list --installed 2>/dev/null | grep -qx "$_WT"; then
+    if cargo check --locked --target "$_WT" 2>&1 | tee /tmp/pir-deploy-wt.log | grep -E '^error(\[|:)'; then
+      die "cargo check --target $_WT failed — a cfg(unix) gate is wrong; see /tmp/pir-deploy-wt.log"
+    fi
+    say "  $_WT type-checks clean"
+    step_done "cross-target clean"
+  else
+    warn "target $_WT not installed; skipping (rustup target add $_WT)"
   fi
 fi
 
