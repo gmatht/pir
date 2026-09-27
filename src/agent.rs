@@ -3889,6 +3889,12 @@ impl Agent {
 
     /// Persist this session's liveness/end-status sidecar so unfinished
     /// conversations can be discovered and resumed later. Called by `turn`.
+    ///
+    /// Also records which zellij session/pane this pir is running in (a no-op
+    /// outside zellij) — the prompt path is the natural place, because that is
+    /// the granularity at which a pane's identity can change (the operator
+    /// re-splits, moves focus, or resumes another conversation in place). See
+    /// [`crate::zellij`].
     fn mark_status(&self, status: SessionStatus, goal_pending: bool, reason: &str) {
         if let Some(p) = &self.log_path {
             crate::session::write_status(
@@ -3899,6 +3905,7 @@ impl Agent {
                 goal_pending,
                 reason,
             );
+            crate::zellij::record(p);
         }
     }
 

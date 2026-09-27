@@ -28,10 +28,14 @@ use crate::session::{read_preview, SessionPreview};
 use crate::term;
 
 /// A candidate row shown in the left pane.
+#[derive(Clone, Debug)]
 pub struct PickItem {
     pub index: usize,
     pub name: String,
     pub shell_pid: u32,
+    /// Controlling terminal the session was started from (`pts/7`), or empty
+    /// when unknown. Shown in preference to the pid, which is recycled.
+    pub tty: String,
     pub from_here: bool,
     pub mtime: SystemTime,
     pub path: std::path::PathBuf,
@@ -42,14 +46,43 @@ pub struct PickItem {
 pub enum PickResult {
     /// Resume the session at this index (into the sorted candidate list).
     Resume(usize),
+    /// Rebuild a whole zellij session instead of resuming one transcript: the
+    /// operator picked one of the zellij sessions offered as a trailing row
+    /// (see `PickItem::Zellij`).
+    RebuildZellij(String),
     /// Don't resume anything — start a fresh session.
     Cancel,
 }
 
+/// A row in the left pane: either a pir session to resume, or — when the
+/// operator has pir sessions recorded inside zellij — a zellij session that can
+/// be rebuilt whole.
+pub enum PickRow {
+    /// A pir transcript.
+    Session(PickItem),
+    /// A zellij session to rebuild, with the number of recorded pir panes in it.
+    Zellij { session: String, panes: usize },
+}
+
+impl PickRow {
+    fn as_session(&self) -> Option<&PickItem> {
+        match self {
+            PickRow::Session(i) => Some(i),
+            PickRow::Zellij { .. } => None,
+        }
+    }
+}
+
 /// Set by the SIGWINCH handler so `wait_key` can wake up (and the loop can
 /// redraw with the new layout) when the terminal is resized while idling.
+///
+/// Unix-only: the handler is installed with `libc::signal`, and every reader
+/// lives in the `#[cfg(unix)]` picker. Gating the static (rather than the `use`)
+/// keeps `AtomicBool`/`Ordering` out of the non-unix build entirely.
+#[cfg(unix)]
 static RESIZED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(unix)]
 extern "C" fn on_winch(_sig: i32) {
     RESIZED.store(true, Ordering::SeqCst);
 }
@@ -65,6 +98,10 @@ extern "C" fn on_winch(_sig: i32) {
 /// Priority is a *hint*, not a contract — the drawing path still computes any
 /// missing preview synchronously, so a wrong guess costs nothing but the work
 /// already done.
+///
+/// Unix-only: it builds its notification pipe with `libc::pipe` and is driven by
+/// the `#[cfg(unix)]` picker loop, so nothing outside that path can reach it.
+#[cfg(unix)]
 struct Prefetcher {
     /// Row index -> finished preview. Shared with the UI thread.
     cache: Arc<Mutex<HashMap<usize, SessionPreview>>>,
@@ -89,6 +126,7 @@ struct Prefetcher {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+#[cfg(unix)]
 impl Prefetcher {
     /// Spawn a worker over `paths`, starting at `selected`.
     fn spawn(paths: Vec<std::path::PathBuf>, selected: usize) -> Prefetcher {
@@ -193,6 +231,7 @@ impl Prefetcher {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Prefetcher {
     fn drop(&mut self) {
         // Abandon any remaining rows: the user has picked (or cancelled), so
@@ -211,10 +250,12 @@ impl Drop for Prefetcher {
 
 /// Scan order for `selected`: the highlighted row first, then outward (down
 /// before up, matching where an arrow key is most likely to go next).
+#[cfg(unix)]
 fn order_from(paths: &[std::path::PathBuf], selected: usize) -> Vec<usize> {
     order_from_len(paths.len(), selected)
 }
 
+#[cfg(unix)]
 fn order_from_len(len: usize, selected: usize) -> Vec<usize> {
     // Build the desired *scan* order explicitly, then reverse it: the queue is
     // consumed with `pop()` (last element first). Priority is
@@ -237,18 +278,41 @@ fn order_from_len(len: usize, selected: usize) -> Vec<usize> {
 }
 
 /// Run the interactive picker over `items` (already sorted newest-first, index
-/// 0 = newest). Returns `PickResult::Cancel` when stdin is not a terminal or
-/// the user bails out. Blocks in raw mode for the duration; restores the
-/// terminal on return.
+/// 0 = newest), optionally offering whole-zellij-session rebuilds as trailing
+/// rows. Returns `PickResult::Cancel` when stdin is not a terminal or the user
+/// bails out. Blocks in raw mode for the duration; restores the terminal on
+/// return.
 #[cfg(unix)]
 pub fn pick_session(items: &[PickItem]) -> PickResult {
+    pick_session_with_zellij(items, &[])
+}
+
+/// [`pick_session`], plus `zellij_sessions` (`(session, recorded pir panes)`)
+/// offered as extra rows after the transcripts. Selecting one yields
+/// [`PickResult::RebuildZellij`] rather than a resume.
+#[cfg(unix)]
+pub fn pick_session_with_zellij(
+    items: &[PickItem],
+    zellij_sessions: &[(String, usize)],
+) -> PickResult {
     if items.is_empty() || !io::stdin().is_terminal() {
+        return PickResult::Cancel;
+    }
+    // Transcripts first (newest first, as the caller sorted them), then any
+    // rebuildable zellij sessions.
+    let mut rows: Vec<PickRow> = items.iter().cloned().map(PickRow::Session).collect();
+    rows.extend(zellij_sessions.iter().map(|(session, panes)| PickRow::Zellij {
+        session: session.clone(),
+        panes: *panes,
+    }));
+    if rows.is_empty() {
         return PickResult::Cancel;
     }
     let mut selected = 0usize;
     // Previews are a per-file scan; the worker fills this ahead of the user and
     // the draw path falls back to a synchronous scan for anything still cold.
-    let paths: Vec<std::path::PathBuf> = items.iter().map(|i| i.path.clone()).collect();
+    let paths: Vec<std::path::PathBuf> =
+        rows.iter().filter_map(PickRow::as_session).map(|i| i.path.clone()).collect();
     let prefetch = Prefetcher::spawn(paths, selected);
 
     // Enter raw mode (separate save slot from the REPL's running-turn raw) and
@@ -267,36 +331,45 @@ pub fn pick_session(items: &[PickItem]) -> PickResult {
     let result = loop {
         // Prefer a prefetched preview; fall back to computing it here so the
         // first paint after launch (or a fast scroll past the worker) is never
-        // blank. Only a cold cache pays the scan.
-        let preview = match prefetch.get(selected) {
-            Some(p) => p,
-            None => {
-                let p = read_preview(&items[selected].path);
-                prefetch.put(selected, p.clone());
-                p
-            }
+        // blank. Only a cold cache pays the scan. A zellij row has no
+        // transcript, so it takes a static preview instead.
+        let preview = match rows[selected].as_session() {
+            Some(item) => match prefetch.get(selected) {
+                Some(p) => p,
+                None => {
+                    let p = read_preview(&item.path);
+                    prefetch.put(selected, p.clone());
+                    p
+                }
+            },
+            None => zellij_preview(&rows[selected]),
         };
-        draw(items, selected, &preview, &mut drawn_rows);
+        draw(&rows, selected, &preview, &mut drawn_rows);
 
         // Re-target the worker at wherever the selection now is, so its next
         // scans are the rows the user is about to look at rather than whatever
         // was queued when the picker opened.
-        prefetch.retarget(items.len(), selected);
+        prefetch.retarget(rows.len(), selected);
 
         match wait_key(prefetch.notify_rx.as_deref()) {
             Key::Up | Key::Char('k') => {
                 selected = selected.saturating_sub(1);
             }
             Key::Down | Key::Char('j') => {
-                if selected + 1 < items.len() {
+                if selected + 1 < rows.len() {
                     selected += 1;
                 }
             }
             Key::Char('g') => selected = 0,
-            Key::Char('G') => selected = items.len().saturating_sub(1),
-            Key::PageUp => selected = selected.saturating_sub(page_step(items.len())),
-            Key::PageDown => selected = (selected + page_step(items.len())).min(items.len() - 1),
-            Key::Enter | Key::Right => break PickResult::Resume(selected),
+            Key::Char('G') => selected = rows.len().saturating_sub(1),
+            Key::PageUp => selected = selected.saturating_sub(page_step(rows.len())),
+            Key::PageDown => selected = (selected + page_step(rows.len())).min(rows.len() - 1),
+            // Enter/Right commit the highlighted row: a transcript resumes, a
+            // zellij row rebuilds the whole session.
+            Key::Enter | Key::Right => break match &rows[selected] {
+                PickRow::Zellij { session, .. } => PickResult::RebuildZellij(session.clone()),
+                PickRow::Session(_) => PickResult::Resume(selected),
+            },
             Key::Char('y') => break PickResult::Resume(0), // newest, like the old `y=latest`
             Key::Char('n') | Key::Char('q') | Key::Esc | Key::CtrlC | Key::CtrlD => {
                 break PickResult::Cancel;
@@ -312,7 +385,7 @@ pub fn pick_session(items: &[PickItem]) -> PickResult {
             Key::Char(c) if c.is_ascii_digit() => {
                 // Jump to the 1-based index if it exists.
                 let n = (c as u32 as usize).saturating_sub(1);
-                if n < items.len() {
+                if n < rows.len() {
                     selected = n;
                 }
             }
@@ -336,11 +409,34 @@ fn page_step(n: usize) -> usize {
     n.min(5)
 }
 
+/// The preview shown for a zellij row: there is no transcript, so explain what
+/// selecting it will do rather than showing stale/empty session text.
+fn zellij_preview(row: &PickRow) -> SessionPreview {
+    let PickRow::Zellij { session, panes } = row else {
+        return SessionPreview {
+            turns: 0,
+            first_prompt: String::new(),
+            last_prompt: String::new(),
+            last_thinking: String::new(),
+            last_output: String::new(),
+        };
+    };
+    SessionPreview {
+        turns: 0,
+        first_prompt: format!("rebuild zellij session '{}'", session),
+        last_prompt: format!(
+            "{panes} pir pane(s) recorded in this session will be restored to their own conversation"
+        ),
+        last_thinking: String::new(),
+        last_output: String::new(),
+    }
+}
+
 /// Render the two panes for `selected`. The layout is recomputed on each draw
 /// from the current terminal size so it works at any width/height. We draw the
 /// whole block from the cursor, anchoring back to the top line afterward so the
 /// next draw overwrites in place..
-fn draw(items: &[PickItem], selected: usize, preview: &SessionPreview, drawn_rows: &mut usize) {
+fn draw(items: &[PickRow], selected: usize, preview: &SessionPreview, drawn_rows: &mut usize) {
     let w = term::terminal_width().max(40);
     let h = term::terminal_height().max(12);
     let list_w = (w / 2).clamp(20, 48);
@@ -370,42 +466,75 @@ fn draw(items: &[PickItem], selected: usize, preview: &SessionPreview, drawn_row
         .min(items.len().saturating_sub(max_list));
     let end = (start + max_list).min(items.len());
 
-    // Left pane: the session list.
+    // Left pane: the session list, plus any zellij rebuild rows.
     let mut rows = 0usize;
-    for (idx, it) in items.iter().enumerate().take(end).skip(start) {
+    for (idx, item) in items.iter().enumerate().take(end).skip(start) {
         let marker = if idx == selected { "▸" } else { " " };
-        let mut label = it.name.replace("pir-", "").replace(".jsonl", "");
         let aw = list_w.saturating_sub(18).max(4);
-        if term::visible_len(&label) > aw {
-            label = term::clip(&label, aw);
-        }
-        let tag = format!("[sh{}]", it.shell_pid);
-        let tag_s = if it.from_here {
-            term::cyan(&tag)
-        } else {
-            term::dim(&tag)
-        };
-        let age = rel_time(it.mtime);
-        let row: String = if idx == selected {
-            format!(
-                "{} {:<2} {:<labelw$} {} {}",
-                term::cyan(marker),
-                idx,
-                label,
-                tag_s,
-                term::dim(&age),
-                labelw = aw,
-            )
-        } else {
-            format!(
-                "{} {:<2} {:<labelw$} {} {}",
-                marker,
-                idx,
-                term::dim(&label),
-                tag_s,
-                term::dim(&age),
-                labelw = aw,
-            )
+        // A zellij row reads as a distinct kind of action, not a transcript:
+        // mark it so `enter` is not mistaken for "resume this transcript".
+        let row: String = match item {
+            PickRow::Zellij { session, panes } => {
+                let mut label = format!("@{}  (rebuild session)", session);
+                if term::visible_len(&label) > aw {
+                    label = term::clip(&label, aw);
+                }
+                let marker_s = if idx == selected { term::yellow(marker) } else { marker.to_string() };
+                let label_s = if idx == selected {
+                    term::yellow(&label)
+                } else {
+                    term::dim(&label)
+                };
+                format!(
+                    "{} {:<2} {:<labelw$} {} {}",
+                    marker_s,
+                    idx,
+                    label_s,
+                    term::dim(&format!("[{panes} pane(s)]")),
+                    String::new(),
+                    labelw = aw,
+                )
+            }
+            PickRow::Session(it) => {
+                let mut label = it.name.replace("pir-", "").replace(".jsonl", "");
+                if term::visible_len(&label) > aw {
+                    label = term::clip(&label, aw);
+                }
+                // Prefer the tty: it is the stable identity. Fall back to the pid for
+                // sessions recorded before the tty was tracked, or detached launches.
+                let tag = if it.tty.is_empty() {
+                    format!("[sh{}]", it.shell_pid)
+                } else {
+                    format!("[{}]", it.tty)
+                };
+                let tag_s = if it.from_here {
+                    term::cyan(&tag)
+                } else {
+                    term::dim(&tag)
+                };
+                let age = rel_time(it.mtime);
+                if idx == selected {
+                    format!(
+                        "{} {:<2} {:<labelw$} {} {}",
+                        term::cyan(marker),
+                        idx,
+                        label,
+                        tag_s,
+                        term::dim(&age),
+                        labelw = aw,
+                    )
+                } else {
+                    format!(
+                        "{} {:<2} {:<labelw$} {} {}",
+                        marker,
+                        idx,
+                        term::dim(&label),
+                        tag_s,
+                        term::dim(&age),
+                        labelw = aw,
+                    )
+                }
+            }
         };
         buf.extend_from_slice(row.as_bytes());
         // Pad with spaces to list_w (row may contain ANSI, so pad by spaces).
@@ -712,8 +841,101 @@ fn translate_result(res: &term::raw::RawInput, buf: &str) -> Key {
     }
 }
 
+/// Non-unix stub: the raw-mode picker is unix-only, so this just reports "no
+/// choice" and lets the caller fall back to its own prompt. It must exist for
+/// the same reason as [`pick_session`] — `main` calls the zellij-aware variant
+/// unconditionally, so a unix-only definition would not compile for Windows.
+#[cfg(not(unix))]
+pub fn pick_session_with_zellij(
+    _items: &[PickItem],
+    _zellij_sessions: &[(String, usize)],
+) -> PickResult {
+    PickResult::Cancel
+}
+
 #[cfg(not(unix))]
 pub fn pick_session(_items: &[PickItem]) -> PickResult { PickResult::Resume(0) }
+
+#[cfg(test)]
+mod row_tests {
+    use super::*;
+
+    fn item(name: &str) -> PickItem {
+        PickItem {
+            index: 0,
+            name: name.to_string(),
+            shell_pid: 1,
+            tty: "pts/0".into(),
+            from_here: false,
+            mtime: std::time::SystemTime::now(),
+            path: std::path::PathBuf::from(name),
+            preview_line: String::new(),
+        }
+    }
+
+    fn rows(n_sessions: usize, zellij: &[(&str, usize)]) -> Vec<PickRow> {
+        let mut rows: Vec<PickRow> = (0..n_sessions)
+            .map(|i| PickRow::Session(item(&format!("pir-{i}.jsonl"))))
+            .collect();
+        rows.extend(zellij.iter().map(|(s, p)| PickRow::Zellij {
+            session: s.to_string(),
+            panes: *p,
+        }));
+        rows
+    }
+
+    /// Transcripts come first (newest first), zellij rebuilds trail: a
+    /// transcript index must stay stable no matter how many rebuild rows are
+    /// offered, or `Resume(idx)` would point at the wrong session.
+    #[test]
+    fn zellij_rows_are_appended_after_transcripts() {
+        let r = rows(2, &[("alpha", 3), ("beta", 1)]);
+        assert_eq!(r.len(), 4);
+        assert!(r[0].as_session().is_some());
+        assert!(r[1].as_session().is_some());
+        assert!(r[2].as_session().is_none());
+        assert!(r[3].as_session().is_none());
+        match &r[2] {
+            PickRow::Zellij { session, panes } => {
+                assert_eq!(session, "alpha");
+                assert_eq!(*panes, 3);
+            }
+            _ => panic!("expected a zellij row"),
+        }
+    }
+
+    /// The preview pane for a zellij row must describe the rebuild, not show an
+    /// empty transcript — otherwise the operator cannot tell what Enter will do.
+    #[test]
+    fn zellij_row_preview_explains_the_rebuild() {
+        let r = rows(0, &[("vitreous-hill", 7)]);
+        let p = zellij_preview(&r[0]);
+        assert!(p.first_prompt.contains("vitreous-hill"), "got: {}", p.first_prompt);
+        assert!(p.last_prompt.contains('7'), "pane count must be shown: {}", p.last_prompt);
+        // A session row must not produce this text.
+        let s = rows(1, &[]);
+        let sp = zellij_preview(&s[0]);
+        assert!(!sp.first_prompt.contains("rebuild"), "a transcript row must not claim a rebuild");
+    }
+
+    /// Selecting a zellij row must yield `RebuildZellij(name)`, never a
+    /// `Resume(idx)` that would resume some transcript instead.
+    #[test]
+    fn zellij_rows_are_never_resumable_by_index() {
+        let r = rows(2, &[("alpha", 3)]);
+        let zellij_positions: Vec<usize> = r
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| matches!(row, PickRow::Zellij { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(zellij_positions, vec![2]);
+        // Resuming is only ever valid for a real session row.
+        for i in zellij_positions {
+            assert!(r[i].as_session().is_none(), "row {i} must not be resumable");
+        }
+    }
+}
 
 #[cfg(test)]
 mod prefetch_tests {
