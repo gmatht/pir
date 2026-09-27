@@ -138,36 +138,47 @@ impl HttpBackend {
 
 /// Wait before re-issuing a failed attempt. It doubles with each attempt so a
 /// struggling server gets progressively more room: timeouts (the server was
-/// merely slow) start short — 10s, 20s, 40s … capped at 5min — while other
-/// transient failures (5xx/429/transport, i.e. the server may be sick) start
-/// at 30s — 30s, 60s, 120s … capped at 10min. Cancellation is still honoured
-/// promptly during the wait because the sleep loop re-checks `cancel` every
-/// 100ms. `PIR_RETRY_BASE_SECS` / `PIR_RETRY_MAX_SECS` override the base/cap
-/// (tests set the base to 0 for instant retries).
+/// merely slow) start at 10s — 10s, 20s, 40s … — while other transient
+/// failures (5xx/429/transport, i.e. the server may be sick) start at 30s —
+/// 30s, 60s, 120s ….
+///
+/// There is deliberately NO default ceiling: retries never give up, so a
+/// fixed maximum delay just froze every retry at one interval forever (a
+/// daily-quota 429 sat at a flat 600s per attempt for hours). The growth now
+/// saturates at the duration limit, which keeps the doubling real while making
+/// an overflow impossible. Operators that deliberately want a flat ceiling
+/// (tests, a fleet that must re-probe on a fixed cadence) still set
+/// `PIR_RETRY_MAX_SECS`; `PIR_RETRY_BASE_SECS` overrides the base (tests set
+/// it to 0 for instant retries). Cancellation is honoured promptly during the
+/// wait because the sleep loop re-checks `cancel` every 100ms.
 const RETRY_TIMEOUT_BASE: Duration = Duration::from_secs(10);
-const RETRY_TIMEOUT_MAX: Duration = Duration::from_secs(300);
 const RETRY_BASE_BACKOFF: Duration = Duration::from_secs(30);
-const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(600);
 
 fn retry_backoff(attempt: u32, timed_out: bool) -> Duration {
-    let (base, max) = if timed_out {
-        (RETRY_TIMEOUT_BASE, RETRY_TIMEOUT_MAX)
+    let base = if timed_out {
+        RETRY_TIMEOUT_BASE
     } else {
-        (RETRY_BASE_BACKOFF, RETRY_MAX_BACKOFF)
+        RETRY_BASE_BACKOFF
     };
     let base = std::env::var("PIR_RETRY_BASE_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or(base);
+    // No default cap — only an explicit operator override. `max` is optional
+    // here, so the growth below stays saturating on its own.
     let max = std::env::var("PIR_RETRY_MAX_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(max);
-    // `attempt` grows without bound (retries never give up), so clamp the
-    // exponent — the cap clamps the result anyway.
-    base.saturating_mul(2u32.saturating_pow(attempt.min(16))).min(max)
+        .map(Duration::from_secs);
+    // `attempt` grows without bound (retries never give up), so cap the
+    // exponent. Without an operator cap the doubling saturates at Duration's
+    // own limit instead of a hard 600s ceiling; with one, the cap wins.
+    let backoff = base.saturating_mul(2u32.saturating_pow(attempt.min(31)));
+    match max {
+        Some(max) => backoff.min(max),
+        None => backoff,
+    }
 }
 
 /// Live progress of a retry wait, reported to `chat`'s `on_retry` callback
@@ -1281,7 +1292,7 @@ fn is_retryable(error: &str) -> bool {
     }
     // Quota / usage-limit errors are terminal, not transient: a rate limit that
     // names a *weekly* limit (or demands an upgrade/billing change) will not
-    // lift within the retry window, so backing off 60s..240s only delays the
+    // lift within the retry window, so backing off only delays the
     // inevitable and keeps the user staring at a spinner instead of a usable
     // REPL. End the turn now so the user can switch model/provider (`/model …`)
     // and retry themselves.
@@ -3030,7 +3041,7 @@ mod tests {
 
     #[test]
     fn quota_limit_errors_are_fatal_not_retried() {
-        // A weekly/usage-limit 429 will not lift within the 60s..240s backoff
+        // A weekly/usage-limit 429 will not lift within any bounded backoff
         // window — retrying only delays returning the REPL to the user. The
         // turn must end immediately instead.
         assert!(!is_retryable(
@@ -3097,17 +3108,56 @@ mod tests {
             std::env::remove_var("PIR_RETRY_BASE_SECS");
             std::env::remove_var("PIR_RETRY_MAX_SECS");
         }
-        // Timeout tier: 10s, 20s, 40s … capped at 300s.
+        // Timeout tier: 10s, 20s, 40s … uncapped by default.
         assert_eq!(retry_backoff(0, true), Duration::from_secs(10));
         assert_eq!(retry_backoff(1, true), Duration::from_secs(20));
-        assert_eq!(retry_backoff(5, true), Duration::from_secs(300)); // hits cap
-        assert_eq!(retry_backoff(10, true), Duration::from_secs(300));
-        // Other-transient tier: 30s, 60s, 120s … capped at 600s.
+        assert_eq!(retry_backoff(2, true), Duration::from_secs(40));
+        assert_eq!(retry_backoff(5, true), Duration::from_secs(320));
+        assert_eq!(retry_backoff(10, true), Duration::from_secs(10_240));
+        // Other-transient tier: 30s, 60s, 120s … uncapped by default. The old
+        // 600s default ceiling made every retry after attempt 5 wait exactly
+        // 10 minutes forever; there is no such cap now.
         assert_eq!(retry_backoff(0, false), Duration::from_secs(30));
         assert_eq!(retry_backoff(1, false), Duration::from_secs(60));
         assert_eq!(retry_backoff(2, false), Duration::from_secs(120));
-        assert_eq!(retry_backoff(5, false), Duration::from_secs(600)); // hits cap
+        assert_eq!(retry_backoff(3, false), Duration::from_secs(240));
+        assert_eq!(retry_backoff(4, false), Duration::from_secs(480));
+        assert_eq!(retry_backoff(5, false), Duration::from_secs(960));
+        assert_eq!(retry_backoff(10, false), Duration::from_secs(30_720));
+        // Growth saturates instead of overflowing at absurd attempt counts.
+        assert_eq!(retry_backoff(100, false), Duration::from_secs(30).saturating_mul(2u32.saturating_pow(31)));
+        assert_eq!(retry_backoff(100, true), Duration::from_secs(10).saturating_mul(2u32.saturating_pow(31)));
+        // An explicit operator cap still works (tests, fixed re-probe cadence).
+        unsafe { std::env::set_var("PIR_RETRY_MAX_SECS", "600") };
+        assert_eq!(retry_backoff(5, false), Duration::from_secs(600));
         assert_eq!(retry_backoff(100, false), Duration::from_secs(600));
+        assert_eq!(retry_backoff(5, true), Duration::from_secs(320).min(Duration::from_secs(600)));
+        unsafe { std::env::remove_var("PIR_RETRY_MAX_SECS") };
+    }
+
+    #[test]
+    fn backoff_env_overrides_are_parsed_and_ignored_when_invalid() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("PIR_RETRY_BASE_SECS");
+            std::env::remove_var("PIR_RETRY_MAX_SECS");
+        }
+        // Base override.
+        unsafe { std::env::set_var("PIR_RETRY_BASE_SECS", "0") };
+        assert_eq!(retry_backoff(0, false), Duration::ZERO);
+        assert_eq!(retry_backoff(5, false), Duration::ZERO);
+        unsafe { std::env::remove_var("PIR_RETRY_BASE_SECS") };
+        // Invalid values fall back to the defaults rather than misbehaving.
+        unsafe {
+            std::env::set_var("PIR_RETRY_BASE_SECS", "not-a-number");
+            std::env::set_var("PIR_RETRY_MAX_SECS", "");
+        }
+        assert_eq!(retry_backoff(0, false), Duration::from_secs(30));
+        assert_eq!(retry_backoff(0, true), Duration::from_secs(10));
+        unsafe {
+            std::env::remove_var("PIR_RETRY_BASE_SECS");
+            std::env::remove_var("PIR_RETRY_MAX_SECS");
+        }
     }
 
     #[test]
@@ -3500,7 +3550,8 @@ mod tests {
         const _: () = assert!(READ_TIMEOUT_GROWTH >= 2);
         assert!(STALL_TIMEOUT.as_secs() >= 30);
         // Retries never give up on their own: no attempt cap by default, and
-        // the backoff doubles per attempt (capped) for both tiers.
+        // the backoff doubles per attempt (uncapped unless PIR_RETRY_MAX_SECS
+        // is set) for both tiers.
         assert_eq!(max_attempts(), None);
         assert!(retry_backoff(1, false) > retry_backoff(0, false));
         assert!(retry_backoff(1, true) > retry_backoff(0, true));
@@ -4772,6 +4823,62 @@ mod tests {
         );
         assert_eq!(body["thinking"], serde_json::json!({ "type": "enabled" }));
         assert!(body.get("reasoning_effort").is_none(), "opt-out drops effort: {body}");
+    }
+
+    #[test]
+    fn space_bunny_routes_send_expected_openai_reasoning_shapes() {
+        use crate::config::ThinkingLevel as L;
+        use crate::plugin::ToolSpec;
+
+        let tools = [ToolSpec {
+            name: "lookup",
+            description: "Look up a record",
+            schema: json!({ "type": "object", "properties": {} }),
+        }];
+        let client = Client::new(ApiKind::OpenAi, "https://route.example/v1", "k".to_string());
+
+        let mut openrouter = reasoning_model(
+            Some("openrouter"),
+            &[("low", Some("low")), ("medium", Some("medium")), ("high", Some("high")), ("xhigh", Some("xhigh")), ("max", Some("max"))],
+        );
+        openrouter.id = "stealth/space-bunny-alpha".to_string();
+        let (url, body) = client.openai_request(
+            &openrouter.id,
+            32,
+            "sys",
+            &[],
+            &tools,
+            L::High,
+            Some(&openrouter),
+        );
+        assert_eq!(url, "https://route.example/v1/chat/completions");
+        assert_eq!(body["model"], json!("stealth/space-bunny-alpha"));
+        assert_eq!(body["max_tokens"], json!(32));
+        assert!(body.get("max_completion_tokens").is_none());
+        assert_eq!(body["reasoning"], json!({ "effort": "high" }));
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["stream"], json!(true));
+        assert_eq!(body["tools"][0]["function"]["name"], json!("lookup"));
+
+        let mut commandcode = reasoning_model(
+            None,
+            &[("low", Some("low")), ("medium", Some("medium")), ("high", Some("high"))],
+        );
+        commandcode.id = "stealth/space-bunny-alpha".to_string();
+        let (_url, body) = client.openai_request(
+            &commandcode.id,
+            32,
+            "sys",
+            &[],
+            &tools,
+            L::High,
+            Some(&commandcode),
+        );
+        assert_eq!(body["max_tokens"], json!(32));
+        assert_eq!(body["reasoning_effort"], json!("high"));
+        assert!(body.get("reasoning").is_none());
+        assert_eq!(body["stream_options"], json!({ "include_usage": true }));
+        assert_eq!(body["tools"][0]["function"]["name"], json!("lookup"));
     }
 
     #[test]
