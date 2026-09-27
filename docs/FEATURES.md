@@ -622,6 +622,65 @@ Knobs: `PIR_RESOURCE_MEMORY_MIB` (sets a ceiling **and** arms it),
 
 ---
 
+## 14. zellij session recording and rebuild
+
+When `pir` runs inside a [zellij](https://zellij.dev) pane it records which
+session and pane it is in, so a whole zellij session can later be rebuilt with
+each `pir` pane restored to the *specific* conversation it held.
+
+zellij already persists layout on its own — a live session can be dumped with
+`zellij action dump-layout`, and an exited one keeps its layout at
+`~/.cache/zellij/contract_version_1/session_info/<name>/session-layout.kdl`
+(what "attach to resurrect" reads). What zellij cannot know is which `pir`
+transcript belonged to which pane; a resurrected pane restarts `pir -r` and
+resolves its session from `parent_shell_pid()`, which is meaningless after a
+reboot. This feature fills exactly that gap.
+
+**Recording.** Once per prompt, `pir` writes a sidecar next to its session log:
+
+```
+<session>.jsonl.zellij.json
+{ "session": "vitreous-hill", "pane_id": "3",
+  "cwd": "/home/ai/src/pir", "captured": 1758888000 }
+```
+
+The capture reads `ZELLIJ_SESSION_NAME` + `ZELLIJ_PANE_ID` from the environment
+and spawns nothing, so it costs a single small file write per turn. Outside
+zellij it is a no-op — no file is written at all.
+
+**Rebuilding.** `pir -r @<zellij-session>` recreates that session from its saved
+layout, rewriting each `pane command="pir"` to resume its recorded conversation:
+
+```kdl
+pane command="pir" cwd="/home/ai/src/pir" {
+    args "-r" "pir-20260926-085546-sh945107"
+}
+```
+
+- `pir -r @vitreous-hill` — rebuild a named session.
+- `pir -r @` — rebuild the session this pane is currently in.
+
+The rewrite is a targeted text transform over the dumped KDL, not a parse and
+re-print: only `command`/`cwd`/`args` on `pir` panes are touched, and every
+other pane, plugin and the `swap_tiled_layout` boilerplate survive
+byte-for-byte. Panes with no recorded `pir` (a shell, `htop`, a plugin) are left
+exactly as they were, and a pane with no matching record keeps a plain `pir -r`.
+
+When more than one record claims the same pane (the operator resumed another
+conversation in place), the freshest `captured` wins.
+
+Implementation notes worth keeping:
+
+- `zellij --new-session-with-layout <file> --session <name>` is what *creates* a
+  session. `zellij -s <name>` on its own only *attaches*, and errors if the
+  session does not exist; `--layout-string` is for adding a tab to one that does.
+- The invocation strips `ZELLIJ`/`ZELLIJ_SESSION_NAME`/`ZELLIJ_PANE_ID` from the
+  child environment, or zellij treats it as an action on the *current* session.
+- `rebuildable_sessions()` lists the zellij sessions with recorded panes, which
+  is what the error path prints when a name does not resolve.
+
+---
+
 ## 13. Environment variables added
 
 | variable | effect |
@@ -646,6 +705,8 @@ Knobs: `PIR_RESOURCE_MEMORY_MIB` (sets a ceiling **and** arms it),
 | `PIR_RESOURCE_PIDS` | per-command process ceiling (overrides the host-derived value) |
 | `PIR_CGROUP` | `0` disables cgroups entirely (detection + host guard only) |
 | `PIR_RESOURCE_ENFORCE` | `1` arms kernel enforcement even on a healthy host |
+| `ZELLIJ_SESSION_NAME` | (read) recorded per prompt; set by zellij — identifies the session a pir runs in |
+| `ZELLIJ_PANE_ID` | (read) recorded per prompt; set by zellij — identifies the pane a pir runs in |
 
 ---
 

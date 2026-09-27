@@ -185,6 +185,25 @@ difference matters when running many concurrent agent instances.
 | Cost tracking | yes | yes (`/usage`) |
 | Light model (titles) | yes (Cerebras default) | yes |
 
+**Space Bunny Alpha routes in pir**
+
+Space Bunny Alpha is a free-preview, OpenAI-compatible model with a 1,000,000-token
+context window, a 524,288-token completion ceiling, mandatory reasoning, and tool
+support. When the corresponding credential is present, pir exposes both routes
+separately:
+
+| Route | Provider ID | Model ID | Endpoint | Credential |
+|---|---|---|---|---|
+| OpenRouter | `openrouter` | `stealth/space-bunny-alpha` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` or `auth.json` entry `openrouter` |
+| Command Code Provider API | `commandcode` | `stealth/space-bunny-alpha` | `https://api.commandcode.ai/provider/v1` | `CMD_API_KEY` (or `COMMANDCODE_API_KEY`) or `auth.json` entry `commandcode` |
+
+Select either route with its qualified label, for example
+`pir -m openrouter/stealth/space-bunny-alpha` or
+`pir -m commandcode/stealth/space-bunny-alpha`. OpenRouter receives the nested
+`reasoning: {effort}` field; the Command Code route receives the standard
+`reasoning_effort` field. The preview is free while available, but provider
+eligibility, rate limits, and retention terms still apply.
+
 ### 3.6 Security & Sandboxing
 
 | Feature | pir | cmd |
