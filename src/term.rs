@@ -3,7 +3,6 @@ use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::sync::OnceLock;
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -112,14 +111,26 @@ pub fn reset_quit_presses() {
 
 static COLOR_OVERRIDE: Mutex<Option<bool>> = Mutex::new(None);
 
-/// Providers, set once at startup, so the line-editor helper can offer
-/// `/model` tab-completion.
-static MODEL_PROVIDERS: OnceLock<Vec<crate::config::Provider>> = OnceLock::new();
+/// Providers for `/model` tab-completion.
+///
+/// Refreshable, not write-once: a `OnceLock` froze the catalog at the startup
+/// snapshot, so `/reload` ("re-read models-store.json … without restarting")
+/// and `/login <provider>` (which can add a provider that was absent for want
+/// of a credential) both silently failed to update completion — `/model comm`
+/// kept completing to whatever the pre-login catalog said.
+static MODEL_PROVIDERS: Mutex<Vec<crate::config::Provider>> = Mutex::new(Vec::new());
 
-/// Register the providers for `/model` tab-completion. Call once after
-/// models.json has been loaded.
+/// Register the providers for `/model` tab-completion. Called after
+/// `models-store.json` has been loaded, and again whenever the catalog is
+/// re-read (`/reload`, `/login`). Replaces the previous set.
 pub fn set_model_providers(providers: &[crate::config::Provider]) {
-    let _ = MODEL_PROVIDERS.set(providers.to_vec());
+    *MODEL_PROVIDERS.lock().unwrap_or_else(|e| e.into_inner()) = providers.to_vec();
+}
+
+/// Borrow the current completion catalog. An empty slice until providers have
+/// been registered.
+fn model_providers() -> Vec<crate::config::Provider> {
+    MODEL_PROVIDERS.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Cap on how many `/model` completion candidates the completer/hinter show.
@@ -973,8 +984,6 @@ pub fn epoch() -> u64 {
 /// PID of the shell (bash) that launched pir, taken from the `PIR_PARENT_PID`
 /// env var if present, else the real parent process id. Used to tag sessions
 /// so `pir -r` can group/resume sessions from the same shell.
-#[cfg(unix)]
-#[cfg(unix)]
 pub fn parent_shell_pid() -> u32 {
     if let Ok(v) = std::env::var("PIR_PARENT_PID")
         && let Ok(n) = v.parse::<u32>()
@@ -982,6 +991,89 @@ pub fn parent_shell_pid() -> u32 {
                 return n;
             }
     parent_pid()
+}
+
+/// The controlling terminal of the shell that launched pir, e.g. `pts/7`.
+///
+/// Prefer `PIR_PARENT_TTY`, else resolve it from the parent shell process.
+/// This is a *more stable* shell identity than the raw PID: PIDs are recycled
+/// (and a WSL restart renumbers everything), so matching on the pid alone can
+/// silently resume an unrelated session. The tty survives pid reuse within a
+/// login session and is empty for detached/service contexts, which we treat as
+/// "no stable identity".
+pub fn parent_shell_tty() -> Option<String> {
+    if let Ok(v) = std::env::var("PIR_PARENT_TTY") {
+        let v = normalize_tty(&v);
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    parent_tty()
+}
+
+/// Tidy a tty name to its canonical short form: `pts/7`, `tty1`, `hvc0`.
+/// Rejects the non-terminals that show up in detached contexts.
+pub fn normalize_tty(raw: &str) -> String {
+    let s = raw.trim();
+    if s.is_empty() || s == "?" || s == "not a tty" {
+        return String::new();
+    }
+    // `tty` may print `/dev/pts/7`; the kernel prints `pts/7`.
+    s.strip_prefix("/dev/").unwrap_or(s).to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn parent_tty() -> Option<String> {
+    // Prefer the parent's fd 0 target: for a shell attached to a terminal this
+    // reads back as the tty device (e.g. /dev/pts/7).
+    let ppid = parent_pid();
+    if ppid != 0
+        && let Ok(p) = std::fs::read_link(format!("/proc/{ppid}/fd/0"))
+    {
+        let t = normalize_tty(&p.to_string_lossy());
+        if t.starts_with("pts/") || t.starts_with("tty") {
+            return Some(t);
+        }
+    }
+    // Fall back to /proc/<pid>/stat field 7 (tty_nr), which is populated even
+    // when fd 0 has been redirected. Encode it the way `ps` does: the minor
+    // number is the terminal index within its driver class.
+    if ppid != 0
+        && let Ok(s) = std::fs::read_to_string(format!("/proc/{ppid}/stat"))
+        && let Some(tty_nr) = stat_tty_nr(&s)
+        && tty_nr != 0
+    {
+        return Some(describe_tty_nr(tty_nr));
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn parent_tty() -> Option<String> {
+    None
+}
+
+/// Extract `tty_nr` (field 7) from `/proc/<pid>/stat`. The comm field (2) is
+/// wrapped in parens and may itself contain spaces and parens, so parse from
+/// the last `)` rather than by naive whitespace splitting.
+#[cfg(target_os = "linux")]
+fn stat_tty_nr(stat: &str) -> Option<i64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    // Fields after comm: state(3) ppid(4) pgrp(5) session(6) tty_nr(7) ...
+    rest.split_whitespace().nth(4)?.parse::<i64>().ok()
+}
+
+/// Render a kernel `tty_nr` as `pts/N` / `ttyN`, matching what `ps` shows.
+#[cfg(target_os = "linux")]
+fn describe_tty_nr(tty_nr: i64) -> String {
+    // dev_t encoding: major(12 bits) | minor(20 bits); see tty_driver.
+    let major = (tty_nr >> 8) & 0xfff;
+    let minor = (tty_nr & 0xff) | ((tty_nr >> 12) & 0xfff00);
+    match major {
+        136..=143 => format!("pts/{minor}"), // Unix98 pty slaves
+        4 => format!("tty{minor}"),          // virtual consoles
+        _ => format!("tty{major}:{minor}"),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1082,7 +1174,7 @@ const SLASH_HELP: &[(&str, &str, &str)] = &[
     ("/project", "init", "create the ai_<project> user (root)"),
     ("/rebuild", "", "cargo build and exec the fresh binary"),
     ("/reexec", "", "exec the current binary in place (pick up a new build at $0)"),
-    ("/reload", "", "re-read models.json + settings.json without restarting"),
+    ("/reload", "", "re-read models-store.json + settings.json without restarting"),
     ("/resume", "<idx|fragment>", "resume an unfinished session"),
     ("/sessions", "", "list recent sessions"),
     ("/sh", "[cmd args]", "drop to a shell, or run a command via $SHELL"),
@@ -1293,7 +1385,7 @@ impl Completer for PirHelper {
         pos: usize,
         ctx: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<String>)> {
-        let providers = MODEL_PROVIDERS.get().map(|v| v.as_slice()).unwrap_or(&[]);
+        let providers = model_providers();
         let left = &line[..pos];
         let start_idx = left.find(|c: char| !c.is_whitespace()).unwrap_or(0);
         let rest = &left[start_idx..];
@@ -1349,7 +1441,7 @@ impl Completer for PirHelper {
         let arg_lead = after.find(|c: char| !c.is_whitespace()).unwrap_or(after.len());
         let arg_start = start_idx + cmd_end + arg_lead;
         let prefix = &left[arg_start..];
-        let matches = crate::config::match_models(providers, prefix, MODEL_COMPLETION_LIMIT);
+        let matches = crate::config::match_models(&providers, prefix, MODEL_COMPLETION_LIMIT);
         Ok((arg_start, matches))
     }
 }
@@ -1366,7 +1458,7 @@ impl Hinter for PirHelper {
         }
         // Show the first matching model as an inline preview while typing a
         // `/model` argument, so the user sees a suggestion to the right.
-        let providers = MODEL_PROVIDERS.get().map(|v| v.as_slice()).unwrap_or(&[]);
+        let providers = model_providers();
         if !providers.is_empty() {
             let left = &line[..pos];
             let start_idx = left.find(|c: char| !c.is_whitespace()).unwrap_or(0);
@@ -1379,7 +1471,7 @@ impl Hinter for PirHelper {
                     let arg_lead = after.find(|c: char| !c.is_whitespace()).unwrap_or(after.len());
                     let arg_start = start_idx + cmd_end + arg_lead;
                     let prefix = &left[arg_start..];
-                    let candidates = crate::config::match_models(providers, prefix, MODEL_COMPLETION_LIMIT);
+                    let candidates = crate::config::match_models(&providers, prefix, MODEL_COMPLETION_LIMIT);
                     let hint = candidates
                         .into_iter()
                         .find_map(|m| crate::config::hint_remainder(&m, prefix));
@@ -1893,8 +1985,8 @@ impl MidTurn {
         let before = self.buf[..self.pos()].to_string();
         let completed = complete_idle(&before)
             .or_else(|| {
-                let providers = MODEL_PROVIDERS.get().map(|v| v.as_slice()).unwrap_or(&[]);
-                crate::config::complete_model_buffer(&before, providers)
+                let providers = model_providers();
+                crate::config::complete_model_buffer(&before, &providers)
             });
         let Some(done) = completed else { return false };
         // Candidate list for cycling: recompute from the same prefix.
@@ -1935,24 +2027,24 @@ fn completion_candidates(before: &str) -> Vec<String> {
             return commands.iter().filter(|c| c.starts_with(frag)).map(|c| format!("/{c}")).collect();
         }
         // /model-arg candidates.
-        let providers = MODEL_PROVIDERS.get().map(|v| v.as_slice()).unwrap_or(&[]);
+        let providers = model_providers();
         if let Some(cmd_end) = before.find(char::is_whitespace) {
             let (cmd, rest) = before.split_at(cmd_end);
             if matches!(cmd, "/model" | "/m" | "/default-model" | "/dm") {
                 let frag = rest.trim_start();
-                return crate::config::match_models(providers, frag, MODEL_COMPLETION_LIMIT);
+                return crate::config::match_models(&providers, frag, MODEL_COMPLETION_LIMIT);
             }
         }
         return Vec::new();
     }
     // complete_idle said None: maybe a /model-arg LCP case it handled — ask
     // match_models directly for the cycle list.
-    let providers = MODEL_PROVIDERS.get().map(|v| v.as_slice()).unwrap_or(&[]);
+    let providers = model_providers();
     if let Some(cmd_end) = before.find(char::is_whitespace) {
         let (cmd, rest) = before.split_at(cmd_end);
         if matches!(cmd, "/model" | "/m" | "/default-model" | "/dm") {
             let frag = rest.trim_start();
-            return crate::config::match_models(providers, frag, MODEL_COMPLETION_LIMIT);
+            return crate::config::match_models(&providers, frag, MODEL_COMPLETION_LIMIT);
         }
     }
     // History fallback (mirrors the completer's plain-text branch).
@@ -4199,6 +4291,64 @@ mod tests {
         assert_eq!(start, "/default-model ".len());
     }
 
+    /// `/reload` and `/login` re-read the catalog, so the completer must be
+    /// able to *replace* its provider set — not just take it once.
+    ///
+    /// Regression: the set was a `OnceLock`, so every `set_model_providers`
+    /// after startup was silently dropped (`let _ = ...set()`). A provider that
+    /// only becomes usable once a credential exists — `commandcode` is
+    /// synthesized by `merge_space_bunny` only when a key is present — stayed
+    /// invisible to `/model` completion for the rest of the session, so
+    /// `/model comm` kept completing to an unrelated provider.
+    #[test]
+    fn model_providers_can_be_replaced_after_startup() {
+        use crate::config::{Model, Provider};
+        let mk = |id: &str, model: &str| Provider {
+            id: Some(id.into()),
+            name: None,
+            base_url: Some("https://example.invalid/v1".into()),
+            api_key: None,
+            api: Some("openai".into()),
+            models: vec![Model {
+                id: model.into(),
+                name: None,
+                context: None,
+                max_tokens: None,
+                api_override: None,
+                url_override: None,
+                no_reasoning_effort: false,
+                reasoning: false,
+                thinking_format: None,
+                supports_reasoning_effort: None,
+                session_affinity_format: None,
+                thinking_level_map: Default::default(),
+                price_per_1k: None,
+            }],
+        };
+        let h = PirHelper { history_hinter: HistoryHinter::new() };
+
+        // First catalog: only the unrelated provider.
+        crate::term::set_model_providers(&[mk("openrouter", "cohere/command-r-08-2024")]);
+        let (_, before) = h
+            .complete("/model comm", "/model comm".len(), &ctx())
+            .unwrap();
+        assert_eq!(before, vec!["openrouter/cohere/command-r-08-2024".to_string()]);
+
+        // Re-seed (what /login and /reload now do): the newly-credentialed
+        // provider must appear, and the old one must be gone.
+        crate::term::set_model_providers(&[
+            mk("commandcode", "stealth/space-bunny-alpha"),
+            mk("openrouter", "cohere/command-r-08-2024"),
+        ]);
+        let (_, after) = h
+            .complete("/model comm", "/model comm".len(), &ctx())
+            .unwrap();
+        assert!(
+            after.contains(&"commandcode/stealth/space-bunny-alpha".to_string()),
+            "re-seeded catalog must complete `comm` to the new provider, got: {after:?}"
+        );
+    }
+
     /// Regression for the "escalation auto-denied before I could answer" bug.
     ///
     /// The old prompt read stdin with `read_line` while the REPL owned fd 0 in
@@ -4435,7 +4585,7 @@ mod command_help_hint_tests {
         assert!(hint.contains("search the web via Ollama"), "got: {hint:?}");
     }
 
-    // `/reload` re-reads `.pi` (models.json + settings.json) without a restart.
+    // `/reload` re-reads `.pi` (models-store.json + settings.json) without a restart.
     // It must be discoverable in the inline hint, since the whole point is that
     // users can find it instead of restarting pir to pick up a config edit.
     #[test]

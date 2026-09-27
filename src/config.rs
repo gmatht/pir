@@ -485,6 +485,180 @@ fn parse_reasoning(mv: &Value) -> bool {
     mv.get("reasoning").and_then(Value::as_bool).unwrap_or(false)
 }
 
+const SPACE_BUNNY_MODEL_ID: &str = "stealth/space-bunny-alpha";
+const SPACE_BUNNY_CONTEXT: u64 = 1_000_000;
+const SPACE_BUNNY_MAX_TOKENS: u64 = 524_288;
+const SPACE_BUNNY_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+const SPACE_BUNNY_COMMANDCODE_BASE_URL: &str = "https://api.commandcode.ai/provider/v1";
+const SPACE_BUNNY_OPENROUTER_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+const SPACE_BUNNY_COMMANDCODE_EFFORTS: &[&str] = &["low", "medium", "high"];
+
+fn space_bunny_model(thinking_format: &str, efforts: &[&str]) -> Model {
+    let mut thinking_level_map = std::collections::BTreeMap::new();
+    for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
+        let value = if efforts.contains(&level) {
+            Some(level.to_string())
+        } else {
+            None
+        };
+        thinking_level_map.insert(level.to_string(), value);
+    }
+    Model {
+        id: SPACE_BUNNY_MODEL_ID.to_string(),
+        name: Some("Space Bunny Alpha".to_string()),
+        context: Some(SPACE_BUNNY_CONTEXT),
+        max_tokens: Some(SPACE_BUNNY_MAX_TOKENS),
+        api_override: None,
+        url_override: None,
+        no_reasoning_effort: false,
+        reasoning: true,
+        thinking_format: Some(thinking_format.to_string()),
+        supports_reasoning_effort: Some(true),
+        session_affinity_format: None,
+        thinking_level_map,
+        price_per_1k: Some((0.0, 0.0)),
+    }
+}
+
+fn space_bunny_provider(
+    id: &str,
+    name: &str,
+    base_url: &str,
+    key: String,
+    thinking_format: &str,
+    efforts: &[&str],
+) -> Provider {
+    Provider {
+        id: Some(id.to_string()),
+        name: Some(name.to_string()),
+        base_url: Some(base_url.to_string()),
+        api_key: Some(key),
+        api: Some("openai".to_string()),
+        models: vec![space_bunny_model(thinking_format, efforts)],
+    }
+}
+
+/// The operator's home directory: the one captured in `PIR_INVOKING_HOME` at
+/// startup, else the current `$HOME`.
+///
+/// `~/.commandcode` is the *operator's* credential store — after an explicit
+/// `-u/--as` drop (or a re-exec that inherited one) `$HOME` points at the
+/// sandbox account, so resolving through it would silently miss the key. This
+/// mirrors `pi_dir`'s precedence.
+fn operator_home() -> std::path::PathBuf {
+    if let Some(h) = std::env::var_os("PIR_INVOKING_HOME") {
+        return std::path::PathBuf::from(h);
+    }
+    std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default()
+}
+
+/// Read the `apiKey` from command code's own credential store
+/// (`~/.commandcode/auth.json`).
+///
+/// Command code is a subscription client, not a pi catalog source, so it never
+/// writes a provider entry into `~/.pi/agent/models-store.json` — and its key
+/// lives in a *flat* `{"apiKey": …}` shape that `load_auth_keys` (which wants
+/// pi's nested `{"type": "api_key", "key": …}`) cannot read. Without this,
+/// `/model commandcode/…` stays invisible to anyone who had only ever signed
+/// in through the command code CLI. Any failure (absent, unreadable, or
+/// malformed file) is a silent `None` — a subscription key is a convenience,
+/// never a hard requirement.
+fn commandcode_store_key() -> Option<String> {
+    // Tests isolate `~/.pi` with `PI_DIR`, but that says nothing about the
+    // operator's real `~/.commandcode`. Without this guard a developer's own
+    // subscription key leaks into any test that builds a catalog — silently
+    // adding a `commandcode` provider to a store the test declared empty. The
+    // store is only consulted when a test opts in explicitly.
+    if cfg!(test) && std::env::var_os("PIR_TEST_COMMANDCODE_STORE").is_none() {
+        return None;
+    }
+    let raw = fs::read_to_string(operator_home().join(".commandcode").join("auth.json")).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    v.get("apiKey")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_string)
+}
+
+fn space_bunny_api_key(provider_id: &str) -> Option<String> {
+    let env_names: &[&str] = match provider_id {
+        "openrouter" => &["OPENROUTER_API_KEY"],
+        "commandcode" => &["CMD_API_KEY", "COMMANDCODE_API_KEY"],
+        _ => return None,
+    };
+    env_names.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .filter(|key| !key.is_empty())
+    })
+    .or_else(|| load_auth_keys().get(provider_id).cloned())
+    .or_else(|| match provider_id {
+        "commandcode" => commandcode_store_key(),
+        _ => None,
+    })
+}
+
+fn merge_space_bunny(providers: &mut Vec<Provider>) {
+    let routes = [
+        (
+            "openrouter",
+            "OpenRouter",
+            SPACE_BUNNY_OPENROUTER_BASE_URL,
+            "openrouter",
+            SPACE_BUNNY_OPENROUTER_EFFORTS,
+        ),
+        (
+            "commandcode",
+            "Command Code Provider",
+            SPACE_BUNNY_COMMANDCODE_BASE_URL,
+            "openai",
+            SPACE_BUNNY_COMMANDCODE_EFFORTS,
+        ),
+    ];
+
+    for (provider_id, name, base_url, thinking_format, efforts) in routes {
+        let existing_index = providers
+            .iter()
+            .position(|provider| provider.pid().eq_ignore_ascii_case(provider_id));
+        let key = existing_index
+            .and_then(|index| providers[index].api_key.as_deref())
+            .and_then(expand_env)
+            .or_else(|| space_bunny_api_key(provider_id));
+        let Some(key) = key else { continue };
+        let Some(existing) = existing_index.map(|index| &mut providers[index]) else {
+            providers.push(space_bunny_provider(
+                provider_id,
+                name,
+                base_url,
+                key,
+                thinking_format,
+                efforts,
+            ));
+            continue;
+        };
+
+        if existing.base_url.as_deref().is_none_or(str::is_empty) {
+            existing.base_url = Some(base_url.to_string());
+        }
+        if existing.api.is_none() {
+            existing.api = Some("openai".to_string());
+        }
+        if existing.api_key.is_none() {
+            existing.api_key = Some(key);
+        }
+        if !existing
+            .models
+            .iter()
+            .any(|model| model.id == SPACE_BUNNY_MODEL_ID)
+        {
+            existing
+                .models
+                .push(space_bunny_model(thinking_format, efforts));
+        }
+    }
+}
+
 /// Process-wide snapshot of the catalog as read by the *invoking* user, before
 /// the privilege drop. `main` seeds this at startup (see `seed_catalog`).
 ///
@@ -667,8 +841,9 @@ fn load_providers_uncached() -> Result<Vec<Provider>, String> {
         return load_from_auth_fallback();
     }
 
-    apply_prices(&mut providers);
     merge_ollama_cloud(&mut providers);
+    merge_space_bunny(&mut providers);
+    apply_prices(&mut providers);
     maybe_add_fake_provider(&mut providers);
     Ok(providers)
 }
@@ -883,10 +1058,16 @@ fn apply_prices(providers: &mut [Provider]) {
 fn load_from_auth_fallback() -> Result<Vec<Provider>, String> {
     let auth_path = pi_dir().join("agent").join("auth.json");
     let settings_path = pi_dir().join("agent").join("settings.json");
-    
-    let auth_raw = fs::read_to_string(&auth_path).map_err(|e| format!("Missing {}: {e}", auth_path.display()))?;
-    let auth_v: Value = serde_json::from_str(&auth_raw).map_err(|e| format!("Parsing {}: {e}", auth_path.display()))?;
-    
+
+    let auth_v: Value = match fs::read_to_string(&auth_path) {
+        Ok(raw) => serde_json::from_str(&raw)
+            .map_err(|e| format!("Parsing {}: {e}", auth_path.display()))?,
+        Err(_) if space_bunny_api_key("openrouter").is_some() || space_bunny_api_key("commandcode").is_some() => {
+            Value::Object(serde_json::Map::new())
+        }
+        Err(e) => return Err(format!("Missing {}: {e}", auth_path.display())),
+    };
+
     let settings_raw = fs::read_to_string(&settings_path).unwrap_or_default();
     let settings_v: Value = serde_json::from_str(&settings_raw).unwrap_or(Value::Null);
     let default_model = settings_v.get("defaultModel").and_then(Value::as_str).unwrap_or("default-model").to_string();
@@ -923,7 +1104,9 @@ fn load_from_auth_fallback() -> Result<Vec<Provider>, String> {
                     }
         }
     }
-    
+
+    merge_space_bunny(&mut providers);
+    apply_prices(&mut providers);
     if providers.is_empty() { Err("No providers found in auth.json".into()) } else { maybe_add_fake_provider(&mut providers); Ok(providers) }
 }
 
@@ -1151,7 +1334,7 @@ pub fn set_auth_key(provider: &str, key: &str) -> Result<PathBuf, String> {
 }
 
 /// Remove the stored credential (API key or OAuth) for `provider` from
-/// `auth.json`. Leaves environment-variable / models.json config untouched
+/// `auth.json`. Leaves environment-variable / models-store.json config untouched
 /// (those are not stored here). Returns `Ok(true)` when an entry was removed,
 /// `Ok(false)` when there was nothing to remove. Used by the `/logout`
 /// command.
@@ -2873,6 +3056,321 @@ mod worktree_settings_tests {
             m.session_affinity_format = Some(v.to_string());
             assert!(!m.no_session_affinity(), "{v:?} must keep the header");
         }
+    }
+
+    #[test]
+    fn space_bunny_route_metadata_matches_published_limits() {
+        let routes = [
+            (
+                "openrouter",
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                "openrouter",
+                SPACE_BUNNY_OPENROUTER_EFFORTS,
+            ),
+            (
+                "commandcode",
+                "commandcode",
+                "https://api.commandcode.ai/provider/v1",
+                "openai",
+                SPACE_BUNNY_COMMANDCODE_EFFORTS,
+            ),
+        ];
+
+        for (id, expected_id, expected_url, expected_format, expected_levels) in routes {
+            let provider = space_bunny_provider(
+                id,
+                id,
+                expected_url,
+                "test-key".to_string(),
+                expected_format,
+                expected_levels,
+            );
+            assert_eq!(provider.pid(), expected_id);
+            assert_eq!(provider.base_url.as_deref(), Some(expected_url));
+            assert_eq!(provider.api.as_deref(), Some("openai"));
+
+            let model = &provider.models[0];
+            assert_eq!(model.id, SPACE_BUNNY_MODEL_ID);
+            assert_eq!(model.context, Some(SPACE_BUNNY_CONTEXT));
+            assert_eq!(model.max_tokens, Some(SPACE_BUNNY_MAX_TOKENS));
+            assert!(model.reasoning);
+            assert_eq!(model.thinking_format.as_deref(), Some(expected_format));
+            assert_eq!(model.supports_reasoning_effort, Some(true));
+            assert_eq!(model.price_per_1k, Some((0.0, 0.0)));
+            assert_eq!(level_names(&model.supported_levels()), expected_levels);
+        }
+    }
+
+    #[test]
+    fn space_bunny_routes_load_only_for_configured_keys() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("pir_space_bunny_keys_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("agent")).unwrap();
+        let old_dir = std::env::var_os("PI_DIR");
+        let old_openrouter = std::env::var_os("OPENROUTER_API_KEY");
+        let old_cmd = std::env::var_os("CMD_API_KEY");
+        let old_commandcode = std::env::var_os("COMMANDCODE_API_KEY");
+        // `PI_DIR` isolates `~/.pi`, but `~/.commandcode` is resolved from the
+        // operator's *home* — so the developer's real subscription key would
+        // otherwise leak in and fail the `providers.is_empty()` assertion below.
+        let old_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &dir);
+            std::env::remove_var("PIR_INVOKING_HOME");
+            std::env::set_var("PI_DIR", &dir);
+            std::env::remove_var("OPENROUTER_API_KEY");
+            std::env::remove_var("CMD_API_KEY");
+            std::env::remove_var("COMMANDCODE_API_KEY");
+        }
+
+        let mut providers = Vec::new();
+        merge_space_bunny(&mut providers);
+        assert!(providers.is_empty());
+
+        unsafe { std::env::set_var("OPENROUTER_API_KEY", "openrouter-test-key"); }
+        let fallback = load_from_auth_fallback().expect("environment-only route must load");
+        let openrouter = fallback
+            .iter()
+            .find(|p| p.pid() == "openrouter")
+            .expect("OpenRouter route");
+        assert_eq!(openrouter.models[0].id, SPACE_BUNNY_MODEL_ID);
+        assert!(!fallback.iter().any(|p| p.pid() == "commandcode"));
+
+        unsafe {
+            std::env::remove_var("OPENROUTER_API_KEY");
+            std::env::set_var("CMD_API_KEY", "commandcode-test-key");
+        }
+        let mut auth_fallback = Vec::new();
+        merge_space_bunny(&mut auth_fallback);
+        assert_eq!(auth_fallback.len(), 1);
+        assert_eq!(auth_fallback[0].pid(), "commandcode");
+        assert_eq!(auth_fallback[0].api_key(), Some("commandcode-test-key".to_string()));
+
+        unsafe { std::env::remove_var("CMD_API_KEY"); }
+        std::fs::write(
+            dir.join("agent").join("auth.json"),
+            serde_json::json!({
+                "commandcode": { "type": "api_key", "key": "auth-test-key" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let auth_key_fallback = load_from_auth_fallback().expect("auth route must load");
+        let commandcode = auth_key_fallback
+            .iter()
+            .find(|p| p.pid() == "commandcode")
+            .expect("Command Code route");
+        let bunny = commandcode
+            .models
+            .iter()
+            .find(|m| m.id == SPACE_BUNNY_MODEL_ID)
+            .expect("Space Bunny model");
+        assert_eq!(commandcode.api_key(), Some("auth-test-key".to_string()));
+        assert_eq!(bunny.id, SPACE_BUNNY_MODEL_ID);
+
+        std::fs::write(
+            dir.join("agent").join("auth.json"),
+            serde_json::json!({
+                "openrouter": { "type": "api_key", "key": "openrouter-auth-key" },
+                "commandcode": { "type": "api_key", "key": "commandcode-auth-key" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let both_routes = load_from_auth_fallback().expect("both auth routes must load");
+        assert!(both_routes.iter().any(|p| {
+            p.pid() == "openrouter"
+                && p.models.iter().any(|m| m.id == SPACE_BUNNY_MODEL_ID)
+        }));
+        assert!(both_routes.iter().any(|p| {
+            p.pid() == "commandcode"
+                && p.models.iter().any(|m| m.id == SPACE_BUNNY_MODEL_ID)
+        }));
+
+        match old_dir {
+            Some(value) => unsafe { std::env::set_var("PI_DIR", value) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        match old_openrouter {
+            Some(value) => unsafe { std::env::set_var("OPENROUTER_API_KEY", value) },
+            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
+        }
+        match old_cmd {
+            Some(value) => unsafe { std::env::set_var("CMD_API_KEY", value) },
+            None => unsafe { std::env::remove_var("CMD_API_KEY") },
+        }
+        match old_commandcode {
+            Some(value) => unsafe { std::env::set_var("COMMANDCODE_API_KEY", value) },
+            None => unsafe { std::env::remove_var("COMMANDCODE_API_KEY") },
+        }
+        match old_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `~/.commandcode/auth.json` store is a real credential source: a user
+    /// who only ever signed in through the command code CLI has no pi
+    /// `auth.json` entry and no env var, and would otherwise never see the
+    /// `commandcode` provider at all.
+    #[test]
+    fn commandcode_route_loads_from_its_own_credential_store() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("pir_cc_store_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("agent")).unwrap();
+        std::fs::create_dir_all(dir.join(".commandcode")).unwrap();
+        let old_dir = std::env::var_os("PI_DIR");
+        let old_home = std::env::var_os("HOME");
+        let old_invoker = std::env::var_os("PIR_INVOKING_HOME");
+        let old_cmd = std::env::var_os("CMD_API_KEY");
+        let old_commandcode = std::env::var_os("COMMANDCODE_API_KEY");
+        let old_opt_in = std::env::var_os("PIR_TEST_COMMANDCODE_STORE");
+        unsafe {
+            std::env::set_var("HOME", &dir);
+            std::env::remove_var("PIR_INVOKING_HOME");
+            std::env::remove_var("PI_DIR");
+            std::env::remove_var("CMD_API_KEY");
+            std::env::remove_var("COMMANDCODE_API_KEY");
+            // Opt in to the `~/.commandcode` lookup this test exists to cover.
+            std::env::set_var("PIR_TEST_COMMANDCODE_STORE", "1");
+        }
+
+        // No credential anywhere yet: the route must stay absent.
+        let mut none = Vec::new();
+        merge_space_bunny(&mut none);
+        assert!(!none.iter().any(|p| p.pid() == "commandcode"));
+
+        // The real store's shape: flat `apiKey`, no `type`, no `key`.
+        std::fs::write(
+            dir.join(".commandcode").join("auth.json"),
+            serde_json::json!({ "apiKey": "cc-store-key", "userId": "u_1" }).to_string(),
+        )
+        .unwrap();
+        let mut providers = Vec::new();
+        merge_space_bunny(&mut providers);
+        let cc = providers
+            .iter()
+            .find(|p| p.pid() == "commandcode")
+            .expect("commandcode route must load from ~/.commandcode/auth.json");
+        assert_eq!(cc.api_key(), Some("cc-store-key".to_string()));
+        assert!(cc.models.iter().any(|m| m.id == SPACE_BUNNY_MODEL_ID));
+
+        // Precedence: an explicit env var still wins over the store.
+        unsafe { std::env::set_var("CMD_API_KEY", "env-wins"); }
+        assert_eq!(space_bunny_api_key("commandcode").as_deref(), Some("env-wins"));
+
+        // A malformed store is a silent miss, never a panic.
+        unsafe { std::env::remove_var("CMD_API_KEY"); }
+        std::fs::write(
+            dir.join(".commandcode").join("auth.json"),
+            "{ not json".to_string(),
+        )
+        .unwrap();
+        assert_eq!(space_bunny_api_key("commandcode"), None);
+
+        // An empty `apiKey` is treated as absent.
+        std::fs::write(
+            dir.join(".commandcode").join("auth.json"),
+            serde_json::json!({ "apiKey": "   " }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(space_bunny_api_key("commandcode"), None);
+
+        // OpenRouter must never pick up the command code subscription.
+        assert_eq!(space_bunny_api_key("openrouter"), None);
+
+        match old_dir {
+            Some(value) => unsafe { std::env::set_var("PI_DIR", value) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        match old_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match old_invoker {
+            Some(value) => unsafe { std::env::set_var("PIR_INVOKING_HOME", value) },
+            None => unsafe { std::env::remove_var("PIR_INVOKING_HOME") },
+        }
+        match old_cmd {
+            Some(value) => unsafe { std::env::set_var("CMD_API_KEY", value) },
+            None => unsafe { std::env::remove_var("CMD_API_KEY") },
+        }
+        match old_commandcode {
+            Some(value) => unsafe { std::env::set_var("COMMANDCODE_API_KEY", value) },
+            None => unsafe { std::env::remove_var("COMMANDCODE_API_KEY") },
+        }
+        match old_opt_in {
+            Some(value) => unsafe { std::env::set_var("PIR_TEST_COMMANDCODE_STORE", value) },
+            None => unsafe { std::env::remove_var("PIR_TEST_COMMANDCODE_STORE") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn space_bunny_merge_preserves_user_catalog_entries() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old_openrouter = std::env::var_os("OPENROUTER_API_KEY");
+        unsafe { std::env::set_var("OPENROUTER_API_KEY", "environment-key"); }
+
+        let mut user_model = space_bunny_model("openrouter", SPACE_BUNNY_OPENROUTER_EFFORTS);
+        user_model.context = Some(123_456);
+        user_model.max_tokens = Some(7_777);
+        let mut providers = vec![Provider {
+            id: Some("openrouter".to_string()),
+            name: Some("User OpenRouter".to_string()),
+            base_url: Some("https://proxy.example/v1".to_string()),
+            api_key: Some("catalog-key".to_string()),
+            api: Some("openai".to_string()),
+            models: vec![user_model],
+        }];
+        merge_space_bunny(&mut providers);
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name.as_deref(), Some("User OpenRouter"));
+        assert_eq!(providers[0].base_url.as_deref(), Some("https://proxy.example/v1"));
+        assert_eq!(providers[0].api_key(), Some("catalog-key".to_string()));
+        assert_eq!(providers[0].models.len(), 1);
+        assert_eq!(providers[0].models[0].context, Some(123_456));
+        assert_eq!(providers[0].models[0].max_tokens, Some(7_777));
+
+        match old_openrouter {
+            Some(value) => unsafe { std::env::set_var("OPENROUTER_API_KEY", value) },
+            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
+        }
+    }
+
+    #[test]
+    fn space_bunny_routes_select_independently() {
+        let providers = vec![
+            space_bunny_provider(
+                "openrouter",
+                "OpenRouter",
+                SPACE_BUNNY_OPENROUTER_BASE_URL,
+                "test-key".to_string(),
+                "openrouter",
+                SPACE_BUNNY_OPENROUTER_EFFORTS,
+            ),
+            space_bunny_provider(
+                "commandcode",
+                "Command Code Provider",
+                SPACE_BUNNY_COMMANDCODE_BASE_URL,
+                "test-key".to_string(),
+                "openai",
+                SPACE_BUNNY_COMMANDCODE_EFFORTS,
+            ),
+        ];
+        let (openrouter, model) = select(&providers, "openrouter/stealth/space-bunny-alpha")
+            .expect("OpenRouter route must resolve");
+        assert_eq!(openrouter.pid(), "openrouter");
+        assert_eq!(model.id, SPACE_BUNNY_MODEL_ID);
+        let (commandcode, model) = select(&providers, "commandcode/stealth/space-bunny-alpha")
+            .expect("Command Code route must resolve");
+        assert_eq!(commandcode.pid(), "commandcode");
+        assert_eq!(model.id, SPACE_BUNNY_MODEL_ID);
     }
 
     #[test]

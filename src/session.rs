@@ -63,6 +63,15 @@ pub struct SessionMeta {
     /// Pid of the process that last wrote this status. 0 when unknown.
     #[serde(default)]
     pub pid: u32,
+    /// Controlling terminal of the shell that started the session, e.g.
+    /// `pts/7`. A *stable* shell identity for `pir -r` where `pid` is not:
+    /// PIDs are recycled and renumbered across a WSL reboot, so two unrelated
+    /// sessions can share a pid and `pir -r` resumes the wrong one. Empty when
+    /// the session was started from a detached context (no terminal). Sessions
+    /// written before this field existed decode to "" and fall back to pid
+    /// matching.
+    #[serde(default)]
+    pub tty: String,
     /// Unix epoch seconds at the time of the last write (best-effort).
     #[serde(default)]
     pub updated: u64,
@@ -171,6 +180,7 @@ pub fn write_status(
     let meta = SessionMeta {
         status,
         pid,
+        tty: crate::term::parent_shell_tty().unwrap_or_default(),
         updated,
         built: build_stamp(),
         last_prompt: last_prompt.to_string(),
@@ -606,6 +616,50 @@ mod tests {
         let m = read_status(&log).unwrap();
         assert_eq!(m.status, SessionStatus::Completed);
         assert!(m.reason.is_empty());
+
+        let _ = std::fs::remove_file(status_path(&log));
+        let _ = std::fs::remove_file(&log);
+    }
+
+    /// The `tty` field must survive a write/read round-trip: it is the stable
+    /// shell identity `pir -r` matches on, so losing it silently degrades
+    /// resume back to the recycled-pid behaviour it replaced.
+    #[test]
+    fn status_roundtrips_tty() {
+        let log = tmp_log("tty");
+        write_status(&log, SessionStatus::Active, 42, "hi", false, "");
+        let m = read_status(&log).expect("status readable");
+        assert_eq!(
+            m.tty,
+            crate::term::parent_shell_tty().unwrap_or_default(),
+            "tty must round-trip through the status sidecar"
+        );
+
+        let _ = std::fs::remove_file(status_path(&log));
+        let _ = std::fs::remove_file(&log);
+    }
+
+    /// Status files written before the `tty` field existed must still parse,
+    /// decoding the new field to empty (which the resolver treats as "unknown
+    /// terminal" and handles via the pid fallback). This is the upgrade path
+    /// for every session already on disk.
+    #[test]
+    fn legacy_status_without_tty_still_parses() {
+        let log = tmp_log("legacy");
+        let legacy = r#"{
+  "status": "active",
+  "pid": 3773,
+  "updated": 1790403551,
+  "built": "0.1.5",
+  "last_prompt": "Fix pir.",
+  "goal_pending": false,
+  "reason": ""
+}"#;
+        std::fs::write(status_path(&log), legacy).unwrap();
+        let m = read_status(&log).expect("legacy status must still parse");
+        assert_eq!(m.pid, 3773);
+        assert_eq!(m.last_prompt, "Fix pir.");
+        assert!(m.tty.is_empty(), "a missing tty decodes to empty, not a parse error");
 
         let _ = std::fs::remove_file(status_path(&log));
         let _ = std::fs::remove_file(&log);
