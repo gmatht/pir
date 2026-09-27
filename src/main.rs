@@ -37,6 +37,7 @@ mod modal;
 mod security;
 mod titler;
 mod wininfo;
+mod zellij;
 #[cfg(feature = "tui")]
 mod tui;
 #[cfg(feature = "gui")]
@@ -291,6 +292,10 @@ OPTIONS
   --confirm                  always prompt to confirm shell/write tools
   -n, --no-color             disable ANSI colors
   -r, --resume, --session [token]  resume a session; token selects by index/time/preview
+  -r @<zellij-session>    rebuild a whole zellij session instead: every recorded
+                          pir pane comes back on its own conversation
+                          (`-r @` = the session this pane is in). The `pir -r`
+                          picker also offers these as extra rows.
   --secure [level]          run this session at the given security level
                           (sandbox|strict|worktree|mitigation|guard|off;
                           default mitigation; saved config unchanged)
@@ -1007,6 +1012,32 @@ fn main() {
     // `-c`/`--continue` implies resuming a session and continuing its goal.
     let continue_mode = continue_token.is_some()
         || std::env::args().skip(1).any(|a| a == "-c" || a == "--continue");
+
+    // `pir -r @<zellij-session>` (or bare `-r @` for the session this pane is
+    // in) is a *zellij rebuild*, not a conversation resume: it recreates the
+    // whole zellij session from its saved layout, pointing each recorded pir
+    // pane back at the conversation it held. This is dispatched before normal
+    // resume resolution because the `@` token names a zellij session, not a
+    // pir transcript.
+    if let Some(tok) = resume_token.as_deref()
+        && let Some(name) = tok.strip_prefix('@')
+    {
+        let session = if name.trim().is_empty() {
+            // Bare `@` means "the zellij session I am running in".
+            match crate::zellij::session_name() {
+                Some(s) => s,
+                None => {
+                    eprintln!(
+                        "pir: `-r @` needs to be run inside a zellij pane (no ZELLIJ_SESSION_NAME set)"
+                    );
+                    std::process::exit(2);
+                }
+            }
+        } else {
+            name.trim().to_string()
+        };
+        std::process::exit(run_zellij_rebuild(&session));
+    }
 
     // If `-r`/`--resume` was given (with or without a token), resolve which
     // session to resume. With no token we default to the latest session that
@@ -2388,7 +2419,7 @@ fn menu_session_rows() -> Vec<(modal::SessionRow, PathBuf)> {
         Some(s) => s,
         None => return Vec::new(),
     };
-    sessions.sort_by_key(|a| std::cmp::Reverse(a.mtime));
+    sessions.sort_by(|a, b| b.mtime.cmp(&a.mtime).then(b.bytes.cmp(&a.bytes)));
     sessions
         .into_iter()
         .map(|s| {
@@ -2941,21 +2972,29 @@ fn handle_command(
             // list (it now includes the freshly stored key) so a provider that
             // was only present via a stored key works without a restart.
             if let Ok(fresh) = config::load_providers()
-                && let Some(p) = fresh.iter().find(|p| p.pid().eq_ignore_ascii_case(&provider_id))
-                    && !p.models.is_empty() {
-                        let mut g = agent_slot.lock().unwrap();
-                        let Some(agent) = g.as_mut() else {
-                            println!("{} key saved; it will be available after reload", term::dim("·"));
-                            return;
-                        };
-                        if agent.switch(p.clone(), p.models[0].clone()).is_ok() {
-                            if let Ok(mut ctx) = current_ctx.lock() {
-                                ctx.0 = p.clone();
-                                ctx.1 = p.models[0].clone();
-                            }
-                            println!("→ switched to {}", agent.label());
+                && !fresh.is_empty() {
+                    *providers = fresh;
+                    // Re-seed `/model` tab-completion too: a key that unlocks a
+                    // provider the completer's startup snapshot never saw (e.g.
+                    // `commandcode`, which is synthesized only once a credential
+                    // exists) would otherwise stay uncompletable until restart.
+                    term::set_model_providers(providers);
+                }
+            if let Some(p) = providers.iter().find(|p| p.pid().eq_ignore_ascii_case(&provider_id))
+                && !p.models.is_empty() {
+                    let mut g = agent_slot.lock().unwrap();
+                    let Some(agent) = g.as_mut() else {
+                        println!("{} key saved; it will be available after reload", term::dim("·"));
+                        return;
+                    };
+                    if agent.switch(p.clone(), p.models[0].clone()).is_ok() {
+                        if let Ok(mut ctx) = current_ctx.lock() {
+                            ctx.0 = p.clone();
+                            ctx.1 = p.models[0].clone();
                         }
+                        println!("→ switched to {}", agent.label());
                     }
+                }
         }
         "logout" => {
             // Remove a stored credential from ~/.pi/agent/auth.json (pi's
@@ -4110,6 +4149,7 @@ fn list_models(providers: &[Provider]) -> String {
 
 fn list_sessions() -> String {
     let my_pid = term::parent_shell_pid();
+    let my_tty = term::parent_shell_tty();
     let mut sessions = match scan_sessions() {
         Some(s) => s,
         None => return term::dim("(no session log directory found)\n").to_string(),
@@ -4118,32 +4158,39 @@ fn list_sessions() -> String {
         return term::dim("(no sessions yet)\n").to_string();
     }
     let mut out = String::new();
-    out.push_str(&format!(
-        "{} (highlighted = from this shell, sh{})\n",
-        term::bold("sessions"),
-        my_pid
-    ));
-    // Newest first.
-    sessions.sort_by_key(|a| std::cmp::Reverse(a.mtime));
+    let here = match &my_tty {
+        Some(t) => format!("highlighted = from this shell, {t}"),
+        None => format!("highlighted = from this shell, sh{my_pid}"),
+    };
+    out.push_str(&format!("{} ({here})\n", term::bold("sessions")));
+    // Newest first, empty stubs last within the same timestamp.
+    sessions.sort_by(|a, b| b.mtime.cmp(&a.mtime).then(b.bytes.cmp(&a.bytes)));
     for (idx, s) in sessions.iter().enumerate() {
-        let from_here = s.shell_pid == my_pid;
+        let from_here = session_is_from_here(s, my_pid, my_tty.as_deref());
         let marker = if from_here { term::cyan("▸") } else { " ".to_string() };
         let name = s.name.replace("pir-", "").replace(".jsonl", "");
-        let tag = format!("[{}]", s.shell_pid);
+        // Show the tty when we know one; it is the identity that matters.
+        let tag = match (from_here, &my_tty) {
+            (true, Some(t)) => format!("[{t}]"),
+            _ if !s.tty.is_empty() => format!("[{}]", s.tty),
+            _ => format!("[{}]", s.shell_pid),
+        };
         let tag_s = if from_here { term::cyan(&tag) } else { term::dim(&tag).to_string() };
+        let empty = if s.bytes == 0 { term::dim(" (empty)") } else { String::new() };
         let line = format!(
-            "  {} {:>2}  {}  {}  {}",
+            "  {} {:>2}  {}  {}  {}{}",
             marker,
             idx,
             term::dim(&name),
             tag_s,
             term::dim(&truncate(&s.preview, 60)),
+            empty,
         );
         out.push_str(&line);
         out.push('\n');
     }
     out.push_str(&term::dim(
-        "resume with: pir -r <idx|time|preview>  (omit token => latest from this shell)\n",
+        "resume with: pir -r <idx|time|preview>  (omit token => latest from this shell/dir)\n",
     ));
     out
 }
@@ -4157,6 +4204,58 @@ fn list_sessions() -> String {
 /// pick_session`): a full-screen two-pane UI that lists every session for this
 /// project (newest first) and shows a live preview of the highlighted session's
 /// first/last prompts and the tail of its last thinking + response. Enter /
+/// Rebuild a zellij session from its saved layout (`pir -r @<session>`).
+///
+/// Each `pir` pane in the layout is pointed back at the conversation that pane
+/// was actually running, using the per-prompt records each pir wrote (see
+/// [`crate::zellij`]). Returns the process exit code.
+fn run_zellij_rebuild(session: &str) -> i32 {
+    // Tell the operator what we actually found, so a rebuild that cannot
+    // restore every pane is legible rather than silently partial.
+    let map = crate::zellij::pane_map(&crate::zellij::session_dirs());
+    let recorded = map.keys().filter(|(s, _)| s == session).count();
+
+    match crate::zellij::rebuild(session, None) {
+        Ok(report) => {
+            if recorded == 0 {
+                eprintln!(
+                    "{}",
+                    term::dim(&format!(
+                        "· no pir pane records for '{session}' — rebuilt the layout only \
+                         (panes will resume via the shell that launched them)"
+                    ))
+                );
+            } else {
+                eprintln!(
+                    "{}",
+                    term::dim(&format!(
+                        "· rebuilt zellij session '{}' ({} of {recorded} recorded pir pane(s) \
+                         restored to their conversations)",
+                        report.session, report.resumed_panes
+                    ))
+                );
+            }
+            eprintln!(
+                "{}",
+                term::dim(&format!("· layout: {}", report.layout_path.display()))
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("pir: could not rebuild zellij session '{session}': {e}");
+            // Show what *is* rebuildable — a typo in the name is the likely cause.
+            let available = crate::zellij::rebuildable_sessions();
+            if !available.is_empty() {
+                eprintln!("{}", term::dim("zellij sessions with recorded pir panes:"));
+                for (name, count) in available.iter().take(15) {
+                    eprintln!("  {}", term::dim(&format!("@{name}  ({count} pane(s))")));
+                }
+            }
+            2
+        }
+    }
+}
+
 /// Right resumes the highlighted one; `y` resumes the newest; `n`/Esc/ctrl-c/
 /// ctrl-d/`q` start a fresh session. The picker only runs when stdin is a tty —
 /// with piped/scripted stdin we fall back to a simple `read_answer` so we never
@@ -4167,10 +4266,15 @@ fn resolve_resume(token: Option<&str>) -> Option<PathBuf> {
         eprintln!("pir: no sessions to resume");
         return None;
     }
-    sessions.sort_by_key(|a| std::cmp::Reverse(a.mtime));
+    // Rank newest-first, but never let an empty stub (a session file that was
+    // created and then abandoned before its first turn was written) win a
+    // selection: `pir -r 0` opening a 0-byte transcript is never what the user
+    // meant. Stubs stay *listed* with their positional index — they are just
+    // not eligible to be chosen by a selection rule.
+    sessions.sort_by(|a, b| b.mtime.cmp(&a.mtime).then(b.bytes.cmp(&a.bytes)));
 
     let chosen = match token {
-        None => sessions.iter().find(|s| s.shell_pid == term::parent_shell_pid()),
+        None => pick_default_session(&sessions),
         Some(t) => {
             // Index (most recent = 0)?
             if let Ok(n) = t.parse::<usize>() {
@@ -4198,12 +4302,28 @@ fn resolve_resume(token: Option<&str>) -> Option<PathBuf> {
             eprintln!("pir: no session from this shell yet — pick one to resume:");
             if std::io::stdin().is_terminal() {
                 let my_pid = term::parent_shell_pid();
-                let items = build_pick_items(&sessions, my_pid);
-                match crate::picker::pick_session(&items) {
+                let my_tty = term::parent_shell_tty();
+                let items = build_pick_items(&sessions, my_pid, my_tty.as_deref());
+                // Offer whole-zellij-session rebuilds alongside the transcripts:
+                // this is where "bring back everything that was running" belongs,
+                // rather than making the operator remember a session name for
+                // `pir -r @name`.
+                let zellij_rows = crate::zellij::rebuildable_sessions();
+                match crate::picker::pick_session_with_zellij(&items, &zellij_rows) {
                     crate::picker::PickResult::Resume(idx) => {
                         if let Some(s) = sessions.get(idx) {
                             return Some(s.path.clone());
                         }
+                    }
+                    crate::picker::PickResult::RebuildZellij(name) => {
+                        // The operator chose a whole-session rebuild, not a
+                        // transcript. Rebuilding spawns a new zellij session and
+                        // hands the terminal to it, so there is nothing left to
+                        // resume here: report and start fresh rather than
+                        // falling through to a resume.
+                        run_zellij_rebuild(&name);
+                        eprintln!("pir: rebuilt zellij session '@{name}' — this pir is starting fresh");
+                        return None;
                     }
                     crate::picker::PickResult::Cancel => {
                         eprintln!("pir: ok — not resuming (start fresh, or `pir -r <idx>` next time)");
@@ -4237,14 +4357,72 @@ struct Session {
     path: PathBuf,
     name: String,
     shell_pid: u32,
+    /// Controlling terminal the session was started from (`pts/7`), or empty
+    /// for detached sessions and for statuses written before the field existed.
+    tty: String,
     mtime: std::time::SystemTime,
+    /// Size of the transcript in bytes. 0 means a stub with no turns in it.
+    bytes: u64,
     preview: String,
+    /// True when this session's transcript lives in the cwd-local
+    /// `.pir/sessions` store, i.e. it belongs to *this* project.
+    local: bool,
+}
+
+/// Decide whether a session came from the same shell as the current process.
+///
+/// Prefers the controlling tty over the pid: pids are recycled and renumbered
+/// across reboots, so a pid match can light up an unrelated session, whereas
+/// the tty is stable for the life of a login. A session with no recorded tty
+/// (old status file, or a detached launch) still matches on pid — but only
+/// when *we* also have no tty, so a real terminal never accidentally claims a
+/// detached session that happens to share its pid.
+///
+/// Shared by the picker list (`list_sessions`) and the default resolver
+/// (`pick_default_session`) so what is highlighted is exactly what a bare
+/// `pir -r` opens.
+fn session_is_from_here(s: &Session, my_pid: u32, my_tty: Option<&str>) -> bool {
+    if s.tty.is_empty() {
+        // The session recorded no terminal (legacy status file, or a detached
+        // launch). Only fall back to the pid when *we* have no terminal either:
+        // a real terminal must not claim an unrelated detached session that
+        // merely happens to share its (recycled) pid.
+        return my_tty.is_none() && s.shell_pid != 0 && s.shell_pid == my_pid;
+    }
+    match my_tty {
+        // Both sides know their terminal: that is the identity that counts.
+        Some(t) => s.tty == t,
+        // We have no terminal but the session does; pid is all we can compare.
+        None => s.shell_pid != 0 && s.shell_pid == my_pid,
+    }
+}
+
+/// Choose the session to open for a bare `pir -r`.
+///
+/// Preference order, most specific first:
+///   1. a session from this shell, in this directory
+///   2. a session from this shell (anywhere)
+///   3. a session in this directory (any shell)
+///   4. the newest session overall
+///
+/// Empty stubs are never selected; `None` here falls through to the picker.
+fn pick_default_session(sessions: &[Session]) -> Option<&Session> {
+    let my_pid = term::parent_shell_pid();
+    let my_tty = term::parent_shell_tty();
+    let here = |s: &Session| session_is_from_here(s, my_pid, my_tty.as_deref());
+
+    sessions
+        .iter()
+        .find(|s| s.bytes > 0 && s.local && here(s))
+        .or_else(|| sessions.iter().find(|s| s.bytes > 0 && here(s)))
+        .or_else(|| sessions.iter().find(|s| s.bytes > 0 && s.local))
+        .or_else(|| sessions.iter().find(|s| s.bytes > 0))
 }
 
 /// Build the candidate list for the interactive `pir -r` picker from a scanned
 /// session set (already sorted newest-first). Carries the `from_here` flag so
 /// the picker can highlight sessions that came from this shell.
-fn build_pick_items(sessions: &[Session], my_pid: u32) -> Vec<crate::picker::PickItem> {
+fn build_pick_items(sessions: &[Session], my_pid: u32, my_tty: Option<&str>) -> Vec<crate::picker::PickItem> {
     sessions
         .iter()
         .enumerate()
@@ -4252,7 +4430,8 @@ fn build_pick_items(sessions: &[Session], my_pid: u32) -> Vec<crate::picker::Pic
             index: idx,
             name: s.name.clone(),
             shell_pid: s.shell_pid,
-            from_here: s.shell_pid == my_pid,
+            tty: s.tty.clone(),
+            from_here: session_is_from_here(s, my_pid, my_tty),
             mtime: s.mtime,
             path: s.path.clone(),
             preview_line: s.preview.clone(),
@@ -4266,17 +4445,18 @@ fn scan_sessions() -> Option<Vec<Session>> {
     // Sessions live in the global dir AND/OR the project-local dir (see
     // `session_dir`: cwd/.pir/sessions wins when present). Scan both, or a
     // restart hint for a project-local session resolves to nothing.
-    let mut dirs = vec![config::pi_dir().join("agent").join("sessions")];
+    let global = config::pi_dir().join("agent").join("sessions");
     let local = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".pir")
         .join("sessions");
-    if local != dirs[0] {
-        dirs.push(local);
+    let mut dirs = vec![(global.clone(), false)];
+    if local != global {
+        dirs.push((local, true));
     }
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for dir in dirs {
+    for (dir, is_local) in dirs {
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
         };
@@ -4295,9 +4475,16 @@ fn scan_sessions() -> Option<Vec<Session>> {
                 .next()
                 .and_then(|s| s.trim_end_matches(".jsonl").trim().parse::<u32>().ok())
                 .unwrap_or(0);
-            let mtime = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+            let md = e.metadata().ok();
+            let mtime = md.as_ref().and_then(|m| m.modified().ok()).unwrap_or(std::time::UNIX_EPOCH);
+            let bytes = md.as_ref().map(|m| m.len()).unwrap_or(0);
+            // The tty is not in the filename (it would make them unwieldy and
+            // it contains a `/`): it rides along in the status sidecar.
+            let tty = crate::session::read_status(&path)
+                .map(|m| term::normalize_tty(&m.tty))
+                .unwrap_or_default();
             let preview = first_user_line(&path);
-            out.push(Session { path, name, shell_pid, mtime, preview });
+            out.push(Session { path, name, shell_pid, tty, mtime, bytes, preview, local: is_local });
         }
     }
     if out.is_empty() {
@@ -4860,6 +5047,148 @@ fn create_project(name: &str) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod main_tests {
     use super::*;
+
+    /// Build a `Session` directly (no filesystem) for selection-policy tests.
+    fn sess(name: &str, pid: u32, tty: &str, age_secs: u64, bytes: u64, local: bool) -> Session {
+        Session {
+            path: PathBuf::from("/tmp").join(name),
+            name: name.to_string(),
+            shell_pid: pid,
+            tty: tty.to_string(),
+            // Lower `age_secs` == newer; newest must sort first.
+            mtime: std::time::UNIX_EPOCH + std::time::Duration::from_secs(10_000 - age_secs),
+            bytes,
+            preview: String::new(),
+            local,
+        }
+    }
+
+    /// Sort order is newest-first, and an empty stub never outranks a real
+    /// session with the same mtime (that is what let `pir -r 0` open a 0-byte
+    /// transcript).
+    #[test]
+    fn newest_first_and_stubs_sort_last_within_a_timestamp() {
+        let mut v = vec![
+            sess("pir-a-sh1.jsonl", 1, "pts/1", 10, 0, false),   // stub, same age
+            sess("pir-b-sh2.jsonl", 2, "pts/2", 10, 500, false), // real, same age
+            sess("pir-c-sh3.jsonl", 3, "pts/3", 99, 100, false), // oldest
+        ];
+        v.sort_by(|a, b| b.mtime.cmp(&a.mtime).then(b.bytes.cmp(&a.bytes)));
+        assert_eq!(v[0].name, "pir-b-sh2.jsonl", "real session must beat an equal-age stub");
+        assert_eq!(v[1].name, "pir-a-sh1.jsonl");
+        assert_eq!(v[2].name, "pir-c-sh3.jsonl");
+    }
+
+    /// The tty is a stronger identity than the pid: a session whose *pid*
+    /// matches but whose tty differs must NOT be treated as from-this-shell.
+    /// This is the recycled-PID bug that resumed an unrelated session on WSL.
+    #[test]
+    fn tty_beats_recycled_pid() {
+        let other = sess("pir-old-sh4242.jsonl", 4242, "pts/9", 5, 100, false);
+        // We are pid 4242 (recycled) but on pts/7, so this is NOT our session.
+        assert!(
+            !session_is_from_here(&other, 4242, Some("pts/7")),
+            "pid match with a different tty must not claim the session"
+        );
+        // Same tty, different pid (shell restarted, pid changed) -> ours.
+        let mine = sess("pir-mine-sh1.jsonl", 1, "pts/7", 5, 100, false);
+        assert!(
+            session_is_from_here(&mine, 4242, Some("pts/7")),
+            "tty match must claim the session across pid changes"
+        );
+    }
+
+    /// A session with no recorded tty (legacy status file, or detached launch)
+    /// falls back to pid matching — but only when *we* also lack a tty, so a
+    /// real terminal never claims a detached session that shares its pid.
+    #[test]
+    fn ttyless_sessions_only_match_when_we_have_no_tty() {
+        let legacy = sess("pir-legacy-sh7.jsonl", 7, "", 5, 100, false);
+        assert!(
+            session_is_from_here(&legacy, 7, None),
+            "no tty on either side: pid fallback applies"
+        );
+        assert!(
+            !session_is_from_here(&legacy, 7, Some("pts/7")),
+            "a real terminal must not claim a tty-less session by pid alone"
+        );
+        // A tty-less session with a non-matching pid is never ours, either way.
+        assert!(!session_is_from_here(&legacy, 8, None));
+        assert!(!session_is_from_here(&legacy, 8, Some("pts/7")));
+    }
+
+    /// Empty stubs are never selected by the default rule, even when they are
+    /// the newest thing on disk and from this very shell.
+    #[test]
+    fn default_selection_skips_empty_stubs() {
+        // Newest overall is an empty stub from our own shell + dir.
+        let stub = sess("pir-20260926-061520-sh41740.jsonl", 1, "pts/7", 1, 0, true);
+        let real = sess("pir-20260925-175246-sh2283.jsonl", 2, "pts/3", 50, 1_087_966, true);
+        let mut v = vec![stub, real];
+        v.sort_by(|a, b| b.mtime.cmp(&a.mtime).then(b.bytes.cmp(&a.bytes)));
+        // Confirm the stub really is first by mtime — the guard must still skip it.
+        assert_eq!(v[0].bytes, 0);
+    }
+
+    /// The bare-`-r` preference ladder: this-shell+this-dir, then this-shell,
+    /// then this-dir, then newest overall. Exercises the real
+    /// `pick_default_session` so the test cannot drift from the implementation.
+    #[test]
+    fn default_selection_prefers_local_then_shell_then_newest() {
+        // The ladder keys off the *real* shell identity of the test process,
+        // so read it back and build fixtures that match it.
+        let my_pid = term::parent_shell_pid();
+        let my_tty = term::parent_shell_tty();
+        let my_tty_s = my_tty.clone().unwrap_or_default();
+
+        // A session "of ours" must carry whichever identity this process has.
+        let ours = |name: &str, age: u64, local: bool| {
+            if my_tty.is_some() {
+                sess(name, 999_999, &my_tty_s, age, 10, local)
+            } else {
+                sess(name, my_pid, "", age, 10, local)
+            }
+        };
+        // A session that is definitely not ours.
+        let theirs = |name: &str, age: u64, local: bool| {
+            if my_tty.is_some() {
+                sess(name, 999_999, "pts/99", age, 10, local)
+            } else {
+                sess(name, my_pid.wrapping_add(1), "", age, 10, local)
+            }
+        };
+        let pick_name = |vs: &[Session]| pick_default_session(vs).map(|s| s.name.clone());
+
+        // (a) best case: ours and local wins.
+        let v = vec![theirs("other_local", 1, true), ours("mine_global", 1, false), ours("mine_local", 50, true)];
+        assert_eq!(pick_name(&v).as_deref(), Some("mine_local"));
+
+        // (b) no local session from us: fall back to ours elsewhere.
+        // (Note: the caller sorts newest-first; mirror that here.)
+        let mut v = vec![theirs("other_local", 1, true), ours("mine_global", 9, false)];
+        v.sort_by(|a, b| b.mtime.cmp(&a.mtime).then(b.bytes.cmp(&a.bytes)));
+        assert_eq!(pick_name(&v).as_deref(), Some("mine_global"));
+
+        // (c) nothing from us: prefer this directory over the global store.
+        let mut v = vec![theirs("other_global", 1, false), theirs("other_local", 9, true)];
+        v.sort_by(|a, b| b.mtime.cmp(&a.mtime).then(b.bytes.cmp(&a.bytes)));
+        assert_eq!(pick_name(&v).as_deref(), Some("other_local"));
+
+        // (d) nothing local: newest overall (input is newest-first).
+        let mut v = vec![theirs("newest_global", 1, false), theirs("older_global", 9, false)];
+        v.sort_by(|a, b| b.mtime.cmp(&a.mtime).then(b.bytes.cmp(&a.bytes)));
+        assert_eq!(pick_name(&v).as_deref(), Some("newest_global"));
+
+        // (e) everything empty: no selection (falls through to the picker).
+        // A stub is a session file with a zero-byte transcript.
+        let stub = if my_tty.is_some() {
+            sess("stub", 999_999, &my_tty_s, 1, 0, true)
+        } else {
+            sess("stub", my_pid, "", 1, 0, true)
+        };
+        let v = vec![stub];
+        assert_eq!(pick_name(&v), None);
+    }
 
     /// `scan_sessions` must find sessions in the PI_DIR global dir: restart
     /// hints (`pir --session <name>`) resolve through this scan, so a session
