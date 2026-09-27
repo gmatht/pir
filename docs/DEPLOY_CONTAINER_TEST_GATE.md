@@ -63,7 +63,48 @@ suite. A reasonable fix, in preference order:
     (which is green) for test coverage — the container build is still needed
     and still does its job.
 
+## 4. The no-API-key smoke test cannot pass on this host (pre-existing)
+
+With `--no-tests --no-clippy` the deploy reaches step 7 and dies:
+
+    one-shot with no API key unexpectedly succeeded (expected graceful failure)
+
+This is a flaw in the smoke test's isolation, not in the binary. The test runs
+
+    env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u PI_MODEL PI_DIR=<throwaway> pir
+
+expecting "no credentials, no providers". That is not what happens, because
+`load_providers` -> `load_from_auth_fallback` -> `space_bunny_api_key` ->
+`commandcode_store_key` reads **`operator_home()/.commandcode/auth.json`**
+(`src/config.rs`). That path is deliberately outside `pi_dir()`, so `PI_DIR`
+cannot redirect it: the operator's real Command Code subscription key is found
+regardless, a `commandcode` provider is manufactured, and the one-shot
+legitimately succeeds and exits 0.
+
+That `cfg!(test)` guard was added for the *test* suite ("a developer's own
+subscription key leaks into any test that builds a catalog"), but the deploy
+smoke test runs a real release binary, where `cfg!(test)` is false, so the leak
+is live. Verified by reproducing with a fully clean `env -i` plus a throwaway
+`PI_DIR`: still `commandcode/stealth/space-bunny-alpha`, still exit 0.
+
+Consequences: this gate has almost certainly not been meaningful on any host
+that has `~/.commandcode/auth.json`. It is unrelated to the v0.1.6 changes.
+
+A real fix is one of:
+
+  * Have the smoke test also override `PIR_TEST_COMMANDCODE_STORE`/add an env
+    that points `commandcode_store_key` at nothing, or run it with a throwaway
+    `HOME` (the check is `cfg!(test)`, so instead the test needs `HOME` set to
+    a directory with no `.commandcode`).
+  * Or accept that this box has a usable provider and change the assertion to
+    "must not panic" rather than "must exit non-zero", which is the property
+    the test actually cares about (the comment says so: "must fail gracefully
+    (no panic)").
+
+The simplest immediate unblock: run the deploy with `--fast` (which sets both
+`--no-tests` and `--no-clippy`) and do the smoke check by hand, or temporarily
+move `~/.commandcode/auth.json` aside for the duration of the deploy.
+
 ## Release state as of this writing
 
-v0.1.6 is committed (`25068ae`) and tagged locally, not pushed: the deploy
-died at the test step before reaching the publish phase.
+v0.1.6 is committed (`25068ae`, plus `f6cbb72` for this doc) and tagged locally.
