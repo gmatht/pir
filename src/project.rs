@@ -240,6 +240,12 @@ fi
 /// a *different* hook exists we don't clobber it (return Ok(false) so the
 /// caller can warn). Returns Ok(true) when a hook was written.
 pub fn install_git_guard_hook(repo: &Path) -> Result<bool, String> {
+    if !git_available() {
+        // Distinct from "not a repository": with no `git` on the host we cannot
+        // tell whether this is a repo, and reporting "not inside a git
+        // repository" sends the operator looking for a problem they don't have.
+        return Err("`git` is not installed (or not on PATH) — cannot install the guard hook".into());
+    }
     let Some(gdir) = git_common_dir(repo) else {
         return Err("not inside a git repository".into());
     };
@@ -261,6 +267,22 @@ pub fn install_git_guard_hook(repo: &Path) -> Result<bool, String> {
         .args(["+x", hook.to_string_lossy().as_ref()])
         .status();
     Ok(true)
+}
+
+/// Whether a `git` binary is actually runnable here.
+///
+/// Distinguishes "no git installed" from "git ran and said no" — the two were
+/// conflated, so a minimal container reported every project as "not a git
+/// repository" and the guard hook as "could not install".
+fn git_available() -> bool {
+    Command::new("git")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Resolve the absolute `.git` directory for `repo`, working from any
@@ -357,11 +379,15 @@ pub fn fix_git_setup(repo: &Path) -> String {
         Err(e) => lines.push(format!("✗ could not install guard hook: {e}")),
     }
     for (k, v) in [("core.fsckObjects", "true"), ("core.quotepath", "false")] {
-        let _ = Command::new("git")
-            .args(["config", k, v])
-            .current_dir(repo)
-            .status();
-        lines.push(format!("✓ git config {k}={v}"));
+        // Report only what actually happened. This used to discard the result and
+        // print "✓" unconditionally, so on a host without `git` the setup summary
+        // claimed two settings it had not applied — the operator reading it has
+        // no way to tell the difference.
+        match Command::new("git").args(["config", k, v]).current_dir(repo).status() {
+            Ok(s) if s.success() => lines.push(format!("✓ git config {k}={v}")),
+            Ok(_) => lines.push(format!("✗ git config {k}={v} (git refused the setting)")),
+            Err(e) => lines.push(format!("• skipped git config {k}={v} ({e})")),
+        }
     }
     #[cfg(unix)]
     let _ = crate::security::overlay::project_active_resume();

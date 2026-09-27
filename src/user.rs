@@ -186,10 +186,24 @@ pub enum AccessibilityAction {
     Relocated(std::path::PathBuf),
 }
 
-/// Run a command, returning its captured stderr (preferred) or
+/// Describe a failed spawn of `prog` in terms the operator can act on.
+///
+/// A bare `io::Error` here reads as `No such file or directory (os error 2)`,
+/// which is indistinguishable from a missing *path* and sends people looking in
+/// the wrong place. Name the tool and say what it is for.
+#[cfg(unix)]
+fn missing_tool(prog: &str, e: &std::io::Error, purpose: &str) -> String {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        format!("`{prog}` is not installed or not on PATH — needed to {purpose}")
+    } else {
+        format!("`{prog}` could not be started to {purpose}: {e}")
+    }
+}
+
+#[cfg(unix)]
+/// Run `args` to completion, collapsing the outcome to a success bool or a
 /// failure, as an error string. Used by the accessibility wizard's relocate/
 /// clone steps. Best-effort: any spawn error is reported directly.
-#[cfg(unix)]
 fn run_cmd(args: &[&str]) -> Result<(), String> {
     use std::process::Command;
     let (prog, rest) = args.split_first().expect("non-empty command");
@@ -200,7 +214,7 @@ fn run_cmd(args: &[&str]) -> Result<(), String> {
             let msg = String::from_utf8_lossy(if !o.stderr.is_empty() { &o.stderr } else { &o.stdout });
             Err(format!("`{}` failed: {}", args.join(" "), msg.trim()))
         }
-        Err(e) => Err(format!("could not run `{}`: {e}", args.join(" "))),
+        Err(e) => Err(missing_tool(prog, &e, &format!("run `{}`", args.join(" ")))),
     }
 }
 
@@ -1116,7 +1130,7 @@ pub fn provision(
         let status = Command::new("useradd")
             .args(["-r", "-s", "/usr/sbin/nologin", "-M", user])
             .status()
-            .map_err(|e| format!("useradd: {e}"))?;
+            .map_err(|e| missing_tool("useradd", &e, "create the sandbox user"))?;
         if !status.success() {
             return Err(format!("useradd failed for '{user}' (exit {})", status.code().unwrap_or(-1)));
         }
@@ -1154,7 +1168,7 @@ pub fn provision(
         let status = Command::new("chown")
             .args(["-R", &format!("{user}:{user}"), &home])
             .status()
-            .map_err(|e| format!("chown: {e}"))?;
+            .map_err(|e| missing_tool("chown", &e, "hand the project to the sandbox user"))?;
         if !status.success() {
             return Err(format!("chown failed for {home} (exit {})", status.code().unwrap_or(-1)));
         }
@@ -1174,7 +1188,7 @@ pub fn provision(
         let status = Command::new("chown")
             .args(["-R", &format!("{user}:{user}"), rp.to_string_lossy().as_ref()])
             .status()
-            .map_err(|e| format!("chown: {e}"))?;
+            .map_err(|e| missing_tool("chown", &e, "hand the project to the sandbox user"))?;
         if !status.success() {
             return Err(format!("chown failed for {p} (exit {})", status.code().unwrap_or(-1)));
         }
@@ -1260,7 +1274,7 @@ fn setup_agent_toolchain(user: &str) -> Result<(), String> {
         let status = Command::new("chown")
             .args(["-R", &format!("{user}:{user}"), d.to_string_lossy().as_ref()])
             .status()
-            .map_err(|e| format!("chown: {e}"))?;
+            .map_err(|e| missing_tool("chown", &e, "hand the project to the sandbox user"))?;
         if !status.success() {
             return Err(format!("chown failed for {} (exit {})", d.display(), status.code().unwrap_or(-1)));
         }
@@ -1345,6 +1359,30 @@ pub fn session_dir_for(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
 #[cfg(all(test, unix))]
 mod accessibility_tests {
     use super::*;
+
+    /// A missing tool must be named, not reported as a bare
+    /// `No such file or directory (os error 2)` — which reads as a missing
+    /// *path* and sends the operator looking in the wrong place entirely.
+    #[test]
+    fn missing_tool_names_the_program_and_its_purpose() {
+        let e = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let msg = missing_tool("useradd", &e, "create the sandbox user");
+        assert!(msg.contains("useradd"), "must name the tool: {msg}");
+        assert!(
+            msg.contains("not installed") || msg.contains("not on PATH"),
+            "must say it is absent: {msg}"
+        );
+        assert!(msg.contains("create the sandbox user"), "must say why: {msg}");
+        assert!(
+            !msg.contains("os error 2"),
+            "must not leak the raw io error: {msg}"
+        );
+        // A different error kind keeps its cause (it is not an absence).
+        let perm = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let msg = missing_tool("chown", &perm, "hand over the project");
+        assert!(msg.contains("chown"), "must still name the tool: {msg}");
+        assert!(!msg.contains("not installed"), "must not claim absence: {msg}");
+    }
 
     /// The portable credential helpers must agree with the platform's own view
     /// of the current process. On Linux they call `setresuid`/`getresuid`; on

@@ -326,6 +326,13 @@ CONFIG (reused from pi, never modified)
                            (AGENTS.override.md wins per dir) appended to the system prompt
   ~/.pi/agent/sessions/        pir session transcripts + goal files (pir-*.jsonl/.goal.json)
   ~/.pi/agent/projects.json    project -> execution-user mappings (set by `pir project init`)
+  ~/.pi/agent/security.toml    security policy (per-project override under .pir/ wins)
+
+  PIR_CONFIG_SOURCE picks where the security policy's values come from:
+    external (default)  use the files above; fall back to built-in defaults
+    builtin             built-in defaults only, ignoring any file on disk
+    merged              the file, layered over the built-in defaults, so a file
+                        naming only `security.level` keeps the rest of the defaults
 
 SPACE BUNNY ALPHA (free preview)
   Space Bunny Alpha is available through either route when its key is configured:

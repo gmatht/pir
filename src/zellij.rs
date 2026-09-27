@@ -1690,14 +1690,18 @@ mod e2e_tests {
             .unwrap_or(false)
     }
 
-    fn run(args: &[&str]) -> std::process::Output {
+    /// Run zellij. Returns `None` when it is not installed or could not be
+    /// spawned — a missing zellij is the normal case on a host that does not use
+    /// one, and must not turn into a suite failure. That is the whole reason
+    /// these tests self-skip, so the absence is expected, not exceptional.
+    fn run(args: &[&str]) -> Option<std::process::Output> {
         Command::new("zellij")
             .args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()
-            .expect("zellij runs")
+            .ok()
     }
 
     fn is_running(name: &str) -> bool {
@@ -1795,7 +1799,8 @@ mod e2e_tests {
             let mut panes = 0usize;
             let mut last = String::new();
             for _ in 0..50 {
-                let out = run(&["--session", &name, "action", "dump-layout"]);
+                let out = run(&["--session", &name, "action", "dump-layout"])
+                    .expect("zellij_available() was checked before this ran");
                 assert!(out.status.success(), "dump-layout failed");
                 last = String::from_utf8_lossy(&out.stdout).to_string();
                 panes = last.matches("command=\"pir\"").count();
@@ -1839,7 +1844,8 @@ mod e2e_tests {
                 kdl.to_str().unwrap(),
                 "--session",
                 &name,
-            ]);
+            ])
+            .expect("zellij_available() was checked before this ran");
             let combined = format!(
                 "{}{}",
                 String::from_utf8_lossy(&out.stdout),

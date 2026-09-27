@@ -1206,14 +1206,92 @@ impl RequestSink for QueuedSink {
 // Config loading (tolerant, dependency-free)
 // ===========================================================================
 
+/// Where a security policy's values come from.
+///
+/// The default is [`ConfigSource::External`]: write a normal
+/// `~/.pi/agent/security.toml` and it is used, exactly as before. The other modes
+/// exist for hosts where a writable config is awkward — a read-only image, a
+/// container built from a base, a policy that must be identical on every host —
+/// and for the bundled-binary case, where the shipped defaults should apply even
+/// if a stray file exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConfigSource {
+    /// Only the built-in defaults. Any config file on disk is ignored.
+    Builtin,
+    /// Only the external file(s), falling back to the built-in defaults when
+    /// there is none. The historical behaviour, and the default.
+    #[default]
+    External,
+    /// External file(s) layered over the built-in defaults, so a file that sets
+    /// only `security.level` keeps the built-in values for everything else.
+    Merged,
+}
+
+impl ConfigSource {
+    /// Parse the value of `PIR_CONFIG_SOURCE` (case-insensitive). An unknown or
+    /// unset value yields `None`, so the caller can warn and fall back rather
+    /// than silently running in a mode the operator did not ask for.
+    pub fn from_env_value(v: &str) -> Option<Self> {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "builtin" | "built-in" | "internal" => Some(Self::Builtin),
+            "external" | "file" => Some(Self::External),
+            "merged" | "merge" | "layered" => Some(Self::Merged),
+            _ => None,
+        }
+    }
+
+    /// The effective source, from `PIR_CONFIG_SOURCE` or the default.
+    pub fn effective() -> (Self, Option<String>) {
+        match std::env::var("PIR_CONFIG_SOURCE") {
+            Ok(v) => match Self::from_env_value(&v) {
+                Some(s) => (s, None),
+                None => (
+                    Self::default(),
+                    Some(format!("unknown PIR_CONFIG_SOURCE {v:?}; using external")),
+                ),
+            },
+            Err(_) => (Self::default(), None),
+        }
+    }
+}
+
 /// Load the security policy from `~/.pi/agent/security.toml` (if present),
 /// else the invoking user's global defaults (see [`global_defaults_file`],
 /// written by the editor's `(d)`), else the documented defaults. Tolerant of
 /// unknown keys / malformed lines. Policy therefore never comes from the repo
 /// itself — a malicious checkout cannot set your level.
+///
+/// The source is chosen by `PIR_CONFIG_SOURCE` (see [`ConfigSource`]):
+/// `builtin` ignores files entirely, `external` (the default) uses them as
+/// before, and `merged` layers the file over the built-in defaults so a partial
+/// file keeps the remaining defaults.
 pub fn load_policy() -> SecurityPolicy {
-    let path = crate::config::pi_dir().join("agent").join("security.toml");
-    load_policy_for(&path, &global_defaults_file())
+    let (source, warn) = ConfigSource::effective();
+    if let Some(w) = warn {
+        eprintln!("{w}");
+    }
+    match source {
+        ConfigSource::Builtin => SecurityPolicy::default(),
+        ConfigSource::External => {
+            let path = crate::config::pi_dir().join("agent").join("security.toml");
+            load_policy_for(&path, &global_defaults_file())
+        }
+        ConfigSource::Merged => {
+            // Start from the built-ins, then let each existing file overwrite
+            // only the keys it actually mentions.
+            let path = crate::config::pi_dir().join("agent").join("security.toml");
+            let global = global_defaults_file();
+            let mut policy = SecurityPolicy::default();
+            if path.exists() {
+                let overlay = load_policy_file(&path);
+                policy.overlay_from(overlay);
+            } else if global != path && global.exists() {
+                let overlay = load_policy_file(&global);
+                policy.overlay_from(overlay);
+            }
+            policy
+        }
+    }
 }
 
 /// Resolve a policy from an explicit session file + global file: session wins,
@@ -1339,6 +1417,59 @@ pub fn load_policy_file(path: &std::path::Path) -> SecurityPolicy {
             policy.allow_worktree = Some(PathBuf::from(wt));
         }
     policy
+}
+
+impl SecurityPolicy {
+    /// Layer `overlay` onto `self`, taking only the keys the overlay actually
+    /// set.
+    ///
+    /// "Actually set" is determined by comparing each field against the built-in
+    /// default. That is a heuristic — a file that explicitly writes a value
+    /// *equal* to the default is indistinguishable from one that omits the key,
+    /// and is treated as omitted, which is harmless: the result is the same
+    /// either way. The alternative (tracking a `set` bit per key while parsing)
+    /// would be exact but threads state through the tolerant parser, which
+    /// handles ~30 keys and several aliases; the divergence only ever occurs
+    /// where the two values are equal, so the complexity buys nothing.
+    fn overlay_from(&mut self, overlay: SecurityPolicy) {
+        let d = SecurityPolicy::default();
+        if overlay.level != d.level {
+            self.level = overlay.level;
+        }
+        if overlay.apt != d.apt {
+            self.apt = overlay.apt;
+        }
+        if overlay.network != d.network {
+            self.network = overlay.network;
+        }
+        if overlay.ask != d.ask {
+            self.ask = overlay.ask;
+        }
+        if overlay.read != d.read {
+            self.read = overlay.read;
+        }
+        if overlay.user_security != d.user_security {
+            self.user_security = overlay.user_security;
+        }
+        if overlay.quarantine != d.quarantine {
+            self.quarantine = overlay.quarantine;
+        }
+        if overlay.quarantine_project != d.quarantine_project {
+            self.quarantine_project = overlay.quarantine_project;
+        }
+        if overlay.allow_worktree != d.allow_worktree {
+            self.allow_worktree = overlay.allow_worktree;
+        }
+        if overlay.quarantine_staging != d.quarantine_staging {
+            self.quarantine_staging = overlay.quarantine_staging;
+        }
+        if overlay.quarantine_critical != d.quarantine_critical {
+            self.quarantine_critical = overlay.quarantine_critical;
+        }
+        if overlay.extra_guard != d.extra_guard {
+            self.extra_guard = overlay.extra_guard;
+        }
+    }
 }
 
 /// One-line process-identity + quarantine-state diagnostic, appended to save
@@ -1705,7 +1836,10 @@ pub fn probe_health(repo_root: &Path, check_cmd: &str) -> Option<HealthProbe> {
         // separately computed. We run the check once (to learn build success)
         // and infer warnings from a dedicated lint run when a Cargo project is
         // present.
-        let build_failed = !run_check(repo_root, check_cmd);
+        // Only a check that actually ran and failed counts as a broken build. If
+        // it could not be run (no `bash`), we have no evidence, and saying
+        // "broken" would send the agent off fixing a non-existent failure.
+        let build_failed = matches!(run_check(repo_root, check_cmd), CheckOutcome::Failed);
         let mut has_warnings = false;
         if !build_failed {
             // Cheap warning probe for Rust projects (the common case here).
@@ -1733,21 +1867,38 @@ pub fn probe_health(repo_root: &Path, check_cmd: &str) -> Option<HealthProbe> {
     }
 }
 
+/// Outcome of running the configured check: whether it failed, or could not be
+/// run at all. The distinction matters — a missing `bash` is not a broken build.
+enum CheckOutcome {
+    Passed,
+    Failed,
+    /// No shell to run the check with (or it could not be spawned). We have no
+    /// evidence either way, so we must not claim the build is broken.
+    Unavailable,
+}
+
 #[cfg(unix)]
-fn run_check(repo_root: &Path, check_cmd: &str) -> bool {
+fn run_check(repo_root: &Path, check_cmd: &str) -> CheckOutcome {
     use std::process::Command;
     if check_cmd.trim().is_empty() {
         // No configured check: nothing we can verify, treat as "clean" so we
         // don't spuriously try to fix a tree we can't even build.
-        return true;
+        return CheckOutcome::Passed;
     }
-    Command::new("bash")
+    match Command::new("bash")
         .arg("-lc")
         .arg(check_cmd)
         .current_dir(repo_root)
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    {
+        Ok(s) if s.success() => CheckOutcome::Passed,
+        Ok(_) => CheckOutcome::Failed,
+        // No `bash` on a minimal/container host. Reporting this as a failed
+        // build tells the agent its tree is broken and sends it off inventing
+        // fixes for a failure that never happened — burning turns, and possibly
+        // editing files, over a missing interpreter.
+        Err(_) => CheckOutcome::Unavailable,
+    }
 }
 
 #[cfg(unix)]
@@ -2133,6 +2284,74 @@ pub mod trash;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `PIR_CONFIG_SOURCE` selects where policy values come from. The default
+    /// must stay `external`, or a config file written for every existing install
+    /// would silently stop being read.
+    #[test]
+    fn config_source_parses_and_defaults_to_external() {
+        assert_eq!(ConfigSource::from_env_value("builtin"), Some(ConfigSource::Builtin));
+        assert_eq!(ConfigSource::from_env_value("BUILT-IN"), Some(ConfigSource::Builtin));
+        assert_eq!(ConfigSource::from_env_value(" external "), Some(ConfigSource::External));
+        assert_eq!(ConfigSource::from_env_value("merged"), Some(ConfigSource::Merged));
+        // A typo must not be guessed at: it is reported, and the caller falls back.
+        assert_eq!(ConfigSource::from_env_value("external-and-magic"), None);
+        assert_eq!(ConfigSource::from_env_value(""), None);
+        assert_eq!(ConfigSource::default(), ConfigSource::External);
+    }
+
+    /// `merged` must layer a partial file over the built-ins, not replace them.
+    /// A file naming only `security.level` still gets the default apt/network/
+    /// read/quarantine posture — that is the whole point of the mode, and the
+    /// easy mistake is to let the file's own defaults overwrite the built-ins.
+    #[test]
+    fn merged_keeps_builtin_values_the_file_does_not_mention() {
+        let dir = std::env::temp_dir().join(format!("pir_cfgsrc_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("security.toml");
+        std::fs::write(&file, "security.level = \"off\"\n").unwrap();
+
+        let base = SecurityPolicy::default();
+        let mut merged = base.clone();
+        merged.overlay_from(load_policy_file(&file));
+        // The one key the file set is taken.
+        assert_eq!(merged.level, SecurityLevel::Off);
+        // Everything else keeps the built-in value.
+        assert_eq!(merged.apt, base.apt, "apt must keep the built-in default");
+        assert_eq!(merged.network, base.network, "network must keep the built-in default");
+        assert_eq!(merged.read, base.read, "read mode must keep the built-in default");
+        assert_eq!(merged.quarantine, base.quarantine, "quarantine must keep the built-in default");
+        assert_eq!(merged.user_security, base.user_security);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A check that could not be *run* must not be reported as a broken build.
+    /// The old code collapsed "could not spawn" into `false`, so `build_failed`
+    /// became true and the idle prompt told the agent its tree was broken —
+    /// sending it off to invent fixes, and possibly edit files, over a missing
+    /// interpreter.
+    ///
+    /// Here `bash` does exist, so the "could not run" arm is not reachable
+    /// directly; what is pinned here is the *classification*: a passing check is
+    /// Passed, a failing one is Failed, and only a spawn error is Unavailable.
+    /// The consumer keys off exactly that distinction.
+    #[cfg(unix)]
+    #[test]
+    fn check_outcome_distinguishes_failure_from_unavailability() {
+        let dir = std::env::temp_dir().join(format!("pir_health_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // Nothing configured: nothing to verify, so not a failure.
+        assert!(matches!(run_check(&dir, ""), CheckOutcome::Passed));
+        // A check that genuinely fails must still be Failed — the fix must not
+        // over-correct into "never report a broken build".
+        assert!(matches!(run_check(&dir, "false"), CheckOutcome::Failed));
+        assert!(matches!(run_check(&dir, "true"), CheckOutcome::Passed));
+        // And the consumer only reports a broken build for Failed.
+        let reported = matches!(run_check(&dir, "false"), CheckOutcome::Failed);
+        assert!(reported, "a real failing check must still surface as build_failed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn decide_off_allows_everything() {        let p = SecurityPolicy { level: SecurityLevel::Off, ..Default::default() };
