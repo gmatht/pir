@@ -144,6 +144,24 @@ pub struct Hierarchy {
     pub note: String,
 }
 
+/// The uid owning this process, used to namespace cgroup directories
+/// (`pir-<uid>`) so two users' slices cannot collide.
+///
+/// `libc::geteuid` is unix-only; on Windows there is no cgroup hierarchy to
+/// namespace in the first place ([`detect_hierarchy`] yields [`Backend::None`]),
+/// so a fixed placeholder is enough to keep the module compiling.
+fn current_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        // SAFETY: `geteuid` is a pure getter with no preconditions.
+        unsafe { libc::geteuid() }
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
 /// Detect the cgroup layout once per process.
 ///
 /// Never fails: every error path yields [`Backend::None`] with a note saying
@@ -569,12 +587,25 @@ pub fn create_command_cgroup(
     let Some(root) = &h.root else {
         return Ok(None);
     };
-    // Nesting: <root>/pir-<uid>/<session>/cmd-<pid>. The uid level keeps two
+    // Nesting: <root>/pir-<uid>/<session>/cmd-<unique>. The uid level keeps two
     // operators' sessions from colliding, and the session level is what the
     // aggregate slice hangs off.
-    let uid_dir = root.join(format!("pir-{}", unsafe { libc::geteuid() }));
+    //
+    // The command directory is named after the **forking process plus the
+    // cgroup's inode**, not just the forker's pid. `cmd-<pid>` looked unique but
+    // is not: a session key can be reused (a resumed session, or a test binary
+    // running many cases under one key), and one process can spawn many
+    // commands, so two commands could land in the *same* directory — the second
+    // would silently inherit the first's written limit, and the first's `Drop`
+    // would remove the directory out from under the second.
+    let uid_dir = root.join(format!("pir-{}", current_uid()));
     let sess_dir = uid_dir.join(session_key);
-    let cmd_dir = sess_dir.join(format!("cmd-{}", std::process::id()));
+    let cmd_dir = unique_cmd_dir(&sess_dir);
+    if cmd_dir.parent() != Some(sess_dir.as_path()) {
+        // `unique_cmd_dir` always yields a child of `sess_dir`; this is a
+        // defensive check so a future edit cannot make cleanup escape upward.
+        return Err(format!("refusing to create cgroup outside {}", sess_dir.display()));
+    }
     for d in [&uid_dir, &sess_dir, &cmd_dir] {
         std::fs::create_dir_all(d).map_err(|e| format!("mkdir {}: {e}", d.display()))?;
     }
@@ -618,6 +649,36 @@ fn write_limit(dir: &Path, file: &str, value: u64) -> bool {
     std::fs::write(dir.join(file), value.to_string()).is_ok()
 }
 
+/// Pick a command-cgroup name that is not already taken.
+///
+/// `pid` alone is not unique enough: a session key can be reused across runs (a
+/// resumed session; a test binary exercising many cases under one key), and a
+/// single process spawns many commands. Colliding would mean one command
+/// silently inheriting another's written limit, and one guard's `Drop` removing
+/// a directory another command is still living in.
+///
+/// So the name carries the pid (for human correlation with `$PIR_SCRATCHPAD` and
+/// the process tree) plus a monotonically increasing counter, with an existence
+/// check as the final arbiter.
+fn unique_cmd_dir(sess_dir: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    for _ in 0..10_000 {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let cand = sess_dir.join(format!("cmd-{pid}-{n}"));
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    // Pathological: fall back to a nanosecond suffix rather than looping.
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    sess_dir.join(format!("cmd-{pid}-{t}"))
+}
+
 /// Lower `file` only if the current value is above `value` — memsw must stay
 /// `>=` the memory limit in v1, and lowering memsw below the (unlimited)
 /// default is the whole point here.
@@ -635,7 +696,7 @@ pub fn ensure_session_slice(session_key: &str, budget: u64, enforce: bool) {
     let h = hierarchy();
     let Some(root) = &h.root else { return };
     let dir = root
-        .join(format!("pir-{}", unsafe { libc::geteuid() }))
+        .join(format!("pir-{}", current_uid()))
         .join(session_key);
     if std::fs::create_dir_all(&dir).is_err() {
         return;
@@ -664,54 +725,72 @@ pub fn sweep_stale() -> usize {
     let h = hierarchy();
     let Some(root) = &h.root else { return 0 };
     let mut removed = 0;
-    let Ok(entries) = std::fs::read_dir(root) else { return 0 };
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().to_string();
-        if !name.starts_with("pir-probe-") && !name.starts_with("pir-") {
-            continue;
-        }
-        if name == format!("pir-{}", unsafe { libc::geteuid() }) {
-            continue; // our own tree; per-session dirs are cleaned below
-        }
-        // Probe dirs from a previous crash are always stale.
-        if name.starts_with("pir-probe-") {
-            removed += remove_if_empty(&e.path());
+
+    // Probe dirs from a crashed run are always stale.
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with("pir-probe-") {
+                removed += remove_if_empty(&e.path());
+            }
         }
     }
-    // Inside our own tree, remove empty session dirs (a session that exited
-    // cleanly already rmdir'd its command cgroups). A session dir left behind
-    // by a *crash* still contains its `cmd-*` children, so those are swept
-    // first — a leaked cgroup holding a limit is worse than no cgroups, because
-    // it makes the next run unaccounted.
-    let ours = root.join(format!("pir-{}", unsafe { libc::geteuid() }));
+
+    // Inside our own tree, sweep every *empty* cgroup. A session that exited
+    // cleanly already removed its command cgroups via `Drop`; one that was
+    // SIGKILLed leaves them behind, and a leaked cgroup holding a limit is worse
+    // than no cgroups at all (it makes the next run unaccounted).
+    //
+    // Depth is not assumed: an earlier version hard-coded exactly one level of
+    // `cmd-*` children and silently leaked anything deeper. Walk all the way
+    // down instead, deepest-first, and never touch a cgroup with a process in
+    // it — that is what keeps a *live* session safe.
+    //
+    // **This session's own slice is skipped entirely.** A foreground command's
+    // cgroup is empty for a moment before the child joins it (creation happens
+    // in the parent, the join in the child's `pre_exec`), and in a multi-threaded
+    // process another thread can call this sweep inside that window — at which
+    // point removing the directory would make the child's join fail and quietly
+    // drop the command out of its limits. Cheap insurance against a subtle
+    // self-inflicted race.
+    let ours = root.join(format!("pir-{}", current_uid()));
+    let mine = ours.join(session_key());
     if let Ok(entries) = std::fs::read_dir(&ours) {
         for e in entries.flatten() {
             let path = e.path();
-            if !path.is_dir() {
+            if !path.is_dir() || path == mine {
                 continue;
             }
-            // Only ever remove a cgroup with nothing running in it, so a live
-            // session's slice is never touched.
-            if let Ok(procs) = std::fs::read_to_string(path.join("cgroup.procs"))
-                && procs.lines().any(|l| !l.trim().is_empty())
-            {
-                continue;
-            }
-            if let Ok(inner) = std::fs::read_dir(&path) {
-                for c in inner.flatten() {
-                    let cp = c.path();
-                    if cp.is_dir()
-                        && let Ok(p) = std::fs::read_to_string(cp.join("cgroup.procs"))
-                        && !p.lines().any(|l| !l.trim().is_empty())
-                    {
-                        removed += usize::from(std::fs::remove_dir(&cp).is_ok());
-                    }
-                }
-            }
-            removed += remove_if_empty(&path);
+            removed += sweep_tree(&path);
         }
     }
     removed
+}
+
+/// Recursively remove every empty cgroup at or below `dir`, deepest-first so a
+/// parent is only removed once its children are gone. Returns how many were
+/// removed.
+///
+/// The two safety rules: never remove a cgroup that has a process joined to it
+/// (a live command or session), and never remove anything that is not inside the
+/// tree we were given.
+fn sweep_tree(dir: &Path) -> usize {
+    let mut removed = 0;
+    // Refuse to walk out of the cgroup mount, whatever the arguments.
+    if !dir.starts_with("/sys/fs/cgroup") {
+        return 0;
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            // Only descend into directories that look like cgroups, so a stray
+            // directory of unrelated files is never walked.
+            if p.is_dir() && p.join("cgroup.procs").exists() {
+                removed += sweep_tree(&p);
+            }
+        }
+    }
+    removed + remove_if_empty(dir)
 }
 
 /// Remove a cgroup directory that has no processes in it.
@@ -1429,6 +1508,9 @@ mod tests {
     /// against the feature becoming a routine per-command ration again.
     #[test]
     fn enforcement_is_off_on_a_healthy_host() {
+        // Pure predicate on a synthetic host: no cgroup, and deliberately no
+        // tree lock (holding it here would stall behind the slow live probes
+        // for no benefit, since nothing here touches the tree).
         // Idle, plenty of memory, no swap pressure: advisory only.
         assert!(!should_enforce(&host(64 << 30, 60 << 30)));
         // Even a fairly loaded host is fine.
@@ -1437,6 +1519,7 @@ mod tests {
 
     #[test]
     fn enforcement_arms_only_under_pressure() {
+        // Pure predicate on synthetic hosts: no cgroup, no tree lock.
         // MemAvailable below max(10% of total, 1 GiB) -> arm it.
         assert!(should_enforce(&host(64 << 30, 3 << 30)));
         // Swap more than half used -> arm it.
@@ -1523,6 +1606,26 @@ mod tests {
     }
 }
 
+/// A single lock guarding the **real** cgroup tree for the whole test module.
+///
+/// Every probe that creates, joins, sweeps or asserts on real cgroups must hold
+/// this. The cgroup tree is process-global shared state and `cargo test` runs
+/// cases concurrently in one process, so without it the cases race: one test's
+/// `sweep_stale()` deletes a directory another test has just created but whose
+/// child has not yet joined, and the victim's command then runs unconstrained —
+/// failing an assertion for a reason that has nothing to do with the code under
+/// test. (The production path is not affected: a command's directory is removed
+/// only by its own `Drop`, and the sweep skips the live session.)
+#[cfg(all(test, unix))]
+static CGROUP_TREE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the shared cgroup-tree lock. Poisoning is ignored so one failed
+/// assertion cannot cascade into "poisoned" failures everywhere else.
+#[cfg(all(test, unix))]
+fn lock_cgroup_tree() -> std::sync::MutexGuard<'static, ()> {
+    CGROUP_TREE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(all(test, unix))]
 mod live_probe {
     use super::*;
@@ -1534,6 +1637,7 @@ mod live_probe {
     /// rather than silently altering behaviour.
     #[test]
     fn report_this_host() {
+        let _tree = super::lock_cgroup_tree();
         let h = hierarchy();
         let host = HostMem::read().expect("/proc/meminfo");
         eprintln!("backend      : {:?}", h.backend);
@@ -1557,6 +1661,7 @@ mod live_probe {
     /// and deliberately OOM-kills a child.
     #[test]
     fn enforcement_kills_an_over_allocator() {
+        let _tree = super::lock_cgroup_tree();
         if std::env::var("PIR_RESOURCE_LIVE_TESTS").map(|v| v != "1").unwrap_or(true) {
             eprintln!("skipped (set PIR_RESOURCE_LIVE_TESTS=1 to run)");
             return;
@@ -1566,8 +1671,10 @@ mod live_probe {
             eprintln!("skipped: no backend on this host");
             return;
         }
+        let _tree = super::lock_cgroup_tree();
         let limit = 256u64 << 20;
-        let cg = create_command_cgroup("live-test", limit, 0, true).expect("create").expect("backend");
+        let key = format!("live-test-{}", std::process::id());
+        let cg = create_command_cgroup(&key, limit, 0, true).expect("create").expect("backend");
         // Spawn an allocator that joins the cgroup itself, so the test does not
         // need pre_exec plumbing.
         let script = format!(
@@ -1605,6 +1712,18 @@ mod live_probe {
 mod integration_probe {
     use super::*;
 
+    /// `PIR_RESOURCE_MEMORY_MIB` is *process-global*, and `cargo test` runs cases
+    /// concurrently in one process — so a test that sets it makes every other
+    /// test observe an armed, tiny budget (`should_enforce` returns true for an
+    /// explicit override, by design). Serialize on the env, and restore it even
+    /// when an assertion fires, so one failure cannot cascade into confusing
+    /// failures elsewhere.
+    pub(super) static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(super) fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// End-to-end through the *real* spawn path used by the agent's bash tool,
     /// with a deliberately tiny budget: the command must come back killed, and
     /// the message must name the budget and its basis.
@@ -1621,18 +1740,38 @@ mod integration_probe {
             eprintln!("skipped: no cgroup backend on this host");
             return;
         }
+        let _env = lock_env();
+        // Hold the tree lock: this test *joins a real cgroup*, and a concurrent
+        // `sweep_stale()` from another case would delete the directory between
+        // our `mkdir` and the child's join — at which point the child silently
+        // runs unconstrained and the assertion below fires for the wrong reason.
+        let _tree = super::lock_cgroup_tree();
         // A tiny budget makes the failure fast and deterministic. The variable
         // is read by `limits_for_session`, so this is exactly the operator's
-        // knob.
-        unsafe { std::env::set_var("PIR_RESOURCE_MEMORY_MIB", "192") };
+        // knob. Guard-restored so a failing assertion cannot leak it into the
+        // other tests.
         let key = format!("live-e2e-{}", std::process::id());
         let host = HostMem::read().expect("meminfo");
+        let prev = std::env::var("PIR_RESOURCE_MEMORY_MIB").ok();
+        unsafe { std::env::set_var("PIR_RESOURCE_MEMORY_MIB", "192") };
         let limits = limits_for_session(&host, &key);
+        match prev {
+            Some(v) => unsafe { std::env::set_var("PIR_RESOURCE_MEMORY_MIB", v) },
+            None => unsafe { std::env::remove_var("PIR_RESOURCE_MEMORY_MIB") },
+        }
         assert_eq!(limits.memory_bytes, 192 << 20, "override should win");
+        // The limit is passed explicitly from here on, so the ambient env no
+        // longer matters to this test.
         let cg = create_command_cgroup(&key, limits.memory_bytes, 0, true).expect("create").expect("backend");
+        // Capture a *join failure* explicitly: without this, a child that never
+        // entered the cgroup just runs unconstrained and the assertion below
+        // fails for a reason that hides the real problem.
         let script = format!(
-            "echo $$ > {}/cgroup.procs; python3 -c 'x=bytearray(600*1024*1024)'",
-            cg.dir().display()
+            "if ! echo $$ > {}/cgroup.procs; then echo JOIN-FAILED >&2; exit 3; fi; \
+             if ! grep -q $$ {}/cgroup.procs; then echo JOIN-VANISHED >&2; exit 4; fi; \
+             python3 -c 'x=bytearray(600*1024*1024)'",
+            cg.dir().display(),
+            cg.dir().display(),
         );
         let child = std::process::Command::new("bash")
             .arg("-c")
@@ -1643,13 +1782,25 @@ mod integration_probe {
             .expect("spawn");
         let out = child.wait_with_output().expect("wait");
         let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
         eprintln!("status: {:?}", out.status);
+        eprintln!("stderr: {}", stderr.trim());
+        eprintln!("dir exists: {}", cg.dir().exists());
         eprintln!("oom_kills: {}", cg.oom_kills());
         eprintln!("peak: {:?}", cg.peak().map(human_bytes));
-        assert!(!stdout.contains("Traceback") || !stdout.contains("MemoryError") || true);
+        // The command must have *died*, not merely exited non-zero: assert the
+        // kernel's own counter moved, which is unambiguous evidence that the
+        // 192 MiB limit — not something else — stopped it.
         assert!(
-            cg.oom_kills() > 0 || !out.status.success(),
-            "command should not have succeeded"
+            cg.oom_kills() > 0,
+            "the kernel should have recorded an oom_kill (status {:?}, stdout {:?})",
+            out.status,
+            stdout
+        );
+        assert!(
+            cg.peak().unwrap_or(0) >= (192 << 20) - (4 << 20),
+            "peak {:?} should have reached the 192 MiB limit",
+            cg.peak()
         );
         // And the message the model would see names the budget.
         let mut g = Guard::new(limits.clone(), Some(cg));
@@ -1657,7 +1808,6 @@ mod integration_probe {
         let msg = g.kill_message(&KillReason::OverBudget, &script);
         assert!(msg.contains("192 MiB"), "budget should be named: {msg}");
         assert!(msg.contains("operator override"), "basis should be named: {msg}");
-        unsafe { std::env::remove_var("PIR_RESOURCE_MEMORY_MIB") };
     }
 }
 
@@ -1678,16 +1828,27 @@ mod posture_probe {
             eprintln!("skipped (set PIR_RESOURCE_LIVE_TESTS=1 to run)");
             return;
         }
+        let _env = super::integration_probe::lock_env();
+        let _tree = super::lock_cgroup_tree();
         let host = HostMem::read().expect("meminfo");
         // Guard the test itself: skip if this host genuinely cannot spare it.
         if host.available < 12 * (1 << 30) {
             eprintln!("skipped: only {} available", human_bytes(host.available));
             return;
         }
+        // Assert on a *synthetic* healthy host rather than the ambient one: this
+        // test is about the posture rule, and a sibling test may legitimately
+        // have an override set (which arms enforcement). Reading the live
+        // environment here would make the two tests fight.
+        let healthy = HostMem {
+            total: 64 << 30,
+            available: 60 << 30,
+            free: 60 << 30,
+            ..HostMem::default()
+        };
         assert!(
-            !should_enforce(&host),
-            "a healthy host must not arm enforcement (available {})",
-            human_bytes(host.available)
+            !should_enforce(&healthy),
+            "a healthy host must not arm enforcement"
         );
         let limits = limits_for_session(&host, "posture-test");
         assert!(!limits.enforce, "default posture is advisory");
@@ -1719,5 +1880,147 @@ mod posture_probe {
             "a 6 GiB allocation must succeed under the default posture: {stdout}"
         );
         assert_eq!(cg.oom_kills(), 0, "nothing may be OOM-killed here");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lifecycle_probe {
+    use super::*;
+
+    /// These tests exercise the **real** cgroup tree and the *global* sweep, so
+    /// they must not race each other: `cargo test` runs cases concurrently in
+    /// one process, and one test's `sweep_stale` would happily delete another
+    /// test's freshly-created (and momentarily empty) fixture — a flake that
+    /// looks like a bug in the sweep but is really shared state.
+    ///
+    /// There is exactly **one** lock for the whole test module
+    /// ([`super::lock_cgroup_tree`]); a second, module-local mutex would risk
+    /// taking them in opposite orders and deadlocking. The resource tree is a
+    /// process-global resource, like the `$VAR`-swapping tests elsewhere in this
+    /// suite that serialize on a lock for the same reason.
+    fn lock_tree() -> std::sync::MutexGuard<'static, ()> {
+        super::lock_cgroup_tree()
+    }
+
+    /// Two commands in the **same** session key must never share a cgroup
+    /// directory. The original `cmd-<pid>` naming made this collision possible
+    /// (a resumed session, or a process spawning several commands sequentially),
+    /// and the consequence was silent: the second command would inherit the
+    /// first's written limit, and the first guard's `Drop` would delete a
+    /// directory the second was still living in.
+    #[test]
+    fn same_session_commands_get_distinct_cgroups() {
+        let _tree = lock_tree();
+        if hierarchy().backend == Backend::None {
+            eprintln!("skipped: no backend");
+            return;
+        }
+        let key = format!("collide-probe-{}", std::process::id());
+        let mut dirs = Vec::new();
+        for _ in 0..3 {
+            let cg = create_command_cgroup(&key, 256 << 20, 0, true)
+                .expect("create")
+                .expect("backend");
+            dirs.push(cg.dir().to_path_buf());
+        }
+        assert_eq!(dirs.len(), 3);
+        for (i, a) in dirs.iter().enumerate() {
+            for b in dirs.iter().skip(i + 1) {
+                assert_ne!(a, b, "two commands shared a cgroup dir: {}", a.display());
+            }
+        }
+        // Dropping the guards must leave the session dir clean.
+        for cg in create_command_cgroup(&key, 0, 0, false).into_iter().flatten() {
+            drop(cg);
+        }
+        for d in &dirs {
+            assert!(!d.exists(), "guard Drop did not remove {}", d.display());
+        }
+    }
+
+    /// The sweep must reach **nested** empty cgroups, not just one level of
+    /// `cmd-*` children — the earlier version hard-coded the depth and silently
+    /// leaked anything deeper.
+    #[test]
+    fn sweep_removes_nested_empty_cgroups() {
+        let _tree = lock_tree();
+        if hierarchy().backend == Backend::None {
+            eprintln!("skipped: no backend");
+            return;
+        }
+        let key = format!("sweep-probe-{}", std::process::id());
+        let cg = create_command_cgroup(&key, 0, 0, false).expect("create").expect("backend");
+        let dir = cg.dir().to_path_buf();
+        let sess = dir.parent().expect("session dir").to_path_buf();
+        // Drop the guard so the command dir is empty, then recreate it by hand
+        // to simulate a crash that left the directory behind.
+        drop(cg);
+        std::fs::create_dir_all(&dir).expect("recreate");
+        assert!(dir.exists());
+
+        let removed = sweep_stale();
+        eprintln!("swept {removed}");
+        assert!(!dir.exists(), "nested empty cgroup survived the sweep");
+        assert!(!sess.exists(), "empty session dir survived the sweep");
+        // Belt and braces: leave nothing behind even if an assertion above was
+        // the thing that failed, so a failing run does not itself leak a cgroup.
+        let _ = std::fs::remove_dir_all(&sess);
+    }
+
+    /// A cgroup with a live process must **never** be swept — that would be the
+    /// sweep killing a running session.
+    ///
+    /// The "live process" is a **child** we spawn, not the test process itself.
+    /// Parking the shared test binary in a cgroup is not an option: `cargo test`
+    /// runs every case as a thread of one process, so a child spawned by any
+    /// later test would inherit the membership — which is exactly how an earlier
+    /// version of this test wedged the whole suite (a *killed* command's
+    /// surviving grandchild stayed in the cgroup and an unrelated later test
+    /// waited on it forever).
+    #[test]
+    fn sweep_never_touches_a_populated_cgroup() {
+        let _tree = lock_tree();
+        if hierarchy().backend == Backend::None {
+            eprintln!("skipped: no backend");
+            return;
+        }
+        let key = format!("live-probe-{}", std::process::id());
+        let cg = create_command_cgroup(&key, 0, 0, false).expect("create").expect("backend");
+        let dir = cg.dir().to_path_buf();
+        let sess = dir.parent().expect("session dir").to_path_buf();
+        // A long-lived child that joins the cgroup itself, so the directory is
+        // genuinely populated while we sweep.
+        let mut child = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "echo $$ > {}/cgroup.procs; sleep 60",
+                dir.display()
+            ))
+            .spawn()
+            .expect("spawn sleeper");
+        // Wait for it to join.
+        let mut joined = false;
+        for _ in 0..100 {
+            if let Ok(p) = std::fs::read_to_string(dir.join("cgroup.procs"))
+                && p.lines().any(|l| !l.trim().is_empty())
+            {
+                joined = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(joined, "sleeper never joined the cgroup");
+
+        let removed = sweep_stale();
+        eprintln!("swept {removed} while a sleeper was live");
+        let survived = dir.exists();
+
+        // Always clean up, even if the assertion below fails.
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir(&dir);
+        let _ = std::fs::remove_dir(&sess);
+
+        assert!(survived, "the sweep removed a cgroup with a live process in it");
     }
 }
