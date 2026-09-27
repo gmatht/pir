@@ -3525,12 +3525,14 @@ mod priv_escalation_tests {
 
     /// The regression this module exists for: `tty_available()` must be true
     /// whenever the process can reach an interactive terminal, so an escalation
-    /// prompt actually waits for the operator. This test only asserts the
-    /// *decision contract* that was broken — we must never claim the operator
-    /// declined when no keypress arrived. It never actually blocks: it stubs
-    /// out the tty-availability question by checking the wording produced for a
-    /// no-answer, which is the message the old code could not produce (it
-    /// always said "user declined").
+    /// prompt actually waits for the operator. This test asserts the *decision
+    /// contract* that was broken — we must never claim the operator declined
+    /// when no keypress arrived — without ever blocking on a real terminal.
+    ///
+    /// The unattended branch is host-dependent by design: with passwordless
+    /// sudo (always true as root) the escalation is legitimately allowed, so the
+    /// test asserts the invariant that holds either way rather than a fixed
+    /// outcome.
     #[test]
     fn no_answer_is_not_reported_as_a_decline() {
         // The refusal produced when nobody answers must name `no answer`, not
@@ -3540,32 +3542,37 @@ mod priv_escalation_tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         );
-        // Directly exercise the prompt's timeout branch with a 0-length wait by
-        // pointing it at an unreadable "terminal": `/dev/tty` may exist for a
-        // test harness, so we instead assert the *source contract* that the
-        // no-answer arm exists by running the non-tty refusal (which is the
-        // path taken when no human can be reached).
-        if crate::term::tty_available() {
-            // A terminal exists but the test runner can't safely consume the
-            // operator's real keystrokes; assert the message wording via the
-            // helper that builds it rather than blocking on /dev/tty.
-            let msg = Builtin::refusal_without_approval("sudo as root", 1);
-            assert!(
-                !msg.contains("user declined"),
-                "must not fabricate a denial by the operator: {msg}"
-            );
-            assert!(
-                msg.contains("no answer") || msg.contains("refusing to escalate"),
-                "expected an explicit no-answer refusal, got: {msg}"
-            );
-        } else {
-            // No terminal at all: the non-tty refusal must point at the
-            // out-of-band escalation path, never claim the user said no.
-            let msg = b
-                .request_priv_escalation_timeout("sudo true", "sudo as root".to_string(), 1)
-                .expect_err("must refuse without a terminal");
-            assert!(!msg.contains("user declined"), "got: {msg}");
-            assert!(msg.contains("refusing to escalate"), "got: {msg}");
+
+        // The decision contract, asserted directly: the message the no-answer
+        // arm builds must never claim the operator said no. This is the branch
+        // that regressed, and it is reachable whatever the host's tty/sudo state.
+        let msg = Builtin::refusal_without_approval("sudo as root", 1);
+        assert!(
+            !msg.contains("user declined"),
+            "must not fabricate a denial by the operator: {msg}"
+        );
+        assert!(
+            msg.contains("no answer") || msg.contains("refusing to escalate"),
+            "expected an explicit no-answer refusal, got: {msg}"
+        );
+
+        // The unattended path (no tty at all) additionally must never claim a
+        // decline. Its *outcome* is host-dependent and deliberately so: with
+        // passwordless sudo the escalation is legitimately allowed, so asserting
+        // an error here would be asserting a lie about the host (it failed as
+        // root, where `sudo true` really does succeed). What must hold either
+        // way is only that success is quiet and refusal never blames the user.
+        if !crate::term::tty_available() {
+            match b.request_priv_escalation_timeout("sudo true", "sudo as root".to_string(), 1) {
+                Ok(()) => assert!(
+                    b.sudo_is_passwordless("sudo true"),
+                    "escalation may only succeed unattended when a password is not required"
+                ),
+                Err(msg) => {
+                    assert!(!msg.contains("user declined"), "got: {msg}");
+                    assert!(msg.contains("refusing to escalate"), "got: {msg}");
+                }
+            }
         }
     }
 }
