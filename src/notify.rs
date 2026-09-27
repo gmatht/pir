@@ -125,6 +125,38 @@ impl AgentEvent {
         }
     }
 
+    /// The window/tab title: identity only — `pir · <dir>`.
+    ///
+    /// Deliberately *not* the event summary. The title sits in a fixed-width
+    /// terminal tab (and zellij truncates it), so anything chatty is noise: it
+    /// was writing lines like `pir · corro: turn done in 12.3s (1234 in / 567
+    /// out tokens)` into the tab strip. Duration and token counts belong in the
+    /// on-screen feed and the desktop pop-up, which have room for them.
+    ///
+    /// A long project path is shortened to its last two segments (`a/b/c` →
+    /// `b/c`) so the title stays scannable when several pir panes are open.
+    pub fn terminal_title(&self) -> String {
+        if self.project.is_empty() {
+            return "pir".to_string();
+        }
+        let project = self.project.trim();
+        if project.is_empty() {
+            return "pir".to_string();
+        }
+        let segs: Vec<&str> = project.split('/').filter(|s| !s.is_empty()).collect();
+        if segs.is_empty() {
+            return "pir".to_string();
+        }
+        // Drop a leading "/" rather than emitting a bare root path, and keep only
+        // the last two segments so a deep path stays scannable next to other tabs.
+        let short = if segs.len() > 2 {
+            segs[segs.len() - 2..].join("/")
+        } else {
+            segs.join("/")
+        };
+        format!("pir · {short}")
+    }
+
     /// Body for desktop pop-ups: the summary, plus the last prompt when we have
     /// one, so the user knows which task finished.
     pub fn desktop_body(&self) -> String {
@@ -438,9 +470,8 @@ impl Notifier for Bell {
             return;
         }
         let _ = std::io::stderr().write_all(b"\x07");
-        let _ = std::io::stderr().write_all(
-            format!("\x1b]0;{}: {}\x07", e.desktop_title(), e.summary()).as_bytes(),
-        );
+        let _ = std::io::stderr()
+            .write_all(format!("\x1b]0;{}\x07", e.terminal_title()).as_bytes());
         let _ = std::io::stderr().flush();
     }
 }
@@ -718,6 +749,47 @@ pub fn render_feed(events: &[AgentEvent]) -> String {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::*;
+
+    fn ev(project: &str) -> AgentEvent {
+        AgentEvent::turn_done(Duration::from_secs(1), 0, 0, project.into(), "hi".into())
+    }
+
+    /// The terminal title is identity only: `pir · <dir>`. It used to append the
+    /// whole event summary, so a zellij tab strip read
+    /// `pir · corro: turn done in 12.3s (1234 in / 567 out tokens)` — a fixed,
+    /// usually-truncated strip with no room for it.
+    #[test]
+    fn terminal_title_carries_identity_not_the_event_summary() {
+        let e = ev("corro");
+        assert_eq!(e.terminal_title(), "pir · corro");
+        // The chatty parts exist, and are deliberately kept out of the title.
+        let summary = e.summary();
+        assert!(summary.contains("turn done"), "sanity: summary is still verbose");
+        assert!(!e.terminal_title().contains("turn done"), "summary leaked into the title");
+        assert!(!e.terminal_title().contains("tokens"), "token counts leaked into the title");
+        assert!(e.terminal_title().chars().count() < 20, "title must stay short");
+    }
+
+    #[test]
+    fn terminal_title_falls_back_to_bare_pir() {
+        assert_eq!(ev("").terminal_title(), "pir");
+        assert_eq!(ev("   ").terminal_title(), "pir");
+    }
+
+    /// A deep path is shortened so the title stays scannable next to other tabs.
+    #[test]
+    fn terminal_title_shortens_long_paths() {
+        assert_eq!(ev("home/ai_pir/src/pir").terminal_title(), "pir · src/pir");
+        assert_eq!(ev("corro").terminal_title(), "pir · corro");
+        assert_eq!(ev("/corro").terminal_title(), "pir · corro");
+        // The desktop pop-up keeps the full path — it has room for it.
+        assert_eq!(ev("home/ai_pir/src/pir").desktop_title(), "pir · home/ai_pir/src/pir");
+    }
 }
 
 #[cfg(test)]
