@@ -27,7 +27,9 @@ use std::time::Duration;
 /// Discriminator for the kind of event, kept separate from the (shared)
 /// descriptive fields so events can carry notification context (project /
 /// prompt) without exploding every variant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// `Hash` is needed by the notification coalescer, which keys a pending map by
+// kind so a burst of same-kind events collapses to one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EventKind {
     TurnDone,
     Error,
@@ -240,6 +242,19 @@ impl Default for NotifierHub {
     }
 }
 
+/// Start the process-wide notification coalescer, driving a hub built from
+/// `policy`. Called once at startup.
+///
+/// This is what makes a burst of agent turns cost one notifier spawn instead
+/// of one per turn, and it is the only path that spawns a notifier child, so
+/// it is also where children get reaped (see
+/// [`crate::notify_coalesce::spawn_and_reap`]). Safe to call more than once:
+/// the first call wins and later calls are ignored.
+pub fn install_coalescer(policy: &NotifyPolicy) {
+    let hub = Arc::new(NotifierHub::from_policy(policy));
+    crate::notify_coalesce::install(Arc::new(move |e: &AgentEvent| hub.fire(e)));
+}
+
 // ---------------------------------------------------------------------------
 // Policy
 // ---------------------------------------------------------------------------
@@ -403,6 +418,12 @@ impl NotifyBus {
     /// Publish an event. Fires external notifiers (gated by policy) and appends
     /// to the on-screen feed (gated by policy for screen). `oneshot` marks an
     /// exit-time event (one-shot / background completion).
+    ///
+    /// External delivery goes through the coalescing thread
+    /// ([`crate::notify_coalesce`]) rather than firing inline, so a burst of
+    /// turns from a long-running agent loop collapses into one notifier spawn
+    /// instead of one per event. The on-screen feed is NOT coalesced: it is a
+    /// cheap in-process ring buffer and the user may want to see each event.
     pub fn publish(&self, event: AgentEvent, oneshot: bool) {
         // One read lock for both gates + the fire, so a concurrent `/reload`
         // can never interleave a policy swap halfway through publishing.
@@ -412,7 +433,19 @@ impl NotifyBus {
         };
         let (policy, external) = &*g;
         if policy.allows(&event, oneshot, false) {
-            external.fire(&event);
+            // Hand the event to the coalescing thread when one is installed:
+            // it collapses a burst of turns into a single notifier spawn. The
+            // thread is configured at startup with its own hub, so nothing
+            // borrowed from this guard crosses the thread boundary.
+            //
+            // If no coalescer is installed (tests, embedded uses), deliver
+            // inline exactly as before — the feature is additive, never a
+            // reason to drop a notification.
+            if crate::notify_coalesce::is_installed() {
+                crate::notify_coalesce::queue(event.clone());
+            } else {
+                external.fire(&event);
+            }
         }
         if policy.allows(&event, oneshot, true) {
             drop(g);
@@ -451,8 +484,15 @@ impl NotifyBus {
 pub type SharedBus = Arc<NotifyBus>;
 
 /// Convenience: build the shared bus behind an `Arc` for the whole process.
+///
+/// Also installs the process-wide notification coalescer on the first call, so
+/// a burst of turns from a long-running agent loop costs one notifier spawn
+/// rather than one per turn. The bus still delivers inline when no coalescer
+/// is installed, so this is purely an optimisation at startup.
 pub fn shared_bus() -> SharedBus {
-    Arc::new(NotifyBus::from_settings())
+    let bus = Arc::new(NotifyBus::from_settings());
+    install_coalescer(&bus.policy());
+    bus
 }
 
 // ---------------------------------------------------------------------------
@@ -484,6 +524,12 @@ impl Notifier for Bell {
 /// headless server or inside WSL2 without a bridge) can never leak error text
 /// onto the user's terminal — that was the source of the spurious
 /// "Could not connect: No such file or directory" lines.
+///
+/// Reaping: every child spawned here is waited on via
+/// [`crate::notify_coalesce::spawn_and_reap`], so a pir that notifies
+/// repeatedly cannot accumulate zombies. Combined with the coalescing thread
+/// (one notifier per burst rather than one per event), this is what keeps a
+/// long-running agent loop from churning a process per turn.
 pub struct Desktop;
 impl Notifier for Desktop {
     fn name(&self) -> &'static str {
@@ -496,12 +542,12 @@ impl Notifier for Desktop {
         // On macOS, use the native AppleScript notification.
         #[cfg(target_os = "macos")]
         {
-            let _ = Command::new("osascript")
-                .args(["-e", &format!("display notification {body:?} with title {title:?}")])
+            let mut c = Command::new("osascript");
+            c.args(["-e", &format!("display notification {body:?} with title {title:?}")])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
+                .stderr(std::process::Stdio::null());
+            crate::notify_coalesce::spawn_and_reap(&mut c);
             return;
         }
 
@@ -523,12 +569,12 @@ impl Notifier for Desktop {
             if !has_session_bus() {
                 return;
             }
-            let _ = Command::new("notify-send")
-                .args([&title, &body])
+            let mut c = Command::new("notify-send");
+            c.args([&title, &body])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
+                .stderr(std::process::Stdio::null());
+            crate::notify_coalesce::spawn_and_reap(&mut c);
         }
     }
 }

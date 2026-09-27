@@ -827,7 +827,7 @@ pub trait RequestSink: Send + Sync {
 }
 
 /// The operator's answer to a surfaced denial.
-#[derive(Default, PartialEq, Eq)]
+#[derive(Default, Clone, PartialEq, Eq)]
 pub enum Decision {
     AllowOnce,
     AllowSession,
@@ -839,6 +839,77 @@ pub enum Decision {
 impl Decision {
     pub fn allows(&self) -> bool {
         matches!(self, Decision::AllowOnce | Decision::AllowSession)
+    }
+}
+
+// ===========================================================================
+// Session grants — what "[s] allow session" actually remembers
+// ===========================================================================
+
+/// One session-scoped approval: a parcel plus the *scope* within it that the
+/// operator agreed to for the rest of this process' lifetime.
+///
+/// A grant is deliberately not "the whole parcel". `guard-system` alone would
+/// hand over `/etc` **and** `/var` **and** `/boot`; an approval to write one
+/// systemd drop-in must not become an approval to rewrite `sshd_config`. The
+/// scope is what keeps `[s]` from being a session-long escalation, and
+/// [`grant_scope`] is the single place that decides how wide each parcel is
+/// allowed to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionGrant {
+    /// `Parcel::id()` of the approved denial.
+    pub parcel: String,
+    /// The op verb it applies to, so a granted *write* never covers a later
+    /// `Exec` at the same path.
+    pub op: String,
+    /// `*` for the whole parcel (non-path ops), otherwise an exact path or the
+    /// single containing directory — see [`grant_scope`].
+    pub scope: String,
+}
+
+impl SessionGrant {
+    /// How the grant is rendered to the operator (`/grants`) — the same string
+    /// used as the map key, so what you're shown is what is enforced.
+    pub fn label(&self) -> String {
+        if self.scope == "*" {
+            format!("{} ({})", self.parcel, self.op)
+        } else {
+            format!("{} ({}) {}", self.parcel, self.op, self.scope)
+        }
+    }
+    fn key(&self) -> String {
+        format!("{}\u{1}{}\u{1}{}", self.parcel, self.op, self.scope)
+    }
+}
+
+/// The scope a parcel may be granted at, for this ask.
+///
+/// Three tiers, by how damaging a too-wide grant would be:
+///   * `*` — the op has no path (network, bind, apt). The parcel *is* the whole
+///     question, so a grant is parcel-wide.
+///   * one file — a single high-value target (a credential, a production DB,
+///     `.git` metadata, a test oracle). Widening to a directory would hand over
+///     sibling secrets nobody approved, so these are pinned to the exact path.
+///   * one dir — "mutate boot/system config" and "touch another user's tree" are
+///     per-*directory* jobs. The agent is nearly always writing a set of related
+///     files (three drop-ins in one `.d/` dir), and a per-file grant re-prompts
+///     for each one — which is exactly the nag this replaces. Bounded to the one
+///     directory, so `/etc/ssh/sshd_config` still asks.
+pub fn grant_scope(parcel: &Parcel, ask: &Ask) -> String {
+    let Some(path) = ask.path.as_ref() else {
+        return "*".to_string();
+    };
+    let canon = canonicalize_lenient(path);
+    match parcel {
+        Parcel::SecretRead { .. }
+        | Parcel::GuardSecrets
+        | Parcel::GuardDb
+        | Parcel::GuardRepoGit
+        | Parcel::GuardTestOracle => canon.to_string_lossy().to_string(),
+        _ => canon
+            .parent()
+            .map(|d| d.to_string_lossy().to_string())
+            .unwrap_or_else(|| canon.to_string_lossy().to_string()),
     }
 }
 
@@ -934,6 +1005,16 @@ pub struct SecurityContext {
     pub quarantine: AtomicBool,
     /// Shared approval context (recent prompts + thinking) for the request sink.
     pub approval: Arc<ApprovalContext>,
+    /// Session grants: what the operator approved with "[s] allow session".
+    /// Lives on the context (not the policy) because it is a *per-session*
+    /// decision made at runtime, never loaded from `security.toml` — a saved
+    /// policy must not carry the authority of an interactive keypress.
+    ///
+    /// Deliberately **not** inherited by a sub-agent: a child builds its own
+    /// context, so a grant the operator gave the parent never widens what the
+    /// child may do. Same rule as the policy clamp in `new_subagent` — narrow
+    /// the child, never widen it.
+    pub grants: Arc<Mutex<Vec<SessionGrant>>>,
     /// Windows: the session Job Object (KILL_ON_JOB_CLOSE + limits). Kept
     /// alive for the life of the context; dropping it reaps the whole tree.
     #[cfg(windows)]
@@ -1051,6 +1132,7 @@ impl SecurityContext {
             headless: AtomicBool::new(headless),
             quarantine: AtomicBool::new(q),
             approval,
+            grants: Arc::new(Mutex::new(Vec::new())),
             #[cfg(windows)]
             windows_job,
             #[cfg(windows)]
@@ -1062,6 +1144,13 @@ impl SecurityContext {
     pub fn check(&self, ask: &Ask) -> Verdict {
         let verdict = self.policy.decide(ask);
         if let Verdict::Deny { parcel, risk } = &verdict {
+            // A session grant silences the ask *before* it is surfaced, so the
+            // operator is never nagged for something they already agreed to
+            // for this session. Plan mode is exempt on purpose (see below):
+            // it is a workflow posture, not a forgotten permission.
+            if !matches!(parcel, Parcel::PlanMode) && self.granted(parcel, ask) {
+                return Verdict::Allow;
+            }
             let denial = Denial {
                 ask: ask.clone(),
                 parcel: parcel.clone(),
@@ -1094,7 +1183,16 @@ impl SecurityContext {
                 }
             }
             match self.sink.surface(&denial) {
-                Decision::AllowOnce | Decision::AllowSession => Verdict::Allow,
+                Decision::AllowSession => {
+                    // This is the one place `AllowSession` means something.
+                    // Record the grant *before* returning Allow, so the next
+                    // equivalent ask is silenced by `granted` above rather than
+                    // re-prompting. `AllowOnce` deliberately records nothing:
+                    // that is the whole difference between the two answers.
+                    self.grant(parcel, ask);
+                    Verdict::Allow
+                }
+                Decision::AllowOnce => Verdict::Allow,
                 Decision::Deny | Decision::Defer => Verdict::Deny {
                     parcel: parcel.clone(),
                     risk: *risk,
@@ -1102,6 +1200,51 @@ impl SecurityContext {
             }
         } else {
             verdict
+        }
+    }
+
+    /// Whether the operator already approved this exact (parcel, op, scope)
+    /// for the rest of the session.
+    pub fn granted(&self, parcel: &Parcel, ask: &Ask) -> bool {
+        let probe = SessionGrant {
+            parcel: parcel.id(),
+            op: ask.op.verb(),
+            scope: grant_scope(parcel, ask),
+        };
+        let Ok(v) = self.grants.lock() else { return false };
+        v.iter().any(|g| g.key() == probe.key())
+    }
+
+    /// Remember a session grant. Re-adding an existing one is a no-op so the
+    /// list stays a set (and `/grants` doesn't grow duplicates).
+    pub fn grant(&self, parcel: &Parcel, ask: &Ask) {
+        let g = SessionGrant {
+            parcel: parcel.id(),
+            op: ask.op.verb(),
+            scope: grant_scope(parcel, ask),
+        };
+        if let Ok(mut v) = self.grants.lock()
+            && !v.iter().any(|x| x.key() == g.key())
+        {
+            v.push(g);
+        }
+    }
+
+    /// The session's grants, in the order they were granted (for `/grants`).
+    pub fn grants_list(&self) -> Vec<SessionGrant> {
+        self.grants.lock().map(|v| v.clone()).unwrap_or_default()
+    }
+
+    /// Drop every session grant (for `/grants clear`), so the next denied ask
+    /// prompts again. Returns how many were dropped.
+    pub fn clear_grants(&self) -> usize {
+        match self.grants.lock() {
+            Ok(mut v) => {
+                let n = v.len();
+                v.clear();
+                n
+            }
+            Err(_) => 0,
         }
     }
 
@@ -2388,6 +2531,203 @@ mod tests {
         let p = SecurityPolicy::default();
         assert_eq!(p.decide(&Ask::write("/home/me/project/src/main.rs")), Verdict::Allow);
         assert_eq!(p.decide(&Ask::write("/tmp/scratch/x")), Verdict::Allow);
+    }
+
+    /// A sink that records what it was asked and answers with a fixed
+    /// decision — lets a test drive `SecurityContext::check` end to end
+    /// without a terminal. `CountingSink` also proves the ask was *not*
+    /// surfaced (the whole point of a grant: no re-prompt).
+    struct CountingSink {
+        decision: Decision,
+        asks: Arc<Mutex<usize>>,
+    }
+    impl RequestSink for CountingSink {
+        fn surface(&self, _d: &Denial) -> Decision {
+            *self.asks.lock().unwrap() += 1;
+            self.decision.clone()
+        }
+    }
+
+    /// The op these tests grant on.
+    ///
+    /// Deliberately *pathless* (`Op::Bind` is denied unconditionally by
+    /// `decide`, on every platform, with no ambient state involved). The obvious
+    /// choice — a write to some guarded path — is **not** usable here: when an
+    /// overlay is mounted, the `Op::Write` arm short-circuits to
+    /// `Verdict::Allow` *before* `guard_write_target` ever classifies the path,
+    /// so no denial and therefore no grant exists. The overlay mount tests set
+    /// that process-global state and cargo runs this suite in parallel, so a
+    /// write-based test here passes alone and fails in a full run. A pathless op
+    /// is refused with no mount, no overlay, and no host dependency, which makes
+    /// these tests deterministic in every mode.
+    fn bind_ask() -> Ask {
+        Ask::new(Op::Bind).with_reason("bind a low port")
+    }
+
+    fn ctx_with(decision: Decision) -> (Arc<SecurityContext>, Arc<Mutex<usize>>) {
+        let asks = Arc::new(Mutex::new(0usize));
+        // headless=true so the default QueuedSink (which would spawn the
+        // platform perm-request queue) is never used; swap in the counting
+        // sink before any check runs.
+        let mut ctx = SecurityContext::new(SecurityPolicy::default(), true);
+        let c = Arc::get_mut(&mut ctx).expect("fresh context is unaliased");
+        c.sink = Box::new(CountingSink { decision, asks: asks.clone() });
+        (ctx, asks)
+    }
+
+    /// The regression this all exists for: "[s] allow session" must actually
+    /// remember. Before the grant store, `AllowSession` was collapsed into
+    /// `AllowOnce` and the *next* identical ask prompted again — so an agent
+    /// writing a set of related files nagged once per file, forever, for the
+    /// whole session.
+    #[test]
+    fn allow_session_silences_the_next_equivalent_ask() {
+        let (ctx, asks) = ctx_with(Decision::AllowSession);
+        let ask = bind_ask();
+
+        // First ask: surfaced, answered "session", allowed.
+        assert_eq!(ctx.check(&ask), Verdict::Allow);
+        assert_eq!(*asks.lock().unwrap(), 1, "the first ask must reach the operator");
+        // Second, identical ask: allowed WITHOUT reaching the operator.
+        assert_eq!(ctx.check(&ask), Verdict::Allow);
+        assert_eq!(*asks.lock().unwrap(), 1, "a session grant must not re-prompt");
+    }
+
+    /// The case that made the dialog repeat for every drop-in: sibling files in
+    /// one config directory. Asserted against the pure scope rule plus
+    /// `grant`/`granted` (the same path `check` takes), because reaching the
+    /// directory tier *through* `check` needs a write the guardrail denies, and
+    /// the only such targets are subject to the overlay short-circuit above.
+    #[test]
+    fn one_grant_covers_the_whole_config_directory() {
+        let (ctx, asks) = ctx_with(Decision::AllowSession);
+        // `Custom` is not in the file-pinned set, so it takes the directory tier.
+        let parcel = Parcel::Custom("operator-guarded".into());
+        let a = Ask::write("/etc/systemd/journald.conf.d/50-wsl-io-throttle.conf");
+        let b = Ask::write("/etc/systemd/journald.conf.d/60-oom.conf");
+        assert_eq!(grant_scope(&parcel, &a), "/etc/systemd/journald.conf.d");
+        assert_eq!(grant_scope(&parcel, &b), "/etc/systemd/journald.conf.d");
+        // `granted` agrees: the second file is covered by the first grant.
+        ctx.grant(&parcel, &a);
+        assert!(ctx.granted(&parcel, &b), "a sibling in the granted dir must be covered");
+        assert_eq!(*asks.lock().unwrap(), 0, "granting directly must not surface an ask");
+    }
+
+    /// "[o] allow once" is the other answer, and it must keep meaning *once*:
+    /// it records no grant, so the next ask prompts again.
+    #[test]
+    fn allow_once_records_nothing() {
+        let (ctx, asks) = ctx_with(Decision::AllowOnce);
+        let ask = bind_ask();
+        assert_eq!(ctx.check(&ask), Verdict::Allow);
+        assert_eq!(ctx.check(&ask), Verdict::Allow);
+        assert_eq!(*asks.lock().unwrap(), 2, "allow-once must prompt every time");
+        assert!(ctx.grants_list().is_empty(), "allow-once must not leave a grant");
+    }
+
+    /// A grant is bounded, so it can't quietly become a session-long root key.
+    /// A grant in one directory must not cover a different one.
+    ///
+    /// Asserted against `grant`/`granted` rather than through `check`, because
+    /// the directory tier is only reached by a system-tree write, and an overlay
+    /// can make those ambient-allowed (see [`bind_ask`]).
+    #[test]
+    fn session_grant_does_not_escape_its_directory() {
+        let (ctx, _asks) = ctx_with(Decision::AllowSession);
+        let parcel = Parcel::Custom("operator-guarded".into());
+        ctx.grant(&parcel, &Ask::write("/etc/systemd/journald.conf.d/50-wsl-io-throttle.conf"));
+        assert!(
+            ctx.granted(&parcel, &Ask::write("/etc/systemd/journald.conf.d/60-oom.conf")),
+            "a sibling in the granted dir must be covered"
+        );
+        assert!(
+            !ctx.granted(&parcel, &Ask::write("/etc/ssh/sshd_config.d/99-x.conf")),
+            "a grant in one dir must not cover another"
+        );
+    }
+
+    /// Secrets/DBs/`.git` are single-file parcels: even the same *directory*
+    /// does not extend a grant, because a directory of drop-ins is a normal
+    /// config job while a directory of credentials is not.
+    #[test]
+    fn high_value_parcels_grant_one_file_not_a_directory() {
+        let (ctx, asks) = ctx_with(Decision::AllowSession);
+        let parcel = Parcel::GuardSecrets;
+        let a = Ask::write("/home/me/.ssh/known_hosts");
+        let b = Ask::write("/home/me/.ssh/authorized_keys");
+        assert_eq!(grant_scope(&parcel, &a), "/home/me/.ssh/known_hosts");
+        ctx.grant(&parcel, &a);
+        assert!(
+            !ctx.granted(&parcel, &b),
+            "a secret grant must not extend to a sibling credential"
+        );
+        assert_eq!(*asks.lock().unwrap(), 0, "granting directly must not surface an ask");
+    }
+
+    /// A grant covers the op it was granted for, not a different one: the op
+    /// is part of the key, so a granted *write* is not authority to a different
+    /// op on the same scope.
+    #[test]
+    fn session_grant_is_scoped_to_its_op() {
+        let (ctx, asks) = ctx_with(Decision::AllowSession);
+        assert_eq!(ctx.check(&bind_ask()), Verdict::Allow);
+        let g = ctx.grants_list();
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].op, "bind", "the grant must record the op it was granted for");
+        assert_eq!(g[0].scope, "*", "a pathless op grants the whole parcel");
+        assert_eq!(*asks.lock().unwrap(), 1);
+    }
+
+    /// Plan mode is a workflow posture, not a forgotten permission: a session
+    /// grant must never silence it, or "[s]" would be a way to edit the repo
+    /// from plan mode.
+    #[test]
+    fn plan_mode_is_never_grantable() {
+        let (mut ctx, asks) = ctx_with(Decision::AllowSession);
+        let mut p = ctx.policy.clone();
+        p.level = SecurityLevel::Plan;
+        Arc::get_mut(&mut ctx).unwrap().policy = p;
+        let ask = Ask::write("/home/me/project/src/main.rs");
+        assert!(matches!(ctx.check(&ask), Verdict::Deny { .. }), "plan mode must still refuse");
+        assert!(ctx.grants_list().is_empty(), "a plan-mode refusal must not be grantable");
+        let _ = asks;
+    }
+
+    /// `/grants clear` puts the operator back in charge: after it, the same
+    /// ask prompts again. Uses [`bind_ask`] so no overlay/mount state can
+    /// suppress the denial (and therefore the grant) underneath it.
+    #[test]
+    fn clear_grants_restores_prompting() {
+        let (ctx, asks) = ctx_with(Decision::AllowSession);
+        let ask = bind_ask();
+        ctx.check(&ask);
+        ctx.check(&ask);
+        assert_eq!(*asks.lock().unwrap(), 1, "the grant must silence the second ask");
+        assert_eq!(ctx.clear_grants(), 1, "one grant should have been recorded");
+        ctx.check(&ask);
+        assert_eq!(*asks.lock().unwrap(), 2, "after clear, the ask must prompt again");
+    }
+
+    /// The scope is the security-relevant part of a grant, so pin the three
+    /// tiers directly: no path => whole parcel, config-ish => one directory,
+    /// secret-ish => one file.
+    #[test]
+    fn grant_scope_tiers() {
+        // No path (network/bind/apt): the parcel IS the question.
+        assert_eq!(grant_scope(&Parcel::NetNone, &Ask::connect("github.com:443")), "*");
+        // A system config write: the containing directory.
+        assert_eq!(
+            grant_scope(
+                &Parcel::GuardSystem,
+                &Ask::write("/etc/systemd/journald.conf.d/50-wsl-io-throttle.conf")
+            ),
+            "/etc/systemd/journald.conf.d"
+        );
+        // A secret: the exact file.
+        assert_eq!(
+            grant_scope(&Parcel::GuardSecrets, &Ask::write("/home/me/.ssh/authorized_keys")),
+            "/home/me/.ssh/authorized_keys"
+        );
     }
 
     #[test]

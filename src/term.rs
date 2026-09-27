@@ -1161,6 +1161,7 @@ const SLASH_HELP: &[(&str, &str, &str)] = &[
     ("/fix", "", "make the git setup LLM-safe (commit guard hook)"),
     ("/fg", "<id>", "bring a background job to the foreground"),
     ("/goal", "[objective]", "start or show the current goal"),
+    ("/grants", "[clear]", "list what \"[s] allow session\" granted this session"),
     ("/help", "", "show all commands"),
     ("/compact", "", "show compact help"),
     ("/jobs", "", "list background jobs"),
@@ -4388,12 +4389,30 @@ mod tests {
             };
             std::process::exit(code);
         }
-        // Parent: give the child a moment to open /dev/tty, then type `y`.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let mut w = unsafe { std::fs::File::from_raw_fd(master) };
-        let _ = w.write_all(b"y");
-        let _ = w.flush();
-        // Wait for the child and check its exit status.
+        // Parent: type `y`, and keep typing it briefly.
+        //
+        // A single write after a fixed sleep races the child's own 5 s
+        // timeout: if the child is scheduled late (a busy or throttled disk is
+        // exactly when this suite sometimes runs), the key lands before
+        // anything is reading /dev/tty and is simply dropped, so the child
+        // times out and the test fails spuriously.
+        //
+        // Typing repeatedly for a bounded window fixes the race properly: the
+        // pty buffers the input, so whenever the child does start reading
+        // there is a `y` waiting. Extra `y`s are harmless — it reads one key
+        // and exits, and none of them are ever left unconsumed. Bounded well
+        // under the child's 5 s timeout so the happy path is not slowed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+        {
+            let mut w = unsafe { std::fs::File::from_raw_fd(master) };
+            while std::time::Instant::now() < deadline {
+                let _ = w.write_all(b"y");
+                let _ = w.flush();
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+        // Wait for the child and check its exit status. This waitpid also
+        // reaps, so the child cannot linger as a zombie.
         let mut status: libc::c_int = 0;
         // SAFETY: waitpid on our own child.
         unsafe { libc::waitpid(pid, &mut status, 0) };

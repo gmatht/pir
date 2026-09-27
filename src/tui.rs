@@ -265,6 +265,9 @@ fn run_inner(
     // Up/Down history navigation while a turn runs: persists across input
     // polls within a turn, reset whenever a new turn starts.
     let mut hist_recall = crate::term::HistRecall::default();
+    // Same lifetime for bracketed-paste state: a paste spans many input polls,
+    // so `pasting` must outlive the poll that saw `ESC[200~`.
+    let mut paste = PasteState::default();
 
     let spinner_frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -389,7 +392,7 @@ fn run_inner(
 
         // ---- Input ----
         if running {
-            match wait_raw_input(ctx, &mut hist_recall) {
+            match wait_raw_input(ctx, &mut hist_recall, &mut paste) {
                 RawKey::Line(s) => {
                     let s = s.trim();
                     if let Ok(mut g) = ctx.typeahead.lock() {
@@ -691,7 +694,11 @@ fn draw<B: ratatui::backend::Backend>(
 /// Read raw keystrokes while a turn runs (event-driven, like the streaming
 /// REPL's `raw::wait_input`) but routed through crossterm so the TUI stays the
 /// sole screen owner. Returns a `RawKey` outcome.
-fn wait_raw_input(ctx: &TuiCtx, recall: &mut crate::term::HistRecall) -> RawKey {
+fn wait_raw_input(
+    ctx: &TuiCtx,
+    recall: &mut crate::term::HistRecall,
+    paste: &mut PasteState,
+) -> RawKey {
     let stdin = match smol::Async::new(io::stdin()) {
         Ok(s) => s,
         Err(_) => return RawKey::None,
@@ -706,7 +713,7 @@ fn wait_raw_input(ctx: &TuiCtx, recall: &mut crate::term::HistRecall) -> RawKey 
     let finished = async { let _ = ctx.done_rx.recv().await; };
     smol::block_on(smol::future::or(readable, finished));
     let mut buf = String::new();
-    let key = read_raw_into(&mut buf, ctx.typeahead, recall);
+    let key = read_raw_into(&mut buf, ctx.typeahead, recall, paste);
     // No actual input and barely any wall time elapsed (EOF pipe): sleep the
     // rest of the poll window so the idle TUI stays near 0% CPU. Genuine input
     // returns instantly.
@@ -727,16 +734,23 @@ fn wait_raw_input(ctx: &TuiCtx, recall: &mut crate::term::HistRecall) -> RawKey 
 /// line (a real `'\n'`) instead of ending it — so a pasted multiline block
 /// becomes a single queued prompt rather than one per line.
 ///
+/// `paste` carries the in-paste state across the repeated 80 ms polls this is
+/// called in: a paste spans many polls, and a per-call `pasting` flag would
+/// reset between them, turning every later newline into its own queued prompt.
+///
 /// Up/Down (`ESC[A` / `ESC[B`) recall session history into the draft via
 /// `recall` (same history the idle prompt uses), shown in the footer draft.
 fn read_raw_into(
     buf: &mut String,
     typeahead: &Arc<Mutex<String>>,
     recall: &mut crate::term::HistRecall,
+    paste: &mut PasteState,
 ) -> RawKey {
     use std::os::unix::io::AsRawFd;
     let fd = io::stdin().as_raw_fd();
-    let mut tmp = [0u8; 256];
+    // 4 KiB, not 256: a paste is delivered in as many reads as the terminal
+    // likes, so a small buffer only means more round trips.
+    let mut tmp = [0u8; 4096];
     let mut nread = 0usize;
     loop {
         let r = unsafe {
@@ -782,8 +796,9 @@ fn read_raw_into(
             update_tui_typeahead(buf, typeahead);
         }};
     }
-    let mut pasting = false;
     let mut esc_meta = false;
+    // A multibyte UTF-8 character split across reads.
+    let mut utf8: Vec<u8> = Vec::new();
     let mut i = 0usize;
     while i < nread {
         let b = tmp[i];
@@ -874,7 +889,7 @@ fn read_raw_into(
         i += 1;
         match b {
             0x0a | 0x0d => {
-                if pasting {
+                if paste.pasting {
                     // Inside a paste: keep the newline as part of the line
                     // (CRLF already normalised to nothing by the CR arm).
                     if b == 0x0a {
@@ -971,24 +986,24 @@ fn read_raw_into(
                     }
                 }
                 // We're in a CSI sequence. Check for the bracketed-paste wrapper
-                // (`ESC[200~` starts, `ESC[201~` ends). The byte after `0x5b` is
-                // the first parameter byte.
-                // Up/Down for mid-turn history recall (`ESC[A` / `ESC[B`): peek
-                // while buffered (`i - 1` is the `0x1b`, already consumed).
-                let arrow = crate::term::csi_arrow(&tmp[i - 1..nread]);
-                let after_bracket = i + 1; // index just after `0x5b`
-                let is_paste_marker = after_bracket + 3 <= nread
-                    && tmp[after_bracket] == b'2'
-                    && tmp[after_bracket + 1] == b'0'
-                    && tmp[after_bracket + 2] == b'0'
-                    && (tmp[after_bracket + 3] == b'~' || tmp[after_bracket + 3] == b'1');
-                if is_paste_marker {
-                    // Flip the `pasting` flag and consume the four wrapper bytes
-                    // (`[ 2 0 0 ~` / `[ 2 0 1 ~`). The body stays literal text.
-                    pasting = tmp[after_bracket + 3] == b'0'; // `200~`=start
-                    i = after_bracket + 4;
+                // (`ESC[200~` starts, `ESC[201~` ends).
+                // A read can cut the wrapper in half, so top the sequence up to
+                // its full six bytes before classifying it: a truncated
+                // `ESC[200` falls through to the generic CSI arm, which cannot
+                // tell it from a key sequence and so would drop the paste.
+                // Up/Down for mid-turn history recall (`ESC[A` / `ESC[B`).
+                let mut csi: Vec<u8> = tmp[i - 1..nread].to_vec();
+                ensure_bytes(fd, &mut csi, 6);
+                if let Some(start) = paste_marker(&csi) {
+                    // Flip the paste flag; the body stays literal text.
+                    paste.pasting = start; // `200~` = start, `201~` = end
+                    // Consume through the `~`; bytes the top-up pulled in past
+                    // it remain in `tmp` and are classified by the next
+                    // iteration, so nothing is lost or seen twice.
+                    i += 5.min(csi.len());
                     continue;
                 }
+                let arrow = crate::term::csi_arrow(&tmp[i - 1..nread]);
                 // Ordinary CSI sequence: skip the `0x5b` (the `0x1b` is already
                 // consumed), then swallow parameter/terminator bytes until an
                 // alphabetic byte or `~`. Consume from the buffered `tmp` first
@@ -1068,10 +1083,26 @@ fn read_raw_into(
                 recall.reset();
                 recall.cursor = ed.cursor;
             }
-            _ => {
-                // Other control bytes are ignored, but they are still
-                // keypresses — not hammering.
-                crate::term::reset_quit_presses();
+            // A byte >= 0x80 is part of a UTF-8 sequence. Hold it rather than
+            // dropping it: the old arm only accepted printable ASCII, so every
+            // em-dash, curly quote and box-drawing char in a paste silently
+            // vanished. The sequence is decoded once it is whole (a terminal
+            // may split even a 2-byte char across two writes).
+            c => {
+                if c >= 0x80 {
+                    utf8.push(c);
+                    if let Some(ch) = decode_utf8(&mut utf8) {
+                        ed.insert(ch);
+                    }
+                    sync_ed!();
+                    crate::term::reset_quit_presses();
+                    recall.reset();
+                    recall.cursor = ed.cursor;
+                } else {
+                    // Other control bytes are ignored, but they are still
+                    // keypresses — not hammering.
+                    crate::term::reset_quit_presses();
+                }
             }
         }
     }
@@ -1223,10 +1254,119 @@ fn read_byte_timeout(fd: libc::c_int, timeout: Duration) -> Option<u8> {
     }
 }
 
+/// How long to wait for the bytes that complete an escape sequence which a read
+/// cut in half. Long enough for a terminal that splits a sequence across
+/// writes, short enough that a genuinely lone Esc stays responsive.
+const ESC_SETTLE: Duration = Duration::from_millis(25);
+
+/// Longest escape sequence we will wait to reassemble. Well above the 6-byte
+/// paste wrappers and the usual 3-6 byte CSI keys, so it never truncates a real
+/// sequence; it only bounds the wait for one that is malformed.
+const ESC_MAX: usize = 16;
+
+/// Is `s` a bracketed-paste wrapper? `Some(true)` for `ESC[200~` (paste start),
+/// `Some(false)` for `ESC[201~` (paste end). The sequence must be *complete* and
+/// start at `s[0]`.
+fn paste_marker(s: &[u8]) -> Option<bool> {
+    if s.len() >= 6 && s[0] == 0x1b && s[1] == 0x5b && s[2] == b'2' && s[3] == b'0' {
+        match s[4] {
+            b'0' if s[5] == b'~' => return Some(true),
+            b'1' if s[5] == b'~' => return Some(false),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Top `buf` up to at least `need` bytes by reading more from `fd`, waiting up
+/// to [`ESC_SETTLE`] for each.
+///
+/// A terminal splits its writes wherever it likes, so an escape sequence (and
+/// a bracketed-paste wrapper above all) can be cut in half by a read. The
+/// callers use this to complete such a sequence *before* classifying it: a
+/// truncated `ESC[200` looks like an ordinary key sequence, and the old code
+/// then cleared the draft in the middle of a paste — which is how one paste
+/// turned into several half-pasted prompts.
+fn ensure_bytes(fd: libc::c_int, buf: &mut Vec<u8>, need: usize) {
+    let mut waited = false;
+    while buf.len() < need && buf.len() < ESC_MAX {
+        // Only the first missing byte may actually block; once one has arrived
+        // the rest of a sequence follows immediately, so read them straight
+        // through rather than adding a settle window per byte.
+        let t = if waited { Duration::from_millis(0) } else { ESC_SETTLE };
+        let mut b: u8 = 0;
+        let r = unsafe { libc::read(fd, &mut b as *mut u8 as *mut libc::c_void, 1) };
+        if r == 1 {
+            waited = true;
+            buf.push(b);
+            continue;
+        }
+        if r == 0 {
+            break; // EOF
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        // EAGAIN: nothing more is queued. Wait once, then give up.
+        if !waited {
+            std::thread::sleep(t);
+            waited = true;
+            continue;
+        }
+        break;
+    }
+}
+
+/// Bracketed-paste state that must outlive a single `read()`.
+///
+/// Both TUI input paths used to keep `pasting` in a local, so it reset to
+/// `false` on every read. A paste is delivered in as many reads as the terminal
+/// cares for, so every newline after the first chunk was read as an Enter and
+/// one paste became several prompts. The flag therefore has to be owned by the
+/// caller's loop and threaded through every read.
+#[derive(Default)]
+struct PasteState {
+    /// Inside an `ESC[200~ … ESC[201~` wrapper: a newline is literal text
+    /// rather than a submit.
+    pasting: bool,
+}
+
+/// Pop one whole character off the front of `bytes`, leaving a trailing partial
+/// UTF-8 sequence in place. Returns `None` while the buffer holds only the
+/// start of a character (the rest arrives in a later read).
+///
+/// A byte that cannot start (or continue) a valid sequence is dropped, so one
+/// bad byte cannot swallow the valid text behind it.
+fn decode_utf8(bytes: &mut Vec<u8>) -> Option<char> {
+    loop {
+        if bytes.is_empty() {
+            return None;
+        }
+        match std::str::from_utf8(bytes) {
+            Ok(s) => {
+                let ch = s.chars().next()?;
+                let n = ch.len_utf8();
+                bytes.drain(..n);
+                return Some(ch);
+            }
+            Err(e) if e.error_len().is_none() => {
+                // A valid prefix, truncated character: wait for the rest.
+                return None;
+            }
+            Err(e) => {
+                // Genuinely invalid: drop exactly that byte and retry.
+                let bad = e.valid_up_to() + e.error_len().unwrap_or(1);
+                bytes.drain(..bad.min(bytes.len()));
+            }
+        }
+    }
+}
+
 /// Consume the remainder of a CSI escape sequence (`… <alpha> | ~`) still on fd.
 fn drain_csi_sequence(fd: libc::c_int) {
     let mut b: u8 = 0;
-    for _ in 0..32 {
+    for _ in 0..ESC_MAX {
         let r = unsafe { libc::read(fd, &mut b as *mut u8 as *mut libc::c_void, 1) };
         if r != 1 {
             break;
@@ -1254,6 +1394,13 @@ fn read_idle_line(
     let history: Vec<String> = read_history();
     let mut hist_idx: i32 = -1; // -1 = current (not recalling)
     let mut buf = String::new();
+    // Bracketed-paste state is owned HERE, not per read: a paste arrives in as
+    // many reads as the terminal likes, so a per-read `pasting` reset to false
+    // after the first chunk and every later newline in the paste submitted a
+    // prompt of its own (the "one paste became five garbled prompts" bug).
+    let mut paste = PasteState::default();
+    // A multibyte UTF-8 character split across reads.
+    let mut utf8: Vec<u8> = Vec::new();
 
     // Register stdin with the smol reactor once, so each idle tick blocks
     // event-driven (0% CPU) instead of polling in a sleep loop. Reused across
@@ -1279,22 +1426,19 @@ fn read_idle_line(
         }
 
         // Non-blocking read (stdin is in raw mode, so it returns immediately).
-        let mut tmp = [0u8; 256];
+        // 4 KiB, not 256: a paste is delivered in as many reads as the terminal
+        // likes, so a small buffer just means more round trips (and, before the
+        // `PasteState` fix, more chances to lose the in-paste state).
+        let mut tmp = [0u8; 4096];
         let n = unsafe { libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
         if n > 0 {
             let mut i = 0usize;
-            // `pasting` tracks whether we're inside a bracketed-paste wrapper; it
-            // is local because `read_idle_line` holds the whole terminal here
-            // and the read below drains the entire paste in one syscall. A
-            // pasted multiline block therefore stays one line (newlines become
-            // real `'\n'`s) until the user presses Enter outside a paste.
-            let mut pasting = false;
             while i < n as usize {
                 let b = tmp[i];
                 i += 1;
                 match b {
                     0x0a | 0x0d => {
-                        if pasting {
+                        if paste.pasting {
                             // Inside a paste: keep the newline (CRLF collapsed
                             // to a single newline by the CR arm below). On the
                             // bare LF just append it; on CR, only if not
@@ -1338,17 +1482,23 @@ fn read_idle_line(
                         let mut is_down = false;
                         let lone = !(i < n as usize && tmp[i] == 0x5b);
                         if i < n as usize && tmp[i] == 0x5b {
-                            // Peek the parameter bytes to see if this is a paste
-                            // wrapper before consuming the sequence.
-                            let pb = i; // index of first param byte
-                            let is_paste = pb + 3 <= n as usize
-                                && tmp[pb] == b'2'
-                                && tmp[pb + 1] == b'0'
-                                && tmp[pb + 2] == b'0'
-                                && (tmp[pb + 3] == b'~' || tmp[pb + 3] == b'1');
-                            if is_paste {
-                                pasting = tmp[pb + 3] == b'0'; // `200~`=start
-                                i += 4;
+                            // Top the buffer up to the longest sequence we
+                            // classify (6 bytes = the paste wrappers) so one
+                            // split across two reads is still seen as one. A
+                            // truncated `ESC[200` otherwise looked like an
+                            // ordinary key sequence, and the `else` arm below
+                            // cleared the draft mid-paste.
+                            let mut seq: Vec<u8> = tmp[i - 1..n as usize].to_vec();
+                            ensure_bytes(fd, &mut seq, 6);
+                            if let Some(start) = paste_marker(&seq) {
+                                // `200~` = start, `201~` = end. The pasted body
+                                // stays literal text either way.
+                                paste.pasting = start;
+                                // Consume through the `~`; anything the top-up
+                                // pulled in past it stays in `tmp` and is
+                                // classified by the next iteration, so no byte
+                                // is dropped and none is processed twice.
+                                i += 5.min(seq.len());
                                 continue;
                             }
                             i += 1;
@@ -1440,8 +1590,23 @@ fn read_idle_line(
                         let _ = crossterm::execute!(io::stdout(), EnterAlternateScreen);
                         let _ = io::stdout().flush();
                     }
-                    _ => {
-                        // Ignored control bytes are still keypresses, not hammering.
+                    // A byte >= 0x80 is part of a UTF-8 sequence: hold it until
+                    // the character is whole instead of dropping it. The arm
+                    // above accepted printable ASCII only, so every em-dash,
+                    // curly quote and box-drawing char in a paste used to
+                    // vanish. A terminal may split even a two-byte char across
+                    // two reads, so the tail waits in `utf8`.
+                    c => {
+                        if c >= 0x80 {
+                            utf8.push(c);
+                            if let Some(ch) = decode_utf8(&mut utf8) {
+                                buf.push(ch);
+                                state.awaiting_input = false;
+                                update_tui_typeahead(&buf, ctx.typeahead);
+                                update_tui_hint(state, &buf);
+                            }
+                        }
+                        // Either way it is a keypress, not hammering.
                         crate::term::reset_quit_presses();
                     }
                 }
@@ -1814,6 +1979,212 @@ commands: /help /model <sel> /models /goal [obj] /continue /clear /finished /fix
 /sh [cmd args]  drop to a shell, or run a command via $SHELL (sh -c)
                /sh -u [user] starts it as another user (default: the invoking user)
 Esc or ctrl-c cancels the running turn; ctrl-d quits; lines ending in & run in the background";
+
+#[cfg(test)]
+mod tui_paste_tests {
+    use super::*;
+
+    /// The wrapper bytes a terminal sends around a bracketed paste.
+    const START: &[u8] = b"\x1b[200~";
+    const END: &[u8] = b"\x1b[201~";
+
+    #[test]
+    fn paste_marker_needs_the_whole_sequence() {
+        assert_eq!(paste_marker(START), Some(true));
+        assert_eq!(paste_marker(END), Some(false));
+        // A wrapper cut short by a read is NOT a marker. This is the case the
+        // callers fix up with `ensure_bytes` before calling: if a truncated
+        // `ESC[200` were accepted here, a paste split across reads would look
+        // like an ordinary key sequence and the draft would be cleared.
+        assert_eq!(paste_marker(b"\x1b[200"), None);
+        assert_eq!(paste_marker(b"\x1b[20"), None);
+        assert_eq!(paste_marker(b"\x1b"), None);
+        assert_eq!(paste_marker(b""), None);
+        // Right length, wrong bytes.
+        assert_eq!(paste_marker(b"\x1b[100~"), None);
+        assert_eq!(paste_marker(b"\x1b[200\x00"), None);
+    }
+
+    #[test]
+    fn a_paste_survives_an_arbitrary_chunking() {
+        // A 20-line paste (~1.9 KiB) is larger than the 256-byte read buffer
+        // the idle path used to have, so it *must* be reassembled from many
+        // reads. Every chunking below has to yield the same text.
+        let body: String = (0..20).map(|i| format!("line{i:02} {}", "x".repeat(90))).collect::<Vec<_>>().join("\n");
+        let mut wire = START.to_vec();
+        wire.extend_from_slice(body.as_bytes());
+        wire.extend_from_slice(END);
+
+        for chunk in [1usize, 3, 7, 64, 255, 256, 257, 1024, 4096] {
+            let (text, submits) = replay_idle(&wire, chunk);
+            assert_eq!(
+                text, body,
+                "chunk={chunk}: a chunked paste must arrive intact and as ONE prompt"
+            );
+            assert_eq!(submits, 0, "chunk={chunk}: no newline in a paste submits");
+        }
+    }
+
+    /// Feed `wire` to the idle decoder in `chunk`-byte slices, exactly as a
+    /// terminal delivering a paste that way would. Returns the accumulated
+    /// text and how many submits it produced.
+    ///
+    /// This mirrors `read_idle_line`'s byte loop with the fd reads replaced by
+    /// the slice, which is the only difference between them.
+    fn replay_idle(wire: &[u8], chunk: usize) -> (String, usize) {
+        let mut buf = String::new();
+        let mut paste = PasteState::default();
+        let mut utf8: Vec<u8> = Vec::new();
+        let mut submits = 0;
+        let mut csi: Vec<u8> = Vec::new();
+        for slice in wire.chunks(chunk) {
+            // Splice in any dangling partial sequence, exactly as the real
+            // reader tops the buffer up with `ensure_bytes`.
+            let mut c: Vec<u8> = csi.clone();
+            c.extend_from_slice(slice);
+            csi.clear();
+            let mut i = 0usize;
+            while i < c.len() {
+                let b = c[i];
+                if b == 0x1b {
+                    let rest = &c[i..];
+                    if rest.len() < 6 {
+                        // Not a full sequence yet: wait for more (the real
+                        // reader blocks in `ensure_bytes`).
+                        csi = rest.to_vec();
+                        break;
+                    }
+                    if let Some(start) = paste_marker(rest) {
+                        paste.pasting = start;
+                        i += 6;
+                        continue;
+                    }
+                    // An ordinary CSI: swallow it whole.
+                    let mut k = i + 2;
+                    while k < c.len() && !c[k].is_ascii_alphabetic() && c[k] != b'~' {
+                        k += 1;
+                    }
+                    i = if k < c.len() { k + 1 } else { c.len() };
+                    continue;
+                }
+                i += 1;
+                match b {
+                    0x0a | 0x0d => {
+                        if paste.pasting {
+                            if b == 0x0a || !(i < c.len() && c[i] == 0x0a) {
+                                buf.push('\n');
+                            }
+                        } else {
+                            submits += 1;
+                        }
+                    }
+                    0x09 | 0x1a | 0x01..=0x08 | 0x0b..=0x12 | 0x14..=0x1f => {}
+                    c if (0x20..0x7f).contains(&c) => buf.push(c as char),
+                    c => {
+                        utf8.push(c);
+                        if let Some(ch) = decode_utf8(&mut utf8) {
+                            buf.push(ch);
+                        }
+                    }
+                }
+            }
+        }
+        (buf, submits)
+    }
+
+    /// The real bug: with the paste flag reset on every read, a 20-line paste
+    /// became five prompts. Guard the property directly so a future change to
+    /// the flag's lifetime fails here rather than in a garbled prompt.
+    #[test]
+    fn a_per_read_paste_flag_would_split_one_paste_into_many() {
+        let body: String = (0..20).map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n");
+        let mut wire = START.to_vec();
+        wire.extend_from_slice(body.as_bytes());
+        wire.extend_from_slice(END);
+
+        // The fixed behaviour: one prompt.
+        assert_eq!(replay_idle(&wire, 64).1, 0);
+
+        // The old behaviour, for contrast: a flag that resets per read sees
+        // every newline after the first chunk as a submit.
+        let mut per_read_submits = 0;
+        for slice in wire.chunks(64) {
+            // The bug under test: a fresh flag for every read, so it can never
+            // still be set by the time a later chunk's newline arrives.
+            #[allow(unused_assignments)]
+            let mut pasting = false;
+            for &b in slice {
+                if b == 0x1b {
+                    continue;
+                }
+                if b == b'\n' {
+                    if pasting {
+                        /* literal */ } else {
+                        per_read_submits += 1;
+                    }
+                }
+            }
+            pasting = false;
+        }
+        assert!(
+            per_read_submits > 1,
+            "the regression this guards must actually fragment a paste"
+        );
+    }
+
+    #[test]
+    fn non_ascii_in_a_paste_is_kept() {
+        // The old byte loop accepted printable ASCII only, so every em-dash and
+        // curly quote in a paste was silently dropped. Include several
+        // multi-byte widths and put them on chunk boundaries.
+        let body = "a — b ’ c ✗ d \u{2500} e 🎉 f";
+        let mut wire = START.to_vec();
+        wire.extend_from_slice(body.as_bytes());
+        wire.extend_from_slice(END);
+        for chunk in [1usize, 2, 3, 5, 64] {
+            let (text, _) = replay_idle(&wire, chunk);
+            assert_eq!(text, body, "chunk={chunk}: non-ASCII must survive");
+        }
+    }
+
+    #[test]
+    fn a_newline_outside_a_paste_still_submits() {
+        // The fix must not make a pasted newline stop being a newline, nor a
+        // typed Enter stop submitting.
+        let mut wire = START.to_vec();
+        wire.extend_from_slice(b"one\ntwo");
+        wire.extend_from_slice(END);
+        wire.extend_from_slice(b"\r");
+        let (text, submits) = replay_idle(&wire, 4096);
+        assert_eq!(text, "one\ntwo");
+        assert_eq!(submits, 1, "Enter outside the wrapper submits exactly once");
+    }
+
+    #[test]
+    fn decode_utf8_waits_for_a_whole_character() {
+        let mut b: Vec<u8> = Vec::new();
+        // An em-dash is E2 80 94.
+        for byte in "—".as_bytes() {
+            b.push(*byte);
+            match b.len() {
+                1 | 2 => assert_eq!(decode_utf8(&mut b), None, "partial: must wait"),
+                _ => assert_eq!(decode_utf8(&mut b), Some('—'), "whole: must decode"),
+            }
+        }
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn decode_utf8_drops_a_bad_byte_without_eating_the_rest() {
+        // A lone 0xFF can never start a character; the text behind it must
+        // survive rather than being swallowed.
+        let mut b: Vec<u8> = vec![0xff, b'o', b'k'];
+        assert_eq!(decode_utf8(&mut b), Some('o'));
+        assert_eq!(decode_utf8(&mut b), Some('k'));
+        assert_eq!(decode_utf8(&mut b), None);
+        assert!(b.is_empty());
+    }
+}
 
 #[cfg(test)]
 mod tui_completion_tests {

@@ -7,6 +7,14 @@
 //! untouched. The operator later reviews the staged writes (`/quarantine`) and
 //! applies them to the real fs or discards them.
 //!
+//! REVIEWING: system-tree writes are *pushed* as well as pullable — at the end
+//! of each turn pir prints one line naming any newly staged `/etc`,
+//! `/usr/local`, `/opt`, `/srv`, `/var` or `/boot` path (see
+//! `staged_system_write_notice`), each path named once per process. Project-tree
+//! writes stay pull-only: the upperdir there is a high-churn per-session diff,
+//! where per-write reporting would be unusable. Pulling always remains
+//! available for every staged write via `/quarantine status`.
+//!
 //! This is strictly stronger than the in-process guardrail: the guardrail only
 //! intercepts operations the agent routes through `SecurityContext::check`,
 //! whereas overlayfs intercepts *every* write at the syscall level. The
@@ -385,6 +393,124 @@ pub fn with_active<R>(f: impl FnOnce(&mut Quarantine) -> R) -> Option<R> {
 /// mounted.
 pub fn manifest_active() -> String {
     with_active(|q| q.manifest()).unwrap_or_else(|| "(write-quarantine not active)".to_string())
+}
+
+// ===========================================================================
+// End-of-turn notice for staged SYSTEM-tree writes
+// ===========================================================================
+//
+// Why this exists: staging was previously *pull-only*. A write to /etc landed
+// in the overlay upperdir and stayed invisible until the operator happened to
+// run `/quarantine status`. For a project tree that is defensible — the overlay
+// upperdir is a per-session diff of a high-churn target, so any per-write push
+// would be unusable at scale (a build loop can stage hundreds of thousands of
+// entries).
+//
+// For SYSTEM trees it is not defensible. Those are low-frequency and
+// high-blast-radius: a staged `/etc/ssh/sshd_config` or a sudoers file looks
+// completely inert, nothing visibly breaks, and the effect only appears after
+// a later `/quarantine apply` or the next boot reads it. That is exactly the
+// case a pull-only model loses.
+//
+// So the push is deliberately narrow: SYSTEM trees only, one line per turn,
+// naming the paths, each path announced once per process.
+
+/// Real paths of staged writes under the system trees, deduplicated and sorted.
+///
+/// A path is a *real* path (`/etc/foo`) — what the operator would see and what
+/// `/quarantine` acts on — not the overlay-internal one.
+pub fn new_system_write_paths(staged: &[StagedWrite], trees: &[PathBuf]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in staged {
+        // Only trees actually under quarantine (the system overlay). The
+        // project/home quarantines are deliberately excluded: that is the
+        // high-churn case this notice is not meant to cover.
+        if !trees.iter().any(|t| s.real_path.starts_with(t)) {
+            continue;
+        }
+        let p = s.real_path.to_string_lossy().to_string();
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Build the one-line end-of-turn summary, or `None` when there is nothing new
+/// to say. Pure w.r.t. global state so it is directly testable.
+///
+/// `previously_announced` carries the paths already reported (across turns) so
+/// a file that is re-staged every turn is mentioned once, not every turn.
+/// The caller owns the accumulator, which is what makes the once-per-path
+/// behaviour hold across a whole session.
+pub fn system_write_notice(
+    candidates: &[String],
+    critical: &dyn Fn(&str) -> bool,
+    previously_announced: &mut std::collections::BTreeSet<String>,
+) -> Option<String> {
+    let fresh: Vec<&String> = candidates
+        .iter()
+        .filter(|p| !previously_announced.contains(*p))
+        .collect();
+    if fresh.is_empty() {
+        return None;
+    }
+    // Mark them seen even if the caller chooses not to print, so a path is
+    // never announced twice.
+    for p in &fresh {
+        previously_announced.insert((*p).clone());
+    }
+    let n = fresh.len();
+    let mut parts: Vec<String> = Vec::new();
+    // Show the first few in full, then count the rest: a bulk staging (an agent
+    // that copied a whole tree) must not produce a 10,000-character line.
+    const SHOWN: usize = 4;
+    for p in fresh.iter().take(SHOWN) {
+        if critical(p) {
+            parts.push(format!("{p} [CRITICAL:denied-on-apply]"));
+        } else {
+            parts.push((*p).clone());
+        }
+    }
+    if n > SHOWN {
+        parts.push(format!("… +{} more", n - SHOWN));
+    }
+    Some(format!(
+        "[pir] {} staged system-tree write(s) awaiting review: {} — review with /quarantine",
+        n,
+        parts.join(", ")
+    ))
+}
+
+/// Paths already announced to the operator this process, so each is named once.
+static ANNOUNCED_STAGED: OnceLock<Mutex<std::collections::BTreeSet<String>>> = OnceLock::new();
+
+fn announced_lock() -> &'static Mutex<std::collections::BTreeSet<String>> {
+    ANNOUNCED_STAGED.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
+}
+
+/// The end-of-turn notice for the active system-tree quarantine, or `None` when
+/// nothing new has been staged since the last turn.
+///
+/// Never fails and never blocks: it only walks the overlay upperdirs (which the
+/// manifest already does) and returns `None` when no quarantine is mounted, so
+/// it is safe to call on every turn-end path.
+pub fn staged_system_write_notice() -> Option<String> {
+    // A torn-down or replaced quarantine must not carry a stale accumulator
+    // forward, or a later session's writes would be suppressed.
+    if !system_quarantine_engaged() {
+        let mut seen = announced_lock().lock().unwrap_or_else(|e| e.into_inner());
+        seen.clear();
+        return None;
+    }
+    with_active(|q| {
+        let staged = q.staged();
+        let candidates = new_system_write_paths(&staged, &q.trees);
+        let mut seen = announced_lock().lock().unwrap_or_else(|e| e.into_inner());
+        system_write_notice(&candidates, &|p| q.is_critical(Path::new(p)), &mut seen)
+    })
+    .flatten()
 }
 
 /// Apply the active quarantine's staged writes to the real fs.
@@ -2395,6 +2521,188 @@ pub fn can_mount() -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    // ── staged system-write notice (pure; no mount required) ──────────────
+    //
+    // The end-of-turn push exists because staging was pull-only. These cover
+    // the three properties that make it usable rather than noise:
+    //   * only system trees (never the project tree, which is the high-churn
+    //     case a per-write push cannot serve);
+    //   * one line per turn, not one line per write;
+    //   * each path announced once, so a re-staged file does not repeat.
+
+    fn staged_at(tree: &str, rel: &str) -> StagedWrite {
+        let t = PathBuf::from(tree);
+        StagedWrite {
+            overlay_path: t.join(rel),
+            real_path: t.join(rel),
+            tree: t,
+            rel: PathBuf::from(rel),
+            kind: WriteKind::Added,
+        }
+    }
+
+    #[test]
+    fn only_system_tree_paths_are_selected() {
+        let staged = vec![
+            staged_at("/etc", "sysctl.d/50-x.conf"),
+            staged_at("/usr/local", "bin/tool"),
+            staged_at("/var", "log/app.log"),
+        ];
+        // A project-tree write must NOT be included: it is the high-churn case.
+        let with_project = vec![
+            staged_at("/etc", "hosts"),
+            staged_at("/home/ai_pir/src/pir", "target/debug/x"),
+        ];
+        let trees: Vec<PathBuf> = ["/etc", "/usr/local", "/var"].iter().map(PathBuf::from).collect();
+
+        let got = new_system_write_paths(&staged, &trees);
+        assert_eq!(got.len(), 3, "all three system paths are selected");
+        assert!(got.contains(&"/etc/sysctl.d/50-x.conf".to_string()));
+        assert!(!got.contains(&"/usr/local".to_string()), "a tree root is not a file");
+
+        let got2 = new_system_write_paths(&with_project, &trees);
+        assert_eq!(
+            got2,
+            vec!["/etc/hosts".to_string()],
+            "a project-tree write is excluded from the notice"
+        );
+    }
+
+    #[test]
+    fn duplicate_paths_are_collapsed_and_sorted() {
+        let staged = vec![
+            staged_at("/etc", "zzz.conf"),
+            staged_at("/etc", "aaa.conf"),
+            staged_at("/etc", "zzz.conf"),
+        ];
+        let trees = vec![PathBuf::from("/etc")];
+        let got = new_system_write_paths(&staged, &trees);
+        assert_eq!(got, vec!["/etc/aaa.conf".to_string(), "/etc/zzz.conf".to_string()]);
+    }
+
+    #[test]
+    fn notice_is_none_when_nothing_is_staged() {
+        let mut seen = std::collections::BTreeSet::new();
+        assert!(
+            system_write_notice(&[], &|_| false, &mut seen).is_none(),
+            "no staged writes must produce no notice"
+        );
+    }
+
+    #[test]
+    fn notice_names_each_new_path_once_across_turns() {
+        let mut seen = std::collections::BTreeSet::new();
+        let paths = vec!["/etc/a.conf".to_string(), "/etc/b.conf".to_string()];
+
+        let first = system_write_notice(&paths, &|_| false, &mut seen).expect("first turn reports");
+        assert!(first.contains("2 staged system-tree write(s)"), "got: {first}");
+        assert!(first.contains("/etc/a.conf"));
+        assert!(first.contains("/etc/b.conf"));
+        assert!(first.contains("/quarantine"), "must point at the review command");
+
+        // Second turn, same files still staged: must be silent.
+        assert!(
+            system_write_notice(&paths, &|_| false, &mut seen).is_none(),
+            "an already-announced path must not be repeated"
+        );
+
+        // Third turn: only a genuinely new file is reported.
+        let mut with_new = paths.clone();
+        with_new.push("/etc/c.conf".to_string());
+        let third = system_write_notice(&with_new, &|_| false, &mut seen).expect("new path is reported");
+        assert!(third.contains("/etc/c.conf"));
+        assert!(third.contains("1 staged"), "only the new one counts: {third}");
+        assert!(!third.contains("/etc/a.conf"), "old paths are not repeated: {third}");
+    }
+
+    #[test]
+    fn a_bulk_stage_is_summarised_not_spilled() {
+        let mut seen = std::collections::BTreeSet::new();
+        let paths: Vec<String> = (0..50).map(|i| format!("/etc/f{i:02}.conf")).collect();
+        let note = system_write_notice(&paths, &|_| false, &mut seen).expect("reported");
+        assert!(note.contains("50 staged system-tree write(s)"));
+        assert!(note.contains("+46 more"), "the tail is counted, not printed: {note}");
+        // Bounded: at most the shown paths plus the tail marker.
+        assert!(note.len() < 400, "notice must stay one readable line: {}", note.len());
+    }
+
+    #[test]
+    fn a_critical_path_is_flagged_in_the_notice() {
+        let mut seen = std::collections::BTreeSet::new();
+        let paths = vec!["/etc/sudoers.d/x".to_string()];
+        let note = system_write_notice(&paths, &|p| p.contains("sudoers"), &mut seen).expect("reported");
+        assert!(
+            note.contains("CRITICAL:denied-on-apply"),
+            "a path that can never be applied must say so: {note}"
+        );
+    }
+
+    /// The real-world case this feature was written for: an agent writing a
+    /// config into /etc produces exactly one notice naming it.
+    #[test]
+    fn a_single_etc_write_produces_one_actionable_line() {
+        let mut seen = std::collections::BTreeSet::new();
+        let staged = vec![staged_at("/etc", "logrotate.d/sh2loop")];
+        let trees = vec![PathBuf::from("/etc")];
+        let candidates = new_system_write_paths(&staged, &trees);
+        let note =
+            system_write_notice(&candidates, &|_| false, &mut seen).expect("the /etc write is reported");
+        assert!(note.contains("/etc/logrotate.d/sh2loop"), "got: {note}");
+        assert!(note.contains("1 staged system-tree write(s)"), "got: {note}");
+        assert!(note.contains("/quarantine"), "got: {note}");
+    }
+
+    /// Drives the REAL process-global path — `staged_system_write_notice` —
+    /// against a quarantine with a genuinely staged file on disk. This is the
+    /// wiring test: the pure tests above could all pass while the turn-end call
+    /// site was unreachable, or while the global accumulator failed to suppress
+    /// repeats. Uses a throwaway staging dir and requires no mount (the notice
+    /// only walks the upperdirs), so no real /etc is involved.
+    #[test]
+    fn the_live_notice_reads_the_staged_upperdir_and_repeats_nothing() {
+        let _guard = VAR_OVERLAY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let staging = std::env::temp_dir().join(format!("pir_notice_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&staging);
+        let upper = staging.join("upper-etc");
+        std::fs::create_dir_all(upper.join("logrotate.d")).expect("staging dir");
+        std::fs::write(upper.join("logrotate.d/sh2loop"), b"x\n").expect("staged file");
+
+        // Declare the REAL tree so `real_path` reads /etc/... exactly as in
+        // production; the notice reads only `trees` + the upperdirs, so the
+        // overlay need not actually be mounted.
+        set_active(Quarantine {
+            staging: staging.clone(),
+            trees: vec![PathBuf::from("/etc")],
+            critical: vec![],
+        });
+        set_system_quarantine_engaged(true);
+        // Order-independent: forget anything a sibling test announced.
+        announced_lock().lock().unwrap().clear();
+
+        let first = staged_system_write_notice().expect("the staged /etc file is announced");
+        assert!(
+            first.contains("/etc/logrotate.d/sh2loop"),
+            "the live notice must name the real path: {first}"
+        );
+        assert!(first.contains("/quarantine"), "got: {first}");
+
+        assert!(
+            staged_system_write_notice().is_none(),
+            "the live notice must not repeat a path"
+        );
+
+        std::fs::create_dir_all(upper.join("sysctl.d")).unwrap();
+        std::fs::write(upper.join("sysctl.d/50-x.conf"), b"y\n").unwrap();
+        let second = staged_system_write_notice().expect("the new file is announced");
+        assert!(second.contains("/etc/sysctl.d/50-x.conf"), "got: {second}");
+        assert!(!second.contains("sh2loop"), "the old path is not repeated: {second}");
+
+        // Unregister so no other test observes this synthetic quarantine.
+        *active_lock().lock().unwrap() = None;
+        set_system_quarantine_engaged(false);
+        let _ = std::fs::remove_dir_all(&staging);
+    }
 
     /// Serialises the two root-only tests: they mount the REAL `/var` tree, and
     /// two concurrent overlays on the same mountpoint would stack and corrupt

@@ -42,16 +42,46 @@ pub fn register(reg: &mut Registry) {
 }
 
 /// How long the escalation / self-kill confirmation waits for the operator to
-/// press a key before giving up. Long enough that a human reading the warning
-/// always gets to answer; overridable (`PIR_CONFIRM_TIMEOUT_SECS`) so tests and
-/// scripted environments can bound it instead of blocking for two minutes.
+/// press a key before giving up.
+///
+/// **The default is "wait for the operator"** — see [`WAIT_FOREVER_SECS`]. A
+/// confirmation is a request for a human decision on the one action that is
+/// about to run with someone else's authority; a human who is still reading
+/// the warning must not have it auto-refused underneath them because they took
+/// ten seconds to look up what `sudo -u ai_x` does. The "nobody is there" case
+/// is already handled *before* this point: [`Self::confirm_escalation`] only
+/// prompts when stdin or `/dev/tty` is a terminal, and every caller's `None`
+/// branch refuses rather than proceeding — so a bound is never needed to keep an
+/// unattended agent safe.
+///
+/// Set `PIR_CONFIRM_TIMEOUT_SECS` to a positive number to bound the wait (the
+/// escape hatch for scripted/test environments). `0` / `off` / `no` / `none` /
+/// unset all mean the same thing: wait for the operator.
 fn priv_prompt_timeout_secs() -> u64 {
-    std::env::var("PIR_CONFIRM_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&s| s > 0)
-        .unwrap_or(120)
+    let Ok(v) = std::env::var("PIR_CONFIRM_TIMEOUT_SECS") else {
+        return WAIT_FOREVER_SECS;
+    };
+    let v = v.trim();
+    if matches!(v.to_ascii_lowercase().as_str(), "0" | "off" | "no" | "none" | "") {
+        return WAIT_FOREVER_SECS;
+    }
+    match v.parse::<u64>() {
+        Ok(secs) => secs,
+        Err(_) => {
+            eprintln!(
+                "[pir] ignoring PIR_CONFIRM_TIMEOUT_SECS={v:?} — want a positive number of \
+                 seconds, or 0/off to wait for the operator (waiting for the operator)"
+            );
+            WAIT_FOREVER_SECS
+        }
+    }
 }
+
+/// "Wait for the operator" as a second count, for the `/dev/tty` single-key
+/// read (which takes a `u64`, not a `Duration`). Effectively unbounded: the
+/// seconds between now and the heat death of the universe, so a bound can never
+/// bite by accident, while every real answer is still one keystroke away.
+const WAIT_FOREVER_SECS: u64 = u64::MAX / 4;
 
 struct Builtin {
     cwd: PathBuf,
@@ -726,12 +756,24 @@ impl Builtin {
         ))
     }
 
-    /// The refusal shown when a prompt was raised but nobody answered within
-    /// `secs`. Deliberately worded "no answer", never "user declined": pir must
-    /// not attribute a decision to an operator who was never given the chance
-    /// to make one (the exact bug this change fixes). Kept free of I/O so the
+    /// The refusal shown when a prompt was raised but nobody answered.
+    /// Deliberately worded "no answer", never "user declined": pir must not
+    /// attribute a decision to an operator who was never given the chance to
+    /// make one (the exact bug this change fixes). Kept free of I/O so the
     /// wording can be unit-tested without touching a live terminal.
+    ///
+    /// With the default unbounded wait this is only reachable on EOF (the
+    /// terminal went away), so the message must not claim a timeout that never
+    /// happened — it names the bound only when one was actually configured,
+    /// rather than printing a meaningless multi-century figure.
     fn refusal_without_approval(what: &str, secs: u64) -> String {
+        if secs >= WAIT_FOREVER_SECS {
+            return format!(
+                "[denied] the terminal closed before an answer was given — refusing to escalate \
+                 ({what}) without explicit approval. Re-run when you can answer the prompt, or \
+                 escalate out-of-band via the rootreq flow (`request_root`)."
+            );
+        }
         format!(
             "[denied] no answer within {secs}s — refusing to escalate ({what}) without explicit \
              approval. Re-run when you can answer the prompt, or escalate out-of-band via the \
@@ -3574,6 +3616,62 @@ mod priv_escalation_tests {
                 }
             }
         }
+    }
+
+    /// The confirmation waits for the operator by default. An escalation prompt
+    /// is a request for a human decision on the one action about to run with
+    /// someone else's authority; the old 120 s default meant someone still
+    /// reading the warning had it auto-refused underneath them.
+    ///
+    /// And `0`/`off` must *mean* "no bound" — the old parser filtered `s > 0`,
+    /// so an operator who explicitly set `0` silently got 120 s and had no way
+    /// to say what they meant.
+    #[test]
+    fn confirm_waits_for_the_operator_by_default() {
+        let old = std::env::var_os("PIR_CONFIRM_TIMEOUT_SECS");
+        // SAFETY: test-local env mutation, restored after the loop.
+        unsafe { std::env::remove_var("PIR_CONFIRM_TIMEOUT_SECS") };
+        assert_eq!(
+            priv_prompt_timeout_secs(),
+            WAIT_FOREVER_SECS,
+            "with no env set, wait for the operator"
+        );
+        for v in ["0", "off", "no", "none", "", " 0 ", "OFF"] {
+            unsafe { std::env::set_var("PIR_CONFIRM_TIMEOUT_SECS", v) };
+            assert_eq!(
+                priv_prompt_timeout_secs(),
+                WAIT_FOREVER_SECS,
+                "{v:?} must mean 'wait for the operator'"
+            );
+        }
+        // A positive bound is still honoured (the escape hatch for scripted runs).
+        unsafe { std::env::set_var("PIR_CONFIRM_TIMEOUT_SECS", "30") };
+        assert_eq!(priv_prompt_timeout_secs(), 30);
+        match old {
+            Some(v) => unsafe { std::env::set_var("PIR_CONFIRM_TIMEOUT_SECS", v) },
+            None => unsafe { std::env::remove_var("PIR_CONFIRM_TIMEOUT_SECS") },
+        }
+    }
+
+    /// The no-answer refusal must not claim a timeout that never happened. With
+    /// the default unbounded wait, the only way to reach that arm is the
+    /// terminal closing — so printing "no answer within 4611686018427387903s"
+    /// would be nonsense, and would read as a bug to whoever sees it.
+    #[test]
+    fn unbounded_refusal_does_not_invent_a_timeout() {
+        let msg = Builtin::refusal_without_approval("sudo as root", WAIT_FOREVER_SECS);
+        assert!(
+            !msg.contains("no answer within"),
+            "must not claim a timeout when none was configured: {msg}"
+        );
+        assert!(
+            msg.contains("terminal closed"),
+            "should name the real cause (the terminal went away): {msg}"
+        );
+        assert!(!msg.contains("user declined"), "got: {msg}");
+        // A *bounded* wait still names the bound it actually applied.
+        let bounded = Builtin::refusal_without_approval("sudo as root", 30);
+        assert!(bounded.contains("no answer within 30s"), "got: {bounded}");
     }
 }
 

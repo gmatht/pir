@@ -825,6 +825,33 @@ impl Agent {
         // to the transcript so a resume can rewind work done before it.
         let checkpoints = crate::checkpoint::Store::load_opt(log_path.as_deref());
         let _ = crate::scratchpad::sweep_old();
+        // Session-transcript retention. The transcript is the one file written
+        // continuously for a whole session, append-only and never rotated, so
+        // a long-lived agent loop that starts pir many times a day accumulates
+        // unbounded transcripts plus sidecars. This sweeps the GLOBAL sessions
+        // dir (every project) plus this project's own, and never touches the
+        // transcript this session is currently writing.
+        //
+        // Run after the scratch sweep and never fatally: a retention failure
+        // must not stop a session from starting.
+        {
+            let cur = log_path.as_deref();
+            let mut rep = crate::retention::sweep_global(cur);
+            // The project-local sessions dir too, when this session is using
+            // one (session_dir() prefers .pir/sessions).
+            if let Some(p) = cur
+                && let Some(dir) = p.parent()
+            {
+                let r = crate::retention::sweep_project(dir, cur);
+                rep.removed_sessions += r.removed_sessions;
+                rep.truncated += r.truncated;
+                rep.freed_bytes += r.freed_bytes;
+            }
+            let line = crate::retention::describe(&rep);
+            if !line.is_empty() {
+                eprintln!("{}", term::dim(&format!("[pir] {line}")));
+            }
+        }
         // Seed the bundled skills (the `locate` skill, and any future ones) into
         // the config skills root on first run. Idempotent and never
         // overwriting, so an operator's edited copy survives an upgrade.
@@ -1427,6 +1454,19 @@ impl Agent {
     /// Returns `None` when no guardrail is configured.
     pub fn security_policy(&self) -> Option<crate::security::SecurityPolicy> {
         self.security.as_ref().map(|c| c.policy.clone())
+    }
+
+    /// The session grants the operator approved with "[s] allow session",
+    /// oldest first. Each is a (parcel, op, scope) triple — see
+    /// [`crate::security::grant_scope`] for how wide a scope may be per parcel.
+    pub fn security_grants(&self) -> Vec<crate::security::SessionGrant> {
+        self.security.as_ref().map(|c| c.grants_list()).unwrap_or_default()
+    }
+
+    /// Drop every session grant, so the next denied ask prompts again.
+    /// Returns how many were dropped (for the status line).
+    pub fn clear_security_grants(&mut self) -> usize {
+        self.security.as_ref().map(|c| c.clear_grants()).unwrap_or(0)
     }
 
     /// Flip the live su-security flag and wire the authority bash consults.
@@ -2870,7 +2910,7 @@ impl Agent {
                     }
                     term::out(&term::dim("· turn cancelled"));
                 }
-                self.notify.publish(self.turn_done_event(), false);
+                self.finish_turn();
                 return Ok(());
             }
             // Optional cumulative token budget (off by default). Stop *before*
@@ -2892,7 +2932,7 @@ impl Agent {
                         ));
                     }
                     self.mark_status(SessionStatus::Interrupted, self.goal_pending(), "token budget reached");
-                    self.notify.publish(self.turn_done_event(), false);
+                    self.finish_turn();
                     if !self.silent() {
                         self.continuations.extend(self.registry.on_turn_end(user));
                     }
@@ -3233,7 +3273,7 @@ impl Agent {
                     self.goal_pending(),
                     "loop detected (repeated identical tool calls or text)",
                 );
-                self.notify.publish(self.turn_done_event(), false);
+                self.finish_turn();
                 if !self.silent() {
                     self.continuations.extend(self.registry.on_turn_end(user));
                 }
@@ -3264,7 +3304,7 @@ impl Agent {
                             )));
                         }
                         self.registry.emit(EventKind::AgentEnd, &json!({}));
-                        self.notify.publish(self.turn_done_event(), false);
+                        self.finish_turn();
                         if !self.silent() {
                             self.registry.emit(EventKind::TurnEnd, &json!({ "prompt": user }));
                             self.continuations.extend(self.registry.on_turn_end(user));
@@ -3288,7 +3328,7 @@ impl Agent {
                             ));
                         }
                         self.registry.emit(EventKind::AgentEnd, &json!({}));
-                        self.notify.publish(self.turn_done_event(), false);
+                        self.finish_turn();
                         if !self.silent() {
                             self.registry.emit(EventKind::TurnEnd, &json!({ "prompt": user }));
                             self.continuations.extend(self.registry.on_turn_end(user));
@@ -3310,7 +3350,7 @@ impl Agent {
                     continue;
                 }
                 self.registry.emit(EventKind::AgentEnd, &json!({}));
-                self.notify.publish(self.turn_done_event(), false);
+                self.finish_turn();
                 // NDJSON: emit turn_end on success
                 self.emit_json(&json!({
                     "type": "turn_end",
@@ -3472,7 +3512,7 @@ impl Agent {
                     }
                     term::out(&term::dim("· turn cancelled"));
                 }
-                self.notify.publish(self.turn_done_event(), false);
+                self.finish_turn();
                 return Ok(());
             }
 
@@ -3509,7 +3549,7 @@ impl Agent {
                     }
                 }
                 self.registry.emit(EventKind::AgentEnd, &json!({}));
-                self.notify.publish(self.turn_done_event(), false);
+                self.finish_turn();
                 if !self.silent() {
                     self.registry.emit(EventKind::TurnEnd, &json!({ "prompt": user }));
                     self.continuations.extend(self.registry.on_turn_end(user));
@@ -3874,6 +3914,29 @@ impl Agent {
             self.project_label(),
             self.last_prompt.clone(),
         )
+    }
+
+    /// End-of-turn: announce any writes the agent staged into SYSTEM trees
+    /// since the last turn, then publish the turn-done event.
+    ///
+    /// The write-quarantine was pull-only — staged writes stayed invisible until
+    /// the operator ran `/quarantine` by hand. That is tolerable for a project
+    /// tree (a high-churn target where any per-write push is unusable) but not
+    /// for `/etc` and friends, where a staged `sshd_config` looks completely
+    /// inert and only bites after a later apply or reboot. So this prints one
+    /// line per turn, naming the new system-tree paths, and each path is named
+    /// only once per process.
+    ///
+    /// Silent and harmless when no quarantine is mounted, and never printed when
+    /// the agent is running quiet (a background session owns no terminal to
+    /// print to).
+    fn finish_turn(&mut self) {
+        if !self.silent()
+            && let Some(note) = crate::security::overlay::staged_system_write_notice()
+        {
+            term::out(&term::yellow(&note));
+        }
+        self.notify.publish(self.turn_done_event(), false);
     }
 
     /// Build the `Idle` event (returned to the REPL prompt). Carries the same

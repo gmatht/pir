@@ -22,6 +22,8 @@ mod plans;
 mod plugin;
 mod project;
 mod provider;
+mod notify_coalesce;
+mod retention;
 mod scratchpad;
 mod resource;
 mod session;
@@ -328,6 +330,12 @@ CONFIG (reused from pi, never modified)
   ~/.pi/agent/projects.json    project -> execution-user mappings (set by `pir project init`)
   ~/.pi/agent/security.toml    security policy (per-project override under .pir/ wins)
 
+  Human-facing prompts (a question, an escalation confirm) WAIT for you by
+  default — they have no deadline, so stepping away never silently auto-denies
+  the decision. Bound them only if you want that:
+    PIR_ASK_TIMEOUT_SECS=<n>     bound ask_user_question (0/off = wait, the default)
+    PIR_CONFIRM_TIMEOUT_SECS=<n> bound sudo/su + self-kill confirms (0/off = wait)
+
   PIR_CONFIG_SOURCE picks where the security policy's values come from:
     external (default)  use the files above; fall back to built-in defaults
     builtin             built-in defaults only, ignoring any file on disk
@@ -365,6 +373,7 @@ COMMANDS
   /model* <sel>  /model-all <sel>   broadcast a model switch to ALL your open pir terminals (also sets the new default)
   /bg <text>  /jobs  /fg <id>  /clear  /usage  /exit
   /undo [all]             revert the last file edit (or all) to its pre-edit state
+  /grants [clear]         list what "[s] allow session" granted this session (clear = forget all)
   /mcp                   list configured MCP servers and the tools they provide
                           (configure in ~/.pi/agent/mcp.json; PIR_MCP=0 disables)
   /mcp init [name...]    write a starter config (e.g. context7 for library docs);
@@ -3996,6 +4005,43 @@ fn handle_command(
             };
             let all = rest.first().map(|s| *s == "all").unwrap_or(false);
             println!("{}", agent.undo(all));
+        }
+        "grants" => {
+            // `/grants [clear]`: what "[s] allow session" actually granted
+            // this session. The list is the enforcement key verbatim, so what
+            // is shown is exactly what is allowed. `clear` drops them all, so
+            // the next denied ask prompts again.
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                eprintln!("pir: agent busy (turn running) — try again when idle");
+                return;
+            };
+            if rest.first().map(|s| *s == "clear").unwrap_or(false) {
+                let n = agent.clear_security_grants();
+                println!(
+                    "{}",
+                    term::dim(&format!(
+                        "cleared {n} session grant(s) — the next denied operation asks again"
+                    ))
+                );
+                return;
+            }
+            let grants = agent.security_grants();
+            if grants.is_empty() {
+                println!(
+                    "{}",
+                    term::dim("(no session grants — answer [s] to an approval dialog to add one)")
+                );
+                return;
+            }
+            println!("{} session grants (this process only):", term::bold("·"));
+            for g in &grants {
+                println!("  - {}", g.label());
+            }
+            println!(
+                "{}",
+                term::dim("  scope = one directory, one file, or the whole parcel (see grant_scope)")
+            );
         }
         "stop-skill" | "stop_skill" | "stopskill" => {
             // `/stop-skill [on|off|default|status]`: toggle the explicit-stop

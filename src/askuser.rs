@@ -27,9 +27,16 @@
 //!
 //! # Timeout and abandonment
 //!
-//! A renderer that *is* installed may still never produce an answer — the
-//! operator walked away, or never saw the dialog. [`ask`] bounds the wait with
-//! [`timeout`] and then returns [`Answer::TimedOut`], which is deliberately
+//! A renderer that *is* installed has a human in front of it, so by default
+//! [`ask`] **waits as long as it takes** ([`timeout`] defaults to
+//! [`WAIT_FOREVER`]). A question is a request for a decision, and the two
+//! things people do with one — take a coffee, think it over — are not failures.
+//! The genuinely unattended case never gets this far: with no renderer
+//! installed [`ask`] returns `None` immediately, and headless runs
+//! (`-bg`, piped, CI) are rejected before the tool runs.
+//!
+//! An operator who *wants* a bound sets `PIR_ASK_TIMEOUT_SECS`; then an
+//! unanswered question returns [`Answer::TimedOut`], which is deliberately
 //! distinct from [`Answer::Dismissed`] (a real "no" from a real operator).
 //!
 //! Crucially, timing out must not leave the dialog on screen: a modal owns the
@@ -74,6 +81,8 @@ pub enum Answer {
     Dismissed,
     /// Nobody answered within [`timeout`] — the question was *never seen* (or
     /// the operator walked away), so the dialog was abandoned and torn down.
+    /// Only reachable when the operator explicitly bounded the wait with
+    /// `PIR_ASK_TIMEOUT_SECS`; the default is to wait for them.
     ///
     /// Distinct from [`Answer::Dismissed`] on purpose: "the operator decided
     /// against this" and "the operator never got a chance to decide" call for
@@ -136,18 +145,48 @@ pub fn interactive() -> bool {
     slot().lock().map(|g| g.is_some()).unwrap_or(false)
 }
 
-/// How long [`ask`] waits for the operator before giving up. A question the
-/// operator walks away from must not wedge an agent turn for hours; two minutes
-/// is long enough to read a long question and answer it, and the timeout is
-/// reported as an explicit [`Answer::TimedOut`] rather than silently pretending
-/// the user said nothing (or, worse, picking a default the operator never chose).
+/// "Wait for the operator" — no deadline. The default for every human-facing
+/// prompt (see [`timeout`]).
+pub const WAIT_FOREVER: Duration = Duration::from_secs(u64::MAX / 4);
+
+/// How long [`ask`] waits for the operator before giving up.
+///
+/// **The default is "wait forever"** ([`WAIT_FOREVER`]). A live operator is not
+/// a latency budget: a question is a request for a human *decision*, and the
+/// "nobody is there" case is already handled upstream — [`interactive`] is false
+/// with no renderer installed, and headless (`-bg`, a piped one-shot, CI) never
+/// reaches this function at all. A question that *is* on screen has a human in
+/// front of it, so all a timer adds is the failure mode where the operator
+/// steps away for a moment, comes back, and finds the question silently
+/// vanished and the operation auto-denied behind their back. That is strictly
+/// worse than waiting: the agent already proceeded without them, and they never
+/// learned they had missed a decision.
+///
+/// Set `PIR_ASK_TIMEOUT_SECS` to a positive number to bound the wait (the
+/// escape hatch for an operator who wants a stale question to self-clear).
+/// `0` / `off` / `no` / `none` / unset all mean the same thing: wait for the
+/// human.
 pub fn timeout() -> Duration {
-    let secs = std::env::var("PIR_ASK_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .unwrap_or(120);
-    Duration::from_secs(secs)
+    let Ok(v) = std::env::var("PIR_ASK_TIMEOUT_SECS") else {
+        return WAIT_FOREVER;
+    };
+    let v = v.trim();
+    if matches!(v.to_ascii_lowercase().as_str(), "0" | "off" | "no" | "none" | "") {
+        return WAIT_FOREVER;
+    }
+    match v.parse::<u64>() {
+        Ok(secs) => Duration::from_secs(secs),
+        // A typo must not silently become "wait forever" (which would read as
+        // patience when it was meant as a bound), nor as an arbitrary default.
+        // Say what was ignored and fall back to the documented behaviour.
+        Err(_) => {
+            eprintln!(
+                "[pir] ignoring PIR_ASK_TIMEOUT_SECS={v:?} — want a positive number of seconds, \
+                 or 0/off to wait for the operator (waiting for the operator)"
+            );
+            WAIT_FOREVER
+        }
+    }
 }
 
 /// Ask the operator `q`. Blocks until they answer or [`timeout`] elapses.
@@ -439,6 +478,77 @@ pub(crate) mod tests {
         assert!(Answer::TimedOut.render().contains("no answer"));
         // The two must be distinguishable — that is the point of the variant.
         assert_ne!(Answer::Dismissed.render(), Answer::TimedOut.render());
+    }
+
+    /// The default is to **wait for the operator**, not to give up on them.
+    /// This is the behaviour the whole change is about: a question on screen
+    /// has a human in front of it, and the old 120 s default meant an operator
+    /// who stepped away for a moment came back to a silently auto-denied
+    /// question. Unset env => unbounded.
+    #[test]
+    fn default_timeout_waits_for_the_operator() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os("PIR_ASK_TIMEOUT_SECS");
+        unsafe { std::env::remove_var("PIR_ASK_TIMEOUT_SECS") };
+        let t = timeout();
+        match old {
+            Some(v) => unsafe { std::env::set_var("PIR_ASK_TIMEOUT_SECS", v) },
+            None => unsafe { std::env::remove_var("PIR_ASK_TIMEOUT_SECS") },
+        }
+        assert_eq!(t, WAIT_FOREVER, "with no env set, wait for the operator");
+        // And it must be long enough that no real session can hit it.
+        assert!(t > Duration::from_secs(86_400), "must exceed a day, got {t:?}");
+    }
+
+    /// `0` / `off` / `no` / `none` / empty all mean "wait for the operator".
+    /// This used to be impossible: the parser filtered `s > 0`, so `0` silently
+    /// fell back to the old 120 s default — an operator who explicitly asked
+    /// for no timeout got a timeout, and had no way to say so.
+    #[test]
+    fn zero_and_off_mean_wait_forever() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os("PIR_ASK_TIMEOUT_SECS");
+        for v in ["0", "off", "no", "none", "", " 0 ", "OFF"] {
+            // SAFETY: test-local env mutation, restored after the loop.
+            unsafe { std::env::set_var("PIR_ASK_TIMEOUT_SECS", v) };
+            assert_eq!(timeout(), WAIT_FOREVER, "{v:?} must mean 'wait for the operator'");
+        }
+        match old {
+            Some(v) => unsafe { std::env::set_var("PIR_ASK_TIMEOUT_SECS", v) },
+            None => unsafe { std::env::remove_var("PIR_ASK_TIMEOUT_SECS") },
+        }
+    }
+
+    /// A positive value is still honoured — the escape hatch for an operator who
+    /// wants a stale question to self-clear must keep working.
+    #[test]
+    fn positive_timeout_is_still_honoured() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os("PIR_ASK_TIMEOUT_SECS");
+        unsafe { std::env::set_var("PIR_ASK_TIMEOUT_SECS", "45") };
+        let t = timeout();
+        match old {
+            Some(v) => unsafe { std::env::set_var("PIR_ASK_TIMEOUT_SECS", v) },
+            None => unsafe { std::env::remove_var("PIR_ASK_TIMEOUT_SECS") },
+        }
+        assert_eq!(t, Duration::from_secs(45));
+    }
+
+    /// A malformed value must not silently become "wait forever" (which would
+    /// read as patience when the operator asked for a bound) — and it must not
+    /// become an arbitrary number either. It falls back to the documented
+    /// default, having said so.
+    #[test]
+    fn a_typo_falls_back_to_waiting_and_says_so() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os("PIR_ASK_TIMEOUT_SECS");
+        unsafe { std::env::set_var("PIR_ASK_TIMEOUT_SECS", "soon") };
+        let t = timeout();
+        match old {
+            Some(v) => unsafe { std::env::set_var("PIR_ASK_TIMEOUT_SECS", v) },
+            None => unsafe { std::env::remove_var("PIR_ASK_TIMEOUT_SECS") },
+        }
+        assert_eq!(t, WAIT_FOREVER, "a typo falls back to the documented default");
     }
 
     /// A renderer that never answers must not hang the caller: the timeout
