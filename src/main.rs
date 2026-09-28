@@ -12,6 +12,7 @@ mod checkpoint;
 mod config;
 mod cpu_probe;
 mod cpu_scenarios_tests;
+mod embed;
 mod fake;
 mod goal;
 mod mcp;
@@ -316,6 +317,12 @@ OPTIONS
                        (model ends its turn with request_stop; text-only
                        answers are auto-nudged). On by default.
                        Env: PIR_STOP_SKILL=0  Config: "stopSkill": false
+  --embed <dir>          write a self-contained pir to <dir>/pire: a copy of
+                       this binary with your auth.json + models-store.json
+                       appended after the executable image. Copy that single
+                       file anywhere; when it runs it merges the embedded
+                       providers/keys with the machine's own, local config
+                       winning on conflict. Exits without starting a session.
   --output-format <fmt>  'text' (default) or 'json'. In json mode, NDJSON
                        events are emitted to stdout: turn_start, tool_call,
                        tool_result, turn_end, result (with exit code + text).
@@ -329,6 +336,12 @@ CONFIG (reused from pi, never modified)
   ~/.pi/agent/sessions/        pir session transcripts + goal files (pir-*.jsonl/.goal.json)
   ~/.pi/agent/projects.json    project -> execution-user mappings (set by `pir project init`)
   ~/.pi/agent/security.toml    security policy (per-project override under .pir/ wins)
+
+  A pir produced by `pir --embed <dir>` also carries an `auth.json` +
+  `models-store.json` appended after its own executable image. Those are read
+  from the running binary itself and unioned UNDER the files above, so a
+  machine-local provider or key always wins on conflict and embedded ones only
+  add what the local machine is missing.
 
   Human-facing prompts (a question, an escalation confirm) WAIT for you by
   default — they have no deadline, so stepping away never silently auto-denies
@@ -758,6 +771,19 @@ fn main() {
             "--no-raw" => no_raw = true,
             "--no-incremental" => no_incremental = true,
             "--no-stop-skill" => no_stop_skill = true,
+            "--embed" => {
+                // `pir --embed <dir>` — write a self-contained copy of this
+                // binary to <dir>/pire with the local auth.json +
+                // models-store.json appended after the executable image. A
+                // terminal mode: it produces the artifact and exits without
+                // starting a session.
+                i += 1;
+                let Some(dir) = args.get(i) else {
+                    die("--embed needs a directory");
+                };
+                run_embed(dir);
+                return;
+            }
             "--output-format" => {
                 i += 1;
                 match args.get(i).map(|s| s.as_str()) {
@@ -4652,6 +4678,55 @@ fn classify_error(error: &str) -> ExitCode {
 fn die(msg: &str) -> ! {
     eprintln!("pir: {msg}");
     std::process::exit(1)
+}
+
+/// `pir --embed <dir>` — build a self-contained pir at `<dir>/pire`: a byte copy
+/// of the running executable with the operator's `auth.json` and
+/// `models-store.json` appended after the executable image inside a
+/// self-describing trailer (see [`crate::embed`]).
+///
+/// The result is a single file you can copy to another machine. When that copy
+/// runs, it reads its own trailer and layers the embedded providers/keys *under*
+/// the local config, so a machine-local store or key always wins while any
+/// provider the local machine lacks becomes available.
+///
+/// A terminal mode: it produces the artifact, prints what it embedded, and
+/// exits without starting a session.
+fn run_embed(dir: &str) {
+    let dir_path = PathBuf::from(dir);
+    if let Err(e) = std::fs::create_dir_all(&dir_path) {
+        die(&format!("cannot create {}: {e}", dir_path.display()));
+    }
+    // The documents to embed come from the *current* config dir, resolved the
+    // same way every other config read is (so `PI_DIR` / the invoking user's
+    // ~/.pi are honoured).
+    let agent_dir = config::pi_dir().join("agent");
+    let entries = crate::embed::entries_from_config(&agent_dir);
+    if entries.is_empty() {
+        die(&format!(
+            "nothing to embed: no auth.json or models-store.json in {}",
+            agent_dir.display()
+        ));
+    }
+    let dest = dir_path.join(if cfg!(windows) { "pire.exe" } else { "pire" });
+    if let Err(e) = crate::embed::write_embedded(&dest, entries) {
+        die(&e);
+    }
+    let total: usize = std::fs::metadata(&dest).map(|m| m.len() as usize).unwrap_or(0);
+    println!("{}", term::green(&format!("✓ embedded pir → {}", dest.display())));
+    for name in [crate::embed::ENTRY_AUTH, crate::embed::ENTRY_STORE] {
+        let p = agent_dir.join(name);
+        if p.exists() {
+            println!("  {} {}", term::dim("·"), name);
+        }
+    }
+    println!(
+        "{}",
+        term::dim(&format!(
+            "  ({} bytes; running it merges these with any local auth/models — local wins)",
+            total
+        ))
+    );
 }
 
 /// `pir project init [--name X] [--path P]` — create the per-project execution

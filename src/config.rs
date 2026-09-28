@@ -707,29 +707,44 @@ fn load_providers_uncached() -> Result<Vec<Provider>, String> {
     // `load_providers` will serve the snapshot — so stay quiet instead of
     // printing a misleading "Falling back" warning on every call.
     let quiet = invoker_catalog().is_some();
-    if !path.exists() {
-        if !quiet {
+    // The embedded payload (see `crate::embed`, written by `pir --embed <dir>`)
+    // is layered UNDER the local store: it contributes any provider the local
+    // file lacks, plus any model missing from a locally-defined provider, while
+    // every local value (baseUrl, apiKey, model list) keeps precedence. When
+    // there is no readable local store the embedded store stands in as the
+    // primary catalog, so a copied pir works on a bare machine.
+    let embedded = crate::embed::embedded_store();
+
+    let local: Option<Value> = if !path.exists() {
+        if !quiet && embedded.is_none() {
             eprintln!("! models-store.json not found. Falling back to auth.json");
         }
-        return load_from_auth_fallback();
-    }
-
-    let raw = match fs::read_to_string(&path) {
-        Ok(r) => r,
-        Err(e) => {
-            if !quiet {
-                eprintln!("! Cannot read models-store.json: {e}. Falling back");
+        None
+    } else {
+        match fs::read_to_string(&path) {
+            Ok(r) => match serde_json::from_str::<Value>(&r) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    eprintln!("! Cannot parse models-store.json: {e}. Falling back");
+                    None
+                }
+            },
+            Err(e) => {
+                if !quiet && embedded.is_none() {
+                    eprintln!("! Cannot read models-store.json: {e}. Falling back");
+                }
+                None
             }
-            return load_from_auth_fallback();
         }
     };
 
-    let v: Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("! Cannot parse models-store.json: {e}. Falling back");
-            return load_from_auth_fallback();
-        }
+    // `merge_store` builds a fresh value; the no-merge arms move the local one
+    // in rather than copying the (potentially 300KB) store.
+    let v: Value = match (local, embedded) {
+        (Some(l), Some(e)) => crate::embed::merge_store(&l, e),
+        (Some(l), None) => l,
+        (None, Some(e)) => e.clone(),
+        (None, None) => return load_from_auth_fallback(),
     };
 
     let providers_val = v.get("providers").cloned().unwrap_or(v);
@@ -1059,13 +1074,28 @@ fn load_from_auth_fallback() -> Result<Vec<Provider>, String> {
     let auth_path = pi_dir().join("agent").join("auth.json");
     let settings_path = pi_dir().join("agent").join("settings.json");
 
+    // Merge any embedded `auth.json` under the local one (local wins), so the
+    // auth-only fallback path — taken when there is no usable models-store —
+    // still sees credentials carried by an embedded pir.
+    let embedded_auth = crate::embed::embedded_auth().cloned();
     let auth_v: Value = match fs::read_to_string(&auth_path) {
-        Ok(raw) => serde_json::from_str(&raw)
-            .map_err(|e| format!("Parsing {}: {e}", auth_path.display()))?,
+        Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+            Ok(v) => match &embedded_auth {
+                Some(e) => crate::embed::merge_auth(&v, e),
+                None => v,
+            },
+            Err(e) => return Err(format!("Parsing {}: {e}", auth_path.display())),
+        },
         Err(_) if space_bunny_api_key("openrouter").is_some() || space_bunny_api_key("commandcode").is_some() => {
             Value::Object(serde_json::Map::new())
         }
-        Err(e) => return Err(format!("Missing {}: {e}", auth_path.display())),
+        Err(e) => {
+            if let Some(e) = embedded_auth {
+                e
+            } else {
+                return Err(format!("Missing {}: {e}", auth_path.display()));
+            }
+        }
     };
 
     let settings_raw = fs::read_to_string(&settings_path).unwrap_or_default();
@@ -1125,16 +1155,38 @@ fn guess_base_url(pid: &str) -> Option<String> {
 fn load_auth_keys() -> std::collections::BTreeMap<String, String> {
     let path = pi_dir().join("agent").join("auth.json");
     let mut map = std::collections::BTreeMap::new();
+    // Seed from the embedded `auth.json` first (see `crate::embed`), so an
+    // embedded credential is available even when the machine has no local
+    // auth.json at all.
+    if let Some(emb) = crate::embed::embedded_auth()
+        && let Some(obj) = emb.as_object()
+    {
+        collect_api_keys(obj, &mut map);
+    }
+    // Local entries overwrite the embedded ones — a machine's own key always
+    // wins over the shared payload's key for the same provider id.
     if let Ok(raw) = fs::read_to_string(&path)
         && let Ok(v) = serde_json::from_str::<Value>(&raw)
             && let Some(obj) = v.as_object() {
-                for (id, val) in obj {
-                    if val.get("type").and_then(Value::as_str) == Some("api_key")
-                        && let Some(key) = val.get("key").and_then(Value::as_str)
-                            && !key.is_empty() { map.insert(id.to_lowercase(), key.to_string()); }
-                }
+                collect_api_keys(obj, &mut map);
             }
     map
+}
+
+/// Insert every `{ "type": "api_key", "key": ... }` entry of an auth object
+/// into `map`, keyed by the lower-cased provider id.
+fn collect_api_keys(
+    obj: &serde_json::Map<String, Value>,
+    map: &mut std::collections::BTreeMap<String, String>,
+) {
+    for (id, val) in obj {
+        if val.get("type").and_then(Value::as_str) == Some("api_key")
+            && let Some(key) = val.get("key").and_then(Value::as_str)
+                && !key.is_empty()
+        {
+            map.insert(id.to_lowercase(), key.to_string());
+        }
+    }
 }
 
 pub fn default_model_setting() -> Option<String> {
