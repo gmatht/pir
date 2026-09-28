@@ -2840,8 +2840,7 @@ impl Agent {
         // turn can't carry over into this one, and stamp the turn clock so the
         // TurnDone notification reports the real wall time (not 0.0s).
         self.loop_detector = LoopDetector::new();
-        self.stop_hit = None;
-        self.stop_nudges = 0;
+        self.begin_turn();
         self.turn_started = Some(std::time::Instant::now());
         // Open a rewind checkpoint (Feature 8) at the turn boundary. Recorded
         // *before* the turn can touch anything, and keyed to the history length
@@ -3321,7 +3320,7 @@ impl Agent {
                     // turn — observed as pir "randomly exiting" every turn on
                     // `pir -r`. Only nudge when the model has not already been
                     // nudged since the last real user prompt.
-                    if self.stop_nudged_for_prompt.as_deref() == Some(user) {
+                    if self.stop_nudged_for_prompt.as_deref() == Some(&user[..]) {
                         if !self.silent() {
                             term::out(&term::dim(
                                 "· stop-skill: this prompt was already nudged — ending turn",
@@ -3937,6 +3936,26 @@ impl Agent {
             term::out(&term::yellow(&note));
         }
         self.notify.publish(self.turn_done_event(), false);
+    }
+
+    /// Clear every per-turn stop-skill counter. Called once at the *start* of
+    /// each turn, before any nudge can be issued.
+    ///
+    /// `stop_nudged_for_prompt` belongs in this set and must not be left
+    /// dangling across turns. It is the guard that ends a turn whose second
+    /// text-only answer is the model answering the nudge itself (see its call
+    /// site in `turn`), and it is keyed on the raw prompt text — so if it
+    /// outlives the turn it also insta-kills every *later* turn whose prompt
+    /// happens to be byte-identical to a previously nudged one, with a full
+    /// [`STOP_NUDGE_MAX`] budget the model never spends and its text answer
+    /// thrown away. Not hypothetical: `drive_goal` builds prompts as
+    /// `[continue goal] Next step: {pending}`, and `pending` repeats verbatim
+    /// until the model marks the step done, so a retried goal step could never
+    /// recover.
+    fn begin_turn(&mut self) {
+        self.stop_hit = None;
+        self.stop_nudges = 0;
+        self.stop_nudged_for_prompt = None;
     }
 
     /// Build the `Idle` event (returned to the REPL prompt). Carries the same
@@ -5578,6 +5597,61 @@ mod goal_bootstrap_tests {
         assert_eq!(StopDecision::parse("keep going"), None);
         assert_eq!(StopDecision::Complete.label(), "stop-complete");
         assert_eq!(StopDecision::NeedsInput.label(), "stop-needs-input");
+    }
+
+    /// Regression: the "already nudged for this prompt" guard is keyed on raw
+    /// prompt text, and it used to be cleared *only* in the constructor. Every
+    /// later turn whose prompt was byte-identical to a previously nudged one
+    /// therefore insta-killed on its first text-only answer — reporting
+    /// "· stop-skill: this prompt was already nudged — ending turn" — with the
+    /// fresh `stop_nudges == 0` budget untouched, so the model's answer was
+    /// discarded instead of nudged once.
+    ///
+    /// This is reachable without any exotic input: `drive_goal` prompts as
+    /// `[continue goal] Next step: {pending}`, and `pending` repeats verbatim
+    /// until the model marks the step done. The same happens in the REPL when
+    /// the operator re-sends or arrow-up-retries a prompt — and because the
+    /// state was process-lifetime, retrying could never clear it.
+    #[test]
+    fn a_new_turn_clears_the_already_nudged_guard_even_for_the_same_prompt() {
+        let mut a = fresh_agent();
+        assert!(a.stop_skill());
+
+        // Turn 1 nudges: the guard is armed for this exact prompt text.
+        a.begin_turn();
+        a.stop_nudges = 1;
+        a.stop_nudged_for_prompt = Some("same prompt".to_string());
+        assert_eq!(a.stop_nudged_for_prompt.as_deref(), Some("same prompt"));
+
+        // Turn 2 starts with the byte-identical prompt. It must get a clean
+        // slate — otherwise this turn is dead on arrival.
+        a.begin_turn();
+        assert_eq!(a.stop_nudged_for_prompt, None, "guard must not survive a turn boundary");
+        assert_eq!(a.stop_nudges, 0, "each turn starts with the full nudge budget");
+        assert_eq!(a.stop_hit, None, "a stop from a previous turn must not carry over");
+
+        // So this turn is free to nudge, rather than insta-killing.
+        a.stop_nudges = 1;
+        a.stop_nudged_for_prompt = Some("same prompt".to_string());
+        assert!(a.stop_nudged_for_prompt.is_some());
+    }
+
+    /// The guard's original purpose must survive the fix: *within* one turn, a
+    /// second text-only answer (the model answering the nudge rather than the
+    /// operator) ends the turn instead of re-nudging forever. This is the
+    /// resumed-session trap the guard was added for, and it is scoped to the
+    /// turn, not the process.
+    #[test]
+    fn the_already_nudged_guard_still_holds_within_a_single_turn() {
+        let mut a = fresh_agent();
+        a.begin_turn();
+        // First text-only answer: nudge, arm the guard.
+        a.stop_nudges += 1;
+        a.stop_nudged_for_prompt = Some("p".to_string());
+        // Second text-only answer for the same prompt: guard is armed, so the
+        // call site would end the turn. A different prompt is not guarded.
+        assert_eq!(a.stop_nudged_for_prompt.as_deref(), Some("p"));
+        assert_ne!(a.stop_nudged_for_prompt.as_deref(), Some("q"));
     }
 
     #[test]

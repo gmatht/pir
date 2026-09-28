@@ -3143,6 +3143,21 @@ fn handle_command(
             // no live process is currently driving.
             print!("{}", session::list_unfinished());
         }
+        "finished" => {
+            // Mark this session finished, so it stops appearing in
+            // `/unfinished`. The TUI and the GUI both have this; adding the arm
+            // here is what puts `/finished` into the generated
+            // `commands::SLASH_COMMANDS` table, so Tab completion in every
+            // front-end can offer it.
+            let log = agent_slot.lock().unwrap().as_ref().and_then(|a| a.log_path.clone());
+            match log {
+                Some(p) => {
+                    session::mark_finished(&p);
+                    eprintln!("pir: session marked finished");
+                }
+                None => eprintln!("pir: no session log to mark finished"),
+            }
+        }
         "resume" | "res" => {
             // Resume an unfinished session (from `/unfinished`, index 0 = newest)
             // into the *current* interactive agent and, if a goal is attached,
