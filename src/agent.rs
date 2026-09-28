@@ -3321,7 +3321,7 @@ impl Agent {
                     // turn — observed as pir "randomly exiting" every turn on
                     // `pir -r`. Only nudge when the model has not already been
                     // nudged since the last real user prompt.
-                    if self.stop_nudged_for_prompt.as_deref() == Some(&user[..]) {
+                    if self.stop_nudged_for_prompt.as_deref() == Some(user) {
                         if !self.silent() {
                             term::out(&term::dim(
                                 "· stop-skill: this prompt was already nudged — ending turn",

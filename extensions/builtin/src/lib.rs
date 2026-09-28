@@ -813,21 +813,202 @@ impl Builtin {
     /// mass extinctions. We deliberately do NOT try to parse shell — just look
     /// for the dangerous tokens. A human confirm is still required, so false
     /// positives only add a prompt, never block unattended safety-critical ops.
+    ///
+    /// The `pir` test is scoped to each kill verb's *pattern operands*, not the
+    /// whole command line. It used to be a bare `command.contains("pir")`,
+    /// which cannot tell "pkill aimed at pir" from "pkill aimed at something
+    /// else, in a command that merely mentions pir". That fired on essentially
+    /// every `pkill` run from inside a session, because the scratchpad is
+    /// always `$TMPDIR/pir/<session-key>` (`$PIR_SCRATCHPAD`) and the project
+    /// path ends in `pir`:
+    ///
+    /// ```text
+    /// cd /tmp/pir/scratch/pir-20260927-181749-sh242445 && pkill fluxbox
+    /// ```
+    ///
+    /// `pkill fluxbox` cannot touch a pir process — and pir is the very process
+    /// running the command, so a self-kill is impossible there. Matching only
+    /// the pattern tokens keeps both real extinction shapes (`pkill -f
+    /// target/…/pir`, `pkill pir`) while dropping the coincidence.
     fn dangerous_kill_reason(command: &str) -> Option<&'static str> {
-        let c = command;
-        // `pkill`/`killall` against `pir`/`target/...pir` (the #1 extinction).
-        if (c.contains("pkill") || c.contains("killall")) && c.contains("pir") {
-            return Some("pkill/killall targeting pir");
+        for words in Self::kill_invocation_words(command) {
+            let Some(verb) = words.first() else { continue };
+            // Only the actual kill verbs; a `cd`/`&&`-chained sibling stage
+            // must never be treated as a kill at all.
+            let base = verb.rsplit('/').next().unwrap_or(verb);
+            if base != "pkill" && base != "killall" {
+                continue;
+            }
+            // Pattern operands only: skip the verb's own options (`-f`, `-9`,
+            // `-u`, `--user`, …) and keep the non-flag tokens. We deliberately
+            // still match *inside* a pattern (no trailing token-boundary
+            // requirement), because `pkill -f target/…/pir` is one of the two
+            // real extinctions and the danger lives in the substring.
+            if words
+                .iter()
+                .skip(1)
+                .filter(|w| !w.starts_with('-'))
+                .any(|pat| pat.contains("pir"))
+            {
+                return Some("pkill/killall targeting pir");
+            }
+            // #2: `pkill -u <this user>` killed every session of `ai_pir`. Only
+            // the *current* user counts — `pkill -u someuser node` is ordinary
+            // administration and must not prompt.
+            if Self::pkill_self_user(&words).is_some_and(|u| Self::is_current_user(&u)) {
+                return Some("pkill scoped to this user");
+            }
         }
-        // `pkill -u <this user>` (the #2 extinction killed `ai_pir`).
-        if c.contains("pkill -u") || c.contains("pkill -U") {
-            return Some("pkill scoped to a user");
-        }
-        // A bare `kill -9` / `kill -TERM` with a broad target is ambiguous, but
-        // `kill` of a process group (`kill -<sig> -<pgid>`) or `killall` of
-        // `pir` is the dangerous shape; `kill <pid>` of is allowed
-        // (that's normal job control). We only flag killall already covered.
         None
+    }
+
+    /// The `-u <user>` / `-U <user>` operand of one `pkill` word list, in both
+    /// the attached (`-u=name`, `--user=name`) and separated (`-u name`) forms.
+    /// Returned as the *value* only, so a bare `-u` with no operand yields
+    /// `None` rather than an empty user that would match nothing anyway.
+    fn pkill_self_user(words: &[String]) -> Option<String> {
+        let mut it = words.iter().skip(1);
+        while let Some(w) = it.next() {
+            if let Some(v) = w.strip_prefix("--user=").or_else(|| w.strip_prefix("-u=")) {
+                return Some(v.to_string());
+            }
+            if w == "-u" || w == "-U" {
+                return it.next().cloned();
+            }
+        }
+        None
+    }
+
+    /// Split a command line into per-invocation word lists, breaking on the
+    /// separators that start a new command (`;`, `&&`, `||`, newline) so a
+    /// `pkill` is only ever judged against its own arguments. Quotes are
+    /// honoured so `bash -c 'pkill -f …'` keeps its inner command as one
+    /// invocation. Redirect targets are dropped: `pkill fluxbox > /tmp/pir/x`
+    /// writes a file, it does not aim a kill at `x`.
+    fn kill_invocation_words(command: &str) -> Vec<Vec<String>> {
+        let mut invocations: Vec<Vec<String>> = Vec::new();
+        let mut cur: Vec<String> = Vec::new();
+        let mut word = String::new();
+        let mut quote: Option<char> = None;
+        let mut chars = command.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match quote {
+                Some(q) => {
+                    if ch == q {
+                        quote = None;
+                    } else {
+                        word.push(ch);
+                    }
+                }
+                None => match ch {
+                    '\'' | '"' => quote = Some(ch),
+                    // `>`/`>>` starts a redirect: skip it and its target (up to
+                    // the next unquoted whitespace), which is never a pattern.
+                    '>' => {
+                        if chars.peek() == Some(&'>') {
+                            chars.next();
+                        }
+                        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                            chars.next();
+                        }
+                        while chars.peek().is_some_and(|c| !c.is_whitespace()) {
+                            chars.next();
+                        }
+                    }
+                    // fd duplication (`2>&1`) is not a target; drop the `&…`.
+                    '&' if chars.peek() == Some(&'>') => {
+                        chars.next();
+                    }
+                    ';' | '\n' => {
+                        if !word.is_empty() {
+                            cur.push(std::mem::take(&mut word));
+                        }
+                        if !cur.is_empty() {
+                            invocations.push(std::mem::take(&mut cur));
+                        }
+                    }
+                    '&' | '|' if chars.peek() == Some(&ch) => {
+                        chars.next();
+                        if !word.is_empty() {
+                            cur.push(std::mem::take(&mut word));
+                        }
+                        if !cur.is_empty() {
+                            invocations.push(std::mem::take(&mut cur));
+                        }
+                    }
+                    c if c.is_whitespace() => {
+                        if !word.is_empty() {
+                            cur.push(std::mem::take(&mut word));
+                        }
+                    }
+                    c => word.push(c),
+                },
+            }
+        }
+        if !word.is_empty() {
+            cur.push(word);
+        }
+        if !cur.is_empty() {
+            invocations.push(cur);
+        }
+        invocations
+    }
+
+    /// Whether `name` is the user running this process, so `pkill -u ai_pir`
+    /// (the #2 extinction) is still caught while `pkill -u someuser node` is
+    /// left alone. A numeric operand is compared against our effective uid.
+    ///
+    /// The login name is resolved through `/etc/passwd` **keyed by uid**, never
+    /// through `/proc/self/status` — that file's `Name:` field is the process
+    /// *name*, which for pir is `pir-2026…-sh123` (or, under `cargo test`, the
+    /// test binary's name), not the login name. A numeric operand is handled by
+    /// the uid comparison above, so no name lookup is needed for it.
+    fn is_current_user(name: &str) -> bool {
+        let n = name.trim();
+        if n.is_empty() {
+            return false;
+        }
+        #[cfg(unix)]
+        let uid = {
+            // SAFETY: `geteuid` reads a process-global, takes no pointers and
+            // cannot fail, so it is always safe to call.
+            unsafe { libc::geteuid() }
+        };
+        if let Ok(parsed) = n.parse::<u32>() {
+            #[cfg(unix)]
+            {
+                return parsed == uid;
+            }
+            #[cfg(not(unix))]
+            {
+                return false;
+            }
+        }
+        #[cfg(not(unix))]
+        let uid = 0u32;
+        match Self::login_name_for_uid(uid) {
+            Some(login) => login == n,
+            None => false,
+        }
+    }
+
+    /// The login name for `uid`, from `/etc/passwd`. `None` when the file is
+    /// unreadable or has no entry (an ldap/nsswitch-only account, say) — in
+    /// which case the guard simply does not fire for a *named* user, which
+    /// fails toward the documented tradeoff: a prompt is a nuisance, a missed
+    /// `pkill -u` is an extinction.
+    fn login_name_for_uid(uid: u32) -> Option<String> {
+        let text = fs::read_to_string("/etc/passwd").ok()?;
+        text.lines()
+            .filter_map(|l| {
+                let mut f = l.split(':');
+                let name = f.next()?;
+                let _pw = f.next()?;
+                let id: u32 = f.next()?.parse().ok()?;
+                Some((name.to_string(), id))
+            })
+            .find(|(_, id)| *id == uid)
+            .map(|(name, _)| name)
     }
 
     /// `glob` — find files by path pattern. ripgrep-backed (`rg --files`) when
@@ -3538,11 +3719,128 @@ mod priv_escalation_tests {
         );
     }
 
+    /// The login name of the user running this process, or `""` when it cannot
+    /// be determined. Env first, then `/etc/passwd` keyed by uid — deliberately
+    /// *not* `id -un`, because spawning a process to answer "who am I" on every
+    /// command is not acceptable. Tests use it so the `-u` guard can be
+    /// exercised against the real user instead of a hard-coded name.
+    fn current_user_name() -> String {
+        for k in ["USER", "LOGNAME"] {
+            if let Ok(v) = std::env::var(k)
+                && !v.is_empty()
+            {
+                return v;
+            }
+        }
+        #[cfg(unix)]
+        // SAFETY: `geteuid` reads a process-global, takes no pointers and
+        // cannot fail, so it is always safe to call.
+        let uid = unsafe { libc::geteuid() };
+        #[cfg(not(unix))]
+        let uid = 0u32;
+        Builtin::login_name_for_uid(uid).unwrap_or_default()
+    }
+
     // Inline escalation buried inside `bash -c '…'` is still caught.
     #[test]
     fn detects_inline_sudo_in_bash_c() {
         assert!(Builtin::priv_escalation("bash -c 'sudo rm -rf /'").is_some());
         assert!(Builtin::priv_escalation("echo hi && su root").is_some());
+    }
+
+    /// The two *real* mass extinctions must keep prompting. The guard exists
+    /// for exactly these two shapes; if a change makes either stop being
+    /// caught, every sibling session in the process group is one typo away from
+    /// death, so these are load-bearing assertions, not coverage.
+    #[test]
+    fn the_real_mass_extinctions_still_prompt() {
+        // #1: `pkill -f target/.../pir` (the historical `pir -f` extinction).
+        assert_eq!(
+            Builtin::dangerous_kill_reason("pkill -f target/debug/pir"),
+            Some("pkill/killall targeting pir")
+        );
+        assert_eq!(
+            Builtin::dangerous_kill_reason("pkill pir"),
+            Some("pkill/killall targeting pir")
+        );
+        assert_eq!(
+            Builtin::dangerous_kill_reason("killall pir"),
+            Some("pkill/killall targeting pir")
+        );
+        // Chained behind other work, and piped.
+        assert_eq!(
+            Builtin::dangerous_kill_reason("cd /home/ai/src/pir && pkill -f ./pir"),
+            Some("pkill/killall targeting pir")
+        );
+        assert_eq!(
+            Builtin::dangerous_kill_reason("pkill -f target/debug/pir || true"),
+            Some("pkill/killall targeting pir")
+        );
+        // #2: `pkill -u <this user>` (the `ai_pir` extinction). The operand is
+        // resolved against the real current user, both spellings.
+        let me = current_user_name();
+        assert!(
+            !me.is_empty(),
+            "the current user must be resolvable, or this guard is untestable"
+        );
+        assert_eq!(
+            Builtin::dangerous_kill_reason(&format!("pkill -u {me}")),
+            Some("pkill scoped to this user"),
+            "pkill scoped to the running user must prompt"
+        );
+        assert_eq!(
+            Builtin::dangerous_kill_reason(&format!("pkill -U {me}")),
+            Some("pkill scoped to this user")
+        );
+        assert_eq!(
+            Builtin::dangerous_kill_reason(&format!("pkill --user={me}")),
+            Some("pkill scoped to this user")
+        );
+    }
+
+    /// The false positive that prompted this change. `pir` used to be matched
+    /// against the *whole* command line, so any command that merely mentioned
+    /// pir — and inside a session every path does, because the scratchpad is
+    /// `$TMPDIR/pir/<session-key>` — combined with any `pkill` to trip the
+    /// guard. `pkill fluxbox` cannot kill a pir process (and pir is the process
+    /// running the command, so self-kill is impossible); it must not prompt.
+    #[test]
+    fn pkill_of_another_process_inside_the_scratchpad_does_not_prompt() {
+        // The exact command from the field report.
+        let cmd = "cd /tmp/pir/scratch/pir-20260927-181749-sh242445 && \
+                   rm -rf real && mkdir real && cd real && \
+                   pkill fluxbox 2>/dev/null; (DISPLAY=:77 fluxbox >/dev/null 2>&1 &)";
+        assert_eq!(
+            Builtin::dangerous_kill_reason(cmd),
+            None,
+            "pkill fluxbox in a scratch dir named pir must not prompt"
+        );
+        // The project path and a grep mentioning pir are the same coincidence.
+        assert_eq!(Builtin::dangerous_kill_reason("cd /home/ai_pir/src/pir && pkill cargo"), None);
+        assert_eq!(Builtin::dangerous_kill_reason("pkill rstimer"), None);
+        assert_eq!(Builtin::dangerous_kill_reason("pkill -9 fluxbox"), None);
+        // `pir` inside a *different* process's name still matches the pattern,
+        // so `pkill pirate` legitimately prompts — the guard is a prompt, not a
+        // block, and `pirate` is not a pir session. (Pinning this so the
+        // substring behaviour is a deliberate choice, not an accident.)
+        assert_eq!(
+            Builtin::dangerous_kill_reason("pkill pirate"),
+            Some("pkill/killall targeting pir")
+        );
+        // Redirect targets are write sinks, not pkill patterns.
+        assert_eq!(Builtin::dangerous_kill_reason("pkill fluxbox > /tmp/pir/log.txt"), None);
+    }
+
+    /// `pkill -u <someone else>` is ordinary administration and must not be
+    /// treated as self-extinction — only the *current* user is the risk.
+    #[test]
+    fn pkill_scoped_to_another_user_does_not_prompt() {
+        // Pick a name that is certainly not the current user.
+        let other = "__definitely_not_this_user__";
+        assert_eq!(Builtin::dangerous_kill_reason(&format!("pkill -u {other} node")), None);
+        assert_eq!(Builtin::dangerous_kill_reason(&format!("pkill --user={other}")), None);
+        // A bare `-u` with no operand is a malformed command, not a self-kill.
+        assert_eq!(Builtin::dangerous_kill_reason("pkill -u"), None);
     }
 
     // Ordinary commands must NOT be mistaken for escalation.
