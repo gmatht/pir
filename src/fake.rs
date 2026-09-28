@@ -398,3 +398,48 @@ mod fake_tests {
         assert!(msg.tool_uses().is_empty());
     }
 }
+
+#[cfg(test)]
+mod text_only_answer_tests {
+    //! The regression harness for the stop-skill nudge loop: a prompt with no
+    //! `FAKE:` directives gets a **canned echo reply**, which is a text-only
+    //! answer — exactly what used to make a turn die with
+    //! "· stop-skill: this prompt was already nudged — ending turn" instead of
+    //! being nudged. Driving a real agent turn through this reply is the only
+    //! way to prove the fix at the call site rather than on paper.
+    use super::*;
+
+    #[test]
+    fn a_prompt_with_no_directives_yields_a_text_only_reply() {
+        assert!(
+            parse_directives("just say something").is_empty(),
+            "a plain prompt must produce no tool calls, i.e. a text-only answer"
+        );
+    }
+
+    /// The reply really is plain text — no tool call — so the turn loop's
+    /// `calls.is_empty()` branch (where the nudge lives) is the one taken.
+    #[test]
+    fn the_canned_reply_has_no_tool_calls() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut text = String::new();
+        let mut think = String::new();
+        let (msg, _usage) = fake_chat(
+            &[Message::user("plain prompt")],
+            &mut |t| text.push_str(t),
+            &mut |t| think.push_str(t),
+            &cancel,
+        )
+        .expect("the fake must answer");
+        assert!(
+            msg.blocks.iter().any(|b| matches!(b, Block::Text(_))),
+            "the fake must produce text, or the nudge branch is never reached: {:?}",
+            msg.blocks
+        );
+        assert!(
+            !msg.blocks.iter().any(|b| matches!(b, Block::ToolUse { .. })),
+            "a text-only answer must carry no tool calls: {:?}",
+            msg.blocks
+        );
+    }
+}
