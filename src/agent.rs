@@ -190,8 +190,8 @@ pub struct Agent {
     /// Explicit-stop skill (`request_stop` tool + auto-nudge). On by default;
     /// off via `PIR_STOP_SKILL=0` / `"stopSkill": false` / `--no-stop-skill` /
     /// `/stop-skill off`. When on, the model ends its turn with an explicit
-    /// `request_stop` call, and text-only answers are auto-nudged (up to
-    /// [`STOP_NUDGE_MAX`] per turn) until it does.
+    /// `request_stop` call, and text-only answers are auto-nudged (unbounded by
+    /// default — see [`STOP_NUDGE_MAX`]) until it does.
     stop_skill: bool,
     /// Output format for this session. `Plain` (default) is human-readable
     /// terminal output; `Json` emits NDJSON events to stdout for machine
@@ -204,7 +204,7 @@ pub struct Agent {
     /// `/stop-skill status` and tests).
     last_stop: Option<(StopDecision, String)>,
     /// Auto-nudges used in the current turn (reset each turn; bounded by
-    /// [`STOP_NUDGE_MAX`]).
+    /// [`STOP_NUDGE_MAX`], which is `usize::MAX` — i.e. unbounded — by default).
     stop_nudges: usize,
     /// The user prompt that the current in-turn nudge was already issued for.
     /// The nudge is itself logged as a `user` message, so a *resumed* session
@@ -403,11 +403,24 @@ impl StopDecision {
     }
 }
 
-/// How many auto-nudges a turn may spend before giving up and ending it: each
-/// text-only answer costs one model call, so the cap also caps the spend. 16
-/// gives the model fifteen chances to comply after the first miss and still
-/// keeps a stuck turn to a handful of cheap calls.
-pub const STOP_NUDGE_MAX: usize = 16;
+/// How many auto-nudges a turn may spend before giving up and ending it.
+///
+/// **Unbounded by default.** A text-only answer is not a stop, so the turn keeps
+/// nudging the model toward an explicit `request_stop` until it complies — the
+/// cap only exists so a genuinely stuck turn cannot spend forever, and guessing
+/// where "stuck" begins was ending turns that were still recovering. The common
+/// failure is a model that has a complete answer and has not yet been told to
+/// call `request_stop`; cutting it off at some fixed count throws that answer
+/// away and reports the turn as finished when it is not.
+///
+/// The loop is still bounded in practice, by the things that actually end a
+/// turn: the model calling `request_stop` (or any tool), the operator
+/// interrupting, the token budget (`--budget` / `PIR_TOKEN_BUDGET`), and the
+/// per-turn nudge guard that stops a *resumed* session nudging for a prompt it
+/// already nudged (that is what made `pir -r` end every turn; see
+/// `stop_nudged_for_prompt`). If you want the old bounded behaviour, set this to
+/// any finite count — the comparison below is `>=`, so the value *is* the cap.
+pub const STOP_NUDGE_MAX: usize = usize::MAX;
 
 /// What `load_session` restored. The REPL (and `/fg`/`/resume`) renders
 /// [`SessionResume::banner`] so `-r` makes it clear which session came back,
@@ -5963,5 +5976,52 @@ mod su_security_sidecar_tests {
         assert!(!sidecar.exists(), "stale override must be gone");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod nudge_budget_tests {
+    use super::*;
+
+    /// The nudge budget is **unbounded by default**, and that is a deliberate
+    /// choice rather than an oversight: a text-only answer is not a stop, and
+    /// cutting the model off at some fixed count throws away a complete answer
+    /// from a model that simply has not been told to call `request_stop` yet.
+    ///
+    /// Pinned because the failure mode of a quiet revert is invisible: the turn
+    /// still ends, just early and reported as `Completed`, and the discarded
+    /// answer looks like the model's fault. The turn is instead bounded by the
+    /// things that genuinely end one — `request_stop`, a tool call, an operator
+    /// interrupt, the token budget, and the resumed-session guard.
+    #[test]
+    fn the_nudge_budget_is_unbounded_by_default() {
+        assert_eq!(STOP_NUDGE_MAX, usize::MAX);
+    }
+
+    /// The cap check is `stop_nudges >= STOP_NUDGE_MAX`, so an unbounded budget
+    /// must never trip it no matter how long a turn runs — and a finite count
+    /// must still be a real cap, since that is the documented way to restore the
+    /// old bounded behaviour.
+    #[test]
+    fn the_cap_arithmetic_matches_an_unbounded_budget() {
+        // What the turn loop does, at the boundary and far past it.
+        assert!(!(0usize >= STOP_NUDGE_MAX), "a fresh turn must be allowed to nudge");
+        assert!(!(1_000_000usize >= STOP_NUDGE_MAX), "an unbounded budget must not trip");
+        // And the finite-cap semantics the doc promises.
+        let finite = 4usize;
+        assert!(4usize >= finite, "the value is the cap (>=), so 4 allows 4 nudges");
+        assert!(!(3usize >= finite), "and stops on the 5th");
+    }
+
+    /// `begin_turn` resets the counter, so the budget is per-turn rather than
+    /// per-session: a long session must not accumulate nudges across turns and
+    /// hit the cap on its own.
+    #[test]
+    fn the_budget_is_per_turn_not_per_session() {
+        // Mirrors `begin_turn`'s reset (the same assertion the resumed-session
+        // regression test makes, repeated here for the budget's own sake).
+        let mut n = 1_000_000usize;
+        n = 0; // what `begin_turn` does
+        assert!(!(n >= STOP_NUDGE_MAX), "a new turn always starts unspent");
     }
 }

@@ -313,9 +313,13 @@ OPTIONS
                        terminals / screen where raw input misbehaves
   --budget <tokens>    optional cumulative in+out token cap; turn stops (with a
                        banner) once exceeded. Off by default. Env: PIR_TOKEN_BUDGET
+                       (this is the real bound on an auto-nudged turn — see
+                       --no-stop-skill below)
   --no-stop-skill        disable the explicit-stop skill for this session
                        (model ends its turn with request_stop; text-only
-                       answers are auto-nudged). On by default.
+                       answers are auto-nudged — with no nudge cap by default,
+                       so use --budget to bound the spend if you want one).
+                       On by default.
                        Env: PIR_STOP_SKILL=0  Config: "stopSkill": false
   --embed <dir>          write a self-contained pir to <dir>/pire: a copy of
                        this binary with your auth.json + models-store.json
