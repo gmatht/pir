@@ -233,6 +233,20 @@ fn translate_key(code: KeyCode, mods: KeyModifiers) -> Key {
 /// selection within a list that fits without scrolling no longer flashes the
 /// entire screen on every keypress. An identical frame is skipped entirely.
 pub fn draw_box(title: &str, lines: &[String]) -> usize {
+    draw_box_titled(title, lines, false)
+}
+
+/// Draw a centered box, with the title bar styled as a *blocking* prompt when
+/// `blocking` is set.
+///
+/// A blocking box is one that has stopped the agent until the operator answers
+/// (a tool approval, a secret entry, a question) — as opposed to a navigational
+/// dialog the operator opened themselves (`/menu`, `/model`), which must NOT
+/// wear the alert styling or the banner would cry wolf. The blocking title gets
+/// a bold black-on-yellow bar, so the whole top edge of the box reads as
+/// "you are the blocker" and matches the inline [`crate::term::awaiting_banner`]
+/// used on the non-modal prompts.
+pub fn draw_box_titled(title: &str, lines: &[String], blocking: bool) -> usize {
     let w = crate::term::terminal_width();
     let h = crate::term::terminal_height();
     let body_w = w.saturating_sub(4).max(10);
@@ -242,11 +256,14 @@ pub fn draw_box(title: &str, lines: &[String]) -> usize {
     let bottom = top + 1 + body_h;
 
     let mut out = String::new();
-    // Title bar.
-    let title = truncate(title, body_w);
-    out.push_str(&format!("\x1b[{};{}H┌─ {} ─", top, left, title));
+    // Title bar. Measure the *visible* width: a blocking title carries SGR
+    // escapes (the alert styling), and counting raw chars would over-count them
+    // as printable columns and under-pad the rest of the border.
+    let plain = truncate(title, body_w);
+    let shown = if blocking { crate::term::alert(&plain) } else { plain.clone() };
+    out.push_str(&format!("\x1b[{};{}H┌─ {} ─", top, left, shown));
     // Fill the rest of the top border.
-    let used = 4 + title.chars().count();
+    let used = 4 + crate::term::visible_len(&plain);
     for _ in used..body_w + 2 {
         out.push('─');
     }
@@ -1011,7 +1028,7 @@ pub fn question_dialog(q: &crate::askuser::Question) -> Option<crate::askuser::A
             lines.push(format!("  {}", if buf.is_empty() { "(type your answer)".to_string() } else { buf.clone() }));
             lines.push(String::new());
             lines.push(crate::term::dim("[enter] submit  [esc] dismiss  [backspace] delete").to_string());
-            draw_box(&format!("pir — {}", q.header), &lines);
+            draw_box_titled(&format!("⏸ pir — {} — waiting for you", q.header), &lines, true);
             match read_key()? {
                 Key::Enter => return Some(Answer::Text(buf)),
                 Key::Esc | Key::CtrlC => return Some(Answer::Dismissed),
@@ -1051,7 +1068,7 @@ pub fn question_dialog(q: &crate::askuser::Question) -> Option<crate::askuser::A
             "[enter] choose  [1-9] choose  [esc] dismiss"
         };
         lines.push(crate::term::dim(hint).to_string());
-        draw_box(&format!("pir — {}", q.header), &lines);
+        draw_box_titled(&format!("⏸ pir — {} — waiting for you", q.header), &lines, true);
         let key = match read_key() {
             Some(k) => k,
             None => return Some(Answer::Dismissed),
@@ -1131,7 +1148,7 @@ pub fn secret_entry(prompt: &str) -> Option<String> {
             String::new(),
             crate::term::dim("[enter] confirm  [esc] cancel  [backspace] delete").to_string(),
         ];
-        draw_box("pir — secret entry", &lines);
+        draw_box_titled("pir — secret entry", &lines, true);
         match read_key()? {
             Key::Enter => {
                 if !buf.is_empty() {
@@ -1161,7 +1178,7 @@ pub fn tool_approval(
     let mut show_info = false;
     loop {
         let lines = approval_lines(denial, &prompts, &thinking, show_info);
-        draw_box("pir — tool approval", &lines);
+        draw_box_titled("⏸ pir — tool approval — waiting for you", &lines, true);
         match read_key()? {
             Key::Char('o') => return Some(Approval::AllowOnce),
             Key::Char('s') => return Some(Approval::AllowSession),
@@ -1221,3 +1238,36 @@ fn approval_lines(
     lines
 }
 
+
+#[cfg(test)]
+mod title_width_tests {
+    use crate::term;
+
+    /// The box border is padded from the title's *visible* width. A blocking
+    /// title carries SGR escapes (the alert styling), so measuring with
+    /// `chars().count()` — as this renderer used to — counts the escape bytes as
+    /// printable columns and under-pads the top border, leaving the box visibly
+    /// short on the right. Pin the measurement the border math depends on.
+    #[test]
+    fn blocking_title_measures_the_same_as_its_plain_text() {
+        term::set_color(true);
+        let plain = "⏸ pir — tool approval — waiting for you";
+        let styled = term::alert(plain);
+        assert_eq!(
+            term::visible_len(&styled),
+            plain.chars().count(),
+            "the alert styling must not change the visible width"
+        );
+        assert!(styled.len() > plain.len(), "the styling must actually be applied");
+    }
+
+    /// With colour off the title is already plain, so the width is trivially
+    /// right — assert it so a future refactor can't make the two paths diverge.
+    #[test]
+    fn plain_title_width_is_its_char_count() {
+        term::set_color(false);
+        let plain = "pir — main menu";
+        assert_eq!(term::visible_len(&term::alert(plain)), plain.chars().count());
+        term::set_color(true);
+    }
+}

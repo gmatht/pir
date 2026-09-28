@@ -41,6 +41,12 @@ pub fn register(reg: &mut Registry) {
     )));
 }
 
+/// The synthetic escalation kind for guard #1 (self-targeting kill commands).
+/// Not a real escalation verb, so it can never collide with an operator's
+/// `[s]` answer on a `sudo`/`su` prompt: approving "stop asking about kills"
+/// must not silently authorise privilege escalation, and vice versa.
+const ESCALATION_SELF_KILL: &str = "self-kill";
+
 /// How long the escalation / self-kill confirmation waits for the operator to
 /// press a key before giving up.
 ///
@@ -590,17 +596,30 @@ impl Builtin {
         // ai_pir`. Always require an explicit human confirm before such a
         // command runs, even in full-auto (correctness/safety beats
         // unattendedness for a command that can terminate every other session).
-        if let Some(why) = Self::dangerous_kill_reason(command) {
+        // A session grant (the `[s]` answer below) silences this guard for the
+        // rest of the session, so an operator who has decided "yes, I know what
+        // I'm doing with kills here" is not re-asked every time. Keyed on the
+        // guard itself, not on the command text: the grant authorises *this*
+        // check, never a later unrelated kill.
+        if let Some(why) = Self::dangerous_kill_reason(command)
+            && !crate::security::escalation_granted(ESCALATION_SELF_KILL)
+        {
             let prompt = format!(
-                "{} this command looks like it would kill pir processes ({why}). Run it anyway? [y]es / [n]o (default no) ",
-                term::yellow("⚠")
+                "{} this command looks like it would kill pir processes ({why}). Run it anyway? {} ",
+                term::yellow("⚠"),
+                term::dim("[y] once / [s] this session / [n] no")
             );
             // Same terminal caveat as escalation: the REPL owns stdin in raw
             // mode, so read the operator's key from the tty directly. A real
-            // "n" (or no answer at all) refuses; only "y" runs it.
+            // "n" (or no answer at all) refuses; "y" runs it once, "s" runs it
+            // and stops asking for the rest of the session.
             if crate::term::tty_available() {
-                match crate::term::prompt_key(&prompt, priv_prompt_timeout_secs()) {
+                match crate::term::prompt_key(
+                    &crate::term::awaiting_banner(&prompt),
+                    priv_prompt_timeout_secs(),
+                ) {
                     Some('y') => {}
+                    Some('s') => crate::security::grant_escalation(ESCALATION_SELF_KILL),
                     Some(_) => {
                         return Ok("[denied] refusing to run a self-targeting kill command".into());
                     }
@@ -612,6 +631,7 @@ impl Builtin {
                 let answer = term::read_answer(&prompt);
                 match answer.as_str() {
                     "y" | "yes" => {}
+                    "s" | "session" => crate::security::grant_escalation(ESCALATION_SELF_KILL),
                     _ => return Ok("[denied] refusing to run a self-targeting kill command".into()),
                 }
             }
@@ -723,18 +743,34 @@ impl Builtin {
         // can't see the keypress), which used to make us skip the prompt
         // entirely and auto-deny. The operator never got to answer.
         if io::stdin().is_terminal() || crate::term::tty_available() {
+            // A session grant (`[s]`) answers this escalation kind for the rest
+            // of the session, so a long chain of `sudo` steps doesn't re-ask
+            // for every one. Keyed on the escalation *verb* (`sudo`, `su`,
+            // `doas`), not the command line: the operator approves the
+            // mechanism they were shown, and a different escalation route still
+            // prompts. `what` is the label built by `priv_escalation`, whose
+            // leading token is that verb.
+            if crate::security::escalation_granted(&what) {
+                return if self.sudo_is_passwordless(command) {
+                    Ok(())
+                } else {
+                    Err(Self::refusal_without_approval(&what, secs))
+                };
+            }
             let prompt = format!(
-                "{} escalate privilege ({})? [y]es / [n]o (default no) ",
+                "{} escalate privilege ({})? {} ",
                 term::yellow("⚠"),
-                what
+                what,
+                term::dim("[y] once / [s] this session / [n] no")
             );
-            let answer = crate::term::prompt_key(&prompt, secs);
+            let answer = crate::term::prompt_key(&crate::term::awaiting_banner(&prompt), secs);
             match answer {
-                // A real keypress: only y/yes approves, anything else denies.
-                Some(c) => {
-                    if c != 'y' {
-                        return Err("[denied] user declined to escalate privilege".into());
-                    }
+                // A real keypress: y runs it once, s runs it and stops asking
+                // for this escalation kind; anything else denies.
+                Some('y') => {}
+                Some('s') => crate::security::grant_escalation(&what),
+                Some(_) => {
+                    return Err("[denied] user declined to escalate privilege".into());
                 }
                 // No human answered (timeout/EOF): never pretend they said no,
                 // and never escalate unattended — refuse with the fallback path.
@@ -3970,6 +4006,42 @@ mod priv_escalation_tests {
         // A *bounded* wait still names the bound it actually applied.
         let bounded = Builtin::refusal_without_approval("sudo as root", 30);
         assert!(bounded.contains("no answer within 30s"), "got: {bounded}");
+    }
+
+    /// The `[s]` answer at an authorisation prompt must actually stop the
+    /// re-asking — that is the whole feature. These drive the real grant/check
+    /// pair the two prompts consult, so a regression in the wiring (or a grant
+    /// recorded under the wrong key) fails here rather than only in the field.
+    #[test]
+    fn session_answer_suppresses_the_next_escalation_prompt() {
+        // The grant store is process-global, so serialise with the other test
+        // that touches it and leave it clean for them.
+        let old = crate::security::escalation_grants();
+        crate::security::clear_escalation_grants();
+        assert!(
+            !crate::security::escalation_granted("sudo -u root"),
+            "must prompt before any grant exists"
+        );
+        // What the `Some('s')` arm does.
+        crate::security::grant_escalation("sudo -u root");
+        assert!(
+            crate::security::escalation_granted("sudo"),
+            "after [s], sudo must not re-prompt"
+        );
+        // The self-kill guard is a distinct kind: approving an escalation must
+        // never silence the kill guard.
+        assert!(!crate::security::escalation_granted(ESCALATION_SELF_KILL));
+        // ...and approving the kill guard must not silence escalations.
+        crate::security::grant_escalation(ESCALATION_SELF_KILL);
+        crate::security::clear_escalation_grants();
+        assert!(
+            !crate::security::escalation_granted("sudo"),
+            "clearing must re-arm the prompt"
+        );
+        // Restore whatever the suite had (normally nothing).
+        for k in old {
+            crate::security::grant_escalation(&k);
+        }
     }
 }
 

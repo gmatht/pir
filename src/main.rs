@@ -349,6 +349,15 @@ CONFIG (reused from pi, never modified)
     PIR_ASK_TIMEOUT_SECS=<n>     bound ask_user_question (0/off = wait, the default)
     PIR_CONFIRM_TIMEOUT_SECS=<n> bound sudo/su + self-kill confirms (0/off = wait)
 
+  When pir is waiting on you, the prompt says so: a bright-yellow banner
+  (⏸ WAITING FOR YOUR INPUT) on the inline confirm, and the same highlight across
+  the title bar of a blocking dialog (tool approval, secret entry, a question).
+  Navigational dialogs you opened yourself (/menu, /model, …) are NOT highlighted.
+  Authorisation prompts take [y] once / [s] this session / [n] no. `[s]` records
+  a grant for the rest of the process — for sudo/su it is keyed on the escalation
+  verb, so approving sudo never approves su, and approving the self-kill guard
+  never approves escalation. `/grants` lists them; `/grants clear` re-arms them.
+
   PIR_CONFIG_SOURCE picks where the security policy's values come from:
     external (default)  use the files above; fall back to built-in defaults
     builtin             built-in defaults only, ignoring any file on disk
@@ -4059,16 +4068,19 @@ fn handle_command(
             };
             if rest.first().map(|s| *s == "clear").unwrap_or(false) {
                 let n = agent.clear_security_grants();
+                let e = crate::security::clear_escalation_grants();
                 println!(
                     "{}",
                     term::dim(&format!(
-                        "cleared {n} session grant(s) — the next denied operation asks again"
+                        "cleared {} session grant(s) — the next denied operation asks again",
+                        n + e
                     ))
                 );
                 return;
             }
             let grants = agent.security_grants();
-            if grants.is_empty() {
+            let esc = crate::security::escalation_grants();
+            if grants.is_empty() && esc.is_empty() {
                 println!(
                     "{}",
                     term::dim("(no session grants — answer [s] to an approval dialog to add one)")
@@ -4078,6 +4090,9 @@ fn handle_command(
             println!("{} session grants (this process only):", term::bold("·"));
             for g in &grants {
                 println!("  - {}", g.label());
+            }
+            for k in &esc {
+                println!("  - escalation: {k} (approved with [s] this session)");
             }
             println!(
                 "{}",

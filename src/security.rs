@@ -40,6 +40,78 @@ pub fn mitigation_active() -> bool {
 }
 
 // ===========================================================================
+// Escalation session grants
+// ===========================================================================
+
+/// Escalation kinds the operator can approve *for the rest of the session* with
+/// `[s]` at an authorisation prompt. Kept as a small closed set so a grant can
+/// never widen into "anything with sudo in it": the kind is the *verb* that
+/// escalates, not the command line.
+static ESCALATION_GRANTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Normalise an escalation label (`"sudo"`, `"su"`, `"doas"`, …) to its kind.
+///
+/// The label may be qualified by the extension (e.g. `"sudo rm -rf"`); only the
+/// leading token is significant, so `sudo apt install` and `sudo rm -rf /` share
+/// a kind while a *different* escalation verb does not. That is deliberate: the
+/// `[s]` answer authorises the escalation mechanism the operator was shown, and
+/// the agent still cannot escalate by a route they were never asked about.
+pub fn escalation_kind(label: &str) -> String {
+    label
+        .trim()
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// Record a session-wide grant for an escalation kind (`[s]` at the prompt).
+pub fn grant_escalation(kind: &str) {
+    let k = escalation_kind(kind);
+    if k.is_empty() {
+        return;
+    }
+    let mut v = ESCALATION_GRANTS.lock().unwrap_or_else(|e| e.into_inner());
+    if !v.iter().any(|x| x == &k) {
+        v.push(k);
+    }
+}
+
+/// Whether the operator already approved this escalation kind for the session.
+pub fn escalation_granted(kind: &str) -> bool {
+    let k = escalation_kind(kind);
+    if k.is_empty() {
+        return false;
+    }
+    ESCALATION_GRANTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|x| x == &k)
+}
+
+/// The escalation kinds granted this session, in the order they were granted.
+/// Used by `/grants` so the operator can see (and clear) them alongside the
+/// path/op grants.
+pub fn escalation_grants() -> Vec<String> {
+    ESCALATION_GRANTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Drop every escalation session grant (for `/grants clear`).
+pub fn clear_escalation_grants() -> usize {
+    let mut v = ESCALATION_GRANTS.lock().unwrap_or_else(|e| e.into_inner());
+    let n = v.len();
+    v.clear();
+    n
+}
+
+// ===========================================================================
 // Core vocabulary
 // ===========================================================================
 
@@ -3006,5 +3078,93 @@ mod tests {
                 assert!(!super::super::is_other_users(&Path::new(&me).join("Documents\\x")));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod escalation_grant_tests {
+    use super::*;
+
+    /// Grant state is process-global (the builtin extension has no
+    /// `SecurityContext`), so these tests must not race. Cargo runs tests in
+    /// parallel, so serialise on one lock and reset between cases.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn reset() {
+        clear_escalation_grants();
+    }
+
+    #[test]
+    fn kind_is_the_leading_verb_not_the_whole_command() {
+        assert_eq!(escalation_kind("sudo"), "sudo");
+        assert_eq!(escalation_kind("sudo apt install curl"), "sudo");
+        assert_eq!(escalation_kind("/usr/bin/sudo rm -rf /"), "sudo");
+        assert_eq!(escalation_kind("  DOAS  x  "), "doas");
+        assert_eq!(escalation_kind(""), "");
+        assert_eq!(escalation_kind("   "), "");
+    }
+
+    /// The whole point of `[s]`: one answer stops the re-asking.
+    #[test]
+    fn a_grant_covers_every_command_of_that_kind() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        assert!(!escalation_granted("sudo"));
+        grant_escalation("sudo apt install curl");
+        assert!(escalation_granted("sudo"));
+        // A *different* sudo command is the same kind — that is the feature.
+        assert!(escalation_granted("sudo rm -rf /var/tmp/x"));
+    }
+
+    /// The safety property: approving `sudo` must not authorise `su`/`doas`, and
+    /// the self-kill guard is its own kind so approving kills never grants
+    /// escalation (or vice versa).
+    #[test]
+    fn a_grant_does_not_leak_to_another_escalation_kind() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        grant_escalation("sudo");
+        assert!(escalation_granted("sudo"));
+        assert!(!escalation_granted("su"), "sudo must not grant su");
+        assert!(!escalation_granted("doas"), "sudo must not grant doas");
+        assert!(!escalation_granted("self-kill"), "sudo must not grant the kill guard");
+        // ...and the reverse direction.
+        grant_escalation("self-kill");
+        assert!(escalation_granted("self-kill"));
+        assert!(!escalation_granted("su"));
+    }
+
+    #[test]
+    fn grants_are_a_set_and_listed_in_order() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        grant_escalation("sudo");
+        grant_escalation("sudo");       // duplicate is a no-op
+        grant_escalation("doas");
+        assert_eq!(escalation_grants(), vec!["sudo".to_string(), "doas".to_string()]);
+    }
+
+    #[test]
+    fn clear_drops_everything_and_reports_the_count() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        grant_escalation("sudo");
+        grant_escalation("su");
+        assert_eq!(clear_escalation_grants(), 2);
+        assert!(escalation_grants().is_empty());
+        assert!(!escalation_granted("sudo"));
+        assert_eq!(clear_escalation_grants(), 0, "clearing twice is harmless");
+    }
+
+    /// An empty/garbage label must never create a grant that matches everything.
+    #[test]
+    fn empty_labels_never_grant() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        grant_escalation("");
+        grant_escalation("   ");
+        assert!(escalation_grants().is_empty(), "empty kinds must not be recorded");
+        assert!(!escalation_granted(""));
+        assert!(!escalation_granted("sudo"));
     }
 }

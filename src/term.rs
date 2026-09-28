@@ -811,6 +811,38 @@ pub fn green(s: &str) -> String { paint("32", s) }
 pub fn yellow(s: &str) -> String { paint("33", s) }
 pub fn cyan(s: &str) -> String { paint("36", s) }
 
+/// Bright-yellow *background* with bold black text: the "you are the blocker"
+/// treatment. Reverse-video-free and palette-safe — it sets an explicit
+/// background and an explicit foreground, so the text stays readable on
+/// emulators that render bright foregrounds as bold or swap colours (unlike a
+/// bare `\x1b[7m` reverse, which goes black-on-white or worse depending on the
+/// user's theme). Degrades to plain text when colour is off, so piped output
+/// carries no escapes.
+pub fn alert(s: &str) -> String {
+    if !color() {
+        return s.to_string();
+    }
+    format!("\x1b[1;30;43m{s}\x1b[0m")
+}
+
+/// The one-line banner every *blocking* prompt wears, so "the agent is waiting
+/// on you" looks identical whether it is a tool-approval box, a sudo
+/// authorisation, or a question.
+///
+/// `keys` is the hint that belongs to the banner itself (e.g.
+/// `"[y]es / [s]ession / [n]o"`), so the banner states the whole instruction
+/// and the body doesn't have to repeat it. Returns a single visible line with
+/// the colour applied only when the terminal can take it — callers may place it
+/// in a box body, where `visible_len` handles the width correctly.
+pub fn awaiting_banner(keys: &str) -> String {
+    let label = "⏸ WAITING FOR YOUR INPUT";
+    if keys.is_empty() {
+        alert(&format!(" {label} "))
+    } else {
+        format!("{} {}", alert(&format!(" {label} ")), bold(keys))
+    }
+}
+
 /// Render `s` as highlighted text: bright-cyan foreground only, no background
 /// and no reverse video — so it never shows up as a black/white inverse on
 /// emulators that render bold-bright or swap colours. With colour disabled it
@@ -1161,7 +1193,7 @@ const SLASH_HELP: &[(&str, &str, &str)] = &[
     ("/fix", "", "make the git setup LLM-safe (commit guard hook)"),
     ("/fg", "<id>", "bring a background job to the foreground"),
     ("/goal", "[objective]", "start or show the current goal"),
-    ("/grants", "[clear]", "list what \"[s] allow session\" granted this session"),
+    ("/grants", "[clear]", "list what \"[s]\" granted this session (paths, ops, escalations)"),
     ("/help", "", "show all commands"),
     ("/compact", "", "show compact help"),
     ("/jobs", "", "list background jobs"),
@@ -5550,5 +5582,71 @@ mod clear_input_zone_tests {
         let seq = zone_clear_seq(1);
         assert!(seq.contains("\x1b[1;1H\x1b[2K"), "got {seq:?}");
         assert!(!seq.contains("\x1b[0;"), "emitted an invalid row 0: {seq:?}");
+    }
+}
+
+#[cfg(test)]
+mod awaiting_banner_tests {
+    use super::*;
+
+    // Drive the shared colour switch so the escapes are deterministic.
+    fn colour(on: bool) {
+        set_color(on);
+    }
+
+    /// The banner is the single visual signal that a human is the blocker, so it
+    /// must be exactly one visible line (callers place it in a box body, where
+    /// the renderer pads by `visible_len` and a wrapped line would break the
+    /// border).
+    #[test]
+    fn banner_is_one_visible_line() {
+        colour(true);
+        let b = awaiting_banner("[y] once / [s] session / [n] no");
+        assert_eq!(visible_len(&b), 1 + "⏸ WAITING FOR YOUR INPUT".chars().count() + 1 + 1 + "[y] once / [s] session / [n] no".chars().count(),
+            "banner must measure as one line of visible text: {b:?}");
+        assert!(!b.contains('\n'), "banner must not contain a newline: {b:?}");
+    }
+
+    /// It carries the keys, so the caller's body text doesn't have to repeat
+    /// them and the operator reads the options off the highlight itself.
+    #[test]
+    fn banner_carries_the_key_hints() {
+        colour(true);
+        let b = awaiting_banner("[y] once / [s] session / [n] no");
+        assert!(b.contains("[s] session"), "keys must survive in the banner: {b:?}");
+    }
+
+    /// Piped output must carry no escapes at all — every other prompt in this
+    /// module respects `color()`, and a banner leaking SGR into a CI log is the
+    /// obvious failure mode.
+    #[test]
+    fn banner_is_plain_when_colour_is_off() {
+        colour(false);
+        let b = awaiting_banner("[y] once / [n] no");
+        assert!(!b.contains('\x1b'), "no escapes when colour is off: {b:?}");
+        assert!(b.contains("WAITING FOR YOUR INPUT"), "text must remain: {b:?}");
+        colour(true);
+    }
+
+    /// `alert` sets an *explicit* background and foreground rather than reverse
+    /// video, so it can't render as an unreadable inverse under a theme that
+    /// swaps or bold-brightens colours.
+    #[test]
+    fn alert_sets_a_background_not_reverse_video() {
+        colour(true);
+        let a = alert("X");
+        assert!(a.contains("43"), "expected a yellow background: {a:?}");
+        assert!(a.contains("30"), "expected an explicit black foreground: {a:?}");
+        assert!(!a.contains("\x1b[7m"), "must not use reverse video: {a:?}");
+        assert!(a.ends_with("\x1b[0m"), "must reset SGR: {a:?}");
+    }
+
+    /// A colourless `alert` is a no-op wrapper, so a caller that always pipes
+    /// through it still prints clean text.
+    #[test]
+    fn alert_is_plain_when_colour_is_off() {
+        colour(false);
+        assert_eq!(alert("X"), "X");
+        colour(true);
     }
 }
