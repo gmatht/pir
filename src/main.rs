@@ -4738,17 +4738,35 @@ fn run_embed(dir: &str) {
             agent_dir.display()
         ));
     }
+    // Whether the default-model selection will travel, decided before
+    // `entries` is consumed below. It is the difference between a
+    // *self-contained* pir and one that merely carries credentials, and it is
+    // invisible until the embedded binary silently picks a different model.
+    let has_settings = entries.iter().any(|e| e.name == crate::embed::ENTRY_SETTINGS);
     let dest = dir_path.join(if cfg!(windows) { "pire.exe" } else { "pire" });
     if let Err(e) = crate::embed::write_embedded(&dest, entries) {
         die(&e);
     }
     let total: usize = std::fs::metadata(&dest).map(|m| m.len() as usize).unwrap_or(0);
     println!("{}", term::green(&format!("✓ embedded pir → {}", dest.display())));
-    for name in [crate::embed::ENTRY_AUTH, crate::embed::ENTRY_STORE] {
+    for name in [
+        crate::embed::ENTRY_AUTH,
+        crate::embed::ENTRY_STORE,
+        crate::embed::ENTRY_SETTINGS,
+    ] {
         let p = agent_dir.join(name);
         if p.exists() {
             println!("  {} {}", term::dim("·"), name);
         }
+    }
+    // Say so when the operator has a settings.json but the default model was
+    // not carried, so the gap is visible at embed time rather than surfacing
+    // later as the wrong model being used on the target machine.
+    if !has_settings && agent_dir.join(crate::embed::ENTRY_SETTINGS).exists() {
+        eprintln!(
+            "{}",
+            term::dim("  (settings.json not embedded — the default model will not travel)")
+        );
     }
     println!(
         "{}",

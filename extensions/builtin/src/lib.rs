@@ -3279,8 +3279,54 @@ mod esc_tests {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
+    /// Owns the module lock *and* the pre-test value of
+    /// `PIR_SHELL_CHECK_IN_SECS`, restoring it on drop so no test can leak its
+    /// check-in into the next one.
+    struct SerialGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _restore: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for SerialGuard {
+        fn drop(&mut self) {
+            // SAFETY: edition 2024 marks env mutation unsafe; pir confines it
+            // to startup config and explicit session toggles.
+            unsafe {
+                match self._restore.take() {
+                    Some(v) => std::env::set_var("PIR_SHELL_CHECK_IN_SECS", v),
+                    None => std::env::remove_var("PIR_SHELL_CHECK_IN_SECS"),
+                }
+            }
+        }
+    }
+
+    /// Serializes the tests in this module, which all drive the real `bash`
+    /// tool and communicate through **process-global** state.
+    ///
+    /// `PIR_SHELL_CHECK_IN_SECS` is read by `run_shell` from the environment,
+    /// and several tests here set it (to force a fast check-in) without
+    /// restoring it. That made the module order-dependent: whichever test ran
+    /// last decided the check-in for *every* concurrent `run_shell` in the
+    /// process, so a test that expected a prompt abort instead inherited the
+    /// 10-minute default and sat there — the suite stalled for minutes with
+    /// `abort_kills_running_command` / `job_kill_survives_grandchild_holding_pipe`
+    /// reported "still running". One lock held for the whole test makes the
+    /// module deterministic, and the returned guard restores the environment.
+    ///
+    /// The env snapshot is taken *after* the lock is held, so a test's
+    /// `set_var` is always inside the critical section.
+    fn serial() -> SerialGuard {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SerialGuard {
+            _restore: std::env::var_os("PIR_SHELL_CHECK_IN_SECS"),
+            _lock: lock,
+        }
+    }
+
     #[test]
     fn abort_kills_running_command() {
+        let _serial = serial();
         // A slow command (`sleep 30`). Flipping the abort flag must kill it
         // almost immediately (well under a second), not wait for it to exit.
         let abort = Arc::new(AtomicBool::new(false));
@@ -3307,6 +3353,7 @@ mod esc_tests {
     /// freshly parked loop so the old 250 ms sleep is the only variable.
     #[test]
     fn abort_latency_is_sub_100ms() {
+        let _serial = serial();
         let abort = Arc::new(AtomicBool::new(false));
         let mut b = Builtin::new(PathBuf::from("."), abort.clone(), Arc::new(AtomicBool::new(false)));
         let handle = std::thread::spawn(move || run_shell(&mut b, "sleep 30"));
@@ -3352,6 +3399,7 @@ mod esc_tests {
     /// grace before the SIGKILL escalation; now ESC kills it at once.
     #[test]
     fn interactive_abort_does_not_wait_for_term_grace() {
+        let _serial = serial();
         let mut best = Duration::MAX;
         let mut last_out = String::new();
         for _ in 0..3 {
@@ -3381,6 +3429,7 @@ mod esc_tests {
     }
     #[test]
     fn no_abort_completes() {
+        let _serial = serial();
         // Without abort, a fast command runs to completion and reports success.
         let abort = Arc::new(AtomicBool::new(false));
         let mut b = Builtin::new(PathBuf::from("."), abort.clone(), Arc::new(AtomicBool::new(false)));
@@ -3390,6 +3439,7 @@ mod esc_tests {
 
     #[test]
     fn abort_only_noop_when_idle() {
+        let _serial = serial();
         // The abort flag alone (no running command) must not abort a later one.
         let abort = Arc::new(AtomicBool::new(false));
         abort.store(true, Ordering::SeqCst);
@@ -3401,6 +3451,7 @@ mod esc_tests {
 
     #[test]
     fn job_kill_survives_grandchild_holding_pipe() {
+        let _serial = serial();
         // The exact production hang: a detached `sleep` keeps running with its
         // output redirected (it inherits and holds the stdout/stderr pipes).
         // The old job_kill only killed the direct `bash -c` child and then
@@ -3426,6 +3477,7 @@ mod esc_tests {
 
     #[test]
     fn job_kill_reports_signal_not_success() {
+        let _serial = serial();
         // Killing a running job should report it was stopped by a signal, not
         // a success exit code (previously `s.code()` on a signal death was
         // surfaced as -1, reading like a normal failure).
@@ -3445,6 +3497,7 @@ mod esc_tests {
 
     #[test]
     fn esc_flag_sweep_kills_detached_jobs() {
+        let _serial = serial();
         // SAFETY: edition 2024 marks env mutation unsafe; pir confines
         // it to startup config and explicit session toggles.
         unsafe { std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1"); }
@@ -3469,6 +3522,7 @@ mod esc_tests {
 
     #[test]
     fn kill_all_jobs_via_trait_kills_running_children() {
+        let _serial = serial();
         // SAFETY: edition 2024 marks env mutation unsafe; pir confines
         // it to startup config and explicit session toggles.
         unsafe { std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1"); }
@@ -3482,6 +3536,7 @@ mod esc_tests {
 
     #[test]
     fn job_kill_after_finish_reports_already_finished() {
+        let _serial = serial();
         // SAFETY: edition 2024 marks env mutation unsafe; pir confines
         // it to startup config and explicit session toggles.
         unsafe { std::env::set_var("PIR_SHELL_CHECK_IN_SECS", "1"); }
@@ -3497,6 +3552,7 @@ mod esc_tests {
 
     #[test]
     fn job_kill_escaped_grandchild_holding_pipe_returns_promptly() {
+        let _serial = serial();
         // The remaining production hang after the process-group fix: a
         // grandchild that calls `setsid` puts itself in a NEW session/process
         // group, so `kill(-pgid)` never reaches it. It also keeps the
@@ -3536,6 +3592,7 @@ mod esc_tests {
     /// take.
     #[test]
     fn bashenv_prefers_rg_for_grep_and_find() {
+        let _serial = serial();
         // The generated script always carries the wrappers; the runtime gate
         // decides whether they are installed.
         assert!(PIR_BASHENV.contains("grep()"), "grep wrapper missing");

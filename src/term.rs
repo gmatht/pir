@@ -4823,6 +4823,15 @@ mod status_line_tests {
     use super::*;
     #[test]
     fn status_line_shows_workspace_and_model() {
+        // Colour is process-global; restore it on drop so a failure here cannot
+        // leave it off for every later test in the binary.
+        struct ColourRestore(bool);
+        impl Drop for ColourRestore {
+            fn drop(&mut self) {
+                set_color(self.0);
+            }
+        }
+        let _restore = ColourRestore(color_enabled());
         // Colour must be forced off so the escape sequences don't break the
         // plain substring match — otherwise this test's result depends on
         // whether stdout happens to be a TTY in the runner environment.
@@ -5621,11 +5630,21 @@ mod awaiting_banner_tests {
     /// obvious failure mode.
     #[test]
     fn banner_is_plain_when_colour_is_off() {
+        // `colour` is process-global, so restore it on drop rather than after
+        // the asserts: a failure here used to leave colour switched *on* for
+        // every later test in the binary, which then failed with escapes in
+        // their output.
+        struct Colour(bool);
+        impl Drop for Colour {
+            fn drop(&mut self) {
+                colour(self.0);
+            }
+        }
+        let _restore = Colour(color_enabled());
         colour(false);
         let b = awaiting_banner("[y] once / [n] no");
         assert!(!b.contains('\x1b'), "no escapes when colour is off: {b:?}");
         assert!(b.contains("WAITING FOR YOUR INPUT"), "text must remain: {b:?}");
-        colour(true);
     }
 
     /// `alert` sets an *explicit* background and foreground rather than reverse

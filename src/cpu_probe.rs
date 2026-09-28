@@ -62,6 +62,19 @@ pub(crate) fn thread_cpu_nanos_for_test() -> Option<u64> {
     thread_cpu_nanos()
 }
 
+/// CPU time (user + system) consumed by **every thread in this process**, in
+/// nanoseconds — the fallback clock, exposed for tests.
+///
+/// Needed when the work under test is not on the calling thread. A background
+/// task (e.g. smol's single `smol-1` executor thread) burns CPU that
+/// [`thread_cpu_nanos`] cannot see, so a per-thread probe would report a
+/// perfectly idle process while a detached task spun at 100% of a core. Tests
+/// that assert on background work must use this instead.
+#[cfg(test)]
+pub(crate) fn process_cpu_nanos_for_test() -> Option<u64> {
+    process_cpu_nanos()
+}
+
 fn thread_cpu_nanos() -> Option<u64> {
     // Linux: precise, per-thread.
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };

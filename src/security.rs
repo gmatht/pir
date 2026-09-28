@@ -57,8 +57,9 @@ static ESCALATION_GRANTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(
 /// `[s]` answer authorises the escalation mechanism the operator was shown, and
 /// the agent still cannot escalate by a route they were never asked about.
 pub fn escalation_kind(label: &str) -> String {
+    // `split_whitespace` already skips leading/trailing whitespace, so no
+    // `trim()` is needed (and clippy is right that adding one is noise).
     label
-        .trim()
         .split_whitespace()
         .next()
         .unwrap_or("")
@@ -2568,6 +2569,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Temporarily clears the process-global "quarantine is engaged" flags and
+    /// restores them on drop, so a policy test asserts the guard path rather
+    /// than whatever an overlay test left behind. `SecurityPolicy::decide`
+    /// returns `Verdict::Allow` for writes while either flag is set (the write
+    /// is expected to be staged by the overlay instead of denied in-process),
+    /// so a parallel overlay test silently inverted these assertions.
+    struct OverlayEngaged {
+        project: bool,
+        system: bool,
+    }
+
+    impl OverlayEngaged {
+        fn cleared() -> Self {
+            let g = Self {
+                project: crate::security::overlay::project_quarantine_engaged(),
+                system: crate::security::overlay::system_quarantine_engaged(),
+            };
+            crate::security::overlay::set_project_quarantine_engaged(false);
+            crate::security::overlay::set_system_quarantine_engaged(false);
+            g
+        }
+    }
+
+    impl Drop for OverlayEngaged {
+        fn drop(&mut self) {
+            crate::security::overlay::set_project_quarantine_engaged(self.project);
+            crate::security::overlay::set_system_quarantine_engaged(self.system);
+        }
+    }
+
     #[test]
     fn decide_off_allows_everything() {        let p = SecurityPolicy { level: SecurityLevel::Off, ..Default::default() };
         assert_eq!(p.decide(&Ask::write("/etc/passwd")), Verdict::Allow);
@@ -2576,6 +2607,12 @@ mod tests {
 
     #[test]
     fn guard_blocks_db_and_secret() {
+        // `decide` deliberately stands aside for writes when a quarantine
+        // overlay is engaged (see the `Op::Write` arm), and that flag is
+        // process-global — a parallel overlay test that had it set made this
+        // test intermittently *allow* the database write it exists to deny.
+        // Assert the guard path itself, independent of the ambient global.
+        let _engaged = OverlayEngaged::cleared();
         let p = SecurityPolicy::default(); // guard, read=Open
         assert!(matches!(
             p.decide(&Ask::write("/srv/app/production.sqlite3")),
@@ -2830,6 +2867,9 @@ mod tests {
 
     #[test]
     fn repo_git_recognized() {
+        // Same process-global caveat as `guard_blocks_db_and_secret`: `decide`
+        // stands aside for writes while a quarantine overlay is engaged.
+        let _engaged = OverlayEngaged::cleared();
         let p = SecurityPolicy::default();
         assert!(matches!(
             p.decide(&Ask::write("/home/me/project/.git/HEAD")),

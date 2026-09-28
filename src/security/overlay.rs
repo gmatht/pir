@@ -734,9 +734,30 @@ fn merge_recurse(
     count: &mut usize,
 ) -> std::io::Result<()> {
     use std::os::unix::fs::symlink;
-    for ent in std::fs::read_dir(node)?.flatten() {
+    // `apply` lazy-unmounts the real tree immediately before this walk, so a
+    // directory can be detached between the `read_dir` and the walk into it.
+    // A missing *directory* is not a failed apply — the staged writes we can
+    // still see must be applied — so treat it as empty and keep going.
+    let entries = match std::fs::read_dir(node) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for ent in entries.flatten() {
         let p = ent.path();
-        let meta = ent.metadata()?;
+        // `read_dir` and `metadata` are separate syscalls, so a real
+        // `/var` (the *live* system tree, with daemons writing under it) can
+        // delete an entry between the two. That is not a quarantine failure —
+        // the staged write is unaffected — so treat a vanished entry as "skip
+        // it", the same way the whitespace-only path is already tolerated.
+        // Failing the whole `apply` here made `var_cache_write_stays_staged_
+        // until_apply` flaky (~1 run in 10) for reasons that have nothing to
+        // do with what it asserts.
+        let meta = match ent.metadata() {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
         let rel = match p.strip_prefix(root) {
             Ok(r) => r.to_path_buf(),
             Err(_) => continue,
@@ -768,11 +789,21 @@ fn merge_recurse(
             std::fs::create_dir_all(parent)?;
         }
         if meta.file_type().is_symlink() {
-            let target = std::fs::read_link(&p)?;
+            // Same TOCTOU as the `metadata` above: the entry can vanish
+            // between the stat and the read, and that is not an apply failure.
+            let target = match std::fs::read_link(&p) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
             let _ = std::fs::remove_file(&dst);
             symlink(&target, &dst)?;
         } else {
-            std::fs::copy(&p, &dst)?;
+            match std::fs::copy(&p, &dst) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            }
             let perm = meta.permissions();
             let _ = std::fs::set_permissions(&dst, perm);
         }
@@ -2662,7 +2693,28 @@ mod tests {
     #[test]
     fn the_live_notice_reads_the_staged_upperdir_and_repeats_nothing() {
         let _guard = VAR_OVERLAY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let staging = std::env::temp_dir().join(format!("pir_notice_test_{}", std::process::id()));
+        // `set_active` / `set_system_quarantine_engaged` are process-global and
+        // `SecurityPolicy::decide` reads the engaged flag to stand *aside* for
+        // quarantined writes. If a panic left it `true`, every concurrent
+        // `decide` would silently allow what it should deny — which is how
+        // `security::tests::guard_blocks_db_and_secret` became load-dependent.
+        // Unregistering from a Drop guard makes the cleanup panic-safe.
+        struct Unregister;
+        impl Drop for Unregister {
+            fn drop(&mut self) {
+                *active_lock().lock().unwrap() = None;
+                set_system_quarantine_engaged(false);
+            }
+        }
+        // Unique per instance, not per process: the old `pid`-only name made
+        // the tree (and its `ANNOUNCED_STAGED` bookkeeping) collide with any
+        // other run of this binary, so a sibling could re-add the very path
+        // this test just consumed from the global set — which is what failed
+        // "the old path is not repeated".
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let staging = std::env::temp_dir()
+            .join(format!("pir_notice_test_{}_{}", std::process::id(), seq));
         let _ = std::fs::remove_dir_all(&staging);
         let upper = staging.join("upper-etc");
         std::fs::create_dir_all(upper.join("logrotate.d")).expect("staging dir");
@@ -2677,6 +2729,8 @@ mod tests {
             critical: vec![],
         });
         set_system_quarantine_engaged(true);
+        // Registered above; the guard tears it down even if an assert fires.
+        let _unregister = Unregister;
         // Order-independent: forget anything a sibling test announced.
         announced_lock().lock().unwrap().clear();
 
@@ -2698,9 +2752,7 @@ mod tests {
         assert!(second.contains("/etc/sysctl.d/50-x.conf"), "got: {second}");
         assert!(!second.contains("sh2loop"), "the old path is not repeated: {second}");
 
-        // Unregister so no other test observes this synthetic quarantine.
-        *active_lock().lock().unwrap() = None;
-        set_system_quarantine_engaged(false);
+        // `_unregister` clears the globals on drop, including on panic.
         let _ = std::fs::remove_dir_all(&staging);
     }
 
@@ -2771,6 +2823,12 @@ mod tests {
             let _ = self.0.suspend(); // lazy umount: real /var exposed again
             clean_real_canary(); // in case apply() landed it
             let _ = std::fs::remove_dir_all(&self.0.staging);
+            // The engaged flags are process-global and `SecurityPolicy::decide`
+            // reads them to stand aside for quarantined writes. Leaving them
+            // set would make an unrelated `decide` in a parallel test allow a
+            // write it must deny, so clear them even on panic.
+            set_system_quarantine_engaged(false);
+            set_project_quarantine_engaged(false);
         }
     }
 
@@ -2839,7 +2897,7 @@ mod tests {
             eprintln!("SKIP root_agent_can_write_var_cache_canary: need euid 0 + overlayfs");
             return;
         }
-        let _lock = VAR_OVERLAY_LOCK.lock().unwrap();
+        let _lock = VAR_OVERLAY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clean_real_canary();
 
         let guard = QuarantineGuard(mount_var_quarantine("write"));
@@ -2878,7 +2936,7 @@ mod tests {
             eprintln!("SKIP var_cache_write_stays_staged_until_apply: need euid 0 + overlayfs");
             return;
         }
-        let _lock = VAR_OVERLAY_LOCK.lock().unwrap();
+        let _lock = VAR_OVERLAY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clean_real_canary();
 
         let guard = QuarantineGuard(mount_var_quarantine("apply"));

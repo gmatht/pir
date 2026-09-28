@@ -1191,15 +1191,23 @@ fn collect_api_keys(
 
 pub fn default_model_setting() -> Option<String> {
     let p = pi_dir().join("agent").join("settings.json");
-    let raw = fs::read_to_string(p).ok()?;
-    let v: Value = serde_json::from_str(&raw).ok()?;
-    
-    let provider = v.get("defaultProvider").and_then(Value::as_str)?;
-    let model = v.get("defaultModel").and_then(Value::as_str)?;
-    
-    if provider.is_empty() || model.is_empty() { return None; }
-    
-    Some(format!("{}/{}", provider, model))
+    // Local first, then the embedded `settings.json` carried by an embedded
+    // binary (see `crate::embed`). The fallback is what makes `--embed` a
+    // *self-contained* pir rather than one that merely has credentials: the
+    // store supplies the models, but only this file records which of them the
+    // operator picked, and without it the binary silently falls back to
+    // `providers[0]`.
+    //
+    // Local wins, matching `load_auth_keys` and the store/auth merges: the
+    // embedded payload supplements a machine with no preference, never
+    // overrides one that has a preference of its own.
+    if let Some(raw) = fs::read_to_string(&p).ok()
+        && let Ok(v) = serde_json::from_str::<Value>(&raw)
+        && let Some(sel) = crate::embed::selector_from_settings(&v)
+    {
+        return Some(sel);
+    }
+    crate::embed::embedded_default_model()
 }
 
 /// Persist a provider/model as the default for new pir sessions by writing it
@@ -3468,5 +3476,62 @@ mod worktree_settings_tests {
         assert!(!applies(&stale), "stale generation ignored");
         assert!(!applies(&old), "old generation ignored");
         assert!(applies(&fresh), "newer generation from another pid applies");
+    }
+}
+
+#[cfg(test)]
+mod default_model_tests {
+    //! The default-model selector, and specifically the rule that a half-set
+    //! default is not a default.
+    //!
+    //! These pin the *shared* [`crate::embed::selector_from_settings`] that the
+    //! local read, the embedded read and the settings merge all call. Going
+    //! through `default_model_setting()` would not work: its embedded fallback
+    //! reads the *running* binary's appended payload, which the test binary does
+    //! not have, so the embedded branch is unobservable from here. Testing the
+    //! pure helper keeps the rule checkable in one place — which is also how
+    //! the three copies of it are prevented from drifting apart.
+    use crate::embed::selector_from_settings;
+    use serde_json::json;
+
+    #[test]
+    fn a_complete_default_yields_provider_slash_model() {
+        let v = json!({"defaultProvider": "commandcode", "defaultModel": "stealth/space-bunny-alpha"});
+        assert_eq!(
+            selector_from_settings(&v).as_deref(),
+            Some("commandcode/stealth/space-bunny-alpha")
+        );
+    }
+
+    /// The rule that matters: `{"defaultProvider": "p"}` is not a default. A
+    /// missing half must not be papered over with an empty string, which would
+    /// produce the nonsense selector `p/` and resolve to something unintended.
+    #[test]
+    fn a_half_set_default_is_not_a_default() {
+        for v in [
+            json!({"defaultProvider": "p"}),
+            json!({"defaultModel": "m"}),
+            json!({"defaultProvider": "", "defaultModel": "m"}),
+            json!({"defaultProvider": "p", "defaultModel": ""}),
+            json!({"defaultProvider": "p", "defaultModel": null}),
+            json!({}),
+        ] {
+            assert_eq!(
+                selector_from_settings(&v),
+                None,
+                "must not treat {v} as a default"
+            );
+        }
+    }
+
+    /// A non-string value must not coerce into a selector either.
+    #[test]
+    fn non_string_halves_are_rejected() {
+        for v in [
+            json!({"defaultProvider": 7, "defaultModel": "m"}),
+            json!({"defaultProvider": "p", "defaultModel": ["m"]}),
+        ] {
+            assert_eq!(selector_from_settings(&v), None, "must reject {v}");
+        }
     }
 }

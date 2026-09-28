@@ -35,10 +35,22 @@ const MAGIC: &[u8; 8] = b"PIREMBD\x01";
 /// Fixed tail size: MAGIC (8) + table_offset (u64, 8).
 const TAIL_LEN: u64 = 16;
 
-/// The embedded document names. These mirror the two files under
-/// `~/.pi/agent/` that pir reads for credentials and the model catalog.
+/// The embedded document names. These mirror the files under `~/.pi/agent/`
+/// that pir reads for credentials, the model catalog, and the default model.
 pub const ENTRY_AUTH: &str = "auth.json";
 pub const ENTRY_STORE: &str = "models-store.json";
+/// The operator's `defaultProvider` / `defaultModel` selection.
+///
+/// This one is not optional. `auth.json` and `models-store.json` supply *what
+/// is available*; `settings.json` supplies *which of it is the default*, and
+/// that is read by a different code path (`config::default_model_setting`) that
+/// no amount of store merging can stand in for. Without it an embedded pir
+/// falls back to `providers[0]`, which is whichever provider happens to sort
+/// first — not the one the operator chose. The command-code/space-bunny
+/// provider is a good example: it is manufactured in code by
+/// `merge_space_bunny`, so its *models* travel in the store, but the operator's
+/// choice of it as the default lives only here.
+pub const ENTRY_SETTINGS: &str = "settings.json";
 
 /// One appended document (name plus its verbatim bytes).
 pub struct Entry {
@@ -191,16 +203,55 @@ pub fn embedded_auth() -> Option<&'static Value> {
         .map(|(_, v)| v)
 }
 
+/// The embedded `settings.json` (if the running binary has one), as a parsed
+/// [`Value`]. `None` when absent or unparseable.
+pub fn embedded_settings() -> Option<&'static Value> {
+    embedded_documents()
+        .iter()
+        .find(|(n, _)| n == ENTRY_SETTINGS)
+        .map(|(_, v)| v)
+}
+
+/// The `provider/model` default recorded in the embedded `settings.json`, if
+/// any.
+///
+/// Returned as a ready-made selector so the caller does not have to know the
+/// key names. `None` when the document is absent, unparseable, or carries only
+/// one half of the pair — a half-set default is not a default, and
+/// `config::default_model_setting` applies the same rule.
+pub fn embedded_default_model() -> Option<String> {
+    selector_from_settings(embedded_settings()?)
+}
+
+/// The `provider/model` selector held in a parsed `settings.json` value, or
+/// `None` when either half is missing or empty.
+///
+/// A half-set default is not a default: `{"defaultProvider": "p"}` must not
+/// become the nonsense selector `p/`. This rule exists in three places — the
+/// local read in `config::default_model_setting`, the embedded read here, and
+/// the settings merge — so it lives in exactly one function and the other two
+/// call it. Three hand-copied copies of "both halves must be present" is
+/// precisely how they drift, and a drift here means an embedded pir resolving a
+/// different model than the same settings file would locally.
+pub fn selector_from_settings(v: &Value) -> Option<String> {
+    let provider = v.get("defaultProvider").and_then(Value::as_str)?;
+    let model = v.get("defaultModel").and_then(Value::as_str)?;
+    if provider.is_empty() || model.is_empty() {
+        return None;
+    }
+    Some(format!("{provider}/{model}"))
+}
+
 // ---------------------------------------------------------------------------
 // Payload construction from the operator's live config
 // ---------------------------------------------------------------------------
 
 /// Collect the documents to embed from the *current* config dir: the
-/// `auth.json` and `models-store.json` under `agent_dir`. Missing files are
-/// skipped (nothing to embed for them).
+/// `auth.json`, `models-store.json` and `settings.json` under `agent_dir`.
+/// Missing files are skipped (nothing to embed for them).
 pub fn entries_from_config(agent_dir: &Path) -> Vec<Entry> {
     let mut entries = Vec::new();
-    for name in [ENTRY_AUTH, ENTRY_STORE] {
+    for name in [ENTRY_AUTH, ENTRY_STORE, ENTRY_SETTINGS] {
         if let Ok(data) = fs::read(agent_dir.join(name)) {
             entries.push(Entry {
                 name: name.to_string(),
@@ -313,6 +364,34 @@ pub fn merge_auth(local: &Value, embedded: &Value) -> Value {
         }
     }
     Value::Object(obj)
+}
+
+/// Merge the embedded default-model setting *under* the local one.
+///
+/// Local wins, matching the store and auth merges: an embedded pir supplements
+/// a machine that has no preference, and never overrides one that does. Only
+/// `defaultProvider` / `defaultModel` are considered — `settings.json` also
+/// holds theme, notify and package configuration, and copying an operator's
+/// desktop preferences onto every machine that runs the embedded binary would be
+/// both surprising and out of scope.
+pub fn merge_settings(local: &Value, embedded: &Value) -> Value {
+    let mut out = local.clone();
+    // Both halves are required, on either side. Reuse the one implementation of
+    // that rule so this merge and the two readers cannot disagree about what
+    // counts as a default.
+    let local_has = selector_from_settings(local).is_some();
+    let embedded_has = selector_from_settings(embedded).is_some();
+    if !embedded_has || local_has {
+        return out;
+    }
+    if let Some(obj) = out.as_object_mut() {
+        for k in ["defaultProvider", "defaultModel"] {
+            if let Some(v) = embedded.get(k) {
+                obj.insert(k.to_string(), v.clone());
+            }
+        }
+    }
+    out
 }
 
 // ----- small Value helpers -------------------------------------------------
@@ -592,13 +671,100 @@ mod tests {
     }
 
     #[test]
-    fn entries_from_config_reads_both_documents() {
+    fn entries_from_config_reads_all_three_documents() {
         let dir = Scratch::new("entries");
         fs::write(dir.join(ENTRY_AUTH), r#"{"x":{"type":"api_key","key":"k"}}"#).unwrap();
         fs::write(dir.join(ENTRY_STORE), r#"{"providers":[]}"#).unwrap();
+        fs::write(dir.join(ENTRY_SETTINGS), r#"{"defaultProvider":"p","defaultModel":"m"}"#).unwrap();
         let entries = entries_from_config(&dir.0);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec![ENTRY_AUTH, ENTRY_STORE]);
+        assert_eq!(names, vec![ENTRY_AUTH, ENTRY_STORE, ENTRY_SETTINGS]);
+    }
+
+    /// The bug this fixes: `settings.json` was not embedded, so an embedded pir
+    /// on a machine with no local config had no way to know which model the
+    /// operator chose and fell back to `providers[0]`. `auth.json` and the store
+    /// supply *what is available*; only this file says *which of it is the
+    /// default*.
+    #[test]
+    fn the_default_model_is_carried_not_just_the_catalog() {
+        let dir = Scratch::new("defaultmodel");
+        fs::write(dir.join(ENTRY_AUTH), r#"{"x":{"type":"api_key","key":"k"}}"#).unwrap();
+        fs::write(dir.join(ENTRY_STORE), r#"{"providers":[{"id":"other","models":[{"id":"m"}]}]}"#).unwrap();
+        fs::write(
+            dir.join(ENTRY_SETTINGS),
+            r#"{"defaultProvider":"commandcode","defaultModel":"stealth/space-bunny-alpha"}"#,
+        )
+        .unwrap();
+        let entries = entries_from_config(&dir.0);
+        let settings = entries
+            .iter()
+            .find(|e| e.name == ENTRY_SETTINGS)
+            .expect("settings.json must be embedded");
+        let v: Value = serde_json::from_slice(&settings.data).unwrap();
+        assert_eq!(
+            v.get("defaultProvider").and_then(Value::as_str),
+            Some("commandcode")
+        );
+        // The selector is the one `default_model_setting()` will hand back.
+        let p = v.get("defaultProvider").and_then(Value::as_str).unwrap();
+        let m = v.get("defaultModel").and_then(Value::as_str).unwrap();
+        assert_eq!(format!("{p}/{m}"), "commandcode/stealth/space-bunny-alpha");
+    }
+
+    #[test]
+    fn embedded_settings_ignores_a_half_set_default() {
+        // A half-set default is not a default: `default_model_setting` has
+        // always required both halves, and the embedded path must agree or an
+        // embedded pir could pick a model the local one would refuse.
+        for doc in [
+            r#"{"defaultProvider":"p"}"#,
+            r#"{"defaultModel":"m"}"#,
+            r#"{"defaultProvider":"","defaultModel":"m"}"#,
+            r#"{"defaultProvider":"p","defaultModel":""}"#,
+        ] {
+            let v: Value = serde_json::from_str(doc).unwrap();
+            let p = v.get("defaultProvider").and_then(Value::as_str);
+            let m = v.get("defaultModel").and_then(Value::as_str);
+            let ok = matches!((p, m), (Some(a), Some(b)) if !a.is_empty() && !b.is_empty());
+            assert!(!ok, "must not treat {doc} as a default");
+        }
+    }
+
+    #[test]
+    fn merge_settings_local_wins_and_fills_only_when_absent() {
+        let embedded = json!({"defaultProvider": "commandcode", "defaultModel": "sb"});
+        // No local preference: the embedded one supplies it.
+        assert_eq!(
+            merge_settings(&json!({"theme": "dark"}), &embedded),
+            json!({"theme": "dark", "defaultProvider": "commandcode", "defaultModel": "sb"})
+        );
+        // A local preference wins outright, and the embedded keys are absent.
+        let local = json!({"defaultProvider": "cerebras", "defaultModel": "gpt-oss-120b"});
+        let merged = merge_settings(&local, &embedded);
+        assert_eq!(merged.get("defaultProvider").unwrap(), "cerebras");
+        assert_eq!(merged.get("defaultModel").unwrap(), "gpt-oss-120b");
+        // A half-set LOCAL default is not a default either, so the embedded
+        // pair supplies both rather than leaving a broken half in place.
+        let half = json!({"defaultProvider": "cerebras"});
+        let merged = merge_settings(&half, &embedded);
+        assert_eq!(merged.get("defaultProvider").unwrap(), "commandcode");
+        assert_eq!(merged.get("defaultModel").unwrap(), "sb");
+    }
+
+    #[test]
+    fn merge_settings_does_not_carry_desktop_preferences() {
+        // settings.json also holds theme/notify/packages. Copying an operator's
+        // desktop config onto every machine running the embedded binary would
+        // be surprising and out of scope, so only the default pair moves.
+        let embedded = json!({
+            "defaultProvider": "p", "defaultModel": "m",
+            "theme": "solarized", "packages": ["npm:pi-ollama-cloud"]
+        });
+        let merged = merge_settings(&json!({}), &embedded);
+        assert_eq!(merged.get("theme"), None, "theme must not travel");
+        assert_eq!(merged.get("packages"), None, "packages must not travel");
+        assert_eq!(merged.get("defaultProvider").unwrap(), "p");
     }
 
     #[test]

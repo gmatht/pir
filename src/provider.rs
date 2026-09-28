@@ -315,6 +315,37 @@ pub struct Client {
     cancel: Arc<AtomicBool>,
 }
 
+/// The body of the cancel-forwarding task, factored out so the production spawn
+/// and the leak regression test drive *the same* code — a test that retyped its
+/// own copy of the loop could pass while the shipped forwarder regressed.
+///
+/// Exits when either condition is met, and both are load-bearing:
+/// * the flag is set → signal the channel and return (the cancel path);
+/// * `tx` is closed → the owning request finished and dropped its receiver, so
+///   return. Without this, a *normally completed* request leaks a `.detach()`ed
+///   task that wakes every 5ms for the rest of the process's life — one per
+///   model call, all on smol's single `smol-1` thread, which is what pinned an
+///   idle session at 35-84% of a core.
+///
+/// `on_wakeup` is a no-op in production and a counter in the test.
+async fn poll_cancel_forwarder(
+    flag: Arc<AtomicBool>,
+    tx: smol::channel::Sender<()>,
+    on_wakeup: impl Fn(),
+) {
+    loop {
+        if flag.load(Ordering::SeqCst) {
+            let _ = tx.send(()).await;
+            return;
+        }
+        if tx.is_closed() {
+            return;
+        }
+        on_wakeup();
+        Timer::after(Duration::from_millis(5)).await;
+    }
+}
+
 impl Client {
     /// Bridge the shared `cancel` `AtomicBool` (set by the REPL on ESC/ctrl-c)
     /// into a `smol` channel the streaming loop can `or()` against, so cancel is
@@ -322,16 +353,20 @@ impl Client {
     /// `AtomicBool` poll. A tiny task watches the flag and signals the channel
     /// the moment it flips; polling every few ms keeps latency well under the
     /// 50ms target while leaving every cancel site (REPL/agent/tests) untouched.
+    ///
+    /// The task must also stop when the request is *over*, not just when it is
+    /// cancelled. A request that completes normally never sets the flag, and the
+    /// receiver is dropped when the caller returns — so without the
+    /// `is_closed` check this task was `.detach()`ed and polled every 5ms for
+    /// the rest of the process's life. One leaked task per model call, all
+    /// waking 200×/s on smol's single `smol-1` executor thread: a session left
+    /// open all afternoon measured ~35% of a core (and up to 84% in the field)
+    /// while completely idle. `tx.is_closed()` becomes true the moment the last
+    /// receiver is dropped, which is exactly the "this request is done" signal.
     fn start_cancel_forwarder(&self) -> SmolRx<()> {
         let (tx, rx) = smol_channel::<()>(1);
         let flag = self.cancel.clone();
-        smol::spawn(async move {
-            while !flag.load(Ordering::SeqCst) {
-                Timer::after(Duration::from_millis(5)).await;
-            }
-            let _ = tx.send(()).await;
-        })
-        .detach();
+        smol::spawn(poll_cancel_forwarder(flag, tx, || {})).detach();
         rx
     }
 
@@ -3231,6 +3266,42 @@ mod tests {
         });
     }
 
+    /// Accept exactly one connection, but never block forever.
+    ///
+    /// A bare `listener.accept()` has no timeout, so a mock server whose client
+    /// never arrives (the request was cancelled, refused, or the assertion
+    /// already failed) parks its thread in `inet_csk_accept` forever. Under
+    /// `cargo test` that keeps the test binary alive after every test has
+    /// finished, so a full-suite run appears to hang indefinitely — exactly how
+    /// a run stalled for 10 minutes with the test binary blocked on a listener.
+    ///
+    /// Returns `None` on timeout and the callers treat that as "no client": the
+    /// test's own client-side assertion then fails loudly instead of the
+    /// process hanging silently.
+    fn accept_within(
+        listener: &std::net::TcpListener,
+        secs: u64,
+    ) -> Option<std::net::TcpStream> {
+        listener.set_nonblocking(true).ok()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        loop {
+            match listener.accept() {
+                Ok((sock, _)) => return Some(sock),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        eprintln!("mock server: no client connected within {secs}s");
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => {
+                    eprintln!("mock server accept failed: {e}");
+                    return None;
+                }
+            }
+        }
+    }
+
     /// Drain one HTTP request (headers + body per Content-Length) from a
     /// mock-server socket before responding. libcurl treats a server close
     /// with an unread request still in flight as a broken transfer
@@ -3295,7 +3366,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().unwrap().to_string();
         let _srv = thread::spawn(move || {
-            let (mut sock, _) = listener.accept().expect("accept");
+            let Some(mut sock) = accept_within(&listener, 30) else { return };
             drain_request(&mut sock);
             use std::io::Write as _;
             let body = "{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi-lsbcurl\"}}]}\n\n";
@@ -3357,7 +3428,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().unwrap().to_string();
         let _srv = thread::spawn(move || {
-            let (mut sock, _) = listener.accept().expect("accept");
+            let Some(mut sock) = accept_within(&listener, 30) else { return };
             drain_request(&mut sock);
             use std::io::Write as _;
             // One SSE frame whose `content` delta is a single huge string (no
@@ -3423,7 +3494,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().unwrap().to_string();
         let _srv = thread::spawn(move || {
-            let (mut sock, _) = listener.accept().expect("accept");
+            let Some(mut sock) = accept_within(&listener, 30) else { return };
             drain_request(&mut sock);
             use std::io::Write as _;
             let body = "{\"error\":{\"message\":\"bad key\"}}";
@@ -3473,7 +3544,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().unwrap().to_string();
         let _srv = thread::spawn(move || {
-            let (_sock, _) = listener.accept().expect("accept");
+            if accept_within(&listener, 30).is_none() { return };
             thread::sleep(Duration::from_secs(30));
         });
         let mut client = Client::new(ApiKind::OpenAi, &format!("http://{addr}"), "test-key".to_string());
@@ -3746,7 +3817,7 @@ mod tests {
         // 1s hold is plenty and keeps the test fast (the assertion only
         // requires cancel to win well before the old 5s window).
         thread::spawn(move || {
-            let (_sock, _) = listener.accept().expect("accept");
+            if accept_within(&listener, 30).is_none() { return };
             thread::sleep(Duration::from_secs(1));
             // socket dropped here: ureq sees EOF/error, but by then the test
             // has already moved on (its worker thread is abandoned).
@@ -3807,7 +3878,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().unwrap().to_string();
         let _srv = thread::spawn(move || {
-            let (mut sock, _) = listener.accept().expect("accept");
+            let Some(mut sock) = accept_within(&listener, 30) else { return };
             drain_request(&mut sock);
             use std::io::Write as _;
             thread::sleep(Duration::from_millis(300));
@@ -3862,7 +3933,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().unwrap().to_string();
         let _srv = thread::spawn(move || {
-            let (mut sock, _) = listener.accept().expect("accept");
+            let Some(mut sock) = accept_within(&listener, 30) else { return };
             drain_request(&mut sock);
             use std::io::Write as _;
             thread::sleep(Duration::from_millis(150));
@@ -3921,7 +3992,7 @@ mod tests {
             // when the real retry lands. `Connection: close` keeps the
             // client from parking these sockets back in its pool.
             for _ in 0..10 {
-                let (mut sock, _) = listener.accept().expect("accept");
+                let Some(mut sock) = accept_within(&listener, 30) else { return };
                 drain_request(&mut sock);
                 let n = hits_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if n < 2 {
@@ -3993,7 +4064,7 @@ mod tests {
             // Serve a few more than the cap so a runaway loop can't deadlock
             // on accept; the client must stop after 2.
             for _ in 0..5 {
-                let Ok((mut sock, _)) = listener.accept() else { break };
+                let Some(mut sock) = accept_within(&listener, 30) else { break };
                 drain_request(&mut sock);
                 hits_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let _ = sock.write_all(
@@ -4219,7 +4290,7 @@ mod tests {
             let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
             let cap_srv = captured.clone();
             let srv = thread::spawn(move || {
-                let (mut sock, _) = listener.accept().expect("accept");
+                let Some(mut sock) = accept_within(&listener, 30) else { return };
                 sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
                 let mut buf = Vec::new();
                 let mut tmp = [0u8; 4096];
@@ -4293,7 +4364,7 @@ mod tests {
         let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let cap_srv = captured.clone();
         let srv = thread::spawn(move || {
-            let (mut sock, _) = listener.accept().expect("accept");
+            let Some(mut sock) = accept_within(&listener, 30) else { return };
             sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
             let mut buf = Vec::new();
             let mut tmp = [0u8; 4096];
@@ -4365,7 +4436,7 @@ mod tests {
             let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
             let cap_srv = captured.clone();
             let srv = thread::spawn(move || {
-                let (mut sock, _) = listener.accept().expect("accept");
+                let Some(mut sock) = accept_within(&listener, 30) else { return };
                 sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
                 let mut buf = Vec::new();
                 let mut tmp = [0u8; 4096];
@@ -4893,6 +4964,95 @@ mod tests {
         let (_url, body) =
             client.responses_request("m", 16, "sys", &[], &[], L::Off, true, Some(&m));
         assert_eq!(body["reasoning"], serde_json::json!({ "effort": "none" }));
+    }
+
+    /// A completed request must NOT leave a polling task behind.
+    ///
+    /// The cancel forwarder is spawned per request and used to exit *only* when
+    /// the cancel flag flipped. A request that completes normally never sets
+    /// that flag, so each one leaked a `.detach()`ed task that woke every 5ms
+    /// for the remaining life of the process. In the field this showed up as a
+    /// single `pir` sitting at 70-84% CPU while idle: the main thread had 69
+    /// ticks of CPU in 16 hours, and one `smol-1` thread had ~7.2 hours of it.
+    ///
+    /// The assertion counts *wakeups* rather than CPU seconds on purpose.
+    /// Process-wide CPU (`CLOCK_PROCESS_CPUTIME_ID`) is the honest way to
+    /// measure the field symptom, but it is a whole-process number, so any
+    /// sibling test burning CPU in parallel makes an otherwise-clean run look
+    /// like a leak. Wakeups are the same defect seen at its source: a leaked
+    /// forwarder wakes `N/requests_per_second` times per second, forever,
+    /// while a correct one stops the moment its receiver is dropped.
+    #[test]
+    fn completed_requests_do_not_leak_a_polling_task() {
+        use std::sync::atomic::AtomicUsize;
+
+        let flag = Arc::new(AtomicBool::new(false));
+        // A handful of iterations is enough and deliberate: each one asserts
+        // independently, and a leaked forwarder fails on the *first* one (2 → 14
+        // wakeups). An earlier version ran 200 iterations, which took ~14s and
+        // added enough scheduling pressure to destabilise unrelated tests on a
+        // loaded box — a regression guard must not be the reason the suite
+        // flakes.
+        for i in 0..3 {
+            let wakes = Arc::new(AtomicUsize::new(0));
+            let counter = wakes.clone();
+            let (tx, rx) = smol_channel::<()>(1);
+            smol::spawn(poll_cancel_forwarder(flag.clone(), tx, move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }))
+            .detach();
+            // Let each task actually start and enter its poll loop, so a leak
+            // is genuinely running work rather than a task that never polled.
+            smol::block_on(Timer::after(Duration::from_millis(5)));
+            drop(rx);
+            // Give the task a bounded chance to notice the dropped receiver.
+            // A correct forwarder stops here; a leaked one is still counting.
+            smol::block_on(Timer::after(Duration::from_millis(5)));
+            let after_drop = wakes.load(Ordering::SeqCst);
+            smol::block_on(Timer::after(Duration::from_millis(60)));
+            let after_wait = wakes.load(Ordering::SeqCst);
+            assert_eq!(
+                after_wait, after_drop,
+                "request {i}: a forwarder whose request finished must stop polling: \
+                 it went {after_drop} -> {after_wait} wakeups after its receiver \
+                 was dropped"
+            );
+        }
+    }
+
+    /// The complementary half: a forwarder whose flag *does* flip must still
+    /// deliver its one signal, and must then be gone. This pins the behaviour
+    /// the cancel path depends on, so the leak fix cannot be implemented by
+    /// simply never signalling.
+    #[test]
+    fn a_cancelled_forwarder_still_signals_exactly_once() {
+        let mut client = Client::new(ApiKind::OpenAi, "http://x", "k".to_string());
+        client.set_cancel(Arc::new(AtomicBool::new(false)));
+        let rx = client.start_cancel_forwarder();
+        // No cancel yet: the receiver must stay pending (this is what lets the
+        // streaming parsers race `recv()` against their network read).
+        assert!(
+            !smol::block_on(async {
+                future::or(
+                    async { rx.recv().await.is_ok() },
+                    async { Timer::after(Duration::from_millis(60)).await; false },
+                )
+                .await
+            }),
+            "must not fire before the flag is set"
+        );
+        // Now cancel, as Ctrl-C would.
+        client.cancel.store(true, Ordering::SeqCst);
+        assert!(
+            smol::block_on(async {
+                future::or(
+                    async { rx.recv().await.is_ok() },
+                    async { Timer::after(Duration::from_millis(500)).await; false },
+                )
+                .await
+            }),
+            "a cancel must be forwarded to the parsers"
+        );
     }
 }
 

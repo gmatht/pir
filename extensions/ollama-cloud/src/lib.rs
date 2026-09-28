@@ -510,6 +510,10 @@ mod tests {
 
     #[test]
     fn search_requires_query() {
+        // Env is process-global: without this lock a parallel test that swaps
+        // `OLLAMA_API_KEY`/`HOME` (see `missing_key_surfaces_clear_error`) can
+        // pull the key out from under this one between the set and the run.
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // With a key present (env), missing query must error before any network.
         // SAFETY: edition 2024 marks env mutation unsafe; pir confines
         // it to startup config and explicit session toggles.
@@ -535,6 +539,12 @@ mod tests {
 
     #[test]
     fn missing_key_surfaces_clear_error() {
+        // This test swaps `HOME`, `PI_DIR` and `PIR_INVOKING_HOME` — all
+        // process-global. Without the shared lock a parallel env test can
+        // observe (or be observed by) the window where they are swapped, which
+        // is exactly how this test became load-dependent. `TEST_ENV_LOCK` is
+        // the repo-wide convention for this.
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: edition 2024 marks env mutation unsafe; pir confines
         // it to startup config and explicit session toggles.
         unsafe { std::env::remove_var("OLLAMA_API_KEY"); }
@@ -544,6 +554,10 @@ mod tests {
         // HOME swap alone no longer isolates the lookup — clear all three.
         let old_pidir = std::env::var_os("PI_DIR");
         let old_invoker = std::env::var_os("PIR_INVOKING_HOME");
+        // `HOME` was previously swapped and never restored, so every later
+        // env test in the process saw a throwaway home. Snapshot and restore
+        // it like the others.
+        let old_home = std::env::var_os("HOME");
         let dir = std::env::temp_dir().join("pir-test-no-ollama");
         let _ = std::fs::create_dir_all(&dir);
         // SAFETY: edition 2024 marks env mutation unsafe; pir confines
@@ -562,6 +576,10 @@ mod tests {
         match old_invoker {
             Some(v) => unsafe { std::env::set_var("PIR_INVOKING_HOME", v) },
             None => unsafe { std::env::remove_var("PIR_INVOKING_HOME") },
+        }
+        match old_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
         }
         assert!(r.is_error);
         assert!(r.content.contains("No Ollama Cloud API key"), "got: {}", r.content);
