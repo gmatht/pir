@@ -17,6 +17,12 @@ pub mod backends_gtk_adapter {
 mod backends_gtk_adapter_impl;
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs")))]
 pub mod backends_gtk_adapter;
+/// Re-export the raw dlopen loader crate so callers can reach the low-level
+/// helpers that sit outside the `Widget` abstraction — recurring timeouts,
+/// raw signal connection, symbol tables. Without this, a downstream crate
+/// (e.g. pir's `gui` feature) has no way to drive the GTK main loop's timers.
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs")))]
+pub use gtk_dynamic_loader;
 #[cfg(all(windows, not(feature = "zork")))]
 pub mod backends_nwg_adapter;
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]

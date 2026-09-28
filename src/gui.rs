@@ -29,8 +29,35 @@ type AgentSlot = Arc<Mutex<Option<Agent>>>;
 /// prelude alias) is a thin wrapper, so we name the real type explicitly here.
 #[cfg(windows)]
 type GuiEntry = rustxwidgets::backends_nwg_adapter::Entry;
-#[cfg(all(feature = "gtk", target_os = "linux"))]
+#[cfg(all(target_os = "linux", not(windows)))]
 type GuiEntry = rustxwidgets::backends_gtk_adapter::Entry;
+
+/// The concrete `Label` type returned by `App::create_label`.
+///
+/// The prelude re-exports `common::Label` — a thin wrapper struct — but the
+/// `App` factory methods hand back the *backend adapter* types, so `GuiWidgets`
+/// has to name the adapter type or the assignment does not typecheck.
+#[cfg(windows)]
+type GuiLabel = rustxwidgets::backends_nwg_adapter::Label;
+#[cfg(all(target_os = "linux", not(windows)))]
+type GuiLabel = rustxwidgets::backends_gtk_adapter::Label;
+
+/// Are we on the GTK backend?
+///
+/// NOTE: this deliberately tests `target_os`, *not* `cfg(feature = "gtk")`.
+/// A `feature` cfg inside this crate tests *pir's* features, and pir has no
+/// feature named `gtk` — the `gtk` feature belongs to the rustxwidgets
+/// dependency. So the old `cfg(feature = "gtk")` guards were silently always
+/// false, which is why `GuiEntry` had no definition and the whole GUI failed
+/// to compile. Gate on the platform, which is what actually picks the adapter.
+#[cfg(all(target_os = "linux", not(windows)))]
+const ON_GTK: bool = true;
+#[cfg(not(all(target_os = "linux", not(windows))))]
+const ON_GTK: bool = false;
+
+/// GTK wrap mode: `GTK_WRAP_WORD_CHAR` — break mid-word only when a single
+/// word is wider than the view, so code blocks and long paths still wrap.
+const GTK_WRAP_WORD_CHAR: i32 = 2;
 
 /// GDK keyval for the Tab key (GDK_KEY_Tab).
 const GDK_KEY_TAB: u32 = 0xff09;
@@ -44,25 +71,39 @@ const GDK_KEY_Q: u32 = 0x71;
 
 /// Idle-mode Tab completion. Completes `/`-command names (and a couple of
 /// argument lists). Returns `Some(completed)` with the new buffer when exactly
-/// one (or a common) completion exists, else `None`. Mirrors the TUI's
-/// `complete_idle`.
+/// one (or a common) completion exists, else `None`.
+///
+/// This list is GUI-local on purpose: `crate::commands::SLASH_COMMANDS` is
+/// generated from the streaming REPL's dispatch and includes aliases (`/c`,
+/// `/h`, `/m`, …), which would make almost every short fragment ambiguous. The
+/// local list is held honest by two tests at the bottom of this file — every
+/// entry must be an implemented `handle_command` arm, and every entry must
+/// exist in the generated global table. That catches the exact bug this
+/// replaces: the old list offered `/fix`, `/bg`, `/jobs` and `/shell` while
+/// implementing none of them, and omitted `/finished`.
+const COMMANDS: &[&str] = &[
+    "help", "model", "models", "goal", "continue", "clear", "undo", "finished",
+    "exit", "usage", "thinking", "cancel", "sessions", "reload", "reexec",
+    "fix", "shell", "bg", "jobs",
+];
+
+/// `/thinking` sub-arguments: the levels `config::ThinkingLevel::parse`
+/// accepts, plus the `show`/`hide` visibility toggle.
+const THINKING_ARGS: &[&str] =
+    &["off", "minimal", "low", "medium", "high", "xhigh", "max", "show", "hide"];
+
 fn complete_idle(buf: &str) -> Option<String> {
-    let commands = [
-        "help", "model", "models", "goal", "continue", "clear", "fix", "undo", "bg", "jobs",
-        "thinking", "cancel", "shell", "exit", "usage", "sessions", "reload", "reexec",
-    ];
     // `/thinking <arg>` sub-argument completion.
     if buf.starts_with("/thinking ") {
         let arg = buf.trim_start_matches("/thinking ").trim_start();
-        let opts = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "show", "hide"];
-        return complete_one_of(&opts, arg, "/thinking ");
+        return complete_one_of(THINKING_ARGS, arg, "/thinking ");
     }
     if buf.starts_with('/') {
         let frag = buf.trim_start_matches('/');
         if frag.contains(' ') {
             return None; // past the command word; nothing to complete
         }
-        return complete_one_of(&commands, frag, "/");
+        return complete_one_of(COMMANDS, frag, "/");
     }
     None
 }
@@ -174,6 +215,127 @@ struct GuiState {
     /// Re-exec broadcast generation seen at startup (durable fallback for a
     /// missed SIGUSR1); updated as newer generations are honoured.
     reexec_seen: u64,
+    /// How many conversation lines are already in the backend's text buffer.
+    /// `sync_textview` is append-only, so this is its write cursor.
+    ///
+    /// This lives on the *session*, not in a `static`: with a process-global
+    /// cursor, a `/clear` or a scrollback trim in one tab would desync every
+    /// other tab's cursor, and panes would stop matching their own models.
+    rendered: usize,
+    /// Set when the text buffer must be rebuilt from scratch (after `/clear`,
+    /// or a trim that dropped lines from the front of the model).
+    needs_rebuild: bool,
+    /// Background turns started with `/bg` or a trailing `&`.
+    bg: Vec<BackgroundTurn>,
+    /// Next background-job id (1-based, like the TUI's `next_bg_id`).
+    next_bg_id: usize,
+    /// Prompts queued by extensions, drained into a new turn when idle. The
+    /// TUI does this; without it the GUI silently drops extension follow-ups.
+    continuations: Vec<String>,
+    /// Braille spinner frame, advanced by the periodic drain each tick.
+    spinner: usize,
+    /// Last status string handed to the backend, so we only touch the label
+    /// when it actually changes (every `set_markup` forces a relayout).
+    last_status: String,
+    /// The agent's model label, cached for the idle footer (the TUI's
+    /// `workspace:`/`model:` line). Refreshed whenever the agent is reachable.
+    last_model: Option<String>,
+}
+
+/// A detached/background turn: its prompt, its own cancel flag, and the agent
+/// it runs (kept out of the foreground slot so the UI stays responsive).
+struct BackgroundTurn {
+    id: usize,
+    prompt: String,
+    cancel: Arc<AtomicBool>,
+    /// The agent comes back here when the worker finishes.
+    slot: AgentSlot,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Run a shell command and capture its combined output for the pane.
+///
+/// The GUI never hands the terminal to a child (there is no alternate screen to
+/// leave and raw mode is not ours to restore), so `/sh` runs the command with
+/// piped stdio and shows the result. The abridged helper keeps the pane from
+/// filling with a runaway `cat` of a huge file, matching how tool output is
+/// echoed everywhere else.
+fn run_shell_guarded(cmdline: &str) -> Result<String, String> {
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmdline)
+        .output()
+        .map_err(|e| format!("could not run shell: {e}"))?;
+    let mut text = String::new();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !stdout.trim().is_empty() {
+        text.push_str(&crate::agent::abridge_output(stdout.trim_end()));
+    }
+    if !stderr.trim().is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&crate::agent::abridge_output(stderr.trim_end()));
+    }
+    if text.trim().is_empty() {
+        text.push_str(&format!("(no output, exit {})", out.status.code().unwrap_or(-1)));
+    } else if let Some(code) = out.status.code() {
+        if code != 0 {
+            text.push_str(&format!("\n(exit {code})"));
+        }
+    }
+    Ok(text)
+}
+
+/// Push the current background-job table into the pane (the TUI's `/jobs`).
+fn list_jobs(s: &mut GuiState) {
+    if s.bg.is_empty() {
+        s.push(ConvKind::System, "· no background jobs — start one with /bg <prompt>");
+        return;
+    }
+    let rows: Vec<(usize, bool, String)> = s
+        .bg
+        .iter()
+        .map(|b| (b.id, b.join.as_ref().is_some_and(|h| !h.is_finished()), b.prompt.clone()))
+        .collect();
+    s.push(ConvKind::System, &format!("background jobs ({}):", rows.len()));
+    for (id, running, prompt) in rows {
+        s.push(
+            ConvKind::System,
+            &format!("  #{id} {} {}", if running { "running" } else { "done   " }, truncate(&prompt, 60)),
+        );
+    }
+}
+
+/// The GUI's `/help` body. Kept in step with `commands::SLASH_COMMANDS` by the
+/// drift test at the bottom of this file.
+const HELP_GUI: &str = "\
+commands:
+  /help                 this list
+  /model <sel>          switch model      /models      list every model
+  /usage                tokens this session
+  /goal [obj]           show or start the standing goal
+  /continue             drive the goal to completion
+  /thinking <lvl>       off|minimal|low|medium|high|xhigh|max  (+ show|hide)
+  /clear                clear the pane    /undo [all]  rewind the last turn
+  /finished             mark this session finished
+  /fix                  repair the workspace VCS setup
+  /sh <cmd>             run a shell command   (/! <cmd> also works)
+  /bg <prompt>          start a background turn   /jobs   list them
+  /cancel               stop the running turn
+  /reload               reload catalog, policy and extension commands
+  /reexec               restart in place (idle only)
+  /sessions             new|close|next|prev|<n>  multi-session tabs
+  /exit                 quit";
+
+const SPINNER_FRAMES: [&str; 10] =
+    ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// How many background turns are still running (shown in the status line, the
+/// TUI's `#tasks running: N`).
+fn tasks_running(s: &GuiState) -> usize {
+    s.bg.iter().filter(|b| b.join.as_ref().is_some_and(|h| !h.is_finished())).count()
 }
 
 impl GuiState {
@@ -189,44 +351,43 @@ impl GuiState {
             reexec_seen: crate::config::read_reexec_broadcast()
                 .map(|b| b.generation)
                 .unwrap_or(0),
+            rendered: 0,
+            needs_rebuild: true,
+            bg: Vec::new(),
+            next_bg_id: 1,
+            continuations: Vec::new(),
+            spinner: 0,
+            last_status: String::new(),
+            last_model: None,
         }
     }
 
     /// Append a conversation line, splitting on newlines and capping
-    /// scrollback so memory stays bounded. The cap only takes effect on a
-    /// `/clear`-style rebuild (see `clear`), because the GTK text buffer is
-    /// append-only between syncs — trimming mid-stream would desync
-    /// `RENDERED_LINES`. 4000 lines is a few hundred KB at most.
+    /// scrollback so memory stays bounded.
+    ///
+    /// The cap keeps the model and the buffer in step: trimming from the front
+    /// means the next sync must rebuild rather than append, so we bump
+    /// `rendered` down with the model and flag `needs_rebuild`.
     fn push(&mut self, kind: ConvKind, text: &str) {
         for para in text.split('\n') {
             self.conv.push(ConvLine { kind, text: para.to_string() });
         }
-        if self.conv.len() > 4000 {
-            let drop = self.conv.len() - 4000;
+        const MAX: usize = 4000;
+        if self.conv.len() > MAX {
+            let drop = self.conv.len() - MAX;
             self.conv.drain(0..drop);
-            RENDERED_LINES.fetch_sub(drop, std::sync::atomic::Ordering::SeqCst);
-            // The buffer now holds fewer lines than were rendered: force a
-            // rebuild on the next sync so the pane matches the model.
-            NEEDS_REBUILD.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.rendered = self.rendered.saturating_sub(drop);
+            self.needs_rebuild = true;
         }
     }
 
-    /// Clear the conversation (e.g. /clear).
+    /// Clear the conversation (e.g. `/clear`).
     fn clear(&mut self) {
         self.conv.clear();
-        NEEDS_REBUILD.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.rendered = 0;
+        self.needs_rebuild = true;
     }
 }
-
-/// How many conversation lines have already been rendered into the GTK text
-/// buffer. `sync_textview` is append-only: it appends everything past this
-/// index, so each line gets its per-kind colour via Pango markup instead of
-/// one flat `set_text`.
-static RENDERED_LINES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Set when the text buffer must be rebuilt from scratch (after /clear or a
-/// scrollback trim dropped lines from the front of the model).
-static NEEDS_REBUILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Arrow-Up/Down navigation state for the prompt Entry, shared between the key
 /// controller and the activate handler. `pos` indexes `history` (== len means
@@ -287,7 +448,7 @@ impl HistoryNav {
 #[derive(Clone)]
 struct GuiWidgets {
     textview: TextView,
-    status: Label,
+    status: GuiLabel,
 }
 
 /// Everything that is per-session when the GUI shows one tab per session:
@@ -372,8 +533,8 @@ pub fn run(
     // lock across the (potentially slow) drain of every session.
     let drain_sessions = sessions.clone();
     let drain_bus = bus.clone();
-    #[cfg(all(feature = "gtk", target_os = "linux"))]
-    unsafe {
+    #[cfg(all(target_os = "linux", not(windows)))]
+    {
         if let Some(loader) = rustxwidgets::backends::gtk::loader() {
             rustxwidgets::gtk_dynamic_loader::timeout_add_recurring(&loader, 150, Box::new(move || {
                 for sv in &*drain_sessions.borrow() {
@@ -392,7 +553,7 @@ pub fn run(
     }
 
     // Window close (destroy signal) -> quit the GTK main loop.
-    #[cfg(all(feature = "gtk", target_os = "linux"))]
+    #[cfg(all(target_os = "linux", not(windows)))]
     unsafe {
         if let Some(loader) = rustxwidgets::backends::gtk::loader() {
             let app_for_destroy = app.clone();
@@ -466,7 +627,7 @@ fn spawn_session(
     vbox.append(&entry);
 
     let status = app.create_label("pir · idle").expect("create_label");
-    #[cfg(all(feature = "gtk", target_os = "linux"))]
+    #[cfg(all(target_os = "linux", not(windows)))]
     status.set_xalign(0.0); // left-align
     vbox.append(&status);
 
@@ -489,7 +650,7 @@ fn spawn_session(
                 providers[0].pid()
             ),
         );
-        sync_textview(&widgets, &s);
+        sync_textview(&widgets, &mut s);
     }
 
     let hist_nav = Arc::new(Mutex::new(HistoryNav::default()));
@@ -509,7 +670,6 @@ fn spawn_session(
     let hist_for_keys = state.clone();
     let app_for_keys = app.clone();
     let _ = entry.on_key_raw(Box::new(move |keyval: u32, kstate: u32| -> bool {
-        use std::sync::atomic::Ordering as AtomicOrdering;
         const CONTROL_MASK: u32 = 1 << 2;
         match keyval {
             GDK_KEY_Q if (kstate & CONTROL_MASK) != 0 => {
@@ -595,6 +755,7 @@ fn spawn_session(
                 &entry_cb_slot,
                 &entry_cb_providers,
                 &entry_cb_bus,
+                _full_auto,
                 &entry_cb_cancel,
                 &entry_cb_state,
                 &app_for_activate,
@@ -603,18 +764,55 @@ fn spawn_session(
             return;
         }
 
+        // `!cmd` / `!!cmd`: the streaming REPL's shell shorthands.
+        if let Some(sh) = text.strip_prefix('!') {
+            let sh = sh.strip_prefix('!').unwrap_or(sh).trim();
+            if sh.is_empty() {
+                entry_cb_state.lock().unwrap().push(ConvKind::Error, "· usage: !<command>");
+            } else {
+                let msg = match run_shell_guarded(sh) {
+                    Ok(out) => out,
+                    Err(e) => format!("· {e}"),
+                };
+                let mut s = entry_cb_state.lock().unwrap();
+                s.push(ConvKind::System, &format!("$ {sh}"));
+                s.push(ConvKind::System, &msg);
+                sync_textview(&entry_cb_widgets, &mut s);
+            }
+            return;
+        }
+
         // Regular prompt: if a turn is running, queue it; else start it now.
         let mut s = entry_cb_state.lock().unwrap();
+
+        // A trailing `&` runs the turn in the background and frees the prompt
+        // immediately — the TUI's `foo &`.
+        let (prompt, background) = match text.strip_suffix('&') {
+            Some(rest) if !rest.trim().is_empty() => (rest.trim().to_string(), true),
+            _ => (text.clone(), false),
+        };
+
+        if background {
+            s.push(ConvKind::User, &prompt);
+            match spawn_background(&prompt, &entry_cb_slot, &entry_cb_providers, &entry_cb_bus, _full_auto, &mut s) {
+                Ok(id) => s.push(ConvKind::System, &format!("· started background job #{id}")),
+                Err(e) => s.push(ConvKind::Error, &e),
+            }
+            s.status = idle_status(&s);
+            sync_textview(&entry_cb_widgets, &mut s);
+            return;
+        }
+
         if s.running {
-            s.pending.push(text.clone());
-            s.status = format!("queued: {}", truncate(&text, 50));
-            sync_textview(&entry_cb_widgets, &s);
+            s.pending.push(prompt.clone());
+            s.status = running_status(&s, s.pending.len());
+            sync_textview(&entry_cb_widgets, &mut s);
             return;
         }
         s.running = true;
-        s.status = "running…".into();
-        s.push(ConvKind::User, &text);
-        sync_textview(&entry_cb_widgets, &s);
+        s.status = running_status(&s, 0);
+        s.push(ConvKind::User, &prompt);
+        sync_textview(&entry_cb_widgets, &mut s);
         drop(s);
 
         // Reset the quiet switch so a previously detached turn's quiet state
@@ -624,7 +822,7 @@ fn spawn_session(
             &entry_cb_slot,
             &entry_cb_cancel,
             &entry_cb_quiet,
-            text,
+            prompt,
             entry_cb_done.clone(),
         );
     });
@@ -670,7 +868,7 @@ fn handle_session_command(
             s.push(ConvKind::System, &format!("  {}{} {}", if i == cur { "*" } else { " " }, i, t));
         }
         s.push(ConvKind::System, "use: /sessions new | close | next | prev | <n>");
-        sync_textview(widgets, &s);
+        sync_textview(widgets, &mut s);
         return;
     }
     match rest[0] {
@@ -728,7 +926,7 @@ fn handle_session_command(
                 Err(e) => {
                     let mut s2 = state.lock().unwrap();
                     s2.push(ConvKind::Error, &format!("could not start new session: {e}"));
-                    sync_textview(widgets, &s2);
+                    sync_textview(widgets, &mut s2);
                 }
             }
         }
@@ -736,7 +934,7 @@ fn handle_session_command(
             let cur = tabs.current_tab();
             if sessions.borrow().len() <= 1 {
                 s.push(ConvKind::System, "only one session open — not closing");
-                sync_textview(widgets, &s);
+                sync_textview(widgets, &mut s);
                 return;
             }
             drop(s);
@@ -765,7 +963,7 @@ fn handle_session_command(
                 ConvKind::Error,
                 &format!("unknown /sessions subcommand '{other}' (new|close|next|prev|<n>|list)"),
             );
-            sync_textview(widgets, &s);
+            sync_textview(widgets, &mut s);
         }
     }
 }
@@ -791,9 +989,16 @@ fn drain_once(
         }
     }
 
-    // Tail the session log.
-    if let Some(log) = agent_slot.lock().unwrap().as_ref().and_then(|a| a.log_path.clone()) {
-        drain_session_log(log, &mut s);
+    // Tail the session log, and cache the model label for the idle footer.
+    {
+        let g = agent_slot.lock().unwrap();
+        if let Some(a) = g.as_ref() {
+            let label = a.label();
+            s.last_model = Some(label);
+            if let Some(log) = a.log_path.clone() {
+                drain_session_log(log, &mut s);
+            }
+        }
     }
 
     // Turn finished? Join it and start the next queued prompt or go idle.
@@ -818,7 +1023,7 @@ fn drain_once(
             }
         if wants_reexec {
             s.push(ConvKind::System, "· reexec requested — restarting…");
-            sync_textview(widgets, &s);
+            sync_textview(widgets, &mut s);
             crate::reexec_self();
         }
     }
@@ -838,21 +1043,124 @@ fn drain_once(
             } else {
                 s.status = "idle".into();
             }
-            let next = s.pending.drain(..).next();
-            if let Some(next) = next {
-                s.running = true;
-                s.status = "running…".into();
-                s.push(ConvKind::User, &next);
-                sync_textview(widgets, &s);
-                drop(s);
-                fg_quiet.store(false, Ordering::SeqCst);
-                spawn_turn(agent_slot, fg_cancel, fg_quiet, next, done.clone());
-                return;
+            // Extensions can queue a follow-up prompt; drain it into a new turn
+            // instead of dropping it (this is what the TUI does, and what kept
+            // the GUI from silently losing post-turn work).
+            if s.continuations.is_empty() {
+                let next = s.pending.drain(..).next();
+                if let Some(next) = next {
+                    s.running = true;
+                    s.status = running_status(&s, 0);
+                    s.push(ConvKind::User, &next);
+                    sync_textview(widgets, &mut s);
+                    drop(s);
+                    fg_quiet.store(false, Ordering::SeqCst);
+                    spawn_turn(agent_slot, fg_cancel, fg_quiet, next, done.clone());
+                    return;
+                }
             }
         }
     }
 
-    sync_textview(widgets, &s);
+    // -- Idle: start any continuation the agent queued during the last turn --
+    if !s.running {
+        let conts = {
+            let mut g = agent_slot.lock().unwrap();
+            match g.as_mut() {
+                Some(a) => a.take_continuations(),
+                None => Vec::new(),
+            }
+        };
+        for c in conts {
+            s.continuations.push(c);
+        }
+        if let Some(next) = s.continuations.first().cloned() {
+            s.continuations.remove(0);
+            s.running = true;
+            s.status = running_status(&s, 0);
+            s.push(ConvKind::User, &next);
+            sync_textview(widgets, &mut s);
+            drop(s);
+            fg_quiet.store(false, Ordering::SeqCst);
+            spawn_turn(agent_slot, fg_cancel, fg_quiet, next, done.clone());
+            return;
+        }
+    }
+
+    // -- Reap finished background turns and report them (the TUI's reap_bg) --
+    reap_background(&mut s);
+
+    // -- Spinner + status parity with the TUI's footer --
+    if s.running {
+        s.spinner = (s.spinner + 1) % SPINNER_FRAMES.len();
+        s.status = running_status(&s, 0);
+    } else {
+        s.status = idle_status(&s);
+    }
+
+    sync_textview(widgets, &mut s);
+}
+
+/// The status line while a turn runs: a braille spinner, the queued-prompt
+/// count, and the number of background jobs — the GUI's stand-in for the
+/// TUI's `⠋ thinking…` status plus its `#tasks running: N` footer.
+fn running_status(s: &GuiState, queued: usize) -> String {
+    let spin = SPINNER_FRAMES[s.spinner % SPINNER_FRAMES.len()];
+    let mut st = format!("{spin} thinking…");
+    if queued > 0 {
+        st.push_str(&format!(" · {} queued", queued));
+    }
+    let bg = tasks_running(s);
+    if bg > 0 {
+        st.push_str(&format!(" · #{bg} background"));
+    }
+    st
+}
+
+/// The status line when idle: the TUI's footer shows the workspace and model,
+/// so the GUI shows the same pair plus a background-job count when any remain.
+fn idle_status(s: &GuiState) -> String {
+    let mut parts = vec![format!("workspace: {}", crate::workspace_label())];
+    if let Some(a) = s.last_model.as_deref() {
+        parts.push(format!("model: {a}"));
+    }
+    let bg = tasks_running(s);
+    if bg > 0 {
+        parts.push(format!("#{bg} background"));
+    }
+    parts.join("   ")
+}
+
+/// Join background turns that have finished, dropping each from the job list
+/// (the TUI's `reap_bg`). Their output still reaches the pane: a background
+/// agent writes to its own log, which `drain_once` tails like any other.
+fn reap_background(s: &mut GuiState) {
+    let mut i = 0;
+    while i < s.bg.len() {
+        let done = s.bg[i]
+            .join
+            .as_ref()
+            .map(|h| h.is_finished())
+            .unwrap_or(true);
+        if done {
+            let job = s.bg.remove(i);
+            if let Some(h) = job.join {
+                let _ = h.join();
+            }
+            let still = tasks_running(s);
+            let note = if still == 0 {
+                String::new()
+            } else {
+                format!(" · {still} still running")
+            };
+            s.push(
+                ConvKind::System,
+                &format!("· background job #{} done{note}", job.id),
+            );
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// Spawn a prompt as a foreground turn on a worker thread, *moving* the agent
@@ -866,6 +1174,85 @@ fn spawn_turn(
     done: smol::channel::Sender<()>,
 ) {
     run_foreground_turn(agent_slot, cancel, quiet, prompt, done);
+}
+
+/// Start `prompt` as a background turn on its own agent, so the UI stays
+/// responsive (the TUI's `spawn_background`, reachable here via `/bg <text>`
+/// and a trailing `&`).
+///
+/// The background agent mirrors the current one (same provider + model) but
+/// gets its own slot and cancel flag, so it cannot collide with the
+/// foreground turn and `/cancel` can stop it independently.
+fn spawn_background(
+    prompt: &str,
+    fg_slot: &AgentSlot,
+    providers: &[Provider],
+    bus: &SharedBus,
+    full_auto: bool,
+    s: &mut GuiState,
+) -> Result<usize, String> {
+    let (provider, model) = {
+        let g = fg_slot.lock().unwrap();
+        match g.as_ref() {
+            Some(a) => (a.provider().clone(), a.model().clone()),
+            None => match crate::config::select(providers, "") {
+                Ok((p, m)) => (p.clone(), m.clone()),
+                Err(e) => return Err(format!("no model available for a background turn: {e}")),
+            },
+        }
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let agent = Agent::new(
+        provider,
+        model,
+        full_auto,
+        true,
+        bus.clone(),
+        None,
+        cancel.clone(),
+        Arc::new(Mutex::new(String::new())),
+    )
+    .map_err(|e| format!("could not start a background turn: {e}"))?;
+
+    let slot: AgentSlot = Arc::new(Mutex::new(Some(agent)));
+    let id = s.next_bg_id;
+    s.next_bg_id += 1;
+
+    // Detach the agent onto its own worker; the join handle lets the periodic
+    // drain reap it once the turn completes.
+    let worker_slot = slot.clone();
+    let worker_cancel = cancel.clone();
+    let worker_bus = bus.clone();
+    let worker_prompt = prompt.to_string();
+    let join = std::thread::spawn(move || {
+        if let Some(mut a) = worker_slot.lock().unwrap().take() {
+            // A background turn reports its own failure: the pane is not being
+            // driven by this worker, so `notify_on_exit`/`error_event` are how
+            // the user finds out it failed.
+            match a.turn(&worker_prompt) {
+                Ok(()) => {
+                    a.notify_on_exit(a.turn_done_event());
+                }
+                Err(e) => {
+                    let _ = a.error_event(e);
+                }
+            }
+            *worker_slot.lock().unwrap() = Some(a);
+        }
+        let _ = worker_bus;
+        // Clear the flag so a later `/bg` on the same slot isn't born
+        // pre-cancelled.
+        worker_cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+
+    s.bg.push(BackgroundTurn {
+        id,
+        prompt: prompt.to_string(),
+        cancel,
+        slot,
+        join: Some(join),
+    });
+    Ok(id)
 }
 
 /// Drain the agent's session log into `state.conv` (appending only new bytes
@@ -959,14 +1346,14 @@ fn drain_session_log(log: PathBuf, state: &mut GuiState) {
 /// word lands in the text view and the next periodic drain's `set_text` wipes
 /// it ("I typed half a word and it just disappeared").
 fn configure_conversation_textview(tv: &TextView) {
-    #[cfg(all(feature = "gtk", target_os = "linux"))]
+    #[cfg(all(target_os = "linux", not(windows)))]
     tv.set_hexpand(true);
-    #[cfg(all(feature = "gtk", target_os = "linux"))]
+    #[cfg(all(target_os = "linux", not(windows)))]
     tv.set_vexpand(true);
     // GTK wrap mode: 2 = GTK_WRAP_WORD_CHAR
     tv.set_wrap_mode(2);
     tv.set_editable(false);
-    #[cfg(all(feature = "gtk", target_os = "linux"))]
+    #[cfg(all(target_os = "linux", not(windows)))]
     tv.set_can_focus(false);
 }
 
@@ -983,45 +1370,57 @@ fn status_markup(status: &str) -> String {
     format!("<span foreground=\"{color}\">{}</span>", escape_markup(status))
 }
 
-/// Sync the GTK text buffer with the conversation model: append-only markup
-/// updates between rebuilds (colours per line, cheap on every 150ms tick),
-/// full rebuild after /clear or a scrollback trim.
-#[cfg(all(feature = "gtk", target_os = "linux"))]
-fn sync_textview(widgets: &GuiWidgets, state: &GuiState) {
-    use std::sync::atomic::Ordering;
-    if NEEDS_REBUILD.swap(false, Ordering::SeqCst) {
+/// Sync the backend's text buffer with the conversation model.
+///
+/// The buffer is append-only between rebuilds: each new line is appended
+/// (`append_text` on GTK) rather than replacing the whole buffer. The old code
+/// called `set_text("")` at the end of the loop, which on GTK goes to
+/// `gtk_text_buffer_set_text` — a *replace* — so the pane ended up blank.
+///
+/// `sync_textview` takes `&mut GuiState` because the per-session write cursor
+/// lives in the state; it must not hold the state's lock while it runs.
+#[cfg(all(target_os = "linux", not(windows)))]
+fn sync_textview(widgets: &GuiWidgets, state: &mut GuiState) {
+    if state.needs_rebuild {
         widgets.textview.set_text("");
-        RENDERED_LINES.store(0, Ordering::SeqCst);
+        state.rendered = 0;
+        state.needs_rebuild = false;
     }
-    let rendered = RENDERED_LINES.load(Ordering::SeqCst);
-    if state.conv.len() > rendered {
-        for line in &state.conv[rendered..] {
-            widgets.textview.set_markup(&line_markup(line));
-            widgets.textview.set_text("\n");
+    if state.conv.len() > state.rendered {
+        for line in &state.conv[state.rendered..] {
+            // The backend has no per-range markup, so the line goes in as
+            // plain text; the conversation pane is monochrome. Colour lives in
+            // the per-line prefix glyph and in the status label.
+            let (_, prefix) = line.kind.style();
+            widgets.textview.append_text(&format!("{prefix}{}\n", line.text));
         }
-        RENDERED_LINES.store(state.conv.len(), Ordering::SeqCst);
+        state.rendered = state.conv.len();
     }
-    widgets.textview.set_text("");
-    widgets.status.set_markup(&status_markup(&state.status));
+    if state.last_status != state.status {
+        widgets.status.set_markup(&status_markup(&state.status));
+        state.last_status = state.status.clone();
+    }
 }
 
 #[cfg(windows)]
-fn sync_textview(widgets: &GuiWidgets, state: &GuiState) {
-    use std::sync::atomic::Ordering;
-    if NEEDS_REBUILD.swap(false, Ordering::SeqCst) {
+fn sync_textview(widgets: &GuiWidgets, state: &mut GuiState) {
+    if state.needs_rebuild {
         widgets.textview.set_text("");
-        RENDERED_LINES.store(0, Ordering::SeqCst);
+        state.rendered = 0;
+        state.needs_rebuild = false;
     }
-    let rendered = RENDERED_LINES.load(Ordering::SeqCst);
-    if state.conv.len() > rendered {
-        for line in &state.conv[rendered..] {
+    if state.conv.len() > state.rendered {
+        for line in &state.conv[state.rendered..] {
             // The nwg backend's `TextView::set_markup` already appends the
             // (markup-stripped) line plus a newline, so no separate newline.
             widgets.textview.set_markup(&line_markup(line));
         }
-        RENDERED_LINES.store(state.conv.len(), Ordering::SeqCst);
+        state.rendered = state.conv.len();
     }
-    widgets.status.set_markup(&status_markup(&state.status));
+    if state.last_status != state.status {
+        widgets.status.set_markup(&status_markup(&state.status));
+        state.last_status = state.status.clone();
+    }
 }
 
 /// Handle a slash command inline (a GUI-appropriate subset). Mirrors the
@@ -1030,7 +1429,8 @@ fn handle_command(
     cmd: &str,
     agent_slot: &AgentSlot,
     providers: &[Provider],
-    _bus: &SharedBus,
+    bus: &SharedBus,
+    full_auto: bool,
     cancel: &Arc<AtomicBool>,
     state: &Arc<Mutex<GuiState>>,
     app: &App,
@@ -1042,10 +1442,7 @@ fn handle_command(
     let mut s = state.lock().unwrap();
     match cmd {
         "h" | "help" => {
-            s.push(ConvKind::System,
-                "commands: /help /model <sel> /models /goal [obj] /continue /clear /undo /reload /reexec\n\
-                 \x20  /cancel  /thinking  /sessions  /usage  /exit  /quit",
-            );
+            s.push(ConvKind::System, HELP_GUI);
         }
         "exit" | "quit" | "q" => {
             s.status = "bye".into();
@@ -1054,11 +1451,41 @@ fn handle_command(
             return;
         }
         "cancel" | "c" => {
+            // Stop the foreground turn and every background job, so `/cancel`
+            // really means "stop work" as it does in the TUI.
+            let mut stopped_fg = false;
             if s.running {
                 cancel.store(true, Ordering::SeqCst);
-                s.push(ConvKind::System, "· requesting cancel (turn stops now)");
-            } else {
-                s.push(ConvKind::System, "· no turn running to cancel");
+                stopped_fg = true;
+            }
+            let bg_ids: Vec<usize> = s
+                .bg
+                .iter()
+                .filter(|b| b.join.as_ref().is_some_and(|h| !h.is_finished()))
+                .map(|b| {
+                    b.cancel.store(true, Ordering::SeqCst);
+                    b.id
+                })
+                .collect();
+            match (stopped_fg, bg_ids.is_empty()) {
+                (true, true) => s.push(ConvKind::System, "· requesting cancel (turn stops now)"),
+                (true, false) => s.push(
+                    ConvKind::System,
+                    &format!(
+                        "· requesting cancel (turn + background job{} {})",
+                        if bg_ids.len() == 1 { "" } else { "s" },
+                        bg_ids.iter().map(|i| format!("#{i}")).collect::<Vec<_>>().join(", ")
+                    ),
+                ),
+                (false, true) => s.push(ConvKind::System, "· no turn running to cancel"),
+                (false, false) => s.push(
+                    ConvKind::System,
+                    &format!(
+                        "· requesting cancel (background job{} {})",
+                        if bg_ids.len() == 1 { "" } else { "s" },
+                        bg_ids.iter().map(|i| format!("#{i}")).collect::<Vec<_>>().join(", ")
+                    ),
+                ),
             }
         }
         "clear" => {
@@ -1216,6 +1643,76 @@ fn handle_command(
             let all = rest.first().map(|x| *x == "all").unwrap_or(false);
             s.push(ConvKind::System, &agent.undo(all));
         }
+        "finished" => {
+            // Same as the TUI: stamp the session log as finished so it stops
+            // showing up in "unfinished" listings.
+            let log = agent_slot.lock().unwrap().as_ref().and_then(|a| a.log_path.clone());
+            match log {
+                Some(p) => {
+                    crate::session::mark_finished(&p);
+                    s.push(ConvKind::System, "· session marked finished");
+                }
+                None => s.push(ConvKind::System, "· no session log to mark finished"),
+            }
+        }
+        "fix" => {
+            // Repair the workspace's VCS setup (the TUI's `/fix`).
+            let repo = std::env::current_dir().unwrap_or_default();
+            if crate::project::is_git_repo(&repo) {
+                s.push(ConvKind::System, &format!("· {}", crate::project::fix_git_setup(&repo)));
+            } else {
+                s.push(ConvKind::System, "· not a git repository — nothing to fix");
+            }
+        }
+        "sh" | "shell" => {
+            // Run a shell command. The GUI has no alternate screen to leave, so
+            // unlike the TUI's `/sh` we cannot hand over the terminal; we run it
+            // and stream its output into the pane instead.
+            let cmdline = rest.join(" ");
+            if cmdline.trim().is_empty() {
+                s.push(ConvKind::Error, "· usage: /sh <command>   (/! <command> is a shorthand)");
+            } else {
+                match run_shell_guarded(&cmdline) {
+                    Ok(out) => s.push(ConvKind::System, &out),
+                    Err(e) => s.push(ConvKind::Error, &format!("· {e}")),
+                }
+            }
+        }
+        "reexec" => {
+            // Re-exec in place, but only when idle: mid-turn this would swap
+            // the image out from under a running worker. The periodic drain
+            // already honours the same request, so refuse rather than fork a
+            // second copy that would race it.
+            if s.running || tasks_running(&s) > 0 {
+                s.push(
+                    ConvKind::System,
+                    "· /reexec only runs when idle — /cancel first, or wait for the turn",
+                );
+            } else {
+                s.push(ConvKind::System, "· reexec requested — restarting…");
+                sync_textview(widgets, &mut s);
+                crate::reexec_self();
+            }
+        }
+        "bg" | "background" | "running" => {
+            // `/bg` with no prompt lists (like the TUI's `/jobs`); with a
+            // prompt it starts a detached turn.
+            let prompt = rest.join(" ");
+            if prompt.trim().is_empty() {
+                list_jobs(&mut s);
+            } else {
+                match spawn_background(&prompt, agent_slot, providers, bus, full_auto, &mut s) {
+                    Ok(id) => s.push(
+                        ConvKind::System,
+                        &format!("· started background job #{id}: {}", truncate(&prompt, 60)),
+                    ),
+                    Err(e) => s.push(ConvKind::Error, &e),
+                }
+            }
+        }
+        "jobs" => {
+            list_jobs(&mut s);
+        }
         other => {
             // Try extension-registered slash commands.
             let mut g = agent_slot.lock().unwrap();
@@ -1230,7 +1727,7 @@ fn handle_command(
         }
     }
     drop(s);
-    sync_textview(widgets, &state.lock().unwrap());
+    sync_textview(widgets, &mut state.lock().unwrap());
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -1534,3 +2031,254 @@ mod gui_colour_tests {
         assert_eq!(complete_idle("plain"), None);
     }
 }
+
+/// Drift guards. These exist because the GUI's completion list and its
+/// `handle_command` arms are maintained by hand, and they had already drifted
+/// apart: the old list offered `/fix`, `/bg`, `/jobs` and `/shell` while the
+/// GUI implemented none of them (so Tab suggested a command that then answered
+/// "unknown command"), and it omitted `/finished` entirely.
+#[cfg(test)]
+mod gui_parity_tests {
+    use super::*;
+
+    /// Every command the GUI's `handle_command` dispatches, read out of this
+    /// file's own source so the check cannot itself go stale.
+    ///
+    /// Only top-level match arms are collected: the scan stops at the catch-all
+    /// `other =>` arm, which is the last arm of the outer match, so the inner
+    /// matches inside an arm (e.g. the `show`/`hide` toggle inside `thinking`)
+    /// are never reached.
+    fn handled_commands() -> Vec<String> {
+        let src = include_str!("gui.rs");
+        let body = src
+            .split("fn handle_command(")
+            .nth(1)
+            .expect("handle_command not found in gui.rs")
+            .split("\n        other => {")
+            .next()
+            .expect("handle_command body not found");
+        let mut out = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            // A top-level arm is written as `"a" | "b" | "c" => {` or
+            // `"a" => {`, at 8 spaces of indentation.
+            if !line.starts_with('"') || line.starts_with("            ") {
+                continue;
+            }
+            // Collect every string alternative before the `=>`.
+            let (alts, tail) = match line.find("=>") {
+                Some(i) => (&line[..i], &line[i..]),
+                None => continue,
+            };
+            let _ = tail;
+            for part in alts.split('|') {
+                let part = part.trim();
+                if let Some(inner) = part.strip_prefix('"') {
+                    if let Some(end) = inner.find('"') {
+                        out.push(inner[..end].to_string());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_completable_command_is_actually_handled() {
+        let handled = handled_commands();
+        for cmd in COMMANDS {
+            assert!(
+                handled.iter().any(|h| h == cmd),
+                "Tab offers /{cmd} but gui.rs has no handle_command arm for it.\n\
+                 Add the arm, or drop it from COMMANDS.\n\
+                 GUI currently handles: {handled:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_completable_command_exists_in_the_global_table() {
+        // `crate::commands::SLASH_COMMANDS` is generated by build.rs from the
+        // streaming REPL's dispatch, so a name in it is a real command
+        // somewhere in pir. A GUI-local name that is *not* there is either a
+        // typo or a GUI-only command that should be documented as such.
+        let global: Vec<&str> = crate::commands::SLASH_COMMANDS.to_vec();
+        for cmd in COMMANDS {
+            let with_slash = format!("/{cmd}");
+            assert!(
+                global.contains(&with_slash.as_str()),
+                "/{cmd} is completed by the GUI but is not in the generated \
+                 SLASH_COMMANDS table — it is not a real pir command"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_completion_matches_the_levels_the_parser_accepts() {
+        // `/thinking` must not offer a level `ThinkingLevel::parse` rejects,
+        // nor omit one it accepts — that was a second, subtler drift.
+        for arg in THINKING_ARGS {
+            if matches!(*arg, "show" | "hide") {
+                continue; // visibility toggles, not levels
+            }
+            assert!(
+                crate::config::ThinkingLevel::parse(arg).is_some(),
+                "/thinking offers '{arg}' but ThinkingLevel::parse rejects it"
+            );
+        }
+        for lvl in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            assert!(
+                THINKING_ARGS.contains(&lvl),
+                "/thinking does not offer the '{lvl}' level"
+            );
+        }
+    }
+
+    #[test]
+    fn gui_implements_every_tui_command_the_gui_advertises() {
+        // The TUI's canonical command set, restricted to what a graphical
+        // front-end can meaningfully offer. The GUI must handle each one; this
+        // is the "GUI supports all TUI features" guard.
+        const TUI_COMMANDS: &[&str] = &[
+            "help", "model", "models", "goal", "continue", "clear", "undo",
+            "finished", "fix", "shell", "bg", "jobs", "thinking", "cancel",
+            "reload", "reexec", "exit",
+        ];
+        let handled = handled_commands();
+        for cmd in TUI_COMMANDS {
+            assert!(
+                handled.iter().any(|h| h == cmd),
+                "the TUI supports /{cmd} but the GUI does not — add a handle_command \
+                 arm for it"
+            );
+        }
+    }
+}
+
+/// The status/footer helpers. Pure string building, so they are testable
+/// without a display.
+#[cfg(test)]
+mod gui_status_tests {
+    use super::*;
+
+    #[test]
+    fn running_status_shows_a_spinner_and_queued_count() {
+        let mut s = GuiState::new();
+        s.spinner = 0;
+        let st = running_status(&s, 0);
+        assert!(st.starts_with(SPINNER_FRAMES[0]), "got {st:?}");
+        assert!(st.contains("thinking"));
+        // No queued prompts => no queued suffix.
+        assert!(!st.contains("queued"));
+
+        let st = running_status(&s, 3);
+        assert!(st.contains("3 queued"), "got {st:?}");
+    }
+
+    #[test]
+    fn spinner_frame_advances_and_wraps() {
+        let s = GuiState::new();
+        for i in 0..SPINNER_FRAMES.len() * 2 {
+            let mut s2 = GuiState::new();
+            s2.spinner = i;
+            let expected = SPINNER_FRAMES[i % SPINNER_FRAMES.len()];
+            assert!(running_status(&s2, 0).starts_with(expected));
+        }
+        // Never panics on an out-of-range frame.
+        let mut s3 = s;
+        s3.spinner = usize::MAX;
+        let _ = running_status(&s3, 0);
+    }
+
+    #[test]
+    fn idle_status_carries_workspace_and_model_like_the_tui_footer() {
+        let mut s = GuiState::new();
+        s.last_model = Some("opencode-go/muse-spark-1.2".into());
+        let st = idle_status(&s);
+        assert!(st.starts_with("workspace: "), "got {st:?}");
+        assert!(st.contains("model: opencode-go/muse-spark-1.2"), "got {st:?}");
+    }
+
+    #[test]
+    fn idle_status_omits_model_until_it_is_known() {
+        let s = GuiState::new();
+        let st = idle_status(&s);
+        assert!(st.starts_with("workspace: "), "got {st:?}");
+        assert!(!st.contains("model: "), "model must wait for the first drain: {st:?}");
+    }
+}
+
+/// Scrollback bookkeeping. The original code kept this in a process-global
+/// `static`, which desynced every tab from every other one; these pin the
+/// per-session behaviour.
+#[cfg(test)]
+mod gui_render_cursor_tests {
+    use super::*;
+
+    #[test]
+    fn clear_resets_the_write_cursor_and_flags_a_rebuild() {
+        let mut s = GuiState::new();
+        s.push(ConvKind::System, "one\ntwo\nthree");
+        s.rendered = 3;
+        s.needs_rebuild = false;
+        s.clear();
+        assert_eq!(s.rendered, 0);
+        assert!(s.needs_rebuild, "clear must force a full buffer rebuild");
+        assert!(s.conv.is_empty());
+    }
+
+    #[test]
+    fn a_fresh_state_needs_a_rebuild() {
+        let s = GuiState::new();
+        assert!(s.needs_rebuild, "the first sync must paint the pane");
+        assert_eq!(s.rendered, 0);
+    }
+
+    #[test]
+    fn scrolling_back_keeps_the_cursor_inside_the_buffer() {
+        // Push past the 4000-line cap and check the cursor can never point past
+        // the end of the model, which is what makes an append write garbage.
+        let mut s = GuiState::new();
+        for i in 0..4200 {
+            s.push(ConvKind::System, &format!("line {i}"));
+        }
+        assert_eq!(s.conv.len(), 4000, "the cap must hold");
+        assert!(
+            s.rendered <= s.conv.len(),
+            "rendered {} > conv {} — an append would index out of range",
+            s.rendered,
+            s.conv.len()
+        );
+        assert!(s.needs_rebuild, "a trim must force a rebuild");
+
+        // Simulate having rendered everything, then overflow again.
+        s.rendered = s.conv.len();
+        s.needs_rebuild = false;
+        for i in 4200..4300 {
+            s.push(ConvKind::System, &format!("line {i}"));
+        }
+        assert!(
+            s.rendered <= s.conv.len(),
+            "cursor {} escaped the trimmed model of {}",
+            s.rendered,
+            s.conv.len()
+        );
+    }
+
+    #[test]
+    fn each_session_keeps_its_own_cursor() {
+        // The regression: two sessions, one clears, the other's cursor must be
+        // untouched. With the old process-global statics this desynced.
+        let mut a = GuiState::new();
+        let mut b = GuiState::new();
+        a.push(ConvKind::User, "a1");
+        a.push(ConvKind::User, "a2");
+        b.push(ConvKind::User, "b1");
+        a.rendered = 2;
+        b.rendered = 1;
+        a.clear();
+        assert_eq!(b.rendered, 1, "clearing session A must not touch B's cursor");
+        assert_eq!(b.conv.len(), 1);
+    }
+}
+

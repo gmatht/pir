@@ -61,6 +61,43 @@ extern "C" fn idle_once_trampoline(data: *mut c_void) -> i32 {
     0
 }
 
+/// Trampoline for a *repeating* timer. GLib keeps the source alive as long as
+/// the handler returns non-zero, so we always return 1 and the `Box` is
+/// deliberately leaked: the closure lives for the lifetime of the source, and
+/// a repeating source that outlives its callback would otherwise be a
+/// use-after-free on the next tick.
+extern "C" fn timeout_repeat_trampoline(data: *mut c_void) -> i32 {
+    if data.is_null() {
+        // Returning 0 removes the source; without a callback there is nothing
+        // left to tick.
+        return 0;
+    }
+    unsafe {
+        // Re-borrow rather than `from_raw`: the Box is intentionally leaked and
+        // must stay owned by this function for the timer's whole life.
+        let cb = &mut *(data as *mut Box<dyn FnMut()>);
+        (*cb)();
+    }
+    1 // keep repeating
+}
+
+/// Add a main-loop timer that runs `cb` every `interval_ms` milliseconds for
+/// the lifetime of the process. Returns the GLib source id, or `None` when
+/// `g_timeout_add` is unavailable.
+///
+/// The callback owns a leaked `Box`, so it runs until the process exits; this
+/// is the right lifetime for a UI poll that drives state, not for a bounded
+/// operation.
+pub fn timeout_add_recurring(
+    loader: &Arc<Loader>,
+    interval_ms: u32,
+    cb: Box<dyn FnMut()>,
+) -> Option<u32> {
+    let add = loader.symbols.g_timeout_add?;
+    let raw = Box::into_raw(Box::new(cb)) as *mut c_void;
+    Some(unsafe { add(interval_ms, Some(timeout_repeat_trampoline), raw) })
+}
+
 pub struct BoxWidget {
     inner: *mut c_void,
     loader: Arc<Loader>,
@@ -394,6 +431,42 @@ impl Button {
         if let Some(sr) = self.loader.symbols.gtk_widget_set_size_request {
             unsafe { sr(self.inner, w, h); }
         }
+    }
+
+    /// The GtkLabel child a GtkButton wraps. Returns null if the button has no
+    /// child yet, or if `gtk_bin_get_child` could not be resolved.
+    fn label_child(&self) -> *mut c_void {
+        if self.inner.is_null() { return std::ptr::null_mut(); }
+        let Some(get_child) = self.loader.symbols.gtk_bin_get_child else {
+            return std::ptr::null_mut();
+        };
+        let child = unsafe { get_child(self.inner) };
+        if child.is_null() { std::ptr::null_mut() } else { child }
+    }
+
+    /// Replace the button's caption, preserving its styling.
+    ///
+    /// A GtkButton's label is a real child GtkLabel, so this mutates that child
+    /// rather than calling `gtk_button_set_label` — that keeps any CSS classes
+    /// already applied to the label (e.g. a red close button) intact.
+    pub fn set_text(&self, text: &str) {
+        let child = self.label_child();
+        if child.is_null() { return; }
+        if let Some(set_text) = self.loader.symbols.gtk_label_set_text {
+            let Ok(c) = std::ffi::CString::new(text) else { return; };
+            unsafe { set_text(child, c.as_ptr()); }
+        }
+    }
+
+    /// The button's current caption, or `None` if it has no label child.
+    pub fn get_text(&self) -> Option<String> {
+        let child = self.label_child();
+        if child.is_null() { return None; }
+        let get_text = self.loader.symbols.gtk_label_get_text?;
+        let s = unsafe { get_text(child) };
+        if s.is_null() { return None; }
+        let c = unsafe { std::ffi::CStr::from_ptr(s) };
+        Some(c.to_string_lossy().into_owned())
     }
 
     pub fn set_visible(&self, visible: bool) {
@@ -3342,6 +3415,75 @@ impl TextView {
         guard_widget!(self, "TextView", "set_wrap_mode");
         if let Some(set_wrap) = self.loader.symbols.gtk_text_view_set_wrap_mode {
             unsafe { set_wrap(self.inner, wrap_mode); }
+        }
+    }
+
+    /// Make the view read-only (`editable = false`) or writable again.
+    pub fn set_editable(&self, editable: bool) {
+        guard_widget!(self, "TextView", "set_editable");
+        if let Some(set_ed) = self.loader.symbols.gtk_text_view_set_editable {
+            unsafe { set_ed(self.inner, if editable { 1 } else { 0 }); }
+        }
+    }
+
+    /// Whether the view currently accepts typed input.
+    pub fn get_editable(&self) -> bool {
+        guard_widget_or!(self, "TextView", "get_editable", false);
+        match self.loader.symbols.gtk_text_view_get_editable {
+            Some(get_ed) => unsafe { get_ed(self.inner) != 0 },
+            None => false,
+        }
+    }
+
+    /// Whether this widget can take keyboard focus.
+    pub fn get_can_focus(&self) -> bool {
+        guard_widget_or!(self, "TextView", "get_can_focus", false);
+        match self.loader.symbols.gtk_widget_get_can_focus {
+            Some(get_cf) => unsafe { get_cf(self.inner) != 0 },
+            None => false,
+        }
+    }
+
+    /// Set whether this widget may take keyboard focus.
+    pub fn set_can_focus(&self, can: bool) {
+        guard_widget!(self, "TextView", "set_can_focus");
+        if let Some(f) = self.loader.symbols.gtk_widget_set_can_focus {
+            unsafe { f(self.inner, if can { 1 } else { 0 }); }
+        }
+    }
+
+    /// Append `text` to the end of the buffer, leaving existing text intact.
+    ///
+    /// Unlike `set_text`, which goes through `gtk_text_buffer_set_text` and
+    /// therefore *replaces* the whole buffer, this inserts at the end iter. An
+    /// incremental renderer (append a line per tick) needs that distinction:
+    /// calling `set_text` per line would leave only the last line visible.
+    pub fn append_text(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        guard_widget!(self, "TextView", "append_text");
+        let symbols = &self.loader.symbols;
+        let (Some(get_buf), Some(get_end), Some(insert)) = (
+            symbols.gtk_text_view_get_buffer,
+            symbols.gtk_text_buffer_get_end_iter,
+            symbols.gtk_text_buffer_insert,
+        ) else {
+            return;
+        };
+        unsafe {
+            let buf = get_buf(self.inner);
+            if buf.is_null() {
+                return;
+            }
+            // GtkTextIter is opaque; the rest of this file sizes it generously.
+            let mut end_iter: [u8; 256] = [0; 256];
+            get_end(buf, end_iter.as_mut_ptr() as *mut c_void);
+            // Interior NULs cannot cross the C boundary; drop them rather than
+            // truncating the line at the first one.
+            let sanitized: String = text.chars().filter(|&c| c != '\0').collect();
+            let Ok(c) = CString::new(sanitized) else { return };
+            insert(buf, end_iter.as_mut_ptr() as *mut c_void, c.as_ptr(), -1);
         }
     }
 

@@ -395,6 +395,7 @@ impl App {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::create_box(orientation, spacing, parent)
     }
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_tabview(&self) -> Result<crate::backends_nwg_adapter::TabView, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::TabView::new(parent)

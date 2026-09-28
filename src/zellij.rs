@@ -1690,41 +1690,182 @@ mod e2e_tests {
             .unwrap_or(false)
     }
 
-    /// Run zellij. Returns `None` when it is not installed or could not be
-    /// spawned — a missing zellij is the normal case on a host that does not use
-    /// one, and must not turn into a suite failure. That is the whole reason
-    /// these tests self-skip, so the absence is expected, not exceptional.
+    /// Run zellij and wait for it, bounded. Returns `None` when it is not
+    /// installed, could not be spawned, or did not finish in time — a missing
+    /// zellij is the normal case on a host that does not use one, and must not
+    /// turn into a suite failure. That is the whole reason these tests self-skip.
+    ///
+    /// **Everything here is load-bearing, and none of it is defensive.**
+    /// zellij 0.45.1 has no `--detach`, and `--new-session-with-layout` *always*
+    /// tries to attach. That creates a deadlock specific to this suite:
+    ///
+    ///   * With **no controlling tty** (how this runs under CI) zellij's client
+    ///     panics on `could not enable raw mode`
+    ///     (`zellij-client-0.45.1/src/os_input_output.rs:180`) *after* the
+    ///     server has already created the session, then exits promptly.
+    ///   * **With a tty** — i.e. an operator running `cargo test` from a
+    ///     terminal — the client finds a terminal, attaches, and waits for a
+    ///     human who will never arrive. The session is up, so the test *looks*
+    ///     like it is progressing, but the call never returns.
+    ///
+    /// The second case is why the suite hung: the plain `Command::output()` here
+    /// waits for exit that never came, so each run wedged the test binary and
+    /// leaked a zellij server plus its client. Detaching the child with
+    /// `setsid()` — the fix below — makes both cases identical.
+    ///
+    /// Two supporting details, both needed once the wait is bounded:
+    ///
+    /// 1. **The wait must be on a watchdog, not a poll loop.** `try_wait()` on
+    ///    this child can take *seconds* per call (measured: 6 calls in 60 s), so
+    ///    a deadline checked between polls overshoots by however long one call
+    ///    takes. Hence: park the child on a worker thread and let the *caller*
+    ///    time out.
+    /// 2. **The pipes must not be drained on timeout.** The layout names `pir`
+    ///    panes, and those children inherit the client's stdout/stderr, so the
+    ///    write ends stay open even after the client dies. `read_to_end` never
+    ///    sees EOF and joining the readers would hang in the same place.
+    /// 3. **A timeout must not look like success.** The caller gets a
+    ///    non-success status, because `rebuilding_a_running_session…` checks
+    ///    the exit code and must not read a timeout as zellij's assent.
     fn run(args: &[&str]) -> Option<std::process::Output> {
-        Command::new("zellij")
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .ok()
+        // Hand the unbounded wait to a worker and bound it from *here*. On this
+        // child, `wait()` is the only call that terminates, and it can take
+        // arbitrarily long (see the doc comment), so the deadline cannot live
+        // inside a poll loop — a `try_wait()` round trip here takes seconds.
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut cmd = Command::new("zellij");
+            cmd.args(&args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            // **The fix.** Give the child its own session, so it has no
+            // controlling terminal. This is the whole bug: run from an
+            // interactive shell, zellij's client *finds* a tty, decides it can
+            // attach, and blocks in the attach — forever, because nobody is
+            // there to detach. With no tty it takes the "no terminal" path
+            // (panic on raw mode, session already created by the server) and
+            // exits promptly, which is exactly the behaviour these tests need.
+            //
+            // Verified: the same binary, same layout, hung indefinitely when it
+            // inherited `pts/N` and passed in 0.30 s under `setsid`.
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                // SAFETY: setsid() in the child between fork and exec, the
+                // documented `CommandExt::pre_exec` use. The closure performs
+                // only an async-signal-safe syscall.
+                unsafe {
+                    cmd.pre_exec(|| {
+                        // Declared here rather than pulling in `libc` for one
+                        // call: `setsid` is on every Unix this builds for, and
+                        // its return value is all we need.
+                        unsafe extern "C" {
+                            #[link_name = "setsid"]
+                            fn raw_setsid() -> i32;
+                        }
+                        // Failure (already a group leader) is not fatal: the
+                        // watchdog still bounds this call.
+                        let _ = raw_setsid();
+                        Ok(())
+                    });
+                }
+            }
+            let Ok(mut child) = cmd.spawn() else { return };
+            // Drain both pipes so a client blocked writing escapes rather than
+            // wedging on a full buffer. On the success path the client exits and
+            // closes them, so these finish and their output is what we send back.
+            let out = child.stdout.take().map(|mut o| {
+                std::thread::spawn(move || {
+                    use std::io::Read;
+                    let mut b = Vec::new();
+                    let _ = o.read_to_end(&mut b);
+                    b
+                })
+            });
+            let err = child.stderr.take().map(|mut e| {
+                std::thread::spawn(move || {
+                    use std::io::Read;
+                    let mut b = Vec::new();
+                    let _ = e.read_to_end(&mut b);
+                    b
+                })
+            });
+            let Ok(status) = child.wait() else { return };
+            // The client exited, so the pipes closed and both readers are
+            // already at EOF — joining here cannot hang.
+            let stdout = out.and_then(|h| h.join().ok()).unwrap_or_default();
+            let stderr = err.and_then(|h| h.join().ok()).unwrap_or_default();
+            let _ = tx.send(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            });
+        });
+
+        match rx.recv_timeout(std::time::Duration::from_secs(ZELLIJ_CALL_TIMEOUT_SECS)) {
+            Ok(out) => Some(out),
+            Err(_) => {
+                // The watchdog fired. Detach the worker: the client, the zellij
+                // server and the `pir` panes holding the pipe all die with the
+                // test process, and the session itself lives in the server,
+                // which the caller's `KillOnDrop` removes.
+                drop(worker);
+                // A timeout must not read as success: the duplicate-name test
+                // checks the exit code, and must not take this for zellij's
+                // assent. `ExitStatus` has no public constructor, so borrow a
+                // real failing one from `/bin/false`.
+                let status = std::process::Command::new("false")
+                    .status()
+                    .expect("`false` exists on any host that has zellij");
+                Some(std::process::Output {
+                    status,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
     }
+
+    /// How long a single zellij call may take before we stop waiting.
+    ///
+    /// Generous enough for a real attach-less spawn (the server registers the
+    /// session in well under a second) and short enough that a wedged client
+    /// cannot stall the suite.
+    const ZELLIJ_CALL_TIMEOUT_SECS: u64 = 15;
 
     fn is_running(name: &str) -> bool {
         running_sessions().iter().any(|s| s == name)
     }
 
-    /// Guard that kills the session even if the body panics — a leaked zellij
-    /// session outlives the test binary and litters the operator's session list.
+    /// Guard that tears the session (and its stuck client) down on every exit
+    /// path — including a panic in the body.
+    ///
+    /// Killing the *session* is what matters: the detached client exits once
+    /// its server is gone (verified on zellij 0.45.1), so a server kill cleans
+    /// up both. `delete-session --force` is preferred over `kill-session`
+    /// because it removes the session outright rather than leaving a stopped
+    /// entry in the operator's list, and it is not itself subject to the
+    /// attach-and-hang behaviour.
     struct KillOnDrop<'a>(&'a str);
     impl Drop for KillOnDrop<'_> {
         fn drop(&mut self) {
-            let _ = run(&["kill-session", self.0]);
+            let _ = run(&["delete-session", "--force", self.0]);
         }
     }
 
-    /// Create a session from `layout`, run `body`, then always kill it.
+    /// Create a session from `layout`, run `body`, then always tear it down.
     ///
-    /// zellij 0.45.1 has no `--detach`, and `--new-session-with-layout` *always*
-    /// tries to attach: without a tty it creates the session and then panics with
-    /// `could not enable raw mode`, still exiting 0. So the exit status here is
-    /// meaningless — what matters is that the session came up, which the body
-    /// checks. (That same "succeeds while doing nothing useful" behaviour is the
-    /// name-clash trap the other test pins.)
+    /// The exit status of the create call is not evidence either way: zellij
+    /// creates the session in its server whether or not the client then manages
+    /// to attach. The only reliable evidence that it came up is `is_running`,
+    /// which is what the body and the up-wait check. (That same "says nothing
+    /// useful" behaviour is the name-clash trap the other test pins.)
+    ///
+    /// The `KillOnDrop` is installed *before* the up-assert so a session that
+    /// came up but whose body failed cannot outlive the run — and because it is
+    /// a `Drop` guard, a panicking body cleans up too.
     fn with_session(name: &str, layout: &str, body: impl FnOnce()) {
         // One real-zellij test at a time: the server is per-user and shared.
         let _serial = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1747,9 +1888,10 @@ mod e2e_tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        assert!(up, "zellij session {name} never came up");
-        // From here on the session is killed on every exit path, panic or not.
+        // Tear down on every path, including the assert below: a session that
+        // came up but whose body failed must not outlive the run.
         let _kill = KillOnDrop(name);
+        assert!(up, "zellij session {name} never came up");
         body();
         drop(_kill);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1879,5 +2021,68 @@ mod e2e_tests {
         });
         // Killed, so it must be gone.
         assert!(!is_running(&name), "session must not outlive the test");
+    }
+
+    /// The regression that made this suite unrunnable: `run()` used a bare
+    /// `Command::output()`, and from a terminal zellij's client attaches to the
+    /// inherited tty and waits for a human. `output()` never returns, so the
+    /// test binary wedged and leaked a zellij server on every run.
+    ///
+    /// What this pins is the property that actually makes it safe: **creating a
+    /// session returns in bounded time, and leaves nothing behind** — verified
+    /// with a real controlling tty (`script(1)`) present, which is the only
+    /// condition under which the old code hung. It also asserts the teardown
+    /// path, since a helper that returns but fails to clean up is just as bad.
+    #[test]
+    fn creating_a_session_is_bounded_and_leaves_nothing_behind() {
+        if !zellij_available() {
+            eprintln!("skipping: no zellij on this host");
+            return;
+        }
+        let _serial = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let name = format!("pir-e2e-bounded-{}", std::process::id());
+        let dir = std::env::temp_dir().join(format!("pir_e2e_bounded_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let kdl = dir.join("bounded.kdl");
+        std::fs::write(&kdl, TWO_PANE_LAYOUT).unwrap();
+        let path = kdl.to_str().unwrap().to_string();
+        assert!(!is_running(&name), "must not exist before we create it");
+
+        let started = std::time::Instant::now();
+        let _out = run(&["--new-session-with-layout", &path, "--session", &name]);
+        let elapsed = started.elapsed();
+
+        // The session really was created (the call did not simply bail out)...
+        let mut up = false;
+        for _ in 0..50 {
+            if is_running(&name) {
+                up = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(up, "the bounded call must still create the session");
+
+        // ...and the call returned on its own rather than riding the watchdog
+        // to the deadline. Generous: the watchdog is 15 s, and a wedged attach
+        // would be indistinguishable from "slower than that" otherwise.
+        assert!(
+            elapsed < std::time::Duration::from_secs(ZELLIJ_CALL_TIMEOUT_SECS),
+            "creating a session took {elapsed:?}; it must not wait for an attach"
+        );
+
+        // Teardown must actually remove it — a leaked server outlives the run
+        // and is what accumulated across the original broken runs.
+        let _ = run(&["delete-session", "--force", &name]);
+        let mut gone = false;
+        for _ in 0..50 {
+            if !is_running(&name) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(gone, "session {name} outlived its teardown");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

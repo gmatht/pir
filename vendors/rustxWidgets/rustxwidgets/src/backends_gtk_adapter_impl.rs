@@ -217,6 +217,8 @@ mod gtk_adapter {
         }
 
         pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
+        pub fn get_text(&self) -> Option<String> { self.0.get_text() }
+        pub fn set_text(&self, text: &str) { self.0.set_text(text); }
         pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
@@ -646,6 +648,11 @@ mod gtk_adapter {
     impl TextView {
         pub fn set_text(&self, text: &str) { self.0.set_text(text); }
         pub fn get_text(&self) -> Option<String> { self.0.get_text() }
+        pub fn append_text(&self, text: &str) { self.0.append_text(text); }
+        pub fn set_editable(&self, editable: bool) { self.0.set_editable(editable); }
+        pub fn get_editable(&self) -> bool { self.0.get_editable() }
+        pub fn get_can_focus(&self) -> bool { self.0.get_can_focus() }
+        pub fn set_can_focus(&self, can_focus: bool) { self.0.set_can_focus(can_focus); }
         pub fn set_wrap_mode(&self, wrap_mode: i32) { self.0.set_wrap_mode(wrap_mode); }
         pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }

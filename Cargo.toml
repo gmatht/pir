@@ -73,7 +73,10 @@ comrak-backend = ["dep:comrak"]
 # (pancurses) REPL. These require rustxWidgets to be present (see the comment
 # above the [dependencies] block) — they are intentionally NOT in this repo, so
 # `gui` / `pancurses` are opt-in and absent from the default build.
-gui = ["dep:rustxwidgets"]
+# `gui` must forward `rustxwidgets/gtk`: every GTK path in src/gui.rs is gated on
+# that feature, and without it rustxwidgets' backend-priority chain resolves no
+# backend at all, so App::init() fails for every platform.
+gui = ["dep:rustxwidgets", "rustxwidgets/gtk"]
 pancurses = ["dep:rustxwidgets", "rustxwidgets/pancurses"]
 
 [profile.release]

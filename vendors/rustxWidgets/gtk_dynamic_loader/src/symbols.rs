@@ -18,6 +18,7 @@ pub type GSignalEmitByName = unsafe extern "C" fn(instance: *mut c_void, detaile
 pub type GtkWindowNew = unsafe extern "C" fn(window_type: i32) -> *mut c_void;
 pub type GtkWindowSetTitle = unsafe extern "C" fn(window: *mut c_void, title: *const i8);
 pub type GtkButtonNewWithLabel = unsafe extern "C" fn(label: *const i8) -> *mut c_void;
+pub type GtkBinGetChild = unsafe extern "C" fn(bin: *mut c_void) -> *mut c_void;
 pub type GtkLabelNew = unsafe extern "C" fn(str: *const i8) -> *mut c_void;
 pub type GtkLabelSetText = unsafe extern "C" fn(label: *mut c_void, str: *const i8);
 pub type GtkLabelGetText = unsafe extern "C" fn(label: *mut c_void) -> *const i8;
@@ -164,6 +165,7 @@ pub type GtkRadioButtonNewWithLabel = unsafe extern "C" fn(group: *mut c_void, l
 pub type GtkTextViewNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkTextBufferNew = unsafe extern "C" fn(table: *mut c_void) -> *mut c_void;
 pub type GtkTextViewGetBuffer = unsafe extern "C" fn(text_view: *mut c_void) -> *mut c_void;
+pub type GTimeoutAdd = unsafe extern "C" fn(interval_ms: u32, func: Option<unsafe extern "C" fn(*mut c_void) -> i32>, data: *mut c_void) -> u32;
 pub type GtkTextBufferSetText = unsafe extern "C" fn(buffer: *mut c_void, text: *const i8, len: i32);
 pub type GtkTextBufferGetText = unsafe extern "C" fn(buffer: *mut c_void, start: *mut c_void, end: *mut c_void, include_hidden_chars: i32) -> *mut c_void;
 pub type GtkTextBufferGetStartIter = unsafe extern "C" fn(buffer: *mut c_void, iter: *mut c_void);
@@ -171,6 +173,11 @@ pub type GtkTextBufferGetEndIter = unsafe extern "C" fn(buffer: *mut c_void, ite
 pub type GtkTextIterCopy = unsafe extern "C" fn(iter: *mut c_void) -> *mut c_void;
 pub type GtkTextIterFree = unsafe extern "C" fn(iter: *mut c_void);
 pub type GtkTextViewSetWrapMode = unsafe extern "C" fn(text_view: *mut c_void, wrap_mode: i32);
+/// Append `text` at `iter` and return the iter just past the inserted text.
+pub type GtkTextBufferInsert = unsafe extern "C" fn(buffer: *mut c_void, iter: *mut c_void, text: *const i8, len: i32) -> *mut c_void;
+pub type GtkTextViewSetEditable = unsafe extern "C" fn(text_view: *mut c_void, editable: i32);
+pub type GtkTextViewGetEditable = unsafe extern "C" fn(text_view: *mut c_void) -> i32;
+pub type GtkWidgetGetCanFocus = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 
 // GtkWidget helper for visibility/event handling
 pub type GtkWidgetSetCanFocus = unsafe extern "C" fn(widget: *mut c_void, can_focus: i32);
@@ -293,6 +300,9 @@ pub struct Symbols {
     pub gtk_window_new: Option<GtkWindowNew>,
     pub gtk_window_set_title: Option<GtkWindowSetTitle>,
     pub gtk_button_new_with_label: Option<GtkButtonNewWithLabel>,
+    /// `gtk_bin_get_child` — lets a container read its single child, so a
+    /// GtkButton's internal GtkLabel can be reached without new widget types.
+    pub gtk_bin_get_child: Option<GtkBinGetChild>,
     pub gtk_label_new: Option<GtkLabelNew>,
     pub gtk_label_set_text: Option<GtkLabelSetText>,
     pub gtk_label_get_text: Option<GtkLabelGetText>,
@@ -373,6 +383,9 @@ pub struct Symbols {
     pub gtk_init: Option<GtkInit>,
     pub g_signal_emit_by_name: Option<GSignalEmitByName>,
     pub g_idle_add: Option<unsafe extern "C" fn(func: Option<unsafe extern "C" fn(*mut c_void) -> i32>, data: *mut c_void) -> u32>,
+    /// `g_timeout_add` — a repeating main-loop timer. The callback must return
+    /// 1 (true) to keep repeating, 0 (false) to stop.
+    pub g_timeout_add: Option<GTimeoutAdd>,
     // pango (optional)
     pub pango_layout_new: Option<unsafe extern "C" fn(context: *mut c_void) -> *mut c_void>,
     pub pango_layout_set_text: Option<unsafe extern "C" fn(layout: *mut c_void, text: *const i8, len: i32)>,
@@ -466,6 +479,10 @@ pub struct Symbols {
     pub gtk_text_iter_copy: Option<GtkTextIterCopy>,
     pub gtk_text_iter_free: Option<GtkTextIterFree>,
     pub gtk_text_view_set_wrap_mode: Option<GtkTextViewSetWrapMode>,
+    pub gtk_text_buffer_insert: Option<GtkTextBufferInsert>,
+    pub gtk_text_view_set_editable: Option<GtkTextViewSetEditable>,
+    pub gtk_text_view_get_editable: Option<GtkTextViewGetEditable>,
+    pub gtk_widget_get_can_focus: Option<GtkWidgetGetCanFocus>,
 
     // Widget helpers
     pub gtk_widget_set_hexpand: Option<GtkWidgetSetHexpand>,
@@ -582,6 +599,7 @@ impl Symbols {
         let gtk_window_new = unsafe { sym::<GtkWindowNew>(gtk, "gtk_window_new") };
         let gtk_window_set_title = unsafe { sym::<GtkWindowSetTitle>(gtk, "gtk_window_set_title") };
         let gtk_button_new_with_label = unsafe { sym::<GtkButtonNewWithLabel>(gtk, "gtk_button_new_with_label") };
+        let gtk_bin_get_child = unsafe { sym::<GtkBinGetChild>(gtk, "gtk_bin_get_child") };
         let gtk_label_new = unsafe { sym::<GtkLabelNew>(gtk, "gtk_label_new") };
         let gtk_label_set_text = unsafe { sym::<GtkLabelSetText>(gtk, "gtk_label_set_text") };
         let gtk_label_get_text = unsafe { sym::<GtkLabelGetText>(gtk, "gtk_label_get_text") };
@@ -639,6 +657,7 @@ impl Symbols {
         let gtk_init = unsafe { sym::<GtkInit>(gtk, "gtk_init") };
         let g_signal_emit_by_name = unsafe { sym::<GSignalEmitByName>(gobject, "g_signal_emit_by_name") };
         let g_idle_add = unsafe { sym::<unsafe extern "C" fn(func: Option<unsafe extern "C" fn(*mut c_void) -> i32>, data: *mut c_void) -> u32>(glib, "g_idle_add") };
+        let g_timeout_add = unsafe { sym::<GTimeoutAdd>(glib, "g_timeout_add") };
         // pango symbols are optional; we try to resolve them from the gtk lib too (some symbols may be available)
         let pango_layout_new = None;
         let pango_layout_set_text = None;
@@ -774,6 +793,10 @@ impl Symbols {
         let gtk_text_iter_copy = unsafe { sym::<GtkTextIterCopy>(gtk, "gtk_text_iter_copy") };
         let gtk_text_iter_free = unsafe { sym::<GtkTextIterFree>(gtk, "gtk_text_iter_free") };
         let gtk_text_view_set_wrap_mode = unsafe { sym::<GtkTextViewSetWrapMode>(gtk, "gtk_text_view_set_wrap_mode") };
+        let gtk_text_buffer_insert = unsafe { sym::<GtkTextBufferInsert>(gtk, "gtk_text_buffer_insert") };
+        let gtk_text_view_set_editable = unsafe { sym::<GtkTextViewSetEditable>(gtk, "gtk_text_view_set_editable") };
+        let gtk_text_view_get_editable = unsafe { sym::<GtkTextViewGetEditable>(gtk, "gtk_text_view_get_editable") };
+        let gtk_widget_get_can_focus = unsafe { sym::<GtkWidgetGetCanFocus>(gtk, "gtk_widget_get_can_focus") };
 
         // Widget helpers
         let gtk_widget_set_hexpand = unsafe { sym::<GtkWidgetSetHexpand>(gtk, "gtk_widget_set_hexpand") };
@@ -826,7 +849,7 @@ impl Symbols {
         Ok(Symbols {
             g_main_loop_new, g_main_loop_run, g_main_loop_quit,
             g_object_ref, g_object_unref, g_object_ref_sink, g_signal_connect_data, g_signal_connect,
-            gtk_window_new, gtk_window_set_title, gtk_button_new_with_label, gtk_label_new, gtk_label_set_text,
+            gtk_window_new, gtk_window_set_title, gtk_button_new_with_label, gtk_bin_get_child, gtk_label_new, gtk_label_set_text,
             gtk_box_new, gtk_box_append, gtk_box_pack_start, gtk_container_add, gtk_container_remove, gtk_window_set_child,
             gtk_widget_show_all, gtk_window_present,
             gtk_grid_new, gtk_grid_attach, gtk_entry_new, gtk_entry_set_text, gtk_entry_get_text,
@@ -842,7 +865,7 @@ impl Symbols {
             gtk_label_get_text,
             gtk_entry_set_editable,
             gtk_drawing_area_new,
-            g_idle_add,
+            g_idle_add, g_timeout_add,
             pango_layout_new, pango_layout_set_text, pango_layout_get_size,
             cairo_create, cairo_font_face_destroy,
             cairo_move_to, cairo_set_source_rgb, cairo_set_source_rgba, cairo_rectangle, cairo_fill, cairo_stroke, cairo_set_line_width, cairo_select_font_face, cairo_set_font_size, cairo_show_text,
@@ -879,7 +902,7 @@ impl Symbols {
             gtk_drop_down_new, gtk_drop_down_set_selected, gtk_drop_down_get_selected, gtk_string_list_new,
             gtk_check_button_new_with_label, gtk_check_button_get_active, gtk_check_button_set_active, gtk_check_button_set_group, gtk_toggle_button_get_active, gtk_toggle_button_set_active,
             gtk_radio_button_new_with_label,
-            gtk_text_view_new, gtk_text_buffer_new, gtk_text_view_get_buffer, gtk_text_buffer_set_text, gtk_text_buffer_get_text, gtk_text_buffer_get_start_iter, gtk_text_buffer_get_end_iter, gtk_text_iter_copy, gtk_text_iter_free, gtk_text_view_set_wrap_mode,
+            gtk_text_view_new, gtk_text_buffer_new, gtk_text_view_get_buffer, gtk_text_buffer_set_text, gtk_text_buffer_get_text, gtk_text_buffer_get_start_iter, gtk_text_buffer_get_end_iter, gtk_text_iter_copy, gtk_text_iter_free, gtk_text_view_set_wrap_mode, gtk_text_buffer_insert, gtk_text_view_set_editable, gtk_text_view_get_editable, gtk_widget_get_can_focus,
             gtk_widget_set_hexpand, gtk_widget_set_vexpand,
             gtk_widget_get_hexpand, gtk_widget_get_vexpand,
             gtk_editable_get_text, gtk_editable_set_text, gtk_editable_set_position, gtk_editable_select_region,
