@@ -404,10 +404,10 @@ impl StopDecision {
 }
 
 /// How many auto-nudges a turn may spend before giving up and ending it: each
-/// text-only answer costs one model call, so the cap also caps the spend. 8
-/// gives the model seven chances to comply after the first miss and still
+/// text-only answer costs one model call, so the cap also caps the spend. 16
+/// gives the model fifteen chances to comply after the first miss and still
 /// keeps a stuck turn to a handful of cheap calls.
-pub const STOP_NUDGE_MAX: usize = 8;
+pub const STOP_NUDGE_MAX: usize = 16;
 
 /// What `load_session` restored. The REPL (and `/fg`/`/resume`) renders
 /// [`SessionResume::banner`] so `-r` makes it clear which session came back,
