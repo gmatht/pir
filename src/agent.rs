@@ -206,6 +206,9 @@ pub struct Agent {
     /// Auto-nudges used in the current turn (reset each turn; bounded by
     /// [`STOP_NUDGE_MAX`], which is `usize::MAX` — i.e. unbounded — by default).
     stop_nudges: usize,
+    /// Consecutive stalled (empty) responses retried in the current turn. Reset
+    /// by the turn loop as soon as a real answer arrives, and by `begin_turn`.
+    stall_retries: usize,
     /// Test-only: how many times a *terminal* nudge notice fired — either
     /// "already nudged" or "no request_stop after N nudge(s)". Both are
     /// observable only through terminal output, which a quiet agent suppresses
@@ -456,8 +459,7 @@ pub enum NudgeVerdict {
 }
 
 impl Agent {
-    /// Decide what a text-only answer means: nudge again, or end the turn.
-    ///
+    /// Decide what a text-only answer means: nudge again, or end the turn.    ///
     /// `nudges_used` is the count *before* this decision and `nudged_this_turn`
     /// records whether this turn has already spent a nudge. The budget check is
     /// first so a spent budget reports as such even if the turn also nudged.
@@ -477,7 +479,52 @@ impl Agent {
             NudgeVerdict::Nudge
         }
     }
+
+    /// Whether a response carried no answer at all — the parsers' stalled-stream
+    /// marker, and nothing else.
+    ///
+    /// Both parsers synthesise exactly `Block::Text("(empty response)")`, alone,
+    /// when a response yields neither text nor tool calls (see `provider.rs`).
+    /// Matching that exact single block is deliberately narrow: a model that
+    /// genuinely writes the words "(empty response)" *and* something else, or
+    /// that emits reasoning alongside it, is not a stall and must be treated as
+    /// the normal answer it is.
+    /// Test-only: every text block in history, for assertions that must not
+    /// depend on `last_reply_text`'s "last non-empty" walk (which a nudge echo
+    /// can shadow).
+    #[cfg(test)]
+    pub fn transcript_texts(&self) -> Vec<String> {
+        self.history
+            .iter()
+            .filter(|m| m.role == crate::types::Role::Assistant)
+            .map(|m| m.text())
+            .collect()
+    }
+
+    /// Test-only: whether any assistant text in history contains `needle`.
+    #[cfg(test)]
+    pub fn transcript_contains(&self, needle: &str) -> bool {
+        self.transcript_texts().iter().any(|t| t.contains(needle))
+    }
+
+    pub fn is_stalled_response(msg: &Message) -> bool {
+        msg.blocks.len() == 1
+            && matches!(
+                msg.blocks.first(),
+                Some(Block::Text(t)) if t.trim() == "(empty response)"
+            )
+    }
 }
+
+/// How many consecutive stalled (empty) responses are retried before giving up.
+///
+/// A stall is a *transport* failure — a dropped connection, a truncated SSE
+/// body, an empty completion — not the model declining to answer, so it must not
+/// end a working turn. Three is enough to ride out a transient blip without
+/// hiding a provider that is genuinely down (the retry notices make that
+/// visible, and the loop detector still applies once real-but-repeating text
+/// arrives).
+pub const MAX_STALL_RETRIES: usize = 3;
 
 /// What `load_session` restored. The REPL (and `/fg`/`/resume`) renders
 /// [`SessionResume::banner`] so `-r` makes it clear which session came back,
@@ -972,6 +1019,7 @@ impl Agent {
             last_stop: None,
             stop_nudges: 0,
             stop_nudged_this_turn: false,
+            stall_retries: 0,
             #[cfg(test)]
             stop_nudge_notices: 0,
             stop_nudged_for_prompt: None,
@@ -3313,6 +3361,45 @@ impl Agent {
                 .into_iter()
                 .map(|(id, name, input)| (id.to_string(), name.to_string(), input.clone()))
                 .collect();
+
+            // A **stalled stream** is not an answer.
+            //
+            // The parsers synthesise `Block::Text("(empty response)")` when a
+            // response yields neither text nor tool calls (see `provider.rs`) —
+            // which is what a dropped connection, a truncated SSE body, or an
+            // empty completion looks like from here. Downstream it is
+            // indistinguishable from a real text-only answer, so the nudge path
+            // used to treat it as "the model answered without calling
+            // request_stop": it nudged once, saw a second stall, took the
+            // already-nudged branch and *ended the turn* — reporting "turn done"
+            // on a turn the model never finished, with the working turn's
+            // progress silently abandoned. Reported as "why did it stop? I don't
+            // see a stop request from the model".
+            //
+            // Retry it instead, on the same budget as any other transport
+            // failure. A *real* empty answer is caught by the loop detector's
+            // text signal once the model repeats itself, so this cannot spin.
+            if calls.is_empty() && Self::is_stalled_response(&assistant) {
+                self.stall_retries += 1;
+                if self.stall_retries > MAX_STALL_RETRIES {
+                    let tried = self.stall_retries - 1;
+                    self.stall_retries = 0;
+                    self.mark_status(SessionStatus::Interrupted, self.goal_pending(), "empty stream");
+                    return Err(format!(
+                        "the model produced no response ({tried} empty stream(s) in a row) — \
+                         the provider or connection is dropping the response, not answering"
+                    ));
+                }
+                if !self.silent() {
+                    term::out(&term::dim(&format!(
+                        "· empty response from the model — retrying ({}/{})",
+                        self.stall_retries,
+                        MAX_STALL_RETRIES
+                    )));
+                }
+                continue;
+            }
+            self.stall_retries = 0;
 
             // Runaway-loop detection: if the model re-issues the *identical*
             // tool-call batch, or repeats the *same* text output while NOT
@@ -6278,6 +6365,67 @@ mod real_turn_nudge_tests {
         .expect("agent")
     }
 
+    /// A **stalled stream** must not silently end the turn.
+    ///
+    /// The reported symptom: a long working turn ended with no `request_stop`
+    /// from the model and no explanation. The transcript showed the last
+    /// assistant message as `(empty response)` — the marker the parsers
+    /// synthesise when a stream yields nothing at all (`provider.rs`). Two
+    /// things conspired:
+    ///
+    /// * the loop detector *skips* empty observations by design (so a stall
+    ///   cannot trip it), and
+    /// * the nudge path saw a text-only answer, nudged once, then took the
+    ///   already-nudged branch — which ended the turn.
+    ///
+    /// So two stalls in a row ended a live turn, silently and reported as
+    /// "turn done", with the model never having asked to stop. A stalled stream
+    /// is a *transport* failure, not the model declining to call `request_stop`:
+    /// it must never be counted as the model's answer.
+    #[test]
+    fn a_stalled_stream_does_not_silently_end_the_turn() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os("PIR_FAKE_MODEL");
+        // SAFETY: test-local env mutation under the shared env lock.
+        unsafe { std::env::set_var("PIR_FAKE_MODEL", "1"); }
+        let mut a = quiet_fake_agent();
+        // Stall twice, then answer: the flaky-connection shape. Before the fix
+        // the first stall was nudged, the second took the already-nudged branch
+        // and the turn ended — reporting "turn done" with no answer and no stop.
+        let res = a.turn("FAKE: empty 2");
+        let nudges = a.stop_nudges;
+        let notices = a.stop_nudge_notices;
+        match old {
+            Some(v) => unsafe { std::env::set_var("PIR_FAKE_MODEL", v) },
+            None => unsafe { std::env::remove_var("PIR_FAKE_MODEL") },
+        }
+        assert!(res.is_ok(), "the turn errored: {:?}", res.err());
+        // It must NOT be reported as a completed turn: the model never asked to
+        // stop, so this is a stalled turn, not a finished one.
+        assert_ne!(
+            a.last_stop(),
+            Some(super::StopDecision::Complete),
+            "a stalled stream must not be reported as a completed turn"
+        );
+        // A stall is a *transport* failure, not the model declining to call
+        // `request_stop`, so it must be retried rather than answered. The proof
+        // the retry happened: the turn survived the stalls and finished on the
+        // model's real answer. (Exactly one nudge is correct here — it is spent
+        // on that real answer, not on a stall.)
+        assert_eq!(notices, 0, "no nudge notice should be printed");
+        // And the turn really did finish on the model's answer once the stream
+        // recovered — i.e. the retry rode out the stalls instead of giving up.
+        // The stalls were retried and the turn reached the model's real answer.
+        // Asserted on the transcript rather than `last_reply_text()`, which
+        // walks back to the last *non-empty* assistant text — here the fake's
+        // echo of the nudge, not the answer.
+        assert!(
+            a.transcript_contains("stall-over-answer"),
+            "the turn did not survive the stalls; history: {:?}",
+            a.transcript_texts()
+        );
+    }
+
     /// A real text-only turn must complete normally — nudged once, and the
     /// model's answer kept — rather than being killed by the guard.
     #[test]
@@ -6329,5 +6477,56 @@ mod real_turn_nudge_tests {
         );
         assert_eq!(recorded.as_deref(), Some("FAKE: echo hello-there"));
         assert!(this_turn, "the guard is armed after the nudge, for the next answer");
+    }
+}
+
+#[cfg(test)]
+mod stall_response_tests {
+    use super::*;
+
+    fn msg(blocks: Vec<Block>) -> Message {
+        Message { role: crate::types::Role::Assistant, blocks }
+    }
+
+    /// The parser's stalled-stream marker, alone, is a stall.
+    #[test]
+    fn the_parser_marker_alone_is_a_stall() {
+        assert!(Agent::is_stalled_response(&msg(vec![Block::Text(
+            "(empty response)".into()
+        )])));
+        // Whitespace variants are how it comes out of the stream accumulation.
+        assert!(Agent::is_stalled_response(&msg(vec![Block::Text(
+            "  (empty response)\n".into()
+        )])));
+    }
+
+    /// Anything with a real answer is NOT a stall — narrow on purpose, so a model
+    /// that happens to write those words (or emits reasoning / a tool call
+    /// alongside them) is treated as the answer it is.
+    #[test]
+    fn a_real_answer_is_never_a_stall() {
+        assert!(!Agent::is_stalled_response(&msg(vec![Block::Text(
+            "here is the answer".into()
+        )])));
+        assert!(!Agent::is_stalled_response(&msg(vec![
+            Block::Text("(empty response)".into()),
+            Block::Text("but actually here is the answer".into()),
+        ])));
+        assert!(!Agent::is_stalled_response(&msg(vec![
+            Block::Text("(empty response)".into()),
+            Block::Thinking { text: "thinking".into() },
+        ])));
+        assert!(!Agent::is_stalled_response(&msg(vec![Block::ToolUse {
+            id: "t".into(),
+            name: "bash".into(),
+            input: serde_json::json!({}),
+        }])));
+        assert!(!Agent::is_stalled_response(&msg(vec![])));
+    }
+
+    /// The retry budget exists so a provider that is genuinely down cannot spin.
+    #[test]
+    fn the_stall_retry_budget_is_small_and_finite() {
+        assert_eq!(MAX_STALL_RETRIES, 3);
     }
 }

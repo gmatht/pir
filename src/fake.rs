@@ -43,6 +43,14 @@ pub enum Directive {
     Type { ch: char, cps: u64, secs: u64 },
     /// Stream reasoning text through the thinking channel (paced chunks).
     Think(String),
+    /// Answer with the parser's stalled-stream marker: no text, no tool call.
+    /// The real providers synthesise `Block::Text("(empty response)")` when a
+    /// stream yields nothing (see `provider.rs`) — what a dropped connection or
+    /// a truncated SSE body looks like to the turn loop.
+    Empty {
+        /// How many model rounds this turn stalls for before answering.
+        stall_rounds: u32,
+    },
 }
 
 /// Parse `FAKE:` directive lines from prompt text. Verbs match
@@ -63,6 +71,11 @@ pub fn parse_directives(text: &str) -> Vec<Directive> {
             "markup" => out.push(Directive::Markup),
             "think" if !args.is_empty() => out.push(Directive::Think(args.to_string())),
             "echo" if !args.is_empty() => out.push(Directive::Echo(args.to_string())),
+            "empty" => {
+                // `empty` or `empty <n>`: stall once, or the first n rounds.
+                let n = args.parse::<u32>().unwrap_or(1);
+                out.push(Directive::Empty { stall_rounds: n });
+            }
             "write" => {
                 if let Some((path, text)) = args.split_once(char::is_whitespace)
                     && !path.is_empty()
@@ -236,6 +249,36 @@ pub fn fake_chat(
                     on_text(&chunk);
                     text.push_str(&chunk);
                     std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            Directive::Empty { stall_rounds } => {
+                // No text emitted, no tool call: the parser's marker alone, which
+                // is exactly what the turn loop sees after a stalled stream.
+                //
+                // The turn loop retries a stall without recording it in history,
+                // so the count must come from here. `history` DOES gain a message
+                // per round (the nudge, or nothing on a retry) — the reliable
+                // signal is the request itself, counted per prompt so each test's
+                // turn is independent.
+                let prompt = history
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == Role::User)
+                    .map(|m| m.text())
+                    .unwrap_or_default();
+                static ROUNDS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                let round = {
+                    let mut v = ROUNDS.lock().unwrap_or_else(|e| e.into_inner());
+                    let key = prompt.clone();
+                    let n = v.iter().filter(|k| **k == key).count() as u32;
+                    v.push(key);
+                    n
+                };
+                if round < *stall_rounds {
+                    text.push_str("(empty response)");
+                } else {
+                    text.push_str("stall-over-answer");
+                    on_text("stall-over-answer");
                 }
             }
             Directive::Think(t) => {
