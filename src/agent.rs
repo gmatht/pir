@@ -206,6 +206,13 @@ pub struct Agent {
     /// Auto-nudges used in the current turn (reset each turn; bounded by
     /// [`STOP_NUDGE_MAX`], which is `usize::MAX` — i.e. unbounded — by default).
     stop_nudges: usize,
+    /// The stop-skill reminder to send with the *next* request only.
+    ///
+    /// Deliberately NOT part of `history`: persisting it made a resumed session
+    /// replay the nudge as if the operator had asked it, which is the root cause
+    /// of the "pir randomly exits on `-r`" family. Cleared as soon as a real
+    /// answer (tool call or stop) arrives.
+    pending_nudge: Option<Message>,
     /// Consecutive stalled (empty) responses retried in the current turn. Reset
     /// by the turn loop as soon as a real answer arrives, and by `begin_turn`.
     stall_retries: usize,
@@ -499,6 +506,23 @@ impl Agent {
             .filter(|m| m.role == crate::types::Role::Assistant)
             .map(|m| m.text())
             .collect()
+    }
+
+    /// Test-only: history length, for assertions about what is *not* recorded.
+    #[cfg(test)]
+    pub fn history_len(&self) -> usize {
+        self.history.len()
+    }
+
+    /// Test-only: whether *any* message in history (of any role) carries the
+    /// nudge text — the thing a resume would replay.
+    #[cfg(test)]
+    pub fn history_has_nudge(&self) -> bool {
+        self.history.iter().any(|m| {
+            m.blocks.iter().any(
+                |b| matches!(b, Block::Text(t) if t.contains("Your last message had no tool calls")),
+            )
+        })
     }
 
     /// Test-only: whether any assistant text in history contains `needle`.
@@ -941,7 +965,14 @@ impl Agent {
         // Rewindable turn checkpoints (Feature 8), loaded from the sidecar next
         // to the transcript so a resume can rewind work done before it.
         let checkpoints = crate::checkpoint::Store::load_opt(log_path.as_deref());
-        let _ = crate::scratchpad::sweep_old();
+        // Scratchpad housekeeping runs *off* the startup path. It has to take
+        // the newest mtime across every leftover session's whole tree (see
+        // `scratchpad::is_stale`), so with a few thousand stale scratch dirs
+        // this blocked for seconds before the REPL appeared — 5.2s measured on
+        // a host with 1633 of them, against 108ms to parse a 2.2MB transcript.
+        // Nothing in resume depends on it finishing, so it is dispatched to a
+        // background thread instead.
+        crate::scratchpad::spawn_sweep();
         // Session-transcript retention. The transcript is the one file written
         // continuously for a whole session, append-only and never rotated, so
         // a long-lived agent loop that starts pir many times a day accumulates
@@ -1019,6 +1050,7 @@ impl Agent {
             last_stop: None,
             stop_nudges: 0,
             stop_nudged_this_turn: false,
+            pending_nudge: None,
             stall_retries: 0,
             #[cfg(test)]
             stop_nudge_notices: 0,
@@ -1051,6 +1083,69 @@ impl Agent {
             "stop-skill: off  (legacy stop-on-first-text behaviour)"
         }
         .to_string()
+    }
+
+    /// Whether this session is running full-auto (no confirmation asks).
+    ///
+    /// This is *derived* from the live ask policy, not stored separately: the
+    /// flag pir showed on the settings screen has to agree with what actually
+    /// happens at tool time, and what happens at tool time is
+    /// `SecurityPolicy::decide`'s `ask == AutoYes` short-circuit. Reporting one
+    /// from the registry and enforcing it with the ask policy is how the screen
+    /// could display a value the session did not honour.
+    pub fn full_auto(&self) -> bool {
+        self.security_policy()
+            .map(|p| p.ask == crate::security::AskMode::AutoYes)
+            .unwrap_or(false)
+    }
+
+    /// Turn full-auto on/off for this session, and make the guardrail agree
+    /// immediately.
+    ///
+    /// Two things change together, deliberately:
+    ///  * the **ask policy** (`security.ask` → `auto-yes` / back to `ask`),
+    ///    which is what actually stops the tool-approval dialog from being
+    ///    surfaced, and
+    ///  * the **registry flag** handed to every sub-agent spawned afterwards, so
+    ///    a child inherits the session's posture instead of the launch-time one.
+    ///
+    /// Turning full-auto **off** restores `Ask`, never `AutoNo`: silently
+    /// denying everything is not what "stop asking me" means, and flipping an
+    /// `ask` into a standing denial as a side effect of toggling convenience
+    /// would change the session's safety posture without asking.
+    ///
+    /// The policy is applied live (not just persisted), so the very next tool
+    /// call already sees it.
+    pub fn set_full_auto(&mut self, on: bool) -> String {
+        self.registry.set_full_auto(on);
+        let mut policy = self.security_policy().unwrap_or_default();
+        let was = policy.ask;
+        policy.ask = if on {
+            crate::security::AskMode::AutoYes
+        } else {
+            crate::security::AskMode::Ask
+        };
+        if policy.ask == was {
+            return if on {
+                "full-auto already on (ask = auto-yes; unanticipated requests run without asking)"
+                    .to_string()
+            } else {
+                "full-auto already off (ask = ask; unanticipated requests prompt you)".to_string()
+            };
+        }
+        self.apply_security_policy(&policy);
+        if on {
+            "full-auto ON for this session (ask = auto-yes) — unanticipated requests now run without asking you. The security level, write-quarantine and path guards are unchanged.".to_string()
+        } else {
+            "full-auto OFF for this session (ask = ask) — unanticipated requests prompt you again.".to_string()
+        }
+    }
+
+    /// The explicit-stop-skill default → session mapping. `/menu → Settings`
+    /// and `/stop-skill` both reach the same toggle, so the rule that turns the
+    /// stored default into a live flag lives in exactly one place.
+    pub fn stop_skill_default() -> bool {
+        config::stop_skill_default()
     }
 
     /// Set the output format for this session.
@@ -2094,7 +2189,7 @@ impl Agent {
             provider,
             model,
             &spawn,
-            self.registry.full_auto(),
+            self.full_auto(),
             policy,
             self.cancel.clone(),
         );
@@ -2144,7 +2239,7 @@ impl Agent {
             (&self.provider, &self.model),
             &self.cached_providers,
             &batch,
-            self.registry.full_auto(),
+            self.full_auto(),
             policy,
             self.cancel.clone(),
         );
@@ -3110,6 +3205,11 @@ impl Agent {
             // single render once the message is complete (see the flush block
             // below). The renderer holds the full accumulated markdown, so the
             // single-render fallback never needs `assistant_text`.
+            // The nudge is a *transient* instruction, not a conversation
+            // message: it is sent with this request but never committed to
+            // `history`. Taken here — before the streaming closure borrows
+            // `self` — so exactly one request carries it.
+            let nudge = self.pending_nudge.take();
             let use_incremental = !self.silent() && tty && self.incremental_md;
             let mut inc: Option<crate::md::IncrementalMarkdown> = if use_incremental {
                 Some(crate::md::IncrementalMarkdown::new(true, crate::term::color_enabled()))
@@ -3236,11 +3336,22 @@ impl Agent {
                 }
                 notices.borrow_mut().push(t.to_string());
             };
+            // The nudge is a *transient* instruction, not a conversation
+            // message: it is sent with this request but never committed to
+            // `history`. See `pending_nudge`.
+            let request_history: Vec<Message> = match nudge {
+                Some(n) => {
+                    let mut h = self.history.clone();
+                    h.push(n);
+                    h
+                }
+                None => self.history.clone(),
+            };
             let result = self.client.chat(
                 &self.model.id,
                 max_tokens,
                 &self.system,
-                &self.history,
+                &request_history,
                 &specs,
                 &mut on_text,
                 self.thinking,
@@ -3467,9 +3578,14 @@ impl Agent {
                     // chance and still answered in text, the answer stands and the
                     // turn ends normally below.
                     //
-                    // Both conditions are decided by the pure `nudge_verdict`, so
-                    // they are unit-testable without a model round-trip — which is
-                    // what the two earlier inline "fixes" here lacked.
+                    // With the nudge no longer persisted (`pending_nudge`), the
+                    // old "don't nudge the same prompt twice" guard has nothing
+                    // left to protect against — it existed only because a resumed
+                    // session replayed a *stored* nudge. Keeping it also made a
+                    // model that answers in prose get cut off after a single
+                    // reminder, silently reporting the turn as done. The budget
+                    // is now the only bound, and a text-only answer keeps being
+                    // nudged until the model calls `request_stop`.
                     match Self::nudge_verdict(self.stop_nudges, self.stop_nudged_this_turn) {
                         NudgeVerdict::BudgetSpent => {
                             #[cfg(test)]
@@ -3491,29 +3607,39 @@ impl Agent {
                             self.mark_status(SessionStatus::Completed, self.goal_pending(), "");
                             return Ok(());
                         }
-                        // Already nudged once this turn: the model has had its
-                        // chance and answered in text again, so let this answer
-                        // stand and end the turn normally.
-                        NudgeVerdict::AlreadyNudgedThisTurn => {
-                            // NOT a notice: the answer stands and the turn ends
-                            // normally below. This is the branch the "already
-                            // nudged — ending turn" message used to be printed
-                            // from, and the whole fix is that it now prints
-                            // nothing and keeps the model's reply.
-                        }
-                        NudgeVerdict::Nudge => {
+                        // Nudge again: the model answered in text and has not yet
+                        // called `request_stop`. This is the *same* case as the
+                        // first text answer — by design there is no "already
+                        // nudged" distinction any more, because the nudge is not
+                        // persisted and so cannot be replayed by a resume.
+                        NudgeVerdict::AlreadyNudgedThisTurn | NudgeVerdict::Nudge => {
                             self.stop_nudges += 1;
                             self.stop_nudged_this_turn = true;
                             self.stop_nudged_for_prompt = Some(user.to_string());
-                            let nudge = Message::user(
+                            // Sent with the NEXT request only — never pushed to
+                            // `history`.
+                            //
+                            // Persisting it was the root cause of the whole
+                            // "randomly exiting on `pir -r`" family: the nudge is
+                            // logged as a `user` message, so a resumed session
+                            // replayed it as if the operator had asked, the model
+                            // answered the nudge, and the turn ended. Every guard
+                            // added since (keyed on the prompt text) was papering
+                            // over that, and each one also killed *normal* turns —
+                            // a text-only answer could never be nudged twice, so a
+                            // model that answered in prose was cut off after one
+                            // reminder, silently reporting the turn as done.
+                            //
+                            // The nudge is an instruction about the current
+                            // exchange, not part of the conversation, so it has no
+                            // business in the transcript or the session log.
+                            self.pending_nudge = Some(Message::user(
                                 "Your last message had no tool calls. If the work is really done, end \
                                  your turn with an explicit request_stop call (reason stop-complete, or \
                                  stop-needs-input with your question in message). If work remains, ignore \
                                  request_stop and keep using tools instead — do NOT stop an unfinished \
                                  task. Continue now.",
-                            );
-                            log_line(&mut self.log, &nudge);
-                            self.history.push(nudge);
+                            ));
                             continue;
                         }
                     }
@@ -4127,6 +4253,7 @@ impl Agent {
         self.stop_nudges = 0;
         self.stop_nudged_this_turn = false;
         self.stop_nudged_for_prompt = None;
+        self.pending_nudge = None;
     }
 
     /// Build the `Idle` event (returned to the REPL prompt). Carries the same
@@ -4612,6 +4739,68 @@ mod reload_tests {
         a
     }
 
+    /// The settings screen advertised `full-auto` but nothing could change it:
+    /// the flag was constructor-only (`Registry::full_auto`, no setter), so a
+    /// session had no in-session way to turn it on at all. Turning it on must
+    /// now move the live ask policy, because `SecurityPolicy::decide`'s
+    /// `ask == AutoYes` short-circuit is what actually stops the tool-approval
+    /// dialog from being surfaced — i.e. the display and the behaviour must
+    /// come from the same fact.
+    #[test]
+    fn full_auto_is_derived_from_the_live_ask_policy() {
+        // `test_agent` runs the real `Agent::new`, which reads the config dir —
+        // so this test participates in the same env-mutation race as every
+        // other test that does. Hold the lock: without it this overlaps a
+        // `PI_DIR`-mutating test, the agent loads a policy from a temp dir that
+        // is being torn down, and unrelated shell/zellij tests fail with
+        // "spawn bash: No such file or directory".
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut a = test_agent();
+        // Precondition: the default policy asks.
+        assert!(!a.full_auto(), "default posture must not claim full-auto");
+        assert_eq!(
+            a.security_policy().map(|p| p.ask),
+            Some(crate::security::AskMode::Ask)
+        );
+
+        let _ = a.set_full_auto(true);
+        assert!(a.full_auto(), "full-auto must read back as on");
+        assert_eq!(
+            a.security_policy().map(|p| p.ask),
+            Some(crate::security::AskMode::AutoYes),
+            "full-auto must be the ask policy, or the dialog still appears"
+        );
+
+        // And back off — to `ask`, never to `auto-no`. Flipping "stop asking me"
+        // into a standing denial would change the session's safety posture as a
+        // side effect of a convenience toggle.
+        let _ = a.set_full_auto(false);
+        assert!(!a.full_auto());
+        assert_eq!(
+            a.security_policy().map(|p| p.ask),
+            Some(crate::security::AskMode::Ask),
+            "turning full-auto off must restore asking, not deny"
+        );
+    }
+
+    /// The flag is what a sub-agent inherits, so a session that turns full-auto
+    /// on must stop handing children the launch-time value.
+    #[test]
+    fn full_auto_toggle_reaches_the_registry_sub_agents_read() {
+        // Same lock rationale as `full_auto_is_derived_from_the_live_ask_policy`:
+        // `test_agent` touches the process-wide config dir.
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut a = test_agent();
+        assert!(!a.registry.full_auto());
+        let _ = a.set_full_auto(true);
+        assert!(
+            a.registry.full_auto(),
+            "the value handed to new sub-agents must follow the live setting"
+        );
+        let _ = a.set_full_auto(false);
+        assert!(!a.registry.full_auto());
+    }
+
     #[test]
     fn reload_keeps_working_catalog_on_unreadable_store() {
         // Point PI_DIR at an empty dir so load_providers fails: reload must
@@ -4813,10 +5002,19 @@ mod prompt_parity_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("AGENTS.md"), "Be excellent.\n").unwrap();
-        let cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir).unwrap();
+        // Deliberately NOT `set_current_dir` into the temp dir. `build_system_prompt`
+        // takes the directory as a parameter and never reads the process cwd, so
+        // chdir bought nothing — while it exposed every *other* concurrently
+        // running test to a process-global that was pointing at a directory this
+        // test was about to `remove_dir_all`. The builtin `bash` tool resolves
+        // its cwd from `std::env::current_dir()`, so any test overlapping this
+        // window either ran in the wrong directory or failed with
+        // "spawn bash: No such file or directory" (or `ENOENT` from `find .`).
+        // The suite had been failing this way intermittently for exactly this
+        // reason. See `crate::config::TEST_CWD_LOCK` for the guard that the
+        // genuinely-cwd-mutating tests (the worktree ones, which really must chdir)
+        // take.
         let p = build_system_prompt(&dir);
-        std::env::set_current_dir(&cwd).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(p.contains("<project_context>"), "project_context wrapper missing");
         assert!(p.contains("<project_instructions"), "project_instructions tag missing");
@@ -6393,7 +6591,6 @@ mod real_turn_nudge_tests {
         // the first stall was nudged, the second took the already-nudged branch
         // and the turn ended — reporting "turn done" with no answer and no stop.
         let res = a.turn("FAKE: empty 2");
-        let nudges = a.stop_nudges;
         let notices = a.stop_nudge_notices;
         match old {
             Some(v) => unsafe { std::env::set_var("PIR_FAKE_MODEL", v) },
@@ -6423,6 +6620,51 @@ mod real_turn_nudge_tests {
             a.transcript_contains("stall-over-answer"),
             "the turn did not survive the stalls; history: {:?}",
             a.transcript_texts()
+        );
+    }
+
+    /// The nudge must never enter `history` — the root cause of the whole
+    /// "pir randomly exits" family.
+    ///
+    /// The nudge text is a `user` message, so persisting it meant a *resumed*
+    /// session replayed it as if the operator had typed it: the model answered
+    /// the nudge, the turn ended, the next nudge was injected — every turn dying
+    /// on `pir -r`. Successive guards keyed on the prompt text papered over that
+    /// and each also killed *normal* turns, because a text-only answer could
+    /// never be nudged twice.
+    ///
+    /// Keeping it out of `history` removes the cause rather than compensating
+    /// for it. The fake cannot terminate a nudge loop on its own (it has no
+    /// memory of which round it is on), so the turn is deliberately allowed to
+    /// hit the loop detector: what matters is what is in `history` when it does.
+    #[test]
+    fn the_nudge_never_enters_history() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os("PIR_FAKE_MODEL");
+        // SAFETY: test-local env mutation under the shared env lock.
+        unsafe { std::env::set_var("PIR_FAKE_MODEL", "1"); }
+        let mut a = quiet_fake_agent();
+        let res = a.turn("FAKE: echo a-plain-answer");
+        let texts = a.transcript_texts();
+        let nudges = a.stop_nudges;
+        let has_nudge = a.history_has_nudge();
+        let history_len = a.history_len();
+        match old {
+            Some(v) => unsafe { std::env::set_var("PIR_FAKE_MODEL", v) },
+            None => unsafe { std::env::remove_var("PIR_FAKE_MODEL") },
+        }
+        // The turn ends (the detector stops the fake repeating itself) — it must
+        // not error, and the answer must be there.
+        assert!(res.is_ok(), "turn failed: {:?}", res.err());
+        assert!(texts.iter().any(|t| t.contains("a-plain-answer")), "answer lost: {texts:?}");
+        // The nudge really was issued, or this proves nothing.
+        assert!(nudges >= 1, "no nudge was issued");
+        // ...and it did NOT go into history. This is the assertion that matters:
+        // history is exactly what a resume replays.
+        assert!(
+            !has_nudge,
+            "a nudge-shaped message is in history ({history_len} msgs) — a resume \
+             would replay it as the operator's prompt: {texts:?}"
         );
     }
 

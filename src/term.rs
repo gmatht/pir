@@ -2768,6 +2768,14 @@ pub mod raw {
     /// this often; the caller re-loops, so typing stays responsive.
     pub(crate) const INPUT_POLL: u64 = 200;
 
+    /// How often [`wait_input`] re-checks while a modal dialog owns the
+    /// keyboard. It is a plain sleep-poll because the modal runs on another
+    /// thread: we must neither read stdin (that is the whole bug) nor block
+    /// forever, since the dialog can close at any moment and a finished turn
+    /// must still wake the REPL. 25ms is well under the modal's own 100ms abort
+    /// poll, so the handover back to the REPL is imperceptible.
+    const MODAL_YIELD: Duration = Duration::from_millis(25);
+
     /// Terminal state captured around a raw-mode session. Guarded by a Mutex so
     /// access is never via a raw `&mut` to a static (sound under the 2024
     /// edition rules). There is only ever one REPL, so the lock is uncontended.
@@ -2934,6 +2942,14 @@ pub mod raw {
     /// we saw. After draining, if no real input arrived and barely any wall time
     /// elapsed, we sleep the rest of the [`INPUT_POLL`] window so the idle REPL
     /// stays near 0% CPU; genuine input returns instantly.
+    ///
+    /// While a modal dialog is up (an `ask_user_question` box, a tool approval)
+    /// this reads *nothing*. The modal and this function are two readers on the
+    /// same fd, and this one is the aggressor: it drains the tty eagerly and
+    /// turns `ESC[A`/`ESC[B` into history recall, so an operator pressing ↑/↓
+    /// in the dialog had their keys eaten by the REPL and the selection never
+    /// moved (you could not reach options 3-9). Standing down for the life of
+    /// the dialog is the fix — see `modal::keyboard_held`.
     pub fn wait_input(
         buf: &mut String,
         typeahead: &Arc<Mutex<String>>,
@@ -2943,6 +2959,22 @@ pub mod raw {
         // Up walks older prompts.
         recall: &mut super::HistRecall,
     ) -> RawInput {
+        if crate::modal::keyboard_held() {
+            // A modal owns the keyboard: wait on turn completion only (never on
+            // stdin) and report no input, so the dialog can be answered at
+            // leisure and the REPL wakes the moment the turn ends.
+            loop {
+                if !crate::modal::keyboard_held() {
+                    break; // dialog closed: fall through to the normal path
+                }
+                match done.try_recv() {
+                    Ok(()) | Err(smol::channel::TryRecvError::Closed) => return RawInput::None,
+                    Err(smol::channel::TryRecvError::Empty) => {}
+                }
+                std::thread::sleep(MODAL_YIELD);
+            }
+            return RawInput::None;
+        }
         // Build an async wrapper around stdin for this wait. `enable_raw` already
         // put fd 0 into non-blocking mode; `Async::new` registers it with the
         // smol reactor (and deregisters on drop) so we can await readiness.

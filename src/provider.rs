@@ -2654,9 +2654,16 @@ mod tests {
     use super::*;
 
     /// Serializes the env-mutating retry tests: parallel test threads share
-    /// one process environment, so anything touching PIR_RETRY_* /
-    /// PIR_MAX_ATTEMPTS holds this while asserting.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// one process environment, so anything touching `PIR_RETRY_*` /
+    /// `PIR_MAX_ATTEMPTS` holds this while asserting.
+    ///
+    /// This is the *shared* env lock, not a private one. `pir_config`-style
+    /// config tests read the same environment, so a private lock left these
+    /// retry tests free to have their `PIR_RETRY` mutation observed mid-read by
+    /// an unrelated test running at the same moment.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_support::env_lock()
+    }
 
     /// A `Read` that yields `data` once, then reports a *timeout* on every
     /// subsequent read — simulating a server that connected, sent its preamble,
@@ -3138,7 +3145,7 @@ mod tests {
     fn backoff_grows_and_caps() {
         // Serialize with the other env-sensitive retry tests (parallel test
         // threads share one process environment).
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock();
         unsafe {
             std::env::remove_var("PIR_RETRY_BASE_SECS");
             std::env::remove_var("PIR_RETRY_MAX_SECS");
@@ -3172,7 +3179,7 @@ mod tests {
 
     #[test]
     fn backoff_env_overrides_are_parsed_and_ignored_when_invalid() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock();
         unsafe {
             std::env::remove_var("PIR_RETRY_BASE_SECS");
             std::env::remove_var("PIR_RETRY_MAX_SECS");
@@ -3607,7 +3614,7 @@ mod tests {
     fn timeout_constants_sane() {
         // Reads the shared env: hold the lock + clear overrides so a
         // concurrently-running retry test can't leak its vars in here.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock();
         unsafe {
             std::env::remove_var("PIR_MAX_ATTEMPTS");
         }
@@ -3976,7 +3983,7 @@ mod tests {
     fn retries_forever_until_provider_recovers() {
         // Two 500s then a success: with no PIR_MAX_ATTEMPTS the loop must
         // keep going and return the recovered response, reporting each wait.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock();
         unsafe {
             std::env::set_var("PIR_RETRY_BASE_SECS", "0");
             std::env::remove_var("PIR_MAX_ATTEMPTS");
@@ -4050,7 +4057,7 @@ mod tests {
     fn max_attempts_caps_retries_for_scripts() {
         // Always-500 server with PIR_MAX_ATTEMPTS=2: must give up after
         // exactly 2 attempts instead of looping forever.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock();
         unsafe {
             std::env::set_var("PIR_RETRY_BASE_SECS", "0");
             std::env::set_var("PIR_MAX_ATTEMPTS", "2");
@@ -4238,7 +4245,7 @@ mod tests {
     fn debug_payload_dump_roundtrips() {
         // `PIR_DEBUG_PAYLOAD=<path>` must persist the exact body so a turn
         // can be replayed byte-identical through curl.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock();
         let path = std::env::temp_dir().join(format!("pir_body_{}.json", std::process::id()));
         let _ = std::fs::remove_file(&path);
         unsafe { std::env::set_var("PIR_DEBUG_PAYLOAD", &path); }
@@ -4256,7 +4263,7 @@ mod tests {
     fn debug_log_to_file_appends() {
         // `PIR_DEBUG=<path>` must append the line to the file (stderr can be
         // wiped by a spinner repaint before it is read).
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock();
         let path = std::env::temp_dir().join(format!("pir_dbg_{}.log", std::process::id()));
         let _ = std::fs::remove_file(&path);
         unsafe { std::env::set_var("PIR_DEBUG", &path); }

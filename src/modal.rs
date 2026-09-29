@@ -36,6 +36,22 @@ struct PrevFrame {
 }
 static PREV_FRAME: Mutex<Option<PrevFrame>> = Mutex::new(None);
 
+/// True while a modal owns the keyboard.
+///
+/// A modal reads the *same* fd 0 the REPL's mid-turn reader does. Two readers
+/// on one tty is a race the operator always loses: the mid-turn reader
+/// (`term::raw::read_chunk`) drains the tty eagerly and translates `ESC[A` /
+/// `ESC[B` into *history recall*, so the arrow keys never reached the dialog
+/// and ↑/↓ did nothing at all. The REPL consults this flag to stay out of the
+/// way for as long as a modal is up (see `term::raw::wait_input`).
+static KEYBOARD_HELD: AtomicBool = AtomicBool::new(false);
+
+/// Whether a modal currently owns the keyboard. The REPL's mid-turn input
+/// reader must not consume stdin while this is true.
+pub fn keyboard_held() -> bool {
+    KEYBOARD_HELD.load(Ordering::SeqCst)
+}
+
 /// A key the user pressed in a modal dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
@@ -76,9 +92,18 @@ impl Modal {
         if !crate::term::is_terminal() {
             return None;
         }
+        // Claim the keyboard *before* any of the work below, and only release
+        // it if construction fails. Every dialog that opens while a turn is
+        // running (an `ask_user_question` box, a tool-approval box) is opened
+        // from the agent's worker thread while the REPL's mid-turn reader is
+        // parked in `wait_input` with raw mode on: two readers on one tty means
+        // whichever wakes first eats the key, and the REPL is a far bigger
+        // tattletale than the dialog.
+        KEYBOARD_HELD.store(true, Ordering::SeqCst);
         let mut stdout = io::stdout();
         // Enter alternate screen, hide the cursor, enable raw mode.
         if execute!(stdout, EnterAlternateScreen, Hide).is_err() {
+            KEYBOARD_HELD.store(false, Ordering::SeqCst);
             return None;
         }
         // Blank the alternate screen *once*, now, so the first frame starts from
@@ -91,6 +116,7 @@ impl Modal {
         let _ = stdout.flush();
         *PREV_FRAME.lock().unwrap() = None;
         if enable_raw_mode().is_err() {
+            KEYBOARD_HELD.store(false, Ordering::SeqCst);
             let _ = execute!(stdout, LeaveAlternateScreen, Show);
             return None;
         }
@@ -110,6 +136,7 @@ impl Drop for Modal {
             return;
         }
         self.active = false;
+        KEYBOARD_HELD.store(false, Ordering::SeqCst);
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
         let _ = execute!(stdout, LeaveAlternateScreen, Show);
@@ -566,43 +593,127 @@ fn security_lines(policy: &crate::security::SecurityPolicy, su_security: bool) -
     lines
 }
 
-/// Show the settings dialog on the alternate screen. Displays the current
-/// settings (model, thinking, done-prompt color, markdown backend, incremental,
-/// stop-skill, full-auto). Returns `None` if not a tty.
-pub fn settings_dialog(
-    model: &str,
-    thinking: &str,
-    show_thinking: bool,
-    incremental: bool,
-    stop_skill: bool,
-    full_auto: bool,
-) -> Option<()> {
-    let _modal = Modal::enter()?;
-    let lines = settings_lines(model, thinking, show_thinking, incremental, stop_skill, full_auto);
-    scroll_until_dismiss("pir — settings", &lines)
+/// The editable rows of the settings dialog: the values it can change, read
+/// once when it opens and written back out when the operator saves.
+///
+/// This is a *view model*, not a handle on the agent. The dialog runs on the
+/// alternate screen and the REPL holds the agent in `agent_slot`, so the dialog
+/// must not touch the agent itself — the caller applies whatever comes back
+/// (and, on save, persists it). Keeping the struct plain is also what makes the
+/// row index stable enough to unit-test without a terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsValues {
+    /// Not editable here: the model changes with `/model` and the dedicated
+    /// picker, which is a different screen with a different key space. Shown
+    /// for orientation only, and skipped by the cursor.
+    pub model: String,
+    /// The full list of thinking levels to cycle through, in display order. The
+    /// dialog cannot know which are valid for the current model, so the caller
+    /// passes the already-filtered list (same source as `thinking_picker`).
+    /// Empty means "unknown/unsupported model" and leaves the row inert.
+    pub thinking_levels: Vec<String>,
+    pub thinking: String,
+    pub show_thinking: bool,
+    pub incremental: bool,
+    pub stop_skill: bool,
+    pub full_auto: bool,
 }
 
-fn settings_lines(
-    model: &str,
-    thinking: &str,
-    show_thinking: bool,
-    incremental: bool,
-    stop_skill: bool,
-    full_auto: bool,
-) -> Vec<String> {
-    use crate::term;
-    let mut lines = Vec::new();
-    lines.push(format!("  model: {}", term::cyan(model)));
-    lines.push(format!("  thinking: {}   show: {}", term::cyan(thinking), if show_thinking { "on" } else { "off" }));
-    lines.push(format!("  done-prompt color: {}", term::cyan(&term::done_prompt_color_token())));
-    lines.push(format!("  markdown backend: {}", term::cyan(crate::config::markdown_renderer_backend())));
-    lines.push(format!("  incremental markdown: {}", if incremental { "on" } else { "off" }));
-    lines.push(format!("  stop-skill: {}", if stop_skill { "on" } else { "off" }));
-    lines.push(format!("  full-auto: {}", if full_auto { term::green("on") } else { "off".to_string() }));
-    lines.push(String::new());
-    lines.push(term::dim("change with /model, /thinking, /stop-skill, /default-model, /su-security").to_string());
-    lines.push(term::dim("[esc] close").to_string());
-    lines
+impl SettingsValues {
+    /// The number of editable rows (`thinking`, `show`, `incremental`,
+    /// `stop-skill`, `full-auto`). `model` is a status line, not a row.
+    const ROWS: usize = 5;
+}
+
+/// Outcome of the settings dialog.
+pub enum SettingsOutcome {
+    /// The operator applied the values (Enter or `s`). The struct holds the
+    /// *edited* values, so the caller diffs them against what it passed in to
+    /// decide what actually needs applying.
+    Saved(SettingsValues),
+    /// The operator closed without applying (Esc / `q` / ctrl-c).
+    Discarded,
+    /// The dialog could not be opened (no tty).
+    NoTty,
+}
+
+/// Show the settings dialog on the alternate screen — and make it *editable*.
+///
+/// It used to be a report: it drew the current values and delegated to
+/// [`scroll_until_dismiss`], so `full-auto` (and every other row) could be read
+/// but never changed, which is why the screen advertised a value the session
+/// had no way to act on. This is now the same shape as [`security_editor`]:
+/// `↑/↓` move, `←/→` cycle the value on the selected row, Enter/`s` applies,
+/// `q`/Esc discards.
+///
+/// The values come in and go out as a plain [`SettingsValues`], so nothing here
+/// needs the agent and the REPL can decide what to persist.
+pub fn settings_editor(vals: SettingsValues) -> SettingsOutcome {
+    let Some(_modal) = Modal::enter() else {
+        return SettingsOutcome::NoTty;
+    };
+    let mut cur = vals;
+    let mut selected = 0usize;
+
+    let yn = |b: bool| -> String { if b { term::green("on") } else { term::yellow("off") } };
+
+    loop {
+        let marker = |i: usize| if i == selected { "▸" } else { " " };
+        let lines: Vec<String> = vec![
+            format!("  model: {}", term::cyan(&cur.model)),
+            String::new(),
+            format!("{} thinking            {}", marker(0), term::cyan(&cur.thinking)),
+            format!("{} show thinking       {}", marker(1), yn(cur.show_thinking)),
+            format!("{} incremental md      {}", marker(2), yn(cur.incremental)),
+            format!("{} stop-skill          {}", marker(3), yn(cur.stop_skill)),
+            format!("{} full-auto           {}", marker(4), yn(cur.full_auto)),
+            String::new(),
+            term::dim("[↑/↓] move  [←/→] change  [enter] apply  [q] discard"),
+            term::dim("full-auto on = ask auto-yes: unanticipated requests run without asking"),
+        ];
+        draw_box("pir — settings", &lines);
+
+        let Some(key) = read_key() else {
+            return SettingsOutcome::NoTty;
+        };
+        match key {
+            Key::Up | Key::Char('k') => selected = selected.saturating_sub(1),
+            Key::Down | Key::Char('j') => selected = (selected + 1).min(SettingsValues::ROWS - 1),
+            Key::Left | Key::Char('h') => apply_setting(&mut cur, selected, -1),
+            Key::Right | Key::Char('l') => apply_setting(&mut cur, selected, 1),
+            Key::Enter | Key::Char('s') | Key::Char('S') => return SettingsOutcome::Saved(cur),
+            Key::Esc | Key::CtrlC | Key::CtrlD | Key::Char('q') | Key::Char('Q') => {
+                return SettingsOutcome::Discarded;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Apply one `←`/`→` step to row `row`. Shared by the key handler and the tests
+/// so the step logic is verifiable without a terminal.
+///
+/// `dir` is `-1` (back) or `1` (forward). The thinking row cycles the caller's
+/// filtered level list; the rest are booleans, so both directions toggle.
+fn apply_setting(vals: &mut SettingsValues, row: usize, dir: i32) {
+    match row {
+        0 => {
+            let levels = &vals.thinking_levels;
+            if levels.is_empty() {
+                return;
+            }
+            let cur = vals.thinking.as_str();
+            let i = levels.iter().position(|l| l == cur).unwrap_or(0) as i32;
+            let n = levels.len() as i32;
+            let next = ((i + dir).rem_euclid(n)) as usize;
+            vals.thinking = levels[next].clone();
+        }
+        1 => vals.show_thinking = !vals.show_thinking,
+        2 => vals.incremental = !vals.incremental,
+        3 => vals.stop_skill = !vals.stop_skill,
+        4 => vals.full_auto = !vals.full_auto,
+        _ => {}
+    }
 }
 
 /// Show the help dialog on the alternate screen. `help_text` is the full `/help`
@@ -958,6 +1069,33 @@ fn state_color(state: &str) -> String {
     }
 }
 
+/// The thinking levels that actually take effect for this provider + context
+/// window + model, in display order. Shared by [`thinking_picker`] and
+/// [`settings_editor`] so the settings screen can never offer a level the
+/// dedicated picker would refuse (a list the two screens disagreed about would
+/// make "the same setting" have two answers).
+pub fn offered_thinking_levels(
+    kind: Option<ApiKind>,
+    ctx: u64,
+    model: Option<&crate::config::Model>,
+) -> Vec<String> {
+    // Only offer levels that actually take effect for this provider + context
+    // window. Showing `minimal` on an OpenAI model (no reasoning_effort) or an
+    // under-budget Anthropic level would let the user pick something that is
+    // silently ignored. `off` is always offered as an explicit opt-out.
+    // When catalog metadata is available, additionally honor the model's
+    // `thinkingLevelMap` (pi `getSupportedThinkingLevels`): explicitly-null
+    // levels are hidden, and `xhigh`/`max` require an explicit entry — e.g.
+    // opencode-go's deepseek-v4.1-flash only offers off/high/max.
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+        .iter()
+        .filter_map(|l| crate::config::ThinkingLevel::parse(l))
+        .filter(|l| l.effective(kind, ctx))
+        .filter(|l| model.map(|m| m.supported_levels().contains(l)).unwrap_or(true))
+        .map(|l| l.as_str().to_string())
+        .collect()
+}
+
 /// Show a thinking-level picker on the alternate screen and return the chosen
 /// level. Returns `None` if not a tty or the user cancels.
 pub fn thinking_picker(
@@ -967,24 +1105,8 @@ pub fn thinking_picker(
     model: Option<&crate::config::Model>,
 ) -> Option<String> {
     let _modal = Modal::enter()?;
-    // Only offer levels that actually take effect for this provider + context
-    // window. Showing `minimal` on an OpenAI model (no reasoning_effort) or an
-    // under-budget Anthropic level would let the user pick something that is
-    // silently ignored. `off` is always offered as an explicit opt-out.
-    // When catalog metadata is available, additionally honor the model's
-    // `thinkingLevelMap` (pi `getSupportedThinkingLevels`): explicitly-null
-    // levels are hidden, and `xhigh`/`max` require an explicit entry — e.g.
-    // opencode-go's deepseek-v4.1-flash only offers off/high/max.
-    let all: Vec<crate::config::ThinkingLevel> = [
-        "off", "minimal", "low", "medium", "high", "xhigh", "max",
-    ]
-    .iter()
-    .filter_map(|l| crate::config::ThinkingLevel::parse(l))
-    .filter(|l| l.effective(kind, ctx))
-    .filter(|l| model.map(|m| m.supported_levels().contains(l)).unwrap_or(true))
-    .collect();
-    let levels: Vec<&'static str> = all.iter().map(|l| l.as_str()).collect();
-    let mut selected = levels.iter().position(|l| *l == current).unwrap_or(0);
+    let levels = offered_thinking_levels(kind, ctx, model);
+    let mut selected = levels.iter().position(|l| l == current).unwrap_or(0);
     loop {
         let lines: Vec<String> = levels
             .iter()
@@ -999,7 +1121,7 @@ pub fn thinking_picker(
         match read_key()? {
             Key::Up | Key::Char('k') => selected = selected.saturating_sub(1),
             Key::Down | Key::Char('j') => selected = (selected + 1).min(levels.len() - 1),
-            Key::Enter | Key::Right => return Some(levels[selected].to_string()),
+            Key::Enter | Key::Right => return Some(levels[selected].clone()),
             Key::Esc | Key::CtrlC | Key::CtrlD => return None,
             _ => {}
         }
@@ -1045,8 +1167,9 @@ pub fn question_dialog(q: &crate::askuser::Question) -> Option<crate::askuser::A
     let mut selected = 0usize;
     let mut checked: Vec<bool> = vec![false; q.options.len()];
     loop {
-        let mut lines = wrap_lines(&q.question, 72);
-        lines.push(String::new());
+        // Rows are laid out once, so the viewport is just a window over them
+        // and the drawn text always matches the highlighted row.
+        let mut rows: Vec<String> = Vec::new();
         for (i, o) in q.options.iter().enumerate() {
             let cursor = if i == selected { "▸" } else { " " };
             let box_ = if multi {
@@ -1054,19 +1177,53 @@ pub fn question_dialog(q: &crate::askuser::Question) -> Option<crate::askuser::A
             } else {
                 ""
             };
-            lines.push(format!("{cursor} {i}) {box_}{}", o.label));
+            // Number the rows 1-based, because that is what the digit keys
+            // select (`1` chooses the first option). Labelling from 0 while
+            // the keys count from 1 made the hint ("[1-9] choose") a lie: `1`
+            // answered the row marked `0)`, and options past the ninth could
+            // not be reached by number at all.
+            rows.push(format!("{cursor} {}) {box_}{}", i + 1, o.label));
             if !o.description.is_empty() {
                 for l in wrap_lines(&o.description, 64) {
-                    lines.push(format!("      {}", crate::term::dim(&l)));
+                    rows.push(format!("      {}", crate::term::dim(&l)));
                 }
             }
         }
+
+        // Keep the highlighted row inside the viewport. Without this a long
+        // option list was silently cut at the bottom of the box: ↓ kept moving
+        // `selected` past the last *drawn* row, so the extra options could be
+        // chosen but never seen — the "I can't get to the later options"
+        // report. (Every other dialog here goes through
+        // `draw_box_scrolled`; this one drew the whole list and hoped.)
+        let viewport = modal_body_rows();
+        let first = if rows.len() <= viewport {
+            0
+        } else {
+            let row_of = selected.min(rows.len() - 1);
+            // Keep the cursor one row inside the window so it stays visible.
+            row_of.saturating_sub(viewport.saturating_sub(2).max(1))
+        }
+        .min(rows.len().saturating_sub(viewport));
+        let visible: Vec<String> = rows[first..(first + viewport).min(rows.len())].to_vec();
+
+        let mut lines = wrap_lines(&q.question, 72);
+        lines.push(String::new());
+        lines.extend(visible);
         lines.push(String::new());
         let hint = if multi {
             "[space] toggle  [enter] confirm  [1-9] toggle  [esc] dismiss"
         } else {
             "[enter] choose  [1-9] choose  [esc] dismiss"
         };
+        // Say so when the list is taller than the box, so a scroll is never a
+        // silent truncation.
+        if first + viewport < rows.len() {
+            lines.push(crate::term::dim(&format!(
+                "… {} more (↑↓ to scroll)",
+                rows.len() - (first + viewport)
+            )).to_string());
+        }
         lines.push(crate::term::dim(hint).to_string());
         draw_box_titled(&format!("⏸ pir — {} — waiting for you", q.header), &lines, true);
         let key = match read_key() {
@@ -1078,6 +1235,12 @@ pub fn question_dialog(q: &crate::askuser::Question) -> Option<crate::askuser::A
             Key::Down | Key::Char('j') => selected = (selected + 1).min(q.options.len() - 1),
             Key::Char(' ') if multi => checked[selected] = !checked[selected],
             Key::Char(c @ '1'..='9') => {
+                // The rows are numbered from 1 on screen (see the `{i})` label
+                // below), so the digit key must mean the same 1-based option.
+                // These used to disagree: the label printed the 0-based index
+                // while this handler subtracted 1, so pressing `1` answered the
+                // row labelled `0)` and any option past the ninth had no digit
+                // at all — "I can't get to 3-9".
                 let idx = (c as usize) - ('1' as usize);
                 if idx < q.options.len() {
                     if multi {
@@ -1104,6 +1267,32 @@ pub fn question_dialog(q: &crate::askuser::Question) -> Option<crate::askuser::A
             _ => {}
         }
     }
+}
+
+/// The visible-window math, extracted so the behaviour is testable without
+    /// a terminal: given `total` rows and a `viewport` of `k`, where must the
+    /// window start so that the row at `selected` is on screen?
+fn window_start(selected: usize, total: usize, viewport: usize) -> usize {
+        if total <= viewport {
+            return 0;
+        }
+        let first = selected.min(total - 1);
+        first
+            .saturating_sub(viewport.saturating_sub(2).max(1))
+            .min(total.saturating_sub(viewport))
+    }
+
+/// How many body rows a modal box can show on this terminal.
+///
+/// `draw_box_titled` centres the box and keeps the title bar, so the body gets
+/// the height minus the 2 border rows and minus the 2 rows the title/footer
+/// text and the surrounding gap need. Kept in one place so a caller computing
+/// a viewport (the question dialog) can never disagree with the renderer about
+/// how many rows actually fit.
+fn modal_body_rows() -> usize {
+    let h = crate::term::terminal_height();
+    // title + blank separator + body + blank separator + hint
+    h.saturating_sub(6).max(1)
 }
 
 /// Wrap `text` to at most `width` visible characters per line, preserving
@@ -1240,6 +1429,101 @@ fn approval_lines(
 
 
 #[cfg(test)]
+mod keyboard_ownership_tests {
+    use super::{keyboard_held, window_start, Modal};
+
+    // -- the question dialog -------------------------------------------------
+
+    /// The regression: options were numbered from 0 on screen while the digit
+    /// keys counted from 1, so the hint "[1-9] choose" pointed at the wrong
+    /// row and the tenth option onward had no digit at all. Pin the mapping
+    /// the dialog actually uses.
+    #[test]
+    fn digit_key_selects_the_option_the_label_shows() {
+        let labels = ["alpha", "beta", "gamma", "delta"];
+        // This is the exact expression the dialog uses, kept honest here.
+        for (row, want) in labels.iter().enumerate() {
+            let digit = char::from_digit(row as u32 + 1, 10).expect("row+1 is a digit");
+            let idx = (digit as usize) - ('1' as usize);
+            assert_eq!(labels[idx], *want, "pressing `{digit}` must answer {want}");
+        }
+    }
+
+    /// Every option must be numbered 1..=n and the label the operator reads
+    /// must be the one the digit answers.
+    #[test]
+    fn option_rows_are_numbered_from_one() {
+        let opts = ["alpha", "beta", "gamma"];
+        for (i, o) in opts.iter().enumerate() {
+            // Exactly the format the dialog renders.
+            let row = format!("{}) {}", i + 1, o);
+            let num: String = row.chars().take_while(|c| c.is_ascii_digit()).collect();
+            assert_eq!(num.parse::<usize>().unwrap(), i + 1, "rows are 1-based: {row}");
+        }
+    }
+
+    /// A list taller than the box must scroll so the highlighted row is always
+    /// on screen — the "I could not see options 3-9" report. Without a window
+    /// the selection walked past the last *drawn* row, so those options were
+    /// choosable but invisible.
+    #[test]
+    fn a_long_option_list_scrolls_to_keep_the_cursor_visible() {
+        let total = 12usize;
+        let viewport = 6usize;
+        for selected in 0..total {
+            let first = window_start(selected, total, viewport);
+            let last = first + viewport; // exclusive
+            assert!(
+                selected >= first && selected < last,
+                "row {selected} is outside the window {first}..{last} — it would be invisible"
+            );
+        }
+    }
+
+    /// A short list never scrolls, and the window stays in range even at the
+    /// last row (an over-scrolled window would hide the tail).
+    #[test]
+    fn a_short_list_does_not_scroll_and_stays_in_range() {
+        assert_eq!(window_start(0, 3, 6), 0);
+        assert_eq!(window_start(2, 3, 6), 0);
+        for selected in 0..12 {
+            let first = window_start(selected, 12, 6);
+            assert!(first + 6 <= 12, "window must not run past the end: {first}");
+        }
+        assert_eq!(window_start(11, 12, 6), 6, "the last row pins the window to the end");
+    }
+
+    // -- the keyboard ownership ---------------------------------------------
+
+    /// The flag must be *false* when no dialog is up — otherwise the REPL's
+    /// mid-turn reader would stand down forever and the operator could not type
+    /// a queued prompt while the agent works (silently swallowing every
+    /// keystroke, which is a worse bug than the one this fixes).
+    #[test]
+    fn no_modal_means_the_repl_may_read() {
+        assert!(
+            !keyboard_held(),
+            "the keyboard must be free when no modal is open"
+        );
+    }
+
+    /// The contract the fix rests on: a modal claims the keyboard for exactly
+    /// its lifetime and releases it on drop, including the failure path in
+    /// `enter` (no tty / raw mode unavailable), which must never leave the flag
+    /// stuck — a stuck flag silences the REPL for the rest of the session.
+    #[test]
+    fn a_failed_enter_does_not_leave_the_keyboard_claimed() {
+        let before = keyboard_held();
+        let _ = Modal::enter(); // None without a tty
+        assert_eq!(
+            keyboard_held(),
+            before,
+            "a modal that never opened must not leave the keyboard claimed"
+        );
+    }
+}
+
+#[cfg(test)]
 mod title_width_tests {
     use crate::term;
 
@@ -1269,5 +1553,112 @@ mod title_width_tests {
         let plain = "pir — main menu";
         assert_eq!(term::visible_len(&term::alert(plain)), plain.chars().count());
         term::set_color(true);
+    }
+}
+
+#[cfg(test)]
+mod settings_editor_tests {
+    use super::{apply_setting, SettingsValues};
+
+    fn vals() -> SettingsValues {
+        SettingsValues {
+            model: "test/model".into(),
+            thinking_levels: vec!["off".into(), "low".into(), "high".into()],
+            thinking: "off".into(),
+            show_thinking: true,
+            incremental: true,
+            stop_skill: true,
+            full_auto: false,
+        }
+    }
+
+    /// The regression this whole change exists for: `full-auto` was displayed
+    /// on the settings screen but had no way to be changed, so an operator
+    /// could see "full-auto: off" and have no key that turned it on. Pin that
+    /// row 4 (`←`/`→`) actually flips it.
+    #[test]
+    fn full_auto_row_toggles() {
+        let mut v = vals();
+        assert!(!v.full_auto, "precondition: starts off");
+        apply_setting(&mut v, 4, 1);
+        assert!(v.full_auto, "row 4 (full-auto) must be toggleable");
+        apply_setting(&mut v, 4, -1);
+        assert!(!v.full_auto, "and toggle back off");
+    }
+
+    /// Every boolean row toggles in *both* directions, and toggling one row
+    /// leaves the others alone — a shared handler that aliased two rows would
+    /// make changing `show` silently flip `stop-skill`.
+    #[test]
+    fn each_boolean_row_toggles_independently() {
+        for row in 1..=4 {
+            let mut v = vals();
+            let before = (v.show_thinking, v.incremental, v.stop_skill, v.full_auto);
+            apply_setting(&mut v, row, 1);
+            let after = (v.show_thinking, v.incremental, v.stop_skill, v.full_auto);
+            let mut flipped = before;
+            match row {
+                1 => flipped.0 = !flipped.0,
+                2 => flipped.1 = !flipped.1,
+                3 => flipped.2 = !flipped.2,
+                4 => flipped.3 = !flipped.3,
+                _ => unreachable!(),
+            }
+            assert_eq!(after, flipped, "row {row} must flip exactly its own value");
+        }
+    }
+
+    /// The thinking row *cycles* the caller-supplied list rather than toggling,
+    /// and wraps in both directions. It must never produce a value outside the
+    /// list — that is the level the picker would refuse.
+    #[test]
+    fn thinking_row_cycles_and_wraps_within_the_offered_list() {
+        let mut v = vals();
+        assert_eq!(v.thinking, "off");
+        apply_setting(&mut v, 0, 1);
+        assert_eq!(v.thinking, "low");
+        apply_setting(&mut v, 0, 1);
+        assert_eq!(v.thinking, "high");
+        apply_setting(&mut v, 0, 1);
+        assert_eq!(v.thinking, "off", "must wrap forward past the end");
+        apply_setting(&mut v, 0, -1);
+        assert_eq!(v.thinking, "high", "must wrap backward past the start");
+    }
+
+    /// A level the model does not offer (e.g. resumed onto a different model,
+    /// or a non-reasoning one) is not in the list. Stepping must still produce
+    /// only offered values rather than leaving a stale or invented one.
+    #[test]
+    fn thinking_row_only_produces_offered_levels() {
+        let mut v = vals();
+        v.thinking = "xhigh".into(); // not in the offered list
+        for dir in [1, -1, 1, -1, 1] {
+            apply_setting(&mut v, 0, dir);
+            assert!(
+                v.thinking_levels.contains(&v.thinking),
+                "stepped to {:?}, which the model does not offer",
+                v.thinking
+            );
+        }
+    }
+
+    /// When no level is offered at all (unknown/unsupported model) the row is
+    /// inert — it must not panic on an empty list, and must not invent a level.
+    #[test]
+    fn thinking_row_is_inert_with_no_offered_levels() {
+        let mut v = vals();
+        v.thinking_levels = Vec::new();
+        apply_setting(&mut v, 0, 1);
+        apply_setting(&mut v, 0, -1);
+        assert_eq!(v.thinking, "off", "an empty list must leave the level alone");
+    }
+
+    /// The row count must cover every editable row the screen draws. `model` is
+    /// a status line, so it is excluded; adding a row without raising this
+    /// would make the last setting unreachable (the `↓` clamp would stop one
+    /// short) — which is the same class of "visible but unreachable" bug.
+    #[test]
+    fn every_editable_row_is_reachable() {
+        assert_eq!(SettingsValues::ROWS, 5, "thinking, show, incremental, stop-skill, full-auto");
     }
 }

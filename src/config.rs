@@ -2517,6 +2517,18 @@ mod select_tests {
 /// Serializes tests that mutate process-global env (`PI_DIR` / `PIR_WT`) so
 /// they can't race when the test binary runs them in parallel. Acquired by the
 /// config, security, and wt-extension tests that set these vars.
+///
+/// This used to claim the wt extension took this lock. It could not: extensions
+/// are separate compilation units, so the wt tests used a *module-private*
+/// `TEST_LOCK` and the two sets never excluded each other. Since `PIR_WT` is
+/// read by `config::worktrees_default`, `security::load_policy` and the overlay
+/// whitelist, a wt test flipping it could be observed by a concurrently-running
+/// config/security test mid-read — the disjoint-lock version of the same class
+/// of bug.
+///
+/// Extensions reach this exact mutex through [`crate::test_support::env_lock`],
+/// which borrows this static rather than declaring a second one. Every test that
+/// mutates a process-global — env vars and the process cwd alike — takes it.
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

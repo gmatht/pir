@@ -622,6 +622,43 @@ Knobs: `PIR_RESOURCE_MEMORY_MIB` (sets a ceiling **and** arms it),
 
 ---
 
+## 15. The `/menu` settings screen is editable
+
+`/menu` is an alternate-screen picker. Its **Settings** and **Security** items
+are editors, not reports: `↑`/`↓` move between rows, `←`/`→` (or `h`/`l`) change
+the selected value, `Enter` applies, `q`/`Esc` discards. Everything applies to
+the running session immediately and is saved where it can carry into the next one.
+
+| row | changes | persisted as |
+|---|---|---|
+| model | *(not editable here — `/model` and the model picker own this)* | — |
+| thinking | the reasoning level, cycled through only the levels the current model actually offers | `<log>.thinking` |
+| show thinking | whether streamed reasoning is displayed | `<log>.thinking` |
+| incremental md | in-place markdown rendering vs. one dump at the end of the turn | `<log>.incmd` |
+| stop-skill | the explicit-`request_stop` skill | session; `/stop-skill default` persists it |
+| full-auto | whether unanticipated requests run without asking | `security.ask` in `security.toml` |
+
+**Full-auto is the ask policy, and nothing more.** It is `security.ask =
+auto-yes` — the setting that makes `SecurityPolicy::decide` return `Allow`
+before any approval is surfaced. It does **not** relax the security level, the
+write-quarantine, or the path guards: a request the policy denies is still
+denied in full-auto. Turning it *off* restores `ask`, never `auto-no`, so
+"stop asking me" can never quietly become "deny everything".
+
+That row used to be the reason this screen was rebuilt: it was *drawn* as a
+value, but the flag behind it was constructor-only (`Registry::full_auto` had
+no setter), so there was no key — and no code path — that could turn it on.
+`Agent::full_auto()` is now **derived from the live ask policy** rather than
+stored beside it, so the number on the screen and the behaviour at tool time
+cannot disagree.
+
+The `←`/`→` handler is unit-tested per row (`modal::settings_editor_tests`),
+including that the thinking row only ever produces levels the model offers, and
+that a resumed session's full-auto reflects its actual posture rather than the
+launch-time flag.
+
+---
+
 ## 14. zellij session recording and rebuild
 
 When `pir` runs inside a [zellij](https://zellij.dev) pane it records which

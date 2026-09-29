@@ -1839,6 +1839,34 @@ mod e2e_tests {
         running_sessions().iter().any(|s| s == name)
     }
 
+    /// 1-minute load average, or 0.0 where it cannot be read.
+    fn e2e_load1() -> f64 {
+        std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|s| s.split_whitespace().next().map(|v| v.to_string()))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+
+    /// Multiplier for the e2e "wait for the session to register" budget.
+    ///
+    /// Every one of these waits is satisfied by a *separate zellij server
+    /// process* competing with everything else on the machine, so a flat budget
+    /// reports a timing failure as a test failure. Scaling with load keeps the
+    /// wait strict on a quiet box and patient on a busy one. Capped at 6x so a
+    /// genuinely broken zellij still fails in bounded time.
+    fn e2e_wait_factor() -> u64 {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let load1 = e2e_load1();
+        if load1 > cores as f64 {
+            ((load1 / cores as f64).ceil() as u64).clamp(1, 6)
+        } else {
+            1
+        }
+    }
+
     /// Guard that tears the session (and its stuck client) down on every exit
     /// path — including a panic in the body.
     ///
@@ -1863,37 +1891,63 @@ mod e2e_tests {
     /// which is what the body and the up-wait check. (That same "says nothing
     /// useful" behaviour is the name-clash trap the other test pins.)
     ///
-    /// The `KillOnDrop` is installed *before* the up-assert so a session that
-    /// came up but whose body failed cannot outlive the run — and because it is
-    /// a `Drop` guard, a panicking body cleans up too.
+    /// The `KillOnDrop` is installed *before* the create call, so every exit
+    /// path — a create that only partially registers, the up-assert below, or a
+    /// panic in `body` — tears the session down. Leaking one is not cosmetic:
+    /// an orphan is a real zellij *server* that keeps competing on the single
+    /// shared per-user server, starving the sessions the remaining e2e tests
+    /// are trying to create.
     fn with_session(name: &str, layout: &str, body: impl FnOnce()) {
         // One real-zellij test at a time: the server is per-user and shared.
         let _serial = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("pir_e2e_{}", std::process::id()));
+        // Per-*test*, not per-process. The old name was keyed on the pid alone,
+        // so a re-run of the binary (or a second binary) reopened the same
+        // directory and a leftover `.kdl`/socket from an interrupted run could
+        // be handed to a fresh `--new-session-with-layout`.
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("pir_e2e_{}_{}", std::process::id(), seq));
         let _ = std::fs::create_dir_all(&dir);
         let kdl = dir.join(format!("{name}.kdl"));
         std::fs::write(&kdl, layout).unwrap();
+        // Install the teardown guard *before* the create call, so a session that
+        // comes up and then wedges — or a create that partially succeeds — is
+        // still torn down. Previously the guard was installed after the
+        // up-wait, so a session that registered between the create returning
+        // and the guard being built survived the run: those orphans are real
+        // zellij *servers* that keep competing on the one shared per-user
+        // server, which is what makes the next `with_session` time out.
+        let _kill = KillOnDrop(name);
         let _ = run(&[
             "--new-session-with-layout",
             kdl.to_str().unwrap(),
             "--session",
             name,
         ]);
-        // Give the server a moment to register the session.
+        // Give the server a moment to register the session. The budget scales
+        // with load (see `e2e_wait_factor`): registration is done by a server
+        // process sharing this box, so a flat 5s failed regularly at load
+        // average 30+ on 16 cores — a timing failure that says nothing about
+        // what these tests assert.
+        let tries = 50 * e2e_wait_factor();
         let mut up = false;
-        for _ in 0..50 {
+        for _ in 0..tries {
             if is_running(name) {
                 up = true;
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        // Tear down on every path, including the assert below: a session that
-        // came up but whose body failed must not outlive the run.
-        let _kill = KillOnDrop(name);
-        assert!(up, "zellij session {name} never came up");
+        // `_kill` was installed before the create, so this assert and any panic
+        // in `body` still tear the session down.
+        assert!(
+            up,
+            "zellij session {name} never came up (waited {}ms, load {:.1} on {} cores)",
+            tries * 100,
+            e2e_load1(),
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+        );
         body();
-        drop(_kill);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2047,21 +2101,37 @@ mod e2e_tests {
         std::fs::write(&kdl, TWO_PANE_LAYOUT).unwrap();
         let path = kdl.to_str().unwrap().to_string();
         assert!(!is_running(&name), "must not exist before we create it");
+        // Teardown guard *before* the create. This test previously had none: it
+        // only deleted the session at the very end, so the two asserts in
+        // between could — and under load did — leak a real zellij *server*
+        // that outlived the run and starved every later e2e test. The comment
+        // at the bottom calls that leak "what accumulated across the original
+        // broken runs"; the guard is what stops it recurring.
+        let _kill = KillOnDrop(&name);
 
         let started = std::time::Instant::now();
         let _out = run(&["--new-session-with-layout", &path, "--session", &name]);
         let elapsed = started.elapsed();
 
         // The session really was created (the call did not simply bail out)...
+        // Budget scales with load for the same reason as `with_session`: the
+        // registering is done by a server process sharing this box.
+        let tries = 50 * e2e_wait_factor();
         let mut up = false;
-        for _ in 0..50 {
+        for _ in 0..tries {
             if is_running(&name) {
                 up = true;
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        assert!(up, "the bounded call must still create the session");
+        assert!(
+            up,
+            "the bounded call must still create the session (waited {}ms, load {:.1} on {} cores)",
+            tries * 100,
+            e2e_load1(),
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+        );
 
         // ...and the call returned on its own rather than riding the watchdog
         // to the deadline. Generous: the watchdog is 15 s, and a wedged attach
@@ -2075,7 +2145,7 @@ mod e2e_tests {
         // and is what accumulated across the original broken runs.
         let _ = run(&["delete-session", "--force", &name]);
         let mut gone = false;
-        for _ in 0..50 {
+        for _ in 0..tries {
             if !is_running(&name) {
                 gone = true;
                 break;

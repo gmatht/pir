@@ -303,6 +303,16 @@ impl Registry {
     pub fn full_auto(&self) -> bool {
         self.full_auto
     }
+    /// Flip the full-auto flag for the rest of this session.
+    ///
+    /// The flag is what `Agent` hands to a sub-agent (`new_subagent`) and what
+    /// the live [`Agent::set_full_auto`] setter writes, so a change here reaches
+    /// every child spawned afterwards. It was previously constructor-only, which
+    /// is why `/menu → Settings` could *display* full-auto but never change it:
+    /// there was no code path to write this field after startup.
+    pub fn set_full_auto(&mut self, on: bool) {
+        self.full_auto = on;
+    }
     pub fn len(&self) -> usize {
         self.backends.len()
     }

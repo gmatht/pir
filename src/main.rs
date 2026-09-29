@@ -30,9 +30,11 @@ mod resource;
 mod session;
 mod sixel;
 mod skills;
+mod lints;
 mod subagent;
 mod taste;
 mod term;
+mod test_support;
 mod types;
 mod user;
 mod activelist;
@@ -385,6 +387,16 @@ AGENT USERS RUN UNATTENDED
   sandbox boundary is the user account itself. Use `pir -c`/`--confirm` or set
   PIR_CONFIRM=1 to force prompts even as an ai_* user.
 
+FULL-AUTO
+  Full-auto means "unanticipated requests run without asking" — it is the
+  `security.ask` policy set to `auto-yes`, nothing more. It does not relax the
+  security level, the write-quarantine, or the path guards, and a denied
+  request is still denied. Toggle it any time from /menu → Settings (this
+  session) or by editing `ask` in ~/.pi/agent/security.toml (every session);
+  the menu also saves the change there, so it carries into the next run. The
+  equivalent of turning it off is `ask` — never `auto-no`, so "stop asking me"
+  can't turn into a standing denial behind your back. `-y` sets it at launch.
+
 AGENT SHELL
   Agent `bash` commands source a small env that wraps `grep`/`find` to
   ripgrep when it is installed, so searches stay fast (a whole-filesystem
@@ -393,6 +405,9 @@ AGENT SHELL
 
 COMMANDS
   /help  /menu  /model <sel>  /models  /default-model <sel>  /sessions  /goal [objective]  /continue
+                          /menu is an alternate-screen picker; its Settings and
+                          Security items are EDITABLE (↑↓ move, ←→ change, enter
+                          applies) and take effect immediately
   /thinking [<level>] [show|hide]   set the model's thinking level
                           (off|minimal|low|medium|high|xhigh|max) and/or toggle
                           whether streamed reasoning is displayed; no arg = status
@@ -463,6 +478,13 @@ COMMANDS
   /autoclean [on|off|status]   fix all errors/warnings/failing tests; with no arg
                           run one cleanup pass now, `on`/`off` toggle cleaning
                           automatically after every prompt
+                          Per-language: the cleanup list is derived from the
+                          tree (Cargo/CMake/meson/pyproject/package.json/go.mod
+                          or source files) and each language gets its own
+                          linter — clippy, LLVM static analysis (scan-build +
+                          clang-tidy) / cppcheck for C and C++, ruff, eslint,
+                          go vet. A linter that is not installed is reported
+                          and offered for install; it is never counted as clean.
   /create [name]           scaffold a new project (seeds from clipboard .md spec)
   /login [provider]        store an API key for a provider in ~/.pi/agent/auth.json
   /logout [provider]       remove a stored provider credential from auth.json
@@ -727,6 +749,27 @@ fn main() {
             "project" => {
                 // `pir project init` — handle in a subcommand branch below.
                 run_project_subcommand(&args[i + 1..]);
+                return;
+            }
+            "lints" => {
+                // `pir lints` — show the per-language lint plan `/autoclean`
+                // would use for this tree, and which tools are missing. Exists
+                // so the plan is inspectable (and testable on a real project)
+                // without spending an agent turn on it.
+                let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let st = crate::lints::partition(crate::lints::detect_lints(&dir));
+                if st.available.is_empty() && st.missing.is_empty() {
+                    println!("no recognised build manifest or source file in {}", dir.display());
+                    return;
+                }
+                for p in &st.available {
+                    println!("{}  {}  (detected via {})", term::green("ok"), p.lang, p.detected_by);
+                    println!("      {}", p.command);
+                }
+                for p in &st.missing {
+                    println!("{}  {}  (detected via {})", term::yellow("MISSING"), p.lang, p.detected_by);
+                    println!("      needed: {}  ·  sudo apt-get install {}", p.tool, p.apt_package);
+                }
                 return;
             }
             "-l" | "--latest-build" => {
@@ -1592,6 +1635,7 @@ fn main() {
                         if let Ok(mut g) = typeahead.lock() { g.clear(); }
                         cleanup_running = true;
                         println!("{} autoclean: fixing all errors/warnings/failing tests", term::bold("·"));
+                        report_lint_plan();
                         fg_handle = Some(run_foreground_turn(
                             &agent_slot,
                             &fg_cancel,
@@ -1658,7 +1702,6 @@ fn main() {
                                 &agent_slot,
                                 &mut providers,
                                 &mut jobs,
-                                full_auto,
                                 &bus,
                                 &fg_cancel,
                                 true,
@@ -1673,7 +1716,6 @@ fn main() {
                             &agent_slot,
                             &mut providers,
                             &mut jobs,
-                            full_auto,
                             &bus,
                             &fg_cancel,
                             true,
@@ -1956,7 +1998,6 @@ fn main() {
                     &agent_slot,
                     &mut providers,
                     &mut jobs,
-                    full_auto,
                     &bus,
                     &fg_cancel,
                     false,
@@ -1977,7 +2018,7 @@ fn main() {
             continue;
         }
         if let Some(cmd) = input.strip_prefix('/') {
-            handle_command(cmd, &agent_slot, &mut providers, &mut jobs, full_auto, &bus, &fg_cancel, false, &current_ctx);
+            handle_command(cmd, &agent_slot, &mut providers, &mut jobs, &bus, &fg_cancel, false, &current_ctx);
         } else if bg {
             jobs.spawn_prompt(input.to_string(), &current_ctx, bus.clone());
         } else {
@@ -2006,6 +2047,7 @@ fn main() {
             fg_quiet.store(false, Ordering::SeqCst);
             cleanup_running = true;
             println!("{} autoclean: fixing all errors/warnings/failing tests", term::bold("·"));
+            report_lint_plan();
             hist_recall.reset();
             fg_handle = Some(run_foreground_turn(
                 &agent_slot,
@@ -2222,18 +2264,54 @@ static AUTOCLEAN_ENABLED: AtomicBool = AtomicBool::new(false);
 /// One-shot request (set by a bare `/autoclean`) to run a cleanup turn immediately.
 static AUTOCLEAN_RUN_ONCE: AtomicBool = AtomicBool::new(false);
 
-/// Prompt that drives the agent to fix every compiler error, every warning, and
-/// every failing test, then re-run build/test and repeat until the project is
-/// fully green. The loop runs *inside* the agent's turn (it has the bash tool),
-/// so this returns once the project is clean.
+/// Prompt that drives the agent to fix every compiler error, every warning, every
+/// static-analysis finding, and every failing test, then re-run and repeat until
+/// the project is fully green.
+///
+/// The command list is **derived from the project** (see [`crate::lints`]),
+/// not hardcoded: this used to be a single Rust-shaped paragraph that told every
+/// project to run `cargo`, so a C/C++ tree was sent to build a nonexistent
+/// manifest and its code was never statically analysed. A linter that is not
+/// installed is reported as a warning *with an offer to install it* rather than
+/// being quietly skipped, so "nothing to fix" can never mean "nothing was
+/// checked".
 fn autoclean_prompt() -> String {
-    "Autoclean this project: run its build and test suite and keep fixing issues until \
-everything is green. Concretely: 1) run `cargo build` (or the project's configured build \
-command) and fix ALL errors and ALL warnings; 2) run `cargo test` (and any other project \
-test commands) and fix every failing test; 3) re-run the build and the tests and repeat \
-until there are zero errors, zero warnings, and all tests pass. Do not stop early and do not \
-commit anything — keep iterating until the project is completely clean."
-        .to_string()
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    crate::lints::autoclean_prompt(&cwd)
+}
+
+/// Tell the operator, *before* the cleanup turn starts, which linters will run
+/// and which are missing — with the apt package to install.
+///
+/// This is the visible half of the no-silent-pass rule. The prompt tells the
+/// model not to call unanalysed code clean, but the operator is the one who
+/// can actually fix a missing tool, so the gap is printed where they will see
+/// it rather than only appearing in the model's final summary.
+fn report_lint_plan() {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let st = crate::lints::partition(crate::lints::detect_lints(&cwd));
+    if st.available.is_empty() && st.missing.is_empty() {
+        println!("{} autoclean: no recognised build manifest or source found — the agent will have to guess how to build this", term::yellow("·"));
+        return;
+    }
+    let have: Vec<String> = st
+        .available
+        .iter()
+        .map(|p| format!("{} ({})", p.lang, p.tool))
+        .collect();
+    if !have.is_empty() {
+        println!("{} autoclean: linters — {}", term::bold("·"), have.join(", "));
+    }
+    for p in &st.missing {
+        println!(
+            "{} autoclean: {} has no linter installed ({} missing) — its code will NOT be \
+analysed. Install it with: sudo apt-get install {}",
+            term::yellow("!"),
+            p.lang,
+            p.tool,
+            p.apt_package,
+        );
+    }
 }
 
 /// A canned sample document used by `/markup_demo`. It exercises every part of
@@ -2506,7 +2584,6 @@ fn handle_command(
     agent_slot: &AgentSlot,
     providers: &mut Vec<Provider>,
     jobs: &mut BackgroundJobs,
-    full_auto: bool,
     bus: &SharedBus,
     cancel: &Arc<AtomicBool>,
     fg_running: bool,
@@ -2620,19 +2697,91 @@ fn handle_command(
                     }
                 }
                 Some(MenuAction::Settings) => {
+                    // The settings screen is *editable*: it returns the
+                    // operator's chosen values and we apply each changed one
+                    // through the same setters the slash commands use, so a
+                    // value shown there and a value set by `/thinking` cannot
+                    // drift apart.
+                    let before = {
+                        let mut g = agent_slot.lock().unwrap();
+                        let Some(agent) = g.as_mut() else {
+                            eprintln!("pir: agent busy (turn running) — try again when idle");
+                            return;
+                        };
+                        let kind = match agent.provider().api.as_deref() {
+                            Some("anthropic") => Some(config::ApiKind::Anthropic),
+                            Some("openai") => Some(config::ApiKind::OpenAi),
+                            _ => None,
+                        };
+                        let model = agent.model();
+                        modal::SettingsValues {
+                            model: agent.label(),
+                            thinking_levels: modal::offered_thinking_levels(
+                                kind,
+                                model.context.unwrap_or(0),
+                                Some(&model),
+                            ),
+                            thinking: agent.thinking_level().as_str().to_string(),
+                            show_thinking: agent.show_thinking(),
+                            incremental: agent.incremental_md(),
+                            stop_skill: agent.stop_skill(),
+                            // Read from the *agent*, not the launch-time
+                            // local: it is derived from the live ask policy, so
+                            // a session that was resumed (or whose policy was
+                            // edited) shows what it is actually doing.
+                            full_auto: agent.full_auto(),
+                        }
+                    };
+                    let chosen = match modal::settings_editor(before.clone()) {
+                        modal::SettingsOutcome::Saved(v) => v,
+                        modal::SettingsOutcome::Discarded => {
+                            println!("{}", term::dim("settings discarded (no change)"));
+                            return;
+                        }
+                        modal::SettingsOutcome::NoTty => {
+                            eprintln!("pir: menu needs a tty");
+                            return;
+                        }
+                    };
                     let mut g = agent_slot.lock().unwrap();
                     let Some(agent) = g.as_mut() else {
-                        eprintln!("pir: agent busy (turn running) — try again when idle");
+                        eprintln!("pir: agent busy (turn running) — settings not applied");
                         return;
                     };
-                    modal::settings_dialog(
-                        &agent.label(),
-                        agent.thinking_level().as_str(),
-                        agent.show_thinking(),
-                        agent.incremental_md(),
-                        agent.stop_skill(),
-                        full_auto,
-                    );
+                    if chosen.thinking != before.thinking
+                        && let Some(lvl) = config::ThinkingLevel::parse(&chosen.thinking)
+                    {
+                        println!("{}", agent.set_thinking(lvl));
+                    }
+                    if chosen.show_thinking != before.show_thinking {
+                        println!("{}", agent.set_show_thinking(chosen.show_thinking));
+                    }
+                    if chosen.incremental != before.incremental {
+                        println!("{}", agent.set_incremental_md(chosen.incremental));
+                    }
+                    if chosen.stop_skill != before.stop_skill {
+                        println!("{}", agent.set_stop_skill(chosen.stop_skill));
+                    }
+                    if chosen.full_auto != before.full_auto {
+                        let msg = agent.set_full_auto(chosen.full_auto);
+                        println!("{msg}");
+                        // Persist the ask-mode to `security.toml` so the new
+                        // posture survives into the next session — the same
+                        // file the security editor writes. Best-effort: a failed
+                        // write is reported but the live change stands, because
+                        // the operator asked for *this* session either way.
+                        if let Some(p) = agent.security_policy() {
+                            match crate::security::save_policy(&p) {
+                                Ok(path) => println!(
+                                    "{}",
+                                    term::dim(&format!("ask-mode saved to {}", path.display()))
+                                ),
+                                Err(e) => eprintln!(
+                                    "pir: could not save ask-mode to security.toml ({e}) — the change applies to this session only"
+                                ),
+                            }
+                        }
+                    }
                 }
                 Some(MenuAction::Thinking) => {
                     let mut g = agent_slot.lock().unwrap();
@@ -3474,6 +3623,7 @@ fn handle_command(
                 "" => {
                     AUTOCLEAN_RUN_ONCE.store(true, Ordering::SeqCst);
                     println!("{} queuing an autoclean pass after this prompt", term::dim("·"));
+                    report_lint_plan();
                 }
                 "on" | "enable" | "1" => {
                     AUTOCLEAN_ENABLED.store(true, Ordering::SeqCst);

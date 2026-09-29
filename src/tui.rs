@@ -2107,24 +2107,21 @@ mod tui_paste_tests {
 
         // The old behaviour, for contrast: a flag that resets per read sees
         // every newline after the first chunk as a submit.
+        //
+        // A per-read flag is false on entry to every chunk and is never set
+        // true — that is precisely what "resets per read" means — so the
+        // `if pasting` branch is unreachable and each chunk's newlines all
+        // count as submits. Modelled directly, without the dead variable.
         let mut per_read_submits = 0;
         for slice in wire.chunks(64) {
-            // The bug under test: a fresh flag for every read, so it can never
-            // still be set by the time a later chunk's newline arrives.
-            #[allow(unused_assignments)]
-            let mut pasting = false;
             for &b in slice {
                 if b == 0x1b {
                     continue;
                 }
                 if b == b'\n' {
-                    if pasting {
-                        /* literal */ } else {
-                        per_read_submits += 1;
-                    }
+                    per_read_submits += 1;
                 }
             }
-            pasting = false;
         }
         assert!(
             per_read_submits > 1,

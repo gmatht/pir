@@ -3316,8 +3316,11 @@ mod esc_tests {
     /// The env snapshot is taken *after* the lock is held, so a test's
     /// `set_var` is always inside the critical section.
     fn serial() -> SerialGuard {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The *shared* env lock, so a test elsewhere that mutates the process
+        // environment (or the cwd) cannot pull the rug from under a command
+        // these tests are about to spawn and then assert on. A module-private
+        // lock only excluded this module.
+        let lock = crate::test_support::env_lock();
         SerialGuard {
             _restore: std::env::var_os("PIR_SHELL_CHECK_IN_SECS"),
             _lock: lock,

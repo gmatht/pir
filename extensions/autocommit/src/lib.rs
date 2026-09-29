@@ -411,13 +411,20 @@ mod tests {
     }
 
     /// These tests mutate process-global `PIR_AUTO_COMMIT` and share a single
-    /// fixed scratch-dir path, so they must not run in parallel. Cargo runs
-    /// tests on many threads by default, so we serialise them with a mutex.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// fixed scratch-dir path, so they must not run in parallel.
+    ///
+    /// They take the *shared* env lock (`crate::test_support::env_lock`) rather
+    /// than a private one, so they also exclude every other test in the process
+    /// that is mutating the environment — a private lock only excluded these.
+    /// The scratch-repo path is keyed on the pid, so these are additionally
+    /// serialised among themselves here.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_support::env_lock()
+    }
 
     #[test]
     fn auto_commits_prompt_as_subject_and_skips_meta_commands() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         // SAFETY: edition 2024 marks env mutation unsafe; pir confines
         // it to startup config and explicit session toggles.
         unsafe { std::env::set_var("PIR_AUTO_COMMIT", "1"); }
@@ -457,7 +464,7 @@ mod tests {
 
     #[test]
     fn off_by_default_does_nothing() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         // SAFETY: edition 2024 marks env mutation unsafe; pir confines
         // it to startup config and explicit session toggles.
         unsafe { std::env::remove_var("PIR_AUTO_COMMIT"); }

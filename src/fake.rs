@@ -43,6 +43,18 @@ pub enum Directive {
     Type { ch: char, cps: u64, secs: u64 },
     /// Stream reasoning text through the thinking channel (paced chunks).
     Think(String),
+    /// Call `ask_user_question` with comma-separated options, so an offline
+    /// puppet can drive the *modal* question dialog — the one screen where the
+    /// operator's arrow keys are the entire interaction.
+    Ask(Vec<String>),
+    /// Emit a real `request_stop` tool call — the model explicitly ending its
+    /// turn, which is what the stop-skill nudge asks for. Without this the fake
+    /// can only answer in text, so a nudge loop has no way to terminate and a
+    /// test driving one would spin until the detector fired.
+    StopRequest {
+        /// `stop-complete` or `stop-needs-input`.
+        reason: String,
+    },
     /// Answer with the parser's stalled-stream marker: no text, no tool call.
     /// The real providers synthesise `Block::Text("(empty response)")` when a
     /// stream yields nothing (see `provider.rs`) — what a dropped connection or
@@ -70,7 +82,26 @@ pub fn parse_directives(text: &str) -> Vec<Directive> {
         match verb.to_ascii_lowercase().as_str() {
             "markup" => out.push(Directive::Markup),
             "think" if !args.is_empty() => out.push(Directive::Think(args.to_string())),
+            "ask" if !args.is_empty() => {
+                let opts: Vec<String> = args
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !opts.is_empty() {
+                    out.push(Directive::Ask(opts));
+                }
+            }
             "echo" if !args.is_empty() => out.push(Directive::Echo(args.to_string())),
+            // `stop [reason]`: emit a real request_stop tool call.
+            "stop" => {
+                let reason = if args.trim().is_empty() {
+                    "stop-complete".to_string()
+                } else {
+                    args.trim().to_string()
+                };
+                out.push(Directive::StopRequest { reason });
+            }
             "empty" => {
                 // `empty` or `empty <n>`: stall once, or the first n rounds.
                 let n = args.parse::<u32>().unwrap_or(1);
@@ -189,7 +220,26 @@ pub fn fake_chat(
     let mut think_text = String::new();
     let mut blocks: Vec<Block> = Vec::new();
     let mut tool_n = 0u32;
-    for d in &directives {
+    // Multi-round scripting: when the prompt carries several directives, round N
+    // runs directive N. A nudge round carries no `FAKE:` line of its own (the
+    // nudge is not persisted into history), so the count comes from the
+    // assistant replies already produced for this prompt — which is exactly the
+    // round number.
+    let rounds_done = match last_text_idx {
+        Some(t) => history[t + 1..]
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .count(),
+        None => 0,
+    };
+    eprintln!("FAKE-DBG rounds={rounds_done} len={} texts={:?}", directives.len(),
+        history.iter().map(|m| format!("{:?}:{}", m.role, m.text().chars().take(20).collect::<String>())).collect::<Vec<_>>());
+    let selected: Vec<&Directive> = if directives.len() > 1 {
+        directives.get(rounds_done.min(directives.len() - 1)).into_iter().collect()
+    } else {
+        directives.iter().collect()
+    };
+    for d in selected {
         if cancel.load(Ordering::SeqCst) {
             return Err("request cancelled".to_string());
         }
@@ -250,6 +300,40 @@ pub fn fake_chat(
                     text.push_str(&chunk);
                     std::thread::sleep(Duration::from_millis(100));
                 }
+            }
+            Directive::StopRequest { reason } => {
+                let ack = format!("fake: ending the turn ({reason}).\n");
+                on_text(&ack);
+                text.push_str(&ack);
+                blocks.push(Block::ToolUse {
+                    id: format!("fake-tool-{tool_n}"),
+                    name: "request_stop".to_string(),
+                    input: serde_json::json!({
+                        "reason": reason,
+                        "message": "the fake ended its turn",
+                    }),
+                });
+                tool_n += 1;
+            }
+            Directive::Ask(options) => {
+                // Opens the modal question dialog on the *worker* thread while
+                // the REPL is mid-turn in its own raw-mode reader: the exact
+                // two-readers-on-one-tty situation the dialog must win.
+                let ack = "fake: asking the operator a question…\n";
+                on_text(ack);
+                text.push_str(ack);
+                let labels: Vec<serde_json::Value> =
+                    options.iter().map(|l| serde_json::json!({"label": l})).collect();
+                blocks.push(Block::ToolUse {
+                    id: format!("fake-tool-{tool_n}"),
+                    name: "ask_user_question".to_string(),
+                    input: serde_json::json!({
+                        "header": "Next step",
+                        "question": "How should I proceed?",
+                        "options": labels,
+                    }),
+                });
+                tool_n += 1;
             }
             Directive::Empty { stall_rounds } => {
                 // No text emitted, no tool call: the parser's marker alone, which

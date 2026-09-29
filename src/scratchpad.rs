@@ -135,9 +135,21 @@ pub fn usage(dir: &Path) -> (usize, u64) {
 }
 
 /// Delete scratch directories (and scratch *files*) older than the TTL.
-/// Called once at startup. Best-effort: a directory that can't be removed
-/// (still in use by a live session, permission denied) is left alone and the
-/// sweep continues — this must never fail a session.
+///
+/// **Do not call this on the startup path** — use [`spawn_sweep`], which does
+/// the same work on a background thread. [`is_stale`] takes the max mtime over
+/// the whole tree of every candidate (a directory's own mtime only changes when
+/// its top-level entries change, so a dir the agent kept writing into would
+/// otherwise look ancient), which means a sweep is O(every file in every
+/// scratchpad ever created). With a few thousand stale session dirs that is
+/// seconds of blocking `stat` calls *before the REPL paints* — measured at 5.2s
+/// on a host with 1633 scratch dirs, where the resume itself took 108ms. The
+/// sweep is pure housekeeping that nothing in the resume path depends on, so it
+/// has no business sitting in front of the first prompt.
+///
+/// Best-effort: a directory that can't be removed (still in use by a live
+/// session, permission denied) is left alone and the sweep continues — this
+/// must never fail a session.
 pub fn sweep_old() -> usize {
     if std::env::var_os("PIR_SCRATCHPAD_KEEP").is_some() {
         return 0;
@@ -179,6 +191,32 @@ pub fn sweep_old() -> usize {
         }
     }
     removed
+}
+
+/// Start [`sweep_old`] on a background thread, so startup never waits for it.
+///
+/// Returns the [`JoinHandle`]. Production **drops it** (detached) — dropping a
+/// handle does not cancel the thread, so the work still completes, and nothing
+/// in resume needs its result. It is returned so a *test* can join it: the
+/// scratch root comes from process-global env, so an unjoined thread could
+/// still be reading `PIR_SCRATCHPAD_DIR` after a test restored it and then
+/// sweep a sibling test's directory.
+///
+/// Deliberately *not* spawned through the smol reactor: the sweep is plain
+/// blocking filesystem I/O, and putting it on that single worker would let it
+/// occupy the executor while the REPL also wants it.
+pub fn spawn_sweep() -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("scratch-sweep".into())
+        .spawn(|| {
+            let removed = sweep_old();
+            if removed > 0 {
+                eprintln!("[pir] scratchpad sweep: removed {removed} stale item(s)");
+            }
+        })
+        // A thread that cannot be spawned must not fail startup: the sweep is
+        // housekeeping, and `sweep_old` is still callable directly.
+        .unwrap_or_else(|_| std::thread::spawn(|| {}))
 }
 
 /// Whether `p` (or the newest file inside it) is older than `cutoff`. A
@@ -350,6 +388,52 @@ mod tests {
             unsafe { std::env::remove_var("PIR_SCRATCHPAD_KEEP"); }
             assert_eq!(removed, 0);
             assert!(stale.exists());
+        });
+    }
+
+    /// The sweep must not sit in front of the first prompt. It walks the newest
+    /// mtime of every leftover session's whole tree, so on a host with a few
+    /// thousand scratch dirs it blocked startup for seconds (5.2s measured with
+    /// 1633 dirs, against 108ms to parse a 2.2MB transcript). Assert the
+    /// contract: `spawn_sweep` returns promptly with the work unfinished, and
+    /// that work still completes once joined.
+    #[test]
+    fn the_sweep_runs_off_the_calling_thread_and_still_completes() {
+        with_root("async", |root| {
+            // Enough real work that a synchronous sweep *cannot* return inside
+            // the budget: 400 dirs × 40 files, each needing a `stat` (the sweep
+            // takes the newest mtime across the whole tree). An earlier version
+            // used 64 one-file dirs, which completed in ~80ms and therefore
+            // "passed" even with the sweep restored to the startup path — the
+            // assertion was vacuous.
+            for i in 0..400 {
+                let d = root.join(format!("stale-{i}"));
+                std::fs::create_dir_all(&d).unwrap();
+                for f in 0..40 {
+                    std::fs::write(d.join(format!("f{f}")), "x").unwrap();
+                }
+                let old = SystemTime::now() - Duration::from_secs(400 * 24 * 3600);
+                for f in 0..40 {
+                    set_mtime(&d.join(format!("f{f}")), old);
+                }
+                set_mtime(&d, old);
+            }
+
+            let start = std::time::Instant::now();
+            let handle = spawn_sweep();
+            // Returning inside the budget is the assertion: a synchronous sweep
+            // does the whole walk before returning from this call.
+            let spawn_elapsed = start.elapsed();
+            assert!(
+                spawn_elapsed < Duration::from_millis(250),
+                "spawn_sweep must return immediately, took {spawn_elapsed:?} — \
+                 the sweep is back on the startup path"
+            );
+
+            // The work is genuinely asynchronous, and genuinely still done.
+            handle.join().expect("sweep thread must not panic");
+            let left = std::fs::read_dir(root).unwrap().flatten().count();
+            assert_eq!(left, 0, "the background sweep must still remove every stale dir");
         });
     }
 

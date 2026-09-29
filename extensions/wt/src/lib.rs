@@ -1776,7 +1776,18 @@ mod tests {
     /// parallel on multiple threads. Serialise them so `repo_root()`/`trunk()`
     /// always resolve against the right scratch repo and env reads aren't
     /// clobbered by a concurrent test.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    ///
+    /// This used to be a *module-private* `static TEST_LOCK`, which serialised
+    /// these tests against each other but against nothing else — and `PIR_WT` is
+    /// not read only here: `config::worktrees_default`, `security::load_policy`
+    /// and the overlay whitelist all consult it, so a wt test flipping the var
+    /// could still be observed by a config or security test running at the same
+    /// moment. `env_lock()` is the *same* mutex `TEST_ENV_LOCK` is (borrowed, not
+    /// a second one), so env- and cwd-mutating tests across every module now
+    /// exclude each other properly.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_support::env_lock()
+    }
 
     /// RAII guard that `cd`s into `dir` and restores the previous cwd on drop —
     /// even if the test panics. Without this, a panicking test leaves the
@@ -1841,7 +1852,7 @@ mod tests {
 
     #[test]
     fn creates_branch_and_merges_back_when_checks_pass() {
-        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = env_lock();
         // SAFETY: edition 2024 marks env mutation unsafe; pir confines
         // it to startup config and explicit session toggles.
         unsafe { std::env::set_var("PIR_WT", "1"); }
@@ -1937,30 +1948,54 @@ mod tests {
         // test failed intermittently. Poll instead — `flock -n` fails while A
         // holds it, so the first refusal is proof A is in.
         //
-        // The budget is a little more generous than the original 10s because each
-        // poll forks two processes and the suite is documented as
-        // contention-bound (see `scripts/deploy.sh`): on a machine saturated by
-        // unrelated CPU work, scheduling the spawned `flock`/`true` pair takes
-        // longer. It is deliberately NOT raised further: when this test fails for
-        // an environmental reason, a long deadline only makes the suite slower to
-        // report it. 20s is enough to absorb scheduling delay while still failing
-        // promptly if `flock` genuinely cannot run here.
-        //
         // Deliberately does NOT inspect A's exit status. `flock` forks (or execs)
         // the `sleep`, so A can legitimately be reaped while the grandchild still
         // holds the lock — treating that as "A died" reported a false failure and
         // was strictly worse than the original. The lock probe below is the only
         // reliable proof that A is in.
+        //
+        // The budget is a little more generous than the original 10s because each
+        // poll forks two processes and the suite is documented as
+        // contention-bound (see `scripts/deploy.sh`).
+        //
+        // It scales with how busy this host actually is. A flat deadline made
+        // this test fail intermittently on a saturated machine (observed at
+        // load average 24 on 16 cores, with rustdoc/qemu/perfs running): A is
+        // forked and still waiting to be scheduled when a fixed 20s expires,
+        // and the suite reports a failure that has nothing to do with the lock
+        // semantics under test. Doubling the budget per unit of load keeps the
+        // test strict where the machine is quick and patient where it is not.
+        // A 4x cap still fails promptly if `flock` genuinely cannot run here.
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let load1 = std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|s| s.split_whitespace().next().map(|v| v.to_string()))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let contended = if load1 > cores as f64 {
+            ((load1 / cores as f64).ceil() as u64).clamp(1, 4)
+        } else {
+            1
+        };
+        let budget = std::time::Duration::from_secs(20 * contended);
+
         let mut held = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let deadline = std::time::Instant::now() + budget;
         while std::time::Instant::now() < deadline {
-            let probe = Command::new("flock")
+            // A probe that cannot even be spawned (fork failure under memory
+            // pressure) is not evidence that the lock is free — `unwrap()`
+            // here used to abort the whole test with a panic that said nothing
+            // about the lock.
+            let Ok(status) = Command::new("flock")
                 .args(["-x", "-n"])
                 .arg(&lock)
                 .arg("true")
                 .status()
-                .unwrap();
-            if !probe.success() {
+            else {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            };
+            if !status.success() {
                 held = true; // someone (A) is holding it
                 break;
             }
@@ -1968,8 +2003,10 @@ mod tests {
         }
         assert!(
             held,
-            "holder A never acquired {lock:?} within 20s (the flock under test did not start, \
-             or this machine cannot run it reliably alongside the rest of the suite)"
+            "holder A never acquired {lock:?} within {:?} (load {:.1} on {cores} cores): \
+             the flock under test did not start, or this machine cannot run it reliably \
+             alongside the rest of the suite",
+            budget, load1
         );
 
         // Holder B should be refused immediately (-w 0 => no wait). This is now
@@ -1992,12 +2029,15 @@ mod tests {
 
     #[test]
     fn off_by_default_pir_wt_1_enables() {
-        // Recover from a poisoned lock: other wt tests panic on Windows git
-        // file-locks while holding TEST_LOCK, which would otherwise break this
-        // (env-only) test too.
-        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Serialize with the config/security tests that also mutate PI_DIR.
-        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // One lock for both the env vars and the cwd. It used to take a
+        // module-private `TEST_LOCK` *and* `config::TEST_ENV_LOCK` in the same
+        // test, which is a self-deadlock waiting to happen once both resolve to
+        // the same mutex — and it was a symptom of the real problem: the two
+        // locks were never the same lock, so this test's `PIR_WT` flip was
+        // never actually serialised against the config/security tests it was
+        // trying to serialise against. `env_lock()` covers env *and* cwd for
+        // every module at once.
+        let _lock = env_lock();
         // Deterministic: point PI_DIR at a throwaway dir so the persisted
         // worktrees default is clean (off).
         let dir = std::env::temp_dir().join(format!("pir_wt_test_{}", std::process::id()));
@@ -2026,7 +2066,7 @@ mod tests {
 
     #[test]
     fn pirt_wt_0_turns_it_off() {
-        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = env_lock();
         // SAFETY: edition 2024 marks env mutation unsafe; pir confines
         // it to startup config and explicit session toggles.
         unsafe { std::env::set_var("PIR_WT", "0"); }
@@ -2053,7 +2093,7 @@ mod tests {
         // A bare repo (no PIR_WT_CHECK, no recognized project type) must report
         // Verdict::NoChecks, never Verdict::Passed — so the extension will NOT
         // silently auto-merge it.
-        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = env_lock();
         // SAFETY: edition 2024 marks env mutation unsafe; pir confines
         // it to startup config and explicit session toggles.
         unsafe { std::env::remove_var("PIR_WT_CHECK"); }
@@ -2074,7 +2114,7 @@ mod tests {
         // On the main checkout (no worktree), startup_report must say we're on
         // the trunk checkout and report the automation on/off state — this is
         // the "why wasn't my worktree reported?" fix.
-        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = env_lock();
         // SAFETY: edition 2024 marks env mutation unsafe; pir confines
         // it to startup config and explicit session toggles.
         unsafe { std::env::set_var("PIR_WT", "0"); } // for the "off" branch
@@ -2102,7 +2142,7 @@ mod tests {
     fn trunk_detection_prefers_checked_out_branch() {
         // Repo whose default branch is "trunk" (not main). trunk() should pick it
         // up from the checked-out branch.
-        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = env_lock();
         let dir = scratch_repo();
         let _chdir = Chdir::new(&dir);
         Command::new("git").args(["checkout", "-qb", "trunk"]).current_dir(&dir).status().unwrap();
