@@ -249,8 +249,6 @@ pub fn fake_chat(
             .count(),
         None => 0,
     };
-    eprintln!("FAKE-DBG rounds={rounds_done} len={} texts={:?}", directives.len(),
-        history.iter().map(|m| format!("{:?}:{}", m.role, m.text().chars().take(20).collect::<String>())).collect::<Vec<_>>());
     let selected: Vec<&Directive> = if directives.len() > 1 {
         directives.get(rounds_done.min(directives.len() - 1)).into_iter().collect()
     } else {
