@@ -65,6 +65,28 @@ pub enum Directive {
     },
 }
 
+/// The operator's prompt in `history`: the latest user message that carries
+/// text and is not the stop-skill nudge.
+///
+/// Shared by the directive lookup and the `Empty` round counter so the two can
+/// never disagree. Tool results also have role `User`, and the nudge is text —
+/// matching on `role == User` alone picks either up, which silently changed the
+/// round key every round and spun a stall forever.
+fn prompt_text(history: &[Message]) -> String {
+    history
+        .iter()
+        .rev()
+        .find(|m| {
+            m.role == Role::User
+                && m.blocks.iter().any(|b| matches!(b, Block::Text(_)))
+                && !m.blocks.iter().any(
+                    |b| matches!(b, Block::Text(t) if t.contains("Your last message had no tool calls")),
+                )
+        })
+        .map(|m| m.text())
+        .unwrap_or_default()
+}
+
 /// Parse `FAKE:` directive lines from prompt text. Verbs match
 /// case-insensitively; malformed lines are skipped (a fake must never crash
 /// a session); unknown verbs are skipped.
@@ -194,12 +216,7 @@ pub fn fake_chat(
             usage,
         ));
     }
-    let prompt = history
-        .iter()
-        .rev()
-        .find(|m| m.role == Role::User)
-        .map(|m| m.text())
-        .unwrap_or_default();
+    let prompt = prompt_text(history);
     let directives = parse_directives(&prompt);
     if directives.is_empty() {
         // Canned echo: proves what the turn received (puppet asserts on it).
@@ -339,21 +356,19 @@ pub fn fake_chat(
                 // No text emitted, no tool call: the parser's marker alone, which
                 // is exactly what the turn loop sees after a stalled stream.
                 //
-                // The turn loop retries a stall without recording it in history,
-                // so the count must come from here. `history` DOES gain a message
-                // per round (the nudge, or nothing on a retry) — the reliable
-                // signal is the request itself, counted per prompt so each test's
-                // turn is independent.
-                let prompt = history
-                    .iter()
-                    .rev()
-                    .find(|m| m.role == Role::User)
-                    .map(|m| m.text())
-                    .unwrap_or_default();
+                // The turn loop retries a stall without recording it, so the
+                // round count cannot come from history. Count the calls for the
+                // current prompt instead, keyed on the prompt so each *turn*
+                // starts a fresh budget.
+                //
+                // NOTE the key is the operator's prompt, not `history.last()`:
+                // the nudge is not persisted, but a tool result (role `User`)
+                // can be, and using the last message made the key change every
+                // round — which reset the counter and stalled forever.
+                let key = prompt_text(history);
                 static ROUNDS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
                 let round = {
                     let mut v = ROUNDS.lock().unwrap_or_else(|e| e.into_inner());
-                    let key = prompt.clone();
                     let n = v.iter().filter(|k| **k == key).count() as u32;
                     v.push(key);
                     n
