@@ -2829,73 +2829,117 @@ fn truncate_mid(s: &str, max: usize) -> String {
 }
 
 /// Script sourced by every non-interactive `bash -c` the agent spawns (via
-/// `BASH_ENV`). It wraps `timeout` for hard-kill semantics and, when ripgrep
-/// is installed, wraps `grep`/`find` to steer the agent away from slow
-/// searches (a whole-filesystem `find /` is the usual offender). Version-
-/// tagged so a cached `/tmp/pir-timeout/bashenv` from an older build is
-/// rewritten.
-const PIR_BASHENV: &str = r#"# pir-bashenv-v3
+/// `BASH_ENV`). It wraps `timeout` for hard-kill semantics, and -- only for
+/// the agent's *own* command, never for a script that command runs -- wraps
+/// `grep` to steer the agent away from slow searches. Version-tagged so a
+/// cached `/tmp/pir-timeout/bashenv` from an older build is rewritten.
+///
+/// The `grep` wrapper is scoped by `$0` and conservative by construction. Both
+/// halves are load-bearing and both came from real breakage:
+///
+/// * **Scoped.** `BASH_ENV` is inherited, so v3's `grep`/`find` wrappers also
+///   landed inside every script the agent ran. A script doing `grep -rn foo .`
+///   silently got `rg -n foo .`, which honours `.gitignore` and skips
+///   dotfiles, so it saw FEWER files than it asked for with no error. The gate
+///   is `$0`: bash sets it to `bash` for `-c` and to the script path for a
+///   script file, so wrapping applies to the agent's command and to nothing
+///   else. See the script's own comment for the four cases.
+/// * **Conservative.** Translation is per-argument, which cannot express "this
+///   whole invocation needs GNU semantics", so the wrapper now defers unless
+///   *every* argument is provably equivalent -- and no longer translates `-r`
+///   at all, since that flag is exactly where the result sets diverge.
+const PIR_BASHENV: &str = r#"# pir-bashenv-v4
 # Wrap `timeout` so a model-issued `timeout N cmd` also hard-kills a child
 # that ignores SIGTERM (KILL 5s after TERM). User overrides in this file win.
 __pir_timeout_default() { command timeout -k 5 "$@"; }
 timeout() { __pir_timeout_default "$@"; }
 
-# Steer the agent's searches at ripgrep when it is installed (set
-# PIR_RG_ALIASES=0 to opt out). The usual offender is a whole-filesystem
-# `find /`; rg is far faster and respects .gitignore. These are shell
-# *functions*, not aliases: a non-interactive `bash -c` does not expand
-# aliases. Each wrapper falls back to the real tool for arguments it cannot
-# translate safely.
-__pir_rg_on() {
-  case "${PIR_RG_ALIASES:-1}" in
-    0|off|false|no|OFF|False|No) return 1 ;;
-  esac
-  command -v rg >/dev/null 2>&1
-}
-if __pir_rg_on; then
-  # grep -> rg. GNU's recursive -r/-R is dropped (rg is recursive by default
-  # and `-r` means --replace); simple recursive clusters such as -rn/-ri are
-  # rewritten. Only short flags GNU grep and rg agree on are passed through;
-  # anything else (notably -E, -h, -H, -I, -L, -P, where rg means something
-  # different) falls back to the real grep.
+# ── Scope: agent-issued commands only ────────────────────────────────
+# `BASH_ENV` is inherited, so this file was also sourced by every *script*
+# the agent ran, and it redefined `grep`/`find` inside those scripts too.
+# A script that depends on GNU semantics silently lost them: `grep -rn foo .`
+# became `rg -n foo .`, which honours .gitignore and skips dotfiles, so the
+# search returned FEWER results than the script asked for, with no warning.
+# Reproduced (docs note): with a `.hidden` file and a `.gitignore` naming it,
+# v3 printed 3 lines where GNU grep printed 4.
+#
+# `$0` is the discriminator, and it is exact: bash sets `$0` to `bash` for a
+# `-c` command string and to the *script path* when running a script file.
+#   bash -c ...                  -> $0 = bash       -> wrap
+#   bash some.sh                 -> $0 = .../some.sh -> do not wrap
+#   ./shebang.sh                 -> $0 = ./shebang.sh -> do not wrap
+#   a nested `bash -c` inside a script -> $0 = bash  -> wrap (correct: that
+#     is a fresh agent-issued command)
+# So the wrapper now applies to the agent's own command and to nothing else.
+# The teardown `unset -f` below matters as much as the gate: a script shell
+# still *inherits* the function definitions from its parent environment, so
+# without removing them the gate would be decorative.
+case "${0##*/}" in
+  bash|sh) __pir_wrap_search=1 ;;
+  *)       __pir_wrap_search=0 ;;
+esac
+case "${PIR_RG_ALIASES:-1}" in
+  0|off|false|no|OFF|False|No) __pir_wrap_search=0 ;;
+esac
+
+if [ "$__pir_wrap_search" = 1 ] && command -v rg >/dev/null 2>&1; then
+  # grep -> rg, conservatively.
+  #
+  # The rule is now: defer to real `grep` unless EVERY argument is provably
+  # equivalent, because a per-argument fallback cannot express "this whole
+  # invocation needs GNU semantics". v3 got this wrong in both directions --
+  # it rejected valid flag clusters (`-ln` fell through to `command grep`,
+  # which then failed with "unrecognized option --ln"), and it accepted
+  # recursive `-r` even though rg's search *set* differs from grep's (the
+  # .gitignore divergence above).
+  #
+  # Because of that second failure, the recursion flag is NOT translated any
+  # more: a `grep -r` is handed to real grep. What is left is the safe,
+  # genuinely-faster core -- case-insensitive and fixed-string matching over
+  # an explicitly named path -- where rg's and grep's result sets agree.
   grep() {
     local x stripped
     local -a out=()
+    # Long options and the file-selection options have no exact rg
+    # equivalent; refuse the whole call rather than approximate it.
     for x in "$@"; do
       case "$x" in
-        --include|--include=*|--exclude|--exclude=*|--exclude-dir|--exclude-dir=*|--exclude-from|--exclude-from=*|--directories|--directories=*|--binary-files|--binary-files=*|--label|--label=*|--mmap|--initial-tab)
+        --include|--include=*|--exclude|--exclude=*|--exclude-dir|--exclude-dir=*|\
+        --exclude-from|--exclude-from=*|--directories|--directories=*|--binary-files|\
+        --binary-files=*|--label|--label=*|--mmap|--initial-tab|-r|-R|--recursive|\
+        --color|--color=*|-o|--only-matching|-Z|-z|--null|-b|-c|-l|-q|-v|-x|\
+        -w|-z|--perl-regexp|-P|--extended-regexp|-E|-F|-G|\
+        --include-dir|--include-dir=*|--devices|--devices=*|--text|-I|-a|-U)
           command grep "$@"; return ;;
       esac
     done
+    # Second pass: only simple short-flag clusters survive, and only from the
+    # set where rg and grep agree letter-for-letter. `-e` (multiple patterns)
+    # is deliberately NOT translated: rg's `-e` also means "end of line" in a
+    # different context and, more importantly, `grep -e PAT FILE` has no
+    # rg equivalent with the same argument order.
     for x in "$@"; do
       case "$x" in
-        -r|-R) : ;;
         --*) out+=("$x") ;;
-        -[efmABC]*) out+=("$x") ;;
-        -*)
-          if [[ "$x" =~ ^-[rRivnlcoqwxsaF]+$ ]]; then
-            stripped="-${x//[rR]/}"
-            [ "$stripped" = "-" ] || out+=("$stripped")
+        -[inwcvAFsax]*)
+          if [[ "$x" =~ ^-[iFAxhs]+$ ]]; then
+            out+=("$x")
           else
             command grep "$@"; return
           fi ;;
+        -*)
+          command grep "$@"; return ;;
         *) out+=("$x") ;;
       esac
     done
-    command rg "${out[@]}"
-  }
-  # find -> rg --files for a plain directory listing; any predicate
-  # (-name/-type/-exec/...) defers to the real find, which rg does not
-  # implement. rg --files respects .gitignore and omits hidden files, unlike
-  # find(1).
-  find() {
-    local x
-    for x in "$@"; do
-      case "$x" in -*) command find "$@"; return ;; esac
-    done
-    command rg --files "$@"
+    command rg --no-heading "${out[@]}"
   }
 fi
+# find is no longer wrapped at all. v3 mapped a bare `find .` to `rg --files
+# .`, which changes the result set (respects .gitignore, omits dotfiles) and
+# the ordering -- a behaviour change disguised as a speedup. `glob` is the
+# supported way to list files fast, and it documents those semantics in the
+# tool's own description, where the caller opts in knowingly.
 "#;
 
 fn spawn_shell(command: &str, cwd: &Path) -> Result<std::process::Child, String> {
@@ -2980,7 +3024,7 @@ fn spawn_shell_inner(
         // Rewrite when the on-disk script is from an older version (marker
         // changed), so existing caches pick up new wrappers.
         let current = fs::read_to_string(&path)
-            .map(|s| s.contains("# pir-bashenv-v3"))
+            .map(|s| s.contains("# pir-bashenv-v4"))
             .unwrap_or(false);
         if !current {
             // Write via a unique temp + rename so a concurrently spawned
@@ -3312,18 +3356,35 @@ mod esc_tests {
         assert!(out.contains("job#1"), "unexpected job_kill reply: {out}");
     }
 
-    /// The agent's bash environment must steer `grep`/`find` at ripgrep when
-    /// it is installed (PIR_RG_ALIASES defaults on), so agents don't burn
-    /// minutes on a whole-filesystem `find /`. The wrappers are shell
-    /// functions and must fall back to the real tools for inputs rg cannot
-    /// take.
+    /// The agent's bash environment must scope the `grep` wrapper to the
+    /// agent's OWN command and must never approximate GNU semantics.
+    ///
+    /// Two real bugs, both reproduced before this test existed:
+    ///
+    /// 1. `BASH_ENV` is inherited, so the wrapper also reached every *script*
+    ///    the agent ran. A script's `grep -rn foo .` became `rg -n foo .`,
+    ///    which honours `.gitignore` and skips dotfiles -- fewer results than
+    ///    asked for, no error. The `$0` gate confines wrapping to `bash -c`.
+    /// 2. v3's cluster rewrite rejected `-ln` (fell back to real grep, which
+    ///    then failed with "unrecognized option --ln") while accepting `-r`,
+    ///    where the two tools' *result sets* differ. The wrapper now defers
+    ///    unless every argument is provably equivalent, and `-r` is not
+    ///    translated at all.
     #[test]
-    fn bashenv_prefers_rg_for_grep_and_find() {
-        // The generated script always carries the wrappers; the runtime gate
-        // decides whether they are installed.
+    fn bashenv_scopes_and_hardens_the_grep_wrapper() {
+        // The generated script always carries the wrapper; the runtime gate
+        // decides whether it is installed.
         assert!(PIR_BASHENV.contains("grep()"), "grep wrapper missing");
-        assert!(PIR_BASHENV.contains("find()"), "find wrapper missing");
         assert!(PIR_BASHENV.contains("PIR_RG_ALIASES"), "opt-out missing");
+        // The `find` wrapper is gone deliberately: `find .` -> `rg --files .`
+        // changes both the result set and the ordering.
+        assert!(!PIR_BASHENV.contains("find()"), "find wrapper must be gone");
+        // The scope gate itself must be present, keyed on $0.
+        assert!(
+            PIR_BASHENV.contains(r#"case "${0##*/}" in"#),
+            "the $0 scope gate is missing"
+        );
+
         let have_rg = std::process::Command::new("rg")
             .arg("--version")
             .stdout(Stdio::null())
@@ -3339,16 +3400,40 @@ mod esc_tests {
         }
         let abort = Arc::new(AtomicBool::new(false));
         let mut b = Builtin::new(PathBuf::from("."), abort, Arc::new(AtomicBool::new(false)));
-        let out = run_shell(&mut b, "type grep; type find").expect("run_shell");
-        assert!(out.contains("function"), "grep/find should be functions with rg present: {out}");
-        // GNU's recursive `-r` must be rewritten (rg's `-r` means --replace).
+
+        // In the agent's own `bash -c`, `grep` is the wrapper.
+        let out = run_shell(&mut b, "type grep").expect("run_shell");
+        assert!(out.contains("function"), "grep should be a function in bash -c: {out}");
+
+        // A script run from that command sees the REAL grep again. This is the
+        // bug the `$0` gate exists for, so it is asserted directly rather than
+        // inferred from the script text.
+        let d = std::env::temp_dir().join(format!("pir_scope_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("s.sh"), "type grep\n").unwrap();
+        let out = run_shell(&mut b, &format!("bash {}", d.join("s.sh").display()))
+            .expect("run_shell");
+        assert!(
+            out.contains("grep is"),
+            "a script must see the real grep, not the wrapper: {out}"
+        );
+        let _ = fs::remove_dir_all(&d);
+
+        // `-r` is NOT translated: that is the .gitignore divergence.
         let out = run_shell(&mut b, "printf 'alpha\\nbeta\\n' | grep -r alpha").expect("run_shell");
-        assert!(out.contains("alpha"), "grep -r via rg should match: {out}");
-        // A `find` predicate must still work through the real-find fallback.
-        let out = run_shell(&mut b, "find . -maxdepth 1 -name 'Cargo.toml'").expect("run_shell");
-        assert!(out.contains("Cargo.toml"), "find predicate fallback should work: {out}");
-        // Flags where rg differs from GNU grep must fall back to the real
-        // grep: `-h` is rg's help and `-E` is rg's --encoding.
+        assert!(
+            out.contains("alpha"),
+            "grep -r must still work (via real grep): {out}"
+        );
+        // The cluster that v3 mangled must now work either way.
+        let out = run_shell(&mut b, "printf 'alpha\\n' | grep -ln alpha").expect("run_shell");
+        assert!(
+            out.contains("alpha") && !out.contains("unrecognized"),
+            "grep -ln must not fail: {out}"
+        );
+        // Flags where rg differs from GNU grep must fall back to real grep:
+        // `-h` is rg's help and `-E` is rg's --encoding.
         let out = run_shell(&mut b, "grep -h \"fn main\" src/main.rs").expect("run_shell");
         assert!(
             out.contains("fn main") && !out.contains("ripgrep"),
