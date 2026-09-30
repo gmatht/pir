@@ -601,41 +601,6 @@ impl Builtin {
         // I'm doing with kills here" is not re-asked every time. Keyed on the
         // guard itself, not on the command text: the grant authorises *this*
         // check, never a later unrelated kill.
-        if let Some(why) = Self::dangerous_kill_reason(command)
-            && !crate::security::escalation_granted(ESCALATION_SELF_KILL)
-        {
-            let prompt = format!(
-                "{} this command looks like it would kill pir processes ({why}). Run it anyway? {} ",
-                term::yellow("⚠"),
-                term::dim("[y] once / [s] this session / [n] no")
-            );
-            // Same terminal caveat as escalation: the REPL owns stdin in raw
-            // mode, so read the operator's key from the tty directly. A real
-            // "n" (or no answer at all) refuses; "y" runs it once, "s" runs it
-            // and stops asking for the rest of the session.
-            if crate::term::tty_available() {
-                match crate::term::prompt_key(
-                    &crate::term::awaiting_banner(&prompt),
-                    priv_prompt_timeout_secs(),
-                ) {
-                    Some('y') => {}
-                    Some('s') => crate::security::grant_escalation(ESCALATION_SELF_KILL),
-                    Some(_) => {
-                        return Ok("[denied] refusing to run a self-targeting kill command".into());
-                    }
-                    None => {
-                        return Ok("[denied] refusing to run a self-targeting kill command (no approval given)".into());
-                    }
-                }
-            } else {
-                let answer = term::read_answer(&prompt);
-                match answer.as_str() {
-                    "y" | "yes" => {}
-                    "s" | "session" => crate::security::grant_escalation(ESCALATION_SELF_KILL),
-                    _ => return Ok("[denied] refusing to run a self-targeting kill command".into()),
-                }
-            }
-        }
         // Guard #2: privilege escalation (`sudo`/`su`/...). `sudo` prompts for a
         // password on `/dev/tty` — NOT on the stdin we hand it (which is
         // `/dev/null`), so it would block forever until the 10-minute detach,
