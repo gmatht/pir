@@ -583,10 +583,17 @@ pub fn clear_input_zone() {
 /// Wiping down to the last row is what removes a wrapped hint tail; absolute
 /// addressing is what makes it independent of where rustyline thinks the
 /// cursor is (see [`clear_input_zone`]).
+///
+/// The rows cleared are exactly [`zone_rows`] — the same three the mid-turn
+/// spinner paints (status / prompt / rule). They used to start at `h-1`, which
+/// left the spinner's *top* row (`h-2`) untouched: that row kept the last
+/// "running · 4s · cwd" status forever, so at idle the operator saw a stale
+/// spinner line stacked on top of the prompt's own rule — the "two lines of
+/// ──── around the prompt" report. Sharing one definition means the two
+/// renderers can never disagree about which rows are theirs.
 fn input_zone_clear_seq(h: usize) -> String {
-    let prompt_row = h.saturating_sub(1).max(1);
     let mut buf = String::new();
-    for row in prompt_row..=h {
+    for row in zone_rows(h) {
         buf.push_str(&format!("\x1b[{row};1H\x1b[2K"));
     }
     buf
@@ -1195,7 +1202,7 @@ const SLASH_HELP: &[(&str, &str, &str)] = &[
     ("/goal", "[objective]", "start or show the current goal"),
     ("/grants", "[clear]", "list what \"[s]\" granted this session (paths, ops, escalations)"),
     ("/help", "", "show all commands"),
-    ("/compact", "", "show compact help"),
+    ("/compact", "[status|on|off]", "summarise the conversation to free context"),
     ("/jobs", "", "list background jobs"),
     ("/login", "<provider>", "store an API key for a provider"),
     ("/logout", "<provider>", "remove a stored provider credential"),
@@ -2662,19 +2669,32 @@ impl Spinner {
     pub fn stop(&mut self) {
         if self.alive.swap(false, Ordering::SeqCst) {
             // Unpark first (under the screen lock so a racing tick can't
-            // re-park after us), erase the zone and release the scroll
-            // region. Later output continues naturally from the blank rows.
-            // Then join the tick thread.
+            // re-park after us), then **join the tick thread**, and only then
+            // erase the zone.
+            //
+            // The join has to come first. The tick loop checks `alive` at the
+            // top and sleeps 80ms, so a tick already past that check will
+            // happily repaint the three zone rows. Erasing before joining let
+            // that in-flight tick land *after* the erase, which is how a
+            // "⠴ running · 0s · …cwd…" line survived into the idle prompt
+            // permanently — the stale-status row the operator kept seeing
+            // under the prompt long after the turn had ended. Joining first
+            // makes the erase the last write to those rows, which is the only
+            // ordering that is actually true.
+            set_parked(false);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+            // The tick thread's own teardown erased the zone while holding the
+            // screen lock, but do it again here under the same lock: it is
+            // cheap, and it is what guarantees the rows are blank even if the
+            // thread had already been taken.
             {
                 let _screen = screen_lock();
-                set_parked(false);
                 let h = terminal_height();
                 let mut stdout = io::stdout();
                 let _ = stdout.write_all(spinner_stop_seq(h).as_bytes());
                 let _ = stdout.flush();
-            }
-            if let Some(h) = self.handle.take() {
-                let _ = h.join();
             }
         }
     }
@@ -2825,6 +2845,31 @@ pub mod raw {
         let _ = io::stdout().flush();
     }
 
+    /// Pure core of [`enable_raw`] / [`enable_raw_picker`]: put `tios` into the
+    /// mode pir's raw reader needs. No libc calls, so the flags it clears are
+    /// unit-testable — the `IXON` bug below was invisible in review and only
+    /// reproducible through a real pty, which no unit test could reach.
+    ///
+    /// Three separate concerns, and *all* of them must be cleared:
+    ///
+    ///  * `ICANON` / `ECHO` — line buffering and echo, so keys arrive
+    ///    immediately and are not printed back at us.
+    ///  * `ISIG` — so `Ctrl-C` / `Ctrl-Z` arrive as *bytes*; we handle them
+    ///    ourselves and the driver must not raise signals for them.
+    ///  * `IXON` / `IXOFF` — software flow control. **This is the one that broke
+    ///    quitting.** With `IXON` still set, the line discipline consumes `0x11`
+    ///    (XON) and `0x13` (XOFF) as flow-control bytes, so `Ctrl-Q` never
+    ///    reaches `read()` at all. Mid-turn `Ctrl-Q` then looks like a hang —
+    ///    the key is swallowed by the tty driver, so nothing downstream can see
+    ///    it, and no amount of retrying or re-binding helps.
+    pub(super) fn to_raw_mode(mut raw: libc::termios) -> libc::termios {
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+        raw.c_iflag &= !(libc::IXON | libc::IXOFF);
+        raw.c_cc[libc::VMIN] = 0;
+        raw.c_cc[libc::VTIME] = 0;
+        raw
+    }
+
     /// Put stdin into raw, non-blocking mode (no canonical line editing, no
     /// echo, reads return immediately). Idempotent. No-op when raw mode is
     /// disabled (`--no-raw`). Enables bracketed-paste mode as well so pasted
@@ -2844,11 +2889,7 @@ pub mod raw {
             let mut tios: libc::termios = std::mem::zeroed();
             if libc::tcgetattr(fd, &mut tios) == 0 {
                 st.orig_termios = Some(tios);
-                let mut raw = tios;
-                raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
-                raw.c_cc[libc::VMIN] = 0;
-                raw.c_cc[libc::VTIME] = 0;
-                libc::tcsetattr(fd, libc::TCSANOW, &raw);
+libc::tcsetattr(fd, libc::TCSANOW, &to_raw_mode(tios));
             }
             let flags = libc::fcntl(fd, libc::F_GETFL);
             st.orig_nonblock = Some(flags & libc::O_NONBLOCK != 0);
@@ -3854,13 +3895,7 @@ pub mod raw {
             let mut tios: libc::termios = std::mem::zeroed();
             if libc::tcgetattr(fd, &mut tios) == 0 {
                 st.orig_termios = Some(tios);
-                let mut raw = tios;
-                // No ISIG so ctrl-c/ctrl-z arrive as raw bytes (we handle them
-                // ourselves rather than letting them raise a signal).
-                raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
-                raw.c_cc[libc::VMIN] = 0;
-                raw.c_cc[libc::VTIME] = 0;
-                libc::tcsetattr(fd, libc::TCSANOW, &raw);
+libc::tcsetattr(fd, libc::TCSANOW, &to_raw_mode(tios));
             }
             let flags = libc::fcntl(fd, libc::F_GETFL);
             st.orig_nonblock = Some(flags & libc::O_NONBLOCK != 0);
@@ -4487,6 +4522,69 @@ mod tests {
 }
 
 #[cfg(test)]
+/// Raw-mode termios flags, pinned.
+///
+/// The `IXON` half is a real bug this project shipped: `enable_raw` cleared
+/// `ICANON | ECHO | ISIG` from `c_lflag` but never touched `c_iflag`, so the
+/// terminal driver's software flow control stayed active and it consumed
+/// `Ctrl-Q` (`0x11`, XON) before `read()` ever saw it. Mid-turn `Ctrl-Q` then
+/// looked like a hang. The flags are asserted here rather than in a pty test
+/// because the failure is invisible to everything short of a real terminal —
+/// which is exactly why it survived review twice.
+#[cfg(all(test, unix))]
+mod raw_mode_flag_tests {
+    use super::raw::to_raw_mode;
+
+    fn tios_with_everything_set() -> libc::termios {
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        // Start from "every flag set", so the test fails if a clear is missing
+        // rather than only if one is accidentally added.
+        t.c_lflag = libc::ICANON | libc::ECHO | libc::ISIG | 0xffff;
+        t.c_iflag = libc::IXON | libc::IXOFF | 0xffff;
+        t
+    }
+
+    /// The regression: flow control must be off, or `Ctrl-Q` is eaten by the tty
+    /// and quitting mid-turn cannot work at all.
+    #[test]
+    fn software_flow_control_is_disabled() {
+        let t = to_raw_mode(tios_with_everything_set());
+        assert_eq!(
+            t.c_iflag & libc::IXON,
+            0,
+            "IXON must be cleared: the line discipline would otherwise consume \
+             Ctrl-Q (0x11, XON) and the key would never reach read()"
+        );
+        assert_eq!(t.c_iflag & libc::IXOFF, 0, "IXOFF must be cleared too");
+    }
+
+    /// And the flags that were already correct must stay correct.
+    #[test]
+    fn canonical_echo_and_isig_stay_disabled() {
+        let t = to_raw_mode(tios_with_everything_set());
+        assert_eq!(t.c_lflag & libc::ICANON, 0, "line editing must be off");
+        assert_eq!(t.c_lflag & libc::ECHO, 0, "echo must be off");
+        assert_eq!(
+            t.c_lflag & libc::ISIG,
+            0,
+            "ctrl-c/ctrl-z must arrive as bytes, not signals"
+        );
+        assert_eq!(t.c_cc[libc::VMIN], 0, "reads must not block waiting for a newline");
+        assert_eq!(t.c_cc[libc::VTIME], 0, "no inter-byte timer");
+    }
+
+    /// A termios with the flags already clear is unchanged — `to_raw_mode` is
+    /// idempotent, so a second call cannot corrupt the mode.
+    #[test]
+    fn applying_raw_mode_twice_is_stable() {
+        let once = to_raw_mode(tios_with_everything_set());
+        let twice = to_raw_mode(once);
+        assert_eq!(once.c_lflag, twice.c_lflag);
+        assert_eq!(once.c_iflag, twice.c_iflag);
+        assert_eq!(once.c_cc[libc::VMIN], twice.c_cc[libc::VMIN]);
+    }
+}
+
 mod quit_press_tests {
     use super::*;
 
@@ -5486,11 +5584,20 @@ mod nonunix_term {
     }
 }
 
-/// Spawn a background thread that force-exits the whole process the instant
-/// a *second* `Ctrl-Q` (`0x11`) arrives on stdin. Implements the two-stage
-/// quit: the first `Ctrl-Q` begins a graceful shutdown (the caller sweeps
-/// jobs and joins the worker); if that hangs because something is frozen,
-/// the second `Ctrl-Q` bypasses *all* cleanup and terminates immediately.
+/// Spawn a background thread that force-exits the whole process the instant a
+/// *second* quit gesture arrives on stdin: `Ctrl-Q` (`0x11`) or the plain
+/// <kbd>Ctrl</kbd>+<kbd>\</kbd> (`0x1c`) that the terminal sends for `SIGQUIT`.
+///
+/// Implements the two-stage quit: the *first* quit press begins a graceful
+/// shutdown (the caller sweeps jobs and joins the worker); if that hangs
+/// because something is frozen, a second press bypasses *all* cleanup and
+/// terminates immediately.
+///
+/// `0x1c` is accepted because raw mode is still enabled while the graceful
+/// path is draining, so a `Ctrl-\` that escapes the process (`SIGQUIT`) has
+/// nowhere to go. The operator's reflex on a wedged shutdown is exactly that
+/// key, and it must never be a no-op — and never be a key we claim to handle
+/// while quietly swallowing it.
 ///
 /// If the graceful shutdown completes normally the caller exits on its own
 /// thread and this watchdog is reaped with the process. It never returns.
@@ -5505,9 +5612,9 @@ pub fn spawn_force_quit_watchdog() {
                 let r = unsafe {
                     libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len())
                 };
-                if r > 0 && tmp[..r as usize].contains(&0x11) {
+                if r > 0 && tmp[..r as usize].iter().copied().any(crate::is_force_quit_byte) {
                     let _ = std::io::stdout()
-                        .write_all(b"\r\n>> force-quitting NOW (Ctrl-Q x2)\r\n");
+                        .write_all(b"\r\n>> force-quitting NOW (Ctrl-Q / Ctrl-\\ x2)\r\n");
                     std::process::exit(1);
                 }
                 if r <= 0 {
@@ -5525,11 +5632,11 @@ pub fn spawn_force_quit_watchdog() {
                         if k.kind == KeyEventKind::Release {
                             continue;
                         }
-                        if k.modifiers.contains(KeyModifiers::CONTROL)
-                            && matches!(k.code, KeyCode::Char('q'))
-                        {
+                        let force = k.modifiers.contains(KeyModifiers::CONTROL)
+                            && (matches!(k.code, KeyCode::Char('q') | KeyCode::Char('\\')));
+                        if force {
                             let _ = std::io::stdout()
-                                .write_all(b"\r\n>> force-quitting NOW (Ctrl-Q x2)\r\n");
+                                .write_all(b"\r\n>> force-quitting NOW (Ctrl-Q / Ctrl-\\ x2)\r\n");
                             std::process::exit(1);
                         }
                     }
@@ -5623,6 +5730,46 @@ mod clear_input_zone_tests {
         let seq = zone_clear_seq(1);
         assert!(seq.contains("\x1b[1;1H\x1b[2K"), "got {seq:?}");
         assert!(!seq.contains("\x1b[0;"), "emitted an invalid row 0: {seq:?}");
+    }
+
+    /// The idle clear must cover *every* row the mid-turn spinner paints.
+    ///
+    /// It used to start at `h-1`, which left the spinner's top row (`h-2`) —
+    /// the "⠴ running · 12s · <cwd>" status — untouched. Once a turn ended that
+    /// text stayed on screen forever, stacked on the prompt's own rule: the
+    /// stale line the operator saw sitting above the input zone. Sharing
+    /// `zone_rows` makes the two renderers structurally unable to disagree.
+    #[test]
+    fn clears_every_row_the_spinner_zone_paints() {
+        for h in [4usize, 5, 10, 24, 40, 100] {
+            let seq = zone_clear_seq(h);
+            for row in super::zone_rows(h) {
+                assert!(
+                    seq.contains(&format!("\x1b[{row};1H\x1b[2K")),
+                    "h={h}: spinner row {row} is never cleared, so its status line survives \
+                     into the idle prompt — {seq:?}"
+                );
+            }
+        }
+    }
+
+    /// And the converse: nothing outside the zone is wiped, or `clear_input_zone`
+    /// would start eating the conversation above it.
+    #[test]
+    fn clears_nothing_outside_the_spinner_zone() {
+        for h in [4usize, 10, 24, 40] {
+            let seq = zone_clear_seq(h);
+            let zone = super::zone_rows(h);
+            for row in 1..=h {
+                if zone.contains(&row) {
+                    continue;
+                }
+                assert!(
+                    !seq.contains(&format!("\x1b[{row};1H\x1b[2K")),
+                    "h={h}: row {row} is outside the zone but is being wiped"
+                );
+            }
+        }
     }
 }
 

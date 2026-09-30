@@ -176,6 +176,10 @@ pub struct Agent {
     /// but the turn ends at the REPL so the user decides (or types their own
     /// retry). Set via `--auto-retry N` (0 = observe only).
     auto_retry: Option<usize>,
+    /// Whether the auto-retry path may compact history when it nears the
+    /// context cap. On by default (the original behaviour); `/compact off`
+    /// turns it off, `/compact on` re-arms it.
+    auto_compact: bool,
     /// Whether the model's reasoning/thinking content is shown on the terminal
     /// as it streams. When false, thinking blocks are still collected + logged
     /// but suppressed from the live output (toggle with `/thinking show`/
@@ -223,20 +227,12 @@ pub struct Agent {
     /// regression assert exactly which branch ran.
     #[cfg(test)]
     stop_nudge_notices: usize,
-    /// Whether this turn has *already issued* a stop-skill nudge.
+    /// The user prompt the current in-turn nudge was issued for.
     ///
-    /// Reset by [`Self::begin_turn`], set only by the nudge path. The guard on
-    /// the nudge reads this, never `stop_nudged_for_prompt`: that field records
-    /// the operator's prompt for the nudge, and the operator's prompt is
-    /// constant for the whole turn, so comparing the two made a turn kill itself
-    /// on the second text-only answer — immediately after its own first nudge,
-    /// with "this prompt was already nudged".
-    stop_nudged_this_turn: bool,
-    /// The user prompt that the current in-turn nudge was already issued for.
-    /// The nudge is itself logged as a `user` message, so a *resumed* session
-    /// replays it; this remembers which prompt it belongs to so bookkeeping and
-    /// diagnostics can attribute the nudge. It is deliberately NOT the nudge
-    /// guard — see [`Self::stop_nudged_this_turn`].
+    /// Bookkeeping/diagnostics only — it has *never* been a nudge guard. The
+    /// one time the guard keyed on it (comparing the operator's prompt against
+    /// the recorded one) ended every turn on its second text-only answer, with
+    /// "this prompt was already nudged"; see [`Self::nudge_verdict`].
     stop_nudged_for_prompt: Option<String>,
     /// Cached provider list (loaded once, reused for model switches / resume).
     /// Avoids re-reading and re-parsing `~/.pi/agent/models-store.json` on every
@@ -439,12 +435,11 @@ impl StopDecision {
 /// away and reports the turn as finished when it is not.
 ///
 /// The loop is still bounded in practice, by the things that actually end a
-/// turn: the model calling `request_stop` (or any tool), the operator
-/// interrupting, the token budget (`--budget` / `PIR_TOKEN_BUDGET`), and the
-/// per-turn nudge guard that stops a *resumed* session nudging for a prompt it
-/// already nudged (that is what made `pir -r` end every turn; see
-/// `stop_nudged_for_prompt`). If you want the old bounded behaviour, set this to
-/// any finite count — the comparison below is `>=`, so the value *is* the cap.
+/// turn: the model calling `request_stop` (or any other tool), the operator
+/// interrupting, and the token budget (`--budget` / `PIR_TOKEN_BUDGET`).
+/// If you want the old bounded behaviour, set this to any finite count — the
+/// comparison in [`Agent::nudge_verdict`] is equality, so the value *is* the
+/// cap.
 pub const STOP_NUDGE_MAX: usize = usize::MAX;
 
 /// Why a text-only answer is (or is not) auto-nudged.
@@ -460,28 +455,39 @@ pub enum NudgeVerdict {
     Nudge,
     /// The nudge budget is used up; end the turn.
     BudgetSpent,
-    /// This turn already issued a nudge and the model answered with text again;
-    /// end the turn rather than nudging a third time.
-    AlreadyNudgedThisTurn,
 }
 
 impl Agent {
-    /// Decide what a text-only answer means: nudge again, or end the turn.    ///
-    /// `nudges_used` is the count *before* this decision and `nudged_this_turn`
-    /// records whether this turn has already spent a nudge. The budget check is
-    /// first so a spent budget reports as such even if the turn also nudged.
+    /// Decide what a text-only answer means: nudge again, or end the turn.
     ///
-    /// Note there is deliberately no comparison against the operator's prompt
-    /// text: the prompt is constant for the whole turn while the nudge records
-    /// itself against it, so such a comparison is *always* true immediately
-    /// after the first nudge and ends the turn with a misleading "already
-    /// nudged" — the reported bug. A *resumed* session's replayed nudge is in
-    /// `history`, not in this decision at all.
-    pub fn nudge_verdict(nudges_used: usize, nudged_this_turn: bool) -> NudgeVerdict {
-        if nudges_used >= STOP_NUDGE_MAX {
+    /// The **only** thing that can end a turn from here is an exhausted
+    /// budget. There is deliberately no "already nudged" case:
+    ///
+    ///  * Such a guard is *self-contradictory* with [`STOP_NUDGE_MAX`]. With the
+    ///    cap set to `usize::MAX` the budget can never be spent, so an
+    ///    already-nudged guard is the sole effective limit — it silently
+    ///    reimposes "one nudge per turn" and reports it as something else. That
+    ///    is exactly the contradiction that was reported: a turn that "ends
+    ///    because it was already nudged" *while* the nudge limit is infinite
+    ///    cannot be explained by the limit, and the state that reported it
+    ///    (`stop_nudged_this_turn`) was never a documented control.
+    ///  * It was not needed. It existed to stop a *resumed* session nudging a
+    ///    prompt it had already nudged, but that replay came from the nudge
+    ///    being **persisted into `history`**. The nudge is now a transient
+    ///    `pending_nudge` that is never recorded, so a resume cannot replay it
+    ///    and there is nothing left for the guard to protect against.
+    ///  * Keeping it was actively harmful: a model that answers in prose was
+    ///    cut off after a single reminder, so the turn reported itself finished
+    ///    while the real answer was still on screen. The turn loop already
+    ///    binds this properly — the operator's `cancel`, the stall-retry budget,
+    ///    the loop detector, and the token budget all end a runaway turn.
+    pub fn nudge_verdict(nudges_used: usize) -> NudgeVerdict {
+        // `==`, not `>=`: with the default cap of `usize::MAX` the two are
+        // equivalent, but `>=` against the type's maximum is the shape clippy
+        // rejects, and the intent is genuinely equality — the budget is spent
+        // when the count reaches the cap.
+        if nudges_used == STOP_NUDGE_MAX {
             NudgeVerdict::BudgetSpent
-        } else if nudged_this_turn {
-            NudgeVerdict::AlreadyNudgedThisTurn
         } else {
             NudgeVerdict::Nudge
         }
@@ -1043,13 +1049,13 @@ impl Agent {
             thinking: config::ThinkingLevel::Off,
             show_thinking: true,
             auto_retry: None,
+            auto_compact: true,
             incremental_md: config::incremental_md_default(),
             stop_skill: config::stop_skill_default(),
             output_format: OutputFormat::Plain,
             stop_hit: None,
             last_stop: None,
             stop_nudges: 0,
-            stop_nudged_this_turn: false,
             pending_nudge: None,
             stall_retries: 0,
             #[cfg(test)]
@@ -1582,14 +1588,41 @@ impl Agent {
 
     /// Whether the history fits (token-wise) without trimming
     pub fn needs_compaction(&self) -> bool {
+        approx_tokens(&self.history) > self.context_budget()
+    }
+
+    /// Approximate tokens currently held in the history. Exposed so `/compact
+    /// status` can report real usage instead of asking the model to count.
+    pub fn context_tokens(&self) -> usize {
+        approx_tokens(&self.history)
+    }
+
+    /// Number of messages in the conversation history.
+    pub fn history_messages(&self) -> usize {
+        self.history.len()
+    }
+
+    /// The context budget the history is measured against: the model's window
+    /// minus the output reserve and a system-prompt allowance, floored so a
+    /// tiny catalog entry still leaves room to work.
+    pub fn context_budget(&self) -> usize {
         let ctx = self.model.context.unwrap_or(200_000) as usize;
         let out_reserve = self.model.max_tokens.unwrap_or(8192) as usize;
         let sys_reserve = 2_000;
-        let budget = ctx
-            .saturating_sub(out_reserve)
+        ctx.saturating_sub(out_reserve)
             .saturating_sub(sys_reserve)
-            .max(8192);
-        approx_tokens(&self.history) > budget
+            .max(8192)
+    }
+
+    /// Whether the auto-retry path may compact history when it gets near the
+    /// cap. Operator-controlled via `/compact on|off`.
+    pub fn set_auto_compact(&mut self, on: bool) {
+        self.auto_compact = on;
+    }
+
+    /// Whether auto-compact is armed (`/compact status`).
+    pub fn auto_compact(&self) -> bool {
+        self.auto_compact
     }
 
     pub fn compact(&mut self) -> String {
@@ -3572,27 +3605,21 @@ impl Agent {
                 // for a stop explicitly or the nudge cap is hit. Off (legacy):
                 // stop on the first text answer, as before.
                 if self.stop_skill {
-                    // The budget is the only *fatal* case; a second text-only
-                    // answer in the same turn is not.
+                    // A text-only answer is *not* a stop and is never
+                    // self-terminating. The only fatal case is an exhausted
+                    // nudge budget; with the default (`usize::MAX`) that cannot
+                    // happen, so a model that answers in prose keeps being
+                    // nudged until it calls `request_stop`, the operator
+                    // interrupts, or another bound (cancel / stall retries /
+                    // loop detector / token budget) ends the turn.
                     //
-                    // The `AlreadyNudgedThisTurn` case used to be fatal and
-                    // noisy: it printed "· stop-skill: this prompt was already
-                    // nudged — ending turn" and returned early, so the operator
-                    // saw that notice *instead of* the model's reply, on what was
-                    // often a complete answer. The nudge exists to give the model
-                    // another chance to call `request_stop`; once it has had that
-                    // chance and still answered in text, the answer stands and the
-                    // turn ends normally below.
-                    //
-                    // With the nudge no longer persisted (`pending_nudge`), the
-                    // old "don't nudge the same prompt twice" guard has nothing
-                    // left to protect against — it existed only because a resumed
-                    // session replayed a *stored* nudge. Keeping it also made a
-                    // model that answers in prose get cut off after a single
-                    // reminder, silently reporting the turn as done. The budget
-                    // is now the only bound, and a text-only answer keeps being
-                    // nudged until the model calls `request_stop`.
-                    match Self::nudge_verdict(self.stop_nudges, self.stop_nudged_this_turn) {
+                    // This arm used to be able to end the turn on its *second*
+                    // text-only answer with "· stop-skill: this prompt was
+                    // already nudged — ending turn", which both hid the
+                    // model's real answer behind a notice and contradicted the
+                    // infinite nudge limit the operator had set. See
+                    // [`Self::nudge_verdict`].
+                    match Self::nudge_verdict(self.stop_nudges) {
                         NudgeVerdict::BudgetSpent => {
                             #[cfg(test)]
                             {
@@ -3613,32 +3640,33 @@ impl Agent {
                             self.mark_status(SessionStatus::Completed, self.goal_pending(), "");
                             return Ok(());
                         }
-                        // Nudge again: the model answered in text and has not yet
-                        // called `request_stop`. This is the *same* case as the
-                        // first text answer — by design there is no "already
-                        // nudged" distinction any more, because the nudge is not
-                        // persisted and so cannot be replayed by a resume.
-                        NudgeVerdict::AlreadyNudgedThisTurn | NudgeVerdict::Nudge => {
+                        // Nudge again: the model answered in text and has not
+                        // yet called `request_stop`. There is deliberately no
+                        // "already nudged" distinction any more — the nudge is
+                        // not persisted, so no resume can replay it, and the
+                        // budget is the only bound.
+                        NudgeVerdict::Nudge => {
                             self.stop_nudges += 1;
-                            self.stop_nudged_this_turn = true;
                             self.stop_nudged_for_prompt = Some(user.to_string());
                             // Sent with the NEXT request only — never pushed to
                             // `history`.
                             //
                             // Persisting it was the root cause of the whole
-                            // "randomly exiting on `pir -r`" family: the nudge is
-                            // logged as a `user` message, so a resumed session
-                            // replayed it as if the operator had asked, the model
-                            // answered the nudge, and the turn ended. Every guard
-                            // added since (keyed on the prompt text) was papering
-                            // over that, and each one also killed *normal* turns —
-                            // a text-only answer could never be nudged twice, so a
-                            // model that answered in prose was cut off after one
-                            // reminder, silently reporting the turn as done.
+                            // "randomly exiting on `pir -r`" family: the nudge
+                            // is logged as a `user` message, so a resumed
+                            // session replayed it as if the operator had asked,
+                            // the model answered the nudge, and the turn
+                            // ended. Every guard added since (keyed on the prompt
+                            // text, then on `stop_nudged_this_turn`) was
+                            // papering over that, and each one also killed
+                            // *normal* turns — a text-only answer could never
+                            // be nudged twice, so a model that answered in
+                            // prose was cut off after one reminder, silently
+                            // reporting the turn as done.
                             //
                             // The nudge is an instruction about the current
-                            // exchange, not part of the conversation, so it has no
-                            // business in the transcript or the session log.
+                            // exchange, not part of the conversation, so it has
+                            // no business in the transcript or the session log.
                             self.pending_nudge = Some(Message::user(
                                 "Your last message had no tool calls. If the work is really done, end \
                                  your turn with an explicit request_stop call (reason stop-complete, or \
@@ -3897,8 +3925,12 @@ impl Agent {
         // Compact *before* the retry when we're within ~20% of the context cap,
         // so the re-run has room for a full new attempt (and doesn't 400 on the
         // provider's combined input+output limit).
+        //
+        // Gated on `auto_compact` so `/compact off` is an actual switch — the
+        // flag is the operator's, and compaction is lossy, so it must not
+        // happen behind their back once they have said no.
         let ctx = self.model.context.unwrap_or(200_000) as usize;
-        if approx_tokens(&self.history) > (ctx * 80 / 100) {
+        if self.auto_compact && approx_tokens(&self.history) > (ctx * 80 / 100) {
             self.trim();
             if !self.silent() {
                 term::out(&term::dim("[pir: compacted history before auto-retry]"));
@@ -4257,7 +4289,6 @@ impl Agent {
     fn begin_turn(&mut self) {
         self.stop_hit = None;
         self.stop_nudges = 0;
-        self.stop_nudged_this_turn = false;
         self.stop_nudged_for_prompt = None;
         self.pending_nudge = None;
     }
@@ -4745,7 +4776,67 @@ mod reload_tests {
         a
     }
 
-    /// The settings screen advertised `full-auto` but nothing could change it:
+    /// `/compact` was advertised in the slash-command help and tab-completion
+    /// but had no handler, so it silently fell through to "unknown command" —
+    /// a command the UI invited that did nothing. Pin that the underlying work
+    /// is reachable and that the budget maths is self-consistent.
+    #[test]
+    fn compact_reports_usage_against_a_real_budget() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let a = test_agent();
+        let used = a.context_tokens();
+        let cap = a.context_budget();
+        assert!(cap >= 8192, "the budget floor must hold, got {cap}");
+        assert!(used <= cap || a.needs_compaction(), "usage and budget must agree");
+        // An empty history is never over budget, so `status` won't cry wolf.
+        assert!(!a.needs_compaction(), "a fresh agent must not need compaction");
+        assert_eq!(a.history_messages(), 0);
+    }
+
+    /// The budget is the model window minus the output reserve and a
+    /// system-prompt allowance — `needs_compaction` used to inline this and a
+    /// `/compact` status line would have had no way to show the same number.
+    /// Both must come from one definition, or the reported percentage lies.
+    #[test]
+    fn context_budget_matches_what_needs_compaction_uses() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let a = test_agent();
+        let ctx = a.model.context.unwrap_or(200_000) as usize;
+        let out = a.model.max_tokens.unwrap_or(8192) as usize;
+        let expect = ctx.saturating_sub(out).saturating_sub(2_000).max(8192);
+        assert_eq!(a.context_budget(), expect, "budget must not drift from the model config");
+    }
+
+    /// `/compact on|off` is an operator switch over lossy summarisation, so it
+    /// must be observable and default to on (the pre-existing behaviour of the
+    /// auto-retry path). If `off` is silently ignored, the flag is a lie.
+    #[test]
+    fn auto_compact_is_a_real_operator_switch() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut a = test_agent();
+        assert!(a.auto_compact(), "precondition: armed by default, as before");
+        a.set_auto_compact(false);
+        assert!(!a.auto_compact(), "off must be honoured");
+        a.set_auto_compact(true);
+        assert!(a.auto_compact(), "on must re-arm it");
+    }
+
+    /// The flag was advertised in the slash-command help and tab-completion, so
+    /// it was discoverable — but nothing handled it, and the typed command fell
+    /// through to the unknown-command arm. The dispatch is the single source of
+    /// truth for completion (build.rs derives `gen_commands.rs` from it), so
+    /// assert the handler arm exists in the same shape the generator reads.
+    #[test]
+    fn compact_has_a_dispatch_arm() {
+        let src = include_str!("main.rs");
+        // The generator scrapes `"<name>" => {` arms out of `handle_command`.
+        assert!(
+            src.contains("\"compact\" => {"),
+            "/compact must appear in the command dispatch, not just the help text"
+        );
+    }
+
+    /// `full_auto_is_derived_from_the_live_ask_policy` follows.
     /// the flag was constructor-only (`Registry::full_auto`, no setter), so a
     /// session had no in-session way to turn it on at all. Turning it on must
     /// now move the live ask policy, because `SecurityPolicy::decide`'s
@@ -5974,101 +6065,98 @@ mod goal_bootstrap_tests {
         assert_eq!(StopDecision::NeedsInput.label(), "stop-needs-input");
     }
 
-    /// The guard is `stop_nudged_this_turn`, not a comparison against the
-    /// operator's prompt.
+    /// A text-only answer must NEVER be self-terminating.
     ///
-    /// REGRESSION: the guard used to be
+    /// REGRESSION, two bugs deep. The guard used to be
     /// `stop_nudged_for_prompt.as_deref() == Some(&user[..])`, where `user` is
     /// the *operator's* prompt — constant for the whole turn — while the nudge
     /// path sets `stop_nudged_for_prompt = Some(user)`. The two therefore always
     /// agreed *within* a turn, so the moment a turn issued its first nudge, the
     /// very next text-only answer matched and the turn ended with
     /// "· stop-skill: this prompt was already nudged — ending turn" — throwing
-    /// away the model's answer for no reason at all. That is the live bug this
-    /// pins: a turn must be able to nudge, be answered, and nudge *again*, up to
-    /// the budget.
+    /// away the model's answer for no reason at all.
+    ///
+    /// It was then "fixed" into `stop_nudged_this_turn`, which was no better:
+    /// that guard caps a turn at exactly one nudge while [`STOP_NUDGE_MAX`] is
+    /// `usize::MAX`. So the turn ends reporting "already nudged" *while the
+    /// configured limit is infinite* — the contradiction that was reported —
+    /// and the effective limit was neither the documented one nor the one on
+    /// screen.
+    ///
+    /// Both are gone. The only fatal verdict left is `BudgetSpent`, so any
+    /// number of consecutive text-only answers keeps nudging.
     #[test]
-    fn a_turn_may_nudge_repeatedly_and_never_self_blocks() {
+    fn a_turn_nudges_forever_and_never_ends_on_its_own_text() {
         let mut a = fresh_agent();
         assert!(a.stop_skill());
         a.begin_turn();
 
-        // Simulate several text-only answers, each followed by a nudge, exactly
-        // as the turn loop does. The guard must stay false throughout: the nudge
-        // we are about to issue has not been issued yet.
-        for i in 0..5 {
-            assert!(
-                !a.stop_nudged_this_turn,
-                "text-only answer {} must still be allowed to nudge, not end the turn",
-                i + 1
-            );
-            // What the nudge path does.
-            a.stop_nudges += 1;
-            a.stop_nudged_this_turn = true;
-            a.stop_nudged_for_prompt = Some("the operator's prompt".to_string());
-            // ...and the next model answer would normally arrive here. A new
-            // *turn* clears it; within the turn we assert the invariant that the
-            // prompt comparison can no longer cause a self-block.
-            assert_eq!(
-                a.stop_nudged_for_prompt.as_deref(),
-                Some("the operator's prompt"),
-                "the recording is kept for attribution only"
-            );
-            if i < 4 {
-                // The turn loop's guard read for the *next* iteration is on
-                // `stop_nudged_this_turn`; a loop that never re-armed it is the
-                // bug. The real loop only sets it inside the nudge branch, so
-                // reset it here to model "the previous nudge already happened".
-                a.stop_nudged_this_turn = false;
+        // Twenty consecutive text-only answers, each followed by a nudge,
+        // exactly as the turn loop drives it. The loop must not terminate and
+        // must not take a terminal notice on any of them.
+        for i in 0..20 {
+            match Agent::nudge_verdict(a.stop_nudges) {
+                NudgeVerdict::Nudge => {
+                    a.stop_nudges += 1;
+                    a.stop_nudged_for_prompt = Some("the operator's prompt".to_string());
+                }
+                NudgeVerdict::BudgetSpent => {
+                    panic!("text-only answer {} ended the turn on an unbounded budget", i + 1)
+                }
             }
         }
-        // Whatever the recording says, the *guard* is what the call site reads,
-        // and it is false here — so the turn continues rather than dying.
-        a.stop_nudged_this_turn = false;
-        assert!(!a.stop_nudged_this_turn, "the prompt text alone must never arm the guard");
+        assert_eq!(a.stop_nudges, 20, "every text-only answer must have been nudged");
+        // And the recording is attribution only — it is not, and never was, a
+        // guard that can end a turn.
+        assert_eq!(
+            a.stop_nudged_for_prompt.as_deref(),
+            Some("the operator's prompt"),
+            "the recording is kept for attribution only"
+        );
     }
 
-    /// `begin_turn` gives every turn a clean slate, so neither the guard nor the
-    /// budget survives a turn boundary — including when the next prompt is
+    /// The reported contradiction, pinned directly: with the nudge budget
+    /// infinite, *no* combination of nudge bookkeeping may produce a
+    /// turn-ending verdict. A text-only answer is not a stop, so the only way
+    /// out of the nudge path is an exhausted budget — which is unreachable at
+    /// the default.
+    #[test]
+    fn an_unbounded_budget_never_reports_a_turn_ending_nudge_verdict() {
+        for used in [0usize, 1, 2, 7, 16, 1_000, 1_000_000, usize::MAX - 1] {
+            assert_eq!(
+                Agent::nudge_verdict(used),
+                NudgeVerdict::Nudge,
+                "{used} nudge(s) with an infinite budget must still nudge, never end the turn"
+            );
+        }
+        // Only the exact saturation point trips it, and even then it is the
+        // *budget* that is reported — never an "already nudged" pseudo-limit.
+        assert_eq!(Agent::nudge_verdict(usize::MAX), NudgeVerdict::BudgetSpent);
+    }
+
+    /// `begin_turn` gives every turn a clean slate, so neither the budget nor the
+    /// attribution survives a turn boundary — including when the next prompt is
     /// byte-identical (a re-sent or arrow-up-retried prompt, or `drive_goal`'s
     /// `[continue goal] Next step: {pending}`, whose `pending` repeats verbatim).
     #[test]
-    fn a_new_turn_clears_the_already_nudged_guard_even_for_the_same_prompt() {
+    fn a_new_turn_clears_the_nudge_budget_even_for_the_same_prompt() {
         let mut a = fresh_agent();
         assert!(a.stop_skill());
 
-        // Turn 1 nudges: the guard is armed and the prompt recorded.
+        // Turn 1 nudges repeatedly: the budget is spent and the prompt recorded.
         a.begin_turn();
-        a.stop_nudges = 1;
-        a.stop_nudged_this_turn = true;
+        a.stop_nudges = 5;
         a.stop_nudged_for_prompt = Some("same prompt".to_string());
 
         // Turn 2 starts with the byte-identical prompt. It must get a clean
         // slate — otherwise this turn is dead on arrival.
         a.begin_turn();
-        assert!(!a.stop_nudged_this_turn, "guard must not survive a turn boundary");
         assert_eq!(a.stop_nudged_for_prompt, None, "recording must not survive either");
         assert_eq!(a.stop_nudges, 0, "each turn starts with the full nudge budget");
         assert_eq!(a.stop_hit, None, "a stop from a previous turn must not carry over");
 
         // So this turn is free to nudge, rather than insta-killing.
-        assert!(!a.stop_nudged_this_turn);
-    }
-
-    /// Within one turn the guard does its real job: a *second* nudge is refused,
-    /// so a model that keeps answering the nudge with text cannot make the turn
-    /// nudge forever.
-    #[test]
-    fn the_guard_refuses_a_second_nudge_within_the_same_turn() {
-        let mut a = fresh_agent();
-        a.begin_turn();
-        // First text-only answer: nudge, arm the guard.
-        assert!(!a.stop_nudged_this_turn, "the first nudge must be allowed");
-        a.stop_nudges += 1;
-        a.stop_nudged_this_turn = true;
-        // Second text-only answer in the same turn: the guard is armed, so the
-        // call site ends the turn instead of nudging again.
-        assert!(a.stop_nudged_this_turn, "a second nudge in one turn must be refused");
+        assert_eq!(Agent::nudge_verdict(a.stop_nudges), NudgeVerdict::Nudge);
     }
 
     #[test]
@@ -6396,25 +6484,33 @@ mod nudge_budget_tests {
     /// still ends, just early and reported as `Completed`, and the discarded
     /// answer looks like the model's fault. The turn is instead bounded by the
     /// things that genuinely end one — `request_stop`, a tool call, an operator
-    /// interrupt, the token budget, and the resumed-session guard.
+    /// interrupt, and the token budget.
     #[test]
     fn the_nudge_budget_is_unbounded_by_default() {
         assert_eq!(STOP_NUDGE_MAX, usize::MAX);
     }
 
-    /// The cap check is `stop_nudges >= STOP_NUDGE_MAX`, so an unbounded budget
+    /// The cap check is `stop_nudges == STOP_NUDGE_MAX`, so an unbounded budget
     /// must never trip it no matter how long a turn runs — and a finite count
     /// must still be a real cap, since that is the documented way to restore the
     /// old bounded behaviour.
+    ///
+    /// The first two assertions are compile-time constants (`STOP_NUDGE_MAX` is
+    /// `usize::MAX`), so they are stated once via `const {}` rather than as
+    /// runtime asserts; the decision-level behaviour is pinned by
+    /// `nudge_verdict_tests::an_unbounded_budget_never_reports_a_turn_ending_nudge_verdict`.
     #[test]
     fn the_cap_arithmetic_matches_an_unbounded_budget() {
-        // What the turn loop does, at the boundary and far past it.
-        assert!(!(0usize >= STOP_NUDGE_MAX), "a fresh turn must be allowed to nudge");
-        assert!(!(1_000_000usize >= STOP_NUDGE_MAX), "an unbounded budget must not trip");
-        // And the finite-cap semantics the doc promises.
+        const { assert!(STOP_NUDGE_MAX == usize::MAX, "unbounded by default") };
+        // The finite-cap semantics the doc promises. The count is compared for
+        // equality, so a finite cap trips exactly when reached.
         let finite = 4usize;
-        assert!(4usize >= finite, "the value is the cap (>=), so 4 allows 4 nudges");
-        assert!(!(3usize >= finite), "and stops on the 5th");
+        let at = |n: usize| n == finite;
+        assert!(at(4), "the value is the cap, so 4 allows 4 nudges");
+        assert!(!at(3), "and stops on the 5th");
+        // And the real decision agrees at the boundary.
+        assert_eq!(Agent::nudge_verdict(3), NudgeVerdict::Nudge);
+        assert_eq!(Agent::nudge_verdict(usize::MAX), NudgeVerdict::BudgetSpent);
     }
 
     /// `begin_turn` resets the counter, so the budget is per-turn rather than
@@ -6425,7 +6521,6 @@ mod nudge_budget_tests {
         a.stop_nudges = 5_000;
         a.begin_turn();
         assert_eq!(a.stop_nudges, 0, "a new turn always starts with an unspent budget");
-        assert!(!a.stop_nudged_this_turn, "and with the guard disarmed");
     }
 }
 
@@ -6440,33 +6535,27 @@ mod nudge_verdict_tests {
     /// itself against that same `user`. So the instant a turn issued its first
     /// nudge, the next text-only answer matched and the turn ended with
     /// "this prompt was already nudged". Every turn died on its second
-    /// text-only answer. `nudged_this_turn` is false until the nudge branch
-    /// sets it, so the first answer is always allowed through.
+    /// text-only answer. Its replacement, `stop_nudged_this_turn`, had the same
+    /// effect (one nudge per turn) while `STOP_NUDGE_MAX` was `usize::MAX`.
+    ///
+    /// The decision is now a pure function of the budget alone, so the first
+    /// answer — and every answer after it — is nudged.
     #[test]
-    fn the_first_text_only_answer_of_a_turn_is_always_nudged() {
+    fn every_text_only_answer_of_a_turn_is_nudged() {
         assert_eq!(
-            Agent::nudge_verdict(0, false),
+            Agent::nudge_verdict(0),
             NudgeVerdict::Nudge,
-            "a fresh turn must never be blocked by the already-nudged guard"
+            "a fresh turn must never be blocked by a pseudo-limit"
         );
-        // Even mid-turn and unspent: the *next* answer after a nudge is the one
-        // the guard is for, and the flag is what distinguishes it.
-        assert_eq!(Agent::nudge_verdict(1, false), NudgeVerdict::Nudge);
-    }
-
-    /// The guard's real job: one nudge per turn. A model that answers the nudge
-    /// with more text cannot make the turn nudge indefinitely.
-    #[test]
-    fn a_second_nudge_in_the_same_turn_ends_the_turn() {
-        assert_eq!(
-            Agent::nudge_verdict(1, true),
-            NudgeVerdict::AlreadyNudgedThisTurn
-        );
-        assert_eq!(
-            Agent::nudge_verdict(0, true),
-            NudgeVerdict::AlreadyNudgedThisTurn,
-            "the guard is the flag, not the count"
-        );
+        // And every subsequent one: there is no in-turn counter left that could
+        // end a turn early.
+        for used in 1..50 {
+            assert_eq!(
+                Agent::nudge_verdict(used),
+                NudgeVerdict::Nudge,
+                "nudge {used} must not end the turn — the budget is the only bound"
+            );
+        }
     }
 
     /// The budget, at the boundary. `STOP_NUDGE_MAX` is `usize::MAX` by default,
@@ -6475,50 +6564,50 @@ mod nudge_verdict_tests {
     #[test]
     fn a_spent_budget_ends_the_turn() {
         // Unbounded by default: even a huge count keeps nudging.
-        assert_eq!(Agent::nudge_verdict(1_000_000, false), NudgeVerdict::Nudge);
+        assert_eq!(Agent::nudge_verdict(1_000_000), NudgeVerdict::Nudge);
         assert_eq!(STOP_NUDGE_MAX, usize::MAX, "unbounded by default");
         // The boundary is `>=`, so the value *is* the cap. Exercised against a
         // local finite cap since the constant cannot be changed at runtime.
         let cap = 3usize;
-        let at = |n: usize, t: bool| if n >= cap { NudgeVerdict::BudgetSpent } else { Agent::nudge_verdict(n, t) };
-        assert_eq!(at(2, false), NudgeVerdict::Nudge, "under the cap still nudges");
-        assert_eq!(at(3, false), NudgeVerdict::BudgetSpent, "the count itself is the cap");
-        assert_eq!(at(4, false), NudgeVerdict::BudgetSpent);
+        let at = |n: usize| if n >= cap { NudgeVerdict::BudgetSpent } else { Agent::nudge_verdict(n) };
+        assert_eq!(at(2), NudgeVerdict::Nudge, "under the cap still nudges");
+        assert_eq!(at(3), NudgeVerdict::BudgetSpent, "the count itself is the cap");
+        assert_eq!(at(4), NudgeVerdict::BudgetSpent);
     }
 
-    /// A spent budget is reported as such even when the turn also nudged, so the
-    /// operator-facing message names the real reason.
+    /// There is exactly one way out of the nudge path, and the operator-facing
+    /// message must name it truthfully. This is the shape of the old
+    /// contradiction — a turn reporting "already nudged" while the budget was
+    /// infinite — and it is now unrepresentable: the enum has two variants, so
+    /// no second, undocumented end-reason can be reported.
     #[test]
-    fn budget_takes_precedence_over_the_already_nudged_guard() {
-        let cap = 1usize;
-        let v = if cap >= cap { NudgeVerdict::BudgetSpent } else { Agent::nudge_verdict(cap, true) };
-        assert_eq!(v, NudgeVerdict::BudgetSpent);
+    fn there_is_exactly_one_turn_ending_nudge_verdict() {
+        let terminal: Vec<NudgeVerdict> = [NudgeVerdict::Nudge, NudgeVerdict::BudgetSpent]
+            .into_iter()
+            .filter(|v| *v != NudgeVerdict::Nudge)
+            .collect();
+        assert_eq!(terminal.len(), 1, "only an exhausted budget may end a turn");
+        assert_eq!(terminal[0], NudgeVerdict::BudgetSpent);
     }
 
     /// Drive a whole turn's worth of text-only answers through the decision: no
-    /// step may self-block, and the guard must engage exactly once.
+    /// step may self-block, and with an unbounded budget the turn is only ever
+    /// ended by the model, the operator, or another bound.
     #[test]
-    fn a_turn_nudges_then_ends_rather_than_self_blocking() {
+    fn a_turn_keeps_nudging_rather_than_self_blocking() {
         let mut nudges_used = 0usize;
-        let mut nudged_this_turn = false;
         let mut nudges_seen = 0usize;
         // Each iteration is one text-only answer from the model.
-        for answer in 1..=4 {
-            match Agent::nudge_verdict(nudges_used, nudged_this_turn) {
+        for _ in 1..=25 {
+            match Agent::nudge_verdict(nudges_used) {
                 NudgeVerdict::Nudge => {
                     nudges_used += 1;
-                    nudged_this_turn = true;
                     nudges_seen += 1;
-                }
-                NudgeVerdict::AlreadyNudgedThisTurn => {
-                    assert_eq!(answer, 2, "the turn must nudge once, then end");
-                    assert_eq!(nudges_seen, 1, "exactly one nudge must have been issued");
-                    return;
                 }
                 NudgeVerdict::BudgetSpent => panic!("unbounded budget must not be spent"),
             }
         }
-        panic!("the turn never ended — the guard is not engaging");
+        assert_eq!(nudges_seen, 25, "every text-only answer must have been nudged");
     }
 }
 

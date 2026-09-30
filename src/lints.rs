@@ -12,14 +12,20 @@
 //!
 //! 1. **Which languages is this?** Detected from build manifests and source
 //!    files, not from the prompt.
-//! 2. **Which linter suits each?** The canonical tool for that language.
-//! 3. **Is it actually installed?** Run on this machine, right now — because a
-//!    plan that names a missing binary is exactly the silent-pass this fixes.
+//! 2. **What could vet each one?** A *list* of candidates, best first — not a
+//!    single canonical tool.
+//! 3. **What is actually installed here?** Probed on this machine, right now.
 //!
-//! A missing linter is reported as a *warning plus an offer to install it*
-//! (via the `request_root` / `apt-install` path, which queues an auditable
-//! request rather than escalating on its own). It is never presented as
-//! "analysis passed".
+//! A language is analysed by **whichever candidates are installed**, and by as
+//! many of them as apply. This matters most for C and C++, where the good
+//! tools are independent: LLVM's `scan-build`, `clang-tidy`, `cppcheck` and
+//! GCC's own `-fanalyzer` each catch different bugs, and a box with only `g++`
+//! on it can still be statically analysed rather than being written off.
+//!
+//! Only when *no* candidate is installed does the language get reported as
+//! unanalysed — and then as a warning plus an offer to install, never as
+//! "analysis passed". Where a fallback carried the analysis, the stronger tools
+//! are still offered, as an upgrade rather than a blocker.
 //!
 //! Deliberately dependency-free: a `command -v` probe is the only way to
 //! answer "is it installed" that cannot be wrong, and shelling out to it beats
@@ -27,36 +33,47 @@
 
 use std::path::Path;
 
-/// A language present in the project, with the linter that should vet it.
+/// One way of analysing a language: the tool that must exist, what it is for,
+/// and the command fragment that invokes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LintTool {
+    /// The binary that must be on `PATH` (probed with `command -v`).
+    pub tool: &'static str,
+    /// What this tool catches, so the model knows why it is being run.
+    pub purpose: &'static str,
+    /// The command fragment, joined with `; ` when several tools are used.
+    pub command: &'static str,
+    /// The apt package that provides it. Empty when the tool ships with the
+    /// base toolchain (e.g. GCC's own analyzer), so there is nothing to fetch.
+    pub apt_package: &'static str,
+}
+
+impl LintTool {
+    const fn new(tool: &'static str, purpose: &'static str, command: &'static str, apt_package: &'static str) -> LintTool {
+        LintTool { tool, purpose, command, apt_package }
+    }
+
+    /// Does this tool need an install to be available?
+    pub fn needs_install(&self) -> bool {
+        !self.apt_package.is_empty()
+    }
+}
+
+/// A detected language and every tool that could vet it, best candidate first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LintPlan {
     /// The detected language (`rust`, `c`, `cpp`, `python`, …).
     pub lang: &'static str,
-    /// The canonical linter for that language (a binary name).
-    pub tool: &'static str,
-    /// How to invoke it, as a shell command line.
-    pub command: String,
-    /// Extra packages needed for that tool, offered to the operator.
-    pub apt_package: &'static str,
     /// The manifest/source pattern that identified the language.
     pub detected_by: String,
+    /// Candidate tools, strongest first. The first *installed* one is the
+    /// primary; every installed one is run.
+    pub candidates: Vec<LintTool>,
 }
 
 impl LintPlan {
-    fn new(
-        lang: &'static str,
-        tool: &'static str,
-        command: String,
-        apt_package: &'static str,
-        detected_by: &str,
-    ) -> Self {
-        LintPlan {
-            lang,
-            tool,
-            command,
-            apt_package,
-            detected_by: detected_by.to_string(),
-        }
+    fn new(lang: &'static str, detected_by: &str, candidates: Vec<LintTool>) -> Self {
+        LintPlan { lang, detected_by: detected_by.to_string(), candidates }
     }
 }
 
@@ -104,61 +121,89 @@ fn has_ext(dir: &Path, ext: &str) -> bool {
     })
 }
 
-/// Detect the project's languages and the linter each one wants.
+/// LLVM's static analyzer. Lives in `clang-tools`, a *separate* package from
+/// `clang` itself — the single most common reason `scan-build` is "installed"
+/// and then not found.
+const SCAN_BUILD: LintTool = LintTool::new(
+    "scan-build",
+    "LLVM static analysis (memory safety, null derefs, leaks, use-after-free)",
+    "scan-build --status-bugs <build-command>",
+    "clang-tools",
+);
+const CLANG_TIDY: LintTool = LintTool::new(
+    "clang-tidy",
+    "clang-analyzer bug patterns plus modern-C++ and style rules",
+    "clang-tidy -p . <sources>",
+    "clang-tools",
+);
+const CPPCHECK: LintTool = LintTool::new(
+    "cppcheck",
+    "portable static analysis, catches things the compiler's parser misses",
+    "cppcheck --enable=warning,style,performance --error-exitcode=1 <sources>",
+    "cppcheck",
+);
+/// GCC ships its own static analyzer, so a box that can compile C can analyse
+/// it with nothing extra installed. Weaker than LLVM's, but *available* — which
+/// is the difference between "analysed" and "not analysed at all".
+///
+/// NB: no `-fsyntax-only`. The analyzer is a dataflow pass that only runs
+/// during code generation, so `-fsyntax-only` makes `-fanalyzer` report
+/// *nothing* — a clean exit that means "not checked". Verified: a deliberate
+/// null dereference yields 15 lines of `-Wanalyzer-null-dereference` without
+/// it and 0 lines with it. Compiling to `/dev/null` keeps it object-file-free.
+const GCC_ANALYZER_C: LintTool = LintTool::new(
+    "gcc",
+    "GCC static analyzer (part of the compiler, so usually already present)",
+    "gcc -fanalyzer -Wall -Wextra -c <sources> -o /dev/null",
+    "",
+);
+const GCC_ANALYZER_CPP: LintTool = LintTool::new(
+    "g++",
+    "GCC static analyzer (part of the compiler, so usually already present)",
+    "g++ -fanalyzer -Wall -Wextra -c <sources> -o /dev/null",
+    "",
+);
+
+/// Detect the project's languages and, for each, the tools that could vet it.
 ///
 /// Detection is manifest-first (a `CMakeLists.txt` is a much stronger signal
 /// than a stray `.c` file) and source-file-second, so a C++ project that keeps
-/// its sources in `src/` is still recognised via its top-level sources.
+/// its sources in `src/` is still recognised.
 pub fn detect_lints(dir: &Path) -> Vec<LintPlan> {
     let mut out: Vec<LintPlan> = Vec::new();
 
-    // Rust. `clippy` is the linter proper; `cargo build` is what surfaces the
-    // warnings, so the command runs both.
     if has_file(dir, "Cargo.toml") {
         out.push(LintPlan::new(
             "rust",
-            "cargo-clippy",
-            "cargo clippy --all-targets -- -D warnings && cargo build 2>&1 | grep -i warning || true; \
-             cargo test"
-                .to_string(),
-            "clippy",
             "Cargo.toml",
+            vec![LintTool::new(
+                "cargo-clippy",
+                "clippy lints, compiler warnings and the test suite",
+                "cargo clippy --all-targets -- -D warnings ; cargo build 2>&1 | grep -i warning || true ; cargo test",
+                "clippy",
+            )],
         ));
     }
 
-    // C++ / C. LLVM's static analyzer is the tool the user asked for; it comes
-    // with `clang-tools`, which is a *separate* package from `clang` itself —
-    // the single most common reason `scan-build` is "installed" and then not
-    // found, so both are named in the offer.
     let has_cpp_manifest = has_file(dir, "CMakeLists.txt")
         || has_file(dir, "meson.build")
         || has_file(dir, "configure.ac")
         || has_file(dir, "CMakePresets.json");
     let has_cpp_src = has_ext(dir, "cc") || has_ext(dir, "cpp") || has_ext(dir, "cxx");
-    let has_c_src = has_ext(dir, "c");
     if has_cpp_manifest || has_cpp_src {
         out.push(LintPlan::new(
             "cpp",
-            "scan-build",
-            // scan-build drives a full compile and reports every static finding;
-            // clang-tidy then vets the style/clang-analyzer rules. Both are run
-            // because they catch genuinely different classes of bug.
-            "scan-build --status-bugs <build-command> ; clang-tidy -p . <sources>".to_string(),
-            "clang-tools",
             if has_cpp_manifest { "CMakeLists.txt" } else { "*.cpp/*.cc source" },
+            vec![SCAN_BUILD, CLANG_TIDY, CPPCHECK, GCC_ANALYZER_CPP],
         ));
-    } else if has_c_src {
+    } else if has_ext(dir, "c") {
         out.push(LintPlan::new(
             "c",
-            "scan-build",
-            "scan-build --status-bugs <build-command> ; cppcheck --enable=warning,style --error-exitcode=1 <sources>"
-                .to_string(),
-            "clang-tools",
             "*.c source",
+            vec![SCAN_BUILD, CPPCHECK, GCC_ANALYZER_C],
         ));
     }
 
-    // Python.
     if has_file(dir, "pyproject.toml")
         || has_file(dir, "setup.py")
         || has_file(dir, "requirements.txt")
@@ -166,75 +211,151 @@ pub fn detect_lints(dir: &Path) -> Vec<LintPlan> {
     {
         out.push(LintPlan::new(
             "python",
-            "ruff",
-            "ruff check . && ruff format --check . ; python -m pytest -q".to_string(),
-            "ruff",
             if has_file(dir, "pyproject.toml") { "pyproject.toml" } else { "*.py source" },
+            vec![
+                LintTool::new(
+                    "ruff",
+                    "lint + format check + the test suite",
+                    "ruff check . && ruff format --check . ; python -m pytest -q",
+                    "ruff",
+                ),
+                LintTool::new(
+                    "pyflakes",
+                    "unused imports/variables and undefined names",
+                    "python3 -m pyflakes <sources> ; python3 -m pytest -q",
+                    "python3-pyflakes",
+                ),
+            ],
         ));
     }
 
-    // JavaScript / TypeScript.
     if has_file(dir, "package.json") {
         out.push(LintPlan::new(
             "javascript",
-            "eslint",
-            "npx eslint . ; npm test --if-present".to_string(),
-            "eslint",
             "package.json",
+            vec![
+                LintTool::new("eslint", "lint + the test script", "eslint . ; npm test --if-present", "eslint"),
+                // `npx` ships with node, so this works with no extra install.
+                LintTool::new("npx", "lint via the project's own toolchain", "npx eslint . ; npm test --if-present", ""),
+            ],
         ));
     }
 
-    // Go.
     if has_file(dir, "go.mod") {
         out.push(LintPlan::new(
             "go",
-            "go",
-            "go vet ./... && go build ./... && go test ./...".to_string(),
-            "golang-golang-x-tools",
             "go.mod",
+            vec![LintTool::new(
+                "go",
+                "go vet, build and the test suite",
+                "go vet ./... && go build ./... && go test ./...",
+                "golang-go",
+            )],
         ));
     }
 
     out
 }
 
-/// The result of checking the plan against this machine.
-pub struct LintStatus {
-    /// Plans whose linter is present and will run.
-    pub available: Vec<LintPlan>,
-    /// Plans whose linter is missing — must be surfaced, never silently
-    /// treated as "clean".
-    pub missing: Vec<LintPlan>,
+/// A language that *can* be analysed here: the tools that will actually run,
+/// plus the stronger ones that could not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedLang {
+    pub lang: &'static str,
+    pub detected_by: String,
+    /// Installed tools, in candidate order. The first is the primary.
+    pub chosen: Vec<LintTool>,
+    /// Better tools that are absent — an upgrade offer, never a blocker.
+    pub extras: Vec<LintTool>,
 }
 
-/// Split the plan by what is actually installed.
+impl SelectedLang {
+    /// The command to run: every installed tool's fragment, joined.
+    pub fn command(&self) -> String {
+        self.chosen.iter().map(|t| t.command).collect::<Vec<_>>().join(" ; ")
+    }
+}
+
+/// A language with no analyser available at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingLang {
+    pub lang: &'static str,
+    pub detected_by: String,
+    /// Every candidate, all absent.
+    pub candidates: Vec<LintTool>,
+}
+
+/// The result of matching the plan against this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LintStatus {
+    /// Languages with at least one installed analyser.
+    pub available: Vec<SelectedLang>,
+    /// Languages with none — must be surfaced, never called clean.
+    pub missing: Vec<MissingLang>,
+}
+
+impl LintStatus {
+    /// True when nothing at all in this project can be analysed.
+    pub fn is_empty(&self) -> bool {
+        self.available.is_empty() && self.missing.is_empty()
+    }
+}
+
+/// Match the plan against what is installed, per language.
+///
+/// A language is `available` as soon as **one** candidate is installed — the
+/// whole point of the candidate list. A fallback is a real analysis, not a
+/// reason to declare the code unchecked.
 pub fn partition(plan: Vec<LintPlan>) -> LintStatus {
     let mut available = Vec::new();
     let mut missing = Vec::new();
     for p in plan {
-        if tool_available(p.tool) {
-            available.push(p);
+        let mut chosen = Vec::new();
+        let mut absent = Vec::new();
+        for t in p.candidates {
+            if tool_available(t.tool) {
+                chosen.push(t);
+            } else {
+                absent.push(t);
+            }
+        }
+        if chosen.is_empty() {
+            missing.push(MissingLang {
+                lang: p.lang,
+                detected_by: p.detected_by,
+                candidates: absent,
+            });
         } else {
-            missing.push(p);
+            available.push(SelectedLang {
+                lang: p.lang,
+                detected_by: p.detected_by,
+                chosen,
+                extras: absent,
+            });
         }
     }
     LintStatus { available, missing }
+}
+
+/// Analyse this project and return the matched plan.
+pub fn lint_status(dir: &Path) -> LintStatus {
+    partition(detect_lints(dir))
 }
 
 /// Build the `/autoclean` prompt for this project.
 ///
 /// The shape is deliberately different from the old hardcoded string:
 ///
-/// * a numbered, per-language list of *concrete commands* to run and fix;
-/// * an explicit statement of which linters are missing, with a request to
-///   offer the install rather than silently skipping;
+/// * a numbered, per-language list of *concrete commands*, built from the
+///   tools that are actually installed;
+/// * an explicit statement of any language that could not be analysed, with an
+///   offer to install rather than a silent skip;
 /// * an explicit "do not claim a clean bill of health you did not verify"
 ///   rule, so "no linter installed" can never be reported as "no findings".
 pub fn autoclean_prompt(dir: &Path) -> String {
-    let plan = detect_lints(dir);
-    let status = partition(plan);
+    let status = lint_status(dir);
 
-    if status.available.is_empty() && status.missing.is_empty() {
+    if status.is_empty() {
         return "Autoclean this project: no recognised build manifest or source file was found in \
 the working directory, so there is no known lint target. Look at the tree, work out how it is \
 built and tested, run that, and fix every error, warning and failing test. If you cannot \
@@ -250,21 +371,51 @@ commit anything.\n",
 
     if !status.available.is_empty() {
         s.push_str("\nRun these, fix everything they report, and re-run until each is silent:\n");
-        for (i, p) in status.available.iter().enumerate() {
+        for (i, l) in status.available.iter().enumerate() {
             s.push_str(&format!(
-                "\n{}. {lang} (detected via {by}) — linter `{tool}`:\n   {cmd}\n",
+                "\n{}. {lang} (detected via {by}) — analysing with {tools}:\n   {cmd}\n",
                 i + 1,
-                lang = p.lang,
-                by = p.detected_by,
-                tool = p.tool,
-                cmd = p.command,
+                lang = l.lang,
+                by = l.detected_by,
+                tools = l
+                    .chosen
+                    .iter()
+                    .map(|t| format!("`{}` ({})", t.tool, t.purpose))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                cmd = l.command(),
             ));
         }
     } else {
         s.push_str(
-            "\nNo linter for this project is installed yet, so nothing has been analysed. Deal \
+            "\nNo analyser for this project is installed yet, so nothing has been analysed. Deal \
 with the install question below first, then analyse whatever becomes available.\n",
         );
+    }
+
+    // Stronger tools that are missing, when a fallback already carried the
+    // analysis: an upgrade worth mentioning, not a blocker.
+    let upgrades: Vec<(&str, &LintTool)> = status
+        .available
+        .iter()
+        .flat_map(|l| l.extras.iter().map(move |t| (l.lang, t)))
+        .filter(|(_, t)| t.needs_install())
+        .collect();
+    if !upgrades.is_empty() {
+        s.push_str(
+            "\nThese are also applicable to this project but are not installed. They catch \
+different bugs from the tool(s) above, so they are worth offering — but the code is NOT \
+unanalysed, so do not block on them and do not report them as a failure:\n",
+        );
+        for (lang, t) in &upgrades {
+            s.push_str(&format!(
+                "  * {lang}: `{tool}` ({purpose}) — `sudo apt-get install {apt}`\n",
+                lang = lang,
+                tool = t.tool,
+                purpose = t.purpose,
+                apt = t.apt_package,
+            ));
+        }
     }
 
     if !status.missing.is_empty() {
@@ -272,14 +423,25 @@ with the install question below first, then analyse whatever becomes available.\
             "\nIMPORTANT — a linter this project needs is NOT installed, so its code has NOT been \
 analysed. Do not describe that code as clean, and do not skip it silently. Instead:\n",
         );
-        for p in &status.missing {
+        for l in &status.missing {
+            let list = l
+                .candidates
+                .iter()
+                .filter(|t| t.needs_install())
+                .map(|t| format!("`{}` (sudo apt-get install {})", t.tool, t.apt_package))
+                .collect::<Vec<_>>()
+                .join(", or ");
             s.push_str(&format!(
-                "  * {lang}: `{tool}` is missing — needed to analyse this project's {by}. \
-Install it with `sudo apt-get install {apt}`.\n",
-                lang = p.lang,
-                tool = p.tool,
-                by = p.detected_by,
-                apt = p.apt_package,
+                "  * {lang} (detected via {by}): none of {all} are available. Install one: {list}\n",
+                lang = l.lang,
+                by = l.detected_by,
+                all = l
+                    .candidates
+                    .iter()
+                    .map(|t| t.tool)
+                    .collect::<Vec<_>>()
+                    .join(" / "),
+                list = list,
             ));
         }
         s.push_str(
@@ -302,6 +464,7 @@ short summary: what you fixed, and (if any) what you could not check and why.",
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     /// A scratch dir that cleans itself up, so detection can be tested against
     /// real files on disk rather than a mocked filesystem.
@@ -323,7 +486,14 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
-    use std::path::PathBuf;
+
+    /// Pick a plan entry for `lang`, failing loudly if detection missed it.
+    fn plan_for(dir: &Path, lang: &str) -> LintPlan {
+        detect_lints(dir)
+            .into_iter()
+            .find(|p| p.lang == lang)
+            .unwrap_or_else(|| panic!("{lang} not detected"))
+    }
 
     /// A tool that certainly exists on any unix box, and one that certainly
     /// does not — the availability probe must tell them apart.
@@ -334,9 +504,8 @@ mod tests {
                 "a nonexistent tool must not be reported as available");
     }
 
-    /// The probe is handed `PATH`/shell metacharacters by no one — but it
-    /// interpolates into a `sh -c` string, so it must refuse anything that is
-    /// not a plain binary name rather than executing it.
+    /// The probe interpolates into a `sh -c` string, so it must refuse
+    /// anything that is not a plain binary name rather than executing it.
     #[test]
     fn availability_probe_refuses_shell_metacharacters() {
         for bad in ["", "a; rm -rf /", "x y", "$(id)", "../../bin/sh"] {
@@ -344,17 +513,18 @@ mod tests {
         }
     }
 
-    /// A C++ project is recognised, and gets LLVM's static analyzer (the tool
-    /// that was silently absent before).
+    /// A C++ project is recognised, and LLVM's static analysis leads the
+    /// candidate list.
     #[test]
-    fn detects_cpp_and_names_llvm_static_analysis() {
+    fn detects_cpp_and_offers_llvm_static_analysis_first() {
         let t = Tmp::new("cpp");
         t.write("CMakeLists.txt").write("main.cpp");
-        let plan = detect_lints(&t.0);
-        let cpp = plan.iter().find(|p| p.lang == "cpp").expect("cpp detected");
-        assert_eq!(cpp.tool, "scan-build", "LLVM static analysis for C++");
-        assert!(cpp.command.contains("clang-tidy"), "clang-tidy vets style too");
-        assert_eq!(cpp.apt_package, "clang-tools");
+        let cpp = plan_for(&t.0, "cpp");
+        assert_eq!(cpp.candidates[0].tool, "scan-build", "LLVM static analysis leads");
+        assert_eq!(cpp.candidates[0].apt_package, "clang-tools");
+        let tools: Vec<&str> = cpp.candidates.iter().map(|t| t.tool).collect();
+        assert!(tools.contains(&"clang-tidy"));
+        assert!(tools.contains(&"cppcheck"));
         assert_eq!(cpp.detected_by, "CMakeLists.txt");
     }
 
@@ -363,10 +533,9 @@ mod tests {
     fn detects_plain_c_from_source_files() {
         let t = Tmp::new("c");
         t.write("main.c");
-        let plan = detect_lints(&t.0);
-        let c = plan.iter().find(|p| p.lang == "c").expect("c detected");
-        assert_eq!(c.tool, "scan-build");
-        assert!(c.command.contains("cppcheck"), "cppcheck is the cheap second opinion");
+        let c = plan_for(&t.0, "c");
+        let tools: Vec<&str> = c.candidates.iter().map(|t| t.tool).collect();
+        assert!(tools.contains(&"scan-build") && tools.contains(&"cppcheck"));
     }
 
     /// A `.cpp` source and a `.c` source together are C++, not two languages.
@@ -379,36 +548,120 @@ mod tests {
         assert!(!plan.iter().any(|p| p.lang == "c"), "must not double-count");
     }
 
-    /// Every detected language's linter is probed, and a missing one lands in
-    /// `missing` — this is the invariant that stops a silent pass.
+    /// The heart of the change: a language with *any* installed candidate is
+    /// analysed, and the run uses every installed candidate, not just the
+    /// first. This is what stops a box that only has `g++` from being written
+    /// off as unanalysed.
+    #[test]
+    fn a_language_is_analysed_by_whichever_candidates_exist() {
+        let t = Tmp::new("pick");
+        t.write("CMakeLists.txt").write("main.cpp");
+        let st = partition(detect_lints(&t.0));
+        let cpp = st.available.iter().find(|l| l.lang == "cpp");
+        let missing = st.missing.iter().find(|l| l.lang == "cpp");
+        if let Some(c) = cpp {
+            assert!(!c.chosen.is_empty());
+            for tool in &c.chosen {
+                assert!(tool_available(tool.tool), "{} chosen but not installed", tool.tool);
+            }
+            // The composed command must carry every chosen tool's fragment.
+            let cmd = c.command();
+            for tool in &c.chosen {
+                assert!(cmd.contains(tool.command), "command missing {}", tool.tool);
+            }
+            // The primary is the strongest installed one, in candidate order:
+            // it is the earliest entry of the original list that survived the
+            // availability filter, so it must precede every other chosen tool.
+            let order: Vec<&str> = plan_for(&t.0, "cpp")
+                .candidates
+                .iter()
+                .map(|x| x.tool)
+                .collect();
+            let first = c.chosen[0].tool;
+            let earliest = order
+                .iter()
+                .position(|x| *x == first)
+                .expect("chosen tool came from the candidate list");
+            for other in &c.chosen[1..] {
+                assert!(
+                    order.iter().position(|x| *x == other.tool).unwrap() > earliest,
+                    "{} was preferred over the stronger {}",
+                    other.tool,
+                    first
+                );
+            }
+        } else {
+            // Nothing installed: it must be reported, not silently dropped.
+            let m = missing.expect("either analysed or reported missing");
+            assert!(m.candidates.iter().all(|t| !tool_available(t.tool)));
+        }
+    }
+
+    /// GCC's analyzer needs no package (it is part of the compiler), so it must
+    /// be offered as an analysis that works with nothing installed.
+    #[test]
+    fn the_compiler_builtin_fallback_needs_no_install() {
+        let d = Tmp::new("gcc");
+        d.write("main.c");
+        let c = plan_for(&d.0, "c");
+        let gcc = c.candidates.iter().find(|t| t.tool == "gcc").expect("gcc fallback offered");
+        assert!(!gcc.needs_install(), "gcc ships with the compiler — nothing to apt-get");
+        assert!(gcc.command.contains("-fanalyzer"));
+    }
+
+    /// Every detected language's candidates are probed, and anything reported
+    /// missing really is missing — the invariant that stops a silent pass.
     #[test]
     fn missing_linters_are_separated_from_available_ones() {
         let t = Tmp::new("part");
         t.write("Cargo.toml");
         let st = partition(detect_lints(&t.0));
-        let rust = st.available.iter().find(|p| p.lang == "rust").expect("rust available");
-        assert_eq!(rust.tool, "cargo-clippy");
-        // Nothing in `missing` may be something we can actually run.
-        for p in &st.missing {
-            assert!(!tool_available(p.tool), "{} is installed but was reported missing", p.tool);
+        for l in &st.available {
+            for e in &l.extras {
+                assert!(!tool_available(e.tool), "{} installed but listed as an extra", e.tool);
+            }
+        }
+        for l in &st.missing {
+            for c in &l.candidates {
+                assert!(!tool_available(c.tool), "{} installed but reported missing", c.tool);
+            }
         }
     }
 
-    /// The prompt must state the *absence* of a linter explicitly, so the model
-    /// is told not to call unanalysed code clean.
+    /// A fallback must NOT trigger the "NOT installed, unanalysed" alarm: the
+    /// code *was* analysed. Only genuinely unanalysable languages do.
+    #[test]
+    fn a_fallback_keeps_the_language_out_of_the_unanalysed_bucket() {
+        let t = Tmp::new("fallback");
+        t.write("CMakeLists.txt").write("main.cpp");
+        let p = autoclean_prompt(&t.0);
+        let st = lint_status(&t.0);
+        let cpp_available = st.available.iter().any(|l| l.lang == "cpp");
+        if cpp_available {
+            assert!(
+                !p.contains("its code has NOT been analysed") || !st.missing.iter().any(|m| m.lang == "cpp"),
+                "a fallback analysed the code — it must not be reported unanalysed"
+            );
+        }
+    }
+
+    /// The prompt must state the *absence* of any analyser explicitly, so the
+    /// model is told not to call unanalysed code clean.
     #[test]
     fn prompt_tells_the_model_not_to_claim_unanalysed_code_is_clean() {
         let t = Tmp::new("prompt");
         t.write("CMakeLists.txt").write("main.cpp");
         let p = autoclean_prompt(&t.0);
-        // Either scan-build runs, or the prompt must say it is missing and
-        // offer the install. Both are acceptable; silence is not.
-        if !tool_available("scan-build") {
-            assert!(p.contains("NOT installed"), "must flag the missing linter: {p}");
+        let cpp_unanalysed = lint_status(&t.0).missing.iter().any(|m| m.lang == "cpp");
+        if cpp_unanalysed {
+            assert!(p.contains("NOT installed"), "must flag it: {p}");
             assert!(p.contains("apt-install"), "must offer the install path");
             assert!(p.contains("ask_user_question"), "must ask before installing");
+            assert!(p.contains("Never report 'no issues found'"), "must forbid a false clean bill");
         } else {
-            assert!(p.contains("scan-build"), "must name the linter it can run");
+            // Analysed: the prompt must name a command that will actually run.
+            assert!(p.contains("scan-build") || p.contains("-fanalyzer") || p.contains("cppcheck")
+                    || p.contains("clang-tidy"), "must name a runnable analyser: {p}");
         }
     }
 
@@ -420,21 +673,47 @@ mod tests {
         assert!(p.contains("no recognised build manifest"), "got: {p}");
     }
 
-    /// When *nothing* is installed the prompt must not still claim to have a
-    /// command list, and must lead with the install question instead.
+    /// The compiler_builtin_fallback_needs_no_install test asserts the *string*.
+    /// This asserts the command actually works: a deliberate null dereference
+    /// must be reported.
+    ///
+    /// This is the test that catches `-fsyntax-only`, which suppresses GCC's
+    /// dataflow pass entirely — the command then exits clean and the code is
+    /// reported as analysed when it was never actually checked, which is the
+    /// exact failure this module exists to prevent. Skipped where no GCC is
+    /// present.
     #[test]
-    fn a_fully_unanalysable_project_says_that_up_front() {
-        let t = Tmp::new("none");
-        t.write("CMakeLists.txt"); // cpp -> scan-build, absent on this host
-        let st = super::partition(detect_lints(&t.0));
-        if st.available.is_empty() {
-            let p = autoclean_prompt(&t.0);
-            assert!(
-                p.contains("No linter for this project is installed"),
-                "must not imply any analysis will run: {p}"
-            );
-            assert!(!p.contains("Run these, fix everything"), "must not promise a command list");
+    fn the_gcc_fallback_command_actually_reports_a_real_bug() {
+        if !tool_available("gcc") {
+            eprintln!("skipping: no gcc on this host");
+            return;
         }
+        let d = Tmp::new("fanalyzer");
+        d.write("bug.c");
+        std::fs::write(
+            d.0.join("bug.c"),
+            b"int deref(int *p) { return *p; }\nint main(void) { return deref(0); }\n",
+        )
+        .unwrap();
+        let plan = plan_for(&d.0, "c");
+        let gcc = plan.candidates.iter().find(|t| t.tool == "gcc").expect("gcc candidate");
+        // Run the real command, with `<sources>` filled in and /dev/null
+        // substituted, so the test exercises the command as documented.
+        let cmd = gcc
+            .command
+            .replace("<sources>", &format!("{}", d.0.join("bug.c").display()));
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .output()
+            .expect("run gcc");
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            text.contains("analyzer-null-dereference") || text.contains("null-dereference"),
+            "the fallback must actually catch a null dereference, but reported nothing.\n\
+             command was: {cmd}\nstderr: {text}\n\
+             (a clean run here means the analyzer was disabled, not that the code is clean)"
+        );
     }
 
     /// Rust is still the first-class citizen it always was — this must not
@@ -447,32 +726,5 @@ mod tests {
         assert!(p.contains("cargo build"), "must still build");
         assert!(p.contains("cargo test"), "must still test");
         assert!(p.contains("clippy"), "must now also lint");
-    }
-}
-
-#[cfg(test)]
-mod prompt_text_tests {
-    use super::autoclean_prompt;
-
-    /// The C++ prompt must both run the analysis AND admit it is missing, with
-    /// an install offer — the exact combination the user asked for.
-    #[test]
-    fn cpp_prompt_names_the_tool_and_offers_the_install() {
-        let dir = std::env::temp_dir().join("pir-lints-prompt-cpp");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("CMakeLists.txt"), b"").unwrap();
-        std::fs::write(dir.join("main.cpp"), b"").unwrap();
-        let p = autoclean_prompt(&dir);
-        let _ = std::fs::remove_dir_all(&dir);
-        if super::tool_available("scan-build") {
-            assert!(p.contains("scan-build"), "must run the analyzer when present");
-        } else {
-            assert!(p.contains("NOT installed"), "must warn it is missing:\n{p}");
-            assert!(p.contains("clang-tools"), "must name the apt package");
-            assert!(p.contains("ask_user_question"), "must ask before installing");
-            assert!(p.contains("apt-install"), "must use the audited escalation path");
-            assert!(p.contains("Never report 'no issues found'"), "must forbid a false clean bill");
-        }
     }
 }

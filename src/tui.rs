@@ -255,7 +255,7 @@ fn run_inner(
     state.push(
         ConvKind::System,
         &format!(
-            "pir · {} · full-screen TUI (/help for commands · Esc/ctrl-c cancel · ↑↓ recall · ctrl-c/Esc ×3 quit · ctrl-d quit · ctrl-q quit now (x2 to force))",
+            "pir · {} · full-screen TUI (/help for commands · Esc/ctrl-c cancel · ↑↓ recall · ctrl-c/Esc ×3 quit · ctrl-d quit · ctrl-q/ctrl-\\ quit now (x2 to force))",
             ctx.providers[0].pid()
         ),
     );
@@ -458,8 +458,13 @@ fn run_inner(
                     // if this shutdown hangs.
                     state.push(
                         ConvKind::System,
-                        "· quitting… press Ctrl-Q again to FORCE-QUIT now if it hangs",
+                        "· quitting… press Ctrl-Q or Ctrl-\\ again to FORCE-QUIT now if it hangs",
                     );
+                    // Arm the watchdog BEFORE the job sweep, which takes
+                    // `agent_slot` — a lock the turn's worker owns for the whole
+                    // turn. Arming it after means a shutdown that wedges on that
+                    // lock has no escape at all.
+                    term::spawn_force_quit_watchdog();
                     {
                         let mut g = ctx.agent_slot.lock().unwrap();
                         if let Some(a) = g.as_mut() {
@@ -469,9 +474,19 @@ fn run_inner(
                     if let Some(f) = crate::agent::job_kill_flag() {
                         f.store(true, Ordering::SeqCst);
                     }
-                    term::spawn_force_quit_watchdog();
                     if let Some(h) = fg_handle.take() {
-                        let _ = h.join();
+                        // The watchdog force-exits on a second quit press, but the
+                        // main loop must not park on an unbounded join: the
+                        // transcript is durable on disk, so a worker that is not
+                        // finishing is exited around rather than waited on.
+                        if h.is_finished() {
+                            let _ = h.join();
+                        } else {
+                            state.push(
+                                ConvKind::System,
+                                "· worker did not stop — exiting anyway (Ctrl-Q / Ctrl-\\ force-quits instantly)",
+                            );
+                        }
                     }
                     break;
                 }

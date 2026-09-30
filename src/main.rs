@@ -28,6 +28,7 @@ mod retention;
 mod scratchpad;
 mod resource;
 mod session;
+mod session_index;
 mod sixel;
 mod skills;
 mod lints;
@@ -413,6 +414,14 @@ COMMANDS
                           whether streamed reasoning is displayed; no arg = status
   /model* <sel>  /model-all <sel>   broadcast a model switch to ALL your open pir terminals (also sets the new default)
   /bg <text>  /jobs  /fg <id>  /clear  /usage  /exit
+  /compact [status|on|off]  summarise the conversation so far and replace it
+                          with the summary, freeing the context window (the
+                          full transcript stays in the session log). `status`
+                          reports how full the window is without calling the
+                          model; `on`/`off` arm/disarm the automatic compaction
+                          that already runs before a near-cap auto-retry.
+                          Compact before switching to a big task — it is the
+                          cheapest way to stop a long session hitting the cap.
   /undo [all]             revert the last file edit (or all) to its pre-edit state
   /grants [clear]         list what "[s] allow session" granted this session (clear = forget all)
   /mcp                   list configured MCP servers and the tools they provide
@@ -480,11 +489,14 @@ COMMANDS
                           automatically after every prompt
                           Per-language: the cleanup list is derived from the
                           tree (Cargo/CMake/meson/pyproject/package.json/go.mod
-                          or source files) and each language gets its own
-                          linter — clippy, LLVM static analysis (scan-build +
-                          clang-tidy) / cppcheck for C and C++, ruff, eslint,
-                          go vet. A linter that is not installed is reported
-                          and offered for install; it is never counted as clean.
+                          or source files) and each language is analysed by
+                          WHICHEVER of its analysers are installed — clippy for
+                          Rust; for C/C++ any of scan-build (LLVM static
+                          analysis), clang-tidy, cppcheck, or the compiler's own
+                          -fanalyzer; ruff/pyflakes; eslint; go vet. Several may
+                          run together. A language with no analyser at all is
+                          reported and offered for install — it is never
+                          counted as clean. `pir lints` shows the plan.
   /create [name]           scaffold a new project (seeds from clipboard .md spec)
   /login [provider]        store an API key for a provider in ~/.pi/agent/auth.json
   /logout [provider]       remove a stored provider credential from auth.json
@@ -753,22 +765,49 @@ fn main() {
             }
             "lints" => {
                 // `pir lints` — show the per-language lint plan `/autoclean`
-                // would use for this tree, and which tools are missing. Exists
+                // would use for this tree: which analysers are installed and
+                // will run, and which stronger ones are merely absent. Exists
                 // so the plan is inspectable (and testable on a real project)
                 // without spending an agent turn on it.
                 let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                let st = crate::lints::partition(crate::lints::detect_lints(&dir));
-                if st.available.is_empty() && st.missing.is_empty() {
+                let st = crate::lints::lint_status(&dir);
+                if st.is_empty() {
                     println!("no recognised build manifest or source file in {}", dir.display());
                     return;
                 }
-                for p in &st.available {
-                    println!("{}  {}  (detected via {})", term::green("ok"), p.lang, p.detected_by);
-                    println!("      {}", p.command);
+                for l in &st.available {
+                    println!(
+                        "{}  {}  (detected via {})",
+                        term::green("ok"),
+                        l.lang,
+                        l.detected_by
+                    );
+                    for t in &l.chosen {
+                        println!("      will run:  {:<14} {}", t.tool, t.purpose);
+                    }
+                    for t in l.extras.iter().filter(|t| t.needs_install()) {
+                        println!(
+                            "      upgrade:  {:<14} {}  (apt: {})",
+                            t.tool, t.purpose, t.apt_package
+                        );
+                    }
+                    println!("      $ {}", l.command());
                 }
-                for p in &st.missing {
-                    println!("{}  {}  (detected via {})", term::yellow("MISSING"), p.lang, p.detected_by);
-                    println!("      needed: {}  ·  sudo apt-get install {}", p.tool, p.apt_package);
+                for l in &st.missing {
+                    println!(
+                        "{}  {}  (detected via {}) — nothing installed",
+                        term::yellow("MISSING"),
+                        l.lang,
+                        l.detected_by
+                    );
+                    for t in &l.candidates {
+                        let how = if t.needs_install() {
+                            format!("sudo apt-get install {}", t.apt_package)
+                        } else {
+                            "ships with the toolchain".to_string()
+                        };
+                        println!("      missing:   {:<14} {}  ({})", t.tool, t.purpose, how);
+                    }
                 }
                 return;
             }
@@ -1462,7 +1501,7 @@ fn main() {
     // "Enable Sixel graphics" on, or any sixel-capable emulator) and the
     // img2sixel binary is installed. Falls back to the plain lines below
     // otherwise.
-    let help_line = "/help for commands · ctrl-d quit · ctrl-q quit now (x2 to force) · ctrl-c/Esc ×3 quit · type while a turn runs: ESC/ctrl-c cancels, ↑↓ recalls history";
+    let help_line = "/help for commands · ctrl-d quit · ctrl-q/ctrl-\\ quit now (x2 to force) · ctrl-c/Esc ×3 quit · type while a turn runs: ESC/ctrl-c cancels, ↑↓ recalls history";
     side_lines.push(term::dim(help_line));
     if let Some(banner) = crate::sixel::render_banner(&side_lines) {
         term::out(&banner);
@@ -1803,6 +1842,19 @@ fn main() {
                 term::raw::RawInput::Eof => {
                     if let Ok(mut g) = typeahead.lock() { g.clear(); }
                     fg_cancel.store(true, Ordering::SeqCst);
+                    // Arm the force-quit watchdog FIRST, before anything that
+                    // can block.
+                    //
+                    // The job sweep below takes `agent_slot`, and mid-turn that
+                    // slot is contended: the worker owns the agent for the whole
+                    // turn. If the watchdog were armed *after* the sweep, a
+                    // shutdown that wedged on that lock would have no escape at
+                    // all — the operator would be pressing a force-quit key into
+                    // a process that had not yet started listening for one.
+                    // That is the mid-turn Ctrl-Q hang: the key was pressed, the
+                    // quit message never even printed, and Ctrl-\ did nothing
+                    // because no watchdog thread existed yet.
+                    term::spawn_force_quit_watchdog();
                     // Quitting (ctrl-d) also sweeps detached jobs so pir's
                     // children don't linger holding output pipes after we exit.
                     {
@@ -1818,7 +1870,20 @@ fn main() {
                     // but don't block forever if the worker is stuck.
                     wait_worker_finish(&done_rx, std::time::Duration::from_secs(5));
                     if let Some(h) = fg_handle.take() {
-                        let _ = h.join();
+                        // The watchdog covers a frozen join, but never leave the
+                        // main thread parked on one unbounded by accident: if the
+                        // grace period expired, the worker is not going to
+                        // finish and the transcript is already durable on disk
+                        // (it is appended per message), so the session is saved
+                        // either way.
+                        let still_running = !h.is_finished();
+                        if still_running {
+                            term::out(&term::dim(
+                                "· worker did not stop — exiting anyway (Ctrl-Q / Ctrl-\\ force-quits instantly if it hangs)",
+                            ));
+                        } else {
+                            let _ = h.join();
+                        }
                     }
                     term::raw::disable_raw();
                     println!("{}", term::dim(&resume_hint(session_path.as_ref())));
@@ -1834,8 +1899,16 @@ fn main() {
                     // force-exits immediately if this shutdown hangs (frozen
                     // worker or a stuck detached job).
                     term::out(&term::dim(
-                        "· quitting… press Ctrl-Q again to FORCE-QUIT now if it hangs",
+                        "· quitting… press Ctrl-Q or Ctrl-\\ again to FORCE-QUIT now if it hangs",
                     ));
+                    // Arm the force-quit watchdog BEFORE the job sweep, which
+                    // takes `agent_slot` — a lock the turn's worker owns for the
+                    // whole turn. Arming it after means a shutdown that wedges
+                    // on that lock has no escape: the operator's force-quit key
+                    // goes to a process not yet listening for one. (This is
+                    // exactly how mid-turn Ctrl-Q hung: the "· quitting…" line
+                    // never printed because the blocking lock came first.)
+                    term::spawn_force_quit_watchdog();
                     {
                         let mut g = agent_slot.lock().unwrap();
                         if let Some(a) = g.as_mut() {
@@ -1845,13 +1918,24 @@ fn main() {
                     if let Some(f) = crate::agent::job_kill_flag() {
                         f.store(true, Ordering::SeqCst);
                     }
-                    term::spawn_force_quit_watchdog();
                     // Graceful cleanup: let the turn finish its current step,
                     // then exit — but don't block forever if the worker is
                     // stuck (the watchdog force-quits on a second Ctrl-Q).
                     wait_worker_finish(&done_rx, std::time::Duration::from_secs(5));
                     if let Some(h) = fg_handle.take() {
-                        let _ = h.join();
+                        // The watchdog is the escape hatch for a *frozen* join,
+                        // but the main thread must not depend on the operator
+                        // knowing that: if the grace period already expired, the
+                        // worker is not finishing, and the transcript is durable
+                        // on disk regardless (it is appended per message), so
+                        // exit instead of parking here indefinitely.
+                        if h.is_finished() {
+                            let _ = h.join();
+                        } else {
+                            term::out(&term::dim(
+                                "· worker did not stop — exiting anyway (Ctrl-Q / Ctrl-\\ force-quits instantly)",
+                            ));
+                        }
                     }
                     term::raw::disable_raw();
                     println!("{}", term::dim(&resume_hint(session_path.as_ref())));
@@ -1969,6 +2053,10 @@ fn main() {
         // off its bookkeeping; wipe the idle zone absolutely so nothing from
         // the previous prompt/hint survives. See [`term::clear_input_zone`].
         term::clear_input_zone();
+        // That wipe covers the whole bottom zone, which includes the footer's
+        // row, so restore the footer immediately rather than leaving a gap
+        // until the next idle tick redraws it.
+        term::draw_footer(&term::status_line(&workspace, &model));
         match res {
             None => {
                 println!();
@@ -2289,27 +2377,60 @@ fn autoclean_prompt() -> String {
 /// it rather than only appearing in the model's final summary.
 fn report_lint_plan() {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let st = crate::lints::partition(crate::lints::detect_lints(&cwd));
-    if st.available.is_empty() && st.missing.is_empty() {
+    let st = crate::lints::lint_status(&cwd);
+    if st.is_empty() {
         println!("{} autoclean: no recognised build manifest or source found — the agent will have to guess how to build this", term::yellow("·"));
         return;
     }
-    let have: Vec<String> = st
-        .available
-        .iter()
-        .map(|p| format!("{} ({})", p.lang, p.tool))
-        .collect();
-    if !have.is_empty() {
-        println!("{} autoclean: linters — {}", term::bold("·"), have.join(", "));
-    }
-    for p in &st.missing {
+    for l in &st.available {
+        // Name every tool that will actually run, and note the rest as an
+        // upgrade rather than a gap: a language with *any* working analyser is
+        // analysed, so it must not read as a failure.
+        let chosen = l
+            .chosen
+            .iter()
+            .map(|t| t.tool)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let extra = if l.extras.iter().any(|t| t.needs_install()) {
+            format!(
+                "  (also applicable, not installed: {})",
+                l.extras
+                    .iter()
+                    .filter(|t| t.needs_install())
+                    .map(|t| t.tool)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else {
+            String::new()
+        };
         println!(
-            "{} autoclean: {} has no linter installed ({} missing) — its code will NOT be \
-analysed. Install it with: sudo apt-get install {}",
+            "{} autoclean: {} — analysing with {}{}",
+            term::bold("·"),
+            l.lang,
+            chosen,
+            extra,
+        );
+    }
+    for l in &st.missing {
+        let opts = l
+            .candidates
+            .iter()
+            .filter(|t| t.needs_install())
+            .map(|t| format!("{} (sudo apt-get install {})", t.tool, t.apt_package))
+            .collect::<Vec<_>>()
+            .join(", or ");
+        println!(
+            "{} autoclean: {} has NO analyser installed — its code will NOT be analysed. \
+Install one: {}",
             term::yellow("!"),
-            p.lang,
-            p.tool,
-            p.apt_package,
+            l.lang,
+            if opts.is_empty() {
+                l.candidates.iter().map(|t| t.tool).collect::<Vec<_>>().join(" / ")
+            } else {
+                opts
+            },
         );
     }
 }
@@ -3594,6 +3715,82 @@ fn handle_command(
             }
             agent.continue_goal();
         }
+        "compact" => {
+            // `/compact` — summarise the conversation so far and replace the
+            // history with that summary, freeing the context window.
+            //
+            // The work (`Agent::compact`) was already implemented and is used by
+            // the auto-retry path, but nothing exposed it: `/compact` appeared
+            // in the slash-command help and tab-completion, so it advertised a
+            // command that silently fell through to "unknown command".
+            //
+            // Modes:
+            //   /compact          summarise now
+            //   /compact status   show the current context usage, no model call
+            //   /compact on|off   arm/disarm the automatic compaction that
+            //                     already runs before a near-cap auto-retry
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                eprintln!("pir: agent busy (turn running) — /compact needs the history, try when idle");
+                return;
+            };
+            let arg = rest.first().copied().unwrap_or("").trim().to_ascii_lowercase();
+            match arg.as_str() {
+                "" => {
+                    // Say what is about to happen first: this is a blocking
+                    // model call, and silently freezing the REPL for a few
+                    // seconds reads as a hang.
+                    println!(
+                        "{} compacting conversation (~{} est. tokens) — this calls the model, please wait…",
+                        term::bold("·"),
+                        fmt_tok(agent.context_tokens() as u64)
+                    );
+                    let out = agent.compact();
+                    if out.starts_with("compaction failed") || out.contains("empty summary") {
+                        eprintln!("{} {}", term::yellow("!"), out);
+                    } else {
+                        println!("{} {}", term::green("·"), out);
+                    }
+                }
+                "status" | "stat" => {
+                    let used = agent.context_tokens() as u64;
+                    let cap = agent.context_budget() as u64;
+                    let pct = if cap > 0 { (used * 100) / cap } else { 0 };
+                    let colour = if pct >= 90 {
+                        term::red(&format!("{pct}%"))
+                    } else if pct >= 70 {
+                        term::yellow(&format!("{pct}%"))
+                    } else {
+                        term::green(&format!("{pct}%"))
+                    };
+                    println!(
+                        "{} context ~{} / {} used ({colour}) across {} messages",
+                        term::bold("·"),
+                        fmt_tok(used),
+                        fmt_tok(cap),
+                        agent.history_messages()
+                    );
+                    if agent.needs_compaction() {
+                        println!(
+                            "{} {} — run /compact to summarise and free the window",
+                            term::yellow("!"),
+                            "near the context cap"
+                        );
+                    }
+                }
+                "auto" | "on" => {
+                    agent.set_auto_compact(true);
+                    println!("{} auto-compact ON — the history is summarised before a retry that nears the cap", term::green("·"));
+                }
+                "off" => {
+                    agent.set_auto_compact(false);
+                    println!("{} auto-compact OFF", term::yellow("·"));
+                }
+                other => eprintln!(
+                    "usage: /compact [status|on|off]   (no arg = summarise now; on/off = auto-compact before a near-cap retry) — got {other:?}"
+                ),
+            }
+        }
         "clear" => {
             let mut g = agent_slot.lock().unwrap();
             let Some(agent) = g.as_mut() else {
@@ -4523,7 +4720,63 @@ fn run_zellij_rebuild(session: &str) -> i32 {
 /// ctrl-d/`q` start a fresh session. The picker only runs when stdin is a tty —
 /// with piped/scripted stdin we fall back to a simple `read_answer` so we never
 /// block forever.
+/// Resolve `name` to a transcript path by EXACT filename match, or `None`.
+///
+/// Deliberately exact: `resolve_resume` also substring-matches tokens against
+/// session names/previews, and this fast path must never be looser than that
+/// path it shortcuts, or the same token could select two different sessions.
+/// Only the candidate locations are searched — the global sessions dir, the
+/// project-local one, and `name` as a path given directly — so a stray
+/// `pir -r ../../etc/passwd` cannot stat outside the session stores.
+///
+/// A hit must be a regular file ending in `.jsonl`: an index token (`0`, `3`) or
+/// a fuzzy fragment falls through to the normal scan.
+fn transcript_named(name: &str) -> Option<PathBuf> {
+    // A token that names a path (has a separator, or exists as given) is taken
+    // at face value, but only when it is a `.jsonl` regular file.
+    let looks_like_path = name.contains('/') || name.ends_with(".jsonl");
+    if looks_like_path {
+        let direct = PathBuf::from(name);
+        if is_transcript_file(&direct) {
+            return Some(direct);
+        }
+    }
+    let global = config::pi_dir().join("agent").join("sessions").join(name);
+    if is_transcript_file(&global) {
+        return Some(global);
+    }
+    let local = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".pir")
+        .join("sessions")
+        .join(name);
+    if is_transcript_file(&local) {
+        return Some(local);
+    }
+    None
+}
+
+/// Whether `p` is an existing regular file with a `.jsonl` extension.
+fn is_transcript_file(p: &Path) -> bool {
+    p.extension().and_then(|x| x.to_str()) == Some("jsonl") && p.is_file()
+}
+
 fn resolve_resume(token: Option<&str>) -> Option<PathBuf> {
+    // Fast path: the token names a transcript file exactly (this is what
+    // `resume_hint` prints on quit, and what `pir --session <name>` documents).
+    // `scan_sessions()` below is a full walk of every transcript — a stat plus a
+    // sidecar read and a JSON parse per file — and the answer here needs none of
+    // it, so try the literal path (and the two session dirs) first. Without this,
+    // `pir -r <exact-filename>` paid the entire scan cost before the match even
+    // happened.
+    if let Some(t) = token {
+        let t = t.trim();
+        if !t.is_empty() && !t.starts_with('@') {
+            if let Some(p) = transcript_named(t) {
+                return Some(p);
+            }
+        }
+    }
     let mut sessions = scan_sessions()?;
     if sessions.is_empty() {
         eprintln!("pir: no sessions to resume");
@@ -4717,6 +4970,13 @@ fn scan_sessions() -> Option<Vec<Session>> {
     if local != global {
         dirs.push((local, true));
     }
+    // The scan runs before the prompt is drawn, on every `pir -r`, and there
+    // can be ~190 transcripts. Reading each one's `.status.json` and parsing its
+    // first user line was ~380 cold opens per start — 1.4–2.9 s measured on a
+    // cold page cache — for data that only a picker row or `/sessions` ever
+    // displays. `session_index` caches that data keyed by (size, mtime), so a
+    // warm start stats each file and opens none. See `session_index`'s docs.
+    let mut index = crate::session_index::Index::load();
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for (dir, is_local) in dirs {
@@ -4741,15 +5001,39 @@ fn scan_sessions() -> Option<Vec<Session>> {
             let md = e.metadata().ok();
             let mtime = md.as_ref().and_then(|m| m.modified().ok()).unwrap_or(std::time::UNIX_EPOCH);
             let bytes = md.as_ref().map(|m| m.len()).unwrap_or(0);
+            // The index is keyed on the whole-second mtime — the same value the
+            // sort below uses — so a transcript appended to since the index was
+            // written is never served a stale entry (see session_index::lookup).
+            let mtime_secs = mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let cached = index.lookup(&path, bytes, mtime_secs);
             // The tty is not in the filename (it would make them unwieldy and
             // it contains a `/`): it rides along in the status sidecar.
-            let tty = crate::session::read_status(&path)
-                .map(|m| term::normalize_tty(&m.tty))
-                .unwrap_or_default();
-            let preview = first_user_line(&path);
+            let (tty, preview) = match cached {
+                Some(c) => (c.tty, c.preview),
+                None => {
+                    let tty = crate::session::read_status(&path)
+                        .map(|m| term::normalize_tty(&m.tty))
+                        .unwrap_or_default();
+                    let preview = first_user_line(&path);
+                    index.put(
+                        &path,
+                        crate::session_index::Entry {
+                            mtime: mtime_secs,
+                            bytes,
+                            tty: tty.clone(),
+                            preview: preview.clone(),
+                        },
+                    );
+                    (tty, preview)
+                }
+            };
             out.push(Session { path, name, shell_pid, tty, mtime, bytes, preview, local: is_local });
         }
     }
+    index.save();
     if out.is_empty() {
         return None;
     }
@@ -5374,6 +5658,198 @@ fn create_project(name: &str) -> Option<std::path::PathBuf> {
     Some(dir)
 }
 
+/// The bytes that force-quit an in-progress shutdown.
+///
+/// Pinned because the bug it fixes is a *missing byte*, and a missing byte is
+/// invisible in review: the graceful path and its watchdog both look correct,
+/// and the only symptom is that the key an operator reaches for on a wedged
+/// shutdown does nothing at all.
+///
+/// `0x11` is `Ctrl-Q` (the documented force-quit). `0x1c` is `Ctrl-\`, which the
+/// terminal sends for `SIGQUIT` — the reflex key for "this is wedged, kill it".
+/// Raw mode is still enabled during the graceful drain, so `SIGQUIT` has
+/// nowhere to go: the byte lands in pir's own stdin and, unhandled, is a no-op.
+/// Swallowing it while advertising `Ctrl-Q` is a lie about what works.
+pub(crate) const FORCE_QUIT_BYTES: [u8; 2] = [0x11, 0x1c];
+
+/// True when `b` is a force-quit key. The single source of truth for the
+/// watchdog's byte test, so the unix and crossterm halves cannot disagree.
+pub(crate) fn is_force_quit_byte(b: u8) -> bool {
+    FORCE_QUIT_BYTES.contains(&b)
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    /// `Ctrl-Q` and `Ctrl-\` both force-quit. Dropping either one reintroduces
+    /// a shutdown the operator cannot escape.
+    #[test]
+    fn both_ctrl_q_and_ctrl_backslash_force_quit() {
+        assert!(is_force_quit_byte(0x11), "Ctrl-Q is the documented force-quit");
+        assert!(
+            is_force_quit_byte(0x1c),
+            "Ctrl-\\ (SIGQUIT) must force-quit too — raw mode swallows SIGQUIT, \
+             so the byte is the only escape and it is the key an operator \
+             actually reaches for when a shutdown is wedged"
+        );
+    }
+
+    /// And nothing else does: the watchdog force-exits the process, so a
+    /// false positive loses work the graceful path was about to finish.
+    #[test]
+    fn ordinary_control_bytes_do_not_force_quit() {
+        for b in [
+            0x03u8, // Ctrl-C
+            0x04,   // Ctrl-D — starts the graceful quit, is not a force-quit
+            0x1a,   // Ctrl-Z
+            0x18,   // Ctrl-X
+            0x1b,   // Esc
+            0x0d,   // Enter
+            0x7f,   // Backspace
+            b'q', b'Q', b'\\',
+        ] {
+            assert!(
+                !is_force_quit_byte(b),
+                "0x{b:02x} must not force-quit — that would exit the process \
+                 while the graceful shutdown was still finishing"
+            );
+        }
+    }
+
+    /// The graceful path is bounded *and* the worker join is not relied upon to
+    /// terminate. `wait_worker_finish` returns after the timeout even when the
+    /// worker never finishes, which is what makes the `is_finished` guard on
+    /// the join a correctness requirement rather than a nicety: the join alone
+    /// is what hung the shutdown.
+    #[test]
+    fn wait_worker_finish_returns_at_its_deadline_even_if_the_worker_never_finishes() {
+        let (_tx, rx) = smol::channel::bounded::<()>(1);
+        // Nothing is ever sent, so the worker is permanently unfinished.
+        let start = std::time::Instant::now();
+        wait_worker_finish(&rx, std::time::Duration::from_millis(200));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(150),
+            "returned early ({elapsed:?}) — it must actually wait out the grace period"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "took {elapsed:?} — the grace period is not a bound on the wait"
+        );
+    }
+
+    /// Every quit path that blocks on the worker join must be guarded by
+    /// `is_finished`. Both the `Eof` (ctrl-d) and `Quit` (ctrl-q) arms in the
+    /// REPL and the `Quit` arm in the TUI do this; a fourth turn on that
+    /// unbounded join would be an inescapable hang, because raw mode is still
+    /// on and SIGINT/SIGQUIT are handled by pir rather than the terminal.
+    #[test]
+    fn no_unbounded_worker_join_remains_in_any_quit_path() {
+        // Scope to the *quit arms* specifically. The other two sites that take
+        // the worker handle are not hangs and must not be "fixed":
+        //   * the idle-loop reap guards its join in the enclosing `if
+        //     h.is_finished()`, and joins only a finished thread by definition;
+        //   * the `&` detach hands ownership to `jobs` and never joins at all.
+        // Anchors are *constructed*, not written as literals: this test's own
+        // source sits in the same files, so a literal like
+        // `"RawInput::Eof => {"` would appear twice and the anchor would match
+        // the table below as readily as the real match arm.
+        let raw = |v: &str| format!("term::raw::RawInput::{v} => {{");
+        for (label, s, arms) in [
+            (
+                "repl",
+                include_str!("main.rs"),
+                vec![raw("Eof"), raw("Quit")],
+            ),
+            ("tui", include_str!("tui.rs"), vec!["RawKey::Quit => {".to_string()]),
+        ] {
+            for arm in arms {
+                let start = s
+                    .find(&arm)
+                    .unwrap_or_else(|| panic!("{label}: no {arm} quit path"));
+                assert_eq!(
+                    s[start..].matches(&arm).count(),
+                    1,
+                    "{label}: {arm} is not unique — this test would be pinning an \
+                     arbitrary match arm"
+                );
+                // Arm indentation: the column of `arm` itself.
+                let line_start = s[..start].rfind('\n').map(|p| p + 1).unwrap_or(0);
+                let indent = &s[line_start..start];
+                assert!(
+                    indent.chars().all(|c| c == ' ' || c == '\t'),
+                    "{label}: {arm} is not at the start of its line — the anchor \
+                     matched a mention rather than a match arm"
+                );
+                // The arm body runs from its `{` to the matching `}`. Brace
+                // balance is the precise boundary here: the arms are ~50 lines
+                // long, and their *interior* contains further `=>` lines (the
+                // inner `if let Some(h) = fg_handle.take() { … }`), so any
+                // "next line ending in `=>`" heuristic truncates the block
+                // before the join it is meant to inspect.
+                let open = s[start..]
+                    .find('{')
+                    .map(|o| start + o)
+                    .expect("a match arm must open a block");
+                let mut depth = 0i32;
+                let mut close = s.len();
+                for (off, ch) in s[open..].char_indices() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close = open + off + 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let block = &s[start..close];
+                assert!(
+                    block.contains("fg_handle.take()"),
+                    "{label}: {arm} no longer takes the worker handle — this test \
+                     is not pinning what it thinks it is"
+                );
+                assert!(
+                    block.contains("is_finished()"),
+                    "{label}: {arm} joins the worker without an is_finished() \
+                     guard — an unguarded join is the unbounded hang this fixes"
+                );
+                assert!(
+                    block.contains("spawn_force_quit_watchdog"),
+                    "{label}: {arm} has no force-quit watchdog, so a shutdown that \
+                     hangs is inescapable"
+                );
+                // ORDERING, not just presence. The watchdog must be armed before
+                // anything that can block — in practice the `agent_slot` lock,
+                // which the turn's worker holds for the whole turn. Armed after,
+                // a shutdown that wedges on that lock has no escape at all: the
+                // operator's force-quit key reaches a process that is not yet
+                // listening for one. This is the mid-turn Ctrl-Q hang: the
+                // "quitting…" line never printed, because the blocking lock came
+                // first, and Ctrl-\ did nothing because no watchdog thread
+                // existed yet.
+                let arm_off = s[..start].rfind("=>").unwrap_or(start);
+                let (lock, dog) = (block.find("agent_slot.lock()"), block.find("spawn_force_quit_watchdog"));
+                match (lock, dog) {
+                    (Some(l), Some(d)) => assert!(
+                        d < l,
+                        "{label}: {arm} arms the force-quit watchdog *after* \
+                         taking agent_slot.lock() — a shutdown that wedges on \
+                         that lock would be inescapable"
+                    ),
+                    (Some(_), None) => unreachable!("already asserted above"),
+                    _ => {}
+                }
+                let _ = arm_off;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod main_tests {
     use super::*;
@@ -5518,6 +5994,56 @@ mod main_tests {
         };
         let v = vec![stub];
         assert_eq!(pick_name(&v), None);
+    }
+
+    /// The scan is the expensive part of `pir -r`, and it must stay correct
+    /// with the index in play: an exact filename must resolve to the same
+    /// transcript the full scan would have picked.
+    #[test]
+    fn exact_token_fast_path_matches_the_scan() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("pir_fast_{}", std::process::id()));
+        let sdir = dir.join("agent").join("sessions");
+        std::fs::create_dir_all(&sdir).unwrap();
+        let name = "pir-20990101-000000-sh99999.jsonl";
+        std::fs::write(
+            sdir.join(name),
+            r#"{"role":"user","blocks":[{"type":"text","text":"fast path"}]}"#.to_string() + "\n",
+        )
+        .unwrap();
+        let old = std::env::var_os("PI_DIR");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PI_DIR", &dir) };
+
+        // The scan finds it...
+        let scanned = scan_sessions().expect("scan finds the temp global dir");
+        let from_scan = scanned
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.path.clone())
+            .expect("scan lists the transcript");
+        // ...and the fast path resolves the same file without scanning.
+        let fast = transcript_named(name).expect("exact filename resolves");
+        assert_eq!(fast, from_scan, "fast path must agree with the scan");
+
+        // A non-exact token must NOT hit the fast path (it has to fall through
+        // to the substring scan, which is a different selection rule).
+        assert!(transcript_named("99999").is_none(), "pid fragment is not a filename");
+        assert!(transcript_named("pir-20990101").is_none(), "partial name is not a filename");
+        // Neither may a sidecar, nor a non-transcript, nor a missing file.
+        assert!(transcript_named("pir-20990101-000000-sh99999.status.json").is_none());
+        assert!(transcript_named("pir-20990101-000000-sh99999.jsonl.tmp").is_none());
+        assert!(transcript_named("no-such-session.jsonl").is_none());
+        // A directory named like a transcript must not be returned.
+        std::fs::create_dir_all(sdir.join("pir-20990101-000000-sh88888.jsonl")).unwrap();
+        assert!(transcript_named("pir-20990101-000000-sh88888.jsonl").is_none());
+
+        match old {
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `scan_sessions` must find sessions in the PI_DIR global dir: restart

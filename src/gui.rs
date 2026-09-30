@@ -42,18 +42,13 @@ type GuiLabel = rustxwidgets::backends_nwg_adapter::Label;
 #[cfg(all(target_os = "linux", not(windows)))]
 type GuiLabel = rustxwidgets::backends_gtk_adapter::Label;
 
-/// Are we on the GTK backend?
-///
-/// NOTE: this deliberately tests `target_os`, *not* `cfg(feature = "gtk")`.
-/// A `feature` cfg inside this crate tests *pir's* features, and pir has no
-/// feature named `gtk` — the `gtk` feature belongs to the rustxwidgets
-/// dependency. So the old `cfg(feature = "gtk")` guards were silently always
-/// false, which is why `GuiEntry` had no definition and the whole GUI failed
-/// to compile. Gate on the platform, which is what actually picks the adapter.
-#[cfg(all(target_os = "linux", not(windows)))]
-const ON_GTK: bool = true;
-#[cfg(not(all(target_os = "linux", not(windows))))]
-const ON_GTK: bool = false;
+// NOTE on the `cfg` gates above: they test `target_os`, *not*
+// `cfg(feature = "gtk")`. A `feature` cfg inside this crate tests *pir's*
+// features, and pir has no feature named `gtk` — that one belongs to the
+// rustxwidgets dependency. The old `cfg(feature = "gtk")` guards were
+// therefore silently always false, which is why `GuiEntry` had no definition
+// at all and the whole GUI failed to compile. Gate on the platform, which is
+// what actually selects the adapter.
 
 /// GTK wrap mode: `GTK_WRAP_WORD_CHAR` — break mid-word only when a single
 /// word is wider than the view, so code blocks and long paths still wrap.
@@ -84,7 +79,8 @@ const GDK_KEY_Q: u32 = 0x71;
 const COMMANDS: &[&str] = &[
     "help", "model", "models", "goal", "continue", "clear", "undo", "finished",
     "exit", "usage", "thinking", "cancel", "sessions", "reload", "reexec",
-    "fix", "shell", "bg", "jobs",
+    "fix", "shell", "sh", "bg", "jobs", "checkpoints", "rewind", "quarantine",
+    "limits", "resources", "skills", "scratchpad",
 ];
 
 /// `/thinking` sub-arguments: the levels `config::ThinkingLevel::parse`
@@ -324,10 +320,23 @@ commands:
   /sh <cmd>             run a shell command   (/! <cmd> also works)
   /bg <prompt>          start a background turn   /jobs   list them
   /cancel               stop the running turn
+  /checkpoints          list rewindable turn boundaries   (/rewind <#> to restore)
+  /quarantine [status|apply all|discard]
+                         review / approve staged writes to the real filesystem
+  /limits               what the agent's commands are bounded by
+  /skills [name]        list the skill catalog, or print one
+  /scratchpad           this session's scratch directory
   /reload               reload catalog, policy and extension commands
   /reexec               restart in place (idle only)
   /sessions             new|close|next|prev|<n>  multi-session tabs
-  /exit                 quit";
+  /exit                 quit
+
+keys:
+  Enter                 send the line / run the command
+  esc or ctrl-c         cancel the running turn (same as /cancel)
+  ctrl-q or ctrl-d      quit
+  tab                   complete the command or model name
+  up / down             recall earlier / later prompts";
 
 const SPINNER_FRAMES: [&str; 10] =
     ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -468,6 +477,174 @@ struct SessionView {
     app: App,
 }
 
+/// Stop the foreground turn and every running background job, reporting what
+/// was actually cancelled. Assumes the caller already holds the state lock.
+///
+/// This is the single definition of "cancel" in the GUI: the `/cancel` command
+/// and the Esc / Ctrl-C keybindings both go through here, so the two can never
+/// disagree about what gets stopped or what the operator is told.
+fn cancel_running_locked(cancel: &Arc<AtomicBool>, s: &mut GuiState) {
+    let mut stopped_fg = false;
+    if s.running {
+        cancel.store(true, Ordering::SeqCst);
+        stopped_fg = true;
+    }
+    let bg_ids: Vec<usize> = s
+        .bg
+        .iter()
+        .filter(|b| b.join.as_ref().is_some_and(|h| !h.is_finished()))
+        .map(|b| {
+            b.cancel.store(true, Ordering::SeqCst);
+            b.id
+        })
+        .collect();
+    let list = bg_ids
+        .iter()
+        .map(|i| format!("#{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    match (stopped_fg, bg_ids.is_empty()) {
+        (true, true) => s.push(ConvKind::System, "· requesting cancel (turn stops now)"),
+        (true, false) => s.push(
+            ConvKind::System,
+            &format!(
+                "· requesting cancel (turn + background job{} {list})",
+                if bg_ids.len() == 1 { "" } else { "s" }
+            ),
+        ),
+        (false, true) => s.push(ConvKind::System, "· no turn running to cancel"),
+        (false, false) => s.push(
+            ConvKind::System,
+            &format!(
+                "· requesting cancel (background job{} {list})",
+                if bg_ids.len() == 1 { "" } else { "s" }
+            ),
+        ),
+    }
+}
+
+/// Cancel from a keybinding: take the state lock, cancel, repaint.
+///
+/// The key handler has no state guard of its own, so it cannot call
+/// [`cancel_running_locked`] directly.
+fn cancel_running(
+    cancel: &Arc<AtomicBool>,
+    state: &Arc<Mutex<GuiState>>,
+    widgets: &GuiWidgets,
+) {
+    let mut s = state.lock().unwrap();
+    cancel_running_locked(cancel, &mut s);
+    sync_textview(widgets, &mut s);
+}
+
+/// Ask the operator a question **in the GUI window** and block until they
+/// answer. Installed as the `ask_user_question` renderer so the agent can be
+/// answered from the graphical frontend.
+///
+/// Why this exists: `--gui` returned from `main` *before*
+/// `install_ask_renderer()` ran (`main.rs`, the GUI block precedes it), so in
+/// GUI mode no renderer was ever installed. `askuser::interactive()` was
+/// therefore false and every `ask_user_question` / plan-approval request came
+/// back as "no interactive user" — the GUI could never answer the model.
+///
+/// Threading: this is called from an agent **worker** thread (the turn loop
+/// runs off the GTK main thread), never from the GTK main loop, so blocking
+/// here does not freeze the UI — the main loop keeps servicing redraws and the
+/// dialog itself. The answer is handed back through a channel the dialog's
+/// response handler fills in.
+#[cfg(all(target_os = "linux", not(windows)))]
+fn question_dialog(
+    app: &App,
+    q: &crate::askuser::Question,
+) -> crate::askuser::Answer {
+    use crate::askuser::Answer;
+    use std::sync::mpsc;
+
+    let dialog = match app.create_dialog() {
+        Ok(d) => d,
+        // Without a dialog there is no way to ask; say so rather than block the
+        // turn forever waiting for an answer that can never arrive.
+        Err(e) => {
+            eprintln!("pir: cannot open a question dialog ({e}) — treating as no answer");
+            return Answer::Dismissed;
+        }
+    };
+    dialog.set_title(if q.header.is_empty() { "pir" } else { &q.header });
+
+    // Question text at the top.
+    let body = app
+        .create_label(&q.question)
+        .expect("question label");
+    body.set_xalign(0.0);
+    dialog.append_content_area(&body);
+
+    // Options as rows of buttons; each sets the answer and closes the dialog.
+    // Free-text (no options) gets an entry below.
+    let (tx, rx) = mpsc::channel::<Answer>();
+    let entry = if q.options.is_empty() {
+        let e = app.create_entry().expect("answer entry");
+        dialog.append_content_area(&e);
+        Some(e)
+    } else {
+        None
+    };
+
+    for opt in &q.options {
+        let label = if opt.description.is_empty() {
+            opt.label.clone()
+        } else {
+            format!("{} — {}", opt.label, opt.description)
+        };
+        let btn = app.create_button(&label).expect("option button");
+        let tx = tx.clone();
+        // `on_click` takes an `FnMut`, which cannot move `chosen` out of the
+        // capture — clone per click instead (a click handler fires once).
+        let chosen = std::sync::Arc::new(opt.label.clone());
+        let chosen_cb = chosen.clone();
+        let _ = btn.on_click(move || {
+            let _ = tx.send(Answer::Chosen(vec![(*chosen_cb).clone()]));
+        });
+        dialog.append_content_area(&btn);
+    }
+
+    // A submit/cancel pair. Cancel closes with Dismissed, which is what the
+    // agent treats as "the user declined to answer".
+    let submit = app.create_button("Submit").expect("submit button");
+    let tx_submit = tx.clone();
+    let entry_for_submit = entry.clone();
+    let _ = submit.on_click(move || {
+        let ans = match entry_for_submit.as_ref().and_then(|e| e.get_text()) {
+            Some(t) if !t.trim().is_empty() => Answer::Text(t),
+            _ => Answer::Dismissed,
+        };
+        let _ = tx_submit.send(ans);
+    });
+    dialog.append_content_area(&submit);
+
+    let cancel = app.create_button("Cancel").expect("cancel button");
+    let tx_cancel = tx.clone();
+    let _ = cancel.on_click(move || {
+        let _ = tx_cancel.send(Answer::Dismissed);
+    });
+    dialog.append_content_area(&cancel);
+
+    // A window-manager close is a dismissal too.
+    let tx_closed = tx.clone();
+    let _ = dialog.connect_response(move |resp| {
+        // Negative response ids are GTK's delete-event / close conventions.
+        if resp < 0 {
+            let _ = tx_closed.send(Answer::Dismissed);
+        }
+    });
+
+    dialog.present();
+
+    // Block this worker until one of the controls above sends. The GTK main
+    // loop is on another thread, so the dialog stays live and the UI keeps
+    // painting while we wait.
+    rx.recv().unwrap_or(Answer::Dismissed)
+}
+
 /// Run the GTK GUI REPL. Returns `Ok(())` on a clean exit (`/exit` or window
 /// close) or an error if the backend couldn't be initialised. Mirrors the TUI:
 /// the agent is switched to `quiet` mode and turns run on worker threads; the
@@ -481,6 +658,39 @@ pub fn run(
     _full_auto: bool,
 ) -> Result<(), String> {
     let app = App::init().map_err(|e| format!("rustxwidgets init: {e}"))?;
+
+    // Install the `ask_user_question` renderer **here**, before any turn can
+    // start. `main` used to install its terminal renderer only after the GUI
+    // block had already returned, so in `--gui` mode no renderer existed at all:
+    // `askuser::interactive()` was false and every question the model asked —
+    // including plan-mode approval — came back as "no interactive user".
+    //
+    // Threading: the renderer type is `Fn(..) -> Answer + Send + Sync` because
+    // `ask` runs it on whatever thread asked — here a turn's *worker*. GTK's
+    // `App` is `Rc`-based and deliberately neither `Send` nor `Sync`, so it
+    // cannot be captured by value, and a raw pointer is not `Sync` either.
+    // The address is therefore carried as a `usize` (which is `Send + Sync`
+    // unconditionally) and cast back at the call site.
+    //
+    // This is sound because: (a) `app` outlives every turn — `run` does not
+    // return until the GTK loop ends — so the address stays valid; and (b) the
+    // `App` is only ever *used* from the GTK main thread, which is the thread
+    // that owns the widgets. Blocking the worker inside `question_dialog` is
+    // therefore not a data race; it is the one place GTK's single-thread
+    // ownership model has to be crossed, and it is documented here so the next
+    // reader does not "tidy" it back into a compile error.
+    #[cfg(all(target_os = "linux", not(windows)))]
+    {
+        let app_addr = std::sync::Arc::new(&app as *const App as usize);
+        crate::askuser::install(std::sync::Arc::new(move |q| {
+            // SAFETY: `app_addr` is the address of the `App` created above, and
+            // that `App` is still alive for the whole call (it lives in `run`'s
+            // frame, which outlives every renderer invocation). Reborrow is
+            // valid because nothing else mutates or frees the value.
+            let app: &App = unsafe { &*(*app_addr as *const App) };
+            question_dialog(app, q)
+        }));
+    }
 
     // -- Build the window + horizontal-tab container --
     let window = app.create_window().map_err(|e| format!("create_window: {e}"))?;
@@ -618,9 +828,27 @@ fn spawn_session(
     let vbox = app
         .create_box(Orientation::Vertical, 4)
         .expect("create_box");
+    // The conversation TextView goes inside a ScrolledWindow. A bare GtkTextView
+    // has no viewport of its own, so without this the pane cannot be scrolled at
+    // all: once a turn fills the window, everything before it is unreachable.
+    // (`create_scrolled_window` already existed in the toolkit and was simply
+    // never called — which is why this file's header comment advertised a
+    // "scrollable conversation TextView" that it did not provide.)
+    let scroller = app
+        .create_scrolled_window()
+        .expect("create_scrolled_window");
+    // Vertical scrolling only: a horizontal scrollbar on a word-wrapped
+    // conversation pane is never what the user wants.
+    scroller.set_policy(0, 1); // GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC
     let textview = app.create_textview().expect("create_textview");
     configure_conversation_textview(&textview);
-    vbox.append(&textview);
+    scroller.set_child(&textview);
+    vbox.append(&scroller);
+    // The scroller, not the TextView, is what must claim the free space, and it
+    // needs a sensible minimum height or the pane collapses when a turn is long.
+    scroller.set_hexpand(true);
+    scroller.set_vexpand(true);
+    scroller.set_size_request(-1, 200);
 
     let entry: GuiEntry = app.create_entry().expect("create_entry");
     entry.set_hexpand(true);
@@ -646,7 +874,8 @@ fn spawn_session(
         s.push(
             ConvKind::System,
             &format!(
-                "pir · {} · GTK GUI  (/help · /sessions new|close|next|prev|<n> · Enter to send · ctrl-q to quit)",
+                "pir · {} · GTK GUI  (/help · /sessions new|close|next|prev|<n> · Enter to send · \
+                 esc or ctrl-c cancels · ctrl-q quits)",
                 providers[0].pid()
             ),
         );
@@ -669,10 +898,45 @@ fn spawn_session(
     let nav_for_keys = hist_nav.clone();
     let hist_for_keys = state.clone();
     let app_for_keys = app.clone();
+    // Captured so Esc / Ctrl-C can cancel the turn without the operator having
+    // to type `/cancel`.
+    let cancel_for_keys = fg_cancel.clone();
+    let state_for_keys = state.clone();
+    let widgets_for_keys = widgets.clone();
     let _ = entry.on_key_raw(Box::new(move |keyval: u32, kstate: u32| -> bool {
         const CONTROL_MASK: u32 = 1 << 2;
+        // Raw GDK keyvals. The toolkit's prelude only re-exports a handful of
+        // `GDK_KEY_*` constants (Q, TAB, UP, DOWN, …); Escape and the control
+        // letters are not among them, and binding them by name would silently
+        // compile as a *catch-all* `u32` pattern (a `GDK_KEY_Escape` that does
+        // not resolve becomes a fresh binding, which matches everything). These
+        // are the stable X11/GDK values for those keys.
+        const KEY_ESCAPE: u32 = 0xff1b;
+        const KEY_C: u32 = b'c' as u32;
+        const KEY_D: u32 = b'd' as u32;
+        let ctrl = kstate & CONTROL_MASK != 0;
         match keyval {
-            GDK_KEY_Q if (kstate & CONTROL_MASK) != 0 => {
+            GDK_KEY_Q if ctrl => {
+                let _ = app_for_keys.clone().quit();
+                true
+            }
+            // Esc and Ctrl-C cancel the running turn — the same affordance the
+            // TUI has and the GUI previously lacked, where the only way to stop
+            // work was to type `/cancel`. Both share the command's logic, so a
+            // key press and the typed command can never disagree about what
+            // "cancel" means.
+            KEY_ESCAPE => {
+                cancel_running(&cancel_for_keys, &state_for_keys, &widgets_for_keys);
+                true
+            }
+            KEY_C if ctrl => {
+                cancel_running(&cancel_for_keys, &state_for_keys, &widgets_for_keys);
+                true
+            }
+            // Ctrl-D quits, as in every other REPL. The TUI's quit gesture is
+            // "cancel twice then quit"; a GUI already has a window close
+            // button, so one Ctrl-D is enough.
+            KEY_D if ctrl => {
                 let _ = app_for_keys.clone().quit();
                 true
             }
@@ -1176,6 +1440,39 @@ fn spawn_turn(
     run_foreground_turn(agent_slot, cancel, quiet, prompt, done);
 }
 
+/// Drive the active goal to completion on a worker thread, *moving* the agent
+/// out of `agent_slot` for the duration — the same shape as [`spawn_turn`].
+///
+/// `/goal <objective>` and `/continue` used to call `agent.continue_goal()`
+/// inline on the GTK main thread. A goal run can take many minutes, so that
+/// froze the whole window: no redraw, no scroll, and `/cancel` could not even be
+/// typed to stop it. Moving the agent to a worker keeps the UI live.
+///
+/// The agent is put back into the slot when the run finishes, which is what the
+/// periodic drain uses to notice the session is idle again. `attach_log` mirrors
+/// `/continue`: re-attach the session log as goal context before driving.
+///
+/// No `quiet` flag is threaded through because the GUI agent is already quiet —
+/// `main` calls `agent.set_quiet(true)` before handing it over — so goal output
+/// reaches the user through the session log, exactly like any other turn.
+fn spawn_goal(agent_slot: &AgentSlot, attach_log: bool) {
+    let slot = agent_slot.clone();
+    std::thread::spawn(move || {
+        let taken = slot.lock().unwrap().take();
+        let Some(mut agent) = taken else { return };
+        if attach_log {
+            let lp = agent.log_path.clone();
+            if let Some(p) = lp {
+                agent.attach_goal(&p);
+            }
+        }
+        // The summary is part of the run's own output; the light-model
+        // backstop inside `continue_goal` is what decides whether it is done.
+        let _summary = agent.continue_goal();
+        *slot.lock().unwrap() = Some(agent);
+    });
+}
+
 /// Start `prompt` as a background turn on its own agent, so the UI stays
 /// responsive (the TUI's `spawn_background`, reachable here via `/bg <text>`
 /// and a trailing `&`).
@@ -1331,12 +1628,22 @@ fn drain_session_log(log: PathBuf, state: &mut GuiState) {
         let text = text.trim_end().to_string();
         if !text.is_empty() {
             state.push(kind, &text);
-                    }
+        }
     }
     // Bound scrollback.
+    //
+    // Trimming the model without telling the renderer about it desyncs the
+    // write cursor: `rendered` is an index into `conv`, so dropping `drop`
+    // leading lines must shift it down by the same amount, and the backend's
+    // buffer still holds the old lines, so it needs a rebuild. `push()` does
+    // exactly this for its 4000-line cap; this second, much larger cap did
+    // not, so hitting 200k lines left `rendered` past the end of `conv` and
+        // every later line was skipped.
     if state.conv.len() > 200_000 {
-        let keep = state.conv.len() - 200_000;
-        state.conv = state.conv.split_off(keep);
+        let drop = state.conv.len() - 200_000;
+        state.conv = state.conv.split_off(drop);
+        state.rendered = state.rendered.saturating_sub(drop);
+        state.needs_rebuild = true;
     }
 }
 
@@ -1350,8 +1657,9 @@ fn configure_conversation_textview(tv: &TextView) {
     tv.set_hexpand(true);
     #[cfg(all(target_os = "linux", not(windows)))]
     tv.set_vexpand(true);
-    // GTK wrap mode: 2 = GTK_WRAP_WORD_CHAR
-    tv.set_wrap_mode(2);
+    // GTK wrap mode: GTK_WRAP_WORD_CHAR — break mid-word only when a single
+    // word is wider than the view, so code blocks and long paths still wrap.
+    tv.set_wrap_mode(GTK_WRAP_WORD_CHAR);
     tv.set_editable(false);
     #[cfg(all(target_os = "linux", not(windows)))]
     tv.set_can_focus(false);
@@ -1452,41 +1760,11 @@ fn handle_command(
         }
         "cancel" | "c" => {
             // Stop the foreground turn and every background job, so `/cancel`
-            // really means "stop work" as it does in the TUI.
-            let mut stopped_fg = false;
-            if s.running {
-                cancel.store(true, Ordering::SeqCst);
-                stopped_fg = true;
-            }
-            let bg_ids: Vec<usize> = s
-                .bg
-                .iter()
-                .filter(|b| b.join.as_ref().is_some_and(|h| !h.is_finished()))
-                .map(|b| {
-                    b.cancel.store(true, Ordering::SeqCst);
-                    b.id
-                })
-                .collect();
-            match (stopped_fg, bg_ids.is_empty()) {
-                (true, true) => s.push(ConvKind::System, "· requesting cancel (turn stops now)"),
-                (true, false) => s.push(
-                    ConvKind::System,
-                    &format!(
-                        "· requesting cancel (turn + background job{} {})",
-                        if bg_ids.len() == 1 { "" } else { "s" },
-                        bg_ids.iter().map(|i| format!("#{i}")).collect::<Vec<_>>().join(", ")
-                    ),
-                ),
-                (false, true) => s.push(ConvKind::System, "· no turn running to cancel"),
-                (false, false) => s.push(
-                    ConvKind::System,
-                    &format!(
-                        "· requesting cancel (background job{} {})",
-                        if bg_ids.len() == 1 { "" } else { "s" },
-                        bg_ids.iter().map(|i| format!("#{i}")).collect::<Vec<_>>().join(", ")
-                    ),
-                ),
-            }
+            // really means "stop work" as it does in the TUI. Shared with the
+            // Esc / Ctrl-C keybindings via `cancel_running`, so the key and the
+            // command cannot drift apart.
+            cancel_running_locked(cancel, &mut s);
+            sync_textview(widgets, &mut s);
         }
         "clear" => {
             s.clear();
@@ -1596,9 +1874,12 @@ fn handle_command(
                 }
             }
         }
-        "sessions" => {
-            s.push(ConvKind::System, "use `pir -r` from a terminal to resume sessions");
-        }
+        // NOTE: there is deliberately no `"sessions"` arm here. `/sessions` is
+        // intercepted by the entry handler *before* `handle_command` is reached
+        // (it has to mutate the tab list), so an arm here was unreachable — and
+        // what it printed, "use `pir -r` from a terminal to resume sessions", was
+        // wrong for the GUI, which does have session tabs. That stale leftover
+        // is what `docs/MISSING_GUI_FEATURES.md` §5.1 referred to.
         "goal" => {
             let mut g = agent_slot.lock().unwrap();
             let Some(agent) = g.as_mut() else {
@@ -1613,26 +1894,30 @@ fn handle_command(
                 }
             } else {
                 agent.start_goal(&obj);
-                s.push(ConvKind::System, &format!("goal started: {obj}"));
-                // Drive the goal to completion (same as /continue); the cheap
-                // light model is a completion backstop. Blocks the GUI main
-                // thread for the duration, like /continue.
-                let out = agent.continue_goal();
-                s.push(ConvKind::System, &out);
+                drop(s);
+                // Drive the goal to completion on a worker thread and **return
+                // immediately**. The goal run writes to the session log, and the
+                // 150ms periodic drain paints it exactly like any other turn
+                // output — so there is nothing to wait for here. Blocking on the
+                // worker's completion channel would freeze the GTK main loop for
+                // the whole run, which is the bug this replaces.
+                spawn_goal(agent_slot, false);
+                s = state.lock().unwrap();
+                s.push(ConvKind::System, &format!("goal started: {obj} — driving it now"));
             }
         }
         "continue" | "cont" => {
-            let mut g = agent_slot.lock().unwrap();
-            let Some(agent) = g.as_mut() else {
+            if agent_slot.lock().unwrap().is_none() {
                 s.push(ConvKind::System, "· agent busy");
                 return;
-            };
-            let lp = agent.log_path.clone();
-            if let Some(p) = lp {
-                agent.attach_goal(&p);
             }
-            let out = agent.continue_goal();
-            s.push(ConvKind::System, &out);
+            // Same off-thread treatment as /goal: `attach_goal` then drive, on a
+            // worker, returning immediately so the window keeps painting and
+            // `/cancel` can interrupt the run.
+            drop(s);
+            spawn_goal(agent_slot, true);
+            s = state.lock().unwrap();
+            s.push(ConvKind::System, "· continuing the goal — /cancel to stop");
         }
         "undo" => {
             let mut g = agent_slot.lock().unwrap();
@@ -1712,6 +1997,129 @@ fn handle_command(
         }
         "jobs" => {
             list_jobs(&mut s);
+        }
+        "checkpoints" | "ckpt" => {
+            // The rewindable turn boundaries for this session (Feature 8).
+            let g = agent_slot.lock().unwrap();
+            match g.as_ref() {
+                Some(a) => s.push(ConvKind::System, &a.checkpoints_listing()),
+                None => s.push(ConvKind::System, "· agent busy (turn running)"),
+            }
+        }
+        "rewind" => {
+            // `/rewind <#>` restores the working tree AND the conversation to a
+            // turn boundary; bare `/rewind` lists what is available.
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                s.push(ConvKind::System, "· agent busy (turn running)");
+                return;
+            };
+            let Some(arg) = rest.first() else {
+                s.push(ConvKind::System, &agent.checkpoints_listing());
+                return;
+            };
+            match arg.parse::<usize>() {
+                Ok(id) => s.push(ConvKind::System, &agent.rewind(id)),
+                Err(_) => s.push(
+                    ConvKind::Error,
+                    &format!("· /rewind takes a checkpoint number (got '{arg}') — /checkpoints lists them"),
+                ),
+            }
+        }
+        // No `q` alias here, unlike the streaming REPL: in the GUI `q` already
+        // means `/quit` (see the `"exit" | "quit" | "q"` arm above), so binding
+        // it to quarantine too would make the shorter, more dangerous spelling
+        // win and silently change what `/q` does.
+        "quarantine" => {
+            // The staged writes the write-quarantine is holding. This is
+            // security-relevant — `/quarantine apply` is the operator's explicit
+            // go-ahead for writes that were only visible to the agent — so it
+            // was worth having in the GUI rather than terminal-only.
+            match rest.first().copied() {
+                None | Some("status") | Some("list") => {
+                    match crate::security::overlay::staged_system_write_notice() {
+                        Some(n) => s.push(ConvKind::System, &n),
+                        None => s.push(
+                            ConvKind::System,
+                            "· nothing staged — the write-quarantine holds no pending writes",
+                        ),
+                    }
+                }
+                Some("apply") => {
+                    let which = rest.get(1).copied().unwrap_or("all");
+                    match which {
+                        "all" => match crate::security::overlay::apply_active() {
+                            Ok(n) => s.push(
+                                ConvKind::System,
+                                &format!("· applied {n} staged write(s) to the real filesystem"),
+                            ),
+                            Err(e) => s.push(ConvKind::Error, &format!("· apply failed: {e}")),
+                        },
+                        other => s.push(
+                            ConvKind::Error,
+                            &format!("· /quarantine apply takes `all` (got '{other}')"),
+                        ),
+                    }
+                }
+                Some("discard") => {
+                    match crate::security::overlay::discard_active() {
+                        Ok(()) => s.push(ConvKind::System, "· discarded every staged write"),
+                        Err(e) => s.push(ConvKind::Error, &format!("· discard failed: {e}")),
+                    }
+                }
+                Some(other) => s.push(
+                    ConvKind::Error,
+                    &format!("· usage: /quarantine [status|apply all|discard] (got '{other}')"),
+                ),
+            }
+        }
+        "limits" | "resources" => {
+            // What the agent's commands are bounded by, and where the budget
+            // came from. Same output as the streaming REPL's `/limits`.
+            let host = crate::resource::HostMem::read().unwrap_or_default();
+            let l = crate::resource::limits_for_session(&host, &crate::resource::session_key());
+            s.push(ConvKind::System, &crate::resource::describe(&host));
+            if l.backend == crate::resource::Backend::None {
+                s.push(
+                    ConvKind::System,
+                    "  note: no cgroup memory controller here — commands are measured and \
+                     host-pressure checked, but not kernel-limited.",
+                );
+            }
+            s.push(
+                ConvKind::System,
+                "  knobs: PIR_RESOURCE_MEMORY_MIB, PIR_RESOURCE_PIDS, PIR_CGROUP=0 disables",
+            );
+        }
+        "skills" | "skill" => {
+            // The catalog the model also sees; bare `/skills` lists, with a name
+            // it prints one in full.
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let skills = crate::skills::discover(&cwd);
+            match rest.first().copied() {
+                None => {
+                    if skills.is_empty() {
+                        s.push(ConvKind::System, "· no skills discovered");
+                    } else {
+                        s.push(ConvKind::System, &format!("skills ({}):", skills.len()));
+                        for sk in &skills {
+                            s.push(ConvKind::System, &format!("  {}", sk.name));
+                        }
+                    }
+                }
+                Some(name) => match skills.iter().find(|sk| sk.name == name) {
+                    Some(sk) => match crate::skills::body(sk) {
+                        Ok(b) => s.push(ConvKind::System, &b),
+                        Err(e) => s.push(ConvKind::Error, &format!("· {e}")),
+                    },
+                    None => s.push(ConvKind::Error, &format!("· no skill named '{name}'")),
+                },
+            }
+        }
+        "scratchpad" | "scratch" => {
+            // Path + size of this session's scratch directory (exported to child
+            // processes as $PIR_SCRATCHPAD).
+            s.push(ConvKind::System, &crate::scratchpad::describe());
         }
         other => {
             // Try extension-registered slash commands.
@@ -2087,6 +2495,15 @@ mod gui_parity_tests {
     fn every_completable_command_is_actually_handled() {
         let handled = handled_commands();
         for cmd in COMMANDS {
+            // `/sessions` is dispatched by `handle_session_command` before
+            // `handle_command` is reached (it has to mutate the tab list), so it
+            // has no `handle_command` arm — and must not have one: a stale dead
+            // arm used to sit there printing "use `pir -r` from a terminal to
+            // resume sessions", which is both unreachable and wrong for the GUI.
+            // It is exempt here rather than special-cased in the dispatch.
+            if *cmd == "sessions" {
+                continue;
+            }
             assert!(
                 handled.iter().any(|h| h == cmd),
                 "Tab offers /{cmd} but gui.rs has no handle_command arm for it.\n\
@@ -2139,19 +2556,66 @@ mod gui_parity_tests {
         // The TUI's canonical command set, restricted to what a graphical
         // front-end can meaningfully offer. The GUI must handle each one; this
         // is the "GUI supports all TUI features" guard.
+        //
+        // It is also the guard that keeps the Tab-completion list honest: every
+        // name here must be offered by `COMMANDS`, so a command that is
+        // implemented but not completable (the old state, where `/shell` was
+        // completable and `/sh` was not) is caught.
         const TUI_COMMANDS: &[&str] = &[
             "help", "model", "models", "goal", "continue", "clear", "undo",
-            "finished", "fix", "shell", "bg", "jobs", "thinking", "cancel",
-            "reload", "reexec", "exit",
+            "finished", "fix", "shell", "sh", "bg", "jobs", "thinking", "cancel",
+            "reload", "reexec", "exit", "checkpoints", "rewind", "quarantine",
+            "limits", "skills", "scratchpad",
         ];
         let handled = handled_commands();
         for cmd in TUI_COMMANDS {
+            // See `every_completable_command_is_actually_handled`: /sessions is
+            // handled by the tab manager, not by `handle_command`.
+            if *cmd == "sessions" {
+                continue;
+            }
             assert!(
                 handled.iter().any(|h| h == cmd),
                 "the TUI supports /{cmd} but the GUI does not — add a handle_command \
                  arm for it"
             );
+            assert!(
+                COMMANDS.contains(&cmd),
+                "/{cmd} is handled but missing from the Tab-completion list"
+            );
         }
+    }
+
+    /// `/goal` and `/continue` must not run on the GTK main thread. Both used
+    /// to call `agent.continue_goal()` inline, which froze the window for the
+    /// whole run — no redraw, no scroll, and `/cancel` could not be typed.
+    ///
+    /// Asserted at the source level because the harm is structural: a
+    /// synchronous call cannot be observed without a real display, but it *can*
+    /// be seen in the code, and it is the thing most likely to be "simplified"
+    /// back into a blocking call by someone tidying the command handler.
+    #[test]
+    fn goal_and_continue_are_spawned_not_run_inline() {
+        let src = include_str!("gui.rs");
+        let body = src
+            .split("fn handle_command(")
+            .nth(1)
+            .expect("handle_command not found in gui.rs")
+            .split("\n        other => {")
+            .next()
+            .expect("handle_command body not found");
+        // Neither command may call `continue_goal` directly — that is the
+        // blocking call. They must go through the worker.
+        assert!(
+            !body.contains("continue_goal()"),
+            "a /goal or /continue arm calls continue_goal() inline, which blocks the \
+             GTK main thread — route both through spawn_goal()"
+        );
+        assert_eq!(
+            body.matches("spawn_goal(").count(),
+            2,
+            "both /goal <obj> and /continue must dispatch via spawn_goal()"
+        );
     }
 }
 
