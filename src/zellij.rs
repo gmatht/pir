@@ -50,6 +50,27 @@
 //! The result is written to a temp `.kdl` and handed to
 //! `zellij --new-session-with-layout <file> --session <name>` — verified to
 //! actually create a session (note that `-s NAME` alone only *attaches*).
+//!
+//! # Why the create is detached (and why it must be)
+//!
+//! `--new-session-with-layout` *always* attaches: zellij 0.45.1 has no
+//! `--detach`. So the child process is not "create and return" — it is "create
+//! and then become a terminal client". Waiting for that child to exit
+//! (`Command::output()`) waits for a human to detach, which never happens when
+//! the operator is sitting at the keyboard, and `pir -r @` hangs forever. The
+//! three facts below were each measured on a live zellij 0.45.1, not inferred:
+//!
+//!   * Inherited a controlling tty → the client attaches and blocks forever
+//!     (the original bug; a `poll()` in `Command::output()` never returns).
+//!   * `setsid()` + `/dev/null` stdio → no controlling terminal, so the client
+//!     takes the "no tty" path, panics on `enable raw mode` **after** the server
+//!     has created the session, and exits in ~0.2 s.
+//!   * That panic is cosmetic: the session and its panes keep running, because
+//!     they live in the zellij server, not in the client that created them.
+//!
+//! So the create runs detached and bounded, and success is then established by
+//! *probing the session* rather than by the client's exit code — which is 101 on
+//! the normal path. See [`create_session_detached`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -885,17 +906,225 @@ pub struct RebuildReport {
     pub resumed_panes: usize,
 }
 
+/// How long a detached `zellij` create may take before we stop waiting for it.
+///
+/// The client exits in well under a second once it has no terminal, but it is a
+/// server-backed call on a machine that may be busy, so this is generous. It
+/// exists to bound a *hang*, not to measure normal latency.
+const CREATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Create a zellij session from `layout`, **detached**, and return once we know
+/// whether it came up. Bounded in time: it never waits for a terminal attach.
+///
+/// The child gets `setsid()` and `/dev/null` on all three fds, and **both are
+/// load-bearing**:
+///
+///   * **null stdio alone is not enough.** `/dev/null` on fds 0/1/2 removes the
+///     *streams*, not the *terminal* — the process still has a controlling tty,
+///     so zellij's client opens it, attaches, and blocks forever. Measured with
+///     a real pty: still hung past a 10 s timeout with stdio redirected and no
+///     `setsid`.
+///   * **`setsid` is what removes the controlling terminal**, and with it the
+///     client's reason to attach at all.
+///
+/// The client then exits ~101 (`could not enable raw mode`) *after* the server
+/// has created the session. That is not a failure: the session and its panes
+/// live in the server, and we verified they keep running after the client dies.
+/// So the exit status is reported for diagnostics but is **not** the success
+/// signal — [`session_is_live`] is.
+///
+/// `Ok(())` means the session was observed live. `Err` carries zellij's own
+/// message where there is one (a bad layout is reported on stderr and is the
+/// common real failure).
+fn create_session_detached(layout: &Path, session: &str) -> Result<(), String> {
+    let mut cmd = Command::new("zellij");
+    cmd.arg("--new-session-with-layout")
+        .arg(layout)
+        .args(["--session", session])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Do not let the current pane's zellij identity leak into the new session's
+    // creation — with it set, zellij reads the command as "act on this session".
+    cmd.env_remove("ZELLIJ")
+        .env_remove("ZELLIJ_SESSION_NAME")
+        .env_remove("ZELLIJ_PANE_ID");
+    // No controlling terminal in the child, or its client attaches and never
+    // returns. See the module docs for the measurements.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid() in the child between fork and exec — the documented
+        // `pre_exec` use. The closure does nothing but the one syscall, which is
+        // async-signal-safe. `setsid` only fails with EPERM if this process is
+        // already a process-group leader, which a freshly forked child is not;
+        // either way the call below is bounded, so the result is irrelevant.
+        unsafe {
+            cmd.pre_exec(|| {
+                let _ = libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return Err(format!("could not run zellij: {e}")),
+    };
+    // Drain both pipes on threads. The client's own output is a burst of setup
+    // escapes plus, on the normal path, the raw-mode panic. Crucially the
+    // *panes* the layout spawns can outlive the client while still holding these
+    // pipes, so a blocking `read_to_end` here could hang even though the session
+    // is up — which is why the wait below has its own deadline and the readers
+    // are never joined.
+    let mut piped: Vec<std::sync::mpsc::Receiver<Vec<u8>>> = Vec::new();
+    let streams: Vec<Box<dyn std::io::Read + Send>> = [
+        child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for mut f in streams {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = f.read_to_end(&mut b);
+            let _ = tx.send(b);
+        });
+        piped.push(rx);
+    }
+
+    // Bound the wait. A poll loop is not enough: on this child a single
+    // `wait()` can take arbitrarily long, so the deadline lives in the caller and
+    // the wait is handed to a worker thread.
+    let (tx, rx) = std::sync::mpsc::channel::<Option<std::process::ExitStatus>>();
+    let waiter = std::thread::spawn(move || {
+        let _ = tx.send(child.wait().ok());
+    });
+    let status = match rx.recv_timeout(CREATE_TIMEOUT) {
+        Ok(s) => s,
+        // Timed out: leave the client running. Killing it would be wrong — it is
+        // the thing holding the new session open, and the whole point is that
+        // the session survives. We simply stop caring about the client.
+        Err(_) => {
+            drop(waiter);
+            None
+        }
+    };
+
+    // Establish the outcome by probing, never by the exit status: 101 with a
+    // "could not enable raw mode" panic is the *successful* path.
+    if session_is_live(session) {
+        return Ok(());
+    }
+
+    // It failed. Report zellij's own words where there are any — a malformed
+    // layout is announced on stderr and that message is the whole diagnosis.
+    // Each pipe is read with a short grace period: the client has just exited
+    // (or timed out), so anything it said is already buffered, but we must not
+    // wait on EOF a live pane may never send.
+    let mut combined = String::new();
+    for p in &piped {
+        if let Ok(chunk) = p.recv_timeout(PIPE_GRACE) {
+            combined.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    }
+    let detail = refusal_line(combined.as_bytes())
+        .or_else(|| first_meaningful_line(combined.as_bytes()))
+        .unwrap_or_else(|| match status {
+            Some(s) if !s.success() => {
+                let code = s.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
+                format!("exit {code}")
+            }
+            _ => "create did not produce a live session".to_string(),
+        });
+    Err(detail)
+}
+
+/// How long to wait for the client's own output once we know it has exited.
+///
+/// Purely for a good error message. It must not be generous enough to become a
+/// second hang: the reader only finishes at EOF, and a pane holding the pipe can
+/// keep it open indefinitely, so this is the real bound on the failure path.
+const PIPE_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// True when `session` is a zellij session that is actually *running*.
+///
+/// This is the success signal for a detached create, and it is deliberately not
+/// the client's exit code (see [`create_session_detached`]).
+///
+/// The probe is `zellij -s <name> action list-panes -a -j`. For a live session
+/// it prints a JSON array; for anything else (no such name, a *dead* session)
+/// it prints a human-readable listing of live sessions on stdout — the same
+/// footgun as `list-panes` on a missing session, which is why success is
+/// "parses as a JSON array" and not merely "exit 0". (Verified on 0.45.1: for a
+/// missing session the command exits 0 while printing a session list.)
+fn session_is_live(session: &str) -> bool {
+    probe_panes(session).is_some()
+}
+
+/// Bounded, minimal-stdio wrapper around `zellij -s <name> action list-panes -a -j`.
+///
+/// `Some` only when the output parses as the JSON pane array, i.e. the session
+/// exists and answers. Never blocks for long: the call is bounded by
+/// [`PROBE_TIMEOUT`], because this is what decides whether a rebuild succeeded
+/// and must not itself become the hang.
+fn probe_panes(session: &str) -> Option<Vec<u8>> {
+    let mut child = Command::new("zellij")
+        .args(["-s", session, "action", "list-panes", "-a", "-j"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let buf = reader.join().ok()?;
+                return parse_live_panes(&buf).map(|_| buf);
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Upper bound on a single existence probe.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Rebuild the zellij session `session` from its saved layout, restoring each
 /// recorded `pir` pane to the conversation it held.
 ///
 /// Writes the rewritten layout to a temp file and starts a **new** session from
 /// it with `zellij --new-session-with-layout <file> --session <name>`.
 ///
-/// Two details worth knowing (both learned by experiment, not from `--help`):
+/// Three details worth knowing (all learned by experiment, not from `--help`):
 ///   * `zellij -s NAME` on its own *attaches*; it does not create. Only
 ///     `--new-session-with-layout` always creates.
 ///   * The environment must not advertise the session we are currently inside,
 ///     or zellij treats the invocation as an action on the *current* session.
+///   * That same invocation *also* attaches, always — so it is spawned detached
+///     and its success judged by probing the session. See
+///     [`create_session_detached`] for the measurements.
 pub fn rebuild(session: &str, new_name: Option<&str>) -> Result<RebuildReport, String> {
     let kdl = load_layout(session)?;
     let map = pane_map(&session_dirs());
@@ -907,67 +1136,60 @@ pub fn rebuild(session: &str, new_name: Option<&str>) -> Result<RebuildReport, S
     std::fs::write(&layout_path, &rewritten)
         .map_err(|e| format!("write {}: {e}", layout_path.display()))?;
 
-    // A session by this name may already be running. zellij then refuses the
+    // A session by this name may already be *running*. zellij then refuses the
     // duplicate with "Session with name … already exists" — and, importantly,
     // it prints that to **stdout and exits 0**, so a status check alone reports
     // a rebuild that never happened. Detect the clash and pick a free name
     // instead, so rebuilding from inside the live session does the useful
     // thing (resurrect it under a new name) rather than silently no-op.
+    //
+    // Only a *live* clash matters. A name that is merely exited is still
+    // refused ("already exists, but is dead"), but it is a corpse with nothing
+    // in it, so it is deleted first and the rebuild then takes the name the
+    // operator actually asked for.
     let base = new_name.unwrap_or(session);
     let name = match running_sessions().iter().any(|s| s == base) {
         true => free_session_name(base),
-        false => base.to_string(),
-    };
-    let mut cmd = Command::new("zellij");
-    cmd.args(["--new-session-with-layout"])
-        .arg(&layout_path)
-        .args(["--session", &name]);
-    // Do not let the current pane's zellij identity leak into the new session's
-    // creation — with it set, zellij reads the command as "act on this session".
-    cmd.env_remove("ZELLIJ")
-        .env_remove("ZELLIJ_SESSION_NAME")
-        .env_remove("ZELLIJ_PANE_ID");
-
-    // `--new-session-with-layout` attaches to the new session, so on success
-    // this call does not return until the operator leaves it. Capture rather
-    // than inherit stdio: its first bytes are terminal setup escape sequences,
-    // and we must not leave the tty in a raw/alternate-screen state if it is
-    // interrupted. The refusal we care about ("already exists") is printed by
-    // zellij and still comes back on stdout.
-    let out = match cmd.output() {
-        Ok(out) => out,
-        Err(e) => {
-            return Err(format!(
-                "could not run zellij: {e} (layout written to {})",
-                layout_path.display()
-            ));
+        false => {
+            if session_exists_dead(base) {
+                let _ = Command::new("zellij")
+                    .args(["delete-session", "--force", base])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+            base.to_string()
         }
     };
-
-    if !out.status.success() {
-        let detail = first_meaningful_line(&out.stdout)
-            .or_else(|| first_meaningful_line(&out.stderr))
-            .unwrap_or_else(|| format!("exit {}", out.status));
-        return Err(format!(
+    create_session_detached(&layout_path, &name).map_err(|detail| {
+        format!(
             "zellij could not create session '{name}': {detail} (layout written to {})",
             layout_path.display()
-        ));
-    }
-    // zellij reports a taken name on stdout *and exits 0*, so success alone is
-    // not proof a session was created. (Any ESC-prefixed bytes are terminal
-    // setup, which is why we look for the words, not just a non-empty first
-    // line.)
-    if let Some(detail) = refusal_line(&out.stdout).or_else(|| refusal_line(&out.stderr)) {
-        return Err(format!(
-            "zellij refused to create session '{name}': {detail} (layout written to {})",
-            layout_path.display()
-        ));
-    }
+        )
+    })?;
     Ok(RebuildReport {
         session: name,
         layout_path,
         resumed_panes: resumed,
     })
+}
+
+/// True when zellij holds an *exited* session under `name` — a name it will
+/// refuse to reuse until the corpse is deleted.
+///
+/// The tell is the persisted layout: an exited session leaves
+/// `session_info/<name>/session-layout.kdl` on disk (that is what "attach to
+/// resurrect" reads), so its presence means the name is taken by a dead
+/// session. A name zellij has never heard of has no such file.
+///
+/// Paired with [`running_sessions`] this is exhaustive: taken-and-live goes
+/// down the rename path, taken-and-dead is deleted first, and free falls
+/// through. Verified against zellij 0.45.1's own two refusals —
+/// `Session with name "x" already exists.` (live, rc 0) versus
+/// `Session with name "x" already exists, but is dead. Use the attach command
+/// to resurrect it or, the delete-session command to kill it …` (dead, rc 1).
+fn session_exists_dead(name: &str) -> bool {
+    exited_layout_path(name).exists()
 }
 
 /// zellij's "that name is already taken" refusal, if the output contains one.
@@ -988,9 +1210,25 @@ fn first_meaningful_line(bytes: &[u8]) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Names of zellij sessions that are currently running.
+/// Names of zellij sessions that are **running**, from a single call.
+///
+/// `--short` is not enough: it also lists *exited* sessions (verified on
+/// 0.45.1 — `list-sessions --short` contains names whose long form says
+/// `EXITED - attach to resurrect`). Treating those as running made a rebuild of
+/// a session that had since exited skip its own name and invent a `-2` suffix,
+/// for no reason. The unformatted long form (`-n`) marks the state inline, so
+/// one call answers the question exactly:
+///
+/// ```text
+/// exquisite-stegosaurus [Created 24days 4h ago] (EXITED - attach to resurrect)
+/// rusty-apricot [Created 17m ago] (current)
+/// ```
+///
+/// So a line containing `EXITED` is a corpse and is filtered out; everything
+/// else is live. (`-n` is required — without it the same words are wrapped in
+/// colour escapes.)
 fn running_sessions() -> Vec<String> {
-    let Ok(out) = Command::new("zellij").args(["list-sessions", "--short"]).output() else {
+    let Ok(out) = Command::new("zellij").args(["list-sessions", "-n"]).output() else {
         return Vec::new();
     };
     if !out.status.success() {
@@ -998,21 +1236,31 @@ fn running_sessions() -> Vec<String> {
     }
     String::from_utf8_lossy(&out.stdout)
         .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
+        .filter(|l| !l.contains(DEAD_MARKER))
+        .filter_map(|l| l.split_whitespace().next().map(str::to_string))
+        .filter(|s| !s.is_empty())
         .collect()
 }
 
+/// How zellij marks an exited session in `list-sessions` output. Matched
+/// without the surrounding parentheses, which differ between versions.
+const DEAD_MARKER: &str = "EXITED";
+
 /// `base` if free, else `base-2`, `base-3`, … until unused.
+///
+/// "Unused" means neither live nor a corpse: zellij refuses a name it holds in
+/// either state, and the operator picking the 3rd rebuild would otherwise get
+/// an unexplained `-2` (or worse, have us silently delete someone's dead
+/// session) because `rusty-apricot-2` is listed but exited.
 fn free_session_name(base: &str) -> String {
     let taken = running_sessions();
-    if !taken.iter().any(|s| s == base) {
+    let name_is_free = |c: &str| !taken.iter().any(|s| s == c) && !session_exists_dead(c);
+    if name_is_free(base) {
         return base.to_string();
     }
     for n in 2..1000u32 {
         let candidate = format!("{base}-{n}");
-        if !taken.iter().any(|s| *s == candidate) {
+        if name_is_free(&candidate) {
             return candidate;
         }
     }
@@ -1835,6 +2083,10 @@ mod e2e_tests {
     /// cannot stall the suite.
     const ZELLIJ_CALL_TIMEOUT_SECS: u64 = 15;
 
+    /// The same bound `rebuild` uses, so this test fails fast against a
+    /// regression rather than sitting in its own 15 s watchdog.
+    const CREATE_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
     fn is_running(name: &str) -> bool {
         running_sessions().iter().any(|s| s == name)
     }
@@ -2154,5 +2406,176 @@ mod e2e_tests {
         }
         assert!(gone, "session {name} outlived its teardown");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The regression for the `pir -r @` hang.**
+    ///
+    /// `pir -r @` used to call `rebuild()`, which ran
+    /// `Command::output()` on `zellij --new-session-with-layout`. That invocation
+    /// always attaches, so with the operator's terminal inherited as a
+    /// controlling tty the client sat in the attach waiting for a human, and
+    /// `output()` blocked forever. Reproduced on this host: the stuck `pir` was
+    /// found under gdb in `poll()` inside `Command::output()`, with its child
+    /// zellij client holding a socket to the new session.
+    ///
+    /// The fix is `create_session_detached`: `setsid()` + null stdio, bounded
+    /// wait, success judged by probing the session. So this drives the **real
+    /// production create path** — not a test helper that merely looks like it —
+    /// under `script(1)`, which is the one condition that ever triggered the
+    /// bug, and asserts the two properties that make it safe:
+    ///
+    /// 1. it returns in bounded time (no attach wait), and
+    /// 2. the session it creates is genuinely there.
+    ///
+    /// It must not be a "does not hang" test alone: the tempting wrong fix is to
+    /// kill the client, which would make it return instantly and leave no
+    /// session at all. Hence (2).
+    ///
+    /// ### How a child gets a real tty
+    /// `setsid` is what we are testing, so the test cannot set up its own
+    /// conditions — the child has to inherit an operator's terminal. It does:
+    /// `script(1)` allocates a pty, so inside that pty the child has a
+    /// controlling terminal, exactly as a real `pir -r @` run does.
+    #[test]
+    fn rebuild_returns_with_a_real_session_even_with_a_controlling_tty() {
+        // The child re-enters this same test with `PROBE` set; when it is set
+        // this test *is* the probe, so it does the create and returns. The
+        // handshake is through the environment because the test harness owns
+        // argv and rejects unknown flags.
+        if let Some(name) = std::env::var_os(PROBE_ENV) {
+            let name = name.to_string_lossy().to_string();
+            let layout = PathBuf::from(std::env::var_os(PROBE_LAYOUT_ENV).expect("probe layout"));
+            let started = std::time::Instant::now();
+            let result = create_session_detached(&layout, &name);
+            println!(
+                "{PROBE_MARKER} elapsed_ms={} ok={}",
+                started.elapsed().as_millis(),
+                result.is_ok()
+            );
+            return;
+        }
+        if !zellij_available() || which("script").is_none() {
+            eprintln!("skipping: no zellij, or no script(1) for a real tty");
+            return;
+        }
+        let _serial = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let name = format!("pir-e2e-tty-{}", std::process::id());
+        let dir = std::env::temp_dir().join(format!("pir_e2e_tty_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let kdl = dir.join("tty.kdl");
+        std::fs::write(&kdl, ONE_PANE_LAYOUT).unwrap();
+        let _kill = KillOnDrop(&name);
+        // Reap any corpse from an interrupted previous run, so this run's
+        // name-collision handling starts from a known state.
+        let _ = run(&["delete-session", "--force", &name]);
+
+        // A layout zellij must actually accept, with one terminal pane.
+        // zellij's `command="…"` is a whole argv, so the spaces in `sleep 30`
+        // make it fail fast (exit 2) — the point of this pane is not to run, it
+        // is to prove the *session* outlives the client that created it.
+        let child = Command::new("script")
+            .args(["-qec", &self_test_command(), &dir.join("child.log").to_string_lossy()])
+            .env(PROBE_ENV, &name)
+            .env(PROBE_LAYOUT_ENV, &kdl)
+            .output()
+            .expect("script(1) runs");
+        let child_out = format!(
+            "{}{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+
+        // (1) Bounded. The old code never returned at all, so any return is
+        // already progress; the bound is what separates "fixed" from "slow".
+        // The child is this same test binary, so it prints its own measurement; read
+        // that rather than guessing from wall time (which also covers harness
+        // startup). Plain integer milliseconds — rust's `Duration` debug format
+        // switches units mid-string (`161.79759ms`), which is not worth parsing.
+        let wall_ms = child_out
+            .lines()
+            .find_map(|l| l.trim().strip_prefix(PROBE_MARKER))
+            .and_then(|rest| rest.split("elapsed_ms=").nth(1))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|d| d.parse::<u64>().ok());
+        assert!(
+            child.status.code().is_some(),
+            "the child must terminate at all — this is the hang being tested. Output:\n{child_out}"
+        );
+        assert!(
+            wall_ms.is_some_and(|ms| ms < CREATE_BUDGET.as_millis() as u64),
+            "the create itself took {wall_ms:?}ms with a real tty; it must not wait for \
+             an attach. Output:\n{child_out}"
+        );
+
+        // (2) The session is real, and its panes came up. This is what a
+        // kill-the-client "fix" would fail: no client, and killing the client is
+        // the one thing we must not do.
+        let tries = 50 * e2e_wait_factor();
+        let mut up = false;
+        for _ in 0..tries {
+            if is_running(&name) {
+                up = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(up, "rebuild must leave a live session {name}; output:\n{child_out}");
+        assert!(
+            probe_panes(&name).is_some(),
+            "the reported session must answer a pane probe"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The command that re-runs *this test alone* in a child, so the probe
+    /// branch above is what executes. `current_exe` is this test binary; the
+    /// filter names this one test.
+    fn self_test_command() -> String {
+        let exe = std::env::current_exe().expect("test binary path");
+        format!(
+            "{} --exact --nocapture zellij::e2e_tests::rebuild_returns_with_a_real_session_even_with_a_controlling_tty",
+            exe.display()
+        )
+    }
+
+    /// Env set on the child to turn this test into the create probe.
+    const PROBE_ENV: &str = "PIR_ZELLIJ_REBUILD_PROBE";
+    /// Layout the probe creates a session from.
+    const PROBE_LAYOUT_ENV: &str = "PIR_ZELLIJ_REBUILD_LAYOUT";
+    /// Marker the probe prints so the parent can find its timing line.
+    const PROBE_MARKER: &str = "pir-zellij-probe:";
+
+    /// A layout zellij must actually accept, with one terminal pane.
+    const ONE_PANE_LAYOUT: &str = r#"layout {
+    cwd "/tmp"
+    tab name="t" focus=true {
+        pane size=1 borderless=true {
+            plugin location="zellij:tab-bar"
+        }
+        pane command="sleep 30" focus=true {
+        }
+        pane size=1 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+    }
+    new_tab_template {
+        pane size=1 borderless=true {
+            plugin location="zellij:tab-bar"
+        }
+        pane
+        pane size=1 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+    }
+}
+"#;
+
+    /// `which`-equivalent for a tool the test needs, without a dependency.
+    fn which(tool: &str) -> Option<PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .map(|d| d.join(tool))
+            .find(|c| c.is_file())
     }
 }

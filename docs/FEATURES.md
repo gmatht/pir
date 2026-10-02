@@ -716,6 +716,62 @@ Implementation notes worth keeping:
 - `rebuildable_sessions()` lists the zellij sessions with recorded panes, which
   is what the error path prints when a name does not resolve.
 
+### The create runs detached, and `pir -r @` never hangs
+
+That same invocation **also always attaches** — zellij 0.45.1 has no
+`--detach`. So the child process is not "create and return", it is "create and
+then become a terminal client", and `Command::output()` on it waits for a human
+to detach. With the operator's terminal inherited as a controlling tty, that is
+forever: `pir -r @` was observed under gdb sitting in `poll()` inside
+`Command::output()`, with the stuck client holding a socket to the new session.
+
+So the create is spawned with `setsid()` and null stdio, waited on with a
+deadline, and its success judged by **probing the session**
+(`zellij -s <name> action list-panes -a -j`) rather than by the client's exit
+code. Three measured facts make this the only correct shape:
+
+| condition | what happens |
+|---|---|
+| inherits a controlling tty | client attaches, blocks forever — the bug |
+| null stdio, no `setsid` | **still hangs** — a controlling tty is what matters, not stdio |
+| `setsid()` + null stdio | no controlling terminal → client exits ~101 (`could not enable raw mode`) in ~0.2 s, **after** the server created the session |
+
+The exit-101 panic is cosmetic: the session and its panes live in the zellij
+*server*, so they keep running after the client dies (verified — a pane in the
+created session was still running five seconds after the client exited). Killing
+the client to force a return would be the tempting wrong fix, and it is exactly
+what must not happen.
+
+The client is therefore **left alive**, and the session name it created is
+printed with the command to reach it:
+
+```
+· rebuilt zellij session 'rusty-apricot-3' (1 of 1 recorded pir pane(s) restored)
+· attach with: zellij attach rusty-apricot-3
+```
+
+### Names: live gets a new one, dead gets reclaimed
+
+zellij refuses a name it holds, in two different ways, and the difference matters
+for what the rebuild should do:
+
+- **live** — `Session with name "x" already exists.` (rc 0, on **stdout**). The
+  rebuild is resurrecting the session it is sitting in, so it takes the next free
+  `name-2`, `name-3`, …
+- **exited** — `Session with name "x" already exists, but is dead. …` (rc 1). A
+  corpse with nothing in it, so it is `delete-session --force`d first and the
+  rebuild then gets **the name the operator asked for**.
+
+`list-sessions --short` cannot tell these apart — it lists exited sessions too —
+so the live set comes from `list-sessions -n`, whose lines carry `(EXITED - …)`
+inline and are filtered on that. Getting this wrong used to push every rebuild of
+an exited session onto an unexplained `-2` suffix.
+
+A regression test drives the real create path under `script(1)`, which is the
+only way to reproduce the original condition (a test with null stdio and no
+session is the CI case, where the bug never appeared). Removing `setsid()` makes
+it fail: **20,032 ms** versus **161 ms** with it.
+
 ---
 
 ## 13. Environment variables added

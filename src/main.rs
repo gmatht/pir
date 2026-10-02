@@ -4699,6 +4699,14 @@ fn run_zellij_rebuild(session: &str) -> i32 {
                 "{}",
                 term::dim(&format!("· layout: {}", report.layout_path.display()))
             );
+            // The session exists but nobody is looking at it: the create runs
+            // detached (it must — see `zellij::create_session_detached`), so it
+            // cannot also switch this terminal over. Say how to get there, rather
+            // than leaving a rebuilt session the operator has no way to find.
+            eprintln!(
+                "{}",
+                term::dim(&format!("· attach with: zellij attach {}", report.session))
+            );
             0
         }
         Err(e) => {
