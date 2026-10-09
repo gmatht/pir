@@ -323,22 +323,35 @@ pub fn out(s: &str) {
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // EAGAIN: make stdout non-blocking (idempotent) and then block
-                // until it is writable, event-driven via the smol reactor
-                // (~0% CPU), instead of polling. We keep the fd non-blocking
-                // afterward (harmless for stdout) so the wait is always correct.
-                let fd = io::stdout().as_raw_fd();
-                unsafe {
-                    let flags = libc::fcntl(fd, libc::F_GETFL);
-                    libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-                }
+                // EAGAIN: wait — event-driven via the smol reactor (~0% CPU) —
+                // until stdout is writable, instead of polling.
+                //
+                // The wait itself needs the fd non-blocking, but **only for the
+                // duration of the wait**. Temporarily setting O_NONBLOCK and
+                // leaving it set (which this used to do, calling it "harmless
+                // for stdout") bricks the whole terminal for the rest of the
+                // process: every *other* writer to stdout in this file does a
+                // bare `let _ = out.write_all(..)`, which now fails with EAGAIN
+                // and is silently discarded. That is exactly how the spinner
+                // froze — the tick thread's repaint was dropped, so the footer
+                // stuck on the second it last managed to draw (`⠋ running · 0s`
+                // that never advanced), while the turn kept running. Child
+                // processes that inherit fd 1 inherit the flag too.
+                //
+                // So save the original flags and restore them after the wait.
+                // A later write that finds the pipe still full simply returns
+                // EAGAIN and takes this same path again, which is correct.
+                let saved_flags = set_nonblocking(fd_of_stdout());
                 let block = async {
-                    if let Ok(a) = smol::Async::new(unsafe { std::fs::File::from_raw_fd(fd) }) {
+                    if let Ok(a) = smol::Async::new(unsafe { std::fs::File::from_raw_fd(fd_of_stdout()) }) {
                         let _ = a.writable().await;
                         std::mem::forget(a); // we only borrowed fd 1; never close it
                     }
                 };
                 smol::block_on(block);
+                // Restore blocking mode (see above) so every other stdout writer
+                // in the process keeps its write-and-block semantics.
+                restore_flags(fd_of_stdout(), saved_flags);
                 continue;
             }
             Err(_) => return, // broken/closed pipe: give up silently
@@ -350,6 +363,42 @@ pub fn out(s: &str) {
 #[cfg(unix)]
 pub fn out_flush() {
     let _ = io::stdout().flush();
+}
+
+/// The file descriptor of stdout (fd 1). A tiny wrapper so the EAGAIN wait can
+/// recover the fd on both sides of the `async` block without holding a borrow
+/// of a temporary `Stdout` handle across it.
+#[cfg(unix)]
+fn fd_of_stdout() -> i32 {
+    libc::STDOUT_FILENO
+}
+
+/// Set `O_NONBLOCK` on `fd`, returning the previous flags (or `-1` when the
+/// fcntl failed). The caller MUST hand the return value to [`restore_flags`]
+/// once the non-blocking window is over — leaving the flag set leaks the
+/// status bit to every other writer of that fd, which is the freezing-spinner
+/// bug this pair exists to prevent. Extracted so a test can drive it on a pipe
+/// instead of on stdout.
+#[cfg(unix)]
+fn set_nonblocking(fd: i32) -> i32 {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags != -1 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        flags
+    }
+}
+
+/// Restore the flags saved by [`set_nonblocking`]. A `-1` (the save failed, so
+/// nothing was changed) is a no-op.
+#[cfg(unix)]
+fn restore_flags(fd: i32, saved: i32) {
+    if saved != -1 {
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFL, saved);
+        }
+    }
 }
 
 /// Width of the terminal in columns (used to size the REPL hrule). Falls back
@@ -3953,6 +4002,55 @@ libc::tcsetattr(fd, libc::TCSANOW, &to_raw_mode(tios));
 mod tests {
     use super::*;
     use rustyline::history::MemHistory;
+
+    /// A transient non-blocking window on a fd must be *undone*.
+    ///
+    /// `out()` briefly flips stdout to `O_NONBLOCK` while it waits for the
+    /// terminal to accept a write. Leaving the flag set is not harmless: every
+    /// other writer to stdout in this file does a bare `let _ = write_all(..)`,
+    /// so the next EAGAIN is silently dropped — which froze the spinner
+    /// ("⠋ running · 0s" that never advanced) because the tick thread's repaint
+    /// vanished, and it also leaks to child processes that inherit the fd.
+    ///
+    /// Driven on a real pipe rather than stdout so the test does not disturb the
+    /// harness's own output. Uses a pipe with no reader, so a *blocking* write
+    /// would hang: we only check the flag bits, never write.
+    #[cfg(unix)]
+    #[test]
+    fn nonblocking_window_is_restored() {
+        use std::os::unix::io::AsRawFd;
+        let (_r, w) = std::io::pipe().expect("pipe");
+        let fd = w.as_raw_fd();
+        // Starts blocking.
+        let before = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert_eq!(before & libc::O_NONBLOCK, 0, "a fresh pipe is blocking");
+
+        let saved = set_nonblocking(fd);
+        assert_eq!(saved, before, "the saved flags must be what was there before");
+        let during = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert_ne!(
+            during & libc::O_NONBLOCK,
+            0,
+            "set_nonblocking must actually set O_NONBLOCK for the wait"
+        );
+
+        restore_flags(fd, saved);
+        let after = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert_eq!(
+            after & libc::O_NONBLOCK,
+            0,
+            "O_NONBLOCK leaked past the wait — this is what drops the spinner's \
+             next repaint (silent EAGAIN) and freezes the footer"
+        );
+
+        // A failed save (-1) must be a no-op, not a crash or a stray clear.
+        restore_flags(fd, -1);
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK,
+            0,
+            "restoring a failed save must leave the fd as it was"
+        );
+    }
 
     // `Context` borrows a `History`; the helper ignores it, so an empty
     // in-memory history (kept in a static so it outlives the `Context`) is fine.
