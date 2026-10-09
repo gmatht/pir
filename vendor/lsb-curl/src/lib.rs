@@ -130,6 +130,7 @@ type SlistAppendFn =
     unsafe extern "C" fn(list: *mut c_void, s: *const c_char) -> *mut c_void;
 type SlistFreeAllFn = unsafe extern "C" fn(list: *mut c_void);
 type VersionFn = unsafe extern "C" fn() -> *const c_char;
+type GlobalInitFn = unsafe extern "C" fn(flags: c_long) -> CURLcode;
 
 /// Write/header callback signature (`size_t nmemb` items of `size` bytes).
 pub type WriteCb =
@@ -295,6 +296,7 @@ impl Curl {
             "curl_slist_append",
             "curl_slist_free_all",
             "curl_version",
+            "curl_global_init",
         ];
         let lib = if let Ok(path) = std::env::var("LSBWRAP_LIBCURL_PATH") {
             if !path.starts_with('/') {
@@ -304,10 +306,7 @@ impl Curl {
             }
             LoadedLibrary::load_explicit(&path, &required)?
         } else {
-            LoadedLibrary::load_from_candidates(
-                &["libcurl.so.4", "libcurl.so", "libcurl-gnutls.so.4"],
-                &required,
-            )?
+            LoadedLibrary::load_from_candidates(&candidates(), &required)?
         };
 
         unsafe {
@@ -318,6 +317,22 @@ impl Curl {
                     )
                 };
             }
+            let global_init: GlobalInitFn = sym!("curl_global_init", GlobalInitFn);
+            // libcurl requires `curl_global_init` to run *once* before any other
+            // libcurl call, and explicitly documents that letting `curl_easy_init`
+            // call it implicitly is **not thread-safe**. `Curl::load` is invoked
+            // from many threads (one per request, and far more under `cargo test`),
+            // so a concurrent first-call corrupted libcurl's global state and the
+            // process heap (observed as "pointer being realloc'd was not allocated"
+            // / SIGABRT on macOS). Guard it with a process-wide `Once`: the first
+            // loader wins, every later one sees it already done.
+            static GLOBAL_INIT: std::sync::Once = std::sync::Once::new();
+            GLOBAL_INIT.call_once(|| {
+                // CURL_GLOBAL_DEFAULT == CURL_GLOBAL_ALL (SSL + WIN32). The
+                // return code is advisory here; a failure simply means the
+                // caller's request will fail later with a libcurl error.
+                let _ = global_init(3);
+            });
             Ok(Curl {
                 easy_init: sym!("curl_easy_init", EasyInitFn),
                 easy_cleanup: sym!("curl_easy_cleanup", EasyCleanupFn),
