@@ -666,17 +666,52 @@ mod leak_tests {
         }
     }
 
+    /// Open a pty pair, returning `(master, slave)`, or `None` when the platform
+    /// has no `openpty` (e.g. Windows, where this whole module is compiled out).
+    ///
+    /// The two trailing arguments are the reason this is a helper rather than a
+    /// bare call: glibc declares them `*const termios` / `*const winsize`, while
+    /// the BSD/macOS declarations (and therefore `libc`'s `openpty` on
+    /// `x86_64-apple-darwin`) use `*mut`. Passing `null()` therefore compiles on
+    /// Linux and fails with `E0308: types differ in mutability` on macOS. Both
+    /// are null here — the caller sets no window size and no termios up front —
+    /// so the only difference is the pointer's mutability.
+    #[cfg(target_os = "linux")]
+    fn open_pty() -> Option<(libc::c_int, libc::c_int)> {
+        let (mut master, mut slave) = (-1, -1);
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        (rc == 0).then_some((master, slave))
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn open_pty() -> Option<(libc::c_int, libc::c_int)> {
+        let (mut master, mut slave) = (-1, -1);
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        (rc == 0).then_some((master, slave))
+    }
+
     #[test]
     fn da1_reply_consumed_not_leaked() {
-        let mut master: libc::c_int = -1;
-        let mut slave: libc::c_int = -1;
-        let opened = unsafe {
-            libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), std::ptr::null())
-        };
-        if opened != 0 {
+        let Some((master, slave)) = open_pty() else {
             eprintln!("SKIP da1_reply_consumed_not_leaked: openpty unavailable");
             return;
-        }
+        };
         unsafe {
             // Point stdin at the pty slave for the duration of the test.
             let saved_stdin = libc::dup(0);

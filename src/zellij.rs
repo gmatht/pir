@@ -210,7 +210,9 @@ fn slot_cache(session: &str, pane_id: &str) -> Option<PaneSlot> {
 /// zellij or when there is no session log (a one-shot run with no transcript).
 ///
 /// Called once per prompt, so this is deliberately just an env read and a small
-/// file write — no subprocess.
+/// file write — no subprocess. The one exception is the *first* call, which also
+/// claims the pane's zellij title; [`claim_pane_title`] latches itself so that
+/// costs a single `zellij` spawn per pir process, not one per prompt.
 pub fn record(log: &Path) {
     if log.as_os_str().is_empty() {
         return;
@@ -218,6 +220,125 @@ pub fn record(log: &Path) {
     let Some(rec) = capture() else { return };
     let Ok(json) = serde_json::to_string_pretty(&rec) else { return };
     let _ = std::fs::write(record_path(log), json);
+    // The title names the transcript's file stem — the same token `pir -r` takes.
+    claim_pane_title(&log_stem(log));
+}
+
+/// The token `pir -r` resolves this log by: its file stem, or `""`.
+fn log_stem(log: &Path) -> String {
+    log.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+}
+
+/// Marker that identifies a pane title we own. The full title is
+/// `pir:<session-stem>`, e.g. `pir:pir-20260926-085546-sh945107`.
+///
+/// Why a title and not zellij's `post_command_discovery_hook`: the hook runs
+/// `sh -c` from the zellij *server* (`background_jobs.rs` on 0.45.1 drives it
+/// once a second, per pane, on process change), so it costs a fork per active
+/// pane per second and — decisively — it runs in the server's environment,
+/// which carries `ZELLIJ_SESSION_NAME` but **no** `ZELLIJ_PANE_ID`, and whose
+/// cwd is the server's, not the pane's. It therefore cannot key anything per
+/// pane. A pane title *is* per-pane data that zellij itself serializes
+/// (`name="…"` on the `pane` node) and re-applies on resurrect, so it carries
+/// the identity with no polling at all.
+///
+/// The marker exists so a title the operator set by hand is never mistaken for
+/// ours and rewritten: only a title that still starts with it is ours to update.
+const TITLE_MARKER: &str = "pir:";
+
+/// The pane title `pir` claims for `session_stem`: `pir:<session-stem>`.
+fn pane_title(session_stem: &str) -> String {
+    format!("{TITLE_MARKER}{session_stem}")
+}
+
+/// The session stem encoded in a `pir:`-marked pane title, if that is what it is.
+fn title_session(title: &str) -> Option<&str> {
+    title.strip_prefix(TITLE_MARKER).filter(|s| !s.is_empty())
+}
+
+/// Claim this pane's zellij title, once per session, so plain
+/// `zellij attach` resurrects the *right* conversation without any help from
+/// `pir -r @<session>`.
+///
+/// Best-effort in the strong sense: every failure is ignored, because a pane
+/// title is a convenience and a missing one costs nothing but a resumed pane
+/// that starts fresh — which is exactly what happens today. Called from the
+/// prompt path, so it must stay cheap.
+///
+/// Two things make this safe to call there:
+///
+///   * **It is called at most once per process**, via [`TITLE_CLAIMED`]. This is
+///     what keeps the prompt path cheap: one `zellij` spawn for the whole
+///     session, not one per prompt.
+///   * **It only claims a title that is ours or unset.** A title the operator
+///     chose by hand is left alone, so this can never rename a pane behind their
+///     back. (A `/rewind` to a different transcript does *not* re-trigger it —
+///     the latch holds for the process's lifetime. The sidecar path still tracks
+///     the new transcript, so `pir -r @<session>` remains correct; only the title,
+///     and therefore plain `zellij attach`, goes stale until the next `pir`.)
+///
+/// The spawn is `zellij action rename-pane --pane-id <id> <title>`; 0.45.1
+/// accepts an explicit `--pane-id`, so this does not depend on which pane
+/// happens to be focused.
+pub fn claim_pane_title(session_stem: &str) {
+    let (Some(_session), Some(pane)) = (session_name(), pane_id()) else { return };
+    if session_stem.is_empty() {
+        return;
+    }
+    let title = pane_title(session_stem);
+
+    // Only the first turn pays for a subprocess.
+    {
+        let mut claimed = TITLE_CLAIMED.lock().unwrap_or_else(|e| e.into_inner());
+        if *claimed {
+            return;
+        }
+        *claimed = true;
+    }
+
+    // Never stomp a title the operator chose. `name=` is absent unless something
+    // already named this pane, so "not ours and not empty" means hands off.
+    if let Some(current) = current_pane_title(&pane) {
+        if title_session(&current).is_none() && !current.is_empty() {
+            return;
+        }
+    }
+
+    let _ = Command::new("zellij")
+        .args(["action", "rename-pane", "--pane-id", &pane, &title])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Set once the title claim has been attempted (successfully or not), so the
+/// prompt path pays for at most one `zellij` spawn per pir process.
+static TITLE_CLAIMED: Mutex<bool> = Mutex::new(false);
+
+/// The title currently set on `pane`, or `None` when it could not be read.
+///
+/// `list-panes` has no `--pane-id` filter (checked on 0.45.1 — it rejects the
+/// flag), so the whole session is listed and the one pane is picked out of the
+/// JSON. A subprocess like the ones this module already runs at rebuild time,
+/// and only ever called from [`claim_pane_title`] — i.e. once per process.
+fn current_pane_title(pane: &str) -> Option<String> {
+    let out = Command::new("zellij")
+        .args(["action", "list-panes", "-a", "-j"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let want: i64 = pane.parse().ok()?;
+    v.as_array()?.iter().find_map(|p| {
+        (p.get("id").and_then(serde_json::Value::as_i64) == Some(want))
+            .then(|| p.get("title").and_then(serde_json::Value::as_str).unwrap_or_default().to_string())
+    })
 }
 
 /// Read the pane record for a session log, if one was written.
@@ -358,6 +479,44 @@ pub struct PaneSlot {
     pub tab: String,
     /// 0-based ordinal among the tab's terminal panes.
     pub index: u32,
+}
+
+/// The logs `match_panes` was given but did **not** place, i.e. the records for
+/// `session` whose log does not appear in the resulting `by_block`.
+///
+/// Derived from `match_panes`' own output rather than re-deriving the join, so
+/// the shortfall cannot drift from what was actually rewritten: a log is placed
+/// exactly when some block names it.
+fn unplaced_logs(
+    session: &str,
+    map: &HashMap<(String, String), PathBuf>,
+    by_block: &[Option<PathBuf>],
+) -> Vec<PathBuf> {
+    let placed: Vec<&PathBuf> = by_block.iter().flatten().collect();
+    let mut out: Vec<PathBuf> = map
+        .iter()
+        .filter(|(k, _)| k.0 == session)
+        .map(|(_, v)| v.clone())
+        .filter(|log| !placed.iter().any(|p| *p == log))
+        .collect();
+    out.sort();
+    out
+}
+
+/// The subset of `unplaced_logs` that is *stale*: records naming a tab that is
+/// not a tab in this layout (e.g. `"Tab#4"` when zellij calls it `"Tab #4"`).
+/// These are the actionable ones — the record itself is wrong, rather than the
+/// join simply being too cautious to place it.
+fn unknown_tabs_of(logs: &[PathBuf], layout_tabs: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = logs
+        .iter()
+        .filter_map(|p| read_record(p))
+        .map(|r| r.tab)
+        .filter(|tab| !tab.is_empty() && !layout_tabs.iter().any(|t| t == tab))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Find `pane … { … }` blocks in `kdl`, descending into *container* panes.
@@ -803,12 +962,81 @@ fn parse_live_panes(bytes: &[u8]) -> Option<HashMap<String, PaneSlot>> {
 /// leaving it alone, so the fallback only fires when every recorded pane is
 /// being consumed in order — if the counts do not line up, nothing is claimed
 /// and the caller reports a layout-only rebuild.
-pub fn inject_resume_args(kdl: &str, session: &str, map: &HashMap<(String, String), PathBuf>) -> (String, usize) {
+/// What `inject_resume_args` produced: the rewritten layout, how many `pir`
+/// panes actually received a conversation, and how many recorded panes could
+/// not be placed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Injection {
+    /// The layout with resume args injected.
+    pub kdl: String,
+    /// `pir` blocks that were rewritten to resume a specific conversation.
+    pub restored: usize,
+    /// Recorded panes for this session that matched no `pir` block. Non-zero
+    /// means the rebuild is *partial*, which the caller must say out loud
+    /// rather than let pass as a clean run.
+    pub unmatched: usize,
+    /// Of the unmatched records, the tab names that are not tabs in this layout.
+    /// Sorted and deduplicated. These are the stale ones (see
+    /// [`RebuildReport::unknown_tabs`]).
+    pub unknown_tabs: Vec<String>,
+}
+
+impl Injection {
+    /// The rewritten layout alone, for callers that do not report counts.
+    pub fn kdl(&self) -> &str {
+        &self.kdl
+    }
+}
+
+pub fn inject_resume_args(kdl: &str, session: &str, map: &HashMap<(String, String), PathBuf>) -> Injection {
     let blocks = find_pane_blocks(kdl);
     let pir_blocks: Vec<&PaneBlock> =
         blocks.iter().filter(|b| b.text.contains("command=\"pir\"")).collect();
-    let by_block = match_panes(session, map, &pir_blocks, live_panes(session).as_ref());
-    rewrite_with(kdl, &pir_blocks, &by_block)
+    let live = live_panes(session);
+    let by_block = match_panes(session, map, &pir_blocks, live.as_ref());
+    let (kdl, restored) = rewrite_with(kdl, &pir_blocks, &by_block);
+
+    // Which records exist for this session but were placed nowhere? Those are
+    // the silent-partial case. `unplaced_logs` derives them from `by_block`
+    // itself, so the shortfall cannot drift from what was actually rewritten,
+    // and `unknown_tabs_of` picks out the stale ones (a record naming a tab this
+    // layout does not have) — which is the diagnosable half.
+    let layout_tabs: Vec<String> = blocks.iter().map(|b| b.slot.tab.clone()).collect();
+    let unplaced = unplaced_logs(session, map, &by_block);
+    let unknown_tabs = unknown_tabs_of(&unplaced, &layout_tabs);
+    let unmatched = unplaced.len();
+    Injection { kdl, restored, unmatched, unknown_tabs }
+}
+
+/// The `pir:` session stem encoded in a pane block's `name=` attribute, if any.
+///
+/// This is the *authoritative* pane→transcript key, better than [`PaneSlot`]:
+/// it was written by the pane itself (`claim_pane_title`) and travels inside
+/// zellij's own layout, so it survives a session that has exited and needs no
+/// inference. A block with no title, or a title the operator set by hand, yields
+/// `None` and is matched the old way.
+///
+/// Read off the block's *header* only (before `{`), so a `name=` inside a child
+/// pane is never mistaken for this pane's.
+fn block_title_session(block: &str) -> Option<&str> {
+    let header = match block.find('{') {
+        Some(i) => &block[..i],
+        // A brace-less one-liner (`pane name="pir:x" cwd="/y"`) has no header
+        // boundary; the whole line is its header.
+        None => block.lines().next().unwrap_or(block),
+    };
+    let needle = "name=\"";
+    let mut from = 0usize;
+    while let Some(rel) = header[from..].find(needle) {
+        let val_start = from + rel + needle.len();
+        let Some(end) = header[val_start..].find('"') else { break };
+        let value = &header[val_start..val_start + end];
+        if let Some(stem) = title_session(value) {
+            return Some(stem);
+        }
+        from = val_start + end + 1;
+    }
+    None
 }
 
 /// Apply `by_block` (one optional log per pir block) to `kdl`, returning the
@@ -829,6 +1057,36 @@ fn rewrite_with(kdl: &str, pir_blocks: &[&PaneBlock], by_block: &[Option<PathBuf
     (out, used)
 }
 
+/// Locate the session log whose file stem is `stem`.
+///
+/// The title names a stem, not a path, so this resolves it against the same
+/// directories [`pane_map`] reads. Returns `None` when the stem is ambiguous
+/// (two logs share it) or when no such log exists — in which case the caller
+/// leaves the pane alone rather than guessing.
+fn log_for_stem(stem: &str) -> Option<PathBuf> {
+    let mut found: Option<PathBuf> = None;
+    for dir in session_dirs() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if path.file_stem().and_then(|s| s.to_str()) != Some(stem) {
+                continue;
+            }
+            // Ambiguous: the same stem in two directories. Refuse rather than
+            // pick — a wrong transcript in a pane is the failure mode we care
+            // most about avoiding.
+            if found.is_some() {
+                return None;
+            }
+            found = Some(path);
+        }
+    }
+    found
+}
+
 /// Decide which session log belongs in each `pir` block of the layout.
 ///
 /// Returns one entry per block: the log to restore there, or `None` to leave the
@@ -845,6 +1103,25 @@ fn match_panes(
     live: Option<&HashMap<String, PaneSlot>>,
 ) -> Vec<Option<PathBuf>> {
     let mut by_block: Vec<Option<PathBuf>> = vec![None; pir_blocks.len()];
+
+    // Strongest key first: a `pir:` title written by the pane itself. It needs no
+    // live session and no inference, and it identifies the transcript even when
+    // the pane was re-split or re-used since the last record was written.
+    //
+    // A pane that HAS such a title is settled either way: resolved, it gets its
+    // own transcript; unresolvable (the log was deleted, renamed, or never
+    // reached the disk), it stays empty. It must NOT then fall through to the
+    // geometry join — that join is a positional guess, and letting it fill a pane
+    // that has already told us exactly which transcript it held is precisely how
+    // the wrong conversation ends up in the wrong pane. So the titled set is
+    // recorded and the weaker joins skip those blocks.
+    let mut titled = vec![false; pir_blocks.len()];
+    for (i, b) in pir_blocks.iter().enumerate() {
+        if let Some(stem) = block_title_session(&b.text) {
+            titled[i] = true;
+            by_block[i] = log_for_stem(stem);
+        }
+    }
 
     // The join key for a record, preferring zellij's live answer and falling
     // back to the geometry snapshotted into the sidecar when the session was
@@ -868,6 +1145,11 @@ fn match_panes(
 
     if !placed.is_empty() {
         for (i, b) in pir_blocks.iter().enumerate() {
+            // A titled pane is settled; the geometry join must not second-guess
+            // it, whether the title resolved or not.
+            if titled[i] {
+                continue;
+            }
             // A block is filled only by the single record claiming its slot; two
             // records claiming one slot is a contradiction, so claim none.
             let claimants: Vec<&PathBuf> = placed
@@ -892,7 +1174,9 @@ fn match_panes(
     recorded.sort_by_key(|(id, _)| *id);
     if recorded.len() == pir_blocks.len() {
         for (i, (_, log)) in recorded.into_iter().enumerate() {
-            by_block[i] = Some(log.clone());
+            if !titled[i] {
+                by_block[i] = Some(log.clone());
+            }
         }
     }
     by_block
@@ -904,6 +1188,27 @@ pub struct RebuildReport {
     pub session: String,
     pub layout_path: PathBuf,
     pub resumed_panes: usize,
+    /// Recorded panes for this session that could **not** be matched to a layout
+    /// block, and so were left to resume whatever the shell gives them.
+    ///
+    /// This exists because "restored 0 of 2" was indistinguishable from "there
+    /// was nothing to restore": a pane whose recorded slot does not match any
+    /// block is silently skipped, and the run still looks successful. Reporting
+    /// the shortfall by name is what turns that silence into a diagnosis — and
+    /// it is deliberately separate from `resumed_panes`, which stays an honest
+    /// count of what was actually rewritten.
+    pub unmatched_panes: usize,
+    /// The tab names named by unmatched records that are **not tabs in this
+    /// layout**, deduplicated and sorted (e.g. `["Tab#4"]` when zellij calls the
+    /// tab `"Tab #4"`).
+    ///
+    /// This is the diagnosable subset of the shortfall: a pane whose recorded
+    /// slot simply disagrees is a guess we declined to make, but a record naming
+    /// a tab that does not exist is *stale data* — written when the session's
+    /// tabs were different, or by a build that spelled the name differently. That
+    /// distinction is the difference between "the rebuild was cautious" and "this
+    /// record is wrong", and only the second is actionable.
+    pub unknown_tabs: Vec<String>,
 }
 
 /// How long a detached `zellij` create may take before we stop waiting for it.
@@ -1128,7 +1433,9 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub fn rebuild(session: &str, new_name: Option<&str>) -> Result<RebuildReport, String> {
     let kdl = load_layout(session)?;
     let map = pane_map(&session_dirs());
-    let (rewritten, resumed) = inject_resume_args(&kdl, session, &map);
+    let inj = inject_resume_args(&kdl, session, &map);
+    let (rewritten, resumed, unmatched, unknown_tabs) =
+        (inj.kdl.clone(), inj.restored, inj.unmatched, inj.unknown_tabs);
 
     let dir = std::env::temp_dir().join("pir-zellij");
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
@@ -1171,6 +1478,8 @@ pub fn rebuild(session: &str, new_name: Option<&str>) -> Result<RebuildReport, S
         session: name,
         layout_path,
         resumed_panes: resumed,
+        unmatched_panes: unmatched,
+        unknown_tabs,
     })
 }
 
@@ -1375,7 +1684,7 @@ mod tests {
         map.insert(("sess".to_string(), "3".to_string()), log3);
         map.insert(("sess".to_string(), "4".to_string()), log4);
 
-        let (out, used) = inject_resume_args(DUMP, "sess", &map);
+        let Injection { kdl: out, restored: used, .. } = inject_resume_args(DUMP, "sess", &map);
         assert_eq!(used, 2, "both pir panes should be matched");
 
         // The pir panes gained the resume session.
@@ -1400,7 +1709,7 @@ mod tests {
         map.insert(("sess".to_string(), "3".to_string()), log3);
         map.insert(("sess".to_string(), "4".to_string()), log4);
 
-        let (out, _) = inject_resume_args(DUMP, "sess", &map);
+        let Injection { kdl: out, .. } = inject_resume_args(DUMP, "sess", &map);
         assert!(out.contains("cwd=\"/home/ai/NEW\""), "cwd not rewritten:\n{out}");
         // The original cwd must be gone from the panes we rewrote.
         assert!(!out.contains("cwd=\"home/ai/src/pir\""), "old cwd still present");
@@ -1415,7 +1724,7 @@ mod tests {
         }
     }
 }"#;
-        let (out, used) = inject_resume_args(kdl, "sess", &HashMap::new());
+        let Injection { kdl: out, restored: used, .. } = inject_resume_args(kdl, "sess", &HashMap::new());
         assert_eq!(used, 0);
         assert_eq!(out, kdl, "a layout with no pir panes must be byte-identical");
     }
@@ -1465,7 +1774,7 @@ mod tests {
         map.insert(("sess".to_string(), "3".to_string()), log);
         // One record but TWO pir panes: pairing them positionally would put
         // pane 3's conversation into whichever block happens to be first.
-        let (out, used) = inject_resume_args(DUMP, "sess", &map);
+        let Injection { kdl: out, restored: used, .. } = inject_resume_args(DUMP, "sess", &map);
         assert_eq!(used, 0, "an ambiguous mapping must restore nothing");
         assert_eq!(out, DUMP, "layout must be byte-identical when nothing is claimed");
     }
@@ -1579,6 +1888,116 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(next("sess"), "sess-4");
+    }
+
+    /// The title is the *authoritative* pane→transcript key, so it must be read
+    /// off the pane's own header — and a child's title must never leak upward.
+    #[test]
+    fn block_title_session_reads_only_our_marker() {
+        assert_eq!(
+            block_title_session("pane command=\"pir\" name=\"pir:s-123\" cwd=\"/x\" {\n}"),
+            Some("s-123")
+        );
+        // A hand-set title is not ours: no match, so the pane is matched the old way.
+        assert_eq!(block_title_session("pane command=\"pir\" name=\"logs\" {\n}"), None);
+        assert_eq!(block_title_session("pane command=\"pir\" {\n}"), None);
+        // Brace-less one-liner still has a header.
+        assert_eq!(block_title_session("pane name=\"pir:s-9\" cwd=\"/y\""), Some("s-9"));
+        // A CHILD's name= belongs to the child, not this container pane.
+        let container = "pane split_direction=\"vertical\" {\n    pane command=\"pir\" name=\"pir:kid\" {\n    }\n}";
+        assert_eq!(block_title_session(container), None);
+    }
+
+    /// A title must win over the geometry join, which is a guess by comparison.
+    ///
+    /// The title is read from real session directories, so the fixture log is
+    /// written where `log_for_stem` looks and removed afterwards — putting it in
+    /// the cwd's `.pir/sessions` is enough, and it is cleaned up on every path.
+    #[test]
+    fn titled_pane_is_not_overridden_by_geometry() {
+        let dir = std::env::current_dir().unwrap().join(".pir").join("sessions");
+        let _ = std::fs::create_dir_all(&dir);
+        let log = dir.join("geometry-wins.jsonl");
+        std::fs::write(&log, "{}\n").unwrap();
+        let rec = PaneRecord {
+            session: "sess".into(),
+            pane_id: "9".into(),
+            cwd: "/x".into(),
+            captured: 1,
+            tab: "Tab #1".into(),
+            index: 0,
+        };
+        std::fs::write(record_path(&log), serde_json::to_string(&rec).unwrap()).unwrap();
+
+        let kdl = concat!(
+            "layout {\n",
+            "  tab name=\"Tab #1\" {\n",
+            "    pane command=\"pir\" name=\"pir:titled\" cwd=\"/x\" {\n",
+            "      args \"-r\"\n",
+            "    }\n",
+            "  }\n",
+            "}\n",
+        );
+        // A record whose recorded geometry points at this very pane. If the title
+        // were ignored, the geometry join would fill the pane with
+        // `geometry-wins` — the exact "wrong conversation in the wrong pane" bug.
+        let mut map: HashMap<(String, String), PathBuf> = HashMap::new();
+        map.insert(("sess".into(), "9".into()), log.clone());
+        let Injection { kdl: out, restored: used, .. } = inject_resume_args(kdl, "sess", &map);
+        assert_eq!(used, 0, "an unresolvable title must not fall through to the guess: {out}");
+        assert!(!out.contains("geometry-wins"), "{out}");
+
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(record_path(&log));
+    }
+
+    /// The end-to-end shape: a title that resolves gets exactly that transcript.
+    #[test]
+    fn titled_pane_restores_its_own_transcript() {
+        let dir = std::env::current_dir().unwrap().join(".pir").join("sessions");
+        let _ = std::fs::create_dir_all(&dir);
+        let log = dir.join("mytalk.jsonl");
+        std::fs::write(&log, "{}\n").unwrap();
+        let rec = PaneRecord {
+            session: "sess".into(),
+            pane_id: "1".into(),
+            cwd: "/x".into(),
+            captured: 1,
+            tab: String::new(),
+            index: 0,
+        };
+        std::fs::write(record_path(&log), serde_json::to_string(&rec).unwrap()).unwrap();
+
+        let kdl = format!(
+            "layout {{\n  tab name=\"Tab #1\" {{\n    pane command=\"pir\" name=\"{}\" cwd=\"/x\" {{\n    }}\n  }}\n}}\n",
+            pane_title("mytalk")
+        );
+        let Injection { kdl: out, restored: used, .. } = inject_resume_args(&kdl, "sess", &HashMap::new());
+        assert_eq!(used, 1, "the titled pane must be restored: {out}");
+        assert!(out.contains("args \"-r\" \"mytalk\""), "{out}");
+        assert!(out.contains("cwd=\"/x\""), "the recorded cwd must still win: {out}");
+
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(record_path(&log));
+    }
+
+    /// A title we do not own, and a title naming a transcript that is gone, must
+    /// both leave the pane exactly as zellij dumped it.
+    #[test]
+    fn foreign_or_missing_titles_are_left_alone() {
+        let kdl = concat!(
+            "layout {\n",
+            "  tab name=\"Tab #1\" {\n",
+            "    pane command=\"pir\" name=\"operator-set\" {\n",
+            "    }\n",
+            "    pane command=\"pir\" name=\"pir:vanished\" {\n",
+            "    }\n",
+            "  }\n",
+            "}\n",
+        );
+        let Injection { kdl: out, restored: used, .. } = inject_resume_args(kdl, "sess", &HashMap::new());
+        assert_eq!(used, 0, "nothing resolvable, so nothing is rewritten: {out}");
+        assert_eq!(out, kdl, "the dumped layout must survive byte-for-byte");
     }
 
     #[test]
@@ -1771,6 +2190,72 @@ mod real_dump_tests {
         assert_eq!(r.slot(), None, "no captured geometry means no slot");
     }
 
+    /// A record whose `tab` is not a tab in the layout — a **stale sidecar**.
+    ///
+    /// This is the failure observed in the field: a record written by an older
+    /// build carried `tab = "Tab#4"` while zellij names tabs `"Tab #4"` (with a
+    /// space), so its slot matched no block and the pane silently came back
+    /// fresh. `inject_resume_args` must therefore report the shortfall rather
+    /// than let a partial rebuild read as a clean one.
+    #[test]
+    fn a_stale_tab_name_is_reported_as_unmatched() {
+        let kdl = r#"layout {
+    tab name="Tab #4" {
+        pane command="pir" cwd="/work" {
+        }
+    }
+}"#;
+        let dir = std::env::temp_dir().join(format!("pir_zellij_stale_{}", std::process::id()));
+        let log = super::tests::write_recorded_log(&dir, "pir-stale-sh1.jsonl", "s", "7", "/work");
+        // A tab name no layout tab has: exactly the `Tab#4` vs `Tab #4` case.
+        let mut rec = read_record(&log).expect("record");
+        rec.tab = "Tab#4".into();
+        rec.index = 0;
+        std::fs::write(record_path(&log), serde_json::to_string(&rec).unwrap()).unwrap();
+
+        let mut map: HashMap<(String, String), PathBuf> = HashMap::new();
+        map.insert(("s".to_string(), "7".to_string()), log);
+        let inj = inject_resume_args(kdl, "s", &map);
+        assert_eq!(inj.restored, 0, "a stale tab name must not place a pane");
+        assert_eq!(
+            inj.unmatched, 1,
+            "a stale record must be counted, so the partial rebuild is visible"
+        );
+        assert_eq!(
+            inj.unknown_tabs,
+            vec!["Tab#4".to_string()],
+            "the stale tab must be named, since that is the actionable diagnosis"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The happy path must still report a clean run, so the new `unmatched`
+    /// counter cannot cry wolf: a record whose slot *does* match is restored and
+    /// counts as zero unmatched.
+    #[test]
+    fn a_placeable_record_reports_no_shortfall() {
+        let kdl = r#"layout {
+    tab name="Tab #4" {
+        pane command="pir" cwd="/work" {
+        }
+    }
+}"#;
+        let dir = std::env::temp_dir().join(format!("pir_zellij_ok_{}", std::process::id()));
+        let log = super::tests::write_recorded_log(&dir, "pir-ok-sh1.jsonl", "s", "7", "/work");
+        let mut rec = read_record(&log).expect("record");
+        rec.tab = "Tab #4".into();
+        rec.index = 0;
+        std::fs::write(record_path(&log), serde_json::to_string(&rec).unwrap()).unwrap();
+
+        let mut map: HashMap<(String, String), PathBuf> = HashMap::new();
+        map.insert(("s".to_string(), "7".to_string()), log);
+        let inj = inject_resume_args(kdl, "s", &map);
+        assert_eq!(inj.restored, 1, "a matching slot must restore");
+        assert_eq!(inj.unmatched, 0, "a clean rebuild must not warn");
+        assert!(inj.kdl.contains("args \"-r\" \"pir-ok-sh1\""), "{}", inj.kdl);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Two records claiming one slot is a contradiction (the pane changed hands
     /// mid-capture, or a re-split invalidated the cache). Refuse to place
     /// either: guessing is what this whole change exists to prevent.
@@ -1813,6 +2298,19 @@ mod real_dump_tests {
         assert_eq!(out, kdl, "layout must be byte-identical when nothing is claimed");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A tab holding a `pir` pane and an `edit=` pane — the exact shape of the
+    /// real host's Tab #3.
+    ///
+    /// This is the ordinal bug, and it is the reason a restore silently
+    /// restores nothing. zellij reports the `edit=` pane as a *terminal* pane
+    /// (`is_plugin: false`), so `parse_live_panes` counts it and gives the next
+    /// pane ordinal 1. `find_pane_blocks` counts only leaf `command=` panes, so
+    /// in the layout the `edit=` pane is not a leaf and the `pir` pane after it
+    /// is numbered 0. The two sides therefore disagree about the ordinal of
+    /// every pane that follows a non-`command=` terminal pane, so the recorded
+    /// slot matches no block, `match_panes` places nothing, and the pane comes
+    /// back un-restored — while the run still reports success.
 
     /// The real session's own `list-panes` output, so the `(y, x)` ordering is
     /// exercised against the messy real thing: several tabs, nested splits, and

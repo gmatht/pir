@@ -15,7 +15,7 @@ rustyline = { version = "14", optional = true }
 # whose vendors/rustxWidgets/ only carries the rustxwidgets symlink and not
 # this sibling directory. Relative "../gtk_dynamic_loader" resolves against the
 # worktree's logical path and 404s the build.
-gtk_dynamic_loader = { path = "/home/ai_pir/src/pir/vendors/rustxWidgets/gtk_dynamic_loader", optional = true }
+gtk_dynamic_loader = { path = "../gtk_dynamic_loader", optional = true }
 gtk4 = { path = "/root/tmp/gtk4-rs/gtk4", package = "gtk4", optional = true, features = ["v4_14"] }
 glib-sys = { path = "/root/tmp/gtk4-rs/generated/glib-sys-dlopen", optional = true }
 gio-sys = { path = "/root/tmp/gtk4-rs/generated/gio-sys-dlopen", optional = true }

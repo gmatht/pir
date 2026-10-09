@@ -2421,9 +2421,35 @@ pub mod overlay {
     pub fn system_quarantine_engaged() -> bool {
         false
     }
+
+    /// No-op on platforms with no overlayfs quarantine: nothing can be engaged,
+    /// so there is no flag to set and the getter above stays `false`.
+    ///
+    /// Present because the policy tests' `OverlayEngaged` guard calls both
+    /// setters from a `Drop`, and those tests live in this crate's shared
+    /// `#[cfg(test)]` module — so without them the *test* build fails to
+    /// compile off Linux even though the release build is fine.
+    pub fn set_system_quarantine_engaged(_v: bool) {}
+
+    /// The end-of-turn notice for staged system-tree writes.
+    ///
+    /// Always `None` here, and truthfully so: on a platform with no overlayfs
+    /// write-quarantine nothing is ever staged, so there is nothing to announce.
+    /// `Agent::finish_turn` calls this on **every** turn on every platform, so
+    /// without this stub the crate fails to compile on anything but Linux
+    /// (`error[E0425]: cannot find function staged_system_write_notice`) — the
+    /// Linux backend in `security/overlay.rs` has it, the cross-platform shims
+    /// did not.
+    pub fn staged_system_write_notice() -> Option<String> {
+        None
+    }
+
     pub fn project_quarantine_engaged() -> bool {
         false
     }
+
+    /// See [`set_system_quarantine_engaged`].
+    pub fn set_project_quarantine_engaged(_v: bool) {}
 
     pub fn project_active_manifest() -> String {
         "(no project quarantine)".to_string()

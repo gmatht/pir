@@ -17,19 +17,32 @@
 //!
 //! # The platform reality this is written against (measured, not assumed)
 //!
-//! The host this was built on is a **hybrid** container:
+//! Enforcement is detected from the **mount table** plus a live probe, because
+//! the layouts differ per host and a hardcoded path silently disables the whole
+//! feature. Two hosts have been measured:
 //!
-//! * cgroup **v2** is mounted at `/sys/fs/cgroup/unified`, but its
-//!   `cgroup.controllers` is empty *even as real root*: `echo +memory >
-//!   cgroup.subtree_control` fails, and a child cgroup gets no `memory.max` /
-//!   `memory.stat` at all. v2 enforcement is therefore unavailable;
-//! * the real memory controller is **v1** at `/sys/fs/cgroup/memory`, whose
-//!   `memory.limit_in_bytes` + `memory.memsw.limit_in_bytes` *do* work (proven:
-//!   a 200 MiB limit killed an 800 MiB allocation, `oom_kill 1`,
-//!   `max_usage_in_bytes` == limit);
-//! * **PSI is absent** (`/proc/pressure/memory` does not exist), so there is no
+//! * **This host (single cgroup2 mount).** `/proc/mounts` has one
+//!   `cgroup2 /sys/fs/cgroup` line; `cgroup.controllers` lists `memory`; a child
+//!   cgroup gets a writable `memory.max`. Proven: `memory.max = 256 MiB`, a
+//!   900 MiB allocation was killed (`memory.events` → `oom_kill 1`, `max 38`,
+//!   `memory.peak` == the limit). Note `/sys/fs/cgroup/memory` also *exists* as a
+//!   plain directory in this layout, so a v1 probe must exercise the real files
+//!   (`memory.limit_in_bytes`) and not merely check that the directory is there.
+//! * **A hybrid container** where v2 is at `/sys/fs/cgroup/unified` but its
+//!   `cgroup.controllers` is empty even as real root, so a child gets no
+//!   `memory.max`; the working controller there is **v1** at
+//!   `/sys/fs/cgroup/memory`, whose `memory.limit_in_bytes` +
+//!   `memory.memsw.limit_in_bytes` do work (proven: a 200 MiB limit killed an
+//!   800 MiB allocation, `oom_kill 1`, `max_usage_in_bytes` == limit).
+//! * **PSI may be absent** (`/proc/pressure/memory` missing), so there is no
 //!   "stalled in reclaim" signal to lean on;
-//! * the v1 tmpfs mount can come up read-only and needs `mount -o remount,rw`.
+//! * a v1 tmpfs mount can come up read-only and needs `mount -o remount,rw`.
+//!
+//! Because v1 and v2 expose the same concepts under **different file names**, and
+//! writing the wrong one fails silently (the file simply does not exist, so no
+//! limit is written while the caller believes one was), every cgroup access goes
+//! through the `f_*` name helpers near the bottom of this module rather than
+//! naming a file inline.
 //!
 //! So the design is: **detect the hierarchy at startup, use whichever controller
 //! actually works, and degrade honestly** — never assume v2, never pretend a
@@ -81,8 +94,11 @@ use std::time::Instant;
 
 /// Where the v1 memory controller is expected to be mounted.
 const V1_ROOT: &str = "/sys/fs/cgroup/memory";
-/// Where cgroup v2 is expected to be mounted (used only when it has controllers).
-const V2_ROOT: &str = "/sys/fs/cgroup/unified";
+/// The fallback location for a cgroup v2 mount when the mount table cannot be
+/// read. `/sys/fs/cgroup` is the standard single-mount point; the historical
+/// `/sys/fs/cgroup/unified` (a hybrid-layout artefact) is also probed, because
+/// a host that has one may not have the other.
+const V2_ROOT_FALLBACKS: &[&str] = &["/sys/fs/cgroup", "/sys/fs/cgroup/unified"];
 
 /// Swap allowance for the *session* slice. A single cold page may be pushed out
 /// without a kill; sustained thrashing is what we are preventing, and swap is
@@ -174,8 +190,11 @@ pub fn hierarchy() -> &'static Hierarchy {
 
 fn detect_hierarchy() -> Hierarchy {
     // v1 first: on a hybrid host the v2 mount can exist but carry no
-    // controllers (this host exactly), and v1's memory controller is the one
-    // that actually enforces.
+    // controllers, and v1's memory controller is the one that actually enforces.
+    // `probe_v1` exercises the real operations (create a child, read and write
+    // `memory.limit_in_bytes`) rather than trusting that the directory exists —
+    // on this host `/sys/fs/cgroup/memory` is a *cgroup2* view, so the path is
+    // present while `memory.limit_in_bytes` is not.
     if probe_v1().is_ok() {
         return Hierarchy {
             backend: Backend::V1,
@@ -183,11 +202,13 @@ fn detect_hierarchy() -> Hierarchy {
             note: format!("cgroup v1 ({V1_ROOT})"),
         };
     }
-    if let Ok(()) = probe_v2() {
+    if let Ok(()) = probe_v2()
+        && let Some(root) = v2_root()
+    {
         return Hierarchy {
             backend: Backend::V2,
-            root: Some(PathBuf::from(V2_ROOT)),
-            note: format!("cgroup v2 ({V2_ROOT})"),
+            note: format!("cgroup v2 ({})", root.display()),
+            root: Some(root),
         };
     }
     Hierarchy {
@@ -221,19 +242,52 @@ fn probe_v1() -> Result<(), String> {
 /// v2 probe: a controller must be delegatable *and* the child must actually get
 /// the files. `cgroup.controllers` being empty is the failure this catches.
 fn probe_v2() -> Result<(), String> {
-    let root = PathBuf::from(V2_ROOT);
-    if !root.join("cgroup.controllers").exists() {
-        return Err("not mounted".into());
+    match v2_root() {
+        Some(r) => {
+            // A controller is only usable when it is delegated *and* the child
+            // actually receives the files — an empty/populated `cgroup.controllers`
+            // is the failure this catches.
+            let probe = r.join(format!("pir-probe-{}", std::process::id()));
+            std::fs::create_dir_all(&probe).map_err(|e| format!("mkdir: {e}"))?;
+            let has_memory = probe.join("memory.max").exists();
+            // Leave the child in place if the write test below wants it.
+            if !has_memory {
+                let _ = std::fs::remove_dir(&probe);
+                return Err("no memory controller delegated to the subtree".into());
+            }
+            let _ = std::fs::remove_dir(&probe);
+            Ok(())
+        }
+        None => Err("not mounted".into()),
     }
-    let probe = root.join(format!("pir-probe-{}", std::process::id()));
-    std::fs::create_dir_all(&probe).map_err(|e| format!("mkdir: {e}"))?;
-    let r = if probe.join("memory.max").exists() {
-        Ok(())
-    } else {
-        Err("no memory controller delegated to the subtree".into())
-    };
-    let _ = std::fs::remove_dir(&probe);
-    r
+}
+
+/// The directory a cgroup v2 mount lives at, or `None` when there is not one.
+///
+/// Resolved from the **mount table** rather than a hardcoded path, because the
+/// single-mount (`/sys/fs/cgroup`) and hybrid (`/sys/fs/cgroup/unified`)
+/// layouts are both common and a host has one or the other. Hardcoding the
+/// hybrid path is exactly how this host reported `Backend::None` ("commands are
+/// measured, not limited") while a fully working v2 controller — with
+/// `memory.max` writable — was mounted at `/sys/fs/cgroup` the whole time.
+fn v2_root() -> Option<PathBuf> {
+    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+        for line in mounts.lines() {
+            let mut f = line.split_whitespace();
+            let _dev = f.next();
+            let Some(mnt) = f.next() else { continue };
+            let Some(fstype) = f.next() else { continue };
+            if fstype == "cgroup2" && Path::new(mnt).join("cgroup.controllers").exists() {
+                return Some(PathBuf::from(mnt));
+            }
+        }
+    }
+    // Fall back to the conventional locations, so a host whose mount table is
+    // unreadable is still detected rather than silently declared unenforceable.
+    V2_ROOT_FALLBACKS
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.join("cgroup.controllers").exists())
 }
 
 /// Everything the poll loop needs to know about the command it is supervising.
@@ -492,7 +546,7 @@ impl CommandCgroup {
     /// writing `cgroup.procs` is race-free. Ordering matters: this must happen
     /// **before** the uid drop, because afterwards the write fails EACCES.
     pub fn attach(&self, pid: u32) -> std::io::Result<()> {
-        std::fs::write(self.dir.join("cgroup.procs"), pid.to_string())
+        std::fs::write(self.dir.join(f_procs()), pid.to_string())
     }
 
     pub fn dir(&self) -> &Path {
@@ -501,23 +555,37 @@ impl CommandCgroup {
 
     /// Current usage in bytes (the cgroup's own accounting; includes page cache).
     pub fn usage(&self) -> Option<u64> {
-        read_u64(&self.dir.join("memory.usage_in_bytes"))
+        read_u64(&self.dir.join(f_usage()))
     }
 
     /// Peak usage since the cgroup was created.
     pub fn peak(&self) -> Option<u64> {
-        read_u64(&self.dir.join("memory.max_usage_in_bytes"))
+        read_u64(&self.dir.join(f_peak()))
     }
 
     /// Resident anonymous memory, excluding page cache. This split is what
     /// makes the difference between killing a runaway allocator and killing a
     /// `cargo build` that merely read a lot of files.
+    ///
+    /// The key differs by backend: v1 calls it `rss`, v2 calls it `anon`. Both
+    /// exclude page cache, which is the property that matters here.
     pub fn anon_bytes(&self) -> Option<u64> {
         let stat = std::fs::read_to_string(self.dir.join("memory.stat")).ok()?;
-        stat.lines()
-            .find(|l| l.starts_with("rss "))
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|v| v.parse::<u64>().ok())
+        let keys: &[&str] = match hierarchy().backend {
+            Backend::V2 => &["anon ", "rss "],
+            _ => &["rss ", "anon "],
+        };
+        for key in keys {
+            if let Some(v) = stat
+                .lines()
+                .find(|l| l.starts_with(key))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                return Some(v);
+            }
+        }
+        None
     }
 
     /// Bytes swapped out by this cgroup.
@@ -529,30 +597,65 @@ impl CommandCgroup {
 
     /// How many times the limit has been hit (nonzero ⇒ the kernel already
     /// refused an allocation here — definitive blame).
+    ///
+    /// v1 exposes a monotonic `memory.failcnt`; v2 exposes event counters in
+    /// `memory.events` instead, where `max` counts the times a charge was
+    /// refused at the `memory.max` limit. Both mean the same thing here, so a
+    /// v2 host keeps its definitive-blame signal rather than always reporting 0.
     pub fn failcnt(&self) -> u64 {
-        read_u64(&self.dir.join("memory.failcnt")).unwrap_or(0)
+        match hierarchy().backend {
+            Backend::V2 => {
+                let Ok(s) = std::fs::read_to_string(self.dir.join("memory.events")) else {
+                    return 0;
+                };
+                s.lines()
+                    .find(|l| l.starts_with("max "))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0)
+            }
+            _ => read_u64(&self.dir.join("memory.failcnt")).unwrap_or(0),
+        }
     }
 
     /// Whether the *kernel* OOM-killed something in this cgroup, and how many.
+    ///
+    /// v1 reports this in `memory.oom_control`; v2 counts it in
+    /// `memory.events` as `oom_kill`. Either is unambiguous evidence that the
+    /// kernel — not pir — stopped a process here.
     pub fn oom_kills(&self) -> u64 {
-        let Ok(s) = std::fs::read_to_string(self.dir.join("memory.oom_control")) else {
-            return 0;
-        };
-        s.lines()
-            .find(|l| l.starts_with("oom_kill "))
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0)
+        match hierarchy().backend {
+            Backend::V2 => {
+                let Ok(s) = std::fs::read_to_string(self.dir.join("memory.events")) else {
+                    return 0;
+                };
+                s.lines()
+                    .find(|l| l.starts_with("oom_kill "))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0)
+            }
+            _ => {
+                let Ok(s) = std::fs::read_to_string(self.dir.join("memory.oom_control")) else {
+                    return 0;
+                };
+                s.lines()
+                    .find(|l| l.starts_with("oom_kill "))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0)
+            }
+        }
     }
 
     /// Current process count in the cgroup.
     pub fn pids(&self) -> Option<u64> {
-        read_u64(&self.dir.join("cgroup.procs")).map(|_| count_procs(&self.dir))
+        read_u64(&self.dir.join(f_procs())).map(|_| count_procs(&self.dir))
     }
 }
 
 fn count_procs(dir: &Path) -> u64 {
-    std::fs::read_to_string(dir.join("cgroup.procs"))
+    std::fs::read_to_string(dir.join(f_procs()))
         .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count() as u64)
         .unwrap_or(0)
 }
@@ -609,31 +712,63 @@ pub fn create_command_cgroup(
     for d in [&uid_dir, &sess_dir, &cmd_dir] {
         std::fs::create_dir_all(d).map_err(|e| format!("mkdir {}: {e}", d.display()))?;
     }
+    // **Delegate the memory controller down the tree.** A cgroup v2 child gets
+    // no `memory.*` files at all unless each ancestor enables `+memory` in its
+    // `cgroup.subtree_control`. Without this every child here contains only
+    // `cgroup.*`, so `write_limit(memory.max)` targets a nonexistent file and
+    // fails — and because that failure is silent, the command then runs
+    // *unmetered while `enforce` is true*, which is the worst of both: the
+    // operator believes a limit is armed and nothing is. Enabling it at the root
+    // and each level we create is what makes the files appear.
+    delegate_memory(&root_to_uid_chain(root, &uid_dir, &sess_dir, &cmd_dir));
 
-    // Note the default: `enforced` is false unless we actually write a limit.
+/// The chain of cgroup directories from the mount root down to `cmd_dir`, so
+/// each ancestor can be asked to delegate `+memory` to its children.
+fn root_to_uid_chain(
+    root: &Path,
+    uid_dir: &Path,
+    sess_dir: &Path,
+    _cmd_dir: &Path,
+) -> Vec<PathBuf> {
+    // Deliberately stops at the session level: `cmd_dir` is a **leaf** where the
+    // command itself lives, and nothing is ever created beneath it, so it has no
+    // children to delegate to. Writing `subtree_control` on it is not merely
+    // pointless — it broke `sweep_never_touches_a_populated_cgroup`, because a
+    // leaf that is about to receive the supervised process cannot have its
+    // subtree control rewritten (the write is refused once it is populated, and
+    // the ordering made the child's join fail).
+    vec![root.to_path_buf(), uid_dir.to_path_buf(), sess_dir.to_path_buf()]
+}
+
+// Note the default: `enforced` is false unless we actually write a limit.
     // A command that is merely *measured* must never be described as limited.
     let mut enforced = false;
     if enforce && limit_bytes > 0 {
-        let wrote = write_limit(&cmd_dir, "memory.limit_in_bytes", limit_bytes);
+        let wrote = write_limit(&cmd_dir, f_memory_max(), limit_bytes);
         if wrote {
             enforced = true;
-            // memsw == limit gives a swap allowance of literal zero (the v1
-            // equivalent of v2's `memory.swap.max = 0`): the command may use RAM
-            // up to the limit and no swap, so overshoot is an immediate
-            // OOM-kill instead of a reclaim-then-thrash period. If memsw cannot
-            // be lowered (accounting compiled out), leave it alone: the poll and
-            // the host guard still cover swap.
-            let _ = write_limit_unless_below(&cmd_dir, "memory.memsw.limit_in_bytes", limit_bytes);
+            // A swap allowance of literal zero: the command may use RAM up to the
+            // limit and no swap, so overshoot is an immediate OOM-kill instead of
+            // a reclaim-then-thrash period. v1 expresses this as
+            // `memsw == limit` (memory+swap combined, hence the same number);
+            // v2 writes `memory.swap.max = 0`. If the file cannot be written
+            // (accounting compiled out), leave it alone: the poll and the host
+            // guard still cover swap.
+            let swap_val = match hierarchy().backend {
+                Backend::V2 => 0,
+                _ => limit_bytes,
+            };
+            let _ = write_limit_unless_below(&cmd_dir, f_memory_swap_max(), swap_val);
             // A *soft* limit only (no OOM): advisory pressure that lets the
             // kernel reclaim from us first without ever killing.
-            let _ = write_limit(&cmd_dir, "memory.soft_limit_in_bytes", limit_bytes);
+            let _ = write_limit(&cmd_dir, f_memory_soft(), limit_bytes);
         }
     } else if limit_bytes > 0 {
         // Advisory mode: set the *soft* limit only. It applies reclaim
         // preference under pressure and can never kill a process, so a 30 GB
         // build proceeds while the kernel still prefers to reclaim our cache
         // over someone else's working set.
-        let _ = write_limit(&cmd_dir, "memory.soft_limit_in_bytes", limit_bytes);
+        let _ = write_limit(&cmd_dir, f_memory_soft(), limit_bytes);
     }
     // PID ceiling is independent of the memory posture: a fork cascade cannot be
     // legitimate at thousands of processes, and hitting it does not kill the
@@ -679,6 +814,66 @@ fn unique_cmd_dir(sess_dir: &Path) -> PathBuf {
     sess_dir.join(format!("cmd-{pid}-{t}"))
 }
 
+// ---------------------------------------------------------------------------
+// Backend-aware cgroup file names
+//
+// The v1 and v2 memory controllers expose the *same concepts* under different
+// file names, and writing the wrong one fails silently (the file simply does not
+// exist, so `write_limit` returns false and the command runs unmetered while the
+// caller believes it wrote a limit). Every access therefore goes through these
+// helpers rather than naming a file directly.
+// ---------------------------------------------------------------------------
+
+/// The hard memory cap. v2: `memory.max`; v1: `memory.limit_in_bytes`.
+fn f_memory_max() -> &'static str {
+    match hierarchy().backend {
+        Backend::V2 => "memory.max",
+        _ => "memory.limit_in_bytes",
+    }
+}
+
+/// The reclaim-preference (non-killing) limit. v2: `memory.high`; v1:
+/// `memory.soft_limit_in_bytes`. Deliberately `high`, not `max`, for the
+/// advisory posture: exceeding `high` throttles and reclaims but never kills.
+fn f_memory_soft() -> &'static str {
+    match hierarchy().backend {
+        Backend::V2 => "memory.high",
+        _ => "memory.soft_limit_in_bytes",
+    }
+}
+
+/// The swap allowance. v2: `memory.swap.max`; v1: `memory.memsw.limit_in_bytes`
+/// (which is memory+swap combined, hence the caller's arithmetic).
+fn f_memory_swap_max() -> &'static str {
+    match hierarchy().backend {
+        Backend::V2 => "memory.swap.max",
+        _ => "memory.memsw.limit_in_bytes",
+    }
+}
+
+/// Current usage in bytes.
+fn f_usage() -> &'static str {
+    match hierarchy().backend {
+        Backend::V2 => "memory.current",
+        _ => "memory.usage_in_bytes",
+    }
+}
+
+/// Peak usage since the cgroup was created.
+fn f_peak() -> &'static str {
+    match hierarchy().backend {
+        Backend::V2 => "memory.peak",
+        _ => "memory.max_usage_in_bytes",
+    }
+}
+
+/// The membership file. `cgroup.procs` exists in both v1 and v2 (v1 also has
+/// `tasks`), so this one needs no branching — kept as a named helper anyway so
+/// every cgroup access in this module is greppable in one place.
+fn f_procs() -> &'static str {
+    "cgroup.procs"
+}
+
 /// Lower `file` only if the current value is above `value` — memsw must stay
 /// `>=` the memory limit in v1, and lowering memsw below the (unlimited)
 /// default is the whole point here.
@@ -692,6 +887,39 @@ fn write_limit_unless_below(dir: &Path, file: &str, value: u64) -> bool {
 
 /// Ensure the session slice exists and carries the aggregate cap. Best-effort:
 /// a missing session slice only means per-command limits stand alone.
+/// Enable `+memory` in `cgroup.subtree_control` for every directory in `chain`.
+///
+/// Only meaningful under v2 (v1 has no `subtree_control`), and best-effort: on a
+/// host where the controller is not delegatable this fails harmlessly and the
+/// caller's `enforced` flag stays false, which is the honest outcome.
+///
+/// Writing the *same* controller twice is fine — v2 ignores a no-op — so this is
+/// safe to run on every command, not just the first.
+fn delegate_memory(chain: &[PathBuf]) {
+    if hierarchy().backend != Backend::V2 {
+        return;
+    }
+    for dir in chain {
+        let ctl = dir.join("cgroup.subtree_control");
+        if !ctl.exists() {
+            continue;
+        }
+        // Read-modify-write rather than a blind `+memory`, so a host that already
+        // delegates `+cpu`/`+pids` keeps them: assigning the file replaces the
+        // whole set, and dropping `+pids` would silently disable the PID ceiling.
+        let current = std::fs::read_to_string(&ctl).unwrap_or_default();
+        let mut wanted: Vec<&str> = current.split_whitespace().collect();
+        for c in ["memory", "pids"] {
+            if !wanted.contains(&c) {
+                wanted.push(c);
+            }
+        }
+        let desired: String =
+            wanted.iter().map(|c| format!("+{c}")).collect::<Vec<_>>().join(" ");
+        let _ = std::fs::write(&ctl, desired);
+    }
+}
+
 pub fn ensure_session_slice(session_key: &str, budget: u64, enforce: bool) {
     let h = hierarchy();
     let Some(root) = &h.root else { return };
@@ -708,11 +936,28 @@ pub fn ensure_session_slice(session_key: &str, budget: u64, enforce: bool) {
     // only under pressure. Note this is the *aggregate* cap, so it gets a small
     // swap allowance — one cold page may be pushed out; sustained thrash is what
     // we are preventing.
+    //
+    // The file names are backend-dependent, exactly as in
+    // `create_command_cgroup`: writing v1's `memory.limit_in_bytes` on a v2 host
+    // targets a file that does not exist, so the aggregate cap silently never
+    // applied. That was invisible — the slice existed, the write "succeeded" in
+    // the sense that nothing reported an error, and only the *effective* cap was
+    // missing.
+    delegate_memory(&[root.to_path_buf()]);
     if enforce {
-        let _ = write_limit(&dir, "memory.limit_in_bytes", budget);
-        let _ = write_limit(&dir, "memory.memsw.limit_in_bytes", budget + SESSION_SWAP_BYTES);
+        let _ = write_limit(&dir, f_memory_max(), budget);
+        // v1 expresses "swap allowance" as memory+swap combined; v2 as a separate
+        // swap ceiling. Using the wrong one silently drops the bound.
+        match hierarchy().backend {
+            Backend::V2 => {
+                let _ = write_limit_unless_below(&dir, f_memory_swap_max(), SESSION_SWAP_BYTES);
+            }
+            _ => {
+                let _ = write_limit(&dir, f_memory_swap_max(), budget + SESSION_SWAP_BYTES);
+            }
+        }
     } else {
-        let _ = write_limit(&dir, "memory.soft_limit_in_bytes", budget);
+        let _ = write_limit(&dir, f_memory_soft(), budget);
     }
 }
 
@@ -765,6 +1010,38 @@ pub fn sweep_stale() -> usize {
         }
     }
     removed
+}
+
+/// Remove this session's own slice directory, if it is empty.
+///
+/// The counterpart to [`ensure_session_slice`]. Without it every `pir` run leaks
+/// its slice forever: the startup sweep deliberately `continue`s over *this*
+/// session's directory (removing it mid-run would race a command's `pre_exec`
+/// join and silently drop that command out of its limits), so nothing ever
+/// reclaimed it. Observed as `/sys/fs/cgroup/pir-0/pir-<stamp>` persisting after
+/// each run with zero processes in it.
+///
+/// Only an **empty** slice is removed, so a detached job still running under this
+/// session keeps its accounting. Best-effort: a failure leaves the directory for
+/// the next run's sweep to collect.
+pub fn remove_own_session_slice() -> usize {
+    let h = hierarchy();
+    let Some(root) = &h.root else { return 0 };
+    let dir = root.join(format!("pir-{}", current_uid())).join(session_key());
+    if !dir.exists() {
+        return 0;
+    }
+    // Remove any empty command cgroups first (deepest-first), then the slice.
+    let mut removed = 0;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() && p.join("cgroup.procs").exists() {
+                removed += remove_if_empty(&p);
+            }
+        }
+    }
+    removed + remove_if_empty(&dir)
 }
 
 /// Recursively remove every empty cgroup at or below `dir`, deepest-first so a
@@ -1059,6 +1336,44 @@ impl Guard {
     /// returned, and a detached job would run unaccounted.
     pub fn take_cgroup(&mut self) -> Option<CommandCgroup> {
         self.cgroup.take()
+    }
+
+    /// Sample the job and report what it is using, *without* deciding to kill.
+    ///
+    /// Called from `job_status` to inspect a detached job. It refreshes the
+    /// guard's history and usage figures (so a later `observe` has real data to
+    /// reason with) but applies no verdict — inspecting a job must never kill it
+    /// as a side effect.
+    ///
+    /// Returns `(usage, anon, peak, budget, pct)` in bytes, or `None` when no
+    /// cgroup accounting is available (a host with no controller, or a job whose
+    /// cgroup was never created). `usage` is total charged memory, `anon` is the
+    /// resident anonymous part — the split that distinguishes a real allocator
+    /// from page cache.
+    pub fn memory_summary(&mut self) -> Option<(u64, u64, u64, u64, u64)> {
+        let host = HostMem::read()?;
+        let (usage, anon, swap) = self.sample_command();
+        let sample = Sample {
+            at: Instant::now(),
+            usage,
+            anon,
+            swap,
+            host_available: host.available,
+            host_free: host.free,
+            swap_used: host.swap_total.saturating_sub(host.swap_free),
+        };
+        if self.history.len() == HISTORY {
+            self.history.pop_front();
+        }
+        self.history.push_back(sample);
+        let cg = self.cgroup.as_ref()?;
+        let peak = cg.peak().unwrap_or(0);
+        let budget = self.limits.memory_bytes;
+        if usage == 0 && peak == 0 {
+            return None;
+        }
+        let pct = (peak as f64 / budget.max(1) as f64 * 100.0).round() as u64;
+        Some((usage, anon, peak, budget, pct))
     }
 
     /// Is *this* command the consumer of the memory that is disappearing?
@@ -1604,6 +1919,91 @@ mod tests {
         }
         assert!(!h.note.is_empty());
     }
+
+    /// The v2 mount is found from the **mount table**, not a hardcoded path.
+    ///
+    /// The regression this pins: `V2_ROOT` was hardcoded to
+    /// `/sys/fs/cgroup/unified`, so on a host using the single-mount layout
+    /// (where the real mount is `/sys/fs/cgroup`) detection returned
+    /// `Backend::None` — reporting "commands are measured, not limited" while a
+    /// fully working controller with a writable `memory.max` sat there unused.
+    /// The result was no kernel backstop at all, which is exactly the condition
+    /// under which a runaway reached 22.8 GB.
+    #[test]
+    fn v2_root_prefers_a_real_cgroup2_mount() {
+        // Whatever this host has, any root we report for v2 must be a genuine
+        // cgroup2 mount directory (it must carry `cgroup.controllers`), and must
+        // not be a path that merely happens to exist.
+        let Some(root) = v2_root() else { return };
+
+        // The discriminating assertion: the root must be the mount point named
+        // by /proc/mounts as a `cgroup2` mount — not a conventional path that
+        // merely exists. The regression was a hardcoded `/sys/fs/cgroup/unified`,
+        // which on a single-mount host does not exist at all, so detection
+        // returned `Backend::None` ("commands are measured, not limited") while a
+        // working controller with a writable `memory.max` sat unused at
+        // `/sys/fs/cgroup`. A test that only checks "the returned path exists"
+        // does not catch that, because the fallback list supplies a path that
+        // exists too.
+        let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+        let cgroup2_mounts: Vec<&str> = mounts
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split_whitespace();
+                let _dev = f.next()?;
+                let mnt = f.next()?;
+                let fstype = f.next()?;
+                (fstype == "cgroup2").then_some(mnt)
+            })
+            .collect();
+        if !cgroup2_mounts.is_empty() {
+            assert!(
+                cgroup2_mounts.iter().any(|m| Path::new(m) == root.as_path()),
+                "v2_root() returned {} but the cgroup2 mount(s) are {:?} — the mount \
+                 table is not being consulted, which is the hardcoded-path bug",
+                root.display(),
+                cgroup2_mounts
+            );
+            assert_ne!(
+                hierarchy().backend,
+                Backend::None,
+                "a host with a cgroup2 mount must not report 'no cgroup memory controller'"
+            );
+        }
+    }
+
+    /// Every backend-dependent file name must resolve to something that exists
+    /// in a real child cgroup on this host, or be absent for a documented reason.
+    /// A name that silently does not exist is how a written limit becomes a
+    /// no-op.
+    #[test]
+    fn backend_file_names_exist_on_this_host() {
+        if hierarchy().backend == Backend::None {
+            eprintln!("skipped: no backend");
+            return;
+        }
+        // Use the live root; the helpers read `hierarchy()`, so the names are the
+        // ones the enforcement path will actually use.
+        let root = hierarchy().root.clone().expect("backend implies a root");
+        let dir = root.join(format!("pir-names-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // The two names that carry enforcement: the hard cap (must be writable)
+        // and the soft cap (must exist). `swap.max` may be absent when swap
+        // accounting is compiled out, which the code tolerates.
+        assert!(
+            dir.join(f_memory_max()).exists(),
+            "the hard-limit file ({}) must exist",
+            f_memory_max()
+        );
+        assert!(
+            dir.join(f_memory_soft()).exists(),
+            "the soft-limit file ({}) must exist",
+            f_memory_soft()
+        );
+        assert!(dir.join(f_usage()).exists(), "usage file must exist");
+        assert!(dir.join(f_procs()).exists(), "membership file must exist");
+        let _ = std::fs::remove_dir(&dir);
+    }
 }
 
 /// A single lock guarding the **real** cgroup tree for the whole test module.
@@ -1626,7 +2026,13 @@ fn lock_cgroup_tree() -> std::sync::MutexGuard<'static, ()> {
     CGROUP_TREE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-#[cfg(all(test, unix))]
+/// Live probe of the *real* host's cgroup/memory state. **Linux-only**: it
+/// reads `/proc/meminfo` and walks `/sys/fs/cgroup`, neither of which exists on
+/// macOS or BSD, so on those platforms it would fail on `expect("/proc/meminfo")`
+/// rather than report anything. Gated rather than made to pass, because the
+/// thing it asserts — that the detected backend matches this machine — has no
+/// meaning where there is no cgroup hierarchy to detect.
+#[cfg(all(test, target_os = "linux"))]
 mod live_probe {
     use super::*;
 
@@ -1656,6 +2062,100 @@ mod live_probe {
         eprintln!("stale swept  : {n}");
     }
 
+    /// A `Guard` over a **real** cgroup reports what a command is using, and
+    /// reporting never kills it.
+    ///
+    /// This is the post-detach fix's proof: a guard carried into a detached job is
+    /// sampled and must produce real figures. Opt-in (`PIR_RESOURCE_LIVE_TESTS=1`)
+    /// because it creates a cgroup in the host tree.
+    ///
+    /// The child joins via `pre_exec`, exactly as production does. A *shell* must
+    /// not be used to join: `bash -c 'echo $$ > cgroup.procs; python3 …'` joins the
+    /// bash, which then exits, leaving the python grandchild outside the cgroup —
+    /// verified, and a property of forking from a joined shell rather than of the
+    /// cgroup. `pre_exec` is the only window where the writing process *is* the one
+    /// that will exec.
+    #[test]
+    fn a_guard_over_a_real_cgroup_reports_memory_without_killing() {
+        let _tree = super::lock_cgroup_tree();
+        if std::env::var("PIR_RESOURCE_LIVE_TESTS").map(|v| v != "1").unwrap_or(true) {
+            eprintln!("skipped (set PIR_RESOURCE_LIVE_TESTS=1 to run)");
+            return;
+        }
+        if hierarchy().backend == Backend::None {
+            eprintln!("skipped: no backend on this host");
+            return;
+        }
+        #[cfg(unix)]
+        use std::os::unix::process::CommandExt;
+
+        let key = format!("mem-report-{}", std::process::id());
+        let host = HostMem::read().expect("meminfo");
+        let limits = limits_for_session(&host, &key);
+        // A limit of 0 keeps the cgroup in advisory mode: nothing is written that
+        // could kill, which is what lets this test assert "reporting is not a
+        // verdict" meaningfully.
+        let cg = create_command_cgroup(&key, 0, 0, false)
+            .expect("create")
+            .expect("a backend was detected, so a cgroup must be produced");
+        let dir = cg.dir().to_path_buf();
+        assert!(dir.exists(), "the command cgroup must exist at {}", dir.display());
+        // Delegation must have happened, or there are no memory files to read.
+        assert!(
+            dir.join(f_usage()).exists(),
+            "the command cgroup has no {} — the memory controller was not delegated              down the tree, so every limit written here would silently no-op",
+            f_usage()
+        );
+
+        let procs = dir.join(f_procs());
+        let mut cmd = std::process::Command::new("python3");
+        cmd.arg("-c").arg("x=bytearray(128*1024*1024); import time; time.sleep(30)");
+        // SAFETY: `pre_exec` runs between fork and exec in the child, which is
+        // single-threaded there. The closure only opens a file and writes a pid —
+        // the documented contract for that hook.
+        unsafe {
+            let procs = procs.clone();
+            cmd.pre_exec(move || {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new().write(true).open(&procs)?;
+                f.write_all(std::process::id().to_string().as_bytes())?;
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("spawn a child into the cgroup");
+
+        // Wait for the allocation to be charged to the cgroup.
+        let mut saw = 0u64;
+        for _ in 0..250 {
+            if let Some(u) = read_u64(&dir.join(f_usage())) {
+                saw = u;
+                if u > 64 * 1024 * 1024 {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let mut g = Guard::new(limits, Some(cg));
+        let reported = g.memory_summary();
+        let alive = child.try_wait().map(|s| s.is_none()).unwrap_or(false);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            saw > 64 * 1024 * 1024,
+            "the child never charged its allocation to the cgroup (saw {saw} bytes;              procs={:?})",
+            std::fs::read_to_string(&procs).map(|s| s.trim().to_string()),
+        );
+        let (usage, anon, peak, budget, _pct) =
+            reported.expect("a real cgroup must yield memory figures");
+        eprintln!("usage={usage} anon={anon} peak={peak} budget={budget}");
+        assert!(usage >= 64 * 1024 * 1024, "usage should be ~128 MiB, got {usage}");
+        assert!(anon > 0, "anonymous memory should be reported, got {anon}");
+        assert!(peak >= usage, "peak {peak} must be at least current {usage}");
+        assert!(alive, "memory_summary must not kill the command it inspects");
+    }
+
     /// The end-to-end enforcement proof, run only when the operator opts in
     /// (`PIR_RESOURCE_LIVE_TESTS=1`) because it writes to the real cgroup tree
     /// and deliberately OOM-kills a child.
@@ -1671,39 +2171,125 @@ mod live_probe {
             eprintln!("skipped: no backend on this host");
             return;
         }
-        let _tree = super::lock_cgroup_tree();
+        // NOTE: `lock_cgroup_tree()` must be taken *once*. It is a plain
+        // `std::sync::Mutex`, so it is not reentrant — a second call in the same
+        // test deadlocks against the first guard, which is exactly how this probe
+        // used to hang (`wchan: anon_pipe_read` was misleading: the thread was
+        // parked on the mutex, and the pipe it appeared to wait on was the test
+        // harness's own output capture).
         let limit = 256u64 << 20;
         let key = format!("live-test-{}", std::process::id());
         let cg = create_command_cgroup(&key, limit, 0, true).expect("create").expect("backend");
-        // Spawn an allocator that joins the cgroup itself, so the test does not
-        // need pre_exec plumbing.
-        let script = format!(
-            "echo $$ > {}/cgroup.procs; python3 -c 'x=bytearray(900*1024*1024)'",
-            cg.dir().display()
-        );
-        let child = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(&script)
+        // The allocator joins the cgroup **in its own `pre_exec`**, so the process
+        // that allocates is the process that is limited. A shell join must not be
+        // used here: `bash -c 'echo $$ > cgroup.procs; python3 …'` puts the *bash*
+        // in the cgroup, and python — a separate process the shell forks — escapes
+        // it. The failure is nasty rather than obvious: the cgroup shows the charge,
+        // the bash is killed at the limit, and the escaped python runs on holding
+        // the stderr pipe, so `wait_with_output` blocks on a read that never
+        // returns EOF (observed as `wchan: anon_pipe_read`). Production joins this
+        // way for the same reason (see `spawn_shell_inner`'s `pre_exec`).
+        #[cfg(unix)]
+        use std::os::unix::process::CommandExt;
+        let procs = cg.dir().join("cgroup.procs");
+        let mut cmd = std::process::Command::new("python3");
+        cmd.arg("-c")
+            .arg("x=bytearray(900*1024*1024); print('ALLOCATED')")
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn");
-        let out = child.wait_with_output().expect("wait");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        eprintln!("exit: {:?}", out.status);
-        eprintln!("stderr: {}", stderr.trim());
+            .stderr(std::process::Stdio::piped());
+        // SAFETY: `pre_exec` runs between fork and exec while the child is still
+        // single-threaded; the closure only opens a file and writes a pid.
+        unsafe {
+            cmd.pre_exec(move || {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new().write(true).open(&procs)?;
+                f.write_all(std::process::id().to_string().as_bytes())?;
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("spawn an allocator into the cgroup");
+        // **Bounded wait.** `wait_with_output()` blocks until EOF on the child's
+        // stderr, and EOF is not guaranteed just because the child died: the
+        // kernel's OOM kill takes the *process*, and any descriptor it duplicated
+        // into another process keeps the pipe open — so the read never returns and
+        // the test hangs (observed as `wchan: anon_pipe_read`). That is the same
+        // "grandchild holds the pipe" hazard the production wait loop guards
+        // against; a test that waits unbounded on a pipe it does not control is
+        // just a latent hang.
+        //
+        // The wait is therefore on the process, with a deadline, and the outcome is
+        // established from the cgroup counters (which is the evidence that matters:
+        // the *kernel* refused the charge and killed the process).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(s)) => break Some(s),
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => panic!("wait: {e}"),
+            }
+        };
+        eprintln!("exit: {status:?}");
         eprintln!("oom_kills: {}", cg.oom_kills());
         eprintln!("peak: {:?}", cg.peak().map(human_bytes));
+        // The allocator must not have completed. We cannot read its stderr without
+        // risking the hang above, so the *counters* are the evidence: the kernel
+        // recorded a kill and the peak reached the limit.
         assert!(
-            !stderr.contains("ALLOCATED"),
-            "the limit was not enforced: {stderr}"
+            cg.oom_kills() > 0,
+            "expected the kernel's oom_kill counter to advance (status {status:?}, peak {:?})",
+            cg.peak().map(human_bytes)
         );
-        // The v1 counter that proves the kernel, not us, stopped it.
-        assert!(cg.oom_kills() > 0, "expected the kernel's oom_kill counter to advance");
         assert!(
             cg.peak().unwrap_or(0) >= limit - (4 << 20),
             "peak {:?} should have reached the limit",
             cg.peak()
+        );
+    }
+
+    /// The unbounded-`wait_with_output` hazard, pinned so a future edit cannot
+    /// quietly reintroduce it.
+    ///
+    /// A child that is OOM-killed can leave its stderr pipe open — a descriptor
+    /// duplicated into another process keeps it alive — so waiting for EOF never
+    /// returns and the test hangs. The live probe therefore polls the child with a
+    /// deadline instead, and establishes the outcome from the cgroup counters.
+    ///
+    /// The check looks for the *call*, not the word: the probe's own comments
+    /// explain the hazard, so a naive substring search would match the
+    /// explanation rather than a reintroduced call.
+    #[test]
+    fn a_killed_child_must_not_be_waited_on_for_eof() {
+        let src = include_str!("resource.rs");
+        let probe = src
+            .split("fn enforcement_kills_an_over_allocator")
+            .nth(1)
+            .unwrap_or("")
+            .split("\n    /// ")
+            .next()
+            .unwrap_or("");
+        // Strip line comments so only executable text is inspected.
+        let code: String = probe
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("wait_with_output"),
+            "the enforcement probe must not wait for EOF on a possibly-orphaned pipe"
+        );
+        assert!(
+            code.contains("try_wait"),
+            "the probe must poll the child with a deadline"
         );
     }
 }

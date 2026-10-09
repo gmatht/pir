@@ -1360,6 +1360,11 @@ fn main() {
                 "tokens_out": agent.usage.output,
             }));
         }
+        // Reclaim this session's cgroup slice before leaving: the startup sweep
+        // skips the *current* session by design, so a one-shot run would
+        // otherwise leak /sys/fs/cgroup/pir-0/<session> like every other exit
+        // path did.
+        let _ = crate::resource::remove_own_session_slice();
         std::process::exit(exit as i32)
     }
 
@@ -1887,6 +1892,11 @@ fn main() {
                     }
                     term::raw::disable_raw();
                     println!("{}", term::dim(&resume_hint(session_path.as_ref())));
+                    // Reclaim this session's cgroup slice. The startup sweep
+                    // deliberately skips the *current* session (removing it mid-run
+                    // would race a command's pre_exec join), so nothing else ever
+                    // collected it — every run leaked /sys/fs/cgroup/pir-0/<session>.
+                    let _ = crate::resource::remove_own_session_slice();
                     return;
                 }
                 term::raw::RawInput::Quit => {
@@ -1939,6 +1949,11 @@ fn main() {
                     }
                     term::raw::disable_raw();
                     println!("{}", term::dim(&resume_hint(session_path.as_ref())));
+                    // Reclaim this session's cgroup slice. The startup sweep
+                    // deliberately skips the *current* session (removing it mid-run
+                    // would race a command's pre_exec join), so nothing else ever
+                    // collected it — every run leaked /sys/fs/cgroup/pir-0/<session>.
+                    let _ = crate::resource::remove_own_session_slice();
                     return;
                 }
                 term::raw::RawInput::Suspend => {
@@ -2061,6 +2076,9 @@ fn main() {
             None => {
                 println!();
                 println!("{}", term::dim(&resume_hint(session_path.as_ref())));
+                // Reclaim this session's cgroup slice (see the note at the other
+                // exit points: the startup sweep skips the current session).
+                let _ = crate::resource::remove_own_session_slice();
                 break;
             }
             Some(s) => line = s,
@@ -4694,6 +4712,43 @@ fn run_zellij_rebuild(session: &str) -> i32 {
                         report.session, report.resumed_panes
                     ))
                 );
+                // A partial rebuild must not read as a clean one. Records exist
+                // for panes that were placed nowhere (their recorded slot matched
+                // no layout block — e.g. a tab whose panes zellij orders
+                // differently from the dump), so those panes come back with
+                // whatever the shell gives them. Say so, and say it with the
+                // count, because "restored 0 of 2" and "there was nothing to
+                // restore" must not look the same.
+                if report.unmatched_panes > 0 {
+                    eprintln!(
+                        "{}",
+                        term::yellow(&format!(
+                            "! {} recorded pir pane(s) could not be matched to a pane in the \
+                             layout — those panes will start fresh instead of resuming",
+                            report.unmatched_panes
+                        ))
+                    );
+                    // Name the stale records when we can: a record whose tab is
+                    // not a tab in this layout is *wrong data* (written when the
+                    // session's tabs differed, or by a build that spelled the
+                    // name differently), which is actionable in a way a bare
+                    // count is not.
+                    if !report.unknown_tabs.is_empty() {
+                        eprintln!(
+                            "{}",
+                            term::dim(&format!(
+                                "  stale records name tab(s) this layout does not have: {} \
+                                 (delete the pane's .zellij.json sidecar to stop it being offered)",
+                                report
+                                    .unknown_tabs
+                                    .iter()
+                                    .map(|t| format!("'{t}'"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ))
+                        );
+                    }
+                }
             }
             eprintln!(
                 "{}",

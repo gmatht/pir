@@ -1,4 +1,10 @@
 /target
+# Same class as `/target`: alternate build directories. `.buildtarget` is used
+# when the `target` symlink points at a mount that is temporarily unavailable
+# (see the WSL storage incident), and `target.bak` is a snapshot of a previous
+# one. Neither is part of the project, and both are large.
+/.buildtarget
+/target.bak
 /build
 /.pir
 
