@@ -2062,6 +2062,14 @@ fn main() {
             }
             term::set_prefill(&partial);
         }
+        // We are back at the interactive prompt: pir has stopped and is waiting
+        // for the operator, so ring the terminal bell. Done *here* — at the one
+        // idle `read_line` in the loop — rather than in the worker thread or in
+        // `finish_turn`, because a finished turn does not always mean "waiting
+        // for you": a queued prompt, an autoclean pass or an extension follow-up
+        // starts the *next* turn immediately, and that path never reaches this
+        // line. Ringing here fires exactly once per return to the prompt.
+        bus.waiting_for_input();
         let res = term::read_line("❯ ");
         // Ctrl-C cleared the line, but rustyline's relative-row redraw can
         // leave the tail of the inline hint behind when the cursor drifted
@@ -2122,6 +2130,15 @@ fn main() {
         let input = input.trim_end_matches('&').trim();
         if input.is_empty() {
             continue;
+        }
+        // The terminal echoed this line as it was typed (rustyline owns the idle
+        // prompt), so a multiline paste has already scrolled the screen once. Now
+        // that the line is submitted, replace what is on screen with the collapsed
+        // view so the scrollback reads as a compact placeholder instead of the whole
+        // pasted block. `input` itself is untouched below — the agent still gets
+        // every pasted line. Only worth doing when something was actually collapsed.
+        if let Some(collapsed) = term::collapse_for_display(input, None) {
+            term::out(&term::dim(&format!("{} {collapsed}", term::cyan("❯"))));
         }
         if let Some(cmd) = input.strip_prefix('/') {
             handle_command(cmd, &agent_slot, &mut providers, &mut jobs, &bus, &fg_cancel, false, &current_ctx);

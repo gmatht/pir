@@ -685,6 +685,55 @@ The capture reads `ZELLIJ_SESSION_NAME` + `ZELLIJ_PANE_ID` from the environment
 and spawns nothing, so it costs a single small file write per turn. Outside
 zellij it is a no-op — no file is written at all.
 
+### The pane title, which is what makes plain `zellij attach` work
+
+The sidecar alone only helps `pir -r @<session>`. For zellij's own
+`zellij attach` to bring back the *right* conversation, the identity has to be
+inside the layout zellij already persists — so once per process `pir` also
+claims its pane's title:
+
+```
+zellij action rename-pane --pane-id <ZELLIJ_PANE_ID> pir:<session-stem>
+```
+
+zellij serializes that as `name="pir:<session-stem>"` on the `pane` node and
+re-applies it when the session is resurrected. Verified end-to-end on 0.45.1: a
+live session's persisted layout contained
+
+```kdl
+pane command="pir" name="pir:pir-20261003-…-sh1" cwd="home/ai_pir/src/pir" focus=true {
+    start_suspended true
+}
+```
+
+**Why a title and not zellij's `post_command_discovery_hook`**, which is a
+supported feature aimed at exactly this problem:
+
+- **The hook cannot tell panes apart.** It runs `sh -c` from the zellij
+  *server*. The server's environment carries `ZELLIJ_SESSION_NAME` but **no
+  `ZELLIJ_PANE_ID`**, and its cwd is the server's (`PWD=/root`), not the pane's.
+  Anything per-pane is therefore impossible from the hook.
+- **It costs a fork per active pane per second, forever.** The server drives it
+  on a 1 s timer and again on every process change in a pane.
+- A pane title is **per-pane data zellij already serializes and restores** — no
+  polling, no hook.
+
+Two deliberate limits. The title is set **once per process** (guarded by a
+latch), so the prompt path still pays for at most one `zellij` spawn per
+session. And a title the operator set by hand is **never** overwritten: only a
+title that is empty or already `pir:`-prefixed is claimed. A consequence worth
+stating: because the latch holds for the process's lifetime, a `/rewind` to a
+*different* transcript does not re-title the pane — the sidecar still tracks the
+new transcript, so `pir -r @<session>` stays correct, and only the title goes
+stale until the next `pir` starts in that pane.
+
+**Rebuild priority.** A `pir:` title is the *authoritative* pane→transcript key —
+it was written by the pane itself and survives a session that has exited, so it
+needs no inference. It therefore outranks the geometry join, and a pane carrying
+an unresolvable title (its log deleted or renamed) is left **empty** rather than
+filled by the positional guess. Restoring the wrong conversation into a pane is
+the one failure worth more than a pane that starts fresh.
+
 **Rebuilding.** `pir -r @<zellij-session>` recreates that session from its saved
 layout, rewriting each `pane command="pir"` to resume its recorded conversation:
 
@@ -771,6 +820,70 @@ A regression test drives the real create path under `script(1)`, which is the
 only way to reproduce the original condition (a test with null stdio and no
 session is the CI case, where the bug never appeared). Removing `setsid()` makes
 it fail: **20,032 ms** versus **161 ms** with it.
+
+---
+
+## 16. Multiline pastes collapse in the REPL
+
+Pasting a large block into either REPL no longer scrolls the input zone with
+every pasted line. The draft is *displayed* collapsed, while the **full text is
+still submitted to the agent**:
+
+```
+❯ [ error: bad thing 4 lines pasted ] fix the parser
+```
+
+The agent receives all four pasted lines followed by `fix the parser`; only the
+echo is abbreviated. The projection lives in `term::collapse_for_display`, which
+is pure and never mutates the buffer, so the display and the submission can never
+drift apart.
+
+Two details make it behave:
+
+- **The pasted span, not the whole draft.** The input readers record the byte
+  range that arrived inside a bracketed-paste wrapper (`ESC[200~ … ESC[201~`) —
+  `PasteSpan`, carried on `HistRecall` (streaming REPL) and `PasteState` (TUI).
+  Text typed *before* or *after* the paste lies outside that range and stays
+  visible, so a paste plus a trailing instruction reads as
+  `[ … N lines pasted ] fix the parser` rather than swallowing the instruction.
+- **A threshold.** Runs shorter than `PASTE_COLLAPSE_MIN_LINES` (4) are shown
+  verbatim — hiding a 3-line paste would be more surprising than echoing it.
+
+This is deliberately **not** done through rustyline's `Highlighter`: rustyline
+only consults a highlighter when colours are enabled (so `-n` would silently stop
+collapsing), and it computes the cursor layout from the real line length *before*
+highlighting, so a shortened echo would leave the terminal cursor past the visible
+text.
+
+### The idle prompt: pir reads a paste itself
+
+The idle `❯` prompt is rustyline's, and rustyline echoes a pasted block verbatim —
+one terminal line per pasted line — which is the echo the operator actually
+watches. There is no supported way to shorten that.
+
+So when a paste is pending, `read_line` **takes the line over** and reads it with
+pir's own raw reader (the same `read_chunk` the mid-turn spinner uses), which
+collapses the echo while keeping every pasted line in the buffer that is
+submitted. The detection is the interesting part:
+
+- raw mode is enabled **before** waiting, because with `ECHO` on the terminal
+  paints the paste — wrapper bytes and all (`ESC[200~alpha …`) — the instant it
+  arrives, before anything can classify it;
+- the wait is a blocking `poll()`, then `ioctl(FIONREAD)` asks how many bytes are
+  buffered. `FIONREAD` does not consume, and a paste arrives as one large write,
+  so a count above `PASTE_PENDING_BYTES` (16) means a paste while a lone keystroke
+  (1–3 bytes) does not;
+- a non-paste restores raw mode and returns `None`, and rustyline reads the
+  untouched bytes normally — so typing, history and completion are exactly as
+  before. A paste is the only case pir owns the line.
+
+`recv(MSG_PEEK)` is the obvious tool here and is **wrong**: on a pty it fails with
+`ENOTSOCK` (verified), which is why the check is `poll` + `FIONREAD`. Under
+`--no-raw` the takeover is skipped entirely (`raw::enabled()`), since the bracketed
+wrapper does not exist on that path.
+
+The projection is rendered at four points: the idle prompt (above), the spinner
+line mid-turn, the TUI footer, and the one-line echo at submit.
 
 ---
 

@@ -312,10 +312,17 @@ pub fn out(s: &str) {
         set_parked(false);
     }
     let bytes = s.as_bytes();
-    let written = 0usize;
+    // Bytes already accepted by the terminal. `write_all` can fail *after*
+    // writing a prefix (a short write, then EAGAIN), so each retry must resume
+    // from where the last one stopped — otherwise every retry re-sends the
+    // whole string from offset 0, duplicating the prefix that already landed.
+    let mut written = 0usize;
     // Bound the total work so a persistent stall can't spin forever.
     for _ in 0..1024 {
         let mut stdout = io::stdout();
+        // `write_all` (not `write`) so a short write is completed internally; a
+        // returned error therefore means *nothing* of this call was counted, and
+        // the EAGAIN/Interrupted arms below may retry the remaining slice safely.
         match stdout.write_all(&bytes[written..]) {
             Ok(()) => {
                 let _ = stdout.flush();
@@ -341,9 +348,16 @@ pub fn out(s: &str) {
                 // So save the original flags and restore them after the wait.
                 // A later write that finds the pipe still full simply returns
                 // EAGAIN and takes this same path again, which is correct.
-                let saved_flags = set_nonblocking(fd_of_stdout());
+                //
+                // Before waiting, flush what the kernel already accepted so the
+                // prefix is visible *now* rather than only once the tail lands;
+                // this is what keeps a partially-written countdown from looking
+                // like a frozen screen while we wait for the terminal.
+                let _ = stdout.flush();
+                let fd = io::stdout().as_raw_fd();
+                let saved_flags = set_nonblocking(fd);
                 let block = async {
-                    if let Ok(a) = smol::Async::new(unsafe { std::fs::File::from_raw_fd(fd_of_stdout()) }) {
+                    if let Ok(a) = smol::Async::new(unsafe { std::fs::File::from_raw_fd(fd) }) {
                         let _ = a.writable().await;
                         std::mem::forget(a); // we only borrowed fd 1; never close it
                     }
@@ -351,7 +365,7 @@ pub fn out(s: &str) {
                 smol::block_on(block);
                 // Restore blocking mode (see above) so every other stdout writer
                 // in the process keeps its write-and-block semantics.
-                restore_flags(fd_of_stdout(), saved_flags);
+                restore_flags(fd, saved_flags);
                 continue;
             }
             Err(_) => return, // broken/closed pipe: give up silently
@@ -363,42 +377,6 @@ pub fn out(s: &str) {
 #[cfg(unix)]
 pub fn out_flush() {
     let _ = io::stdout().flush();
-}
-
-/// The file descriptor of stdout (fd 1). A tiny wrapper so the EAGAIN wait can
-/// recover the fd on both sides of the `async` block without holding a borrow
-/// of a temporary `Stdout` handle across it.
-#[cfg(unix)]
-fn fd_of_stdout() -> i32 {
-    libc::STDOUT_FILENO
-}
-
-/// Set `O_NONBLOCK` on `fd`, returning the previous flags (or `-1` when the
-/// fcntl failed). The caller MUST hand the return value to [`restore_flags`]
-/// once the non-blocking window is over — leaving the flag set leaks the
-/// status bit to every other writer of that fd, which is the freezing-spinner
-/// bug this pair exists to prevent. Extracted so a test can drive it on a pipe
-/// instead of on stdout.
-#[cfg(unix)]
-fn set_nonblocking(fd: i32) -> i32 {
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags != -1 {
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-        flags
-    }
-}
-
-/// Restore the flags saved by [`set_nonblocking`]. A `-1` (the save failed, so
-/// nothing was changed) is a no-op.
-#[cfg(unix)]
-fn restore_flags(fd: i32, saved: i32) {
-    if saved != -1 {
-        unsafe {
-            libc::fcntl(fd, libc::F_SETFL, saved);
-        }
-    }
 }
 
 /// Width of the terminal in columns (used to size the REPL hrule). Falls back
@@ -502,6 +480,101 @@ pub fn hrule() -> String {
 pub fn hrule_w(w: usize) -> String {
     dim(&"─".repeat(w))
 }
+
+/// Fewest pasted lines that are collapsed for display.
+///
+/// A paste shorter than this is left verbatim: it is cheap to echo and hiding it
+/// would be more surprising than showing it. At 4 lines (`3` embedded newlines) a
+/// paste is long enough to scroll the input zone and worth a placeholder.
+pub const PASTE_COLLAPSE_MIN_LINES: usize = 4;
+
+/// Longest run of the pasted first line kept in the placeholder's prefix.
+const PASTE_PREFIX_CHARS: usize = 24;
+
+/// Collapse a multi-line draft into a one-line placeholder for **display only**.
+///
+/// A multiline paste is echoed as `[ <prefix> N lines pasted ]` so it cannot scroll
+/// the input zone, with any text typed after the paste kept verbatim on the same
+/// display line:
+///
+/// ```text
+/// draft:  "fn main() {\n  let x = 1;\n  x + 1\n}\nfix this"
+/// view:   "[ fn main() { 4 lines pasted ] fix this"
+/// ```
+///
+/// `run` is the half-open **byte** range of the draft that came from the paste (see
+/// [`PasteSpan`]). Text before the run is kept, the run becomes the placeholder, and
+/// text after it is kept — that is what lets a real instruction typed after a paste
+/// survive. When `run` is `None` (an idle line where the paste span was not
+/// recorded, since rustyline owns that buffer) the whole draft is treated as the run,
+/// which is correct for a pure paste and degrades gracefully otherwise.
+///
+/// Returns `None` when the draft needs no collapsing (a single line, or a run shorter
+/// than [`PASTE_COLLAPSE_MIN_LINES`]), so callers can render the draft unchanged.
+///
+/// **The draft is never modified.** This is a projection: the caller still submits
+/// the original string, newlines and all, so the agent receives the whole paste.
+/// Everything here is pure, so the transformation is unit-testable without a tty.
+pub fn collapse_for_display(draft: &str, run: Option<PasteSpan>) -> Option<String> {
+    let (start, end) = match run {
+        Some(r) => (r.start.min(draft.len()), r.end.min(draft.len())),
+        None => (0, draft.len()),
+    };
+    // Byte offsets come from the input readers at wrapper boundaries, which are always
+    // char boundaries — but a hand-built or stale `PasteSpan` must never panic the REPL,
+    // so refuse anything that is not a valid slice rather than trusting it.
+    if start > end || !draft.is_char_boundary(start) || !draft.is_char_boundary(end) {
+        return None;
+    }
+    let pasted = &draft[start..end];
+    // Lines *inside* the pasted run. A run with fewer than the threshold is not
+    // worth hiding — that is the boundary case.
+    let lines: Vec<&str> = pasted.split('\n').collect();
+    let hidden = if pasted.ends_with('\n') { lines.len() - 1 } else { lines.len() };
+    if hidden < PASTE_COLLAPSE_MIN_LINES {
+        return None;
+    }
+    // The prefix identifies the paste by its first line, so two pastes read
+    // differently at a glance.
+    let first = lines.first().copied().unwrap_or_default().trim();
+    let prefix: String = first.chars().take(PASTE_PREFIX_CHARS).collect();
+    let placeholder = if prefix.is_empty() {
+        format!("[ {hidden} lines pasted ]")
+    } else {
+        let ellipsis = if first.chars().count() > PASTE_PREFIX_CHARS { "…" } else { "" };
+        format!("[ {prefix}{ellipsis} {hidden} lines pasted ]")
+    };
+    // Stitch the surrounding (non-pasted) text back around the placeholder,
+    // trimming the whitespace that separated it from the run so the result is a
+    // single clean line.
+    let before = draft[..start].trim();
+    let after = draft[end..].trim();
+    let mut out = String::new();
+    if !before.is_empty() {
+        out.push_str(before);
+        out.push(' ');
+    }
+    out.push_str(&placeholder);
+    if !after.is_empty() {
+        out.push(' ');
+        out.push_str(after);
+    }
+    Some(out)
+}
+
+/// The half-open byte range of the draft that came from a bracketed paste.
+///
+/// Recorded by the input readers when `ESC[200~` opens and `ESC[201~` closes, so
+/// [`collapse_for_display`] can hide exactly the pasted block while leaving text the
+/// operator typed before or after it visible. Without it, a paste and the instruction
+/// typed after it are indistinguishable in the buffer (they concatenate with no
+/// separator), and the placeholder would swallow the instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasteSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
 
 /// Rows to scroll so the idle input zone (top hrule + prompt) fits above the
 /// 1-line footer, which serves as the zone's bottom border: with the cursor on
@@ -731,6 +804,34 @@ fn content_lead_in(parked: bool, h: usize) -> String {
     }
     let (_, region_bottom) = zone_geometry(h);
     format!("\x1b[{region_bottom};1H\n")
+}
+
+/// Set `O_NONBLOCK` on `fd`, returning the previous flags (or `-1` when the
+/// fcntl failed). The caller MUST hand the return value to [`restore_flags`]
+/// once the non-blocking window is over — leaving the flag set leaks the
+/// status bit to every other writer of that fd, which is the freezing-spinner
+/// bug this pair exists to prevent. Extracted so a test can drive it on a pipe
+/// instead of on stdout.
+#[cfg(unix)]
+fn set_nonblocking(fd: i32) -> i32 {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags != -1 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        flags
+    }
+}
+
+/// Restore the flags saved by [`set_nonblocking`]. A `-1` (the save failed, so
+/// nothing was changed) is a no-op.
+#[cfg(unix)]
+fn restore_flags(fd: i32, saved: i32) {
+    if saved != -1 {
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFL, saved);
+        }
+    }
 }
 
 /// Byte sequence that reserves the footer zone: confine scrolling to the
@@ -1903,11 +2004,18 @@ pub struct HistRecall {
     /// because `HistRecall` only persists cursor/recall across polls while
     /// `MidTurn` (owned per poll batch) does the completion work.
     pub tab: Option<(usize, Vec<String>)>,
+    /// Byte range of the draft that came from a bracketed paste (see [`PasteSpan`]).
+    ///
+    /// Persisted here, not on `MidTurn`, because the collapse must survive past the
+    /// poll that received the paste: the spinner keeps rendering the placeholder on
+    /// later polls, and `MidTurn` is rebuilt fresh each call. Reset whenever the draft
+    /// is submitted or abandoned, so a stale span can never mis-collapse a new line.
+    pub paste: Option<PasteSpan>,
 }
 
 impl Default for HistRecall {
     fn default() -> Self {
-        HistRecall { idx: -1, saved: String::new(), cursor: None, tab: None }
+        HistRecall { idx: -1, saved: String::new(), cursor: None, tab: None, paste: None }
     }
 }
 
@@ -1923,6 +2031,9 @@ pub struct MidTurn {
     pub cursor: Option<usize>,
     /// Tab-cycle state: (word start, candidates, next index).
     pub tab: Option<(usize, Vec<String>, usize)>,
+    /// Byte range of `buf` that came from a bracketed paste, for the display-only
+    /// collapse (see [`PasteSpan`]). Opened at `ESC[200~`, closed at `ESC[201~`.
+    pub paste: Option<PasteSpan>,
 }
 
 impl MidTurn {
@@ -2282,6 +2393,18 @@ pub(crate) fn csi_arrow(seq: &[u8]) -> Option<bool> {
 pub fn read_line(prompt: &str) -> Option<String> {
     use rustyline::error::ReadlineError;
 
+    // A bracketed paste may already be arriving. rustyline would echo it *raw* —
+    // one terminal line per pasted line — and it cannot be made to collapse (its
+    // `Highlighter` is bypassed when colours are off and computes the cursor from
+    // the real line length before highlighting). So when a paste wrapper is at the
+    // head of the input, read the line with pir's own raw reader instead: it
+    // collapses the echo to a placeholder and still keeps every pasted line in the
+    // buffer that gets submitted. A non-paste keystroke falls through to rustyline
+    // unchanged, so history/editing/completion are untouched in the common case.
+    if let Some(line) = read_pasted_line(prompt) {
+        return Some(line);
+    }
+
     // Initialization is best-effort; fall back to plain stdin if needed.
     EDITOR.with(|e| {
         if e.borrow().is_none() {
@@ -2318,6 +2441,127 @@ pub fn read_line(prompt: &str) -> Option<String> {
     // paste in the console input buffer and coalesce it ourselves — see
     // `coalesce_paste`.
     .map(|acc| coalesce_paste(prompt, acc))
+}
+
+/// If a bracketed paste is already pending on stdin, read the whole line with pir's
+/// own raw reader (which collapses the echo) and return it; otherwise return `None`
+/// so the caller uses rustyline.
+///
+/// Why this exists: rustyline echoes a pasted block verbatim — one terminal line per
+/// pasted line — and there is no supported way to shorten that (see [`read_line`]).
+/// Owning just the paste case keeps the collapse honest without giving up rustyline's
+/// editing/history/completion for ordinary typing.
+///
+/// Detection uses `ioctl(FIONREAD)`, which reports how many bytes are buffered
+/// **without consuming them** — the right tool on a tty, where `recv(MSG_PEEK)` fails
+/// with `ENOTSOCK` (verified: recv on a pty returns ENOTSOCK). A paste arrives as a
+/// single large write, so a buffered count above a small threshold means a paste is
+/// waiting; a lone typed keystroke is one byte and falls through to rustyline.
+///
+/// Unix-only: the paste wrapper is a Unix-terminal concept and rustyline already
+/// coalesces pastes on Windows via [`coalesce_paste`].
+#[cfg(unix)]
+fn read_pasted_line(prompt: &str) -> Option<String> {
+    use std::io::Write as _;
+    use std::os::unix::io::AsRawFd;
+    if !is_terminal() {
+        return None;
+    }
+    // `--no-raw` disables our reader entirely (line-buffered stdin, no bracketed
+    // paste); taking the line over there would block oddly and lose the wrapper we
+    // depend on. Fall through to rustyline / the plain reader.
+    if !raw::enabled() {
+        return None;
+    }
+    let fd = io::stdin().as_raw_fd();
+
+    // Enter raw mode *before* waiting: with ECHO on, the terminal echoes the paste
+    // (wrapper bytes and all) the moment it arrives, before we can classify it — the
+    // `ESC[200~alpha` splatter. Raw mode turns ECHO off, so nothing is painted until we
+    // decide what to do.
+    //
+    // Raw mode is a normal toggle here (the REPL already brackets every turn with it),
+    // and it is *reversible*: on the non-paste branch below we restore it and hand the
+    // line to rustyline. FIONREAD never consumes, so a keystroke read during the wait is
+    // still pending for rustyline afterwards.
+    let was_raw = raw::is_active();
+    if !was_raw {
+        raw::enable_raw();
+    }
+
+    let mut pending: libc::c_int = 0;
+    // Wait (idle, ~0% CPU) for the first byte of real input, then ask FIONREAD how much
+    // is buffered: a paste lands as one large write, a keystroke as one or three bytes.
+    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    let ready = unsafe { libc::poll(&mut pfd, 1, -1) };
+    let is_paste = ready > 0
+        && unsafe { libc::ioctl(fd, libc::FIONREAD, &mut pending) } == 0
+        && (pending as usize) >= PASTE_PENDING_BYTES;
+    if !is_paste {
+        // Ordinary typing (or an interrupt): restore the terminal and let rustyline own
+        // the line, exactly as before. The pending bytes are untouched.
+        if !was_raw {
+            raw::disable_raw();
+        }
+        return None;
+    }
+
+    // A paste is buffered. Own the line: print the prompt and read with the same
+    // machinery the mid-turn spinner uses, which records the paste span and collapses
+    // the *display* while keeping every line in the buffer.
+    let mut out = io::stdout();
+    let _ = write!(out, "{prompt}");
+    let _ = out.flush();
+
+    // A paste is buffered. Own the line: raw mode is already on (above), so just print
+    // the prompt and read with the same machinery the mid-turn spinner uses — it records
+    // the paste span and collapses the *display*, keeping every line in the buffer.
+    let mut out = io::stdout();
+    let _ = write!(out, "{prompt}");
+    let _ = out.flush();
+
+    let mut buf = String::new();
+    let ta: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let mut recall = HistRecall::default();
+    // Read until Enter (a `Line`), EOF, or a cancel. `read_chunk` collapses the
+    // display via the paste span it records, so what the user sees is the
+    // placeholder while `buf` keeps every pasted line.
+    let line = loop {
+        match raw::read_chunk(&mut buf, &ta, &mut recall) {
+            raw::RawInput::Line(l) => break Some(l),
+            raw::RawInput::Eof | raw::RawInput::Quit => break None,
+            // Interrupt/cancel on the paste: abandon the line, as at the idle prompt.
+            raw::RawInput::Interrupt | raw::RawInput::Cancel => {
+                buf.clear();
+                break Some(String::new());
+            }
+            _ => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    };
+    // Restore the terminal state the idle prompt expects.
+    if !was_raw {
+        raw::disable_raw();
+    }
+    // Leave the cursor on a fresh line so the turn's output starts cleanly.
+    println!();
+    line
+}
+
+/// Bytes buffered on stdin that mean "a paste is waiting" rather than "one keystroke".
+///
+/// A bracketed-paste wrapper alone is 12 bytes (`ESC[200~` + `ESC[201~`), and any real
+/// paste is longer, so this sits comfortably above a single typed byte (or a 3-byte
+/// arrow key) and below a genuine paste. When in doubt the check falls through to
+/// rustyline, which is the safe direction: the cost is a raw echo, never a lost
+/// keystroke.
+#[cfg(unix)]
+const PASTE_PENDING_BYTES: usize = 16;
+
+#[cfg(not(unix))]
+fn read_pasted_line(_prompt: &str) -> Option<String> {
+    None
 }
 
 fn plain_read_line(prompt: &str) -> Option<String> {
@@ -2562,7 +2806,68 @@ pub fn push_history(line: &str) {
 pub struct Spinner {
     handle: Option<JoinHandle<()>>,
     alive: Arc<AtomicBool>,
+    /// Shared one-line status the tick thread renders *instead of* "thinking".
+    ///
+    /// This exists so a long wait can be shown where the eye already is — on the
+    /// footer row the tick thread repaints every 80ms — rather than as a one-shot
+    /// line written through `term::out`. That mattered for the retry countdown:
+    /// `term::out` scrolls the line into the content region (see
+    /// `content_lead_in`), and the very next tick (≤80ms later) repaints the
+    /// footer and re-parks the cursor, so a printed countdown scrolled away
+    /// almost immediately. The screen then sat on a stale `running · 0s` frame
+    /// for the whole (multi-minute, growing) backoff, which is indistinguishable
+    /// from a freeze. Writing into the footer itself makes each tick show the
+    /// *current* remaining seconds, so the wait visibly advances.
+    ///
+    /// `None` means "no status override": render `label` as usual.
+    status: Arc<StatusCell>,
 }
+
+/// The shared, last-writer-wins status line for a spinner's footer.
+///
+/// A `Mutex<Option<String>>` rather than an atomic because the value is a short
+/// formatted string ("retrying in 42s"). A poisoned lock never matters here — a
+/// torn status line is a cosmetic problem, not a correctness one — so the
+/// accessors recover rather than panic, matching `screen_lock()`.
+#[derive(Default)]
+pub struct StatusCell(std::sync::Mutex<Option<String>>);
+
+impl StatusCell {
+    /// Set the override line. Empty/blank clears it back to the normal `label`.
+    pub fn set(&self, s: impl Into<String>) {
+        let s = s.into();
+        let v = if s.trim().is_empty() { None } else { Some(s) };
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = v;
+    }
+
+    /// Clear the override, restoring the plain `label`.
+    pub fn clear(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// The current override, or `None` when no status is set. Crate-visible so
+    /// the Windows spinner module can read it too.
+    pub(crate) fn get(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// Count of live spinner tick threads. A `Spinner` is only "done" once its
+/// thread has been joined — which is `stop()`'s job. If a turn unwinds via a
+/// path that returns without calling `stop()`, the thread is orphaned and
+/// keeps repainting `⠹ running · Ns · <cwd>` over the idle prompt forever (the
+/// reported permanently-stale spinner line). Exposed so a regression test can
+/// assert the count returns to its starting value after a turn, which is the
+/// only way to see the leak from outside the process.
+static LIVE_SPINNERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of spinner tick threads currently alive (not yet joined). See
+/// [`LIVE_SPINNERS`]. Test-facing: a turn that returns cleanly must leave this
+/// unchanged.
+pub fn live_spinner_threads() -> usize {
+    LIVE_SPINNERS.load(Ordering::SeqCst)
+}
+
 
 #[cfg(unix)]
 impl Spinner {
@@ -2588,21 +2893,58 @@ impl Spinner {
     /// writing its "thinking" block to the terminal behind the user's prompt.
     #[cfg(unix)]
     pub fn start(label: &str, typeahead: Arc<Mutex<String>>, enabled: bool) -> Spinner {
-        Spinner::start_with(label, typeahead, enabled, Arc::new(AtomicBool::new(false)))
+        Spinner::start_with(label, typeahead, enabled, Arc::new(AtomicBool::new(false)), std::time::Instant::now())
     }
 
     /// Like [`Spinner::start`], but also stops drawing when `quiet` is set (used
     /// by the agent, which passes its shared `quiet_req` so a turn detached
     /// mid-"thinking" silences the spinner immediately).
+    ///
+    /// `since` is the instant the **turn** began, not the moment this spinner was
+    /// created — see [`Spinner::start_with_status`] for why that distinction is
+    /// the difference between a clock that counts up and one stuck at `0s`.
     #[cfg(unix)]
     pub fn start_with(
         label: &str,
         typeahead: Arc<Mutex<String>>,
         enabled: bool,
         quiet: Arc<AtomicBool>,
+        since: std::time::Instant,
+    ) -> Spinner {
+        Self::start_with_status(
+            label,
+            typeahead,
+            enabled,
+            quiet,
+            Arc::new(StatusCell::default()),
+            since,
+        )
+    }
+
+    /// [`Spinner::start_with`], plus a shared [`StatusCell`] the caller may write
+    /// to at any time to replace the footer's `label` (used for the live retry
+    /// countdown — see [`StatusCell`]). The cell is cloned into the tick thread,
+    /// so a caller holding the handle can update the footer between ticks.
+    ///
+    /// `since` is the instant the elapsed readout counts from. It must be the
+    /// **turn's** start, not `Instant::now()`. A turn creates a new spinner on
+    /// every model round (before the first token, during the tool batch, and
+    /// between rounds) because each round's footer shows a different label; if
+    /// each spinner timed itself the clock would restart at `0s` every round,
+    /// so a long turn — e.g. one cycling through retry backoff — would display
+    /// `running · 0s` forever instead of counting up. Passing one turn-level
+    /// instant makes every spinner for that turn agree on the elapsed time.
+    #[cfg(unix)]
+    pub fn start_with_status(
+        label: &str,
+        typeahead: Arc<Mutex<String>>,
+        enabled: bool,
+        quiet: Arc<AtomicBool>,
+        status: Arc<StatusCell>,
+        since: std::time::Instant,
     ) -> Spinner {
         if !enabled {
-            return Spinner { handle: None, alive: Arc::new(AtomicBool::new(false)) };
+            return Spinner { handle: None, alive: Arc::new(AtomicBool::new(false)), status };
         }
         // Reserve the footer zone synchronously (before the first tick runs):
         // confine scrolling to the content region and park the cursor, so
@@ -2619,7 +2961,9 @@ impl Spinner {
         let alive = Arc::new(AtomicBool::new(true));
         let a = alive.clone();
         let q = quiet.clone();
+        let st = status.clone();
         let label = label.to_string();
+        LIVE_SPINNERS.fetch_add(1, Ordering::SeqCst);
         let handle = thread::spawn(move || {
             let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
             let mut i = 0usize;
@@ -2627,9 +2971,13 @@ impl Spinner {
             // The working directory shown in the footer's status. Captured once:
             // it can't change while a turn is running.
             let cwd = crate::workspace_label();
-            // Tick zero for the elapsed-time readout (`thinking · 12s · …`),
-            // so a slow-but-alive turn is visibly distinct from a stuck one.
-            let started = std::time::Instant::now();
+            // Tick zero for the elapsed-time readout (`thinking · 12s · …`), so a
+            // slow-but-alive turn is visibly distinct from a stuck one. Counts
+            // from the **turn's** start (`since`), not this spinner's creation:
+            // the turn builds a fresh spinner every model round, so timing from
+            // `Instant::now()` here would restart the clock at 0s each round and
+            // a long turn would read `running · 0s` forever.
+            let started = since;
             let w = terminal_width().max(20);
             let mut erased = false;
             while a.load(Ordering::SeqCst) {
@@ -2666,9 +3014,14 @@ impl Spinner {
                 buf.push_str(&format!("\x1b[1;{region_bottom}r"));
                 if h >= 4 {
                     let elapsed = fmt_elapsed(started.elapsed());
+                    // A caller-supplied status (the live retry countdown) takes
+                    // the label's place for this tick, so the footer shows the
+                    // wait where the eye already is. Re-read every tick: the
+                    // whole point is that it changes.
+                    let eff_label = st.get().unwrap_or_else(|| label.clone());
                     for (k, content) in midturn_zone_lines(
                         &frame.to_string(),
-                        &label,
+                        &eff_label,
                         &elapsed,
                         &cwd,
                         &typed,
@@ -2709,8 +3062,24 @@ impl Spinner {
                 let _screen = screen_lock();
                 erase_footer();
             }
+            // The tick thread is about to exit; publish that so
+            // `live_spinner_threads()` measures *joined* threads. Decrementing
+            // after the loop (not when `alive` flips) is what makes the count
+            // prove the join actually happened: a turn that skips `stop()`
+            // never joins, so the decrement never runs and the leak is visible.
+            LIVE_SPINNERS.fetch_sub(1, Ordering::SeqCst);
         });
-        Spinner { handle: Some(handle), alive }
+        Spinner { handle: Some(handle), alive, status }
+    }
+
+    /// The shared status cell for this spinner's footer.
+    ///
+    /// Write to it to replace the footer's label (a live retry countdown), and
+    /// `clear()` it to fall back to the original label. Cheap: the tick thread
+    /// re-reads it every 80ms.
+    #[cfg(unix)]
+    pub fn status(&self) -> &Arc<StatusCell> {
+        &self.status
     }
 
     /// Stop the spinner and erase its block. Safe to call multiple times.
@@ -2873,6 +3242,13 @@ pub mod raw {
     /// to a child shell.
     pub fn is_active() -> bool {
         STATE.lock().unwrap().active
+    }
+
+    /// Whether pir's raw reader is available at all (`--no-raw` turns it off).
+    /// Callers that would otherwise take stdin over — like the idle-prompt paste
+    /// reader — must check this and fall back to the line-buffered path.
+    pub fn enabled() -> bool {
+        *ENABLED.lock().unwrap()
     }
 
     /// Enable bracketed-paste mode (`ESC [ ? 2 0 0 4 h`). While this is on, the
@@ -3194,16 +3570,18 @@ libc::tcsetattr(fd, libc::TCSANOW, &to_raw_mode(tios));
             buf: std::mem::take(buf),
             cursor: recall.cursor,
             tab: recall.tab.take().map(|(s, c)| (s, c, 0)),
+            paste: recall.paste,
         };
         let sync = |ed: &mut super::MidTurn, buf: &mut String, recall: &mut super::HistRecall| {
             recall.cursor = ed.cursor;
             recall.tab = ed.tab.clone().map(|(s, c, _)| (s, c));
+            recall.paste = ed.paste;
             // Clone, not take/move: `ed` stays the accumulator across bytes
             // within this call AND across `wait_input` polls (cursor/tab live
             // in `recall`). Taking here ate every insert — Enter returned
             // Line("") and mid-turn typing vanished.
             *buf = ed.buf.clone();
-            update_typeahead(buf, typeahead);
+            update_typeahead(buf, typeahead, ed.paste);
         };
         // `pasting` tracks whether we're inside a bracketed-paste wrapper
         // (`ESC[200~` … `ESC[201~`). It is local because `read_chunk` always
@@ -3280,6 +3658,9 @@ libc::tcsetattr(fd, libc::TCSANOW, &to_raw_mode(tios));
                         let line = std::mem::take(&mut ed.buf);
                         ed.cursor = None;
                         ed.tab = None;
+                        // The line is submitted: the paste span must not survive to
+                        // mis-collapse the next draft.
+                        ed.paste = None;
                         sync(&mut ed, buf, recall);
                         super::reset_quit_presses();
                         recall.reset();
@@ -3302,6 +3683,7 @@ libc::tcsetattr(fd, libc::TCSANOW, &to_raw_mode(tios));
                         let line = std::mem::take(&mut ed.buf);
                         ed.cursor = None;
                         ed.tab = None;
+                        ed.paste = None;
                         sync(&mut ed, buf, recall);
                         super::reset_quit_presses();
                         recall.reset();
@@ -3469,6 +3851,17 @@ libc::tcsetattr(fd, libc::TCSANOW, &to_raw_mode(tios));
                         // body between them keeps being literal text (newlines
                         // included). `continue` skips the loop's trailing `i += 1`.
                         pasting = start; // `200~` = start
+                        // Record the pasted byte range for the display-only collapse:
+                        // open at the current end of the buffer, close at it when the
+                        // wrapper ends. Text typed after the paste appends *outside*
+                        // the range and so stays visible.
+                        if start {
+                            ed.paste = Some(super::PasteSpan { start: ed.buf.len(), end: ed.buf.len() });
+                        } else if let Some(mut span) = ed.paste {
+                            span.end = ed.buf.len();
+                            ed.paste = Some(span);
+                        }
+                        sync(&mut ed, buf, recall);
                         i += 6;
                         continue;
                     }
@@ -3602,10 +3995,16 @@ libc::tcsetattr(fd, libc::TCSANOW, &to_raw_mode(tios));
     /// Mirror `buf` into the shared `typeahead` so the spinner/cursor reflects
     /// the current draft (including any pasted newlines). Single small helper
     /// so the three byte arms that mutate `buf` stay in sync.
-    fn update_typeahead(buf: &str, typeahead: &Arc<Mutex<String>>) {
+    ///
+    /// The mirror is the *collapsed* view (see [`collapse_for_display`]): a
+    /// multiline paste shows as a one-line placeholder on the spinner instead of
+    /// scrolling the whole block across the terminal. Only the display is
+    /// affected — `buf` still holds every pasted line, and that is what is
+    /// submitted.
+    pub(crate) fn update_typeahead(buf: &str, typeahead: &Arc<Mutex<String>>, paste: Option<super::PasteSpan>) {
         if let Ok(mut g) = typeahead.lock() {
             g.clear();
-            g.push_str(buf);
+            g.push_str(&super::collapse_for_display(buf, paste).unwrap_or_else(|| buf.to_string()));
         }
     }
 
@@ -3707,13 +4106,14 @@ libc::tcsetattr(fd, libc::TCSANOW, &to_raw_mode(tios));
             buf: std::mem::take(buf),
             cursor: None,
             tab: None,
+            paste: None,
         };
         let sync = |ed: &mut super::MidTurn, buf: &mut String| {
             // Clone, not take: `ed` stays the accumulator across keystrokes
             // within this call; only the Enter arm takes it into the Line.
             // (take here silently ate every insert — Enter returned Line("")).
             *buf = ed.buf.clone();
-            update_typeahead(buf, typeahead);
+            update_typeahead(buf, typeahead, ed.paste);
         };
         let mut pasting = false;
         let mut esc_meta = false;
@@ -3865,6 +4265,16 @@ libc::tcsetattr(fd, libc::TCSANOW, &to_raw_mode(tios));
                     // wrapper starts at `i`.
                     if let Some(start) = paste_marker_at(bytes, i) {
                         pasting = start; // `200~` = start
+                        // Record the pasted byte range for the display-only collapse
+                        // (see `read_chunk`). Text typed after the paste appends
+                        // outside the range and stays visible.
+                        if start {
+                            ed.paste = Some(super::PasteSpan { start: ed.buf.len(), end: ed.buf.len() });
+                        } else if let Some(mut span) = ed.paste {
+                            span.end = ed.buf.len();
+                            ed.paste = Some(span);
+                        }
+                        sync(&mut ed, buf);
                         // The wrapper is 6 bytes (`ESC [ 2 0 0 ~`) starting at
                         // `i`. `continue` skips the loop's trailing `i += 1`, so
                         // advance by 6 to land just past the wrapper. (Matches
@@ -4052,6 +4462,58 @@ mod tests {
         );
     }
 
+    /// The retry countdown must be *visible and changing*: the footer the tick
+    /// thread draws has to reflect the shared status cell, because that is the
+    /// only thing that proves the wait is ticking rather than frozen. A printed
+    /// line (`term::out`) scrolls into the content region and is repainted over
+    /// by the next tick, which is exactly how a 4-minute backoff came to look
+    /// like a dead process.
+    #[test]
+    fn status_cell_overrides_the_footer_label() {
+        let cell = StatusCell::default();
+        assert_eq!(cell.get(), None, "no override by default: footer shows the label");
+
+        cell.set("⏳ attempt 3 failed — retrying in 240s (Ctrl-C to stop)");
+        let line = cell.get().expect("status must be readable");
+        assert!(
+            line.contains("retrying in 240s"),
+            "the footer must carry the live countdown, got {line:?}"
+        );
+
+        // A later tick shows fewer seconds: the rendered line must change, or
+        // the countdown is not actually live.
+        cell.set("⏳ attempt 3 failed — retrying in 239s (Ctrl-C to stop)");
+        assert_ne!(cell.get(), Some(line), "a later tick must render a different line");
+
+        // Blank clears back to the plain label; so does an explicit clear.
+        cell.set("   ");
+        assert_eq!(cell.get(), None);
+        cell.set("x");
+        cell.clear();
+        assert_eq!(cell.get(), None);
+    }
+
+    /// The footer line is what the operator actually reads, so assert the status
+    /// reaches it (not just that the cell stores a string).
+    #[test]
+    fn midturn_zone_shows_the_status_in_place_of_the_label() {
+        let lines = midturn_zone_lines(
+            "⠋",
+            "⏳ attempt 2 failed — retrying in 42s (Ctrl-C to stop)",
+            "7s",
+            "~/proj",
+            "",
+            80,
+            false,
+        );
+        assert!(
+            lines[0].contains("retrying in 42s"),
+            "status row must show the countdown, got {:?}",
+            lines[0]
+        );
+        assert_eq!(lines.len(), 3, "zone stays three rows");
+    }
+
     // `Context` borrows a `History`; the helper ignores it, so an empty
     // in-memory history (kept in a static so it outlives the `Context`) is fine.
     fn ctx() -> Context<'static> {
@@ -4130,6 +4592,98 @@ mod tests {
         assert_eq!(super::fmt_elapsed(Duration::from_secs(3600)), "1h00m");
         assert_eq!(super::fmt_elapsed(Duration::from_secs(7384)), "2h03m");
     }
+
+    /// The footer's elapsed readout must measure the **turn**, not the spinner.
+    ///
+    /// A turn builds a fresh spinner on every model round (a `thinking` one
+    /// before the first token, a `running` one for the tool batch, another
+    /// between rounds) because each round shows a different label. A spinner
+    /// that timed itself from its own creation restarted the clock at `0s` every
+    /// round, so a long turn — e.g. one cycling through retry backoff —
+    /// displayed `running · 0s` indefinitely instead of counting up, which is
+    /// indistinguishable from a frozen process (the reported symptom).
+    ///
+    /// Asserted against the spinner's **actual terminal output**, not a
+    /// recomputation. A test that formats `since.elapsed()` itself passes even
+    /// when the tick thread ignores `since` entirely — verified: that weaker
+    /// version stayed green with the fix reverted. So the spinner is started
+    /// inside a pty (via `script(1)`, the technique the bash tty tests use) and
+    /// the bytes it painted are searched for the elapsed string. It is given a
+    /// start 95s in the past, so a self-timing spinner paints `0s` and this
+    /// fails.
+    #[cfg(unix)]
+    #[test]
+    fn spinner_footer_counts_from_the_turn_start_not_its_own_creation() {
+        if std::env::var_os(SPINNER_PROBE_ENV).is_none() {
+            // Parent: re-exec this test under a pty so the spinner's stdout is a
+            // terminal it will actually paint to.
+            if !script_available() {
+                eprintln!("skipping: no script(1) to allocate a pty");
+                return;
+            }
+            let exe = std::env::current_exe().expect("test binary path");
+            let probe = format!(
+                "{} --exact --nocapture term::tests::spinner_footer_counts_from_the_turn_start_not_its_own_creation",
+                exe.display()
+            );
+            let log =
+                std::env::temp_dir().join(format!("pir-spinner-{}.log", std::process::id()));
+            let mut sc = std::process::Command::new("script");
+            if cfg!(target_os = "macos") {
+                sc.arg("-q").arg(&log).arg("sh").arg("-c").arg(&probe);
+            } else {
+                sc.arg("-qec").arg(&probe).arg(&log);
+            }
+            let child = sc
+                .env(SPINNER_PROBE_ENV, "1")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("script(1) runs");
+            let painted = format!(
+                "{}{}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            )
+            .replace('\r', "");
+            assert!(
+                painted.contains("1m35s"),
+                "the spinner's own output must show the turn's elapsed time (1m35s); \
+                 a self-timing spinner would paint 0s. Painted bytes:\n{painted}"
+            );
+            return;
+        }
+        // Probe (inside the pty): give the spinner a turn start 95s in the past,
+        // let a few 80ms ticks paint, then stop it.
+        let since = std::time::Instant::now() - Duration::from_secs(95);
+        let mut sp = Spinner::start_with_status(
+            "running",
+            Arc::new(Mutex::new(String::new())),
+            true,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(StatusCell::default()),
+            since,
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        sp.stop();
+    }
+
+    /// Whether `script(1)` exists (it allocates the pty the test above needs).
+    /// A presence check, not a flag check: util-linux's `script` has `--version`
+    /// while BSD/macOS's has neither it nor `-c`.
+    fn script_available() -> bool {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg("command -v script")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Env that turns the test above into the in-pty spinner probe.
+    const SPINNER_PROBE_ENV: &str = "PIR_TERM_SPINNER_PROBE";
 
     #[test]
     fn zone_geometry_confines_zone_below_region() {
@@ -4621,6 +5175,135 @@ mod tests {
         let code = if exited { libc::WEXITSTATUS(status) } else { -1 };
         assert_eq!(code, 0, "wait_tty_answer did not receive the 'y' key (status {status})");
     }
+
+    // ---- paste collapsing (display-only projection) -------------------------
+
+    /// A span covering the whole draft — the shape a pure paste produces.
+    fn whole(s: &str) -> Option<PasteSpan> {
+        Some(PasteSpan { start: 0, end: s.len() })
+    }
+
+    #[test]
+    fn a_single_line_draft_is_not_collapsed() {
+        assert_eq!(collapse_for_display("just one line", whole("just one line")), None);
+    }
+
+    /// The boundary is [`PASTE_COLLAPSE_MIN_LINES`]: one short of it stays verbatim
+    /// (hiding a 3-line paste would be more surprising than showing it), and exactly
+    /// it collapses.
+    #[test]
+    fn collapse_boundary_is_the_documented_line_count() {
+        assert_eq!(collapse_for_display("a\nb\nc", whole("a\nb\nc")), None);
+        let got = collapse_for_display("a\nb\nc\nd", whole("a\nb\nc\nd")).expect("4 lines collapse");
+        assert!(got.contains("pasted"), "got: {got}");
+        assert!(got.contains('4'), "the collapsed run is 4 lines: {got}");
+        assert_eq!(PASTE_COLLAPSE_MIN_LINES, 4);
+    }
+
+    /// The placeholder must distinguish two different pastes, so it leads with a
+    /// truncated head of the paste's first line.
+    #[test]
+    fn placeholder_carries_a_prefix_of_the_first_pasted_line() {
+        let s = "fn main() {\n  let x = 1;\n  x + 1\n}";
+        let got = collapse_for_display(s, whole(s)).unwrap();
+        assert!(got.starts_with("[ fn main() {"), "got: {got}");
+        assert!(got.ends_with("4 lines pasted ]"), "got: {got}");
+    }
+
+    #[test]
+    fn a_long_first_line_is_truncated_with_an_ellipsis() {
+        let long = "x".repeat(100);
+        let s = format!("{long}\nb\nc\nd");
+        let got = collapse_for_display(&s, whole(&s)).unwrap();
+        assert!(got.contains('…'), "a truncated prefix is marked: {got}");
+        assert!(!got.contains(&long), "the whole long line leaked into the placeholder: {got}");
+    }
+
+    /// Text typed **after** the paste is the operator's real instruction and must
+    /// survive on the display line, after the placeholder. This is what the span
+    /// exists for: `fix the parser` sits *outside* the pasted range.
+    #[test]
+    fn text_after_the_paste_is_kept_after_the_placeholder() {
+        let pasted = "line1\nline2\nline3\nline4";
+        let draft = format!("{pasted}fix the parser");
+        let span = PasteSpan { start: 0, end: pasted.len() };
+        let got = collapse_for_display(&draft, Some(span)).unwrap();
+        assert!(got.contains("pasted"), "got: {got}");
+        assert!(got.ends_with("fix the parser"), "trailing text must survive: {got}");
+        assert!(!got.contains("line2"), "the pasted body leaked: {got}");
+    }
+
+    /// Text typed **before** the paste stays visible too, on the same line.
+    #[test]
+    fn text_before_the_paste_is_kept_before_the_placeholder() {
+        let pasted = "one\ntwo\nthree\nfour";
+        let draft = format!("see this: {pasted}");
+        let span = PasteSpan { start: "see this: ".len(), end: draft.len() };
+        let got = collapse_for_display(&draft, Some(span)).unwrap();
+        assert!(got.starts_with("see this: ["), "the lead-in must survive: {got}");
+        assert!(got.contains("4 lines pasted"), "got: {got}");
+    }
+
+    /// A span shorter than the threshold collapses nothing, even in a long draft —
+    /// the span, not the draft length, decides.
+    #[test]
+    fn a_short_paste_in_a_long_draft_is_not_collapsed() {
+        let draft = "a\nb\nc\nd\ntiny\npaste";
+        let span = PasteSpan { start: 9, end: draft.len() };
+        assert_eq!(collapse_for_display(draft, Some(span)), None);
+    }
+
+    /// A draft that ends in a newline is a 4-line paste, not 5 (the trailing empty
+    /// split is not a line).
+    #[test]
+    fn a_trailing_newline_does_not_inflate_the_line_count() {
+        let s = "a\nb\nc\nd\n";
+        assert_eq!(collapse_for_display(s, whole(s)).unwrap(), "[ a 4 lines pasted ]");
+    }
+
+    /// The load-bearing invariant: the projection must never mutate the draft. It
+    /// takes `&str` and is pure, so this pins it against a future refactor that
+    /// returns the collapsed text *as* the buffer.
+    #[test]
+    fn collapsing_is_a_projection_and_leaves_the_draft_untouched() {
+        let draft = "pasted\nwith\nmany\nlines\nand a tail";
+        let view = collapse_for_display(draft, whole(draft)).unwrap();
+        assert_ne!(view, draft);
+        assert_eq!(draft.matches('\n').count(), 4, "the source is unchanged");
+    }
+
+    /// A `PasteSpan` that is out of range or lands mid-character must make the
+    /// transform decline, never panic the REPL. Offsets come from the readers at
+    /// wrapper boundaries in practice, but the guard is what makes that a guarantee.
+    #[test]
+    fn a_malformed_span_is_refused_rather_than_panicking() {
+        // Reversed range.
+        assert_eq!(collapse_for_display("a\nb\nc\nd", Some(PasteSpan { start: 9, end: 2 })), None);
+        // Past the end of the draft (clamped, then just a short run → None).
+        assert_eq!(collapse_for_display("ab", Some(PasteSpan { start: 0, end: 999 })), None);
+        // Mid-character boundary: 'é' is two bytes, so offset 1 is not a boundary.
+        let s = "é\nb\nc\nd";
+        assert_eq!(collapse_for_display(s, Some(PasteSpan { start: 1, end: s.len() })), None);
+    }
+
+    /// The whole point: the buffer keeps every newline so the agent is submitted the
+    /// full paste, while the text mirrored for display is the placeholder. Drives the
+    /// same helper the mid-turn spinner uses.
+    #[test]
+    fn the_display_is_collapsed_but_the_buffer_keeps_every_line() {
+        let pasted = "error: bad thing\n  at line 1\n  at line 2\n  at line 3";
+        let ta = Arc::new(Mutex::new(String::new()));
+        super::raw::update_typeahead(pasted, &ta, whole(pasted));
+        let shown = ta.lock().unwrap().clone();
+        assert!(shown.contains("pasted"), "spinner shows the placeholder: {shown}");
+        assert!(
+            !shown.contains("at line 2"),
+            "the pasted body must not reach the display: {shown}"
+        );
+        // And the submitted buffer is the original, newlines intact.
+        assert_eq!(pasted.matches('\n').count(), 3);
+        assert!(pasted.contains("at line 2"));
+    }
 }
 
 #[cfg(test)]
@@ -4910,6 +5593,23 @@ mod paste_tests {
     use super::raw::{paste_marker_at, translate, RawInput};
     use std::sync::{Arc, Mutex};
 
+    /// The idle-prompt paste detection must sit between "one keystroke" and "a real
+    /// paste". A bracketed-paste wrapper alone is 12 bytes (`ESC[200~`+`ESC[201~`), so a
+    /// threshold at or below that would swallow ordinary typing (an arrow key is 3
+    /// bytes, a burst of fast typing could exceed a low bound); one above the wrapper but
+    /// below any real paste is the safe window, and the fall-through direction is to
+    /// rustyline.
+    #[test]
+    fn paste_pending_threshold_is_above_a_single_keystroke_and_the_bare_wrapper() {
+        assert!(
+            super::PASTE_PENDING_BYTES > 12,
+            "must exceed the 12-byte bare wrapper, or a pasted empty block would be \
+             mistaken for typing"
+        );
+        // Comfortably above a 1-3 byte keystroke / CSI sequence.
+        assert!(super::PASTE_PENDING_BYTES >= 8, "a single keystroke must not look like a paste");
+    }
+
     // A closed-pipe stdin must NOT busy-spin. `read_chunk` (and thus the
     // `wait_input` throttle path) must not spin; this guards the runaway-CPU
     // bug where a pipe at EOF made `smol::Async::readable()` fire immediately
@@ -4971,7 +5671,7 @@ mod paste_tests {
     #[test]
     fn midturn_word_motion_and_home_end() {
         use super::MidTurn;
-        let mut m = MidTurn { buf: "hello world".into(), cursor: None, tab: None };
+        let mut m = MidTurn { buf: "hello world".into(), ..Default::default() };
         m.move_word(true);
         assert_eq!(m.pos(), 6);
         m.move_word(true);
@@ -5002,10 +5702,10 @@ mod paste_tests {
     #[test]
     fn midturn_tab_completes_slash_and_thinking() {
         use super::MidTurn;
-        let mut m = MidTurn { buf: "/mod".into(), cursor: None, tab: None };
+        let mut m = MidTurn { buf: "/mod".into(), ..Default::default() };
         assert!(m.tab_complete());
         assert_eq!(m.buf, "/model");
-        let mut m = MidTurn { buf: "/thinking h".into(), cursor: None, tab: None };
+        let mut m = MidTurn { buf: "/thinking h".into(), ..Default::default() };
         assert!(m.tab_complete());
         assert_eq!(m.buf, "/thinking hi");
         // Second Tab cycles to the next candidate — order follows the
@@ -5016,6 +5716,46 @@ mod paste_tests {
         assert!(["/thinking high", "/thinking hide"].contains(&m.buf.as_str()), "got {}", m.buf);
         assert!(m.tab_complete());
         assert!(["/thinking high", "/thinking hide"].contains(&m.buf.as_str()), "got {}", m.buf);
+    }
+
+    /// End-to-end through the shared translator: a real bracketed-paste byte stream
+    /// must (a) keep every pasted line in the buffer that is submitted, and (b) mirror
+    /// the *collapsed* placeholder to `typeahead` for display. This is the contract the
+    /// whole feature rests on — display is lossy, submission is not.
+    #[test]
+    fn a_bracketed_paste_collapses_the_display_but_keeps_every_line_in_the_buffer() {
+        use super::raw::RawInput;
+        let mut buf = String::new();
+        let ta = Arc::new(Mutex::new(String::new()));
+        // ESC[200~ <4 lines> ESC[201~ — the wrapper a terminal sends around a paste.
+        let bytes = b"\x1b[200~alpha\nbravo\ncharlie\ndelta\x1b[201~";
+        let out = super::raw::translate(&mut buf, &ta, bytes);
+        // Not submitted: no Enter was in the stream.
+        assert!(matches!(out, RawInput::None), "a paste alone must not submit");
+        // The buffer holds every line, newlines intact — this is what is sent to the
+        // agent.
+        assert_eq!(buf, "alpha\nbravo\ncharlie\ndelta");
+        assert_eq!(buf.matches('\n').count(), 3);
+        // The mirrored display is the placeholder.
+        let shown = ta.lock().unwrap().clone();
+        assert!(shown.starts_with("[ alpha"), "got: {shown}");
+        assert!(shown.contains("4 lines pasted"), "got: {shown}");
+        assert!(!shown.contains("bravo"), "the pasted body reached the display: {shown}");
+    }
+
+    /// Text typed after a paste is part of the *same* buffer but outside the pasted
+    /// span, so the display keeps it beside the placeholder.
+    #[test]
+    fn a_paste_then_a_typed_instruction_keeps_the_instruction_visible() {
+        let mut buf = String::new();
+        let ta = Arc::new(Mutex::new(String::new()));
+        // Paste four lines, then type " go" with no Enter.
+        let bytes = b"\x1b[200~one\ntwo\nthree\nfour\x1b[201~ go";
+        let _ = super::raw::translate(&mut buf, &ta, bytes);
+        assert_eq!(buf, "one\ntwo\nthree\nfour go");
+        let shown = ta.lock().unwrap().clone();
+        assert!(shown.contains("pasted"), "got: {shown}");
+        assert!(shown.ends_with("go"), "the typed instruction must stay visible: {shown}");
     }
 
     #[test]
@@ -5340,11 +6080,18 @@ mod nonunix_term {
     pub struct Spinner {
         handle: Option<thread::JoinHandle<()>>,
         alive: Arc<AtomicBool>,
+        status: Arc<super::StatusCell>,
     }
 
     impl Spinner {
         pub fn start(label: &str, ta: Arc<Mutex<String>>, enabled: bool) -> Spinner {
             Spinner::start_with(label, ta, enabled, Arc::new(AtomicBool::new(false)))
+        }
+
+        /// The shared footer status (see `Unix`'s `StatusCell`): the live retry
+        /// countdown is written here so the wait is visible where the eye is.
+        pub fn status(&self) -> &Arc<super::StatusCell> {
+            &self.status
         }
 
         pub fn start_with(
@@ -5353,12 +6100,23 @@ mod nonunix_term {
             enabled: bool,
             quiet: Arc<AtomicBool>,
         ) -> Spinner {
+            Self::start_with_status(label, ta, enabled, quiet, Arc::new(super::StatusCell::default()))
+        }
+
+        pub fn start_with_status(
+            label: &str,
+            ta: Arc<Mutex<String>>,
+            enabled: bool,
+            quiet: Arc<AtomicBool>,
+            status: Arc<super::StatusCell>,
+        ) -> Spinner {
             if !enabled {
-                return Spinner { handle: None, alive: Arc::new(AtomicBool::new(false)) };
+                return Spinner { handle: None, alive: Arc::new(AtomicBool::new(false)), status };
             }
             let alive = Arc::new(AtomicBool::new(true));
             let a = alive.clone();
             let q = quiet.clone();
+            let st = status.clone();
             let label = label.to_string();
             let handle = thread::spawn(move || {
                 let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -5387,7 +6145,8 @@ mod nonunix_term {
                     };
                     let typed = ta.lock().map(|g| g.clone()).unwrap_or_default();
                     let elapsed = super::fmt_elapsed(started.elapsed());
-                    let line = super::thinking_footer_line(&frame, &label, &elapsed, &cwd, &typed, w, super::color_enabled());
+                    let eff_label = st.get().unwrap_or_else(|| label.clone());
+                    let line = super::thinking_footer_line(&frame, &eff_label, &elapsed, &cwd, &typed, w, super::color_enabled());
                     // Rewrite the footer in place at the bottom row each tick
                     // (save/restore cursor), so it can never drift.
                     let h = terminal_height();

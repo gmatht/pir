@@ -172,8 +172,21 @@ impl AgentEvent {
 }
 
 /// Clip a string to `n` chars, appending an ellipsis if truncated.
+///
+/// A **multiline** prompt is first collapsed to the one-line paste placeholder
+/// (see [`crate::term::collapse_for_display`]) — a pasted block used to be echoed
+/// verbatim here, so an 80-char, 12-line paste printed 12 lines into the notify
+/// line and wrecked the feed. Collapsing happens before the length clip, so the
+/// count and the ellipsis describe the placeholder the user will actually see.
 fn clip(s: &str, n: usize) -> String {
-    let s = s.trim();
+    let collapsed = crate::term::collapse_for_display(s, None);
+    let s = collapsed.as_deref().unwrap_or(s).trim();
+    // A collapsed placeholder is emitted whole even if it exceeds `n`: truncating
+    // it would cut the `N lines pasted ]` suffix that carries the count, and it is
+    // already short by construction.
+    if collapsed.is_some() {
+        return s.to_string();
+    }
     if s.chars().count() <= n {
         s.to_string()
     } else {
@@ -477,6 +490,24 @@ impl NotifyBus {
             Err(e) => e.into_inner().0.clone(),
         }
     }
+
+    /// Announce that pir has stopped and is waiting for the operator.
+    ///
+    /// Rings the terminal bell on *every* turn boundary, deliberately
+    /// bypassing the [`NotifyPolicy`] gates: `min_seconds` / `when` / `on` all
+    /// exist to keep a *long-running agent loop* (or a background worker) from
+    /// firing a notifier on every short turn, and applying them here is exactly
+    /// what would silence the bell an interactive operator is waiting for. The
+    /// bell is the "your turn" signal, not a notification *about* a turn, so it
+    /// is unconditional; only the "no terminal attached" case suppresses it
+    /// (handled inside [`ring`]).
+    ///
+    /// Ring the bell here rather than from the worker thread so it fires at the
+    /// true prompt boundary — after any follow-up/continuation turn has also
+    /// finished — instead of once per internal turn.
+    pub fn waiting_for_input(&self) {
+        ring();
+    }
 }
 
 /// Cheap, clonable handle to the shared bus, passed to every agent (foreground
@@ -514,6 +545,23 @@ impl Notifier for Bell {
             .write_all(format!("\x1b]0;{}\x07", e.terminal_title()).as_bytes());
         let _ = std::io::stderr().flush();
     }
+}
+
+/// Ring the terminal bell (BEL, `\x07`) — the "pir has stopped and is waiting
+/// for you" signal. Suppressed when stdout isn't a terminal (a piped/headless
+/// run has nobody to hear it).
+///
+/// This is deliberately a bare write rather than a `Notifier` on the bus: the
+/// turn-boundary bell must not be gated by `min_seconds` / `when` (those exist
+/// to keep *long-running agent loops* from pinging on every short turn), so it
+/// does not go through [`NotifyPolicy::allows`]. See
+/// [`NotifyBus::waiting_for_input`].
+pub fn ring() {
+    if !term::is_terminal() {
+        return;
+    }
+    let _ = std::io::stderr().write_all(b"\x07");
+    let _ = std::io::stderr().flush();
 }
 
 /// Desktop pop-up via the platform notifier. Best-effort; silently skips
@@ -800,7 +848,6 @@ pub fn render_feed(events: &[AgentEvent]) -> String {
 #[cfg(test)]
 mod title_tests {
     use super::*;
-
     fn ev(project: &str) -> AgentEvent {
         AgentEvent::turn_done(Duration::from_secs(1), 0, 0, project.into(), "hi".into())
     }
@@ -891,5 +938,45 @@ mod reload_policy_tests {
         // And the feed is still policy-independent for non-idle events.
         bus.publish(ev(), false);
         assert_eq!(bus.drain_feed().len(), 1, "screen feed ignores the `on` gate");
+    }
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::*;
+
+    #[test]
+    fn a_short_prompt_is_returned_as_is() {
+        assert_eq!(clip("fix the parser", 80), "fix the parser");
+    }
+
+    #[test]
+    fn a_long_single_line_is_clipped_with_an_ellipsis() {
+        let long = "x".repeat(120);
+        let got = clip(&long, 80);
+        assert!(got.ends_with('…'), "got: {got}");
+        assert_eq!(got.chars().count(), 81, "80 chars + the ellipsis");
+    }
+
+    /// The bug this fixes: a multiline paste used to be printed verbatim into the
+    /// notify line — an 80-char, 12-line paste dumped 12 lines into the feed. It must
+    /// come back as the one-line placeholder instead.
+    #[test]
+    fn a_multiline_prompt_is_collapsed_to_one_line() {
+        let pasted = "error: bad thing\n  at line 1\n  at line 2\n  at line 3\n  at line 4";
+        let got = clip(pasted, 80);
+        assert!(got.contains("lines pasted"), "got: {got}");
+        assert!(!got.contains('\n'), "a collapsed prompt must be a single line: {got:?}");
+        assert!(!got.contains("at line 2"), "the pasted body leaked into the notify line");
+    }
+
+    /// A collapsed placeholder is emitted whole: truncating it would cut the
+    /// `N lines pasted ]` suffix that carries the count.
+    #[test]
+    fn a_collapsed_placeholder_is_never_truncated() {
+        let long_first = "y".repeat(60);
+        let pasted = format!("{long_first}\nb\nc\nd");
+        let got = clip(&pasted, 20);
+        assert!(got.ends_with("lines pasted ]"), "the count suffix must survive: {got}");
     }
 }

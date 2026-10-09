@@ -333,6 +333,12 @@ fn run_inner(
                     // awaiting the user's first keystroke, so the footer shows
                     // the configured "done" placeholder until they type.
                     state.awaiting_input = true;
+                    // pir has stopped and is waiting for input: ring the
+                    // terminal bell. Only on this transition (the queued /
+                    // continuation paths above start the next turn instead and
+                    // never reach here), so it fires exactly once per return to
+                    // the idle prompt — not once per internal turn.
+                    ctx.bus.waiting_for_input();
                 }
             }
         }
@@ -378,6 +384,12 @@ fn run_inner(
         } else {
             state.draft.clone()
         };
+        // Collapse a multiline paste for display only (see
+        // `term::collapse_for_display`). `state.draft` above stays the raw buffer
+        // that gets submitted, so the agent still receives every pasted line; only
+        // the footer shows the placeholder. `paste.span` scopes the collapse to the
+        // pasted block, so text typed after the paste stays visible.
+        let draft = crate::term::collapse_for_display(&draft, paste.span).unwrap_or(draft);
         let status_line = if running {
             format!(
                 "{} {}…",
@@ -1345,6 +1357,10 @@ struct PasteState {
     /// Inside an `ESC[200~ … ESC[201~` wrapper: a newline is literal text
     /// rather than a submit.
     pasting: bool,
+    /// Byte range of the draft that came from the paste, for the display-only
+    /// collapse (see [`crate::term::PasteSpan`]). Opened when the wrapper opens,
+    /// closed when it ends, so text typed after the paste stays visible.
+    span: Option<crate::term::PasteSpan>,
 }
 
 /// Pop one whole character off the front of `bytes`, leaving a trailing partial
@@ -1509,6 +1525,16 @@ fn read_idle_line(
                                 // `200~` = start, `201~` = end. The pasted body
                                 // stays literal text either way.
                                 paste.pasting = start;
+                                // Record the pasted byte range for the display-only
+                                // collapse: open at the current end of the buffer,
+                                // close at it when the wrapper ends. Text typed after
+                                // the paste appends outside the range and stays visible.
+                                if start {
+                                    paste.span = Some(crate::term::PasteSpan { start: buf.len(), end: buf.len() });
+                                } else if let Some(mut s) = paste.span {
+                                    s.end = buf.len();
+                                    paste.span = Some(s);
+                                }
                                 // Consume through the `~`; anything the top-up
                                 // pulled in past it stays in `tmp` and is
                                 // classified by the next iteration, so no byte
