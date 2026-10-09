@@ -3077,7 +3077,11 @@ libc::tcsetattr(fd, libc::TCSANOW, &to_raw_mode(tios));
     /// wrapper is open, embedded newlines are kept as part of the line (as
     /// `'\n'`) instead of being interpreted as Enter — so a *pasted* multiline
     /// block becomes a single queued prompt rather than one prompt per line.
-    fn read_chunk(
+    ///
+    /// `pub(crate)` rather than private: `read_pasted_line` (a sibling
+    /// top-level fn in this module) drives the same reader for a bracketed
+    /// paste, so the two front-ends cannot drift apart.
+    pub(crate) fn read_chunk(
         buf: &mut String,
         typeahead: &Arc<Mutex<String>>,
         recall: &mut super::HistRecall,
