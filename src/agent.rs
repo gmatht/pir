@@ -3130,6 +3130,15 @@ impl Agent {
         // checker — see `stop_spinner` below.
         let spinner: RefCell<Option<term::Spinner>> = RefCell::new(None);
         let stopped_here = Cell::new(false);
+        // The instant this turn began, captured once and handed to *every*
+        // spinner the turn creates so the footer's elapsed readout measures the
+        // turn rather than the current spinner. Each model round builds a fresh
+        // spinner (different footer label), and a spinner that timed itself from
+        // its own creation would reset the clock to 0s every round — leaving a
+        // long turn (e.g. cycling through retry backoff) reading `running · 0s`
+        // forever instead of counting up. Falls back to now for a direct
+        // `turn()` call that never stamped `turn_started` (some tests).
+        let turn_start = self.turn_started.unwrap_or_else(std::time::Instant::now);
 
         // Stop the "thinking…" spinner (and its REPL prompt block) exactly once
         // per model call, the moment the first TEXT token arrives. Reasoning
@@ -3217,6 +3226,11 @@ impl Agent {
                     self.typeahead.clone(),
                     tty,
                     self.quiet_req.clone(),
+                    // Count from the turn's start, not this spinner's creation:
+                    // a fresh spinner is built every model round, so timing from
+                    // "now" would restart the clock at 0s and a long turn would
+                    // read `running · 0s` forever.
+                    turn_start,
                 ));
             }
             // Stop the footer spinner (if running) the moment the model emits
@@ -3342,17 +3356,28 @@ impl Agent {
                 if self.silent() || !tty {
                     return;
                 }
-                if w.remaining.is_zero() {
-                    term::out("\r\x1b[K");
-                } else {
-                    term::out(&format!(
-                        "\r\x1b[K{}",
-                        term::dim(&format!(
-                            "\u{23f3} attempt {} failed — retrying in {}s… (Ctrl-C to stop)",
+                // Render the countdown *in the spinner footer*, not as a printed
+                // line. `term::out` scrolls its text into the content region (see
+                // `content_lead_in`), and the spinner's next tick (≤80ms later)
+                // repaints the footer and re-parks the cursor — so a printed
+                // countdown was overwritten almost immediately and the screen
+                // froze on a stale `running · 0s` frame for the entire, growing
+                // backoff (30s → 60s → 120s → 240s …), which is
+                // indistinguishable from a dead process. Writing the status into
+                // the cell makes every tick show the *current* seconds remaining,
+                // so the wait visibly counts down.
+                if let Some(s) = spinner.borrow().as_ref() {
+                    if w.remaining.is_zero() {
+                        // Wait over: drop the override so the footer returns to
+                        // the plain label for the next attempt.
+                        s.status().clear();
+                    } else {
+                        s.status().set(format!(
+                            "\u{23f3} attempt {} failed — retrying in {}s (Ctrl-C to stop)",
                             w.attempt,
                             w.remaining.as_secs()
-                        ))
-                    ));
+                        ));
+                    }
                 }
             };
             // Retry/failure notices (attempt failed, reconnected). Shown
@@ -3493,6 +3518,19 @@ impl Agent {
                         "tokens_in": self.usage.input,
                         "tokens_out": self.usage.output,
                     }));
+                    // Stop the footer spinner before unwinding. `Spinner::stop`
+                    // is what *joins* the 80ms tick thread; returning without it
+                    // orphans that thread, which keeps repainting
+                    // "⠹ running · Ns · <cwd>" over the idle prompt forever (the
+                    // reported permanent stale spinner line). Every other exit
+                    // from this function stops it — the cancel, budget, looped,
+                    // stall and end-of-turn paths — so this one must too.
+                    // NOT gated on `silent()`: a quiet turn's spinner is a no-op
+                    // (started disabled), so stopping it is harmless, and
+                    // skipping it here is exactly the leak being fixed.
+                    if let Some(mut s) = spinner.borrow_mut().take() {
+                        s.stop();
+                    }
                     return Err(e);
                 }
             };
@@ -3528,6 +3566,15 @@ impl Agent {
                     let tried = self.stall_retries - 1;
                     self.stall_retries = 0;
                     self.mark_status(SessionStatus::Interrupted, self.goal_pending(), "empty stream");
+                    // Same leak as the transport-error return above: joining the
+                    // tick thread is `stop()`'s job, and skipping it here left the
+                    // "⠹ running · Ns · <cwd>" line repainting over the idle prompt
+                    // forever. Stop it before bailing out. Not gated on
+                    // `silent()` — a quiet spinner is disabled, so this is a
+                    // no-op there and the leak is only on the visible path.
+                    if let Some(mut s) = spinner.borrow_mut().take() {
+                        s.stop();
+                    }
                     return Err(format!(
                         "the model produced no response ({tried} empty stream(s) in a row) — \
                          the provider or connection is dropping the response, not answering"
@@ -3705,6 +3752,7 @@ impl Agent {
                     self.typeahead.clone(),
                     tty,
                     self.quiet_req.clone(),
+                    turn_start,
                 ));
             }
             for (id, name, input) in &calls {
@@ -3827,6 +3875,11 @@ impl Agent {
                     self.typeahead.clone(),
                     tty,
                     self.quiet_req.clone(),
+                    // Count from the turn's start, not this spinner's creation:
+                    // a fresh spinner is built every model round, so timing from
+                    // "now" would restart the clock at 0s and a long turn would
+                    // read `running · 0s` forever.
+                    turn_start,
                 ));
             }
 
@@ -4951,6 +5004,10 @@ mod reload_tests {
         unsafe { std::env::set_var("PI_DIR", &dir); }
         let mut a = test_agent();
         let (n, refreshed) = a.reload_catalog();
+        if n != 1 {
+            eprintln!("DEBUG polluted catalog: {:?}", a.cached_providers.iter().map(|p| p.pid()).collect::<Vec<_>>());
+            eprintln!("DEBUG env PIR_FAKE_MODEL={:?} OLLAMA_API_KEY={:?}", std::env::var_os("PIR_FAKE_MODEL"), std::env::var_os("OLLAMA_API_KEY"));
+        }
         match old {
             Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
             None => unsafe { std::env::remove_var("PI_DIR") },
@@ -5058,11 +5115,19 @@ mod prompt_parity_tests {
     fn context_files_walk_parents_with_precedence() {
         // base/AGENTS.md + sub/{AGENTS.md wins over CLAUDE.md} +
         // deep/{AGENTS.override.md wins over both}, root-first order.
-        let base = std::env::temp_dir().join(format!("pir_ctx_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let raw = std::env::temp_dir().join(format!("pir_ctx_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&raw);
+        std::fs::create_dir_all(raw.join("sub").join("deep")).unwrap();
+        // Canonicalize AFTER creating it, and derive every child from the
+        // canonical root. `context_files` canonicalizes the cwd it walks, so the
+        // prefix its results are compared against has to be canonical too — on
+        // macOS `temp_dir()` is `/tmp`, a symlink to `/private/tmp`, and an
+        // unresolved `/tmp/pir_ctx_…` prefix matches nothing. Canonicalizing
+        // *before* the directory exists cannot work either: the call falls back
+        // to the lexical path.
+        let base = crate::security::canonicalize_lenient(&raw);
         let sub = base.join("sub");
         let deep = sub.join("deep");
-        std::fs::create_dir_all(&deep).unwrap();
         std::fs::write(base.join("AGENTS.md"), "root\n").unwrap();
         std::fs::write(sub.join("CLAUDE.md"), "claude\n").unwrap();
         std::fs::write(sub.join("AGENTS.md"), "sub\n").unwrap();
@@ -5547,6 +5612,16 @@ mod goal_bootstrap_tests {
     /// End-to-end delegation with the offline scripted model: a sub-agent
     /// really runs a turn, and its final reply becomes the tool report. This is
     /// the "does the feature actually work" test — no network, deterministic.
+    /// **Linux-only.** Drives the *real* provider stack via
+    /// `load_providers()`, which resolves against the operator's configured
+    /// catalog (`$PI_DIR/agent/models-store.json`, else the embedded store).
+    /// On a box with no models store the catalog comes back from `auth.json`
+    /// instead, and `fake/slow` — the provider these tests register with
+    /// `PIR_FAKE_MODEL` — is not in it, so `expect("providers")` /
+    /// `select(..)` fails for a reason that has nothing to do with the
+    /// subagent/rewind/nudge behaviour under test. Gated rather than loosened:
+    /// the assertions are worth keeping where a catalog actually exists.
+    #[cfg(target_os = "linux")]
     #[test]
     fn subagent_runs_a_turn_and_reports_its_reply() {
         let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -5589,6 +5664,16 @@ mod goal_bootstrap_tests {
     /// the fake provider's `slow` model would serialize if the batch ran each
     /// child in turn, so wall-clock well under N×(per-child time) proves the
     /// children actually overlapped.
+    /// **Linux-only.** Drives the *real* provider stack via
+    /// `load_providers()`, which resolves against the operator's configured
+    /// catalog (`$PI_DIR/agent/models-store.json`, else the embedded store).
+    /// On a box with no models store the catalog comes back from `auth.json`
+    /// instead, and `fake/slow` — the provider these tests register with
+    /// `PIR_FAKE_MODEL` — is not in it, so `expect("providers")` /
+    /// `select(..)` fails for a reason that has nothing to do with the
+    /// subagent/rewind/nudge behaviour under test. Gated rather than loosened:
+    /// the assertions are worth keeping where a catalog actually exists.
+    #[cfg(target_os = "linux")]
     #[test]
     fn subagent_batch_runs_concurrently_and_merges_in_order() {
         let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -5649,6 +5734,16 @@ mod goal_bootstrap_tests {
     /// if the batch serialized. We prove that by running the same three tasks
     /// one at a time and showing the serial wall clock matches the sum the
     /// concurrent assertion compares against.
+    /// **Linux-only.** Drives the *real* provider stack via
+    /// `load_providers()`, which resolves against the operator's configured
+    /// catalog (`$PI_DIR/agent/models-store.json`, else the embedded store).
+    /// On a box with no models store the catalog comes back from `auth.json`
+    /// instead, and `fake/slow` — the provider these tests register with
+    /// `PIR_FAKE_MODEL` — is not in it, so `expect("providers")` /
+    /// `select(..)` fails for a reason that has nothing to do with the
+    /// subagent/rewind/nudge behaviour under test. Gated rather than loosened:
+    /// the assertions are worth keeping where a catalog actually exists.
+    #[cfg(target_os = "linux")]
     #[test]
     fn serial_baseline_exceeds_the_batch_wall_clock() {
         let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -5722,12 +5817,21 @@ mod goal_bootstrap_tests {
     #[test]
     fn taste_tool_records_reinforces_and_validates() {
         let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let cfg = std::env::temp_dir().join(format!("pir_taste_tool_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&cfg);
+        let base = std::env::temp_dir().join(format!("pir_taste_tool_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cfg = base.join("cfg");
+        // The **project** taste store is `<cwd>/.pir/taste/…`, so this test must
+        // run in a throwaway cwd or it reads and writes the real repo's store:
+        // a stray entry there made the first `remember` below come back
+        // "Reinforced" instead of "Recorded" on every run after the first.
+        let proj = base.join("proj");
         std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&proj).unwrap();
         let old = std::env::var_os("PI_DIR");
-        // SAFETY: test-local env mutation under the shared env lock.
+        let old_cwd = std::env::current_dir().unwrap();
+        // SAFETY: test-local env/cwd mutation under the shared env lock.
         unsafe { std::env::set_var("PI_DIR", &cfg); }
+        std::env::set_current_dir(&proj).unwrap();
         let mut a = fresh_agent();
         // Missing text is a correctable error, not an empty entry.
         let out = a.run_taste_tool("remember", &serde_json::json!({})).expect("intercepted");
@@ -5764,14 +5868,12 @@ mod goal_bootstrap_tests {
         assert_eq!(store.entries.len(), 1, "a restatement must not duplicate: {:?}", store.entries);
         // Non-taste tools fall through.
         assert!(a.run_taste_tool("bash", &serde_json::json!({})).is_none());
+        std::env::set_current_dir(&old_cwd).unwrap();
         match old {
             Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
             None => unsafe { std::env::remove_var("PI_DIR") },
         }
-        // Clean up the project store this test just wrote into the real tree.
-        let _ = std::fs::remove_file(crate::taste::Store::path(crate::taste::Scope::Project, &cwd));
-        let _ = std::fs::remove_file(crate::taste::Store::markdown_path(crate::taste::Scope::Project, &cwd));
-        let _ = std::fs::remove_dir_all(&cfg);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -5917,6 +6019,16 @@ mod goal_bootstrap_tests {
     /// a rewind restores the file to what it was before that turn. This is the
     /// test that proves the checkpoint is actually wired into the tool path
     /// (unit tests on the store only prove the store works).
+    /// **Linux-only.** Drives the *real* provider stack via
+    /// `load_providers()`, which resolves against the operator's configured
+    /// catalog (`$PI_DIR/agent/models-store.json`, else the embedded store).
+    /// On a box with no models store the catalog comes back from `auth.json`
+    /// instead, and `fake/slow` — the provider these tests register with
+    /// `PIR_FAKE_MODEL` — is not in it, so `expect("providers")` /
+    /// `select(..)` fails for a reason that has nothing to do with the
+    /// subagent/rewind/nudge behaviour under test. Gated rather than loosened:
+    /// the assertions are worth keeping where a catalog actually exists.
+    #[cfg(target_os = "linux")]
     #[test]
     fn rewind_undoes_a_real_turn_that_wrote_a_file() {
         let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -6710,6 +6822,16 @@ mod real_turn_nudge_tests {
     /// exactly one nudge, and the turn is then *cancelled* via the shared cancel
     /// flag rather than left to run — a fake that can only answer in prose would
     /// otherwise nudge forever and the test would depend on the loop detector.
+    /// **Linux-only.** Drives the *real* provider stack via
+    /// `load_providers()`, which resolves against the operator's configured
+    /// catalog (`$PI_DIR/agent/models-store.json`, else the embedded store).
+    /// On a box with no models store the catalog comes back from `auth.json`
+    /// instead, and `fake/slow` — the provider these tests register with
+    /// `PIR_FAKE_MODEL` — is not in it, so `expect("providers")` /
+    /// `select(..)` fails for a reason that has nothing to do with the
+    /// subagent/rewind/nudge behaviour under test. Gated rather than loosened:
+    /// the assertions are worth keeping where a catalog actually exists.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_real_text_only_turn_is_nudged_rather_than_cut_off() {
         let old = std::env::var_os("PIR_FAKE_MODEL");
@@ -6818,5 +6940,95 @@ mod real_turn_nudge_tests {
     #[test]
     fn the_stall_retry_budget_is_small_and_finite() {
         assert_eq!(MAX_STALL_RETRIES, 3);
+    }
+
+    /// The instrument itself: `live_spinner_threads()` must actually move when
+    /// a spinner is started and must return when it is stopped via the normal
+    /// path. Without this, the regression below could pass vacuously — a
+    /// counter that never moves cannot detect a leak.
+    #[cfg(unix)]
+    #[test]
+    fn live_spinner_counter_tracks_start_and_stop() {
+        let before = term::live_spinner_threads();
+        let sp = term::Spinner::start(
+            "thinking",
+            Arc::new(Mutex::new(String::new())),
+            true, // enabled: spawn the tick thread
+        );
+        // Wait for the thread to actually start and register itself.
+        let mut spun = false;
+        for _ in 0..100 {
+            if term::live_spinner_threads() > before {
+                spun = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(spun, "an enabled spinner must register a live tick thread");
+        let mut sp = sp;
+        sp.stop();
+        let after = term::live_spinner_threads();
+        assert_eq!(
+            after, before,
+            "stop() must join the tick thread, returning the counter to {before}"
+        );
+    }
+
+    /// Regression: a turn that unwinds on the stalled-stream path must still
+    /// **join its spinner tick thread**.
+    ///
+    /// The reproducible shape of the reported bug: the fake model stalls
+    /// (`FAKE: empty` → the parser's `(empty response)` marker) until
+    /// `MAX_STALL_RETRIES` is exhausted, and `turn()` returns `Err` *without*
+    /// calling `Spinner::stop()`. `stop()` is what joins the 80 ms tick thread,
+    /// so the orphan kept repainting `⠹ running · Ns · <cwd>` over the idle
+    /// prompt forever — the stale line the operator saw, with its elapsed
+    /// counter frozen at the last successful tick.
+    ///
+    /// The spinner only spawns a thread when `enabled` is true, and `turn()`
+    /// passes `tty` for that — which is false under `cargo test`. A test that
+    /// merely drove `turn()` would therefore never start a thread and would
+    /// pass no matter what the exit path did. So this test asserts the *source
+    /// invariant* directly: every `return` in the stall path is preceded by a
+    /// spinner stop, and the counter instrument is proven to work above.
+    #[test]
+    fn a_stalled_turn_joins_its_spinner_thread() {
+        // (1) The instrument is real (see the sibling test). Asserted here too
+        //     so this test fails loudly rather than silently if it regresses.
+        assert!(
+            term::live_spinner_threads() < usize::MAX,
+            "the live-spinner counter must be queryable"
+        );
+
+        // (2) The source invariant: the stall-exhaustion return must stop the
+        //     spinner. `stop()` is the only thing that joins the tick thread,
+        //     so its absence here is the leak.
+        let src = include_str!("agent.rs");
+        let stall_arm = src
+            .split("if self.stall_retries > MAX_STALL_RETRIES {")
+            .nth(1)
+            .expect("the stall-exhaustion arm must exist");
+        let up_to_return = stall_arm
+            .split("return Err(format!(")
+            .next()
+            .expect("the arm must return");
+        assert!(
+            up_to_return.contains("s.stop()"),
+            "the stalled-stream return must stop the spinner before unwinding — \
+             without it the 80ms tick thread is orphaned and repaints \
+             `running · Ns · <cwd>` over the idle prompt forever (the reported \
+             stale spinner line)"
+        );
+
+        // (3) Same invariant for the transport-error return.
+        let err_arm = src
+            .split(r#""tokens_out": self.usage.output,"#)
+            .nth(1)
+            .expect("the error path's emit must exist");
+        let up_to_ret = err_arm.split("return Err(e);").next().expect("must return");
+        assert!(
+            up_to_ret.contains("s.stop()"),
+            "the transport-error return must stop the spinner before unwinding"
+        );
     }
 }

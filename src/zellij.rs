@@ -187,23 +187,74 @@ pub fn capture() -> Option<PaneRecord> {
 /// because a slot is only trusted when it is unambiguous.
 static SLOT_CACHE: Mutex<Option<(String, u64, HashMap<String, PaneSlot>)>> = Mutex::new(None);
 
+/// True while a background refresh of [`SLOT_CACHE`] is in flight, so the prompt
+/// path never queues a second one (and never waits behind the first).
+static SLOT_REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// How long a cached pane layout is trusted before re-querying zellij.
 const SLOT_CACHE_TTL: u64 = 30;
 
 /// The slot for `pane_id` in `session`, or `None` when it cannot be resolved.
+///
+/// **Never spawns.** This runs on the prompt path (via [`capture`]), and the
+/// subprocess it used to run here — `zellij action list-panes` — can block
+/// indefinitely when the session named by `ZELLIJ_SESSION_NAME` is gone. Holding
+/// the cache lock across it meant one hung `zellij` stalled *every* prompt, and
+/// because [`SLOT_CACHE_TTL`] is shorter than a typical prompt cadence the cache
+/// was always stale, so it re-spawned (and re-hung) each time.
+///
+/// So the lookup is now purely a cached read: it returns the last-known-good slot
+/// (or `None` on a cold cache) and, if the entry is stale, kicks a **detached
+/// background thread** to refresh it. The prompt returns immediately either way;
+/// the refreshed geometry is picked up by a later prompt. A stale slot only ever
+/// costs a pane its geometry (the rebuild then treats it as unmatched and leaves
+/// it alone), never a hung prompt.
 fn slot_cache(session: &str, pane_id: &str) -> Option<PaneSlot> {
     let now = crate::term::epoch();
-    let mut guard = SLOT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    let fresh = guard
-        .as_ref()
-        .is_some_and(|(s, at, _)| s == session && now.saturating_sub(*at) < SLOT_CACHE_TTL);
+    let (fresh, cached) = {
+        let guard = SLOT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let fresh = guard
+            .as_ref()
+            .is_some_and(|(s, at, _)| s == session && now.saturating_sub(*at) < SLOT_CACHE_TTL);
+        let cached = guard
+            .as_ref()
+            .filter(|(s, _, _)| s == session)
+            .and_then(|(_, _, m)| m.get(pane_id).cloned());
+        (fresh, cached)
+    };
     if !fresh {
-        let map = live_panes(session)?;
-        *guard = Some((session.to_string(), now, map));
+        refresh_slot_cache(session);
     }
-    guard
-        .as_ref()
-        .and_then(|(_, _, m)| m.get(pane_id).cloned())
+    cached
+}
+
+/// Refresh [`SLOT_CACHE`] for `session` on a detached thread, at most once at a
+/// time. Best-effort: a refresh that cannot run (no live session, a dead one, a
+/// hung zellij) simply leaves the previous snapshot in place.
+///
+/// Detached and single-flight by design — the caller is the prompt path, so this
+/// must not join, must not block on the lock, and must not accumulate one thread
+/// per prompt if a refresh is slow.
+fn refresh_slot_cache(session: &str) {
+    use std::sync::atomic::Ordering;
+    if SLOT_REFRESH_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        return; // a refresh is already running
+    }
+    let session = session.to_string();
+    std::thread::spawn(move || {
+        // `live_panes` has its own hard deadline, so this thread terminates even
+        // when zellij hangs; the in-flight flag is cleared even if it panics.
+        let map = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| live_panes(&session)))
+            .ok()
+            .flatten();
+        if let Some(map) = map {
+            let now = crate::term::epoch();
+            let mut guard = SLOT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some((session, now, map));
+        }
+        SLOT_REFRESH_IN_FLIGHT.store(false, Ordering::SeqCst);
+    });
 }
 
 /// Record this process's zellij pane for `log`. Best-effort and a no-op outside
@@ -304,13 +355,71 @@ pub fn claim_pane_title(session_stem: &str) {
         }
     }
 
-    let _ = Command::new("zellij")
-        .args(["action", "rename-pane", "--pane-id", &pane, &title])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    // Bounded: this runs on the prompt path, and `zellij action` against a
+    // session that has gone away can block instead of failing. A title is a
+    // convenience, so a slow zellij must never stall the turn that is starting.
+    let _ = run_zellij_bounded(
+        &["action", "rename-pane", "--pane-id", &pane, &title],
+        TITLE_CALL_TIMEOUT,
+        false,
+    );
 }
+
+/// Run a `zellij <args…>` command with a hard deadline, returning its stdout on
+/// success. `None` on spawn failure, non-zero exit, or timeout (the child is
+/// killed in that case, and its reader joined).
+///
+/// `capture_stdout` selects a piped read; when false the output is discarded (a
+/// fire-and-forget action like `rename-pane`). This is the one place a bounded
+/// `zellij` call is made from the prompt path — everything here used to be a bare
+/// blocking `Command::output()`, which is exactly how a stale `ZELLIJ_SESSION_NAME`
+/// could freeze every prompt.
+fn run_zellij_bounded(args: &[&str], timeout: std::time::Duration, capture_stdout: bool) -> Option<Vec<u8>> {
+    let mut child = Command::new("zellij")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(if capture_stdout {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let reader = child.stdout.take().map(|mut stdout| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let buf = reader.and_then(|r| r.join().ok()).unwrap_or_default();
+                return if status.success() { Some(buf) } else { None };
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if let Some(r) = reader {
+                        let _ = r.join();
+                    }
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Bound on the `list-panes` / `rename-pane` calls the title claim makes, which
+/// run on the first turn's prompt path.
+const TITLE_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Set once the title claim has been attempted (successfully or not), so the
 /// prompt path pays for at most one `zellij` spawn per pir process.
@@ -323,17 +432,14 @@ static TITLE_CLAIMED: Mutex<bool> = Mutex::new(false);
 /// JSON. A subprocess like the ones this module already runs at rebuild time,
 /// and only ever called from [`claim_pane_title`] — i.e. once per process.
 fn current_pane_title(pane: &str) -> Option<String> {
-    let out = Command::new("zellij")
-        .args(["action", "list-panes", "-a", "-j"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    // Bounded: see `run_zellij_bounded`. The title read sits on the first turn's
+    // prompt path, so it gets the same deadline as the rename that follows it.
+    let out = run_zellij_bounded(
+        &["action", "list-panes", "-a", "-j"],
+        TITLE_CALL_TIMEOUT,
+        true,
+    )?;
+    let v: serde_json::Value = serde_json::from_slice(&out).ok()?;
     let want: i64 = pane.parse().ok()?;
     v.as_array()?.iter().find_map(|p| {
         (p.get("id").and_then(serde_json::Value::as_i64) == Some(want))
@@ -884,16 +990,22 @@ fn live_panes(session: &str) -> Option<HashMap<String, PaneSlot>> {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                let buf = reader.join().ok()?;
                 if !status.success() {
                     return None;
                 }
-                let buf = reader.join().ok()?;
                 return parse_live_panes(&buf);
             }
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
+                    // Kill the child, then *join the reader*: once the process is
+                    // gone its stdout pipe reaches EOF and the reader returns
+                    // promptly. Letting `reader` detach here leaked one thread per
+                    // timed-out call — and on the "stale session name" path that
+                    // was one leaked thread per prompt.
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = reader.join();
                     return None;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1759,6 +1871,77 @@ mod tests {
             elapsed < std::time::Duration::from_secs(20),
             "live_panes must be bounded, took {elapsed:?}"
         );
+    }
+
+    /// The regression this fixes: `capture()` runs on **every prompt** (via
+    /// `record` → `mark_status`), and it used to call `live_panes` inline, holding
+    /// the cache lock. With a stale `ZELLIJ_SESSION_NAME` that meant a `zellij`
+    /// spawn (and up to a 2 s wait) on every single prompt.
+    ///
+    /// It must now return immediately no matter what zellij does: the lookup is a
+    /// cached read and any refresh happens on a detached thread. This asserts the
+    /// prompt path costs milliseconds, not seconds.
+    #[test]
+    fn capture_never_waits_on_zellij_on_the_prompt_path() {
+        let old = (
+            std::env::var_os("ZELLIJ_SESSION_NAME"),
+            std::env::var_os("ZELLIJ_PANE_ID"),
+        );
+        unsafe {
+            // A session that cannot exist: exactly the stale-env case that used
+            // to hang the prompt path.
+            std::env::set_var("ZELLIJ_SESSION_NAME", "pir-nonexistent-capture-xyz");
+            std::env::set_var("ZELLIJ_PANE_ID", "1");
+        }
+        // Clear the cache so this is a cold lookup, the worst case.
+        *SLOT_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+
+        let t = std::time::Instant::now();
+        let rec = capture().expect("inside zellij env, a record is built");
+        let elapsed = t.elapsed();
+
+        match old.0 {
+            Some(v) => unsafe { std::env::set_var("ZELLIJ_SESSION_NAME", v) },
+            None => unsafe { std::env::remove_var("ZELLIJ_SESSION_NAME") },
+        }
+        match old.1 {
+            Some(v) => unsafe { std::env::set_var("ZELLIJ_PANE_ID", v) },
+            None => unsafe { std::env::remove_var("ZELLIJ_PANE_ID") },
+        }
+
+        // A generous bound: the point is "does not wait for the 2 s subprocess
+        // deadline", not micro-latency on a loaded CI box.
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "capture() must not wait on zellij (took {elapsed:?})"
+        );
+        // With a cold cache and no resolvable session there is no geometry yet —
+        // that is fine (the rebuild treats it as unmatched); what matters is that
+        // building the record did not block.
+        assert_eq!(rec.session, "pir-nonexistent-capture-xyz");
+        assert_eq!(rec.pane_id, "1");
+    }
+
+    /// A slow refresh must not accumulate one thread per prompt: a second
+    /// `slot_cache` call while a refresh is in flight must start no second one.
+    #[test]
+    fn slot_refresh_is_single_flight() {
+        use std::sync::atomic::Ordering;
+        *SLOT_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // Simulate an in-flight refresh and confirm a lookup neither clears the
+        // flag nor spawns (the lookup must still answer from cache).
+        SLOT_REFRESH_IN_FLIGHT.store(true, Ordering::SeqCst);
+        let t = std::time::Instant::now();
+        let _ = slot_cache("some-session", "1");
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(200),
+            "a lookup with a refresh in flight must not block"
+        );
+        assert!(
+            SLOT_REFRESH_IN_FLIGHT.load(Ordering::SeqCst),
+            "a lookup must not disturb an in-flight refresh"
+        );
+        SLOT_REFRESH_IN_FLIGHT.store(false, Ordering::SeqCst);
     }
 
     /// A record set that does **not** correspond one-to-one with the dump's pir

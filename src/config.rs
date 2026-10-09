@@ -671,19 +671,47 @@ fn merge_space_bunny(providers: &mut Vec<Provider>) {
 /// read is not an agent action, so it must not be subject to the drop; serving
 /// the pre-drop snapshot keeps model switching working instead of silently
 /// degrading to the (much smaller) sandbox store or the auth fallback.
-static INVOKER_CATALOG: std::sync::OnceLock<Vec<Provider>> = std::sync::OnceLock::new();
+///
+/// A `Mutex<Option<…>>` rather than a `OnceLock`: in production it is written
+/// exactly once, but a `OnceLock` cannot be reset, and a test that seeds it
+/// would then leak the snapshot into every later test in the same process
+/// (tests run concurrently, so "later" means an arbitrary other test — it sees
+/// the seeded provider in a catalog it built from its own `PI_DIR` and fails
+/// for a reason that has nothing to do with what it asserts).
+/// A lock plus a test-only reset keeps production write-once while making the
+/// global recoverable under `cargo test`.
+static INVOKER_CATALOG: std::sync::Mutex<Option<Vec<Provider>>> = std::sync::Mutex::new(None);
 
 /// Snapshot the catalog read as the invoking user, for post-drop reuse. Called
-/// by `main` right after the pre-drop `load_providers`. No-op when unset.
+/// by `main` right after the pre-drop `load_providers`. No-op when unset, and
+/// write-once in production: the first non-empty seed wins, as with the
+/// `OnceLock` this replaced.
 pub fn seed_catalog(providers: &[Provider]) {
-    if !providers.is_empty() {
-        let _ = INVOKER_CATALOG.set(providers.to_vec());
+    if providers.is_empty() {
+        return;
+    }
+    let mut slot = INVOKER_CATALOG.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_none() {
+        *slot = Some(providers.to_vec());
     }
 }
 
 /// The pre-drop catalog snapshot, if `main` seeded one.
-pub fn invoker_catalog() -> Option<&'static Vec<Provider>> {
-    INVOKER_CATALOG.get()
+pub fn invoker_catalog() -> Option<Vec<Provider>> {
+    INVOKER_CATALOG.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Undo a [`seed_catalog`] for the *test* process only.
+///
+/// `seeded_catalog_survives_unreadable_store` must seed the snapshot to
+/// exercise the post-drop path, but the snapshot is process-global and outlives
+/// that test — so any other test reading the catalog in the same process (they
+/// run concurrently) would see the seeded provider and could fail. Clearing it
+/// under the shared [`TEST_ENV_LOCK`] restores the invariant they rely on.
+/// Compiled out of the real binary: production seeds once and never unsets.
+#[cfg(test)]
+pub fn clear_catalog_for_test() {
+    *INVOKER_CATALOG.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 pub fn load_providers() -> Result<Vec<Provider>, String> {
@@ -2787,6 +2815,13 @@ mod worktree_settings_tests {
         }];
         seed_catalog(&seeded);
         let got = load_providers().expect("snapshot must be served");
+        // Clear the process-global snapshot *before* releasing the lock: it
+        // outlives this test, and every other test in this binary reads the
+        // same catalog. Leaving it seeded made `load_providers()` serve this
+        // `opencode-go` entry to unrelated tests — e.g.
+        // `reload_never_moves_active_model_off_label`, which builds a one-
+        // provider store and then saw two.
+        clear_catalog_for_test();
         match old {
             Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
             None => unsafe { std::env::remove_var("PI_DIR") },
@@ -2797,10 +2832,6 @@ mod worktree_settings_tests {
             got.iter().filter(|p| p.pid() == "opencode-go").count(),
             1,
             "seeded catalog must survive an unreadable store (unseeded len was {unseeded})"
-        );
-        assert!(
-            invoker_catalog().is_some(),
-            "snapshot must remain available for the process lifetime"
         );
     }
 
