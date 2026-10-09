@@ -1315,8 +1315,8 @@ impl Builtin {
             return Err(format!("job_kill: no such job #{id}"));
         };
         let was_running = slot.child.try_wait().map(|s| s.is_none()).unwrap_or(true);
-        // Kill the WHOLE process group (the child got process_group(0)), not
-        // just the direct `bash -c` child: grandchildren like `cargo`/`rustc`
+        // Kill the WHOLE process group (the child leads its own, via setsid),
+        // not just the direct `bash -c` child: grandchildren like `cargo`/`rustc`
         // survive a lone SIGKILL to the child and keep the output pipes open,
         // which used to hang the drain joins below forever — job_kill never
         // returned, so the agent loop and the REPL with it (the recorded
@@ -2702,10 +2702,10 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
     // tool result so the model learns *why* it died (an unexplained SIGKILL
     // makes it retry the same command forever).
     let mut resource_status: Option<String> = None;
-    // Kill the whole process group of the child (item: child is in its own
-    // group via process_group(0)), so shell pipelines / subcommands die too,
-    // and so cancelling a runaway command never takes pir down with it.
-    // TERM first, bounded grace, then KILL for survivors.
+    // Kill the whole process group of the child (item: child leads its own
+    // group — and session — because spawn_shell_inner setsid()s it), so shell
+    // pipelines / subcommands die too, and so cancelling a runaway command never
+    // takes pir down with it. TERM first, bounded grace, then KILL for survivors.
     let kill_tree = |child: &mut std::process::Child| {
         kill_process_tree(child);
     };
@@ -2956,8 +2956,8 @@ fn copy_capped(r: &mut impl Read, buf: &Arc<Mutex<Vec<u8>>>) {
 /// `bash -c` child, so grandchildren (`cargo`, `rustc`, `sleep 30` behind a
 /// pipe) survived and kept the output pipes open — which hung `job_kill`'s
 /// drain joins forever and wedged the agent loop/REPL. The child was spawned
-/// with `process_group(0)`, so its pgid == its pid and `kill(-pgid)` reaches
-/// every descendant that didn't create its own group.
+/// with `setsid()` (see `spawn_shell_inner`), so its pgid == its pid and
+/// `kill(-pgid)` reaches every descendant that didn't create its own group.
 ///
 /// Returns the child's exit status (reaped exactly once, here).
 pub(crate) fn kill_process_tree(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
@@ -3283,12 +3283,46 @@ fn spawn_shell_inner(
         let mut c = Command::new(prog);
         c.arg(flag).arg(command);
         c.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        // Put the command in its OWN process group (item: don't let a runaway
-        // command share pir's foreground process group, so killing the search
-        // kills only the search, not pir). On unix this uses setpgid(0,0);
-        // `process_group(0)` is the cross-platform way to request it.
+        // Put the command in its OWN process group AND its own session.
+        //
+        // `setsid()` is what does both: it creates a new session, and — because
+        // a session leader is also its own process-group leader — the child's
+        // pgid == its pid, so `kill(-pid)` still reaches every descendant that
+        // did not create its own group (the runaway-search containment this was
+        // here for). On top of that, a process in a session with no controlling
+        // terminal cannot `open("/dev/tty")`.
+        //
+        // We deliberately do NOT also call `process_group(0)`: it is redundant
+        // (setsid already made the child a group leader) and actively harmful —
+        // `setpgid(0,0)` first would make the child a group leader, and
+        // `setsid()` then fails with EPERM for a caller that is already a
+        // process-group leader. Verified: setpgid-then-setsid returns -1/EPERM,
+        // which silently left the child in pir's session and still able to grab
+        // the terminal — the fix appeared present but did nothing.
+        //
+        // Why the terminal matters: `stdin(Stdio::null())` alone does not stop a
+        // child reaching for `/dev/tty`. `ssh` reads a password from the
+        // terminal, not stdin, so a null stdin still left it blocked forever on
+        // a prompt no one would answer, with no output — the model just saw a
+        // command that never returned (the frozen `ssh imac` report; measured a
+        // >20s hang that only an external `timeout` ended). `priv_escalation`
+        // special-cases sudo/su/doas, but ssh, gpg, passwd, git's credential
+        // helper and `read -s` reach for `/dev/tty` the same way. Under setsid
+        // the open fails with ENXIO and the command dies at once (measured: the
+        // same ssh exits 255 in 0.2s). Same defence `zellij.rs` uses.
+        //
+        // SAFETY: `setsid()` in the child between fork and exec, the documented
+        // `pre_exec` use. The closure does the one syscall (async-signal-safe)
+        // and nothing else. The child is freshly forked, so it is not yet a
+        // process-group leader; failure (EPERM) is impossible on the normal path
+        // and harmless if it somehow happened.
         #[cfg(unix)]
-        c.process_group(0);
+        unsafe {
+            c.pre_exec(|| {
+                let _ = libc::setsid();
+                Ok(())
+            });
+        }
         // Source the hard-kill timeout wrapper (see above): every
         // non-interactive `bash -c` sources `$BASH_ENV`. (`BASH` itself can't
         // be used — bash overwrites it with its own path.) `sh -c` fallbacks
@@ -3667,6 +3701,138 @@ mod esc_tests {
         let out = b.job_kill(&json!({ "id": 1 })).expect("job_kill must return");
         assert!(out.contains("already finished"), "got: {out}");
     }
+
+    /// A command must not be able to block on a controlling terminal.
+    ///
+    /// `stdin(Stdio::null())` alone left the child in pir's *session*, so it
+    /// could still `open("/dev/tty")` and block forever on a prompt no one will
+    /// answer — with no output, so the model just sees a command that never
+    /// returns (the frozen `ssh imac` report: ssh reads a password from
+    /// `/dev/tty`, not stdin, so a `/dev/null` stdin does not stop it; measured
+    /// a hang of more than 20s). The child is now `setsid()`-ed and has its own
+    /// session with no controlling terminal.
+    ///
+    /// ### Why this re-execs itself under `script(1)`
+    /// The observation only has meaning when the *test process* has a
+    /// controlling terminal: if nothing in the chain has one (a `cargo test`
+    /// under a detached parent, or any ssh session), the child reports "no tty"
+    /// whether or not `setsid` ran, and the test passes vacuously — verified by
+    /// removing the fix and watching a naive version still pass on both Linux
+    /// and macOS. So, exactly as `zellij.rs` does for its tty case, this test
+    /// re-executes itself inside `script(1)`, which allocates a pty and gives the
+    /// child a real controlling terminal. Then the difference is observable:
+    /// with the fix the child cannot open `/dev/tty`; without it, it can.
+    ///
+    /// (A session-id check would be the other oracle, but it is not portable:
+    /// macOS 10.13's `ps` reports `SESS` as 0 for *every* process, including
+    /// pid 1, so no `ps` on that box can see it.)
+    #[test]
+    fn command_cannot_open_a_controlling_terminal() {
+        let _serial = serial();
+        // The child re-enters this same test with the probe var set; when it is
+        // set, this test *is* the probe: run the real bash tool and report
+        // whether the spawned command could reach `/dev/tty`.
+        if std::env::var_os(PROBE_ENV).is_some() {
+            let mut b = Builtin::new(
+                PathBuf::from("."),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            );
+            // The command under test: can it open the controlling terminal? If
+            // it can, a real prompt (ssh password, sudo, read -s) would block
+            // here forever. We only *open* it — never read — so even a broken
+            // build cannot hang this probe.
+            let out = run_shell(
+                &mut b,
+                "( : < /dev/tty ) 2>/dev/null && echo tty=yes || echo tty=no",
+            )
+            .expect("run_shell result");
+            println!("{PROBE_MARKER} {}", out.trim());
+            return;
+        }
+        if !which_script() {
+            eprintln!("skipping: no script(1) to allocate a controlling terminal");
+            return;
+        }
+        // Re-exec THIS test binary under a pty. `--exact --nocapture` so only
+        // this test runs and the probe's marker line reaches stdout.
+        //
+        // The two `script(1)` implementations take the command differently and
+        // there is no invocation both accept: util-linux wants `-c "cmd"` and
+        // rejects a positional command ("unexpected number of arguments"), while
+        // BSD/macOS has no `-c` at all ("illegal option -- c") and wants the
+        // command as positional args after the log file. So the child command is
+        // passed the way each platform's `script` expects.
+        let exe = std::env::current_exe().expect("test binary path");
+        let probe_cmd = format!(
+            "{} --exact --nocapture ext_tests::test_ext_builtin::esc_tests::command_cannot_open_a_controlling_terminal",
+            exe.display()
+        );
+        let log = std::env::temp_dir().join(format!("pir-tty-probe-{}.log", std::process::id()));
+        let mut sc = Command::new("script");
+        if cfg!(target_os = "macos") {
+            // BSD: `script [-q] file command args...` — run the probe via `sh -c`.
+            sc.arg("-q")
+                .arg(&log)
+                .arg("sh")
+                .arg("-c")
+                .arg(&probe_cmd);
+        } else {
+            // util-linux: `script -q -e -c "cmd" file`.
+            sc.arg("-qec").arg(&probe_cmd).arg(&log);
+        }
+        let child = sc
+            .env(PROBE_ENV, "1")
+            .stdin(Stdio::null())
+            .output()
+            .expect("script(1) runs");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        // `script` echoes the child's output with CRLF; normalise before
+        // searching so the marker match is not defeated by a stray \r.
+        let combined = combined.replace('\r', "");
+        let verdict = combined
+            .lines()
+            .find_map(|l| l.trim().strip_prefix(PROBE_MARKER))
+            .map(|v| v.trim().to_string())
+            .unwrap_or_else(|| {
+                panic!("probe produced no marker line; child output:\n{combined}")
+            });
+        assert_eq!(
+            verdict, "tty=no",
+            "the spawned command could still open /dev/tty inside a pty, so a \
+             password prompt would block it forever (setsid is missing or \
+             ineffective). probe said: {verdict:?}\nchild output:\n{combined}"
+        );
+    }
+
+    /// Whether `script(1)` is available (it allocates the pty this test needs).
+    ///
+    /// Deliberately a *presence* check, not a flag check: the two `script`
+    /// implementations disagree on flags. util-linux's `script --version`
+    /// exits 0 while BSD/macOS's has no `--version` at all (exit 1), so a
+    /// flag-based probe silently reported "unavailable" on macOS and made this
+    /// test skip there — passing vacuously on the very platform the bug was
+    /// found on. `command -v` is the one form both shells agree on.
+    fn which_script() -> bool {
+        Command::new("sh")
+            .arg("-c")
+            .arg("command -v script")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Env that turns this test into the in-pty probe.
+    const PROBE_ENV: &str = "PIR_BUILTIN_TTY_PROBE";
+    /// Marker the probe prints so the parent can read its verdict.
+    const PROBE_MARKER: &str = "pir-tty-probe:";
 
     #[test]
     fn job_kill_escaped_grandchild_holding_pipe_returns_promptly() {
