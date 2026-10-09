@@ -682,6 +682,15 @@ mod tests {
     /// reported as analysed when it was never actually checked, which is the
     /// exact failure this module exists to prevent. Skipped where no GCC is
     /// present.
+    ///
+    /// **Linux-only**, despite the `tool_available("gcc")` guard: on macOS
+    /// `/usr/bin/gcc` is a shim for Apple clang, which has no `-fanalyzer` at
+    /// all (`clang: error: unknown argument: '-fanalyzer'`). The guard passes,
+    /// the analyzer never runs, and the test fails on a clean compile — which
+    /// is this module's own failure signature, reported for the wrong reason.
+    /// The command being verified is GCC's; without GCC there is nothing to
+    /// verify.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_gcc_fallback_command_actually_reports_a_real_bug() {
         if !tool_available("gcc") {

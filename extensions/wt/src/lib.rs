@@ -1064,20 +1064,36 @@ impl Wt {
 
     fn remove_worktree(&self, wt_dir: &Path, branch: &str) -> Outcome {
         let root = self.repo_root();
+        // `git worktree remove` landed in git 2.17. Older git (notably the
+        // Apple Git 2.14.3 on macOS 10.13) prints its `worktree` usage and
+        // exits 129 instead. Fall back to removing the directory by hand and
+        // letting `git worktree prune` clear the stale bookkeeping entry.
         let out = Command::new("git")
             .args(["worktree", "remove", "--force"])
             .arg(wt_dir)
             .current_dir(&root)
             .status();
+        let removed = match out {
+            Ok(s) if s.success() => true,
+            _ => {
+                let _ = std::fs::remove_dir_all(wt_dir);
+                Command::new("git")
+                    .args(["worktree", "prune"])
+                    .current_dir(&root)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            }
+        };
         let _ = Command::new("git")
             .args(["branch", "-D"])
             .arg(branch)
             .current_dir(&root)
             .status();
-        match out {
-            Ok(s) if s.success() => Outcome::ok(format!("removed worktree {wt_dir}", wt_dir = wt_dir.display())),
-            Ok(_) => Outcome::err(format!("worktree remove failed for {wt_dir}", wt_dir = wt_dir.display())),
-            Err(e) => Outcome::err(format!("worktree remove error: {e}")),
+        if removed {
+            Outcome::ok(format!("removed worktree {wt_dir}", wt_dir = wt_dir.display()))
+        } else {
+            Outcome::err(format!("worktree remove failed for {wt_dir}", wt_dir = wt_dir.display()))
         }
     }
 
@@ -1916,7 +1932,12 @@ mod tests {
 
     // Uses the `flock` command (util-linux), which doesn't exist on Windows;
     // the lock semantics are validated on unix.
-    #[cfg(unix)]
+    //
+    // **Linux-only in practice:** macOS ships no `flock` (it has `flock(2)` but
+    // not the util-linux command), so the spawn below fails with "No such file
+    // or directory". `#[cfg(unix)]` is therefore too permissive — the tool, not
+    // the syscall, is what this exercises.
+    #[cfg(target_os = "linux")]
     #[test]
     fn merge_lock_is_exclusive() {
         // Two concurrent flock holders on the same lock file must not both win.

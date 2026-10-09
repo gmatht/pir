@@ -1389,10 +1389,17 @@ mod tests {
         }
     }
 
+    /// A journal-copy fires only when the redirect target already exists
+    /// (truncating an existing file is the destructive case).
+    ///
+    /// **Linux-only**: the mitigation under test is `cp -a --reflink=auto`, and
+    /// `--reflink` is a GNU coreutils flag. BSD/macOS `cp` rejects it outright
+    /// (`cp: illegal option -- -`), so the plan produced there is not the one
+    /// this asserts on. The redirect/journal logic itself is portable — only the
+    /// flag it emits is not.
+    #[cfg(target_os = "linux")]
     #[test]
     fn redirect_onto_existing_adds_journal_copy() {
-        // A journal-copy fires only when the redirect target already exists
-        // (truncating an existing file is the destructive case).
         let dir = std::env::temp_dir().join(format!("pir_mit_redir_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("x.txt");

@@ -1875,6 +1875,14 @@ fn maybe_dump_payload(body: &Value) {
     if path.is_empty() {
         return;
     }
+    dump_payload_to(std::path::Path::new(&path), body);
+}
+
+/// The write half of [`maybe_dump_payload`], split out so a test can exercise
+/// it against an explicit path without touching the process-global env var —
+/// which the *real* request path reads too, so a test that set the var and then
+/// read the file would race every concurrent `chat()` in the same process.
+fn dump_payload_to(path: &std::path::Path, body: &Value) {
     let _ = std::fs::write(path, body.to_string());
 }
 
@@ -3293,7 +3301,15 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(secs);
         loop {
             match listener.accept() {
-                Ok((sock, _)) => return Some(sock),
+                Ok((sock, _)) => {
+                    // BSD/macOS `accept()` inherits O_NONBLOCK from the
+                    // listening socket, so the accepted stream would return
+                    // `WouldBlock` immediately on every read instead of
+                    // blocking (Linux does not do this). Every mock server here
+                    // assumes blocking reads, so clear it explicitly.
+                    sock.set_nonblocking(false).ok()?;
+                    return Some(sock);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     if std::time::Instant::now() >= deadline {
                         eprintln!("mock server: no client connected within {secs}s");
@@ -3437,7 +3453,7 @@ mod tests {
         let _srv = thread::spawn(move || {
             let Some(mut sock) = accept_within(&listener, 30) else { return };
             drain_request(&mut sock);
-            use std::io::Write as _;
+            use std::io::{Read as _, Write as _};
             // One SSE frame whose `content` delta is a single huge string (no
             // newlines), then the terminator. The huge line forces libcurl to
             // deliver many chunks.
@@ -3451,8 +3467,32 @@ mod tests {
             );
             let _ = sock.write_all(frame.as_bytes());
             let _ = sock.flush();
-            // Hold the connection open briefly so the client drains the body.
-            thread::sleep(Duration::from_millis(200));
+            // Keep the connection open until the client has actually drained
+            // the body. The response carries no Content-Length (it is
+            // delimited by connection close, which is how an SSE stream really
+            // arrives), so the client cannot finish until the server closes --
+            // and the client only reaches EOF once libcurl has delivered every
+            // chunk. A fixed sleep was a race: on the iMac a 200 ms window was
+            // regularly not enough to stream 256 KiB through the bounded(8)
+            // channel, so the server closed early and the parser saw a
+            // truncated frame and reported 0 bytes for a transfer that had in
+            // fact succeeded. Waiting for the read side to drain removes the
+            // timing assumption entirely.
+            let mut sink = [0u8; 4096];
+            sock.set_read_timeout(Some(Duration::from_secs(30))).ok();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if Instant::now() >= deadline {
+                    eprintln!("mock server: client never closed the connection");
+                    break;
+                }
+                // Read returns 0 only once the client has shut down its write
+                // side, which it does after consuming the whole body.
+                match sock.read(&mut sink) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
         });
         // Run the turn on a worker and bound the wait: on the old code it
         // deadlocked, and the test must fail (not hang the suite) when it does.
@@ -4245,17 +4285,41 @@ mod tests {
     fn debug_payload_dump_roundtrips() {
         // `PIR_DEBUG_PAYLOAD=<path>` must persist the exact body so a turn
         // can be replayed byte-identical through curl.
-        let _guard = env_lock();
+        //
+        // Exercises `dump_payload_to` directly rather than through the env var:
+        // the same env var is read by the real request path, which other tests
+        // drive concurrently in this process, so a set-then-read through the
+        // global would race them (they would rewrite this very file).
         let path = std::env::temp_dir().join(format!("pir_body_{}.json", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        unsafe { std::env::set_var("PIR_DEBUG_PAYLOAD", &path); }
         let body = serde_json::json!({"model": "m", "stream": true});
-        maybe_dump_payload(&body);
-        unsafe { std::env::remove_var("PIR_DEBUG_PAYLOAD"); }
+        dump_payload_to(&path, &body);
         let back: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("payload file"))
                 .expect("valid json");
         assert_eq!(back, body, "dumped body must parse back identically");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn maybe_dump_payload_honours_the_env_path_and_no_ops_when_unset() {
+        // The wrapper still resolves its path from the env var and writes the
+        // body there; unset (or empty) it must touch nothing.
+        let _guard = env_lock();
+        let path = std::env::temp_dir().join(format!("pir_envbody_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        unsafe { std::env::remove_var("PIR_DEBUG_PAYLOAD"); }
+        maybe_dump_payload(&serde_json::json!({"nope": true}));
+        assert!(!path.exists(), "unset var must not write anything");
+        unsafe { std::env::set_var("PIR_DEBUG_PAYLOAD", &path); }
+        let body = serde_json::json!({"model": "m"});
+        maybe_dump_payload(&body);
+        unsafe { std::env::remove_var("PIR_DEBUG_PAYLOAD"); }
+        let back: Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).expect("env-selected payload file"),
+        )
+        .expect("valid json");
+        assert_eq!(back, body);
         let _ = std::fs::remove_file(&path);
     }
 
