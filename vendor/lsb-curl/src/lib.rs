@@ -250,13 +250,37 @@ impl std::fmt::Debug for Curl {
     }
 }
 
+/// Candidate library names for the host's libcurl, in priority order.
+///
+/// The list is platform-specific because the *filename* differs, not the ABI:
+/// the same `curl_easy_*` symbols are resolved either way, and `dlopen` is what
+/// actually loads the file.
+///
+/// * **Linux** — `libcurl.so.4` is the stable ABI since 7.x on every glibc
+///   distro (CentOS 7 ships 7.29.0 as `libcurl.so.4.3.0`). Debian/Ubuntu also
+///   ship GnuTLS-flavoured variants with the identical ABI (e.g. `libcurl-
+///   gnutls.so.4`, historically the *only* curl on Ubuntu 16.04); those are
+///   tried as a fallback.
+/// * **macOS** — there is no `.so.4` soname; the system library is
+///   `libcurl.4.dylib` (with `libcurl.dylib` as the unversioned symlink).
+///   **Without this arm `Curl::load` fails on every macOS host**, because all
+///   three Linux candidates simply do not exist there, and every provider
+///   request then errors with `lsb-curl backend unavailable`. Verified on
+///   macOS 10.13 (x86_64), which ships `libcurl.4.dylib`.
+/// * **other unix** — try the generic name and let the loader decide.
+#[cfg(target_os = "macos")]
+fn candidates() -> &'static [&'static str] {
+    &["libcurl.4.dylib", "libcurl.dylib", "/usr/lib/libcurl.4.dylib"]
+}
+
+#[cfg(not(target_os = "macos"))]
+fn candidates() -> &'static [&'static str] {
+    &["libcurl.so.4", "libcurl.so", "libcurl-gnutls.so.4"]
+}
+
 impl Curl {
-    /// Load the host libcurl. Candidate sonames cover the distro spread:
-    /// `libcurl.so.4` is the stable ABI since 7.x on every glibc distro
-    /// (CentOS 7 ships 7.29.0 as `libcurl.so.4.3.0`). Debian/Ubuntu also
-    /// ship GnuTLS-flavored variants (`libcurl-gnutls.so.4`, e.g. the
-    /// *only* curl on Ubuntu 16.04) with the identical `curl_easy_*`
-    /// ABI — those are tried as a fallback.
+    /// Load the host libcurl. Candidate sonames cover the distro spread;
+    /// see [`candidates`] for the per-platform list and why it differs.
     ///
     /// `LSBWRAP_LIBCURL_PATH` forces an explicit absolute path (same
     /// convention as `LSBWRAP_LIBZ_PATH` / `LSBWRAP_LIBSSL_PATH`).
