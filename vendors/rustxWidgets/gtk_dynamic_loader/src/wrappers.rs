@@ -1174,10 +1174,31 @@ impl ScrolledWindow {
         )
     }
 
+    /// The vertical adjustment's upper bound: the end of the scrollable extent.
+    ///
+    /// This is what distinguishes "scrolled to the bottom" from "scrolled away
+    /// from the bottom". A caller that only reads `get_vadjustment_value` can
+    /// see *where* the user is but not whether that is the end, so it cannot
+    /// implement follow-the-tail without yanking a reader back down.
+    pub fn get_vadjustment_upper(&self) -> f64 {
+        guard_widget_or!(self, "ScrolledWindow", "get_vadjustment_upper", 0.0);
+        self.adj_upper(
+            self.loader.symbols.gtk_scrolled_window_get_vadjustment,
+            self.loader.symbols.gtk_adjustment_get_upper,
+        )
+    }
+
     fn adj_value(&self, get_adj: Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void>, get_val: Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> f64>) -> f64 {
         get_adj.and_then(|f| {
             let adj = unsafe { f(self.inner) };
             if adj.is_null() { None } else { get_val.map(|gv| unsafe { gv(adj) }) }
+        }).unwrap_or(0.0)
+    }
+
+    fn adj_upper(&self, get_adj: Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void>, get_upper: Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> f64>) -> f64 {
+        get_adj.and_then(|f| {
+            let adj = unsafe { f(self.inner) };
+            if adj.is_null() { None } else { get_upper.map(|gu| unsafe { gu(adj) }) }
         }).unwrap_or(0.0)
     }
 }

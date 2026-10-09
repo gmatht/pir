@@ -1039,6 +1039,14 @@ mod gtk_adapter {
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
         pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
+
+        /// Current vertical scroll position, in pixels.
+        pub fn get_vadjustment_value(&self) -> f64 { self.0.get_vadjustment_value() }
+
+        /// End of the scrollable extent, in pixels. Comparing this against
+        /// `get_vadjustment_value` is how a caller tells "at the bottom" from
+        /// "scrolled away from the bottom" — i.e. follow-the-tail.
+        pub fn get_vadjustment_upper(&self) -> f64 { self.0.get_vadjustment_upper() }
     }
 
     impl AsRef<*mut c_void> for ScrolledWindow { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }

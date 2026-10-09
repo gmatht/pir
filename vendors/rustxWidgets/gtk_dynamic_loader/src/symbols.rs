@@ -98,6 +98,7 @@ pub type GtkEventControllerSetPropagationPhase = unsafe extern "C" fn(controller
 pub type GtkScrolledWindowGetVadjustment = unsafe extern "C" fn(sw: *mut c_void) -> *mut c_void;
 pub type GtkScrolledWindowGetHadjustment = unsafe extern "C" fn(sw: *mut c_void) -> *mut c_void;
 pub type GtkAdjustmentGetValue = unsafe extern "C" fn(adj: *mut c_void) -> f64;
+pub type GtkAdjustmentGetUpper = unsafe extern "C" fn(adj: *mut c_void) -> f64;
 pub type GtkGestureClickNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkWidgetSetCanTarget = unsafe extern "C" fn(widget: *mut c_void, can_target: i32);
 pub type GtkWidgetSetHalign = unsafe extern "C" fn(widget: *mut c_void, align: i32);
@@ -431,6 +432,7 @@ pub struct Symbols {
     pub gtk_scrolled_window_get_vadjustment: Option<GtkScrolledWindowGetVadjustment>,
     pub gtk_scrolled_window_get_hadjustment: Option<GtkScrolledWindowGetHadjustment>,
     pub gtk_adjustment_get_value: Option<GtkAdjustmentGetValue>,
+    pub gtk_adjustment_get_upper: Option<GtkAdjustmentGetUpper>,
     // GMenuModel iteration (for GTK3 fallback)
     pub g_menu_model_get_n_items: Option<GMenuModelGetNItems>,
     pub g_menu_model_get_item_attribute_value: Option<GMenuModelGetItemAttributeValue>,
@@ -720,6 +722,7 @@ impl Symbols {
         let gtk_scrolled_window_get_vadjustment = unsafe { sym::<GtkScrolledWindowGetVadjustment>(gtk, "gtk_scrolled_window_get_vadjustment") };
         let gtk_scrolled_window_get_hadjustment = unsafe { sym::<GtkScrolledWindowGetHadjustment>(gtk, "gtk_scrolled_window_get_hadjustment") };
         let gtk_adjustment_get_value = unsafe { sym::<GtkAdjustmentGetValue>(gtk, "gtk_adjustment_get_value") };
+        let gtk_adjustment_get_upper = unsafe { sym::<GtkAdjustmentGetUpper>(gtk, "gtk_adjustment_get_upper") };
 
         // application/menu/action symbols (try glib/gio)
         // try gio first then glib for the app/menu symbols
@@ -897,6 +900,7 @@ impl Symbols {
             gtk_scrolled_window_get_vadjustment,
             gtk_scrolled_window_get_hadjustment,
             gtk_adjustment_get_value,
+            gtk_adjustment_get_upper,
             gtk_dialog_new, gtk_dialog_add_button, gtk_dialog_get_content_area, gtk_dialog_run,
             gtk_combo_box_text_new, gtk_combo_box_text_append_text, gtk_combo_box_text_get_active_text, gtk_combo_box_set_active, gtk_combo_box_get_active,
             gtk_drop_down_new, gtk_drop_down_set_selected, gtk_drop_down_get_selected, gtk_string_list_new,
