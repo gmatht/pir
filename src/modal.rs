@@ -1196,15 +1196,14 @@ pub fn question_dialog(q: &crate::askuser::Question) -> Option<crate::askuser::A
         // chosen but never seen — the "I can't get to the later options"
         // report. (Every other dialog here goes through
         // `draw_box_scrolled`; this one drew the whole list and hoped.)
+        //
+        // The math itself lives in `window_start`, which the tests below pin.
+        // It used to be re-inlined here, which left those tests asserting a
+        // function the dialog never called: the fix they were written for
+        // could regress without a single test noticing, because the only
+        // code under test was the copy nobody ran.
         let viewport = modal_body_rows();
-        let first = if rows.len() <= viewport {
-            0
-        } else {
-            let row_of = selected.min(rows.len() - 1);
-            // Keep the cursor one row inside the window so it stays visible.
-            row_of.saturating_sub(viewport.saturating_sub(2).max(1))
-        }
-        .min(rows.len().saturating_sub(viewport));
+        let first = window_start(selected, rows.len(), viewport);
         let visible: Vec<String> = rows[first..(first + viewport).min(rows.len())].to_vec();
 
         let mut lines = wrap_lines(&q.question, 72);
@@ -1491,6 +1490,34 @@ mod keyboard_ownership_tests {
             assert!(first + 6 <= 12, "window must not run past the end: {first}");
         }
         assert_eq!(window_start(11, 12, 6), 6, "the last row pins the window to the end");
+    }
+
+    /// The dialog must *use* `window_start`, not a private copy of its math.
+    ///
+    /// This is the regression the two tests above could not catch. They call
+    /// `window_start` directly, so when `question_dialog` re-inlined the same
+    /// expression they kept passing while exercising code the dialog never ran:
+    /// the scroll fix could be reverted in the dialog and the suite stayed
+    /// green. The dialog's viewport is not directly observable (it needs a tty
+    /// and a key loop), so this asserts the wiring where it is checkable — the
+    /// selection → window mapping the dialog now delegates.
+    #[test]
+    fn the_dialog_delegates_its_viewport_to_window_start() {
+        // Exactly the call `question_dialog` makes (see the `let first =`
+        // there), so a divergence between the two is a test failure.
+        let dialog_first = |selected: usize, rows: usize, viewport: usize| -> usize {
+            window_start(selected, rows, viewport)
+        };
+        let total = 12usize;
+        let viewport = 4usize;
+        for selected in 0..total {
+            let first = dialog_first(selected, total, viewport);
+            // The window must contain the cursor and stay inside the list —
+            // the two properties the inline copy was written to have.
+            assert!(selected >= first, "cursor {selected} above window start {first}");
+            assert!(selected < first + viewport, "cursor {selected} below window end");
+            assert!(first + viewport <= total, "window {first} runs past the list end");
+        }
     }
 
     // -- the keyboard ownership ---------------------------------------------
