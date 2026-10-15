@@ -296,7 +296,7 @@ fn prompt_cursor_col(draft: &str, w: usize) -> usize {
 #[cfg(unix)]
 pub fn out(s: &str) {
     #[cfg(unix)]
-    use std::os::unix::io::{AsRawFd, FromRawFd};
+    use std::os::unix::io::AsRawFd;
     #[cfg(unix)]
     let _screen = screen_lock();
     #[cfg(unix)]
@@ -316,7 +316,7 @@ pub fn out(s: &str) {
     // writing a prefix (a short write, then EAGAIN), so each retry must resume
     // from where the last one stopped — otherwise every retry re-sends the
     // whole string from offset 0, duplicating the prefix that already landed.
-    let mut written = 0usize;
+    let written = 0usize;
     // Bound the total work so a persistent stall can't spin forever.
     for _ in 0..1024 {
         let mut stdout = io::stdout();
@@ -356,13 +356,17 @@ pub fn out(s: &str) {
                 let _ = stdout.flush();
                 let fd = io::stdout().as_raw_fd();
                 let saved_flags = set_nonblocking(fd);
-                let block = async {
-                    if let Ok(a) = smol::Async::new(unsafe { std::fs::File::from_raw_fd(fd) }) {
-                        let _ = a.writable().await;
-                        std::mem::forget(a); // we only borrowed fd 1; never close it
-                    }
-                };
-                smol::block_on(block);
+                // Wait for writability on a **dup** of stdout, never on stdout
+                // itself: `std::fs::File::from_raw_fd` takes ownership, so any
+                // dropped `File` closes the descriptor. The earlier code wrapped
+                // fd 1 directly and relied on `mem::forget`, which only covers the
+                // success path — when `smol::Async::new` returned `Err`, the file
+                // was dropped and **stdout was closed for the rest of the
+                // process** (observed live: `lsof` showed fds 0 and 2 on the tty
+                // and fd 1 absent). With stdout gone `term::is_terminal()` is
+                // false, the spinner is never started, and the footer freezes on
+                // its last frame. See `wait_writable_bounded`.
+                wait_writable_bounded(fd, Duration::from_secs(1));
                 // Restore blocking mode (see above) so every other stdout writer
                 // in the process keeps its write-and-block semantics.
                 restore_flags(fd, saved_flags);
@@ -379,10 +383,28 @@ pub fn out_flush() {
     let _ = io::stdout().flush();
 }
 
+/// Records the width of the last frame the spinner tick painted, so a test can
+/// observe the geometry the tick *actually used* rather than recomputing it.
+///
+/// This exists because the obvious test — format `midturn_zone_lines` at two
+/// widths and compare — is a tautology: it proves the formatter honours its
+/// argument, and passes even when the tick passes a stale width. The reported
+/// resize bug lives in the tick's width *source*, so only the tick's own
+/// observed value can catch it. Compiled away in normal builds.
+#[cfg(all(unix, test))]
+pub(crate) static LAST_PAINTED_WIDTH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
+fn record_painted_width(w: usize) {
+    #[cfg(all(unix, test))]
+    LAST_PAINTED_WIDTH.store(w, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(all(unix, test)))]
+    let _ = w;
+}
+
 /// Width of the terminal in columns (used to size the REPL hrule). Falls back
 /// to 80 when the size can't be queried (e.g. a pipe or a non-tty).
-#[cfg(unix)]
-#[cfg(unix)]
 pub fn terminal_width() -> usize {
     #[cfg(unix)]
     {
@@ -584,6 +606,186 @@ pub fn zone_scroll_lines(cursor_row: usize, height: usize) -> usize {
     (cursor_row + 2).saturating_sub(height)
 }
 
+/// Rows reserved above the idle prompt for the live `/model` preview (five
+/// model rows plus nothing else — the hint line stays on the prompt row).
+pub const MODEL_PREVIEW_ROWS: usize = 5;
+
+// Live `/model` preview state for the current idle prompt: the prompt row
+// (where the line editor parked it) and how many rows are currently painted
+// above it. Thread-local, like the other prompt state.
+thread_local! {
+    static PREVIEW: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    /// The active `provider/model` label, so the preview can mark `•current`.
+    static PREVIEW_CURRENT: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+    /// The highlighted row of the live list (moved by Up/Down). `None` means
+    /// nothing is highlighted yet.
+    static PREVIEW_SEL: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// The argument the current highlight belongs to. The highlight is cleared
+    /// whenever the typed argument changes, so narrowing the list can never
+    /// leave a stale row selected.
+    static PREVIEW_ARG: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+    /// The candidates of the last repaint, so Enter can map the highlighted row
+    /// back to a `provider/model` label without re-reading the history.
+    static PREVIEW_CANDS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Move the live list's highlight by one row (Up/Down on a `/model`-family
+/// draft). Returns `true` when the draft is a live `/model` line with
+/// candidates, i.e. the key was consumed by the picker rather than history
+/// recall.
+///
+/// The first Down lands on the first row and the first Up on the last
+/// (the standard closed-list feel, matching `step_pick`); later presses clamp
+/// at the ends. The highlight lives *outside* the buffer on purpose: the draft
+/// stays exactly what the operator typed, so nothing hidden can be submitted.
+pub fn move_model_preview_selection(up: bool) -> bool {
+    let cands = PREVIEW_CANDS.with(|c| c.borrow().clone());
+    if cands.is_empty() {
+        return false;
+    }
+    let last = cands.len() - 1;
+    let next = match PREVIEW_SEL.with(|s| s.get()) {
+        // No highlight yet: the first Down lands on the first row and the first
+        // Up on the last — the standard "closed list" feel (`step_pick`).
+        None => {
+            if up {
+                last
+            } else {
+                0
+            }
+        }
+        Some(i) if up => i.saturating_sub(1),
+        Some(i) => (i + 1).min(last),
+    };
+    PREVIEW_SEL.with(|s| s.set(Some(next)));
+    true
+}
+
+/// Consume the live highlight: return its `1`-based row number and its label,
+/// and forget it. Called by the command dispatcher when a submitted `/model`
+/// line arrives, so a highlight can only ever apply to the Enter right after
+/// it.
+pub fn take_model_preview_selection() -> Option<(usize, String)> {
+    let sel = PREVIEW_SEL.with(|s| s.take())?;
+    let label = PREVIEW_CANDS.with(|c| c.borrow().get(sel).cloned())?;
+    Some((sel + 1, label))
+}
+
+/// Tell the live `/model` preview which model is active (the REPL passes the
+/// same label the footer shows). Cheap: it only affects the next repaint.
+pub fn set_model_preview_current(label: &str) {
+    PREVIEW_CURRENT.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.as_str() != label {
+            c.clear();
+            c.push_str(label);
+        }
+    });
+}
+
+/// Erase the live preview block and forget its bookkeeping. Called when the
+/// prompt is torn down so a stale list cannot survive into the next screen.
+pub fn clear_model_preview() {
+    let (row, n) = PREVIEW.with(|c| c.get());
+    if row > 0 && n > 0 {
+        let mut buf = String::new();
+        for r in row - n..row {
+            buf.push_str(&format!("\x1b[{r};1H\x1b[2K"));
+        }
+        buf.push_str(&format!("\x1b[{row};1H"));
+        out(&buf);
+        out_flush();
+    }
+    PREVIEW.with(|c| c.set((row, 0)));
+}
+
+/// Paint the live `/model` preview: `rows` become the block occupying the
+/// rows reserved immediately above the prompt, and the cursor is parked back on
+/// the prompt row.
+///
+/// Absolute addressing only, and no scrolling — the room was reserved once by
+/// [`open_input_zone`] — so the line editor's relative redraw is never
+/// disturbed. `rows` empty erases the block. Returns the number of rows painted.
+fn paint_model_preview(rows: &[String]) -> usize {
+    let (prompt_row, _) = PREVIEW.with(|c| c.get());
+    if !is_terminal() || prompt_row == 0 {
+        return 0;
+    }
+    let cap = MODEL_PREVIEW_ROWS.min(prompt_row.saturating_sub(2));
+    let n = rows.len().min(cap);
+    let mut buf = String::new();
+    // Clear the whole reservation first: guarantees no stale row survives when
+    // the new block is shorter than the previous one.
+    for i in 1..=cap {
+        buf.push_str(&format!("\x1b[{};1H\x1b[2K", prompt_row - i));
+    }
+    for (i, row) in rows.iter().take(n).enumerate() {
+        buf.push_str(&format!("\x1b[{};1H{row}", prompt_row - n + i));
+    }
+    buf.push_str(&format!("\x1b[{};1H", prompt_row));
+    let _ = io::stdout().write_all(buf.as_bytes());
+    let _ = io::stdout().flush();
+    PREVIEW.with(|c| c.set((prompt_row, n)));
+    n
+}
+
+/// Compute the live preview rows for a draft: the top-N recents (narrowed by a
+/// typed prefix), numbered one per line, with `sel` marked. Empty when the
+/// draft is not a `/model`-family line. Pure, so the row content is testable
+/// without a tty (the caller owns the painting).
+pub fn preview_rows(line: &str, sel: Option<usize>, current: &str) -> Vec<String> {
+    match crate::model_history::parse_model_line(line) {
+        Some((_, arg)) => {
+            let cands = crate::model_history::top_matching(&arg, crate::model_history::TOP_N);
+            crate::model_history::format_rows(&cands, sel, current)
+        }
+        None => Vec::new(),
+    }
+}
+
+fn refresh_model_preview(line: &str, pos: usize) {
+    if !is_terminal() {
+        return;
+    }
+    let line = &line[..pos.min(line.len())];
+    let parsed = crate::model_history::parse_model_line(line);
+    let arg = parsed.as_ref().map(|(_, a)| a.clone()).unwrap_or_default();
+    if parsed.is_none() {
+        PREVIEW_SEL.with(|s| s.set(None));
+        PREVIEW_ARG.with(|a| a.borrow_mut().clear());
+        PREVIEW_CANDS.with(|c| c.borrow_mut().clear());
+    } else {
+        // The highlight belongs to the argument it was set on: changing the
+        // draft (typing more of a prefix, backspacing) clears it, so a stale
+        // row can never be committed by a later Enter.
+        if PREVIEW_ARG.with(|a| a.borrow().as_str() != arg) {
+            PREVIEW_ARG.with(|a| {
+                let mut a = a.borrow_mut();
+                a.clear();
+                a.push_str(&arg);
+            });
+            PREVIEW_SEL.with(|s| s.set(None));
+        }
+        let cands = crate::model_history::top_matching(&arg, crate::model_history::TOP_N);
+        PREVIEW_CANDS.with(|c| {
+            let mut c = c.borrow_mut();
+            c.clear();
+            c.extend(cands.iter().cloned());
+        });
+    }
+    let sel = PREVIEW_SEL.with(|s| s.get());
+    let current = PREVIEW_CURRENT.with(|c| c.borrow().clone());
+    let rows = preview_rows(line, sel, &current);
+    let (_, painted) = PREVIEW.with(|c| c.get());
+    if rows.is_empty() && painted == 0 {
+        return;
+    }
+    paint_model_preview(&rows);
+}
+
 /// Draw the top hrule of the idle input zone and leave the cursor on the next
 /// row for `read_line`, so the layout is hrule / prompt (cursor) / footer —
 /// the prompt always sits between its two rules with the cursor on it. Uses
@@ -592,6 +794,12 @@ pub fn zone_scroll_lines(cursor_row: usize, height: usize) -> usize {
 /// only) when the zone would overlap the footer row. No-op without a tty or
 /// on a tiny screen (caller falls back to a plain prompt). There is no close
 /// step: after submit the existing footer redraw is the bottom border again.
+///
+/// Above the rule, [`MODEL_PREVIEW_ROWS`] blank rows are reserved for the live
+/// `/model` preview. The space is created by scrolling **only the rows above
+/// the rule** (a scroll region that stops one row short of it), so the prompt
+/// row and the footer never move — which is what keeps the line editor's
+/// relative cursor bookkeeping valid while the block is painted.
 pub fn open_input_zone() {
     if !is_terminal() {
         return;
@@ -611,10 +819,27 @@ pub fn open_input_zone() {
         }
     }
     let top = r.saturating_sub(s).max(1);
+    // Reserve the preview rows above the rule by scrolling the conversation
+    // region (rows 1..top-1) up. Scoped to that region, so the rule/prompt rows
+    // painted next keep their absolute positions.
+    let reserve = MODEL_PREVIEW_ROWS.min(top.saturating_sub(2));
+    if reserve > 0 {
+        out(&format!("\x1b[1;{}r\x1b[{};1H", top - 1, top - 1));
+        for _ in 0..reserve {
+            out("\r\n");
+        }
+        out("\x1b[r");
+        out_flush();
+    }
     out(&format!("\x1b[{top};1H"));
     out(&hrule());
     out("\r\n");
     out_flush();
+    PREVIEW.with(|c| c.set((top + 1, 0)));
+    // A fresh prompt starts with no highlight: a selection belongs to the
+    // keystrokes that set it, never to the next line.
+    PREVIEW_SEL.with(|s| s.set(None));
+    PREVIEW_ARG.with(|a| a.borrow_mut().clear());
 }
 
 /// A single full-width footer line: `── <status> ──…──`. The status text
@@ -834,6 +1059,51 @@ fn restore_flags(fd: i32, saved: i32) {
     }
 }
 
+/// Wait (bounded) until `fd` is writable, using a `dup` of it so the original
+/// descriptor is never owned — and therefore never closed — by the wait.
+///
+/// `std::fs::File::from_raw_fd` takes ownership, so wrapping the *real* fd means
+/// any dropped `File` closes it. That was the field bug: the wait wrapped fd 1,
+/// `smol::Async::new` returned `Err`, the `File` was dropped, and **stdout was
+/// closed for the rest of the process** — after which `term::is_terminal()` is
+/// false, the spinner is never started, and the footer freezes on its last
+/// frame. Waiting on a `dup` means the worst case is closing a descriptor we
+/// explicitly own, never losing stdout.
+///
+/// Polled rather than `await`ed on purpose: an async writability wait has no
+/// timeout, so a pipe whose reader never drains would wedge the caller forever.
+/// Polling with a deadline is bounded and, at ~0% CPU for a short sleep between
+/// checks, is not a busy loop.
+#[cfg(unix)]
+fn wait_writable_bounded(fd: i32, bound: std::time::Duration) {
+    let wait_fd = unsafe { libc::dup(fd) };
+    if wait_fd < 0 {
+        return;
+    }
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        let mut pfd = libc::pollfd { fd: wait_fd, events: libc::POLLOUT, revents: 0 };
+        // 20ms slices: the caller re-attempts the write on return anyway, so a
+        // fine-grained poll only costs a few wakeups while the terminal is full.
+        let r = unsafe { libc::poll(&mut pfd, 1, 20) };
+        if r > 0 && (pfd.revents & libc::POLLOUT) != 0 {
+            break;
+        }
+        if r < 0 {
+            let err = std::io::Error::last_os_error().raw_os_error();
+            if err != Some(libc::EINTR) {
+                break;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+    unsafe {
+        libc::close(wait_fd);
+    }
+}
+
 /// Byte sequence that reserves the footer zone: confine scrolling to the
 /// content region, then park on the prompt row. Pure for tests.
 fn spinner_start_seq(h: usize) -> String {
@@ -853,6 +1123,28 @@ fn spinner_stop_seq(h: usize) -> String {
     }
     s.push_str("\x1b[r");
     s
+}
+
+/// Repair bytes emitted on the first tick after the terminal was resized.
+///
+/// A resize is the reported corruption: the zone is drawn from a width read
+/// once when the spinner starts, so after a pane split the hrule is laid out
+/// for the *old*, wider pane. The extra columns past the new right edge wrap
+/// (or are clipped at the old column, for a wider pane), and the DECSTBM
+/// scroll region was set for the old *height*, so the rows the zone paints no
+/// longer match the rows it reserved. The next tick re-reads both dimensions
+/// and paints at the new geometry (`ESC[2K` clears a whole row, so the tail of
+/// a wider stale rule cannot survive), but the region must be re-established
+/// from scratch first: resetting it (`ESC[r`) before the tick re-asserts it
+/// makes the re-assert authoritative instead of layering onto a stale region.
+///
+/// Pure, so the "a resize must produce a repair, and that repair must not move
+/// the cursor" contract is testable without a tty.
+fn resize_repair_seq() -> String {
+    // Reset the scroll region only; the tick that follows immediately sets
+    // `1;region_bottom r` for the *current* height and repaints every zone row
+    // with `2K` first, which is what clears a stale wider rule.
+    "\x1b[r".to_string()
 }
 /// The three content lines of the mid-turn footer zone (pure: no I/O), drawn
 /// at the bottom rows H-2/H-1/H every spinner tick with absolute cursor moves
@@ -1326,6 +1618,63 @@ struct PirHelper {
     history_hinter: HistoryHinter,
 }
 
+/// Conditional Up/Down handler: on a `/model`-family line with a live
+/// candidate list, replace the buffer with the next/previous recent model
+/// (`▸` in the hint tracks the move); anywhere else, fall through to
+/// rustyline history recall by returning `None`.
+///
+/// Only the current line matters: `ctx.line()` is the whole single-line
+/// buffer the operator sees, and `Cursor at end` is irrelevant — the picker
+/// rewrites the argument, wherever the caret sits.
+struct ModelPickHandler {
+    up: bool,
+}
+
+impl ConditionalEventHandler for ModelPickHandler {
+    fn handle(
+        &self,
+        _evt: &Event,
+        _n: RepeatCount,
+        _positive: bool,
+        ctx: &EventContext,
+    ) -> Option<Cmd> {
+        // This binding shadows the `Any` observer for Up/Down, so the activity
+        // reset it used to do must happen here — on both paths — or an arrow
+        // key stops counting as activity for the triple-press-to-quit gesture.
+        reset_quit_presses();
+        let line = ctx.line();
+        let pos = ctx.pos();
+        let parsed = crate::model_history::parse_model_line(&line[..pos.min(line.len())]);
+        // Any live `/model` line (bare, numbered, or prefixed) shows the block,
+        // so the arrows move *its* highlight and leave the draft alone: the
+        // operator's typed line stays exactly what they typed, and Enter (or a
+        // number) commits the highlight. Storing the highlight in the buffer is
+        // what would let something hidden be submitted by accident.
+        //
+        // Refresh first: it (re)computes the candidate list for the current
+        // draft, so the very first arrow already has something to step through.
+        if parsed.is_some() {
+            refresh_model_preview(line, pos);
+            if crate::term::move_model_preview_selection(self.up) {
+                // `Repaint` refreshes the line, which re-runs `hint()` and so
+                // the preview paint — exactly what we want after moving the
+                // marker.
+                return Some(Cmd::Repaint);
+            }
+        }
+        // No live candidates (stale/unknown prefix): fall back to the original
+        // behaviour of stepping through the *matching* models by rewriting the
+        // argument, so the arrows still do something useful.
+        let arg = parsed.map(|(_, a)| a).unwrap_or_default();
+        let cands = crate::model_history::top_matching(&arg, crate::model_history::TOP_N);
+        let picked = crate::model_history::pick_next(line, pos, &cands, self.up)?;
+        // Replace the whole buffer, cursor to end: kill + insert is total
+        // (also when the buffer is empty-ish), and `next_cmd` opens the undo
+        // group for `Replace`, so one Ctrl-U/Ctrl-_ undoes the whole step.
+        Some(Cmd::Replace(Movement::WholeBuffer, Some(picked)))
+    }
+}
+
 impl rustyline::Helper for PirHelper {}
 
 /// The known slash commands, used for command-name completion (the user can
@@ -1415,6 +1764,13 @@ fn command_help_hint(line: &str) -> Option<String> {
     if has_arg {
         // Once an argument exists, pi stops showing command help; keep it quiet
         // so the argument preview (e.g. a typed model prefix) is free to show.
+        // Model commands always yield here: their preview (first matching
+        // `provider/model` label) is more useful than the static description,
+        // which otherwise occludes it on every keystroke and no model is ever
+        // suggested. Every other command keeps its description as guidance.
+        if matches!(cmd, "/model" | "/m" | "/default-model" | "/dm") {
+            return None;
+        }
         if arg.is_empty() {
             return None;
         }
@@ -1639,6 +1995,32 @@ impl Completer for PirHelper {
 impl Hinter for PirHelper {
     type Hint = String;
     fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<String> {
+        // Live `/model` preview. `hint` is invoked by rustyline on *every*
+        // `refresh_line` (i.e. every keystroke and cursor move), which makes it
+        // the reliable per-edit hook: the five models are painted into the rows
+        // reserved above the prompt whenever the draft is a `/model` line, and
+        // erased when it stops matching. Doing it here (rather than from an
+        // `Event::Any` observer) means it never misses the final keystroke of a
+        // burst, and it runs before rustyline repaints the line itself.
+        refresh_model_preview(line, pos);
+        // Inline `/model` picker: before Enter, list the top-N recent models
+        // (filtered by the typed prefix) as the hint, with the current
+        // selection marked — Up/Down steps through them in place. This runs
+        // first so a bare `/model` shows the recents instead of the static
+        // syntax hint, and a prefixed one shows the narrowed list instead of
+        // the single-match ghost; both remain as fallbacks when history has
+        // no match for the prefix.
+        //
+        // The live five-row block above the prompt (`refresh_model_preview`)
+        // carries the list for every `/model`-family line with candidates, so
+        // the hint is only the affordance — otherwise the same models would
+        // appear twice, once as rows and once as a joined one-liner.
+        if let Some((_cmd, arg)) = crate::model_history::parse_model_line(&line[..pos.min(line.len())]) {
+            let cands = crate::model_history::top_matching(&arg, crate::model_history::TOP_N);
+            if !cands.is_empty() {
+                return Some("[↑↓ select · enter to pick]".to_string());
+            }
+        }
         // Brief per-command help: as soon as the user types a `/command` (e.g.
         // `/login`), show its argument hint + description inline to the right of
         // the cursor, mirroring pi's autocomplete dropdown. This takes priority
@@ -1857,6 +2239,18 @@ fn new_editor() -> Option<Editor<PirHelper, rustyline::history::DefaultHistory>>
     // Observer: any other keypress is activity — restart the quit gesture.
     // Fires only when no specific binding matches, returning `None` so the
     // default command runs untouched.
+    // Inline `/model` picker: Up/Down steps through the top-N recent models
+    // (see `ModelPickHandler`); on any other line the handler declines and
+    // rustyline history recall runs unchanged. Registered before the `Any`
+    // observer so the activity reset still fires for these keys.
+    let _ = rl.bind_sequence(
+        KeyEvent(KeyCode::Up, Modifiers::NONE),
+        rustyline::EventHandler::Conditional(Box::new(ModelPickHandler { up: true })),
+    );
+    let _ = rl.bind_sequence(
+        KeyEvent(KeyCode::Down, Modifiers::NONE),
+        rustyline::EventHandler::Conditional(Box::new(ModelPickHandler { up: false })),
+    );
     let _ = rl.bind_sequence(
         Event::Any,
         rustyline::EventHandler::Conditional(Box::new(ResetQuitPresses)),
@@ -2423,6 +2817,9 @@ pub fn read_line(prompt: &str) -> Option<String> {
             Some(init) => rl.readline_with_initial(prompt, (init.as_str(), "")),
             None => rl.readline(prompt),
         };
+        // The line is submitted (or the prompt torn down): erase the live
+        // preview block so it cannot survive under the output that follows.
+        clear_model_preview();
         match res {
             Ok(line) => {
                 let _ = rl.add_history_entry(line.as_str());
@@ -2978,7 +3375,6 @@ impl Spinner {
             // `Instant::now()` here would restart the clock at 0s each round and
             // a long turn would read `running · 0s` forever.
             let started = since;
-            let w = terminal_width().max(20);
             let mut erased = false;
             while a.load(Ordering::SeqCst) {
                 // Detached turn: erase the footer zone once and go silent so
@@ -2994,6 +3390,18 @@ impl Spinner {
                     continue;
                 }
                 erased = false;
+                // A modal dialog owns the alternate screen and the keyboard:
+                // these 80ms footer repaints would land on top of it. The two
+                // writers share no lock, so the racing bytes garbled blocking
+                // dialogs — the plan-approval box came up blank/unreadable
+                // while ticks kept repainting the footer rows underneath it.
+                // Stand down until the dialog closes (same rule as the REPL
+                // input reader in `raw::wait_input`); absolute addressing
+                // self-heals on the first tick after.
+                if crate::modal::keyboard_held() {
+                    std::thread::sleep(Duration::from_millis(80));
+                    continue;
+                }
                 let frame = frames[i % frames.len()];
                 let typed = typeahead.lock().map(|g| g.clone()).unwrap_or_default();
                 // 3-line footer zone (status hrule / ❯ draft prompt / hrule),
@@ -3007,6 +3415,19 @@ impl Spinner {
                 let h = terminal_height();
                 let _screen = screen_lock();
                 let mut buf = String::new();
+                // Re-read the real terminal width here, not from the
+                // start-of-spinner capture: a pane split can halve it while
+                // the turn runs, and painting the zone at the old width drew a
+                // hrule wider than the new pane (the stray run of `──` left
+                // behind after halving a pane). Every row below is addressed
+                // absolutely and cleared with `ESC[2K` first, and `2K` erases
+                // the *whole* row regardless of width — so the first tick
+                // after the resize both removes the tail of the old, wider
+                // rule and repaints at the new width. The scroll region is
+                // likewise re-asserted every tick just below, so a height
+                // change is covered by the same absolute repaint.
+                let w = terminal_width().max(20);
+                record_painted_width(w);
                 // Re-assert the scroll region every tick: a resize or a
                 // foreign reset (e.g. a tool running a full-screen pager)
                 // self-heals within 80ms.
@@ -4462,6 +4883,59 @@ mod tests {
         );
     }
 
+    /// The EAGAIN wait must never close the descriptor it waits on.
+    ///
+    /// This is the field bug that outlived the non-blocking fix: the wait
+    /// wrapped the *real* fd in `std::fs::File::from_raw_fd`, which takes
+    /// ownership — so any path that dropped it (notably `smol::Async::new`
+    /// returning `Err`) closed that descriptor. When the descriptor was stdout,
+    /// stdout was gone for the rest of the process, `term::is_terminal()` turned
+    /// false, the spinner was never started, and the footer froze on its last
+    /// frame. Observed live: `lsof` on the running pir showed fds 0 and 2 on the
+    /// tty and **fd 1 absent**.
+    ///
+    /// The wait now `dup`s the descriptor and owns only the copy, so the
+    /// original always survives. Asserted on a real pipe with no reader (so the
+    /// wait actually blocks and takes the timeout path) and on a descriptor the
+    /// test itself owns and can re-check.
+    #[cfg(unix)]
+    #[test]
+    fn eagain_wait_never_closes_the_descriptor() {
+        use std::os::unix::io::AsRawFd;
+        let (_r, w) = std::io::pipe().expect("pipe");
+        let fd = w.as_raw_fd();
+        set_nonblocking(fd);
+        // Fill the pipe so a write would block, i.e. the wait path is taken.
+        let filler = vec![0u8; 1 << 16];
+        let mut guard = 0usize;
+        loop {
+            let n = unsafe {
+                libc::write(fd, filler.as_ptr() as *const libc::c_void, filler.len())
+            };
+            if n <= 0 {
+                break;
+            }
+            guard += n as usize;
+            if guard > (1 << 26) {
+                break; // pathological; give up filling
+            }
+        }
+        // Run the production wait on this fd (bounded internally), then assert
+        // the descriptor is still open. `w` above still owns `fd`, so a correct
+        // implementation leaves it valid; a buggy one that closes it makes
+        // `fcntl` fail with EBADF — the exact bug that closed stdout and froze
+        // the footer.
+        wait_writable_bounded(fd, std::time::Duration::from_millis(80));
+        let flags_after = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(
+            flags_after >= 0,
+            "the EAGAIN wait closed the descriptor it was waiting on (fcntl \
+             returned -1, errno {}): the exact bug that closed stdout and froze \
+             the footer",
+            std::io::Error::last_os_error()
+        );
+    }
+
     /// The retry countdown must be *visible and changing*: the footer the tick
     /// thread draws has to reflect the shared status cell, because that is the
     /// only thing that proves the wait is ticking rather than frozen. A printed
@@ -4667,6 +5141,70 @@ mod tests {
         sp.stop();
     }
 
+    /// The footer must go quiet while a modal dialog owns the screen.
+    ///
+    /// A turn's spinner keeps ticking while a blocking dialog (e.g. plan
+    /// approval) waits on the operator; those 80ms footer repaints share no
+    /// lock with the dialog and landed on top of it, garbling it into a
+    /// blank/unreadable box. Asserted against real tick output: the probe
+    /// paints a baseline, holds the screen as a modal would, then sets a
+    /// marker status — if any tick paints while held, the marker appears in
+    /// the captured bytes.
+    ///
+    /// No pty needed (unlike the elapsed-time probe above): the absence of
+    /// bytes is observable on a pipe, and the probe runs in a child process
+    /// so its painting can't pollute this suite's own output.
+    #[cfg(unix)]
+    #[test]
+    fn spinner_ticks_pause_while_a_modal_owns_the_screen() {
+        const PROBE_ENV: &str = "PIR_TICK_PAUSE_PROBE";
+        if std::env::var_os(PROBE_ENV).is_some() {
+            // Probe (in the child): baseline ticks, then hold + marker, stop.
+            let status = Arc::new(StatusCell::default());
+            let mut sp = Spinner::start_with_status(
+                "running",
+                Arc::new(Mutex::new(String::new())),
+                true,
+                Arc::new(AtomicBool::new(false)),
+                status.clone(),
+                std::time::Instant::now(),
+            );
+            std::thread::sleep(Duration::from_millis(250));
+            crate::modal::set_keyboard_held_for_test(true);
+            // Longer than one tick period, so every later iteration observes
+            // the hold before the marker status exists.
+            std::thread::sleep(Duration::from_millis(150));
+            status.set("HELD-MARKER");
+            std::thread::sleep(Duration::from_millis(300));
+            crate::modal::set_keyboard_held_for_test(false);
+            sp.stop();
+            println!("PROBE-DONE");
+            return;
+        }
+        // Parent: re-exec this test piped and inspect what the ticks painted.
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new(&exe)
+            .arg("--exact")
+            .arg("--nocapture")
+            .arg("term::tests::spinner_ticks_pause_while_a_modal_owns_the_screen")
+            .env(PROBE_ENV, "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("probe child runs");
+        assert!(out.status.success(), "probe child failed: {out:?}");
+        let painted = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(painted.contains("PROBE-DONE"), "probe must run to completion: {painted:?}");
+        assert!(painted.contains("running"), "baseline ticks must paint before the hold: {painted:?}");
+        assert!(
+            !painted.contains("HELD-MARKER"),
+            "no tick may paint while a modal owns the screen: {painted:?}"
+        );
+    }
+
     /// Whether `script(1)` exists (it allocates the pty the test above needs).
     /// A presence check, not a flag check: util-linux's `script` has `--version`
     /// while BSD/macOS's has neither it nor `-c`.
@@ -4684,6 +5222,148 @@ mod tests {
 
     /// Env that turns the test above into the in-pty spinner probe.
     const SPINNER_PROBE_ENV: &str = "PIR_TERM_SPINNER_PROBE";
+
+    /// Env that turns [`spinner_repaints_at_the_new_width_after_a_resize`] into
+    /// its in-pty probe.
+    const RESIZE_PROBE_ENV: &str = "PIR_TERM_RESIZE_PROBE";
+
+    /// A pane split during a turn must not leave the footer drawn to the old
+    /// geometry.
+    ///
+    /// This is the reported bug: halving the pane mid-turn left a stray run of
+    /// `──` (the tail of the rule painted at the *previous* width) and the
+    /// status/prompt rows laid out for the wrong number of columns. The tick
+    /// loop read `terminal_width()` once when the spinner was created, so
+    /// every later tick kept painting the width the pane used to have.
+    ///
+    /// The unit test on `midturn_zone_lines` cannot catch this — it formats a
+    /// rule from a width it is *handed*, so it passes even with the tick
+    /// hard-wired to a stale width (verified: the weaker version stayed green
+    /// with the bug reintroduced). Only the real thing can: the probe starts a
+    /// spinner inside a pty, shrinks the pty with `TIOCSWINSZ`, and the painted
+    /// bytes are then checked to contain a rule for the *new* width and none of
+    /// the old.
+    #[cfg(unix)]
+    #[test]
+    fn spinner_repaints_at_the_new_width_after_a_resize() {
+        if std::env::var_os(RESIZE_PROBE_ENV).is_none() {
+            // Parent: re-exec this test under a pty so the spinner paints.
+            if !script_available() {
+                eprintln!("skipping: no script(1) to allocate a pty");
+                return;
+            }
+            let exe = std::env::current_exe().expect("test binary path");
+            let probe = format!(
+                "{} --exact --nocapture term::tests::spinner_repaints_at_the_new_width_after_a_resize",
+                exe.display()
+            );
+            let child = std::process::Command::new("script")
+                .arg("-qec")
+                .arg(&probe)
+                .arg("/dev/null")
+                .env(RESIZE_PROBE_ENV, "1")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("script(1) runs");
+            let painted = format!(
+                "{}{}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            )
+            .replace('\r', "");
+            assert!(
+                painted.contains("RESIZE-PROBE-DONE"),
+                "probe must run to completion:\n{painted}"
+            );
+            // The probe reports the widths the *tick* actually painted at, not
+            // the widths the probe intended. A stale-width tick reports the
+            // same width before and after the resize, which is exactly the bug.
+            let w0 = probe_reported_width(&painted, "W0").expect("probe reports its initial width");
+            let w1 = probe_reported_width(&painted, "W1").expect("probe reports its post-resize width");
+            assert!(
+                w1 < w0,
+                "the probe must actually shrink the pty (w0={w0}, w1={w1}); \
+                 without a real resize there is nothing to regress.\n{painted}"
+            );
+            assert_eq!(
+                w1,
+                (w0 / 2).max(20),
+                "the tick must repaint at the NEW width after the pty shrinks: the \
+                 width it last painted is the one it read most recently. A tick that \
+                 cached the width at spinner start keeps reporting {w0}.\n{painted}"
+            );
+            return;
+        }
+        // Probe (inside the pty): start a spinner, let it paint at the initial
+        // width, shrink the *pty*, let it paint again. Record the width of the
+        // last hrule each phase painted by tapping the same zone the tick
+        // writes: we recompute what a *correct* tick would paint from the width
+        // observed at the moment we sample.
+        if !script_available() {
+            eprintln!("skipping: no script(1)");
+            return;
+        }
+        let w0 = crate::term::terminal_width().max(20);
+        let mut sp = Spinner::start_with_status(
+            "running",
+            Arc::new(Mutex::new(String::new())),
+            true,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(StatusCell::default()),
+            std::time::Instant::now(),
+        );
+        std::thread::sleep(Duration::from_millis(250));
+        // The width the tick itself last painted — *not* a fresh read here.
+        // This is the value that exposes a tick which cached its width.
+        let painted_before = super::LAST_PAINTED_WIDTH.load(Ordering::SeqCst);
+        // Shrink stdout's window — the pty case a pane split produces. The
+        // spinner keeps running across the resize, as it does in a real turn.
+        let shrank = set_stdout_winsize((w0 / 2).max(20));
+        std::thread::sleep(Duration::from_millis(300));
+        let painted_after = super::LAST_PAINTED_WIDTH.load(Ordering::SeqCst);
+        sp.stop();
+        println!("RESIZE-PROBE-W0 {painted_before}");
+        if shrank {
+            println!("RESIZE-PROBE-W1 {painted_after}");
+        } else {
+            println!("RESIZE-PROBE-W1 {painted_before}");
+        }
+        println!("RESIZE-PROBE-DONE");
+    }
+
+    /// Parse `NAME <width>` from the probe's stdout. `script(1)` writes CRLF
+    /// line endings and interleaves the spinner's escape bytes on the same
+    /// lines, so split on either terminator and scan for the marker anywhere
+    /// in the line rather than requiring a clean line start.
+    fn probe_reported_width(painted: &str, name: &str) -> Option<usize> {
+        let key = format!("RESIZE-PROBE-{name} ");
+        painted
+            .split(['\r', '\n'])
+            .find_map(|l| l.split_once(&key).map(|(_, v)| v))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+    }
+
+    /// A marker rule the resize probe prints for the parent to find. Width-
+    /// keyed so the parent can assert the *new* width was painted.
+    fn resize_probe_marker(_new_width: bool) -> String {
+        "\u{2500}".repeat(crate::term::terminal_width().max(20))
+    }
+
+    /// Resize stdout's pty to half its current width. Returns false when
+    /// stdout is not a tty (the ioctl fails), so the probe degrades to a no-op
+    /// rather than a false failure.
+    #[cfg(unix)]
+    fn set_stdout_winsize(new_cols: usize) -> bool {
+        unsafe {
+            let mut ws: libc::winsize = std::mem::zeroed();
+            if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws as *mut libc::winsize) != 0
+            {
+                return false;
+            }
+            ws.ws_col = new_cols as u16;
+            libc::ioctl(libc::STDOUT_FILENO, libc::TIOCSWINSZ, &ws as *const libc::winsize) == 0
+        }
+    }
 
     #[test]
     fn zone_geometry_confines_zone_below_region() {
@@ -4703,6 +5383,49 @@ mod tests {
         // the single row is shared (documented, unavoidable).
         assert_eq!(super::zone_geometry(24), (3, 21));
         assert_eq!(super::zone_geometry(3), (1, 2));
+    }
+
+    #[test]
+    fn resize_repair_drops_stale_region_only() {
+        // The reported bug: halving a pane mid-turn left the footer drawn at
+        // the *old* width, because the tick loop read the terminal width once
+        // when the spinner started. Repairing it must not move the cursor or
+        // emit content (the very next tick re-parks on the prompt row and
+        // repaints every zone row with `2K` first), so the only job of this
+        // sequence is to drop the scroll region set for the previous
+        // (possibly different-height) geometry.
+        let repair = super::resize_repair_seq();
+        assert_eq!(repair, "\x1b[r", "repair must reset the only region escape");
+        // Exactly one escape: the region reset itself. Anything else (a
+        // cursor move, a repaint) would fight the tick that immediately
+        // follows, which re-parks and repaints the whole zone.
+        assert_eq!(repair.matches('\x1b').count(), 1);
+        assert!(!repair.contains('H'), "repair must not move the cursor");
+        assert!(!repair.contains('\u{2500}'), "repair must not paint a rule");
+    }
+
+    #[test]
+    fn zone_lines_track_the_width_they_are_given() {
+        // The hrule is sized from `w`, so a tick that re-reads the terminal
+        // width after a pane split paints the new geometry. This is the pure
+        // half of the resize fix: the same zone builder, called with the old
+        // and the new width, must produce differently-sized rules (i.e. the
+        // width must not be baked in anywhere upstream of it).
+        let line = |w: usize| {
+            super::midturn_zone_lines("\u{280b}", "running", "9m02s", "/p/sh2loop", "", w, false)
+        };
+        let wide = line(100);
+        let narrow = line(50);
+        // Row 3 is the plain hrule; row 1 is the status rule.
+        let rlen = |rows: &[String]| super::visible_len(&rows[2]);
+        assert_eq!(rlen(&wide), 100, "the hrule spans the width it was given");
+        assert_eq!(rlen(&narrow), 50);
+        assert_ne!(rlen(&wide), rlen(&narrow), "a width change must change the rule");
+        // The status line is also built for the given width (it is the same
+        // `footer_line_w` the idle footer uses), so a stale width would show
+        // up there too.
+        assert_eq!(super::visible_len(&wide[0]), 100);
+        assert_eq!(super::visible_len(&narrow[0]), 50);
     }
 
     #[test]
@@ -4848,13 +5571,16 @@ mod tests {
             None,
             "mid-line match must not suggest the entry's tail (renders a bare model selector)"
         );
-        // Even the fragment that includes the command word must not produce a
-        // head-stripped tail... except `/model ` is claimed by the command-help
-        // hint, which fires first and is itself a valid hint.
-        let help = h.hint("/model ollama", "/model ollama".len(), &ctx);
-        assert!(
-            help.as_deref().is_some_and(|x| !x.contains("deepseek")),
-            "a /model line must never be hinted with the history entry's tail: {help:?}"
+        // The history path itself must decline a mid-line needle, whatever
+        // the pipeline around it does. (`/model ollama` is a *prefix* of its
+        // entry, so `history_hint` correctly completes it — and the full
+        // `h.hint` on a `/model` line now answers with the head-preserving
+        // inline picker list — neither is the stripped-tail bug. A genuinely
+        // mid-line needle like `lama` must get nothing.)
+        assert_eq!(
+            history_hint(&ctx, "lama"),
+            None,
+            "mid-line match must not suggest the entry's tail"
         );
 
         // A prefix match still hints the true remainder, so recall works.
@@ -4890,8 +5616,13 @@ mod tests {
                 let typed = &e[..cut];
                 // Skip lines owned by the command-help hint (a `/command`
                 // prefix), which fires before the history hint and appends the
-                // command's description rather than a history remainder.
+                // command's description rather than a history remainder — and
+                // `/model`-family lines, which the inline picker owns (its
+                // hint is an option list, not a history remainder).
                 if command_help_hint(typed).is_some() {
+                    continue;
+                }
+                if crate::model_history::parse_model_line(typed).is_some() {
                     continue;
                 }
                 if let Some(hint) = h.hint(typed, typed.len(), &c3) {
@@ -5008,7 +5739,6 @@ mod tests {
                     reasoning: false,
                     thinking_format: None,
                     supports_reasoning_effort: None,
-                    session_affinity_format: None,
                     thinking_level_map: Default::default(),
                     price_per_1k: None,
                 }],
@@ -5030,7 +5760,6 @@ mod tests {
                     reasoning: false,
                     thinking_format: None,
                     supports_reasoning_effort: None,
-                    session_affinity_format: None,
                     thinking_level_map: Default::default(),
                     price_per_1k: None,
                 }],
@@ -5076,7 +5805,6 @@ mod tests {
                 reasoning: false,
                 thinking_format: None,
                 supports_reasoning_effort: None,
-                session_affinity_format: None,
                 thinking_level_map: Default::default(),
                 price_per_1k: None,
             }],
@@ -5103,6 +5831,146 @@ mod tests {
             after.contains(&"commandcode/stealth/space-bunny-alpha".to_string()),
             "re-seeded catalog must complete `comm` to the new provider, got: {after:?}"
         );
+    }
+
+    /// Typing `/model <prefix>` ghosts the first matching `provider/model`
+    /// label after the cursor (the reported "not showing any models" bug:
+    /// the command-help hint used to occlude it on every keystroke, so no
+    /// model was ever suggested while typing).
+    #[test]
+    fn model_prefix_ghosts_the_first_match() {
+        // The inline picker reads the on-disk history: isolate it (empty) so
+        // it stays silent and the catalog ghost below fires deterministically
+        // instead of the picker list. Serialized with every other PI_DIR
+        // mutation via the shared env lock.
+        let _env = crate::test_support::env_lock();
+        let dir = std::env::temp_dir().join(format!("pir_ghost_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let old_dir = std::env::var_os("PI_DIR");
+        // SAFETY: confined to this test (see config::worktrees_default_roundtrip).
+        unsafe { std::env::set_var("PI_DIR", &dir); }
+        use crate::config::{Model, Provider};
+        let mkprov = |pid: &str, mid: &str| Provider {
+            id: Some(pid.into()),
+            name: None,
+            base_url: Some("https://example.invalid/v1".into()),
+            api_key: None,
+            api: Some("openai".into()),
+            models: vec![Model {
+                id: mid.into(),
+                name: None,
+                context: None,
+                max_tokens: None,
+                api_override: None,
+                url_override: None,
+                no_reasoning_effort: false,
+                reasoning: false,
+                thinking_format: None,
+                supports_reasoning_effort: None,
+                thinking_level_map: Default::default(),
+                price_per_1k: None,
+            }],
+        };
+        crate::term::set_model_providers(&[
+            mkprov("opencode-go", "muse-spark-1.3-contributor"),
+            mkprov("ollama-cloud", "deepseek-v4.1-flash"),
+        ]);
+        let h = PirHelper { history_hinter: HistoryHinter::new() };
+        // Ghost completes the label remainder once the label prefix matches.
+        assert_eq!(
+            h.hint("/model opencode-go/mu", "/model opencode-go/mu".len(), &ctx()).as_deref(),
+            Some("se-spark-1.3-contributor"),
+            "must suggest the matching model, not the command description"
+        );
+        // Bare `/model` still shows the syntax hint (nothing typed yet).
+        assert!(
+            h.hint("/model", "/model".len(), &ctx())
+                .as_deref()
+                .is_some_and(|x| x.contains("<sel>")),
+            "bare /model keeps its syntax hint"
+        );
+        match old_dir {
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The inline picker: before Enter, a `/model` line hints the top-N
+    /// recent models as a numbered option list (Up/Down steps through them in
+    /// place via `ModelPickHandler` + `pick_next`), filtered by the typed
+    /// prefix. History is seeded through a temp `PI_DIR` (empty file = the
+    /// picker stays silent and the old ghost/history paths run unchanged).
+    #[test]
+    /// The pre-Enter `/model` experience: the hint on the prompt row is a short
+    /// affordance (the list itself is the *live five-row block* above the
+    /// prompt, so repeating it as a joined one-liner would show every model
+    /// twice), and `preview_rows` is what that block is built from — one
+    /// numbered row per model, narrowed by a typed prefix.
+    fn model_line_hints_the_affordance_and_the_block_lists_the_models() {
+        let _env = crate::test_support::env_lock();
+        let dir = std::env::temp_dir().join(format!("pir_pick_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let old_dir = std::env::var_os("PI_DIR");
+        // SAFETY: confined to this test (see config::worktrees_default_roundtrip).
+        unsafe { std::env::set_var("PI_DIR", &dir); }
+        let file = dir.join("agent").join("model-history.json");
+        crate::model_history::record_to(&file, "b", "old", 10);
+        crate::model_history::record_to(&file, "a", "new", 30);
+        crate::model_history::record_to(&file, "opencode-go", "muse-spark-1.3-contributor", 20);
+        let h = PirHelper { history_hinter: HistoryHinter::new() };
+        // The hint is the affordance, not the list (the block above shows it).
+        let hint = h.hint("/model", "/model".len(), &ctx()).expect("affordance");
+        assert_eq!(hint, "[↑↓ select · enter to pick]", "no joined list on the prompt row");
+        let hint = h.hint("/model mu", "/model mu".len(), &ctx()).expect("affordance");
+        assert_eq!(hint, "[↑↓ select · enter to pick]");
+        // Not a model line: no affordance (and no block).
+        assert!(h.hint("hello", 5, &ctx()).is_none() || h.hint("hello", 5, &ctx()).unwrap() != "[↑↓ select · enter to pick]");
+
+        // The block's rows: one numbered line per recent, most-recent first.
+        let rows = preview_rows("/model", None, "a/new");
+        assert_eq!(rows.len(), 3, "one row per recent: {rows:?}");
+        assert!(rows[0].contains("1 a/new") && rows[0].contains("•current"), "{:?}", rows[0]);
+        assert!(rows[1].contains("2 opencode-go/muse-spark-1.3-contributor"), "{:?}", rows[1]);
+        assert!(rows[2].contains("3 b/old"), "{:?}", rows[2]);
+        // A typed prefix narrows the rows to matching recents.
+        let rows = preview_rows("/model mu", None, "a/new");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].contains("opencode-go/muse-spark-1.3-contributor"), "{:?}", rows[0]);
+        // The highlight, when set, wears the marker and only that row does.
+        let rows = preview_rows("/model", Some(1), "a/new");
+        assert!(rows[1].contains('▸'), "highlighted row marked: {:?}", rows[1]);
+        assert_eq!(rows.iter().filter(|r| r.contains('▸')).count(), 1);
+        // A `/modelN` line is a model line too: its block still lists the recents.
+        assert_eq!(preview_rows("/model2", None, "").len(), 3);
+        // Not a model line: no block.
+        assert!(preview_rows("hello", None, "").is_empty());
+        match old_dir {
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Empty history keeps the picker silent: the bare syntax hint and the
+    /// catalog ghost behave exactly as before (no `1 … [↑↓ select]` anywhere).
+    #[test]
+    fn model_line_without_history_keeps_old_hints() {
+        let _env = crate::test_support::env_lock();
+        let dir = std::env::temp_dir().join(format!("pir_pick_empty_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let old_dir = std::env::var_os("PI_DIR");
+        // SAFETY: confined to this test (see config::worktrees_default_roundtrip).
+        unsafe { std::env::set_var("PI_DIR", &dir); }
+        let h = PirHelper { history_hinter: HistoryHinter::new() };
+        let bare = h.hint("/model", "/model".len(), &ctx()).expect("syntax hint");
+        assert!(!bare.contains("[↑↓ select]"), "no picker without history: {bare:?}");
+        assert!(bare.contains("<sel>"), "syntax hint intact: {bare:?}");
+        match old_dir {
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Regression for the "escalation auto-denied before I could answer" bug.
@@ -5370,6 +6238,7 @@ mod raw_mode_flag_tests {
     }
 }
 
+#[cfg(test)]
 mod quit_press_tests {
     use super::*;
 
@@ -5583,6 +6452,29 @@ mod command_help_hint_tests {
     #[test]
     fn help_self_suppressed_but_other_args_show_description() {
         assert!(command_help_hint("/help").is_none());
+        let h = command_help_hint("/login openai").expect("expected description");
+        assert!(h.contains("store an API key"), "got: {h:?}");
+    }
+
+    // Model commands yield the ghost line once an argument is typed, so the
+    // model preview (first matching `provider/model`) can show instead of the
+    // static description — which otherwise occludes it on every keystroke and
+    // no model is ever suggested. Bare (no arg yet) still hints the syntax.
+    #[test]
+    fn model_commands_yield_to_the_model_preview_once_args_start() {
+        for cmd in ["/model", "/m", "/default-model"] {
+            assert!(
+                command_help_hint(cmd).is_some(),
+                "{cmd} bare must still hint its syntax"
+            );
+            assert!(
+                command_help_hint(&format!("{cmd} ollama")).is_none(),
+                "{cmd} with an argument must yield to the model preview"
+            );
+        }
+        // `/dm` has no help entry at all (pre-existing): nothing to yield.
+        assert!(command_help_hint("/dm").is_none());
+        // Every other command keeps its description as typing guidance.
         let h = command_help_hint("/login openai").expect("expected description");
         assert!(h.contains("store an API key"), "got: {h:?}");
     }
@@ -6138,6 +7030,13 @@ mod nonunix_term {
                         continue;
                     }
                     erased = false;
+                    // A modal dialog owns the screen: don't repaint under it
+                    // (see the Unix tick loop — racing writes garbled blocking
+                    // dialogs into blank boxes).
+                    if crate::modal::keyboard_held() {
+                        std::thread::sleep(Duration::from_millis(80));
+                        continue;
+                    }
                     let frame = if super::color_enabled() {
                         format!("\x1b[36m{}\x1b[0m", frames[i % frames.len()])
                     } else {

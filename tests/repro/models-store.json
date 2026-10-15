@@ -1,0 +1,20 @@
+{
+  "providers": {
+    "mockan": {
+      "api": "anthropic-messages",
+      "baseUrl": "http://127.0.0.1:8765",
+      "apiKey": "k",
+      "models": [
+        { "id": "m1", "name": "m1", "context": 128000, "maxTokens": 1024 }
+      ]
+    },
+    "mockai": {
+      "api": "openai-completions",
+      "baseUrl": "http://127.0.0.1:8765",
+      "apiKey": "k",
+      "models": [
+        { "id": "m1", "name": "m1", "context": 128000, "maxTokens": 1024 }
+      ]
+    }
+  }
+}

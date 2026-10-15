@@ -4,9 +4,11 @@
 //! blocks, links, …). The REPL used to dump them verbatim, so the user saw
 //! raw `**`/`#`/` ``` ` instead of formatted text. This module parses the
 //! markdown and emits a plain-text approximation suitable for a fixed-width
-//! terminal: headings get a marker + bold, emphasis becomes ANSI emphasis,
-//! code blocks are fenced and indented, links show their text with the URL in
-//! brackets, and list/quote markers are preserved.
+//! terminal, styled after pi's TUI renderer: warm-yellow headings (no `#`
+//! markers on h1/h2), accent `- ` list bullets, indented code blocks under
+//! dim fences, `│ ` gray blockquotes, steel-blue underlined links (OSC 8
+//! hyperlinks when coloured, `text (url)` otherwise), and aligned Unicode
+//! tables with blank lines between blocks.
 //!
 //! The output is *not* HTML — it is text with ANSI styling, so it can be
 //! printed by the streaming REPL (`term::out`) and by the TUI (each paragraph
@@ -99,9 +101,75 @@ pub fn stream_markdown(md: &str, color: bool, chunk_size: usize) -> Vec<String> 
 /// it render `text` as a clickable link exposing the hidden `url`; terminals
 /// that don't simply show `text`. Only emitted when the terminal is colour/
 /// hyperlink capable (the caller's `color` gate), with the non-capable
-/// fallback being `text [url]`.
+/// fallback being `text (url)`.
 fn osc8_link(text: &str, url: &str) -> String {
     format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
+}
+
+// ---------------------------------------------------------------------------
+// pi-parity theme (pi's dark-theme markdown colors, mapped to terminal codes).
+//
+// pi renders assistant markdown with per-element colors (warm-yellow headings,
+// steel-blue links, teal code/bullets, gray quotes/borders/rules) while pir
+// used to emit bold-only headings, unstyled links and `> ` quotes. These
+// constants are the terminal-code equivalents, used by all three backends so
+// the output shape stays identical regardless of parser.
+// ---------------------------------------------------------------------------
+
+/// pi `mdHeading` (#f0c674): warm yellow.
+const C_HEADING: &str = "\x1b[38;5;222m";
+/// pi `mdLink` (#81a2be): muted steel blue, always underlined (see `C_LINK_OPEN`).
+const C_LINK: &str = "\x1b[38;5;109m";
+/// pi `mdCode` / `mdListBullet` (accent #8abeb7): muted teal.
+const C_ACCENT: &str = "\x1b[38;5;109m";
+/// pi `mdCodeBlock` green (#b5bd68 — the same hue as `syntaxNumber` below):
+/// fallback for code blocks with no supported language (highlighted blocks
+/// carry per-token colors instead).
+const C_CODE_FALLBACK: &str = "\x1b[38;5;151m";
+/// pi gray (#808080): quote/code borders, rules. Bright-black reads gray on
+/// both dark and light terminals.
+const C_MUTED: &str = "\x1b[90m";
+
+/// Opening codes for a link's text (color + underline, closed with `\x1b[0m`).
+const C_LINK_OPEN: &str = "\x1b[38;5;109m\x1b[4m";
+/// Opening codes for a heading level: color + bold, plus underline for h1
+/// (pi underlines h1 only). Level 3+ also keeps its `### ` markers, styled.
+fn heading_open(level: usize, color: bool) -> &'static str {
+    if !color {
+        return "";
+    }
+    if level <= 1 {
+        return "\x1b[38;5;222m\x1b[1m\x1b[4m";
+    }
+    "\x1b[38;5;222m\x1b[1m"
+}
+/// Opening codes for a blockquote body: gray + italic (the `│ ` border itself
+/// is gray without italic).
+const C_QUOTE_OPEN: &str = "\x1b[90m\x1b[3m";
+
+/// Re-assert block styling after inline resets: any `\x1b[0m` inside a styled
+/// block (heading body, quote body, link text) would otherwise drop the
+/// block's own style for the rest of the line — e.g. ``## Fix `code` now``
+///
+/// rendered " now" unstyled. pi re-applies its style prefix the same way.
+fn reapply_resets(s: &str, reopen: &str) -> String {
+    if reopen.is_empty() {
+        return s.to_string();
+    }
+    s.replace("\x1b[0m", &format!("\x1b[0m{reopen}"))
+}
+
+/// A pi-style horizontal rule: a full-width dim line, capped at 80 columns
+/// (pi uses `min(width, 80)`). Falls back to 80 when the size can't be
+/// queried, so tests stay deterministic.
+fn hr_rule(color: bool) -> String {
+    let w = crate::term::terminal_width().clamp(8, 80);
+    let rule = "─".repeat(w);
+    if color {
+        format!("{C_MUTED}{rule}\x1b[0m")
+    } else {
+        rule
+    }
 }
 
 /// Default pulldown-cmark backend (always compiled; see [`render`]).
@@ -145,6 +213,26 @@ struct PdRenderer {
     /// wrapped in an OSC 8 hyperlink on `End(Link)` instead of having already
     /// been flushed to `out` piecemeal.
     link_text: Option<String>,
+    /// Buffered body of the current heading ( levels 1-6), so its inline
+    /// resets can be re-wrapped in the heading style at `End(Heading)` (see
+    /// [`reapply_resets`]) instead of dropping the style mid-line.
+    heading_buf: Option<String>,
+    /// The heading's marker prefix (`### ` for level 3+, empty for h1/h2 —
+    /// pi shows no markers on h1/h2), emitted styled at `End(Heading)`.
+    heading_prefix: String,
+    /// Reopen codes for the styled blocks currently open (heading body,
+    /// quote body), innermost last. A `\x1b[0m` emitted while this is
+    /// non-empty re-asserts the innermost style so nested emphasis/code
+    /// never strips the block's own styling.
+    style_stack: Vec<String>,
+    /// A top-level paragraph just ended: emit one blank line before the next
+    /// block starts (pi separates blocks with blanks). Deferred — not
+    /// immediate — so the blank lands between blocks rather than inside the
+    /// paragraph. Consumed (as a blank) by the next block start, or dropped
+    /// by block ends that emit their own blank. (Pulldown reports no blank-
+    /// line events, so a paragraph glued to a list with no source blank
+    /// still separates — pi wouldn't; model output always separates.)
+    para_blank: bool,
     /// Table capture state (active only inside a table).
     table_active: bool,
     table_in_cell: bool,
@@ -171,25 +259,52 @@ impl PdRenderer {
                 PdEvent::Text(t) => self.push_text(&t),
                 PdEvent::Code(t) => {
                     if self.color {
-                        // Bright-cyan text (no background / reverse video) so
-                        // inline code reads as emphasised rather than as an
-                        // inverse black/white block.
-                        self.push_text(&format!("\x1b[96m{}\x1b[0m", t));
+                        // Muted teal text (pi `mdCode` accent), no background.
+                        self.push_text(&format!("{C_ACCENT}{t}\x1b[0m"));
+                        // A code span inside a styled block (heading/quote)
+                        // resets that block's style: re-assert it — unless a
+                        // heading buffer is open, whose end-of-heading
+                        // post-process already covers it (see `push_reset`).
+                        if self.heading_buf.is_none()
+                            && let Some(reopen) = self.style_stack.last().cloned() {
+                                self.push_text(&reopen);
+                            }
                     } else {
                         self.push_text(&format!("`{}`", t));
                     }
                 }
                 PdEvent::SoftBreak | PdEvent::HardBreak => {
                     if self.in_blockquote {
+                        // Close the body style at the line end; the prefix
+                        // below re-opens it. Without the close, gray-italic
+                        // would leak into whatever follows the quote.
+                        if self.color {
+                            self.out.push_str("\x1b[0m");
+                        }
                         self.out.push('\n');
-                        self.out.push_str("> ");
+                        // Re-open the border + body style on the new line.
+                        if self.color {
+                            self.out.push_str(&format!("{C_MUTED}│ \x1b[3m"));
+                        } else {
+                            self.out.push_str("│ ");
+                        }
                     } else {
                         self.out.push('\n');
                     }
                 }
-                PdEvent::Rule => self.push_text("---\n"),
-                PdEvent::Html(t) => {
-                    // Keep literal inline HTML as-is (matches terminal expectations).
+                PdEvent::Rule => {
+                    self.take_para_blank();
+                    self.end_line();
+                    self.out.push_str(&hr_rule(self.color));
+                    self.out.push('\n');
+                    // A rule separates like any block: blank after.
+                    self.out.push('\n');
+                }
+                PdEvent::Html(t) | PdEvent::InlineHtml(t) => {
+                    // Keep literal HTML as-is (matches terminal expectations
+                    // and pi, which renders inline tags literally). `Html` is
+                    // block-level, `InlineHtml` (split out in pulldown 0.13)
+                    // is inline — dropping the latter ate `<b>…</b>` spans.
                     self.push_text(&t);
                 }
                 // FootnoteReference / InlineMath / DisplayMath etc. are not used
@@ -203,7 +318,8 @@ impl PdRenderer {
     }
 
     /// Route a text/plain segment into the current table cell (if any), the
-    /// current link buffer (if any), or the main output.
+    /// current link buffer (if any), the current heading buffer (if any), or
+    /// the main output.
     fn push_text(&mut self, s: &str) {
         if self.in_code {
             self.code_buf.push_str(s);
@@ -211,26 +327,95 @@ impl PdRenderer {
             self.table_cur_cell.push_str(s);
         } else if let Some(buf) = self.link_text.as_mut() {
             buf.push_str(s);
+        } else if let Some(buf) = self.heading_buf.as_mut() {
+            buf.push_str(s);
         } else {
             self.out.push_str(s);
         }
     }
 
+    /// Route a main-flow segment (never code/table/link content) into the
+    /// heading buffer while one is open, else the main output.
+    fn push_main(&mut self, s: &str) {
+        if self.table_in_cell {
+            self.table_cur_cell.push_str(s);
+        } else if let Some(buf) = self.heading_buf.as_mut() {
+            buf.push_str(s);
+        } else {
+            self.out.push_str(s);
+        }
+    }
+
+    /// Emit a style reset, re-asserting the innermost open block style (if
+    /// any) so nested emphasis/code never strips a heading/quote style.
+    /// Skipped while a heading buffer is open: the heading post-processes its
+    /// whole body at `End(Heading)` (see [`reapply_resets`]), so an immediate
+    /// re-assert would just double it.
+    fn push_reset(&mut self) {
+        if !self.color {
+            return;
+        }
+        self.emit("\x1b[0m");
+        if self.heading_buf.is_none()
+            && let Some(reopen) = self.style_stack.last().cloned() {
+                self.emit(&reopen);
+            }
+    }
+
+    /// End the current output line if one is open.
+    fn end_line(&mut self) {
+        if !self.out.is_empty() && !self.out.ends_with('\n') {
+            self.out.push('\n');
+        }
+    }
+
+    /// Consume a deferred paragraph blank: emit one blank line before the
+    /// next block starts (paragraphs separate from what follows, except a
+    /// list, which clears the flag silently at `Start(List)`).
+    fn take_para_blank(&mut self) {
+        if self.para_blank {
+            self.para_blank = false;
+            self.end_line();
+            self.out.push('\n');
+        }
+    }
+
+    /// End a block with pi-style spacing: terminate the line and follow it
+    /// with one blank line (runs collapse to a single blank downstream).
+    /// Subsumes any deferred paragraph blank.
+    fn end_block(&mut self) {
+        self.para_blank = false;
+        self.end_line();
+        self.out.push('\n');
+    }
+
     fn on_start(&mut self, tag: PdTag<'_>) {
         match tag {
             PdTag::Heading { level, .. } => {
-                let n = level as usize;
-                self.out.push_str(&format!("{} ", "#".repeat(n.min(6))));
+                self.take_para_blank();
+                let n = (level as usize).min(6);
+                // pi shows no markers on h1/h2; level 3+ keeps styled `### `.
+                self.heading_prefix = if n >= 3 { format!("{} ", "#".repeat(n)) } else { String::new() };
+                self.heading_buf = Some(String::new());
+                self.style_stack.push(heading_open(n, self.color).to_string());
+            }
+            PdTag::Paragraph => {
+                self.take_para_blank();
+            }
+            PdTag::BlockQuote(_) => {
+                self.take_para_blank();
+                self.in_blockquote = true;
+                self.style_stack.push(if self.color { C_QUOTE_OPEN.to_string() } else { String::new() });
+                // Border gray, then the body style opens (gray italic): the
+                // body inherits it until the next reset, which re-asserts it.
                 if self.color {
-                    self.out.push_str("\x1b[1m");
+                    self.out.push_str(&format!("{C_MUTED}│ \x1b[3m"));
+                } else {
+                    self.out.push_str("│ ");
                 }
             }
-            PdTag::Paragraph => {}
-            PdTag::BlockQuote(_) => {
-                self.in_blockquote = true;
-                self.out.push_str("> ");
-            }
             PdTag::CodeBlock(kind) => {
+                self.take_para_blank();
                 let lang = match kind {
                     pulldown_cmark::CodeBlockKind::Fenced(info) => info.trim().to_string(),
                     pulldown_cmark::CodeBlockKind::Indented => String::new(),
@@ -238,9 +423,17 @@ impl PdRenderer {
                 self.in_code = true;
                 self.code_lang = lang.clone();
                 self.code_buf.clear();
-                self.out.push_str(&format!("```{lang}\n"));
+                if self.color {
+                    self.out.push_str(&format!("{C_MUTED}```{lang}\x1b[0m\n"));
+                } else {
+                    self.out.push_str(&format!("```{lang}\n"));
+                }
             }
             PdTag::List(start) => {
+                // A paragraph flowing into a list keeps its separating blank
+                // (pi renders the source's blank line here): consume the
+                // deferred blank like any other block start.
+                self.take_para_blank();
                 // A nested list that opens mid-line must start on a fresh line.
                 if !self.out.is_empty() && !self.out.ends_with('\n') {
                     self.out.push('\n');
@@ -255,6 +448,7 @@ impl PdRenderer {
                 self.out.push_str(&marker);
             }
             PdTag::Table(_) => {
+                self.take_para_blank();
                 if self.table_active {
                     self.flush_table();
                 }
@@ -274,11 +468,9 @@ impl PdRenderer {
                 self.pending_link = Some(dest_url.to_string());
                 self.link_text = Some(String::new());
             }
-            PdTag::Image { title, .. } => {
-                let t = title.trim().to_string();
-                if !t.is_empty() {
-                    self.push_text(&format!("[image: {t}]"));
-                }
+            PdTag::Image { .. } => {
+                // Bare alt text, streamed by the inner text events; the title
+                // attribute is ignored, matching pi. Nothing to emit here.
             }
             _ => {}
         }
@@ -286,48 +478,102 @@ impl PdRenderer {
 
     fn on_end(&mut self, end: PdTagEnd) {
         match end {
-            PdTagEnd::Heading(_) | PdTagEnd::Emphasis | PdTagEnd::Strong | PdTagEnd::Strikethrough => {
+            PdTagEnd::Heading(level) => {
+                let n = (level as usize).min(6);
+                let open = heading_open(n, self.color);
+                let prefix = std::mem::take(&mut self.heading_prefix);
+                let body = self.heading_buf.take().unwrap_or_default();
+                // Re-assert the heading style after any inline resets, so
+                // ``## Fix `code` now`` keeps " now" styled.
+                let body = reapply_resets(body.trim(), open);
+                self.style_stack.pop();
                 if self.color {
-                    self.emit("\x1b[0m");
+                    self.out.push_str(open);
                 }
-                if matches!(end, PdTagEnd::Heading(_)) {
-                    self.out.push('\n');
+                self.out.push_str(&prefix);
+                self.out.push_str(&body);
+                if self.color {
+                    self.out.push_str("\x1b[0m");
                 }
+                self.out.push('\n');
+                // Headings separate from what follows (pi).
+                self.out.push('\n');
+            }
+            PdTagEnd::Emphasis | PdTagEnd::Strong | PdTagEnd::Strikethrough => {
+                self.push_reset();
             }
             PdTagEnd::Paragraph => {
-                // In a tight list the items flow without blank lines.
+                // In a tight list the items flow without blank lines; at top
+                // level the blank is deferred so a following list stays tight.
                 if !self.in_list {
-                    self.out.push('\n');
+                    self.end_line();
+                    self.para_blank = true;
                 }
             }
             PdTagEnd::BlockQuote(_) => {
                 self.in_blockquote = false;
-                self.out.push('\n');
+                self.style_stack.pop();
+                // Close the body style the line prefixes opened, so it can't
+                // leak into the following block.
+                if self.color {
+                    self.out.push_str("\x1b[0m");
+                }
+                self.end_block();
             }
             PdTagEnd::CodeBlock => {
                 if self.in_code {
                     // Split the buffered source into lines, dropping a trailing
                     // empty element produced by a trailing newline, then emit it
                     // syntax-highlighted (colours applied only when enabled and
-                    // the language is known to `synoptic`).
+                    // the language is known to `synoptic`). Body lines are
+                    // indented two spaces under pi-style dim fence borders.
                     let mut lines: Vec<String> =
                         self.code_buf.split('\n').map(String::from).collect();
                     while lines.last().map(|s| s.is_empty()) == Some(true) {
                         lines.pop();
                     }
                     let lang = std::mem::take(&mut self.code_lang);
-                    for line in code_highlight(&lang, &lines, self.color) {
-                        self.out.push_str(&line);
+                    let highlighted = code_highlight(&lang, &lines, self.color);
+                    // pi paints an unhighlightable block (unknown language)
+                    // wholly green, but leaves unhighlighted spans of a
+                    // highlighted block in the default foreground — never a
+                    // mix of green and highlighted lines in one block.
+                    let any_hl = highlighted.iter().any(|l| l.contains("\x1b["));
+                    for (i, line) in highlighted.iter().enumerate() {
+                        let src = &lines[i];
+                        let body = if self.color && !any_hl && !src.is_empty() {
+                            format!("{C_CODE_FALLBACK}{line}\x1b[0m")
+                        } else {
+                            line.clone()
+                        };
+                        self.out.push_str("  ");
+                        self.out.push_str(&body);
                         self.out.push('\n');
                     }
-                    self.out.push_str("```\n");
+                    if self.color {
+                        self.out.push_str(&format!("{C_MUTED}```\x1b[0m\n"));
+                    } else {
+                        self.out.push_str("```\n");
+                    }
                     self.in_code = false;
+                    // A fence separates like any block — unless nested in a
+                    // list item, where the enclosing list's own blank covers it.
+                    if self.in_list {
+                        self.para_blank = false;
+                    } else {
+                        self.end_block();
+                    }
                 } else {
                     self.out.push_str("```\n");
                 }
             }
             PdTagEnd::List(_) => {
                 self.list_stack.pop();
+                // A finished top-level list separates from what follows; a
+                // nested list closing mid-item must not split the item.
+                if self.list_stack.is_empty() {
+                    self.end_block();
+                }
             }
             PdTagEnd::Item => {
                 self.in_list = false;
@@ -351,10 +597,18 @@ impl PdRenderer {
                 if let Some(url) = self.pending_link.take() {
                     let text = self.link_text.take().unwrap_or_default();
                     let text = text.trim().to_string();
-                    if self.color {
-                        self.out.push_str(&osc8_link(&text, &url));
+                    // Inner resets (emphasis inside the link text) re-assert
+                    // the link style, so the whole text stays linked.
+                    let styled = if self.color {
+                        let text = reapply_resets(&text, C_LINK_OPEN);
+                        format!("{C_LINK_OPEN}{text}\x1b[0m")
                     } else {
-                        self.out.push_str(&format!("{text} [{url}]"));
+                        text.clone()
+                    };
+                    if self.color {
+                        self.push_main(&osc8_link(&styled, &url));
+                    } else {
+                        self.push_main(&format!("{text} ({url})"));
                     }
                 }
             }
@@ -369,17 +623,24 @@ impl PdRenderer {
 
     fn item_marker(&mut self) -> String {
         // Top of stack is the innermost list currently being iterated. Nested
-        // lists are indented by two spaces per level so the markers don't jam.
+        // lists step in four spaces per level (pi's airy nesting). Markers
+        // carry pi's accent color when colour is on: `- ` bullets and the
+        // `1. ` numbers alike.
         let depth = self.list_stack.len();
-        let pad = "  ".repeat(depth.saturating_sub(1));
-        match self.list_stack.last_mut() {
+        let pad = "    ".repeat(depth.saturating_sub(1));
+        let marker = match self.list_stack.last_mut() {
             Some(Some((base, count))) => {
                 let idx = *count;
                 *count += 1;
-                format!("{pad}{}. ", *base + idx)
+                format!("{}. ", *base + idx)
             }
             // Bullet list (None) or not inside a list.
-            _ => format!("{pad}• "),
+            _ => "- ".to_string(),
+        };
+        if self.color {
+            format!("{pad}{C_ACCENT}{marker}\x1b[0m")
+        } else {
+            format!("{pad}{marker}")
         }
     }
 
@@ -391,12 +652,13 @@ impl PdRenderer {
 
     /// Emit `s`, routing it into the current link buffer (when inside a link,
     /// so the whole link — including any inline emphasis — can be wrapped in a
-    /// single OSC 8 hyperlink) otherwise into the main output.
+    /// single OSC 8 hyperlink) otherwise into the heading buffer or main
+    /// output.
     fn emit(&mut self, s: &str) {
         if let Some(buf) = self.link_text.as_mut() {
             buf.push_str(s);
         } else {
-            self.out.push_str(s);
+            self.push_main(s);
         }
     }
 
@@ -407,7 +669,8 @@ impl PdRenderer {
             return;
         }
         let rows = std::mem::take(&mut self.table_cells);
-        self.out.push_str(&table_grid(&rows, self.color, |s| s.chars().count()));
+        // ANSI-aware width: cells may carry styling (inline code/links).
+        self.out.push_str(&table_grid(&rows, self.color, crate::term::visible_len));
     }
 }
 
@@ -505,26 +768,35 @@ fn normalize_lang(lang: &str) -> String {
     ext.to_string()
 }
 
-/// ANSI foreground colour for a `synoptic` token kind. Unknown kinds render in
-/// the terminal's default foreground (empty code → no reset emitted).
+/// ANSI colour for a `synoptic` token kind, following pi's code palette
+/// (VS Code Dark+, via `cli-highlight`): blue keywords, teal types, pale-
+/// green numbers, warm-tan strings, sage comments, pale-yellow functions,
+/// sky variables, and uncoloured operators/punctuation. Hex values are pi's
+/// `syntax*` theme roles, mapped to the nearest 256-color cell. Unknown kinds
+/// render in the terminal's default foreground (empty code → no reset
+/// emitted).
 fn tok_color(kind: &str) -> &'static str {
     match kind {
-        // comments / docs stay unobtrusive
-        "comment" => "\x1b[90m",
-        // strings, regexes, interpolation
-        "string" | "regex" | "escape" | "interp" | "char" => "\x1b[32m",
-        // keywords, booleans, types, operators
-        "keyword" | "kw" | "boolean" | "operator" | "type" => "\x1b[33m",
-        // numeric literals
-        "number" | "digit" | "constant" => "\x1b[35m",
-        // calls, macros, methods
-        "function" | "macro" | "method" => "\x1b[36m",
-        // named types / namespaces / tags / attributes
-        "class" | "struct" | "module" | "namespace" | "attribute" | "tag" => "\x1b[34m",
+        // sage green (pi syntaxComment #6A9955)
+        "comment" => "\x1b[38;5;65m",
+        // warm tan (pi syntaxString #CE9178)
+        "string" | "regex" | "escape" | "interp" | "char" => "\x1b[38;5;174m",
+        // blue (pi syntaxKeyword #569CD6)
+        "keyword" | "kw" => "\x1b[38;5;74m",
+        // pale green (pi syntaxNumber #B5CEA8; booleans/literals too)
+        "number" | "digit" | "constant" | "literal" | "boolean" => "\x1b[38;5;151m",
+        // teal (pi syntaxType #4EC9B0; macros are hljs built-ins)
+        "type" | "builtin" | "built_in" | "class" | "struct" | "module" | "namespace" | "attribute" | "tag" | "macro" => "\x1b[38;5;79m",
+        // pale yellow (pi syntaxFunction #DCDCAA)
+        "function" | "method" => "\x1b[38;5;187m",
+        // sky blue (pi syntaxVariable #9CDCFE)
+        "variable" | "property" | "params" | "attr" | "key" => "\x1b[38;5;153m",
+        // uncoloured, like pi (its theme maps these to default fg)
+        "operator" | "punctuation" => "",
         // markup-ish tokens & identifiers
         "header" | "heading" | "bold" | "italic" | "strikethrough" | "link" | "list"
-        | "quote" | "image" | "table" | "linebreak" | "block" | "key" | "variable"
-        | "property" | "deletion" | "insertion" | "math" => "\x1b[36m",
+        | "quote" | "image" | "table" | "linebreak" | "block"
+        | "deletion" | "insertion" | "math" => "\x1b[36m",
         _ => "",
     }
 }
@@ -610,19 +882,25 @@ fn render_node<'a>(node: &'a AstNode<'a>, ctx: &RenderCtx, out: &mut String) {
             }
         }
         NodeValue::Heading(h) => {
-            let level = h.level as usize;
-            let hashes = "#".repeat(level.min(6));
-            let prefix = format!("{hashes} ");
+            let level = (h.level as usize).min(6);
+            let open = heading_open(level, ctx.color);
+            // pi shows no markers on h1/h2; level 3+ keeps styled `### `.
+            let prefix = if level >= 3 { format!("{} ", "#".repeat(level)) } else { String::new() };
             let mut body = String::new();
             for c in node.children() {
                 render_node(c, ctx, &mut body);
             }
-            let body = body.trim();
-            if ctx.color && !body.is_empty() {
-                out.push_str(&format!("\x1b[1m{}{}\x1b[0m\n", prefix, body));
-            } else {
-                out.push_str(&format!("{prefix}{body}\n"));
+            let body = reapply_resets(body.trim(), open);
+            if ctx.color {
+                out.push_str(open);
             }
+            out.push_str(&prefix);
+            out.push_str(&body);
+            if ctx.color {
+                out.push_str("\x1b[0m");
+            }
+            // Headings separate from what follows (pi).
+            out.push_str("\n\n");
         }
         NodeValue::Paragraph => {
             let mut body = String::new();
@@ -632,7 +910,9 @@ fn render_node<'a>(node: &'a AstNode<'a>, ctx: &RenderCtx, out: &mut String) {
             let body = body.trim_end();
             if !body.is_empty() {
                 out.push_str(&indent_lines(body, ctx.indent));
-                out.push('\n');
+                // Paragraphs separate from what follows (pi); the blank
+                // collapses downstream when doubled.
+                out.push_str("\n\n");
             }
         }
         NodeValue::BlockQuote => {
@@ -641,22 +921,41 @@ fn render_node<'a>(node: &'a AstNode<'a>, ctx: &RenderCtx, out: &mut String) {
             for c in node.children() {
                 render_node(c, &inner, &mut body);
             }
+            let reopen = if ctx.color { C_QUOTE_OPEN } else { "" };
             for l in body.lines() {
                 out.push_str(&" ".repeat(ctx.indent));
-                out.push_str("> ");
-                out.push_str(l);
+                if ctx.color {
+                    // Gray border, then the gray-italic body style (re-asserted
+                    // after any inline resets on the line).
+                    out.push_str(&format!("{C_MUTED}│ \x1b[3m"));
+                } else {
+                    out.push_str("│ ");
+                }
+                out.push_str(&reapply_resets(l, reopen));
+                if ctx.color {
+                    out.push_str("\x1b[0m");
+                }
                 out.push('\n');
             }
+            out.push('\n');
         }
         NodeValue::List(l) => {
             let mut idx: usize = 1;
             let ordered = l.list_type == ListType::Ordered;
             let start = l.start as usize;
             for c in node.children() {
-                let marker = if ordered {
-                    format!("{}{}. ", " ".repeat(ctx.indent), start + idx - 1)
+                let raw = if ordered {
+                    format!("{}. ", start + idx - 1)
                 } else {
-                    format!("{}• ", " ".repeat(ctx.indent))
+                    "- ".to_string()
+                };
+                // Four spaces per nesting level (pulldown/streaming shape);
+                // pi's accent markers, plain in no-color mode.
+                let pad = "    ".repeat(ctx.indent);
+                let marker = if ctx.color {
+                    format!("{pad}{C_ACCENT}{raw}\x1b[0m")
+                } else {
+                    format!("{pad}{raw}")
                 };
                 let mut item_ctx = RenderCtx {
                     color: ctx.color,
@@ -665,6 +964,11 @@ fn render_node<'a>(node: &'a AstNode<'a>, ctx: &RenderCtx, out: &mut String) {
                 };
                 render_list_item(c, &marker, &mut item_ctx, out);
                 idx += 1;
+            }
+            // A finished top-level list separates from what follows; a nested
+            // list closing mid-item must not split the item.
+            if !ctx.in_list {
+                out.push('\n');
             }
         }
         NodeValue::Item(_) => {
@@ -675,17 +979,37 @@ fn render_node<'a>(node: &'a AstNode<'a>, ctx: &RenderCtx, out: &mut String) {
         NodeValue::CodeBlock(cb) => {
             let indent = " ".repeat(ctx.indent);
             let lang = cb.info.as_str().trim();
-            out.push_str(&format!("{indent}```{lang}\n"));
+            // Dim pi-style fence borders; body indented two spaces.
+            if ctx.color {
+                out.push_str(&format!("{indent}{C_MUTED}```{lang}\x1b[0m\n"));
+            } else {
+                out.push_str(&format!("{indent}```{lang}\n"));
+            }
             let lines: Vec<String> = cb.literal.as_str().lines().map(String::from).collect();
-            for l in code_highlight(lang, &lines, ctx.color) {
+            let highlighted = code_highlight(lang, &lines, ctx.color);
+            // Green fallback only when nothing highlighted (see pulldown).
+            let any_hl = highlighted.iter().any(|l| l.contains("\x1b["));
+            for (i, l) in highlighted.iter().enumerate() {
+                let src = &lines[i];
+                let body = if ctx.color && !any_hl && !src.is_empty() {
+                    format!("{C_CODE_FALLBACK}{l}\x1b[0m")
+                } else {
+                    l.clone()
+                };
                 out.push_str(&indent);
-                out.push_str(&l);
+                out.push_str("  ");
+                out.push_str(&body);
                 out.push('\n');
             }
-            out.push_str(&format!("{indent}```\n"));
+            if ctx.color {
+                out.push_str(&format!("{indent}{C_MUTED}```\x1b[0m\n"));
+            } else {
+                out.push_str(&format!("{indent}```\n"));
+            }
+            out.push('\n');
         }
         NodeValue::ThematicBreak => {
-            out.push_str(&format!("{}---\n", " ".repeat(ctx.indent)));
+            out.push_str(&format!("{}{}\n\n", " ".repeat(ctx.indent), hr_rule(ctx.color)));
         }
         NodeValue::Table(_) => {
             render_table(node, ctx, out);
@@ -697,8 +1021,8 @@ fn render_node<'a>(node: &'a AstNode<'a>, ctx: &RenderCtx, out: &mut String) {
         NodeValue::LineBreak => out.push('\n'),
         NodeValue::Code(c) => {
             if ctx.color {
-                // Bright-cyan text (no background / reverse video).
-                out.push_str(&format!("\x1b[96m{}\x1b[0m", c.literal.as_str()));
+                // Muted teal (pi `mdCode` accent), no background.
+                out.push_str(&format!("{C_ACCENT}{}\x1b[0m", c.literal.as_str()));
             } else {
                 out.push_str(&format!("`{}`", c.literal.as_str()));
             }
@@ -747,13 +1071,20 @@ fn render_node<'a>(node: &'a AstNode<'a>, ctx: &RenderCtx, out: &mut String) {
             } else if url == body {
                 out.push_str(&body);
             } else if ctx.color {
-                out.push_str(&osc8_link(&body, url));
+                let body = reapply_resets(&body, C_LINK_OPEN);
+                out.push_str(&osc8_link(&format!("{C_LINK_OPEN}{body}\x1b[0m"), url));
             } else {
                 out.push_str(&format!("{body} [{url}]"));
             }
         }
-        NodeValue::Image(i) => {
-            out.push_str(&format!("[image: {}]", i.title.as_str()));
+        NodeValue::Image(_) => {
+            // Bare alt text (pi shows just the description): the alt lives
+            // in the children, like pulldown's inner text events.
+            let mut body = String::new();
+            for c in node.children() {
+                render_node(c, ctx, &mut body);
+            }
+            out.push_str(body.trim());
         }
         _ => {
             for c in node.children() {
@@ -770,18 +1101,34 @@ fn render_list_item<'a>(node: &'a AstNode<'a>, marker: &str, ctx: &mut RenderCtx
     let mut first = true;
     for c in node.children() {
         let mut body = String::new();
-        render_node(c, ctx, &mut body);
+        // A nested list deepens one level so its markers step in like the
+        // other backends'; everything else renders at the current indent.
+        // Nested lines already carry their full indent, so they pass through
+        // unpadded (like pi) instead of stacking the outer continuation pad.
+        let is_list = matches!(c.data.borrow().value, NodeValue::List(_));
+        if is_list {
+            let mut nested = RenderCtx { color: ctx.color, indent: ctx.indent + 1, in_list: true };
+            render_node(c, &nested, &mut body);
+        } else {
+            render_node(c, ctx, &mut body);
+        }
         let body = body.trim_end();
         if body.is_empty() {
             continue;
         }
         for l in body.lines() {
-            if first {
+            if first && !is_list {
                 out.push_str(marker);
                 out.push_str(l);
                 first = false;
             } else {
-                out.push_str(&" ".repeat(marker.chars().count()));
+                first = false;
+                if !is_list {
+                    // Visible width, not char count: a styled marker's ANSI
+                    // escapes must not widen the continuation indent (which put
+                    // nested items 17 columns out).
+                    out.push_str(&" ".repeat(crate::term::visible_len(marker)));
+                }
                 out.push_str(l);
             }
             out.push('\n');
@@ -815,7 +1162,7 @@ fn render_table<'a>(node: &'a AstNode<'a>, ctx: &RenderCtx, out: &mut String) {
     }
     // `table_grid` draws its own borders; indent the finished block by the
     // current list/quote indent to stay consistent with neighbouring content.
-    let grid = table_grid(&rows, ctx.color, |s| s.chars().count());
+    let grid = table_grid(&rows, ctx.color, crate::term::visible_len);
     let grid = grid.trim_end();
     out.push_str(&indent_lines(grid, ctx.indent));
     out.push('\n');
@@ -1126,8 +1473,9 @@ fn render_whole(md: &str, color: bool) -> String {
 // so a line that continues a block renders correctly without re-parsing the
 // prefix.
 //
-// Output shape matches the pulldown backend (headings `# `+bold, `• ` lists,
-// fenced code, `> ` quotes, `text [url]` links) so the two are interchangeable.
+// Output shape matches the pulldown backend (pi-style headings, `- ` lists,
+// indented fenced code, `│ ` quotes, styled links) so the two are
+// interchangeable.
 // ---------------------------------------------------------------------------
 
 /// Streaming markdown renderer: feed lines, get ANSI output for just the new
@@ -1266,7 +1614,7 @@ impl StreamingRenderer {
         let mut preview = InlineParser::new();
         let mut s = String::new();
         if self.in_blockquote {
-            s.push_str("> ");
+            s.push_str("│ ");
         }
         for el in preview.parse(&self.pending_line) {
             self.render_inline_into(&el, &mut s);
@@ -1308,10 +1656,10 @@ impl StreamingRenderer {
             ParseEvent::Text(t) => self.out.push_str(&t),
             ParseEvent::InlineCode(c) => {
                 if self.color {
-                    // Bright-cyan text (no background / reverse video).
-                    self.out.push_str(&format!("\x1b[96m{}\x1b[0m", c));
+                    // Muted teal (pi `mdCode` accent), no background.
+                    self.out.push_str(&format!("{C_ACCENT}{c}\x1b[0m"));
                 } else {
-                    self.out.push_str(&format!("`{}`", c));
+                    self.out.push_str(&format!("`{c}`"));
                 }
             }
             ParseEvent::Bold(t) => self.styled("\x1b[1m", &t),
@@ -1323,15 +1671,19 @@ impl StreamingRenderer {
                 let text = sanitize_for_terminal(&text);
                 // Only emit the URL if it's safe for terminal hyperlinks (no
                 // escape-sequence injection, safe scheme). When colour is on and
-                // the URL is safe and differs from the text, wrap the text in an
-                // OSC 8 hyperlink so the terminal shows it as a clickable link;
-                // otherwise fall back to `text [url]`.
+                // the URL is safe and differs from the text, wrap the styled
+                // text in an OSC 8 hyperlink so the terminal shows it as a
+                // clickable link; otherwise fall back to `text (url)`.
                 if let Some(url) = sanitize_url(&url) {
                     if !url.is_empty() && url != text {
                         if self.color {
-                            self.out.push_str(&osc8_link(&text, &url));
+                            let text = reapply_resets(&text, C_LINK_OPEN);
+                            self.out.push_str(&osc8_link(
+                                &format!("{C_LINK_OPEN}{text}\x1b[0m"),
+                                &url,
+                            ));
                         } else {
-                            self.out.push_str(&format!("{text} [{url}]"));
+                            self.out.push_str(&format!("{text} ({url})"));
                         }
                     } else {
                         self.out.push_str(&text);
@@ -1341,8 +1693,9 @@ impl StreamingRenderer {
                 }
             }
             ParseEvent::Image { alt, .. } => {
+                // Bare alt text (pi shows just the description, no wrapper).
                 if !alt.is_empty() {
-                    self.out.push_str(&format!("[image: {alt}]"));
+                    self.out.push_str(&sanitize_for_terminal(&alt));
                 }
             }
             ParseEvent::Footnote(f) => {
@@ -1350,12 +1703,25 @@ impl StreamingRenderer {
             }
             ParseEvent::Heading { level, content } => {
                 let n = (level as usize).min(6);
-                let prefix = format!("{} ", "#".repeat(n));
-                if self.color {
-                    self.out.push_str(&format!("\x1b[1m{prefix}{content}\x1b[0m\n"));
-                } else {
-                    self.out.push_str(&format!("{prefix}{content}\n"));
+                let open = heading_open(n, self.color);
+                // pi shows no markers on h1/h2; level 3+ keeps styled `### `.
+                let prefix = if n >= 3 { format!("{} ", "#".repeat(n)) } else { String::new() };
+                // The content may carry inline formatting — parse it so
+                // ``## Fix `code` now`` doesn't leak raw backticks.
+                let mut body = String::new();
+                for el in self.inline.parse(&content) {
+                    self.render_inline_into(&el, &mut body);
                 }
+                let body = reapply_resets(body.trim(), open);
+                if self.color {
+                    self.out.push_str(open);
+                }
+                self.out.push_str(&prefix);
+                self.out.push_str(&body);
+                if self.color {
+                    self.out.push_str("\x1b[0m");
+                }
+                self.out.push('\n');
             }
             ParseEvent::CodeBlockStart { language, .. } => {
                 let lang = language.clone().unwrap_or_default();
@@ -1374,7 +1740,7 @@ impl StreamingRenderer {
                 self.md_fence = Some(Vec::new());
                 self.md_fence_is_md = is_md_lang;
                 if !is_md_lang && !lang.is_empty() {
-                    self.out.push_str(&format!("```{lang}\n"));
+                    self.emit_fence_border(&format!("```{lang}"));
                 }
             }
             ParseEvent::CodeBlockLine(l) => {
@@ -1408,29 +1774,50 @@ impl StreamingRenderer {
                     // A language on the fence line already had its opening
                     // marker emitted in `CodeBlockStart`; a bare (language-less)
                     // fence gets its opening marker here so the block closes
-                    // cleanly. The buffered source is then syntax-highlighted.
+                    // cleanly. The buffered source is then syntax-highlighted,
+                    // each body line indented two spaces under the dim borders.
                     if self.fence_lang.is_empty() {
-                        self.out.push_str("```\n");
+                        self.emit_fence_border("```");
                     }
-                    for line in code_highlight(&self.fence_lang, &buf, self.color) {
-                        self.out.push_str(&line);
+                    let highlighted = code_highlight(&self.fence_lang, &buf, self.color);
+                    // Green fallback only when nothing highlighted (see pulldown).
+                    let any_hl = highlighted.iter().any(|l| l.contains("\x1b["));
+                    for (i, line) in highlighted.iter().enumerate() {
+                        let src = &buf[i];
+                        let body = if self.color && !any_hl && !src.is_empty() {
+                            format!("{C_CODE_FALLBACK}{line}\x1b[0m")
+                        } else {
+                            line.clone()
+                        };
+                        self.out.push_str("  ");
+                        self.out.push_str(&body);
                         self.out.push('\n');
                     }
-                    self.out.push_str("```\n");
+                    self.emit_fence_border("```");
                 }
                 self.fence_lang.clear();
             }
             ParseEvent::ListItem { indent, bullet, content } => {
+                // pi drops task-list markers (`[ ]`/`[x]`) and shows plain
+                // bullets; strip them so backends agree.
+                let content = content
+                    .strip_prefix("[ ] ")
+                    .or_else(|| content.strip_prefix("[x] ").or_else(|| content.strip_prefix("[X] ")))
+                    .unwrap_or(&content);
                 let marker = match bullet {
                     ListBullet::Ordered(n) => format!("{n}. "),
-                    _ => "• ".to_string(),
+                    _ => "- ".to_string(),
                 };
                 let pad = "  ".repeat(indent);
                 self.out.push_str(&pad);
-                self.out.push_str(&marker);
+                if self.color {
+                    self.out.push_str(&format!("{C_ACCENT}{marker}\x1b[0m"));
+                } else {
+                    self.out.push_str(&marker);
+                }
                 // List item content is raw markdown — inline-parse it so `**bold**`
                 // and `_em_` render like the pulldown backend.
-                for el in self.inline.parse(&content) {
+                for el in self.inline.parse(content) {
                     self.on_inline(el);
                 }
                 self.out.push('\n');
@@ -1452,17 +1839,36 @@ impl StreamingRenderer {
                 self.flush_table();
             }
             ParseEvent::BlockquoteStart { .. } => {
+                // The `│ ` prefix is emitted per line (below), so no dangling
+                // prefix is left when the quote ends.
                 self.in_blockquote = true;
-                self.out.push_str("> ");
             }
             ParseEvent::BlockquoteLine(l) => {
-                self.out.push_str(&l);
+                // Quote lines arrive as raw markdown — inline-parse them so
+                // emphasis/code render like everywhere else, then re-assert
+                // the quote style after any inline resets.
+                let mut body = String::new();
+                for el in self.inline.parse(&l) {
+                    self.render_inline_into(&el, &mut body);
+                }
+                let body = reapply_resets(&body, if self.color { C_QUOTE_OPEN } else { "" });
+                if self.color {
+                    // Gray border, then the gray-italic body style opens: the
+                    // body inherits it until the next reset re-asserts it.
+                    self.out.push_str(&format!("{C_MUTED}│ \x1b[3m"));
+                } else {
+                    self.out.push_str("│ ");
+                }
+                self.out.push_str(&body);
                 self.out.push('\n');
-                self.out.push_str("> ");
             }
             ParseEvent::BlockquoteEnd => {
                 self.in_blockquote = false;
-                self.out.push('\n');
+                // Close the body style the line prefixes opened; the lines
+                // self-terminate so no extra newline (and no dangling `> `).
+                if self.color {
+                    self.out.push_str("\x1b[0m");
+                }
             }
             ParseEvent::ThinkBlockStart => {}
             ParseEvent::ThinkBlockLine(l) => {
@@ -1471,10 +1877,16 @@ impl StreamingRenderer {
             }
             ParseEvent::ThinkBlockEnd => {}
             ParseEvent::HorizontalRule => {
-                self.out.push_str("---\n");
+                self.out.push_str(&hr_rule(self.color));
+                self.out.push('\n');
             }
             ParseEvent::EmptyLine => {
-                self.out.push('\n');
+                // Source blank lines separate blocks — but a block end that
+                // already left a blank (e.g. a flushed table grid) must not
+                // grow a second one.
+                if !self.out.ends_with("\n\n") {
+                    self.out.push('\n');
+                }
             }
             ParseEvent::Newline => {
                 self.out.push('\n');
@@ -1528,10 +1940,10 @@ impl StreamingRenderer {
             InlineElement::Strikeout(t) => self.styled_into("\x1b[9m", t, target),
             InlineElement::Code(c) => {
                 if self.color {
-                    // Bright-cyan text (no background / reverse video).
-                    target.push_str(&format!("\x1b[96m{}\x1b[0m", c));
+                    // Muted teal (pi `mdCode` accent), no background.
+                    target.push_str(&format!("{C_ACCENT}{c}\x1b[0m"));
                 } else {
-                    target.push_str(&format!("`{}`", c));
+                    target.push_str(&format!("`{c}`"));
                 }
             }
             InlineElement::Link { text, url } => {
@@ -1539,9 +1951,13 @@ impl StreamingRenderer {
                 if let Some(url) = sanitize_url(url) {
                     if !url.is_empty() && url != text {
                         if self.color {
-                            target.push_str(&osc8_link(&text, &url));
+                            let text = reapply_resets(&text, C_LINK_OPEN);
+                            target.push_str(&osc8_link(
+                                &format!("{C_LINK_OPEN}{text}\x1b[0m"),
+                                &url,
+                            ));
                         } else {
-                            target.push_str(&format!("{text} [{url}]"));
+                            target.push_str(&format!("{text} ({url})"));
                         }
                     } else {
                         target.push_str(&text);
@@ -1571,6 +1987,17 @@ impl StreamingRenderer {
             return;
         }
         self.out.push_str(&table_grid(&rows, self.color, crate::term::visible_len));
+    }
+
+    /// Emit a code-fence border line (```lang / ```), dimmed when colour is
+    /// on (pi's gray `mdCodeBlockBorder`).
+    fn emit_fence_border(&mut self, marker: &str) {
+        if self.color {
+            self.out.push_str(&format!("{C_MUTED}{marker}\x1b[0m\n"));
+        } else {
+            self.out.push_str(marker);
+            self.out.push('\n');
+        }
     }
 
     /// Heuristic: does this bare-fence buffer look like a markdown table? True
@@ -1611,14 +2038,14 @@ mod streaming_tests {
         // No raw emphasis/italic markdown left.
         assert!(!out.contains("**markdown**"), "got: {out:?}");
         assert!(!out.contains("_parser_"), "got: {out:?}");
-        assert!(out.contains("# Plan"), "got: {out:?}");
-        assert!(out.contains("## Steps"), "got: {out:?}");
+        assert!(out.contains("Plan"), "got: {out:?}");
+        assert!(out.contains("Steps"), "got: {out:?}");
         assert!(out.contains("```rust"), "got: {out:?}");
-        assert!(out.contains("let x = 1;"), "got: {out:?}");
-        assert!(out.contains("> a note"), "got: {out:?}");
+        assert!(out.contains("  let x = 1;"), "got: {out:?}");
+        assert!(out.contains("│ a note"), "got: {out:?}");
         assert!(out.contains("https://example.com"), "got: {out:?}");
         assert!(out.contains("1. read the file"), "got: {out:?}");
-        assert!(out.contains("• support"), "got: {out:?}");
+        assert!(out.contains("- support"), "got: {out:?}");
     }
 
     // Streaming across a code-fence boundary: the fence opens on one line and
@@ -1653,11 +2080,12 @@ mod streaming_tests {
         assert_eq!(code_highlight("rust", &lines, false), lines);
         // unknown language => verbatim even in colour.
         assert_eq!(code_highlight("nonsense", &lines, true), lines);
-        // known language + colour => ANSI escapes present.
+        // known language + colour => ANSI escapes present (pi's palette:
+        // blue keywords, tan strings — see `tok_color`).
         let hl = code_highlight("rust", &lines, true);
         assert_eq!(hl.len(), lines.len());
-        assert!(hl[0].contains("\x1b[") && hl[0].contains("fn"), "rust keyword not coloured: {hl:?}");
-        assert!(hl[1].contains("\x1b[32m"), "string literal not coloured green: {hl:?}");
+        assert!(hl[0].contains("\x1b[38;5;74m") && hl[0].contains("fn"), "rust keyword not blue: {hl:?}");
+        assert!(hl[1].contains("\x1b[38;5;174m"), "string literal not warm tan: {hl:?}");
         assert!(!hl[2].contains("\x1b["), "closing brace should be plain: {hl:?}");
     }
 
@@ -1669,8 +2097,8 @@ mod streaming_tests {
         r.push_line("- b");
         r.finalize();
         let out = r.output();
-        assert!(out.contains("• a"), "got: {out:?}");
-        assert!(out.contains("• b"), "got: {out:?}");
+        assert!(out.contains("- a"), "got: {out:?}");
+        assert!(out.contains("- b"), "got: {out:?}");
     }
 
     // Colour mode emits ANSI for bold/italic.
@@ -1689,9 +2117,9 @@ mod streaming_tests {
     fn streaming_push_returns_only_new_tail() {
         let mut r = StreamingRenderer::new(false);
         let first = r.push("# Title\n");
-        assert!(first.contains("# Title"), "got: {first:?}");
+        assert!(first.contains("Title"), "got: {first:?}");
         let second = r.push("\nbody\n");
-        assert!(!second.contains("# Title"), "tail must not repeat the title: {second:?}");
+        assert!(!second.contains("Title"), "tail must not repeat the title: {second:?}");
         assert!(second.contains("body"), "got: {second:?}");
     }
 
@@ -1716,26 +2144,26 @@ mod streaming_tests {
     }
 
     // A safe link with colour on is wrapped in an OSC 8 hyperlink (clickable in
-    // supporting terminals); the URL and text are both present, and the sequence
-    // is closed.
+    // supporting terminals) around styled link text; the URL and text are both
+    // present, and the sequence is closed.
     #[test]
     fn streaming_link_is_osc8_hyperlink_when_coloured() {
         let mut r = StreamingRenderer::new(true);
         r.push_line("[GitHub page](https://example.com/x)");
         r.finalize();
         let out = r.output();
-        assert!(out.contains("\x1b]8;;https://example.com/x\x1b\\GitHub page\x1b]8;;\x1b\\"), "got: {out:?}");
-        assert!(!out.contains("GitHub page [https://example.com/x]"), "got: {out:?}");
+        assert!(out.contains("\x1b]8;;https://example.com/x\x1b\\\x1b[38;5;109m\x1b[4mGitHub page\x1b[0m\x1b]8;;\x1b\\"), "got: {out:?}");
+        assert!(!out.contains("GitHub page (https://example.com/x)"), "got: {out:?}");
     }
 
-    // Colour off falls back to `text [url]`.
+    // Colour off falls back to `text (url)`.
     #[test]
     fn streaming_link_falls_back_to_text_url_when_plain() {
         let mut r = StreamingRenderer::new(false);
         r.push_line("[GitHub page](https://example.com/x)");
         r.finalize();
         let out = r.output();
-        assert!(out.contains("GitHub page [https://example.com/x]"), "got: {out:?}");
+        assert!(out.contains("GitHub page (https://example.com/x)"), "got: {out:?}");
         assert!(!out.contains("\x1b]8"), "got: {out:?}");
     }
 
@@ -1845,7 +2273,7 @@ mod streaming_tests {
             r2.push_line(line);
         }
         r2.finalize();
-        assert_eq!(r2.output(), "```\nlet x = 1;\n```\n", "bare code fence changed: {:?}", r2.output());
+        assert_eq!(r2.output(), "```\n  let x = 1;\n```\n", "bare code fence changed: {:?}", r2.output());
     }
 
     // Regression: streaming feeds arbitrary byte slices that split lines mid-way
@@ -1921,9 +2349,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn heading_renders_with_hashes() {
+    fn heading_renders_without_markers_on_h1_h2() {
+        // pi shows no `#` markers on h1/h2 (h3+ keeps styled `### `).
         let r = render("# Title\n", false);
-        assert!(r.contains("# Title"), "got: {r:?}");
+        assert!(!r.contains("# Title"), "h1 markers must go: {r:?}");
+        assert!(r.contains("Title"), "got: {r:?}");
+        let r2 = render("## Sub\n", false);
+        assert!(!r2.contains("## Sub"), "h2 markers must go: {r2:?}");
+        let r3 = render("### Deep\n", false);
+        assert!(r3.contains("### Deep"), "h3 keeps its markers: {r3:?}");
+    }
+
+    #[test]
+    fn heading_levels_are_styled_when_coloured() {
+        // Warm-yellow bold everywhere, plus underline on h1 (pi's h1).
+        let r = render("# Title\n", true);
+        assert!(r.contains("\x1b[38;5;222m\x1b[1m\x1b[4mTitle\x1b[0m"), "got: {r:?}");
+        let r2 = render("## Sub\n", true);
+        assert!(r2.contains("\x1b[38;5;222m\x1b[1mSub\x1b[0m"), "got: {r2:?}");
+        assert!(!r2.contains("\x1b[4m"), "h2 must not underline: {r2:?}");
+    }
+
+    /// Inline formatting inside a heading must not strip the heading style:
+    /// ``## Fix `code` now`` keeps " now" styled (pi re-applies its style
+    /// prefix after nested resets).
+    #[test]
+    fn heading_style_survives_inline_code() {
+        let r = render("## Fix `code` now\n", true);
+        assert!(r.contains("\x1b[0m\x1b[38;5;222m\x1b[1m now"), "heading style not re-asserted: {r:?}");
     }
 
     #[test]
@@ -1944,8 +2397,16 @@ mod tests {
     #[test]
     fn list_markers_present() {
         let r = render("- a\n- b\n", false);
-        assert!(r.contains("• a"), "got: {r:?}");
-        assert!(r.contains("• b"), "got: {r:?}");
+        assert!(r.contains("- a"), "got: {r:?}");
+        assert!(r.contains("- b"), "got: {r:?}");
+    }
+
+    /// Bullets and ordered markers carry pi's accent color when coloured.
+    #[test]
+    fn list_markers_are_accent_when_coloured() {
+        let r = render("- a\n1. b\n", true);
+        assert!(r.contains("\x1b[38;5;109m- \x1b[0ma"), "got: {r:?}");
+        assert!(r.contains("\x1b[38;5;109m1. \x1b[0mb"), "got: {r:?}");
     }
 
     #[test]
@@ -1954,23 +2415,24 @@ mod tests {
         assert!(r.contains("https://example.com"), "got: {r:?}");
     }
 
-    // With colour on, an inline link is wrapped in an OSC 8 terminal hyperlink
-    // (`ESC ] 8 ; ; <url> ESC \ <text> ESC ] 8 ; ; ESC \`) so a supporting
-    // terminal shows it as a clickable link. The URL and text survive inside the
-    // sequence and the sequence is closed at the end.
+    // With colour on, an inline link is styled (pi's blue + underline) and
+    // wrapped in an OSC 8 terminal hyperlink (`ESC ] 8 ; ; <url> ESC \ <text>
+    // ESC ] 8 ; ; ESC \`) so a supporting terminal shows it as a clickable
+    // link. The URL and text survive inside the sequence and the sequence is
+    // closed at the end.
     #[test]
     fn link_is_osc8_hyperlink_when_coloured() {
         let r = render("[GitHub page](https://example.com/x)", true);
-        assert!(r.contains("\x1b]8;;https://example.com/x\x1b\\GitHub page\x1b]8;;\x1b\\"), "got: {r:?}");
-        // No `text [url]` fallback when coloured.
-        assert!(!r.contains("GitHub page [https://example.com/x]"), "got: {r:?}");
+        assert!(r.contains("\x1b]8;;https://example.com/x\x1b\\\x1b[38;5;109m\x1b[4mGitHub page\x1b[0m\x1b]8;;\x1b\\"), "got: {r:?}");
+        // No `text (url)` fallback when coloured.
+        assert!(!r.contains("GitHub page (https://example.com/x)"), "got: {r:?}");
     }
 
-    // With colour off, the link falls back to the `text [url]` plain form.
+    // With colour off, the link falls back to the `text (url)` plain form.
     #[test]
     fn link_falls_back_to_text_url_when_plain() {
         let r = render("[GitHub page](https://example.com/x)", false);
-        assert!(r.contains("GitHub page [https://example.com/x]"), "got: {r:?}");
+        assert!(r.contains("GitHub page (https://example.com/x)"), "got: {r:?}");
         assert!(!r.contains("\x1b]8"), "no OSC 8 escape when colour is off: {r:?}");
     }
 
@@ -2007,15 +2469,79 @@ mod tests {
         assert!(!out.contains("_parser_"), "got: {out:?}");
         // The backtick in the inline code span keeps its literal `**`.
         assert!(out.contains("`**`"), "got: {out:?}");
-        assert!(out.contains("# Plan"), "got: {out:?}");
-        assert!(out.contains("## Steps"), "got: {out:?}");
+        assert!(out.contains("Plan"), "got: {out:?}");
+        assert!(out.contains("Steps"), "got: {out:?}");
         assert!(out.contains("```rust"), "got: {out:?}");
-        assert!(out.contains("let x = 1;"), "got: {out:?}");
-        assert!(out.contains("> a note"), "got: {out:?}");
+        assert!(out.contains("  let x = 1;"), "got: {out:?}");
+        assert!(out.contains("│ a note"), "got: {out:?}");
         assert!(out.contains("https://example.com"), "got: {out:?}");
         // Ordered + unordered list markers both present.
         assert!(out.contains("1. read the file"), "got: {out:?}");
-        assert!(out.contains("• support"), "got: {out:?}");
+        assert!(out.contains("- support"), "got: {out:?}");
+    }
+
+    /// Blocks separate with blank lines (pi's airy spacing): heading,
+    /// paragraph, list, fence and quote each stand apart.
+    #[test]
+    fn blocks_separate_with_blank_lines() {
+        let out = render("# H\n\npara\n\n- a\n", false);
+        assert!(out.contains("H\n\npara\n\n- a\n"), "missing block blanks: {out:?}");
+        let out2 = render("para one\n\npara two\n", false);
+        assert!(out2.contains("para one\n\npara two\n"), "missing para blank: {out2:?}");
+    }
+
+    /// Blockquotes use pi's `│ ` border; code fences get dim borders with
+    /// their body indented two spaces.
+    #[test]
+    fn quote_and_fence_shapes_match_pi() {
+        let q = render("> note\n", false);
+        assert!(q.contains("│ note"), "got: {q:?}");
+        assert!(!q.contains('>'), "old quote marker leaked: {q:?}");
+        let f = render("```rust\nlet x = 1;\n```\n", false);
+        assert!(f.contains("```rust\n  let x = 1;\n```\n"), "got: {f:?}");
+        let hr = render("---\n", false);
+        assert!(hr.contains(&"─".repeat(80)), "hr must be a full rule: {hr:?}");
+    }
+
+    /// Quote bodies are gray italic, and inline code inside a quote must not
+    /// strip the quote style for the rest of the line.
+    #[test]
+    fn quote_body_is_styled_and_survives_code() {
+        let r = render("> mentions `code` tail\n", true);
+        assert!(r.contains("\x1b[90m│ "), "missing gray border: {r:?}");
+        assert!(r.contains("\x1b[0m\x1b[90m\x1b[3m tail"), "quote style not re-asserted: {r:?}");
+    }
+
+    /// Inline HTML spans survive verbatim (pi renders them literally):
+    /// pulldown 0.13 split them into a separate `InlineHtml` event, which the
+    /// old `_ => {}` arm silently ate.
+    #[test]
+    fn inline_html_is_preserved() {
+        let r = render("a <b>bold-ish</b> span\n", false);
+        assert!(r.contains("<b>bold-ish</b>"), "inline html dropped: {r:?}");
+    }
+
+    /// The optional comrak backend renders the same pi-parity shapes as
+    /// pulldown (headings without h1/h2 markers, `- ` bullets with 4-space
+    /// nesting, `│ ` quotes, indented fences), so the look never depends on
+    /// which parser is compiled in.
+    #[cfg(feature = "comrak-backend")]
+    #[test]
+    fn comrak_matches_pulldown_shapes() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os("PIR_MARKDOWN_RENDERER");
+        // SAFETY: test-local env mutation under the shared env lock.
+        unsafe { std::env::set_var("PIR_MARKDOWN_RENDERER", "comrak") };
+        let out = render("# H\n\npara\n\n- a\n  - b\n\n> q\n\n```rust\nlet x = 1;\n```\n", false);
+        match old {
+            Some(v) => unsafe { std::env::set_var("PIR_MARKDOWN_RENDERER", v) },
+            None => unsafe { std::env::remove_var("PIR_MARKDOWN_RENDERER") },
+        }
+        assert!(!out.contains("# H"), "h1 markers must go: {out:?}");
+        assert!(out.contains("H\n\npara\n\n- a\n"), "missing block blanks: {out:?}");
+        assert!(out.contains("    - b"), "nested indent wrong: {out:?}");
+        assert!(out.contains("│ q"), "quote shape wrong: {out:?}");
+        assert!(out.contains("```rust\n  let x = 1;"), "fence indent wrong: {out:?}");
     }
 }
 
@@ -2046,7 +2572,7 @@ mod incremental_tests {
         r2.set_throttle(Duration::ZERO);
         r2.push("```\nlet x = 1;\n```\n");
         r2.flush();
-        assert!(r2.frames().last().unwrap().contains("```\nlet x = 1;"), "bare code fence collapsed: {:?}", r2.frames().last());
+        assert!(r2.frames().last().unwrap().contains("```\n  let x = 1;"), "bare code fence collapsed: {:?}", r2.frames().last());
     }
 
     // Default throttle is 200ms (the ceiling requested by the PR: redraw at
@@ -2132,7 +2658,7 @@ mod incremental_tests {
         assert!(later.starts_with("\x1b["), "later frame must jump the cursor back: {later:?}");
         assert!(later.contains("[1A"), "jump-back must move up N rows: {later:?}");
         // The body is the full current markdown, rendered once — not doubled.
-        assert_eq!(later.matches("# Title").count(), 1);
+        assert_eq!(later.matches("Title").count(), 1);
         assert_eq!(later.matches("body text").count(), 1);
     }
 
@@ -2165,7 +2691,7 @@ mod incremental_tests {
         assert_eq!(r.frames().len(), first + 2, "flush must force a final redraw");
         // The flushed frame carries the full accumulated markdown.
         let last = r.frames().last().unwrap();
-        assert!(last.contains("# Title"), "flush must show the title: {last:?}");
+        assert!(last.contains("Title"), "flush must show the title: {last:?}");
         assert!(last.contains("more content"), "flush must show the appended text: {last:?}");
         // The last frame jumps back over the previous block (it is not the first).
         assert!(last.starts_with('\x1b'), "flush frame must overwrite in place: {last:?}");
@@ -2201,8 +2727,8 @@ mod incremental_tests {
         // appended, so we never see "- a" twice in a single frame.
         let last = r.frames().last().unwrap();
         let body = last.trim_start_matches('\x1b').trim_start_matches('[').split('A').nth(1).unwrap_or(last.as_str());
-        assert_eq!(body.matches("• a").count(), 1, "item a duplicated in final frame: {body:?}");
-        assert_eq!(body.matches("• d").count(), 1, "item d missing/duplicated: {body:?}");
+        assert_eq!(body.matches("- a").count(), 1, "item a duplicated in final frame: {body:?}");
+        assert_eq!(body.matches("- d").count(), 1, "item d missing/duplicated: {body:?}");
     }
 
     /// Simulate a cell-based terminal replaying the exact byte frames an
@@ -2323,10 +2849,10 @@ mod incremental_tests {
         let body = last.trim_start_matches('\x1b').trim_start_matches('[').split('A').nth(1).unwrap_or(last.as_str());
         // The paragraph is one line, not split into `We will ship the` + ` thing.`.
         assert!(body.contains("We will ship the thing."), "paragraph split by mid-line flush: {body:?}");
-        // The list item is one bullet, not `• support incremental` + ` markdown`.
-        assert!(body.contains("• support incremental markdown"), "list item split by mid-line flush: {body:?}");
-        assert_eq!(body.matches("• support incremental").count(), 1, "bullet duplicated: {body:?}");
-        assert_eq!(body.matches("• never stack").count(), 1, "bullet missing/duplicated: {body:?}");
+        // The list item is one bullet, not `- support incremental` + ` markdown`.
+        assert!(body.contains("- support incremental markdown"), "list item split by mid-line flush: {body:?}");
+        assert_eq!(body.matches("- support incremental").count(), 1, "bullet duplicated: {body:?}");
+        assert_eq!(body.matches("- never stack").count(), 1, "bullet missing/duplicated: {body:?}");
     }
 
     // Regression: a table streamed incrementally (the path `/markup_demo` and

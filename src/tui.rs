@@ -814,6 +814,7 @@ fn read_raw_into(
         buf: std::mem::take(buf),
         cursor: recall.cursor,
         tab: recall.tab.take().map(|(s, c)| (s, c, 0)),
+        paste: None,
     };
     macro_rules! sync_ed {
         () => {{
@@ -1146,10 +1147,20 @@ fn update_tui_typeahead(buf: &str, typeahead: &Arc<Mutex<String>>) {
     }
 }
 
-/// Update the footer hint based on the current idle draft. Shows the available
-/// `/thinking` options when the user has typed `/thinking` (with no further
-/// argument), and otherwise a generic nudge to press Tab for completions.
+/// Update the footer hint based on the current idle draft. On a
+/// `/model`-family line the hint is the inline picker list (the top-N recent
+/// models for the typed prefix, Up/Down-selectable — same core as the
+/// streaming REPL, see `model_history::format_options`); otherwise the
+/// available `/thinking` options, a generic Tab nudge, or nothing.
 fn update_tui_hint(state: &mut TuiState, buf: &str) {
+    if let Some((_cmd, arg)) = crate::model_history::parse_model_line(buf) {
+        let cands = crate::model_history::top_matching(&arg, crate::model_history::TOP_N);
+        let shown = crate::model_history::format_options(&cands, &arg);
+        if !shown.is_empty() {
+            state.hint = shown;
+            return;
+        }
+    }
     if buf == "/thinking" {
         state.hint = "[Tab] levels: off | minimal | low | medium | high | xhigh | max · show | hide".to_string();
     } else if buf == "/" {
@@ -1487,6 +1498,8 @@ fn read_idle_line(
                     }
                     0x7f | 0x08 => {
                         buf.pop();
+                        update_tui_typeahead(&buf, ctx.typeahead);
+                        update_tui_hint(state, &buf);
                         crate::term::reset_quit_presses();
                     }
                     0x03 => {
@@ -1561,7 +1574,29 @@ fn read_idle_line(
                                 }
                             }
                         }
-                        if is_up {
+                        // Inline `/model` picker: Up/Down steps through the top-N
+                        // recent models in place (same `pick_next` core as the
+                        // streaming REPL). Any other line keeps history recall.
+                        // Either way the footer hint re-renders so the `▸`
+                        // selection mark tracks the move.
+                        let picked = if is_up || is_down {
+                            let arg = crate::model_history::parse_model_line(&buf)
+                                .map(|(_, a)| a)
+                                .unwrap_or_default();
+                            let cands = crate::model_history::top_matching(
+                                &arg,
+                                crate::model_history::TOP_N,
+                            );
+                            crate::model_history::pick_next(&buf, buf.len(), &cands, is_up)
+                        } else {
+                            None
+                        };
+                        if let Some(next) = picked {
+                            crate::term::reset_quit_presses();
+                            buf = next;
+                            update_tui_typeahead(&buf, ctx.typeahead);
+                            update_tui_hint(state, &buf);
+                        } else if is_up {
                             crate::term::reset_quit_presses();
                             if !history.is_empty() {
                                 if hist_idx < (history.len() as i32) - 1 {
@@ -1802,18 +1837,85 @@ fn handle_command(
             }
         }
         "h" | "help" => state.push(ConvKind::System, HELP_TUI),
+        // `/model<N>` / `/m<N>`: pick the Nth of the top-N recent list directly
+        // (`/model2` = the second), mirroring the streaming REPL. Handled before
+        // the `"m" | "model"` arm because the token is the whole command word.
+        _ if crate::model_history::parse_number(cmd).is_some() => {
+            let n = crate::model_history::parse_number(cmd).unwrap();
+            let labels = crate::model_history::top_matching("", crate::model_history::TOP_N);
+            let Some(label) = labels.get(n - 1) else {
+                state.push(
+                    ConvKind::Error,
+                    &format!(
+                        "· /model{n} — only {} recent model(s); type /model to list them",
+                        labels.len()
+                    ),
+                );
+                return;
+            };
+            let mut g = ctx.agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                state.push(ConvKind::System, "· agent busy (turn running) — try again when idle");
+                return;
+            };
+            match crate::config::select(ctx.providers, label) {
+                Ok((p, m)) => match agent.switch(p.clone(), m.clone()) {
+                    Ok(()) => {
+                        crate::model_history::record(&p.pid(), &m.id);
+                        state.push(ConvKind::System, &format!("→ {}", agent.label()));
+                    }
+                    Err(e) => state.push(ConvKind::Error, &e),
+                },
+                Err(e) => state.push(ConvKind::Error, &e),
+            }
+        }
         "m" | "model" => {
             let mut g = ctx.agent_slot.lock().unwrap();
             let Some(agent) = g.as_mut() else {
                 state.push(ConvKind::System, "· agent busy (turn running) — try again when idle");
                 return;
             };
-            if rest.is_empty() {
-                state.push(ConvKind::System, &format!("current model: {}", agent.label()));
-            } else {
-                match crate::config::select(ctx.providers, &rest.join(" ")) {
+            let query = rest.join(" ");
+            if query.is_empty() {
+                // Bare `/model`: the top five recent models, one per line, in
+                // the conversation pane. The footer's inline ↑↓ picker (see
+                // `update_tui_hint` / `pick_next`) steps the draft line through
+                // this same list, so the two agree row for row.
+                let labels = crate::model_history::top_matching("", crate::model_history::TOP_N);
+                let current = agent.label();
+                if labels.is_empty() {
+                    state.push(ConvKind::System, &format!("current model: {current}"));
+                    state.push(
+                        ConvKind::System,
+                        "· no recent models yet — /models lists the whole catalog",
+                    );
+                } else {
+                    let mut text = format!("· recent models (top {} by use)\n", labels.len());
+                    for row in crate::model_history::format_rows(&labels, None, &current) {
+                        text.push_str(&row);
+                        text.push('\n');
+                    }
+                    text.push_str("type a number (/model2) or use ↑↓ on the /model line");
+                    state.push(ConvKind::System, &text);
+                }
+            } else if let Some(label) = crate::model_history::sole_match(&query) {
+                match crate::config::select(ctx.providers, &label) {
                     Ok((p, m)) => match agent.switch(p.clone(), m.clone()) {
-                        Ok(()) => state.push(ConvKind::System, &format!("→ {}", agent.label())),
+                        Ok(()) => {
+                            crate::model_history::record(&p.pid(), &m.id);
+                            state.push(ConvKind::System, &format!("→ {}", agent.label()));
+                        }
+                        Err(e) => state.push(ConvKind::Error, &e),
+                    },
+                    Err(e) => state.push(ConvKind::Error, &e),
+                }
+            } else {
+                match crate::config::select(ctx.providers, &query) {
+                    Ok((p, m)) => match agent.switch(p.clone(), m.clone()) {
+                        Ok(()) => {
+                            crate::model_history::record(&p.pid(), &m.id);
+                            state.push(ConvKind::System, &format!("→ {}", agent.label()));
+                        }
                         Err(e) => state.push(ConvKind::Error, &e),
                     },
                     Err(e) => state.push(ConvKind::Error, &e),
@@ -2014,8 +2116,10 @@ fn handle_command(
 }
 
 const HELP_TUI: &str = "\
-commands: /help /model <sel> /models /goal [obj] /continue /clear /finished /fix /undo [all] \
+commands: /help /model /model<N> /models /goal [obj] /continue /clear /finished /fix /undo [all] \
 /bg <text> /jobs /cancel /reload
+/model lists the five most recent models (↑/↓ on the /model line, or type /model2
+       for the second); /models opens the full-catalog picker
 /reexec  exec the current binary in place (streaming REPL only; TUI/GUI must restart manually)
 /sh [cmd args]  drop to a shell, or run a command via $SHELL (sh -c)
                /sh -u [user] starts it as another user (default: the invoking user)
@@ -2272,7 +2376,6 @@ mod tui_completion_tests {
                         reasoning: false,
                         thinking_format: None,
                         supports_reasoning_effort: None,
-                        session_affinity_format: None,
                         thinking_level_map: Default::default(),
                         price_per_1k: None,
                     },
@@ -2287,7 +2390,6 @@ mod tui_completion_tests {
                         reasoning: false,
                         thinking_format: None,
                         supports_reasoning_effort: None,
-                        session_affinity_format: None,
                         thinking_level_map: Default::default(),
                         price_per_1k: None,
                     },
@@ -2343,6 +2445,80 @@ mod tui_completion_tests {
         assert!(s.hint.contains("Tab"));
         update_tui_hint(&mut s, "hello");
         assert!(s.hint.is_empty());
+    }
+
+    /// Seed throwaway model history for the picker tests below (temp `PI_DIR`,
+    /// serialized via the shared env lock). Returns the old `PI_DIR` and the
+    /// temp dir for teardown.
+    fn seed_picker_history() -> (Option<std::ffi::OsString>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("pir_tui_pick_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let old = std::env::var_os("PI_DIR");
+        // SAFETY: confined to the calling test (see config::worktrees_default_roundtrip).
+        unsafe { std::env::set_var("PI_DIR", &dir); }
+        let file = dir.join("agent").join("model-history.json");
+        crate::model_history::record_to(&file, "b", "old", 10);
+        crate::model_history::record_to(&file, "a", "new", 30);
+        crate::model_history::record_to(&file, "opencode-go", "muse-spark-1.3-contributor", 20);
+        (old, dir)
+    }
+
+    fn restore_picker_history(old: Option<std::ffi::OsString>, dir: std::path::PathBuf) {
+        match old {
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The TUI footer hint shows the same inline picker list as the streaming
+    /// REPL (top-N recents, narrowed by prefix, `▸` on the selection) — the
+    /// parity the feature requires.
+    #[test]
+    fn tui_hint_lists_recent_models_before_enter() {
+        let _env = crate::test_support::env_lock();
+        let (old, dir) = seed_picker_history();
+        let mut s = TuiState::new();
+        update_tui_hint(&mut s, "/model");
+        assert!(s.hint.contains("1 a/new"), "most recent first: {:?}", s.hint);
+        assert!(s.hint.contains("2 opencode-go/muse-spark-1.3-contributor"), "got: {:?}", s.hint);
+        assert!(s.hint.contains("[↑↓ select]"), "arrow affordance: {:?}", s.hint);
+        // A typed prefix narrows; a selected label is marked.
+        update_tui_hint(&mut s, "/model mu");
+        assert!(s.hint.contains("opencode-go/muse-spark-1.3-contributor"), "got: {:?}", s.hint);
+        assert!(!s.hint.contains("a/new"), "non-matching recents hidden: {:?}", s.hint);
+        update_tui_hint(&mut s, "/model a/new");
+        assert!(s.hint.contains("▸1 a/new"), "selection marked: {:?}", s.hint);
+        restore_picker_history(old, dir);
+    }
+
+    /// Up/Down on a `/model` line steps through the recents in place (same
+    /// `pick_next` core as the streaming REPL); an unmatched prefix falls
+    /// through to history recall (unchanged behavior).
+    #[test]
+    fn tui_arrows_step_through_recent_models() {
+        let _env = crate::test_support::env_lock();
+        let (old, dir) = seed_picker_history();
+        let cands = |arg: &str| crate::model_history::top_matching(arg, crate::model_history::TOP_N);
+        let buf = "/model".to_string();
+        let c = cands("");
+        let down = crate::model_history::pick_next(&buf, buf.len(), &c, false)
+            .expect("Down must pick the first recent");
+        assert_eq!(down, "/model a/new");
+        // Up from the head clamps (never wraps); Up from a partial prefix
+        // jumps to the last entry — the closed-list contract in `step_pick`.
+        let c2 = cands("a/new");
+        let up = crate::model_history::pick_next(&down, down.len(), &c2, true)
+            .expect("Up from the head stays on the head");
+        assert_eq!(up, "/model a/new");
+        let buf = "/model".to_string();
+        let last = crate::model_history::pick_next(&buf, buf.len(), &c, true)
+            .expect("Up from a bare prefix jumps to the last entry");
+        assert_eq!(last, "/model b/old");
+        // A prefix with no recent match picks nothing (history recall owns it).
+        let buf = "/model zzz".to_string();
+        assert_eq!(crate::model_history::pick_next(&buf, buf.len(), &cands("zzz"), false), None);
+        restore_picker_history(old, dir);
     }
 }
 

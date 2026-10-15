@@ -447,6 +447,81 @@ def scenario_fake_turn_midturn_carry():
         p.close()
     print("PASS fake turn: mid-turn draft + carry")
 
+def scenario_model_picker_digit():
+    """`/model` + a digit key selects the row labelled with that :N.
+
+    The reported bug: the modal picker lists `▸ :0  :1  :2  :3` but pressing a
+    digit did nothing, so the only way to reach a model was arrowing to it. This
+    drives the REAL binary through a pty: open the picker, press `2`, Enter, and
+    assert the switched model is the row labelled `:2` (the third model in
+    /models order: alpha/aaa, alpha/bbb, beta/ccc, beta/ddd -> :2 is beta/ccc).
+
+    A pure unit test pins the key map; this proves the dialog on the wire
+    actually responds to the digit and commits that row.
+    """
+    import json
+    wt, pi, base = fresh_dirs("mpick")
+    store = {
+        "providers": {
+            "alpha": {
+                "api": "openai-completions",
+                "baseUrl": "http://127.0.0.1:9/v1",
+                "apiKey": "k",
+                "models": [
+                    {"id": "aaa", "name": "AAA first", "context": 128000},
+                    {"id": "bbb", "name": "BBB second", "context": 128000},
+                ],
+            },
+            "beta": {
+                "api": "openai-completions",
+                "baseUrl": "http://127.0.0.1:9/v1",
+                "apiKey": "k",
+                "models": [
+                    {"id": "ccc", "name": "CCC third", "context": 128000},
+                    {"id": "ddd", "name": "DDD fourth", "context": 128000},
+                ],
+            },
+        }
+    }
+    # Replace the seeded catalog with ours (the fake provider is appended on top).
+    with open(os.path.join(pi, "agent", "models-store.json"), "w") as f:
+        json.dump(store, f)
+    # A bare `/model` lists the MRU history (most-recent first), so seed four
+    # entries — otherwise a fresh session shows a one-row picker and there is no
+    # `:2` to reach. The order here is the row order in the box.
+    now = int(time.time())
+    hist = [
+        {"label": "alpha/aaa", "last_used": now},
+        {"label": "alpha/bbb", "last_used": now - 1},
+        {"label": "beta/ccc", "last_used": now - 2},
+        {"label": "beta/ddd", "last_used": now - 3},
+    ]
+    with open(os.path.join(pi, "agent", "model-history.json"), "w") as f:
+        json.dump(hist, f)
+    env = {"PIR_FAKE_MODEL": "1"}
+    p = Puppet(wt, pi, extra_env=env, argv=[PIR, "-m", "alpha/aaa"])
+    p.start()
+    try:
+        # Idle readiness: the footer names the workspace, and rustyline only
+        # renders the ❯ prompt once a key has been pressed — so wait for the
+        # footer, not the glyph (the glyph reliably shows up after our Enter).
+        p.expect_clean("workspace:", timeout=30, what="repl footer")
+        p.sendline("/model")
+        # The picker box, with our models.
+        p.expect_clean("choose model", timeout=15, what="model picker box")
+        p.expect_clean("CCC third", timeout=5, what="the row we will jump to")
+        # THE BUG: pressing a digit. Pre-fix this did nothing, so the picker
+        # stayed on row 0 and Enter picked alpha/aaa — never beta/ccc.
+        p.send("2", pause=0.8)
+        p.send("\r", pause=1.0)
+        p.expect_clean("\u2192 beta/ccc", timeout=15, what="digit-selected switch")
+        # The shortcut must also be advertised, or it exists but is unfindable.
+        p.expect_clean("[0-9] jump to that :N", timeout=5, what="digit hint")
+        p.quit()
+    finally:
+        p.close()
+    print("PASS /model digit selects the row named by :N")
+
 def scenario_thinking_keeps_prompt():
     """Thinking phase must keep the prompt visible.
 
@@ -789,6 +864,8 @@ if __name__ == "__main__":
     if which in ("all", "zonerows"):
         scenario_midturn_zone_rows()
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
+    if which in ("all", "mpick"):
+        scenario_model_picker_digit()
     if which in ("all", "thinking"):
         scenario_thinking_keeps_prompt()
     which = sys.argv[1] if len(sys.argv) > 1 else "all"

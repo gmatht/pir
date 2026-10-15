@@ -40,6 +40,7 @@ mod types;
 mod user;
 mod activelist;
 mod modal;
+mod model_history;
 mod security;
 mod titler;
 mod wininfo;
@@ -405,10 +406,17 @@ AGENT SHELL
   keeps its predicates via the real find. Set PIR_RG_ALIASES=0 to disable.
 
 COMMANDS
-  /help  /menu  /model <sel>  /models  /default-model <sel>  /sessions  /goal [objective]  /continue
+  /help  /menu  /model  /models  /default-model <sel>  /sessions  /goal [objective]  /continue
                           /menu is an alternate-screen picker; its Settings and
                           Security items are EDITABLE (↑↓ move, ←→ change, enter
                           applies) and take effect immediately
+  /model                 while you type, the five most-recently-used models are
+                          listed one per line above the prompt: ↑/↓ move the
+                          highlight, enter (or pressing the row's number)
+                          switches, esc leaves it. `/model2` picks the second
+                          row directly. `/model <prefix>` narrows the list (a
+                          unique prefix switches straight to it); `/models`
+                          opens the full-catalog picker
   /thinking [<level>] [show|hide]   set the model's thinking level
                           (off|minimal|low|medium|high|xhigh|max) and/or toggle
                           whether streamed reasoning is displayed; no arg = status
@@ -485,20 +493,35 @@ COMMANDS
   /rebuild                cargo build + exec the fresh binary (unix)
   /reexec                 exec the current binary in place, same args (pick up a new build at $0; unix)
   /autoclean [on|off|status]   fix all errors/warnings/failing tests; with no arg
-                          run one cleanup pass now, `on`/`off` toggle cleaning
-                          automatically after every prompt
-                          Per-language: the cleanup list is derived from the
-                          tree (Cargo/CMake/meson/pyproject/package.json/go.mod
-                          or source files) and each language is analysed by
-                          WHICHEVER of its analysers are installed — clippy for
-                          Rust; for C/C++ any of scan-build (LLVM static
-                          analysis), clang-tidy, cppcheck, or the compiler's own
-                          -fanalyzer; ruff/pyflakes; eslint; go vet. Several may
-                          run together. A language with no analyser at all is
-                          reported and offered for install — it is never
-                          counted as clean. `pir lints` shows the plan.
+                           run one cleanup pass now, `on`/`off` toggle cleaning
+                           automatically after every prompt
+                           Per-language: the cleanup list is derived from the
+                           tree (Cargo/CMake/meson/pyproject/package.json/go.mod
+                           or source files) and each language is analysed by
+                           WHICHEVER of its analysers are installed — clippy for
+                           Rust; for C/C++ any of scan-build (LLVM static
+                           analysis), clang-tidy, cppcheck, or the compiler's own
+                           -fanalyzer; ruff/pyflakes; eslint; go vet. Several may
+                           run together. A language with no analyser at all is
+                           reported and offered for install — it is never
+                           counted as clean. `pir lints` shows the plan.
+                           Opt-in branch coverage: `/autoclean coverage` runs one
+                           pass with coverage, `coverage on|off|status` persists
+                           it (`--coverage` / `with-coverage` also work once,
+                           or toggle it in `/menu`).
+                           The agent then measures per-language branch coverage
+                           and writes tests toward 100% where possible.
   /create [name]           scaffold a new project (seeds from clipboard .md spec)
-  /login [provider]        store an API key for a provider in ~/.pi/agent/auth.json
+  /login [provider] [key] [model]
+                          store an API key for a provider in ~/.pi/agent/auth.json.
+                          One line does the whole job:
+                            /login provider key            save the key (no prompt)
+                            /login provider key model       save it AND switch to
+                                                           `model` (a bare id/name or
+                                                           a full provider/model
+                                                           selector)
+                          With no provider you pick from a list; with a provider
+                          but no key the key is prompted for with echo off.
   /logout [provider]       remove a stored provider credential from auth.json
   /l                      show desktop window titles + clipboard; guess the provider
                           from a window title and/or the key format, then pre-fill
@@ -768,7 +791,11 @@ fn main() {
                 // would use for this tree: which analysers are installed and
                 // will run, and which stronger ones are merely absent. Exists
                 // so the plan is inspectable (and testable on a real project)
-                // without spending an agent turn on it.
+                // without spending an agent turn on it. `pir lints --coverage`
+                // additionally shows the opt-in branch-coverage plan.
+                let want_cov = args
+                    .get(i + 1)
+                    .is_some_and(|s| s == "--coverage" || s == "coverage" || s == "--cover");
                 let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 let st = crate::lints::lint_status(&dir);
                 if st.is_empty() {
@@ -807,6 +834,46 @@ fn main() {
                             "ships with the toolchain".to_string()
                         };
                         println!("      missing:   {:<14} {}  ({})", t.tool, t.purpose, how);
+                    }
+                }
+                if want_cov {
+                    let cov = crate::lints::coverage_status(&dir);
+                    if cov.is_empty() {
+                        println!("no coverage target recognised in {}", dir.display());
+                    }
+                    for l in &cov.available {
+                        println!(
+                            "{}  coverage {}  (detected via {})",
+                            term::green("ok"),
+                            l.lang,
+                            l.detected_by
+                        );
+                        for t in &l.chosen {
+                            println!("      will run:  {:<14} {}", t.tool, t.purpose);
+                        }
+                        for t in l.extras.iter().filter(|t| t.needs_install()) {
+                            println!(
+                                "      upgrade:  {:<14} {}  ({})",
+                                t.tool, t.purpose, t.install
+                            );
+                        }
+                        println!("      $ {}", l.command());
+                    }
+                    for l in &cov.missing {
+                        println!(
+                            "{}  coverage {}  (detected via {}) — nothing installed",
+                            term::yellow("MISSING"),
+                            l.lang,
+                            l.detected_by
+                        );
+                        for t in &l.candidates {
+                            let how = if t.needs_install() {
+                                t.install.to_string()
+                            } else {
+                                "ships with the toolchain".to_string()
+                            };
+                            println!("      missing:   {:<14} {}  ({})", t.tool, t.purpose, how);
+                        }
                     }
                 }
                 return;
@@ -1179,10 +1246,29 @@ fn main() {
     // If `-r`/`--resume` was given (with or without a token), resolve which
     // session to resume. With no token we default to the latest session that
     // came from the same shell (bash) that launched this pir.
+    //
+    // A bare `pir` with no token at all, running inside zellij, first checks
+    // the pane's own title: a pane resurrected by plain `zellij attach`
+    // restarts as bare `pir` (the layout's `command="pir"` carries no resume
+    // token), but its title still names the transcript it held
+    // (`pir:<stem>`, claimed by `zellij::claim_pane_title` and persisted by
+    // zellij in the layout's `name=`). Resuming that is what brings the pane
+    // back to its conversation instead of a fresh session. Explicit flags and
+    // positional prompts always win over the title, and this only fires when
+    // stdin is a terminal — a piped/scripted `pir` must never silently pick up
+    // someone else's conversation.
     let resume = if resume_token.is_some() || continue_mode
         || std::env::args().skip(1).any(|a| a == "-r" || a == "--resume" || a == "--session")
     {
         resolve_resume(resume_token.as_deref())
+    } else if prompt.is_empty() && bg_prompt.is_none() && std::io::stdin().is_terminal() {
+        match crate::zellij::resurrect_from_own_title() {
+            Some(log) => {
+                eprintln!("{}", term::dim(&format!("resuming {} (from this pane's title)", log.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default())));
+                Some(log)
+            }
+            None => None,
+        }
     } else {
         None
     };
@@ -1216,6 +1302,9 @@ fn main() {
         Ok(a) => a,
         Err(e) => die(&e),
     };
+    // The session model counts as used (it is what every turn runs on),
+    // seeding `/model` history from the very first launch.
+    note_model_used(&provider, &model);
     // Apply output format (--output-format json for headless/CI use).
     agent.set_output_format(output_format);
     // In JSON mode, suppress terminal colors and the spinner so NDJSON
@@ -1325,6 +1414,7 @@ fn main() {
         let mut jobs = BackgroundJobs::new();
         let provider = provider.clone();
         let model = model.clone();
+        note_model_used(&provider, &model);
         let bcancel = Arc::new(AtomicBool::new(false));
         jobs.spawn(prompt, agent.log_path.clone().unwrap_or_default(), {
             let bus = bus.clone();
@@ -1678,7 +1768,11 @@ fn main() {
                     if run_clean {
                         if let Ok(mut g) = typeahead.lock() { g.clear(); }
                         cleanup_running = true;
-                        println!("{} autoclean: fixing all errors/warnings/failing tests", term::bold("·"));
+                        if autoclean_wants_coverage() {
+                            println!("{} autoclean: fixing all errors/warnings/failing tests + branch coverage", term::bold("·"));
+                        } else {
+                            println!("{} autoclean: fixing all errors/warnings/failing tests", term::bold("·"));
+                        }
                         report_lint_plan();
                         fg_handle = Some(run_foreground_turn(
                             &agent_slot,
@@ -2048,6 +2142,10 @@ fn main() {
             let g = agent_slot.lock().unwrap();
             g.as_ref().map(|a| a.label()).unwrap_or_default()
         };
+        // Keep the live `/model` preview's `•current` marker in step with the
+        // footer: both read this same label, so the row marked in the list and
+        // the model named at the bottom cannot disagree.
+        term::set_model_preview_current(&model);
         // Boxed input zone: top hrule, then the prompt with the cursor on it;
         // the persistent footer below is the bottom border (redrawn after).
         term::open_input_zone();
@@ -2071,6 +2169,26 @@ fn main() {
         // line. Ringing here fires exactly once per return to the prompt.
         bus.waiting_for_input();
         let res = term::read_line("❯ ");
+        // The live `/model` list keeps its highlight *outside* the buffer (the
+        // draft stays exactly what was typed), so an Enter that followed a
+        // highlight must be resolved here: rewrite the line to the model the
+        // highlight names. Taken (not read) so a highlight can only ever apply
+        // to the Enter right after it. A bare `/model` becomes `/modelN` (the
+        // row number, the same form the operator could have typed); a prefixed
+        // line names the label directly.
+        let res = res.map(|s| {
+            let trimmed = s.trim().to_string();
+            if crate::model_history::parse_model_line(&trimmed).is_none() {
+                return s;
+            }
+            match term::take_model_preview_selection() {
+                Some((n, _label)) if trimmed == "/model" || trimmed == "/m" => {
+                    format!("/model{n}")
+                }
+                Some((_, label)) => format!("/model {label}"),
+                None => s,
+            }
+        });
         // Ctrl-C cleared the line, but rustyline's relative-row redraw can
         // leave the tail of the inline hint behind when the cursor drifted
         // off its bookkeeping; wipe the idle zone absolutely so nothing from
@@ -2169,7 +2287,11 @@ fn main() {
             if let Ok(mut g) = typeahead.lock() { g.clear(); }
             fg_quiet.store(false, Ordering::SeqCst);
             cleanup_running = true;
-            println!("{} autoclean: fixing all errors/warnings/failing tests", term::bold("·"));
+            if autoclean_wants_coverage() {
+                println!("{} autoclean: fixing all errors/warnings/failing tests + branch coverage", term::bold("·"));
+            } else {
+                println!("{} autoclean: fixing all errors/warnings/failing tests", term::bold("·"));
+            }
             report_lint_plan();
             hist_recall.reset();
             fg_handle = Some(run_foreground_turn(
@@ -2386,6 +2508,22 @@ fn spawn_reexec_broadcast_watcher(
 static AUTOCLEAN_ENABLED: AtomicBool = AtomicBool::new(false);
 /// One-shot request (set by a bare `/autoclean`) to run a cleanup turn immediately.
 static AUTOCLEAN_RUN_ONCE: AtomicBool = AtomicBool::new(false);
+/// Persistent opt-in: also drive branch coverage to 100% where possible during
+/// autoclean passes. Flipped by `/autoclean coverage on|off`. Off by default —
+/// coverage is slower than lint+test and Rust `--branch` needs nightly, so it
+/// stays opt-in rather than changing every existing pass.
+static AUTOCLEAN_COVERAGE: AtomicBool = AtomicBool::new(false);
+/// One-shot coverage request (set by `/autoclean coverage` / `with-coverage` /
+/// `--coverage`): the next cleanup turn measures branch coverage even when the
+/// persistent flag is off. Consumed when the prompt is built.
+static AUTOCLEAN_COVERAGE_ONCE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the next cleanup turn should measure branch coverage: the
+/// persistent opt-in, or a queued one-shot request. Non-consuming, so both the
+/// pre-turn report and the prompt itself can consult it.
+fn autoclean_wants_coverage() -> bool {
+    AUTOCLEAN_COVERAGE.load(Ordering::SeqCst) || AUTOCLEAN_COVERAGE_ONCE.load(Ordering::SeqCst)
+}
 
 /// Prompt that drives the agent to fix every compiler error, every warning, every
 /// static-analysis finding, and every failing test, then re-run and repeat until
@@ -2398,9 +2536,16 @@ static AUTOCLEAN_RUN_ONCE: AtomicBool = AtomicBool::new(false);
 /// installed is reported as a warning *with an offer to install it* rather than
 /// being quietly skipped, so "nothing to fix" can never mean "nothing was
 /// checked".
+///
+/// When branch coverage was opted in (`/autoclean coverage …`), the prompt
+/// gains a second section driving coverage to 100% where possible.
 fn autoclean_prompt() -> String {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    crate::lints::autoclean_prompt(&cwd)
+    // Consume the one-shot flag at prompt-build time so exactly one pass gets
+    // coverage; the persistent flag is untouched.
+    let once = AUTOCLEAN_COVERAGE_ONCE.swap(false, Ordering::SeqCst);
+    let with_coverage = AUTOCLEAN_COVERAGE.load(Ordering::SeqCst) || once;
+    crate::lints::autoclean_prompt(&cwd, with_coverage)
 }
 
 /// Tell the operator, *before* the cleanup turn starts, which linters will run
@@ -2458,6 +2603,67 @@ fn report_lint_plan() {
             .join(", or ");
         println!(
             "{} autoclean: {} has NO analyser installed — its code will NOT be analysed. \
+Install one: {}",
+            term::yellow("!"),
+            l.lang,
+            if opts.is_empty() {
+                l.candidates.iter().map(|t| t.tool).collect::<Vec<_>>().join(" / ")
+            } else {
+                opts
+            },
+        );
+    }
+    if autoclean_wants_coverage() {
+        report_coverage_plan();
+    }
+}
+
+/// Tell the operator which branch-coverage tools will run and which are
+/// missing. Only called when coverage was opted in; mirrors [`report_lint_plan`].
+fn report_coverage_plan() {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let st = crate::lints::coverage_status(&cwd);
+    if st.is_empty() {
+        return;
+    }
+    for l in &st.available {
+        let chosen = l
+            .chosen
+            .iter()
+            .map(|t| t.tool)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let extra = if l.extras.iter().any(|t| t.needs_install()) {
+            format!(
+                "  (also applicable, not installed: {})",
+                l.extras
+                    .iter()
+                    .filter(|t| t.needs_install())
+                    .map(|t| t.tool)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else {
+            String::new()
+        };
+        println!(
+            "{} autoclean coverage: {} — measuring with {}{}",
+            term::bold("·"),
+            l.lang,
+            chosen,
+            extra,
+        );
+    }
+    for l in &st.missing {
+        let opts = l
+            .candidates
+            .iter()
+            .filter(|t| t.needs_install())
+            .map(|t| format!("{} ({})", t.tool, t.install))
+            .collect::<Vec<_>>()
+            .join(", or ");
+        println!(
+            "{} autoclean coverage: {} has NO coverage tool installed — its branches will NOT be measured. \
 Install one: {}",
             term::yellow("!"),
             l.lang,
@@ -2727,6 +2933,131 @@ fn menu_session_rows() -> Vec<(modal::SessionRow, PathBuf)> {
         .collect()
 }
 
+/// Record a model use in the MRU history (best-effort; see
+/// [`crate::model_history`]). Called after every successful switch and once
+/// for the startup model, so `/model` offers what this operator actually
+/// reaches for.
+fn note_model_used(p: &Provider, m: &Model) {
+    crate::model_history::record(&p.pid(), &m.id);
+}
+
+/// Build an owned provider list containing only `labels` (exact
+/// `provider/model` labels, in order) for the MRU picker. Entries that no
+/// longer resolve against the catalog (removed models) are skipped silently.
+/// One single-model clone per label keeps the picker's flat index a trivial
+/// range, preserves strict recency order, and leaves its per-row provider
+/// column unchanged.
+fn providers_for_labels(providers: &[Provider], labels: &[String]) -> Vec<Provider> {
+    let mut out = Vec::new();
+    for label in labels {
+        let Ok((p, m)) = crate::config::select(providers, label) else { continue };
+        let mut owned = p.clone();
+        owned.models = vec![m.clone()];
+        out.push(owned);
+    }
+    out
+}
+
+/// Resolve a `provider/model` label against the catalog, switch the live agent
+/// to it, and report it. Shared by every `/model` route — the `:N`/number path,
+/// the prefix short-circuits, the inline top-five list and the full picker —
+/// so all four agree on what a switch does (including the session-only
+/// persistence note and the default-model hint). A busy agent — mid-turn, so
+/// the slot is taken by the worker — is reported instead of panicking.
+fn switch_model(
+    agent_slot: &AgentSlot,
+    providers: &[Provider],
+    current_ctx: &Arc<Mutex<(Provider, Model, bool)>>,
+    label: &str,
+) {
+    let mut g = agent_slot.lock().unwrap();
+    let Some(agent) = g.as_mut() else {
+        eprintln!("pir: agent busy (turn running) — try again when idle");
+        return;
+    };
+    match config::select(providers, label) {
+        Ok((p, m)) => match agent.switch(p.clone(), m.clone()) {
+            Ok(()) => {
+                // Keep the shared background-job context in sync so any `/bg`
+                // or `&` fired afterwards uses the new model.
+                if let Ok(mut ctx) = current_ctx.lock() {
+                    ctx.0 = p.clone();
+                    ctx.1 = m.clone();
+                }
+                note_model_used(p, m);
+                println!("→ {}", agent.label());
+                println!("{} (saved for this session; restored on resume)", term::dim("·"));
+                println!(
+                    "{}",
+                    term::dim(&format!(
+                        "to use this by default in new sessions, add to {}:\n  {{ \"defaultModel\": \"{}\" }}",
+                        config::pi_dir().join("agent").join("settings.json").display(),
+                        agent.label()
+                    ))
+                );
+            }
+            Err(e) => eprintln!("{e}"),
+        },
+        Err(e) => eprintln!("{e}"),
+    }
+}
+
+/// Split the arguments of `/login` into `(provider, key?, model?)`.
+///
+/// The one-line forms are:
+///
+/// ```text
+/// /login PROVIDER KEY          -> (PROVIDER, Some(KEY), None)
+/// /login PROVIDER KEY MODEL    -> (PROVIDER, Some(KEY), Some(MODEL))
+/// /login PROVIDER              -> (PROVIDER, None, None)   [key is prompted]
+/// ```
+///
+/// `rest` is the command's whitespace-split arguments (so `KEY` may not itself
+/// contain a space — that case keeps the prompt). The model is `rest[2..]`
+/// joined back together so a selector that was quoted on the far side still
+/// arrives as one string. A missing key yields `None`, never an empty string,
+/// so the caller can tell "not supplied" from "supplied empty" — the latter is
+/// rejected by the empty-key guard, the former falls through to the prompt.
+fn parse_login_args(rest: &[&str]) -> (String, Option<String>, Option<String>) {
+    let provider = rest.first().map(|s| s.trim().to_string()).unwrap_or_default();
+    let key = rest
+        .get(1)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let model = rest
+        .get(2..)
+        .map(|m| m.join(" "))
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+    (provider, key, model)
+}
+
+/// Resolve the model named by `/login PROVIDER KEY MODEL`.
+///
+/// `config::select` already understands `provider/model`, a bare model id, a
+/// display name, a partial label and `:N`. It is tried on the selector as typed
+/// first, so an explicit `alpha/other-model` label is honoured exactly as
+/// written. Only if that fails *and* the selector contains a `/` is it retried
+/// scoped to the provider being logged into — which is what makes a prefix like
+/// `betaprov/beta` resolve instead of erroring.
+fn resolve_login_model(
+    providers: &[Provider],
+    provider_id: &str,
+    selector: &str,
+) -> Result<(Provider, Model), String> {
+    if let Ok((p, m)) = config::select(providers, selector) {
+        return Ok((p.clone(), m.clone()));
+    }
+    if selector.contains('/') {
+        return config::select(providers, &format!("{provider_id}/{selector}"))
+            .map(|(p, m)| (p.clone(), m.clone()));
+    }
+    Err(format!(
+        "no model matches '{selector}' for provider '{provider_id}' — try a model id, \
+         a provider/model label, or `:N` from `/models`"
+    ))
+}
+
 /// Handle a slash command. `agent_slot` holds the interactive agent behind an
 /// `Option` so a running foreground turn can own it on its worker thread;
 /// commands that need the agent take it only briefly. `jobs` surfaces
@@ -2989,6 +3320,7 @@ fn handle_command(
                                         ctx.0 = p2.clone();
                                         ctx.1 = m2.clone();
                                     }
+                                    note_model_used(&p2, &m2);
                                     println!("→ {}", agent.label());
                                 }
                                 Err(e) => eprintln!("{e}"),
@@ -3006,6 +3338,22 @@ fn handle_command(
                             p.display()
                         ),
                         Err(e) => eprintln!("pir: could not persist worktree setting: {e}"),
+                    }
+                }
+                Some(MenuAction::AutocleanCoverage) => {
+                    // Toggle the persistent branch-coverage opt-in — the same
+                    // flag `/autoclean coverage on|off` flips. Turning it on
+                    // also shows which coverage tools will run, mirroring the
+                    // pre-turn report; turning it off drops a queued one-shot
+                    // too, so off means off.
+                    let on = !AUTOCLEAN_COVERAGE.load(Ordering::SeqCst);
+                    AUTOCLEAN_COVERAGE.store(on, Ordering::SeqCst);
+                    if on {
+                        println!("{} autoclean coverage ON — passes will drive branch coverage toward 100% where possible", term::green("·"));
+                        report_coverage_plan();
+                    } else {
+                        AUTOCLEAN_COVERAGE_ONCE.store(false, Ordering::SeqCst);
+                        println!("{} autoclean coverage OFF", term::yellow("·"));
                     }
                 }
                 Some(action @ (MenuAction::Resume | MenuAction::BackgroundSessions)) => {
@@ -3045,86 +3393,90 @@ fn handle_command(
                 }
             }
         }
+        // `/model<N>` / `/m<N>`: pick the Nth of the top-N recent list directly
+        // (e.g. `/model2` = the second). Handled before the `"m" | "model"` arm
+        // because the command word here is the whole token (`model2`), not a
+        // prefix-bearing command. Out-of-range numbers fall through to the list
+        // (with an explanatory note) rather than switching to nothing.
+        _ if crate::model_history::parse_number(cmd).is_some() => {
+            let n = crate::model_history::parse_number(cmd).unwrap();
+            let labels = crate::model_history::top_matching("", crate::model_history::TOP_N);
+            let Some(label) = labels.get(n - 1) else {
+                eprintln!(
+                    "pir: /model{n} — only {} recent model(s) to choose from; run /model to see them",
+                    labels.len()
+                );
+                return;
+            };
+            switch_model(agent_slot, providers, current_ctx, label);
+        }
         "m" | "model" => {
-            if rest.is_empty() {
-                // No argument: open the interactive model picker (arrow keys /
-                // hotkeys; Enter picks). Esc cancels.
+            let query = rest.join(" ");
+            // MRU candidates: the whole history when bare, prefix-filtered
+            // otherwise (`/model mu` finds recent `…/muse-…`).
+            let mru = crate::model_history::top_matching(&query, crate::model_history::TOP_N);
+            if !query.is_empty() && mru.is_empty() {
+                // No recent model matches: legacy fuzzy/exact select path,
+                // unchanged — then record the switch like every other path.
+                switch_model(agent_slot, providers, current_ctx, &query);
+            } else if let Some(label) = crate::model_history::sole_match(&query) {
+                // Exactly one recent model matches the typed prefix, so the
+                // choice is already made: switch straight to it rather than
+                // listing one. Blank prefixes always browse (a bare `/model` is
+                // a browse, not a selection).
+                switch_model(agent_slot, providers, current_ctx, &label);
+            } else if query.is_empty() && !mru.is_empty() {
+                // Bare `/model` with history: the top five, one per line, in
+                // the normal scrollback. Up/Down move the highlight, Enter (or
+                // pressing the row's number) switches; Esc leaves the model
+                // alone. This is the "both" shape the operator asked for: the
+                // inline list is the browse, `/models` keeps the full-catalog
+                // alternate-screen picker.
+                let current = {
+                    let g = agent_slot.lock().unwrap();
+                    g.as_ref().map(|a| a.label()).unwrap_or_default()
+                };
+                println!(
+                    "{}",
+                    term::dim(&format!("· recent models (top {} by use)", mru.len()))
+                );
+                if let Some(idx) = modal::model_list_picker(&mru, &current) {
+                    switch_model(agent_slot, providers, current_ctx, &mru[idx]);
+                }
+            } else {
+                // A prefix that matches several recent models — or a bare
+                // `/model` with no history yet, where there is nothing to
+                // browse. Both keep the full picker over the MRU hits (or the
+                // whole catalog when the list is empty, e.g. on a first run).
+                let owned = providers_for_labels(providers, &mru);
+                let pick: &[Provider] = if owned.is_empty() { providers } else { &owned };
+                if !owned.is_empty() {
+                    println!(
+                        "{}",
+                        term::dim(&if query.is_empty() {
+                            format!("· recent models (top {} by use)", owned.len())
+                        } else {
+                            format!("· recent models starting with {query:?} ({})", owned.len())
+                        })
+                    );
+                }
+                // Interactive model picker (arrow keys / hotkeys; Enter picks).
                 let current_label = {
                     let g = agent_slot.lock().unwrap();
                     g.as_ref().map(|a| a.label()).unwrap_or_default()
                 };
-                match modal::model_picker(providers, &current_label) {
+                match modal::model_picker(pick, &current_label) {
                     None => {}
                     Some(idx) => {
-                        let flat: Vec<(&Provider, &Model)> = providers
+                        let flat: Vec<(&Provider, &Model)> = pick
                             .iter()
                             .flat_map(|p| p.models.iter().map(move |m| (p, m)))
                             .collect();
                         let Some((p, m)) = flat.get(idx) else { return };
-                        let p2 = (*p).clone();
-                        let m2 = (*m).clone();
-                        let mut g = agent_slot.lock().unwrap();
-                        let Some(agent) = g.as_mut() else {
-                            eprintln!("pir: agent busy (turn running) — try again when idle");
-                            return;
-                        };
-                        match agent.switch(p2.clone(), m2.clone()) {
-                            Ok(()) => {
-                                // Keep the shared background-job context in sync so
-                                // any `/bg` or `&` fired afterwards uses the new model.
-                                if let Ok(mut ctx) = current_ctx.lock() {
-                                    ctx.0 = p2.clone();
-                                    ctx.1 = m2.clone();
-                                }
-                                println!("→ {}", agent.label());
-                                println!(
-                                    "{} (saved for this session; restored on resume)",
-                                    term::dim("·")
-                                );
-                                println!(
-                                    "{}",
-                                    term::dim(&format!(
-                                        "to use this by default in new sessions, add to {}:\n  {{ \"defaultModel\": \"{}\" }}",
-                                        config::pi_dir().join("agent").join("settings.json").display(),
-                                        agent.label()
-                                    ))
-                                );
-                            }
-                            Err(e) => eprintln!("{e}"),
-                        }
+                        switch_model(agent_slot, providers, current_ctx, &p.label(m));
                     }
                 }
-                return;
             }
-            let mut g = agent_slot.lock().unwrap();
-            let Some(agent) = g.as_mut() else {
-                eprintln!("pir: agent busy (turn running) — try again when idle");
-                return;
-            };
-            match config::select(providers, &rest.join(" ")) {
-                    Ok((p, m)) => match agent.switch(p.clone(), m.clone()) {
-                        Ok(()) => {
-                            // Keep the shared background-job context in sync so
-                            // any `/bg` or `&` fired afterwards uses the new model.
-                            if let Ok(mut ctx) = current_ctx.lock() {
-                                ctx.0 = p.clone();
-                                ctx.1 = m.clone();
-                            }
-                            println!("→ {}", agent.label());
-                            println!("{} (saved for this session; restored on resume)", term::dim("·"));
-                            println!(
-                                "{}",
-                                term::dim(&format!(
-                                    "to use this by default in new sessions, add to {}:\n  {{ \"defaultModel\": \"{}\" }}",
-                                    config::pi_dir().join("agent").join("settings.json").display(),
-                                    agent.label()
-                                ))
-                            );
-                        }
-                        Err(e) => eprintln!("{e}"),
-                    },
-                    Err(e) => eprintln!("{e}"),
-                }
         }
         "model*" | "model-all" => {
             // Broadcast a model switch to *every* running pir instance for this
@@ -3153,6 +3505,7 @@ fn handle_command(
                                     ctx.0 = p.clone();
                                     ctx.1 = m.clone();
                                 }
+                                note_model_used(p, m);
                                 println!("→ {} (this instance)", agent.label());
                             }
                             Err(e) => eprintln!("{e}"),
@@ -3273,23 +3626,42 @@ fn handle_command(
         }
         "login" => {
             // Store an API key for a provider in ~/.pi/agent/auth.json (pi's
-            // `/login`, minus the OAuth/subscription flows). With an argument we
-            // use it as the provider id; with none we list the known providers
-            // (from the catalog) plus any already-stored ones and let the user
-            // pick one. On success the key is saved and — if that provider is
-            // already in the live model catalog — the agent switches to its
-            // first model so the credential is live immediately. Environment
-            // variables (`{env:VAR}` in models-store.json) take precedence over stored
-            // keys, exactly as at startup.
+            // `/login`, minus the OAuth/subscription flows).
+            //
+            // Three shapes, one line each:
+            //   /login                      list known providers, prompt for one,
+            //                               then prompt for the key (hidden)
+            //   /login PROVIDER KEY         store the key non-interactively — the
+            //                               shape `/l` pre-fills, so its
+            //                               suggestion can be submitted as-is
+            //   /login PROVIDER KEY MODEL   also switch to MODEL, so a fresh key
+            //                               is usable in the same line instead of
+            //                               always landing on the provider's
+            //                               first model
+            //
+            // The key is positional (not prompted) whenever it is given, so the
+            // whole flow works from a single pasted line. `rest` is split on
+            // whitespace by `handle_command`, so a key containing spaces cannot
+            // be expressed inline — that is what the interactive prompt is for.
+            // On success the key is saved and — if that provider is already in
+            // the live model catalog — the agent switches to the requested model
+            // (or the provider's first) so the credential is live immediately.
+            // Environment variables (`{env:VAR}` in models-store.json) take
+            // precedence over stored keys, exactly as at startup.
             if fg_running {
                 eprintln!("pir: a turn is running — finish or /cancel it first, then /login");
                 return;
             }
-            let provider_id = match rest.first().copied() {
-                Some(id) => id.trim().to_string(),
+            // `rest[1]` is the key, `rest[2..]` an optional model selector
+            // (joined so a selector may be quoted/multi-token upstream). The
+            // pure splitting lives in `parse_login_args` so it is unit-tested —
+            // mis-slicing here would either drop a model or silently treat one
+            // as the key.
+            let (provider_id, inline_key, requested_model) = match rest.first() {
+                Some(_) => parse_login_args(&rest),
                 None => {
                     if providers.is_empty() {
-                        term::read_answer("provider id: ")
+                        (term::read_answer("provider id: "), None, None)
                     } else {
                         println!("{}", term::bold("providers (from your model catalog):"));
                         for p in providers.iter() {
@@ -3300,7 +3672,7 @@ fn handle_command(
                                 println!("  - {}  {}", id, term::dim("(stored, not in catalog)"));
                             }
                         }
-                        term::read_answer("provider id: ")
+                        (term::read_answer("provider id: "), None, None)
                     }
                 }
             };
@@ -3308,7 +3680,13 @@ fn handle_command(
             if provider_id.is_empty() {
                 return;
             }
-            let key = term::read_secret(&format!("API key for {provider_id}: "));
+            // With an inline key we never prompt — that is the whole point of
+            // the one-line form. Otherwise read it with echo off as before.
+            // `parse_login_args` never yields `Some("")`, so no `Some(k) if …`.
+            let key = match inline_key {
+                Some(k) => k,
+                None => term::read_secret(&format!("API key for {provider_id}: ")),
+            };
             if key.is_empty() {
                 eprintln!("pir: empty key — nothing saved");
                 return;
@@ -3327,10 +3705,11 @@ fn handle_command(
                     return;
                 }
             }
-            // If the provider is in the live catalog, switch to its first model
-            // so the credential is usable immediately. Re-resolve the provider
-            // list (it now includes the freshly stored key) so a provider that
-            // was only present via a stored key works without a restart.
+            // If the provider is in the live catalog, switch to the requested
+            // model — or its first — so the credential is usable immediately.
+            // Re-resolve the provider list (it now includes the freshly stored
+            // key) so a provider that was only present via a stored key works
+            // without a restart.
             if let Ok(fresh) = config::load_providers()
                 && !fresh.is_empty() {
                     *providers = fresh;
@@ -3340,21 +3719,43 @@ fn handle_command(
                     // exists) would otherwise stay uncompletable until restart.
                     term::set_model_providers(providers);
                 }
-            if let Some(p) = providers.iter().find(|p| p.pid().eq_ignore_ascii_case(&provider_id))
-                && !p.models.is_empty() {
-                    let mut g = agent_slot.lock().unwrap();
-                    let Some(agent) = g.as_mut() else {
-                        println!("{} key saved; it will be available after reload", term::dim("·"));
+            // Resolve what to switch to. An explicit selector is matched against
+            // the refreshed catalog; with none we fall back to the provider's
+            // own first model (the pre-existing behaviour).
+            let target: Option<(Provider, Model)> = match &requested_model {
+                Some(sel) => match resolve_login_model(providers, &provider_id, sel) {
+                    Ok(pair) => Some(pair),
+                    Err(e) => {
+                        eprintln!("pir: key saved, but {e}");
                         return;
-                    };
-                    if agent.switch(p.clone(), p.models[0].clone()).is_ok() {
-                        if let Ok(mut ctx) = current_ctx.lock() {
-                            ctx.0 = p.clone();
-                            ctx.1 = p.models[0].clone();
-                        }
-                        println!("→ switched to {}", agent.label());
                     }
+                },
+                None => providers
+                    .iter()
+                    .find(|p| p.pid().eq_ignore_ascii_case(&provider_id))
+                    .filter(|p| !p.models.is_empty())
+                    .map(|p| (p.clone(), p.models[0].clone())),
+            };
+            if let Some((p, m)) = target {
+                let mut g = agent_slot.lock().unwrap();
+                let Some(agent) = g.as_mut() else {
+                    println!("{} key saved; it will be available after reload", term::dim("·"));
+                    return;
+                };
+                if agent.switch(p.clone(), m.clone()).is_ok() {
+                    if let Ok(mut ctx) = current_ctx.lock() {
+                        ctx.0 = p.clone();
+                        ctx.1 = m.clone();
+                    }
+                    note_model_used(&p, &m);
+                    println!("→ switched to {}", agent.label());
                 }
+            } else if requested_model.is_some() {
+                // No selector error was printed above, so the only way here is
+                // that the provider itself is absent from the catalog — say so
+                // rather than silently saving the key and doing nothing.
+                eprintln!("pir: key saved, but provider '{provider_id}' is not in the model catalog");
+            }
         }
         "logout" => {
             // Remove a stored credential from ~/.pi/agent/auth.json (pi's
@@ -3850,30 +4251,61 @@ fn handle_command(
             // after every subsequent prompt (and runs one pass immediately);
             // `/autoclean off` disables that. The flag is a process-global static,
             // so it applies for the rest of this interactive session.
+            //
+            // Opt-in branch coverage: `/autoclean coverage` queues one pass with
+            // coverage measured (toward 100% where possible) without flipping the
+            // persistent flag; `/autoclean coverage on|off|status` persists it.
+            // `with-coverage` and `--coverage` are one-shot aliases.
             let arg = rest.first().copied().unwrap_or("");
-            match arg {
-                "" => {
+            let sub = rest.get(1).copied().unwrap_or("");
+            match (arg, sub) {
+                ("", "") => {
                     AUTOCLEAN_RUN_ONCE.store(true, Ordering::SeqCst);
                     println!("{} queuing an autoclean pass after this prompt", term::dim("·"));
                     report_lint_plan();
                 }
-                "on" | "enable" | "1" => {
+                ("coverage", "") | ("with-coverage", _) | ("--coverage", _) | ("full", _) => {
+                    AUTOCLEAN_COVERAGE_ONCE.store(true, Ordering::SeqCst);
+                    AUTOCLEAN_RUN_ONCE.store(true, Ordering::SeqCst);
+                    println!("{} queuing an autoclean pass with branch coverage after this prompt", term::dim("·"));
+                    report_lint_plan();
+                }
+                ("coverage", "on") | ("coverage", "enable") | ("coverage", "1") => {
+                    AUTOCLEAN_COVERAGE.store(true, Ordering::SeqCst);
+                    AUTOCLEAN_RUN_ONCE.store(true, Ordering::SeqCst);
+                    println!("{} autoclean coverage ON — passes will drive branch coverage toward 100% where possible", term::green("·"));
+                    report_lint_plan();
+                }
+                ("coverage", "off") | ("coverage", "disable") | ("coverage", "0") => {
+                    AUTOCLEAN_COVERAGE.store(false, Ordering::SeqCst);
+                    AUTOCLEAN_COVERAGE_ONCE.store(false, Ordering::SeqCst);
+                    println!("{} autoclean coverage OFF", term::yellow("·"));
+                }
+                ("coverage", "status") | ("coverage", "state") => {
+                    println!(
+                        "{} autoclean coverage is {}",
+                        term::dim("·"),
+                        if autoclean_wants_coverage() { term::green("ON") } else { term::yellow("OFF") }
+                    );
+                }
+                ("on", _) | ("enable", _) | ("1", _) => {
                     AUTOCLEAN_ENABLED.store(true, Ordering::SeqCst);
                     AUTOCLEAN_RUN_ONCE.store(true, Ordering::SeqCst);
                     println!("{} autoclean ON — will fix all errors/warnings/failing tests after every prompt", term::green("·"));
                 }
-                "off" | "disable" | "0" => {
+                ("off", _) | ("disable", _) | ("0", _) => {
                     AUTOCLEAN_ENABLED.store(false, Ordering::SeqCst);
                     println!("{} autoclean OFF", term::yellow("·"));
                 }
-                "status" | "state" => {
+                ("status", _) | ("state", _) => {
                     println!(
-                        "{} autoclean is {}",
+                        "{} autoclean is {} (coverage {})",
                         term::dim("·"),
-                        if AUTOCLEAN_ENABLED.load(Ordering::SeqCst) { term::green("ON") } else { term::yellow("OFF") }
+                        if AUTOCLEAN_ENABLED.load(Ordering::SeqCst) { term::green("ON") } else { term::yellow("OFF") },
+                        if autoclean_wants_coverage() { term::green("ON") } else { term::yellow("OFF") },
                     );
                 }
-                _other => eprintln!("usage: /autoclean [on|off|status]   (no arg = run one cleanup pass now)"),
+                _other => eprintln!("usage: /autoclean [on|off|status] [coverage [on|off|status]]   (no arg = run one cleanup pass now; `coverage` = one pass with branch coverage)"),
             }
         }
         "reload" => {
@@ -4671,14 +5103,27 @@ fn list_sessions() -> String {
             _ => format!("[{}]", s.shell_pid),
         };
         let tag_s = if from_here { term::cyan(&tag) } else { term::dim(&tag).to_string() };
+        // The session's directory (last two components): sibling panes on one
+        // terminal are otherwise indistinguishable in this list.
+        let dir = if s.cwd.is_empty() {
+            String::new()
+        } else {
+            let parts: Vec<&str> = s.cwd.split('/').filter(|p| !p.is_empty()).collect();
+            match parts.as_slice() {
+                [] => String::new(),
+                [a] => format!(" {a}"),
+                [.., a, b] => format!(" {a}/{b}"),
+            }
+        };
         let empty = if s.bytes == 0 { term::dim(" (empty)") } else { String::new() };
         let line = format!(
-            "  {} {:>2}  {}  {}  {}{}",
+            "  {} {:>2}  {}  {}  {}{}{}",
             marker,
             idx,
             term::dim(&name),
             tag_s,
             term::dim(&truncate(&s.preview, 60)),
+            term::dim(&dir),
             empty,
         );
         out.push_str(&line);
@@ -4692,10 +5137,11 @@ fn list_sessions() -> String {
 
 /// Find the session file for a `-r` token: an index from the listing, a
 /// fragment of the timestamp, or a fragment of the first-line preview.
-/// With no token, default to the latest session from this shell (bash).
+/// With no token, default to the latest session from this directory/shell
+/// (cwd match first, then shell match).
 ///
-/// When there is no session from this shell (and no explicit token), instead of
-/// the old line-prompt we launch the interactive arrow-key picker (`picker::
+/// When nothing matches this directory/shell (and no explicit token), instead
+/// of the old line-prompt we launch the interactive arrow-key picker (`picker::
 /// pick_session`): a full-screen two-pane UI that lists every session for this
 /// project (newest first) and shows a live preview of the highlighted session's
 /// first/last prompts and the tail of its last thinking + response. Enter /
@@ -4891,11 +5337,13 @@ fn resolve_resume(token: Option<&str>) -> Option<PathBuf> {
                 eprintln!("pir: no session matches '{token:?}'");
                 return None;
             }
-            // No session from this shell. Don't dead-end: offer the interactive
-            // picker over every session in this project (they may be from a
-            // different shell/terminal), with a live preview. The picker drives
+            // No session matched this directory/shell. Don't dead-end, and
+            // don't silently open the newest unrelated session either (that is
+            // how a bare `pir -r` cross-resumed a different checkout's session
+            // from a sibling multiplexer pane): offer the interactive picker
+            // over every session, with a live preview. The picker drives
             // stdin in raw mode and restores it on exit.
-            eprintln!("pir: no session from this shell yet — pick one to resume:");
+            eprintln!("pir: no session from this directory/shell yet — pick one to resume:");
             if std::io::stdin().is_terminal() {
                 let my_pid = term::parent_shell_pid();
                 let my_tty = term::parent_shell_tty();
@@ -4956,6 +5404,11 @@ struct Session {
     /// Controlling terminal the session was started from (`pts/7`), or empty
     /// for detached sessions and for statuses written before the field existed.
     tty: String,
+    /// Working directory the session ran in (absolute, canonicalized
+    /// leniently), recovered from the `.status.json` sidecar. Empty for
+    /// detached sessions without a recorded cwd and for statuses written
+    /// before the field existed — the resolver skips the cwd rung for those.
+    cwd: String,
     mtime: std::time::SystemTime,
     /// Size of the transcript in bytes. 0 means a stub with no turns in it.
     bytes: u64,
@@ -4993,26 +5446,45 @@ fn session_is_from_here(s: &Session, my_pid: u32, my_tty: Option<&str>) -> bool 
     }
 }
 
+/// Decide whether a session ran in the same working directory as the current
+/// process. Both sides are canonicalized leniently at record/scan time, so a
+/// plain string equality is the right comparison. A session with no recorded
+/// cwd (status written before the field existed, or a detached launch that
+/// never had one) never matches — the resolver skips the cwd rung for those
+/// rather than treating "unknown" as "same".
+fn session_is_same_cwd(s: &Session, my_cwd: &str) -> bool {
+    !s.cwd.is_empty() && !my_cwd.is_empty() && s.cwd == my_cwd
+}
+
 /// Choose the session to open for a bare `pir -r`.
 ///
 /// Preference order, most specific first:
-///   1. a session from this shell, in this directory
-///   2. a session from this shell (anywhere)
-///   3. a session in this directory (any shell)
-///   4. the newest session overall
+///   1. a session from this shell, in this directory (cwd match)
+///   2. a session in this directory (cwd match, any shell)
+///   3. a session from this shell (anywhere)
+///   4. a session in this project-local store (any shell)
 ///
-/// Empty stubs are never selected; `None` here falls through to the picker.
+/// Empty stubs are never selected. `None` here falls through to the picker.
+///
+/// Deliberately, there is NO "newest session overall" rung anymore. That rung
+/// is what silently cross-resumed the fx session into a backends-sh-fb0 pane:
+/// two panes in one multiplexer share a controlling tty but sit in different
+/// checkouts, and when neither rung above matches, opening the newest global
+/// session is never what the operator meant — showing the picker is. An
+/// explicit token (`pir -r <idx|fragment>`) still reaches any session.
 fn pick_default_session(sessions: &[Session]) -> Option<&Session> {
     let my_pid = term::parent_shell_pid();
     let my_tty = term::parent_shell_tty();
+    let my_cwd = crate::session::session_cwd();
     let here = |s: &Session| session_is_from_here(s, my_pid, my_tty.as_deref());
+    let same_dir = |s: &Session| session_is_same_cwd(s, &my_cwd);
 
     sessions
         .iter()
-        .find(|s| s.bytes > 0 && s.local && here(s))
+        .find(|s| s.bytes > 0 && same_dir(s) && here(s))
+        .or_else(|| sessions.iter().find(|s| s.bytes > 0 && same_dir(s)))
         .or_else(|| sessions.iter().find(|s| s.bytes > 0 && here(s)))
         .or_else(|| sessions.iter().find(|s| s.bytes > 0 && s.local))
-        .or_else(|| sessions.iter().find(|s| s.bytes > 0))
 }
 
 /// Build the candidate list for the interactive `pir -r` picker from a scanned
@@ -5027,6 +5499,7 @@ fn build_pick_items(sessions: &[Session], my_pid: u32, my_tty: Option<&str>) -> 
             name: s.name.clone(),
             shell_pid: s.shell_pid,
             tty: s.tty.clone(),
+            cwd: s.cwd.clone(),
             from_here: session_is_from_here(s, my_pid, my_tty),
             mtime: s.mtime,
             path: s.path.clone(),
@@ -5089,14 +5562,18 @@ fn scan_sessions() -> Option<Vec<Session>> {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let cached = index.lookup(&path, bytes, mtime_secs);
-            // The tty is not in the filename (it would make them unwieldy and
-            // it contains a `/`): it rides along in the status sidecar.
-            let (tty, preview) = match cached {
-                Some(c) => (c.tty, c.preview),
+            // The tty and cwd are not in the filename (they would make them
+            // unwieldy and both contain a `/`): they ride along in the status
+            // sidecar.
+            let (tty, cwd, preview) = match cached {
+                Some(c) => (c.tty, c.cwd, c.preview),
                 None => {
-                    let tty = crate::session::read_status(&path)
+                    let meta = crate::session::read_status(&path);
+                    let tty = meta
+                        .as_ref()
                         .map(|m| term::normalize_tty(&m.tty))
                         .unwrap_or_default();
+                    let cwd = meta.map(|m| m.cwd).unwrap_or_default();
                     let preview = first_user_line(&path);
                     index.put(
                         &path,
@@ -5104,13 +5581,14 @@ fn scan_sessions() -> Option<Vec<Session>> {
                             mtime: mtime_secs,
                             bytes,
                             tty: tty.clone(),
+                            cwd: cwd.clone(),
                             preview: preview.clone(),
                         },
                     );
-                    (tty, preview)
+                    (tty, cwd, preview)
                 }
             };
-            out.push(Session { path, name, shell_pid, tty, mtime, bytes, preview, local: is_local });
+            out.push(Session { path, name, shell_pid, tty, cwd, mtime, bytes, preview, local: is_local });
         }
     }
     index.save();
@@ -5492,13 +5970,25 @@ fn reexec_all() {
 /// Collapse `$HOME` to `~` in a path for a compact display, leaving other
 /// absolute paths intact. Used by the REPL status line's "Workspace" field.
 fn home_collapsed(path: &std::path::Path) -> String {
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = std::path::Path::new(&home);
-        if let Ok(suffix) = path.strip_prefix(home) {
-            return format!("~{}", suffix.to_string_lossy());
+    if let Some(home) = std::env::var_os("HOME")
+        && let Some(s) = collapse_home(std::path::Path::new(&home), path) {
+            return s;
         }
-    }
     path.to_string_lossy().to_string()
+}
+
+/// Pure core of [`home_collapsed`], split out so tests never mutate `HOME`:
+/// the system prompt embeds home-derived paths, and mutating it under the
+/// suite's parallelism breaks tests that refresh the prompt without the env
+/// lock (see the plan-mode banner test).
+fn collapse_home(home: &std::path::Path, path: &std::path::Path) -> Option<String> {
+    let suffix = path.strip_prefix(home).ok()?;
+    // `strip_prefix` eats the separator too, so re-add it — `~/x`, not `~x`.
+    // A path that IS $HOME has an empty suffix and stays bare `~`.
+    if suffix.as_os_str().is_empty() {
+        return Some("~".to_string());
+    }
+    Some(format!("~/{}", suffix.to_string_lossy()))
 }
 
 /// The "Workspace" shown in the status line: the current working directory with
@@ -5935,12 +6425,13 @@ mod main_tests {
     use super::*;
 
     /// Build a `Session` directly (no filesystem) for selection-policy tests.
-    fn sess(name: &str, pid: u32, tty: &str, age_secs: u64, bytes: u64, local: bool) -> Session {
+    fn sess(name: &str, pid: u32, tty: &str, cwd: &str, age_secs: u64, bytes: u64, local: bool) -> Session {
         Session {
             path: PathBuf::from("/tmp").join(name),
             name: name.to_string(),
             shell_pid: pid,
             tty: tty.to_string(),
+            cwd: cwd.to_string(),
             // Lower `age_secs` == newer; newest must sort first.
             mtime: std::time::UNIX_EPOCH + std::time::Duration::from_secs(10_000 - age_secs),
             bytes,
@@ -5955,9 +6446,9 @@ mod main_tests {
     #[test]
     fn newest_first_and_stubs_sort_last_within_a_timestamp() {
         let mut v = vec![
-            sess("pir-a-sh1.jsonl", 1, "pts/1", 10, 0, false),   // stub, same age
-            sess("pir-b-sh2.jsonl", 2, "pts/2", 10, 500, false), // real, same age
-            sess("pir-c-sh3.jsonl", 3, "pts/3", 99, 100, false), // oldest
+            sess("pir-a-sh1.jsonl", 1, "pts/1", "/w", 10, 0, false),   // stub, same age
+            sess("pir-b-sh2.jsonl", 2, "pts/2", "/w", 10, 500, false), // real, same age
+            sess("pir-c-sh3.jsonl", 3, "pts/3", "/w", 99, 100, false), // oldest
         ];
         v.sort_by(|a, b| b.mtime.cmp(&a.mtime).then(b.bytes.cmp(&a.bytes)));
         assert_eq!(v[0].name, "pir-b-sh2.jsonl", "real session must beat an equal-age stub");
@@ -5970,14 +6461,14 @@ mod main_tests {
     /// This is the recycled-PID bug that resumed an unrelated session on WSL.
     #[test]
     fn tty_beats_recycled_pid() {
-        let other = sess("pir-old-sh4242.jsonl", 4242, "pts/9", 5, 100, false);
+        let other = sess("pir-old-sh4242.jsonl", 4242, "pts/9", "/w", 5, 100, false);
         // We are pid 4242 (recycled) but on pts/7, so this is NOT our session.
         assert!(
             !session_is_from_here(&other, 4242, Some("pts/7")),
             "pid match with a different tty must not claim the session"
         );
         // Same tty, different pid (shell restarted, pid changed) -> ours.
-        let mine = sess("pir-mine-sh1.jsonl", 1, "pts/7", 5, 100, false);
+        let mine = sess("pir-mine-sh1.jsonl", 1, "pts/7", "/w", 5, 100, false);
         assert!(
             session_is_from_here(&mine, 4242, Some("pts/7")),
             "tty match must claim the session across pid changes"
@@ -5989,7 +6480,7 @@ mod main_tests {
     /// real terminal never claims a detached session that shares its pid.
     #[test]
     fn ttyless_sessions_only_match_when_we_have_no_tty() {
-        let legacy = sess("pir-legacy-sh7.jsonl", 7, "", 5, 100, false);
+        let legacy = sess("pir-legacy-sh7.jsonl", 7, "", "", 5, 100, false);
         assert!(
             session_is_from_here(&legacy, 7, None),
             "no tty on either side: pid fallback applies"
@@ -6003,76 +6494,124 @@ mod main_tests {
         assert!(!session_is_from_here(&legacy, 8, Some("pts/7")));
     }
 
+    /// The cwd predicate: an exact directory match counts, anything else does
+    /// not — and a session with no recorded cwd (legacy sidecar) never
+    /// matches, so old sessions fall through to the shell/local rungs instead
+    /// of being treated as "same directory".
+    #[test]
+    fn same_cwd_needs_exact_match_and_recorded_cwd() {
+        let same = sess("pir-a-sh1.jsonl", 1, "pts/7", "/mnt/wsl/projects/fx", 5, 100, false);
+        assert!(session_is_same_cwd(&same, "/mnt/wsl/projects/fx"));
+        let other_dir = sess("pir-b-sh2.jsonl", 1, "pts/7", "/mnt/wsl/projects/pir", 5, 100, false);
+        assert!(!session_is_same_cwd(&other_dir, "/mnt/wsl/projects/fx"));
+        // Same prefix is not enough — the compare is equality, not containment.
+        let prefix = sess("pir-c-sh3.jsonl", 1, "pts/7", "/mnt/wsl/projects", 5, 100, false);
+        assert!(!session_is_same_cwd(&prefix, "/mnt/wsl/projects/fx"));
+        // Legacy sidecar with no recorded cwd never matches, even from the
+        // same tty — it must not claim the cwd rung.
+        let legacy = sess("pir-legacy-sh7.jsonl", 7, "pts/7", "", 5, 100, false);
+        assert!(!session_is_same_cwd(&legacy, "/mnt/wsl/projects/fx"));
+    }
+
     /// Empty stubs are never selected by the default rule, even when they are
     /// the newest thing on disk and from this very shell.
     #[test]
     fn default_selection_skips_empty_stubs() {
         // Newest overall is an empty stub from our own shell + dir.
-        let stub = sess("pir-20260926-061520-sh41740.jsonl", 1, "pts/7", 1, 0, true);
-        let real = sess("pir-20260925-175246-sh2283.jsonl", 2, "pts/3", 50, 1_087_966, true);
+        let stub = sess("pir-20260926-061520-sh41740.jsonl", 1, "pts/7", "/w", 1, 0, true);
+        let real = sess("pir-20260925-175246-sh2283.jsonl", 2, "pts/3", "/w", 50, 1_087_966, true);
         let mut v = vec![stub, real];
         v.sort_by(|a, b| b.mtime.cmp(&a.mtime).then(b.bytes.cmp(&a.bytes)));
         // Confirm the stub really is first by mtime — the guard must still skip it.
         assert_eq!(v[0].bytes, 0);
     }
 
-    /// The bare-`-r` preference ladder: this-shell+this-dir, then this-shell,
-    /// then this-dir, then newest overall. Exercises the real
-    /// `pick_default_session` so the test cannot drift from the implementation.
+    /// The bare-`-r` preference ladder: same-cwd+this-shell, then same-cwd,
+    /// then this-shell, then this project-local store — and never the newest
+    /// session overall. Exercises the real `pick_default_session` so the test
+    /// cannot drift from the implementation.
     #[test]
-    fn default_selection_prefers_local_then_shell_then_newest() {
-        // The ladder keys off the *real* shell identity of the test process,
-        // so read it back and build fixtures that match it.
+    fn default_selection_prefers_cwd_then_shell_then_local() {
+        // The ladder keys off the *real* shell identity and cwd of the test
+        // process, so read them back and build fixtures that match.
         let my_pid = term::parent_shell_pid();
         let my_tty = term::parent_shell_tty();
         let my_tty_s = my_tty.clone().unwrap_or_default();
+        let my_cwd = crate::session::session_cwd();
 
-        // A session "of ours" must carry whichever identity this process has.
-        let ours = |name: &str, age: u64, local: bool| {
-            if my_tty.is_some() {
-                sess(name, 999_999, &my_tty_s, age, 10, local)
+        // A session "of ours" carries this process's tty (or pid when tty-less)
+        // and, when `here`, its cwd too.
+        let ours = |name: &str, age: u64, cwd: &str, local: bool| {
+            let (pid, tty) = if my_tty.is_some() {
+                (999_999, my_tty_s.clone())
             } else {
-                sess(name, my_pid, "", age, 10, local)
-            }
+                (my_pid, String::new())
+            };
+            sess(name, pid, &tty, cwd, age, 10, local)
         };
-        // A session that is definitely not ours.
-        let theirs = |name: &str, age: u64, local: bool| {
-            if my_tty.is_some() {
-                sess(name, 999_999, "pts/99", age, 10, local)
+        // A session that is definitely not from our shell.
+        let theirs = |name: &str, age: u64, cwd: &str, local: bool| {
+            let (pid, tty) = if my_tty.is_some() {
+                (999_999, "pts/99".to_string())
             } else {
-                sess(name, my_pid.wrapping_add(1), "", age, 10, local)
-            }
+                (my_pid.wrapping_add(1), String::new())
+            };
+            sess(name, pid, &tty, cwd, age, 10, local)
         };
         let pick_name = |vs: &[Session]| pick_default_session(vs).map(|s| s.name.clone());
 
-        // (a) best case: ours and local wins.
-        let v = vec![theirs("other_local", 1, true), ours("mine_global", 1, false), ours("mine_local", 50, true)];
-        assert_eq!(pick_name(&v).as_deref(), Some("mine_local"));
+        // (a) best case: ours and same-cwd wins — even over a newer session
+        // from our own shell elsewhere. This is the backends-sh-fb0/fx
+        // incident: same tty, two panes, different checkouts.
+        let mut v = vec![
+            ours("mine_elsewhere", 1, "/elsewhere", false),
+            theirs("theirs_same_cwd", 5, &my_cwd, false),
+            ours("mine_same_cwd", 50, &my_cwd, false),
+        ];
+        v.sort_by(|a, b| b.mtime.cmp(&a.mtime).then(b.bytes.cmp(&a.bytes)));
+        assert_eq!(pick_name(&v).as_deref(), Some("mine_same_cwd"));
 
-        // (b) no local session from us: fall back to ours elsewhere.
-        // (Note: the caller sorts newest-first; mirror that here.)
-        let mut v = vec![theirs("other_local", 1, true), ours("mine_global", 9, false)];
+        // (b) no session of ours here: same-cwd from another shell still beats
+        // our own shell elsewhere (the checkout matters more than the pane).
+        let mut v = vec![
+            ours("mine_elsewhere", 1, "/elsewhere", false),
+            theirs("theirs_same_cwd", 9, &my_cwd, false),
+        ];
+        v.sort_by(|a, b| b.mtime.cmp(&a.mtime).then(b.bytes.cmp(&a.bytes)));
+        assert_eq!(pick_name(&v).as_deref(), Some("theirs_same_cwd"));
+
+        // (c) no same-cwd session: fall back to ours elsewhere.
+        let mut v = vec![
+            theirs("other_local", 1, "/elsewhere", true),
+            ours("mine_global", 9, "/elsewhere", false),
+        ];
         v.sort_by(|a, b| b.mtime.cmp(&a.mtime).then(b.bytes.cmp(&a.bytes)));
         assert_eq!(pick_name(&v).as_deref(), Some("mine_global"));
 
-        // (c) nothing from us: prefer this directory over the global store.
-        let mut v = vec![theirs("other_global", 1, false), theirs("other_local", 9, true)];
+        // (d) nothing from us either: prefer this project-local store.
+        let mut v = vec![
+            theirs("other_global", 1, "/elsewhere", false),
+            theirs("other_local", 9, "/elsewhere", true),
+        ];
         v.sort_by(|a, b| b.mtime.cmp(&a.mtime).then(b.bytes.cmp(&a.bytes)));
         assert_eq!(pick_name(&v).as_deref(), Some("other_local"));
 
-        // (d) nothing local: newest overall (input is newest-first).
-        let mut v = vec![theirs("newest_global", 1, false), theirs("older_global", 9, false)];
+        // (e) no cwd, shell, or local match: NO silent cross-resume — the
+        // caller falls through to the picker. (The old "newest overall" rung
+        // is what opened the fx session inside a backends-sh-fb0 pane.)
+        let mut v = vec![
+            theirs("newest_global", 1, "/elsewhere", false),
+            theirs("older_global", 9, "/far-away", false),
+        ];
         v.sort_by(|a, b| b.mtime.cmp(&a.mtime).then(b.bytes.cmp(&a.bytes)));
-        assert_eq!(pick_name(&v).as_deref(), Some("newest_global"));
+        assert_eq!(pick_name(&v), None);
 
-        // (e) everything empty: no selection (falls through to the picker).
+        // (f) everything empty: no selection (falls through to the picker).
         // A stub is a session file with a zero-byte transcript.
-        let stub = if my_tty.is_some() {
-            sess("stub", 999_999, &my_tty_s, 1, 0, true)
-        } else {
-            sess("stub", my_pid, "", 1, 0, true)
-        };
-        let v = vec![stub];
+        let stub = ours("stub", 1, &my_cwd, true);
+        let mut v = vec![stub];
+        // Give the stub a real Session shape with zero bytes.
+        v[0].bytes = 0;
         assert_eq!(pick_name(&v), None);
     }
 
@@ -6160,6 +6699,66 @@ mod main_tests {
         );
     }
 
+    /// The scan recovers each session's cwd from its `.status.json` sidecar
+    /// (and caches it in the index): the `Session.cwd` the resolver matches
+    /// on must equal what the sidecar recorded. This is the incident
+    /// reproduction at the scan level — a fabricated fx-sidecar (same tty as
+    /// the operator's pane, different cwd) must surface with the fx cwd, so
+    /// the ladder can tell it apart from a backends-sh-fb0 session.
+    #[test]
+    fn scan_recovers_session_cwd_from_sidecar() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("pir_scan_cwd_{}", std::process::id()));
+        let sdir = dir.join("agent").join("sessions");
+        std::fs::create_dir_all(&sdir).unwrap();
+        let name = "pir-20990101-000000-sh99999.jsonl";
+        std::fs::write(
+            sdir.join(name),
+            r#"{"role":"user","blocks":[{"type":"text","text":"hello cwd"}]}"#.to_string() + "\n",
+        )
+        .unwrap();
+        // A sidecar as `write_status` would have written it from /mnt/wsl/projects/fx.
+        std::fs::write(
+            sdir.join("pir-20990101-000000-sh99999.status.json"),
+            r#"{
+  "status": "interrupted",
+  "pid": 4242,
+  "tty": "pts/25",
+  "updated": 1791694061,
+  "built": "0.1.6",
+  "last_prompt": "Allow user to right click on list items",
+  "goal_pending": false,
+  "reason": "",
+  "cwd": "/mnt/wsl/projects/fx"
+}"#,
+        )
+        .unwrap();
+        let old = std::env::var_os("PI_DIR");
+        // SAFETY: edition 2024 marks env mutation unsafe; pir confines
+        // it to startup config and explicit session toggles.
+        unsafe { std::env::set_var("PI_DIR", &dir); }
+        let sessions = scan_sessions();
+        match old {
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let sessions = sessions.expect("scan finds the temp global dir");
+        let found = sessions
+            .iter()
+            .find(|s| s.name == name)
+            .expect("fake session must be listed");
+        assert_eq!(
+            found.cwd, "/mnt/wsl/projects/fx",
+            "scan must recover the cwd the sidecar recorded"
+        );
+        assert_eq!(
+            crate::term::normalize_tty(&found.tty),
+            "pts/25",
+            "scan must also recover the tty"
+        );
+    }
+
     /// `!` routes to /sh (confinement applies); `!!` routes to /sh-as-invoker
     /// (one spawn as the invoking user). Both bare and with-command forms.
     #[test]
@@ -6193,5 +6792,230 @@ mod main_tests {
         assert!(b.is_empty(), "buffer must be empty after the take");
         let mut e = String::new();
         assert_eq!(take_partial_for_prefill(&mut e), None);
+    }
+
+    /// `$HOME` collapses to `~` with the separator kept: `~/x`, not `~x`.
+    /// `strip_prefix` eats the separator, which is how the status line ended
+    /// up showing `~corro_head_fix`. Pure (no env mutation) so it can't race
+    /// prompt-building tests running in parallel.
+    #[test]
+    fn home_collapsed_keeps_the_separator() {
+        let home = std::path::Path::new("/Users/imac");
+        assert_eq!(
+            collapse_home(home, std::path::Path::new("/Users/imac/corro_head_fix")),
+            Some("~/corro_head_fix".to_string())
+        );
+        assert_eq!(
+            collapse_home(home, std::path::Path::new("/Users/imac")),
+            Some("~".to_string()),
+            "the home dir itself stays bare"
+        );
+        assert_eq!(
+            collapse_home(home, std::path::Path::new("/tmp/other")),
+            None,
+            "paths outside $HOME don't collapse"
+        );
+        assert_eq!(
+            home_collapsed(std::path::Path::new("/definitely/not/home/x")),
+            "/definitely/not/home/x",
+            "absolute fallback is intact"
+        );
+    }
+}
+
+#[cfg(test)]
+mod model_command_wiring_tests {
+    /// The requirement's two routes must both reach `handle_command`:
+    ///   * bare `/model` paints the five numbered rows and reads ↑/↓ via
+    ///     `model_list_picker`;
+    ///   * `/model2` (`parse_number`) switches straight to the second row.
+    ///
+    /// `handle_command` needs a live `Agent`, so it cannot be driven from a
+    /// unit test. Assert the *wiring* at the source instead — the same approach
+    /// the modal's key-map tests use — so a refactor that quietly dropped one
+    /// route (leaving `/model2` to fall through to an unknown command) fails
+    /// here rather than in the operator's hands.
+    #[test]
+    fn bare_model_lists_and_numbered_model_switches_via_the_shared_helpers() {
+        let src = include_str!("main.rs");
+        let body = src
+            .split("fn handle_command(")
+            .nth(1)
+            .expect("handle_command must exist");
+
+        // The numbered route: a guard arm that parses `/model<N>` and selects
+        // the Nth of the top-N list through the shared switch path.
+        assert!(
+            body.contains("crate::model_history::parse_number(cmd)"),
+            "handle_command must recognise `/model<N>` (parse_number)"
+        );
+        assert!(
+            body.contains("labels.get(n - 1)"),
+            "the number must index the top-N list 1-based (row N -> labels[N-1])"
+        );
+
+        // The browse route: bare `/model` opens the inline (non-alt-screen)
+        // picker, which paints one numbered line per model (the row rendering
+        // lives in `model_list_picker`, asserted by its own test in modal.rs).
+        assert!(
+            body.contains("modal::model_list_picker("),
+            "bare `/model` must open the inline list picker"
+        );
+        // Both routes converge on the one switch implementation, so the reported
+        // label/note cannot differ between them.
+        assert!(
+            body.contains("switch_model(agent_slot, providers, current_ctx,"),
+            "every /model route must switch through the shared switch_model"
+        );
+        // The full catalog picker stays reachable (`/models` and the ambiguous
+        // prefix path), so the inline list did not replace it.
+        assert!(
+            body.contains("modal::model_picker("),
+            "the full-catalog picker must remain for /models and multi-match prefixes"
+        );
+    }
+}
+
+#[cfg(test)]
+mod login_command_tests {
+    use super::{parse_login_args, resolve_login_model};
+
+    /// `/login PROVIDER KEY` and `/login PROVIDER KEY MODEL` are the two shapes
+    /// the operator asked for; the third (`/login PROVIDER`) must still leave
+    /// the key to the hidden prompt.
+    #[test]
+    fn provider_and_key_forms_split_correctly() {
+        let rest = vec!["openrouter", "sk-or-abc123"];
+        let (p, k, m) = parse_login_args(&rest);
+        assert_eq!(p, "openrouter");
+        assert_eq!(k.as_deref(), Some("sk-or-abc123"), "the inline key is carried, not prompted for");
+        assert_eq!(m, None, "no model given => None, so the provider's first model is used");
+    }
+
+    #[test]
+    fn a_third_argument_is_the_model_selector() {
+        let rest = vec!["openrouter", "sk-or-abc123", "anthropic/claude-sonnet-4-5"];
+        let (p, k, m) = parse_login_args(&rest);
+        assert_eq!(p, "openrouter");
+        assert_eq!(k.as_deref(), Some("sk-or-abc123"));
+        assert_eq!(m.as_deref(), Some("anthropic/claude-sonnet-4-5"));
+    }
+
+    /// A bare provider keeps the interactive flow: no key => `None` (never an
+    /// empty string), so the caller prompts with echo off as before.
+    #[test]
+    fn provider_only_leaves_the_key_to_the_prompt() {
+        let rest = vec!["openrouter"];
+        let (p, k, m) = parse_login_args(&rest);
+        assert_eq!(p, "openrouter");
+        assert_eq!(k, None);
+        assert_eq!(m, None);
+    }
+
+    /// An empty provider (e.g. `/login ""`) parses to empty, which the handler
+    /// treats as "cancel" — it must not panic or fabricate a key.
+    #[test]
+    fn empty_arguments_are_inert() {
+        let rest: Vec<&str> = Vec::new();
+        assert_eq!(parse_login_args(&rest), (String::new(), None, None));
+    }
+
+    /// A multi-token model is rejoined, so a quoted selector survives the
+    /// whitespace split rather than being silently truncated to its first word.
+    #[test]
+    fn a_multi_token_model_is_rejoined() {
+        let rest = vec!["p", "k", "some", "model", "name"];
+        let (_, _, m) = parse_login_args(&rest);
+        assert_eq!(m.as_deref(), Some("some model name"));
+    }
+
+    // ---- resolve_login_model -------------------------------------------
+
+    fn provider(id: &str, models: &[&str]) -> crate::config::Provider {
+        crate::config::Provider {
+            id: Some(id.to_string()),
+            name: None,
+            base_url: Some("http://127.0.0.1:9".to_string()),
+            api_key: Some("k".to_string()),
+            api: Some("openai".to_string()),
+            models: models
+                .iter()
+                .map(|m| crate::config::Model {
+                    id: (*m).to_string(),
+                    name: None,
+                    context: Some(1000),
+                    max_tokens: Some(100),
+                    api_override: None,
+                    url_override: None,
+                    no_reasoning_effort: false,
+                    reasoning: false,
+                    thinking_format: None,
+                    supports_reasoning_effort: None,
+                    thinking_level_map: Default::default(),
+                    price_per_1k: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// The catalog `resolve_login_model` is exercised against: two providers,
+    /// sharing no model ids.
+    fn catalog() -> Vec<crate::config::Provider> {
+        vec![provider("alphaprov", &["alpha-one", "alpha-two"]), provider("betaprov", &["beta-one"])]
+    }
+
+    /// `/login betaprov KEY beta-one` — a bare model id switches to that model
+    /// on the provider being logged into, not to the provider's first model.
+    #[test]
+    fn a_bare_model_id_resolves_to_that_model() {
+        let (p, m) = resolve_login_model(&catalog(), "betaprov", "beta-one").expect("beta-one resolves");
+        assert_eq!(p.pid(), "betaprov");
+        assert_eq!(m.id, "beta-one");
+    }
+
+    /// A full `provider/model` label resolves as written.
+    #[test]
+    fn a_full_label_resolves() {
+        let (p, m) = resolve_login_model(&catalog(), "betaprov", "alphaprov/alpha-two").expect("full label");
+        assert_eq!(p.pid(), "alphaprov");
+        assert_eq!(m.id, "alpha-two");
+    }
+
+    /// A selector written as a full label is honoured as written, even when it
+    /// names a provider other than the one being logged into — the operator was
+    /// explicit, and `config::select` documents `provider/model` as a selector.
+    #[test]
+    fn an_explicit_full_label_wins_even_for_another_provider() {
+        let (p, m) = resolve_login_model(&catalog(), "betaprov", "alphaprov/alpha-two")
+            .expect("an explicit provider/model label resolves as written");
+        assert_eq!(p.pid(), "alphaprov");
+        assert_eq!(m.id, "alpha-two");
+    }
+
+    /// A *partial* slashed selector that only `config::select` cannot resolve
+    /// bare is retried scoped to the provider being logged into, so a prefix
+    /// like `betaprov/beta` still lands on betaprov.
+    #[test]
+    fn a_scoped_retry_keeps_the_selector_on_the_logged_in_provider() {
+        let (p, m) = resolve_login_model(&catalog(), "betaprov", "betaprov/beta")
+            .expect("provider/prefix resolves via the scoped retry");
+        assert_eq!(p.pid(), "betaprov");
+        assert_eq!(m.id, "beta-one");
+    }
+
+    /// A slashed selector that resolves under NO provider is an error naming the
+    /// provider, so the handler can still say the key was saved.
+    #[test]
+    fn an_unresolvable_slashed_selector_errors() {
+        let err = resolve_login_model(&catalog(), "betaprov", "betaprov/alpha-two").unwrap_err();
+        assert!(err.contains("betaprov"), "error names the provider: {err}");
+    }
+
+    /// An unresolvable selector is an error (so the handler can say the key was
+    /// saved but the model was not applied) rather than a silent no-op.
+    #[test]
+    fn an_unknown_selector_is_an_error() {
+        let err = resolve_login_model(&catalog(), "betaprov", "nosuchmodel").unwrap_err();
+        assert!(err.contains("nosuchmodel"), "error names the bad selector: {err}");
     }
 }

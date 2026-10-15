@@ -10,11 +10,14 @@
 //! even the `pane command="pir" cwd="…" { args "-r" }` lines all survive a
 //! restart on their own.
 //!
-//! What zellij cannot know is **which pir conversation belonged to which pane**.
-//! A resurrected pane restarts `pir -r` and resolves its session from
-//! `parent_shell_pid()` (see `term::parent_shell_pid`), which is meaningless
-//! after a reboot or from a different shell. The gap this module fills is
-//! therefore the *pane → pir transcript* mapping, not the layout.
+//! What zellij cannot know is **which pir conversation belonged to which pane**:
+//! a resurrected pane restarts as bare `pir` (the layout's `command="pir"`
+//! carries no resume token), which would otherwise start a fresh session every
+//! time. The gap this module fills is therefore the *pane → pir transcript*
+//! mapping, not the layout: each pane claims its title as `pir:<stem>`
+//! ([`claim_pane_title`]), zellij persists that title in the layout's `name=`,
+//! and a bare `pir` with no resume token reads it back at startup
+//! ([`resurrect_from_own_title`]) and resumes the transcript it names.
 //!
 //! # Recording
 //!
@@ -307,6 +310,45 @@ fn title_session(title: &str) -> Option<&str> {
     title.strip_prefix(TITLE_MARKER).filter(|s| !s.is_empty())
 }
 
+/// True when `title` is zellij's own default for a pane rather than something
+/// the operator typed: the bare command name (`"pir"`, and the `"pir · …"`
+/// frame zellij renders around it — measured live as `pir · pir`, `pir ·
+/// bash-o4`).
+///
+/// A resurrected pane comes back with exactly this, so the claim must treat it
+/// as unset: otherwise every pane created by `zellij attach` keeps its default
+/// title forever and no transcript is ever named.
+fn is_default_pane_title(title: &str) -> bool {
+    title == "pir" || title.strip_prefix("pir · ").is_some_and(|s| !s.is_empty())
+}
+
+/// True when `title` was emitted by the shell itself rather than typed by the
+/// operator: an OSC title (`🐧<dir>`, from `PROMPT_COMMAND` — measured live as
+/// `🐧pir`, `🐧bash-o4` on panes sitting at a shell prompt).
+///
+/// A pir the operator started from such a shell still carries the shell's
+/// title when the first prompt claims it, so the claim must treat it as unset
+/// too: otherwise no shell-started pir is ever claimed (hence no transcript
+/// named) and every attach of those panes starts fresh. An explicit
+/// `rename-pane` sticks over shell OSC output (probed live), so claiming here
+/// cannot clobber a real operator rename — those never carry the marker.
+fn is_shell_title(title: &str) -> bool {
+    title.strip_prefix("🐧").is_some_and(|s| !s.is_empty())
+}
+
+/// Whether [`claim_pane_title`] may rename a pane currently titled `current`:
+/// ours (re-claiming is a no-op rename), unset, zellij's own default, or the
+/// shell's OSC title.
+///
+/// Split out so the regression test asserts on exactly what the claim
+/// consults, not a recomputation of it.
+fn title_is_claimable(current: &str) -> bool {
+    title_session(current).is_some()
+        || current.is_empty()
+        || is_default_pane_title(current)
+        || is_shell_title(current)
+}
+
 /// Claim this pane's zellij title, once per session, so plain
 /// `zellij attach` resurrects the *right* conversation without any help from
 /// `pir -r @<session>`.
@@ -321,12 +363,20 @@ fn title_session(title: &str) -> Option<&str> {
 ///   * **It is called at most once per process**, via [`TITLE_CLAIMED`]. This is
 ///     what keeps the prompt path cheap: one `zellij` spawn for the whole
 ///     session, not one per prompt.
-///   * **It only claims a title that is ours or unset.** A title the operator
-///     chose by hand is left alone, so this can never rename a pane behind their
-///     back. (A `/rewind` to a different transcript does *not* re-trigger it —
-///     the latch holds for the process's lifetime. The sidecar path still tracks
-///     the new transcript, so `pir -r @<session>` remains correct; only the title,
-///     and therefore plain `zellij attach`, goes stale until the next `pir`.)
+///   * **It only claims a title that is ours, unset, zellij's default, or the
+///     shell's OSC title.** A title the operator chose by hand is left alone,
+///     so this can never rename a pane behind their back. (A `/rewind` to a
+///     different transcript does *not* re-trigger it — the latch holds for the
+///     process's lifetime. The sidecar path still tracks the new transcript, so
+///     `pir -r @<session>` remains correct; only the title, and therefore plain
+///     `zellij attach`, goes stale until the next `pir`.)
+///
+/// A pane zellij just resurrected reports its title as the bare command name
+/// (`"pir"`) — zellij fills that in itself, the operator never typed it — so
+/// that counts as claimable exactly like an empty title. Without this every
+/// resurrected pane kept its default title forever (measured on live zellij
+/// 0.44.1: panes 10/11/12 all titled `"pir"`, none ever claimed), and plain
+/// `zellij attach` kept starting fresh sessions.
 ///
 /// The spawn is `zellij action rename-pane --pane-id <id> <title>`; 0.45.1
 /// accepts an explicit `--pane-id`, so this does not depend on which pane
@@ -348,9 +398,12 @@ pub fn claim_pane_title(session_stem: &str) {
     }
 
     // Never stomp a title the operator chose. `name=` is absent unless something
-    // already named this pane, so "not ours and not empty" means hands off.
+    // already named this pane, so "not ours and not empty" means hands off —
+    // with two exceptions, both things the operator never typed: zellij itself
+    // reports a never-renamed pane's title as its bare command name, and the
+    // shell reports its own OSC title (`🐧<dir>` from `PROMPT_COMMAND`).
     if let Some(current) = current_pane_title(&pane) {
-        if title_session(&current).is_none() && !current.is_empty() {
+        if !title_is_claimable(&current) {
             return;
         }
     }
@@ -440,9 +493,23 @@ fn current_pane_title(pane: &str) -> Option<String> {
         true,
     )?;
     let v: serde_json::Value = serde_json::from_slice(&out).ok()?;
+    title_of_pane(&v, pane)
+}
+
+/// The title of terminal pane `pane` in a parsed `list-panes -a -j` array.
+///
+/// The pure half of [`current_pane_title`]: no subprocess, just the pick.
+/// Split out so the regression test asserts on exactly what the claim reads,
+/// without needing a live zellij.
+fn title_of_pane(v: &serde_json::Value, pane: &str) -> Option<String> {
     let want: i64 = pane.parse().ok()?;
     v.as_array()?.iter().find_map(|p| {
-        (p.get("id").and_then(serde_json::Value::as_i64) == Some(want))
+        // zellij reuses small ids across plugins and terminals (measured live:
+        // id 0 is both the `zellij:link` plugin and a terminal), and array
+        // order puts plugins first — so an unfiltered id match reads the
+        // *plugin's* title, never the pane's. Terminals only.
+        let is_terminal = !p.get("is_plugin").and_then(serde_json::Value::as_bool).unwrap_or(true);
+        (is_terminal && p.get("id").and_then(serde_json::Value::as_i64) == Some(want))
             .then(|| p.get("title").and_then(serde_json::Value::as_str).unwrap_or_default().to_string())
     })
 }
@@ -1197,6 +1264,48 @@ fn log_for_stem(stem: &str) -> Option<PathBuf> {
         }
     }
     found
+}
+
+/// The session log this pane held before zellij detached, or `None` when there
+/// is nothing to resurrect.
+///
+/// This is the read-back half of [`claim_pane_title`]: a pane resurrected by a
+/// plain `zellij attach` restarts as **bare** `pir` (the layout's
+/// `command="pir"` carries no resume token — zellij only persists the layout,
+/// and only `pir -r @` rewrites it with per-pane targets). The pane's *title*,
+/// however, is persisted by zellij in the layout's `name=` attribute, so the
+/// `pir:<stem>` claim survives the restart. When this process starts inside
+/// zellij with no explicit resume token, its own title names the transcript it
+/// was running — resolving it here is what makes plain `attach` come back to
+/// the right conversation instead of a fresh session.
+///
+/// Returns `None` (start fresh) in every ambiguous case: not inside zellij,
+/// the title could not be read (a slow/dead `zellij` must never stall startup),
+/// the title is not one of ours (the operator named the pane by hand), no such
+/// transcript exists on disk (it was deleted or moved), the stem names two logs
+/// (a wrong transcript in a pane is the failure mode to avoid), or the one log
+/// it names is explicitly finished (`/finished` means "do not come back").
+///
+/// Bounded by [`TITLE_CALL_TIMEOUT`] twice (one `list-panes` read): startup
+/// must never hang behind a zellij that has gone away.
+pub fn resurrect_from_own_title() -> Option<PathBuf> {
+    let pane = pane_id()?;
+    let current = current_pane_title(&pane)?;
+    resurrect_log_for_title(&current)
+}
+
+/// The transcript named by a `pir:<stem>` pane title, or `None`.
+///
+/// The pure half of [`resurrect_from_own_title`]: no subprocess, just the
+/// stem → log resolution plus the finished gate. Split out so the regression
+/// test asserts on exactly what startup uses, without needing a live zellij.
+fn resurrect_log_for_title(title: &str) -> Option<PathBuf> {
+    let stem = title_session(title)?.to_string();
+    let log = log_for_stem(&stem)?;
+    match crate::session::read_status(&log) {
+        Some(meta) if meta.status == crate::session::SessionStatus::Finished => None,
+        _ => Some(log),
+    }
 }
 
 /// Decide which session log belongs in each `pir` block of the layout.
@@ -2181,6 +2290,161 @@ mod tests {
         let Injection { kdl: out, restored: used, .. } = inject_resume_args(kdl, "sess", &HashMap::new());
         assert_eq!(used, 0, "nothing resolvable, so nothing is rewritten: {out}");
         assert_eq!(out, kdl, "the dumped layout must survive byte-for-byte");
+    }
+
+    /// The startup read-back: a bare `pir` in a resurrected pane resolves the
+    /// transcript its own `pir:<stem>` title names — the token plain `zellij
+    /// attach` drops on the floor. This asserts on the value startup itself
+    /// uses ([`resurrect_log_for_title`]), not a recomputation.
+    ///
+    /// The fixture lives where `log_for_stem` looks (the cwd-local sessions
+    /// dir, like the title tests above) under a pid-unique stem, so no live
+    /// zellij and no real transcript can interfere; everything is removed
+    /// afterwards.
+    #[test]
+    fn startup_title_resumes_the_transcript_it_names() {
+        let dir = std::env::current_dir().unwrap().join(".pir").join("sessions");
+        let _ = std::fs::create_dir_all(&dir);
+        let stem = format!("startup-title-resume-{}", std::process::id());
+        let log = dir.join(format!("{stem}.jsonl"));
+        std::fs::write(&log, "{}\n").unwrap();
+
+        // Our own title, live transcript: startup must pick it up.
+        let got = resurrect_log_for_title(&pane_title(&stem));
+        assert_eq!(got, Some(log.clone()), "startup must resume the titled transcript");
+
+        // A finished transcript stays finished: `/finished` means "do not come back".
+        crate::session::mark_finished(&log);
+        assert_eq!(
+            resurrect_log_for_title(&pane_title(&stem)),
+            None,
+            "a finished session must not be resurrected by its title"
+        );
+
+        // A hand-set title is not ours, and a stem with no log is nothing.
+        assert_eq!(resurrect_log_for_title("operator-set"), None);
+        assert_eq!(resurrect_log_for_title("pir:vanished-startup-xyz"), None);
+        assert_eq!(resurrect_log_for_title(""), None);
+
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(crate::session::status_path(&log));
+    }
+
+    /// Repro: plain `zellij attach` resurrects bare `pir`, which starts a
+    /// fresh session instead of `pir --session <stem>`.
+    ///
+    /// The attach path is title-driven: [`record`] claims the pane's title as
+    /// `pir:<stem>`, zellij persists it in the layout's `name=`, and a bare
+    /// `pir` at startup reads it back ([`resurrect_from_own_title`]). The bug
+    /// was in the claim guard: a pane zellij just resurrected reports its
+    /// title as the bare command name (`"pir"`) — zellij fills that in, the
+    /// operator never typed it — and the guard treated any non-empty,
+    /// non-ours title as operator-chosen and bailed. So no resurrected pane
+    /// was ever claimed (measured live: every `pir` pane titled `"pir"`), no
+    /// transcript was ever named, and every attach started fresh.
+    ///
+    /// This drives the claim decision itself — the value [`claim_pane_title`]
+    /// consults — with the exact title a resurrected pane reports, so it fails
+    /// while the guard bails on zellij's default. (Editing the persisted
+    /// layout instead was tried and measured dead: the running server
+    /// regenerates that file from live state every ~30 s and reverts any edit
+    /// in under 10 s. The title is the only channel that sticks.)
+    #[test]
+    fn plain_attach_claims_a_resurrected_panes_default_title() {
+        // What the operator typed is sacred; what zellij filled in is not.
+        assert!(
+            !is_default_pane_title("logs"),
+            "an operator title must never read as default"
+        );
+        assert!(
+            !is_default_pane_title("pir:pir-20260926-085546-sh945107"),
+            "our own claim must never read as default"
+        );
+        assert!(
+            !is_default_pane_title(""),
+            "empty is unset, not default — handled by its own branch"
+        );
+        // What a resurrected pane actually reports (measured live).
+        assert!(
+            is_default_pane_title("pir"),
+            "zellij's default title for a pir pane must be claimable"
+        );
+        assert!(
+            is_default_pane_title("pir · pir"),
+            "zellij's framed default must be claimable too"
+        );
+
+        // The guard decision itself, asserted on the value `claim_pane_title`
+        // consults ([`title_is_claimable`]) — not a recomputation. A
+        // resurrected pane's `"pir"` must fall on the claim side; that is the
+        // whole bug.
+        assert!(
+            title_is_claimable("pir:abc"),
+            "our title: already claimed, rename is a no-op"
+        );
+        assert!(title_is_claimable(""), "unset: claim");
+        assert!(
+            title_is_claimable("pir"),
+            "resurrected default: must claim, not bail"
+        );
+        assert!(
+            title_is_claimable("pir · pir"),
+            "framed default: must claim, not bail"
+        );
+        assert!(!title_is_claimable("logs"), "operator title: hands off");
+        assert!(!title_is_claimable("bash-o4"), "operator title: hands off");
+        // A pir started from a shell still carries the shell's OSC title
+        // (`🐧<dir>`, measured live as `🐧pir` on pane 13) when the first
+        // prompt claims it — that is zellij/the shell talking, not the
+        // operator, so it must fall on the claim side too.
+        assert!(
+            is_shell_title("🐧pir"),
+            "shell OSC title must read as shell-emitted"
+        );
+        assert!(
+            is_shell_title("🐧bash-o4"),
+            "shell OSC title must read as shell-emitted"
+        );
+        assert!(!is_shell_title("logs"), "operator title is not shell OSC");
+        assert!(!is_shell_title(""), "empty is unset, not shell OSC");
+        assert!(
+            title_is_claimable("🐧pir"),
+            "shell-started pir: must claim, not bail"
+        );
+        assert!(
+            title_is_claimable("🐧bash-o4"),
+            "shell-started pir: must claim, not bail"
+        );
+    }
+
+    /// Repro for the second half: zellij reuses small ids across plugins and
+    /// terminals (measured live on this very session: id 0 is both the
+    /// `zellij:link` plugin *and* a terminal, id 2 both `status-bar` and a
+    /// terminal), and `list-panes -a -j` lists plugins first. So an unfiltered
+    /// id match reads the *plugin's* title — `(.) - zellij:link`,
+    /// `zellij:status-bar` — never the pane's. Neither is claimable, so the
+    /// claim bailed on every low-id pane even though the pane itself carried a
+    /// claimable title (`pir · bash-o4` on both).
+    ///
+    /// This parses the same shape `list-panes -a -j` emits and asserts on the
+    /// value [`current_pane_title`] itself returns, not a recomputation: with
+    /// a plugin shadowing the id, the pane's own title must still win.
+    #[test]
+    fn title_read_skips_plugin_entries_sharing_the_id() {
+        // Exact shape measured live: plugin first, terminal second, same id.
+        let out = serde_json::json!([
+            { "id": 0, "is_plugin": true,  "title": "(.) - zellij:link" },
+            { "id": 0, "is_plugin": false, "title": "pir · bash-o4" },
+            { "id": 2, "is_plugin": true,  "title": "zellij:status-bar" },
+            { "id": 2, "is_plugin": false, "title": "pir · bash-o4" },
+        ]);
+        let got = |pane: &str| title_of_pane(&out, pane);
+        assert_eq!(got("0"), Some("pir · bash-o4".to_string()));
+        assert_eq!(got("2"), Some("pir · bash-o4".to_string()));
+        // And both of those are claimable (zellij's framed default), so the
+        // claim proceeds instead of bailing on the plugin's title.
+        assert!(title_is_claimable(&got("0").unwrap()));
+        assert!(title_is_claimable(&got("2").unwrap()));
     }
 
     #[test]

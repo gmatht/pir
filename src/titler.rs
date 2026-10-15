@@ -125,7 +125,7 @@ pub fn maybe_generate_title(log: Option<&PathBuf>) {
             thread::sleep(wait);
         }
 
-        if let Some(t) = generate_title(&log, api_kind, &base_url, &api_key, &model_id) {
+        if let Some(t) = generate_title(&log, api_kind, &base_url, &api_key, &model_id, prov.pid() == "opencode-go") {
             session::write_title(&log, &t);
         }
         PENDING.store(false, Ordering::SeqCst);
@@ -394,10 +394,18 @@ fn tiny_request(
     (url, body)
 }
 
-/// Auth header pairs for a tiny call (user-agent + per-kind auth).
+/// Auth header pairs for a tiny call (user-agent + per-kind auth, plus the
+/// OpenCode Go session header when `session` is `Some` — the gateway 400s
+/// when it is missing, so Go callers must pass one).
 /// Replaces the old ureq request-builder version: headers are now plain
 /// pairs handed to [`crate::provider::lsb_json`] (host libcurl, no static TLS).
-fn tiny_headers<'a>(api_kind: config::ApiKind, api_key: &'a str, ua: &'a str, bearer: &'a str) -> Vec<(&'a str, &'a str)> {
+fn tiny_headers<'a>(
+    api_kind: config::ApiKind,
+    api_key: &'a str,
+    ua: &'a str,
+    bearer: &'a str,
+    session: Option<&'a str>,
+) -> Vec<(&'a str, &'a str)> {
     let mut headers: Vec<(&str, &str)> = vec![("user-agent", ua)];
     match api_kind {
         config::ApiKind::Anthropic => {
@@ -408,6 +416,9 @@ fn tiny_headers<'a>(api_kind: config::ApiKind, api_key: &'a str, ua: &'a str, be
             headers.push(("Authorization", bearer));
         }
     }
+    if let Some(id) = session.filter(|s| !s.is_empty()) {
+        headers.push(("x-opencode-session", id));
+    }
     headers
 }
 
@@ -415,10 +426,16 @@ fn tiny_headers<'a>(api_kind: config::ApiKind, api_key: &'a str, ua: &'a str, be
 /// libcurl (no static TLS). Returns the parsed JSON or `None` on any failure
 /// — callers treat that as "skip", never as a hard error. Timeouts mirror
 /// the old ureq agents (15s connect / 30s total).
-fn tiny_post(url: &str, api_kind: config::ApiKind, api_key: &str, body: &Value) -> Option<Value> {
+fn tiny_post(
+    url: &str,
+    api_kind: config::ApiKind,
+    api_key: &str,
+    body: &Value,
+    session: Option<&str>,
+) -> Option<Value> {
     let ua = user_agent();
     let bearer = format!("Bearer {api_key}");
-    let headers = tiny_headers(api_kind, api_key, &ua, &bearer);
+    let headers = tiny_headers(api_kind, api_key, &ua, &bearer, session);
     crate::provider::lsb_json(
         lsb_curl::Method::POST,
         url,
@@ -482,7 +499,14 @@ fn call_light(system: &str, user: &str) -> Option<String> {
 
     let (url, body) = tiny_request(&base_url, api_kind, &model_id, 12, system, user);
 
-    let v = tiny_post(&url, api_kind, &api_key, &body)?;
+    // OpenCode Go 400s without the session header: resolve the process id
+    // for Go providers, nothing for anyone else.
+    let session = if prov.pid() == "opencode-go" {
+        crate::provider::Client::opencode_session_id()
+    } else {
+        None
+    };
+    let v = tiny_post(&url, api_kind, &api_key, &body, session.as_deref())?;
     let raw = tiny_text(api_kind, &v)?;
     let t = raw.trim().to_lowercase();
     Some(
@@ -627,6 +651,7 @@ fn generate_title(
     base_url: &str,
     api_key: &str,
     model_id: &str,
+    is_go: bool,
 ) -> Option<String> {
     let prompts = recent_prompts(log);
     if prompts.is_empty() {
@@ -648,7 +673,9 @@ fn generate_title(
 
     // The light model is fire-and-forget; a single attempt is enough. If it
     // fails (rate-limited, offline, etc.) we just don't get a title this time.
-    let v = tiny_post(&url, api_kind, api_key, &body)?;
+    // Go needs the session header like every other call (see `call_light`).
+    let session = if is_go { crate::provider::Client::opencode_session_id() } else { None };
+    let v = tiny_post(&url, api_kind, api_key, &body, session.as_deref())?;
 
     let raw = tiny_text(api_kind, &v)?;
     let title = clean_title(&raw);
@@ -727,5 +754,35 @@ pub fn last_call_epoch() -> u64 {
             .map(|d| d.as_secs())
             .unwrap_or(0),
         Err(_) => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tiny-call headers carry the Go session id when given one (the
+    /// gateway 400s without it) and omit it otherwise — so non-Go providers
+    /// never see the header.
+    #[test]
+    fn tiny_headers_carry_session_only_when_given() {
+        let h = tiny_headers(config::ApiKind::OpenAiResponses, "k", "pir/0", "Bearer k", Some("sess-9"));
+        assert!(h.contains(&("user-agent", "pir/0")), "ua: {h:?}");
+        assert!(h.contains(&("Authorization", "Bearer k")), "auth: {h:?}");
+        assert!(
+            h.contains(&("x-opencode-session", "sess-9")),
+            "session header present: {h:?}"
+        );
+        let h = tiny_headers(config::ApiKind::OpenAiResponses, "k", "pir/0", "Bearer k", None);
+        assert!(
+            !h.iter().any(|(k, _)| *k == "x-opencode-session"),
+            "no session leak without an id: {h:?}"
+        );
+        // Empty ids are dropped, never sent blank.
+        let h = tiny_headers(config::ApiKind::OpenAi, "k", "pir/0", "Bearer k", Some(""));
+        assert!(
+            !h.iter().any(|(k, _)| *k == "x-opencode-session"),
+            "blank session id must not go out: {h:?}"
+        );
     }
 }

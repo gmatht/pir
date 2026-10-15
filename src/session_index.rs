@@ -64,6 +64,11 @@ pub struct Entry {
     /// Controlling terminal recovered from the `.status.json` sidecar.
     #[serde(default)]
     pub tty: String,
+    /// Working directory recovered from the `.status.json` sidecar
+    /// (canonicalized leniently). What bare `pir -r` matches on first, so a
+    /// warm start must not pay a sidecar re-read to learn it.
+    #[serde(default)]
+    pub cwd: String,
     /// First user prompt, for the picker/`/sessions` list.
     #[serde(default)]
     pub preview: String,
@@ -81,7 +86,7 @@ struct IndexFile {
 }
 
 /// Bumped on any change to [`Entry`]; a mismatch means "rebuild".
-const INDEX_VERSION: u32 = 1;
+const INDEX_VERSION: u32 = 2;
 
 /// Name of the index file, written next to the global sessions dir's parent so
 /// it covers the global store. The project-local store is indexed in the same
@@ -199,10 +204,11 @@ mod tests {
         let mut i = Index { entries: HashMap::new(), dirty: Vec::new() };
         i.entries.insert(
             "/a.jsonl".into(),
-            Entry { mtime: 100, bytes: 10, tty: "pts/3".into(), preview: "hi".into() },
+            Entry { mtime: 100, bytes: 10, tty: "pts/3".into(), cwd: "/w".into(), preview: "hi".into() },
         );
         let hit = i.lookup(Path::new("/a.jsonl"), 10, 100).expect("exact match hits");
         assert_eq!(hit.tty, "pts/3");
+        assert_eq!(hit.cwd, "/w");
         assert_eq!(hit.preview, "hi");
         assert!(i.lookup(Path::new("/a.jsonl"), 11, 100).is_none(), "size change must miss");
         assert!(i.lookup(Path::new("/a.jsonl"), 10, 101).is_none(), "mtime change must miss");
@@ -226,7 +232,7 @@ mod tests {
             assert!(i.lookup(Path::new("/x.jsonl"), 5, 7).is_none(), "empty index misses");
             i.put(
                 Path::new("/x.jsonl"),
-                Entry { mtime: 7, bytes: 5, tty: "pts/9".into(), preview: "p".into() },
+                Entry { mtime: 7, bytes: 5, tty: "pts/9".into(), cwd: "/x".into(), preview: "p".into() },
             );
             assert_eq!(i.dirty_len(), 1);
             i.save();
@@ -234,6 +240,7 @@ mod tests {
         let mut i2 = Index::load();
         let e = i2.lookup(Path::new("/x.jsonl"), 5, 7).expect("persisted entry hits");
         assert_eq!(e.tty, "pts/9");
+        assert_eq!(e.cwd, "/x");
         assert_eq!(e.preview, "p");
 
         match old {

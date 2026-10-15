@@ -342,6 +342,265 @@ pub fn lint_status(dir: &Path) -> LintStatus {
     partition(detect_lints(dir))
 }
 
+/// One way of measuring branch coverage: the binary that must exist, what it
+/// is for, the command fragment that enforces 100%, and how to install it.
+///
+/// Unlike [`LintTool`], the install is a full instruction rather than an apt
+/// package: coverage tools arrive via `cargo install`, `pip install` or `npx`,
+/// so an apt-only field cannot name them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageTool {
+    /// The binary that must be on `PATH` (probed with `command -v`).
+    pub tool: &'static str,
+    /// What this tool measures, including known metric limits.
+    pub purpose: &'static str,
+    /// The command fragment that measures branch coverage and fails below 100%.
+    pub command: &'static str,
+    /// How to install it. Empty when it ships with the toolchain (Go, gcov,
+    /// npx), so there is nothing to fetch.
+    pub install: &'static str,
+}
+
+impl CoverageTool {
+    const fn new(tool: &'static str, purpose: &'static str, command: &'static str, install: &'static str) -> CoverageTool {
+        CoverageTool { tool, purpose, command, install }
+    }
+
+    /// Does this tool need an install to be available?
+    pub fn needs_install(&self) -> bool {
+        !self.install.is_empty()
+    }
+}
+
+/// A detected language and every tool that could measure its branch coverage,
+/// best candidate first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoveragePlan {
+    /// The detected language (`rust`, `python`, …).
+    pub lang: &'static str,
+    /// The manifest/source pattern that identified the language.
+    pub detected_by: String,
+    /// Candidate tools, strongest first.
+    pub candidates: Vec<CoverageTool>,
+}
+
+impl CoveragePlan {
+    fn new(lang: &'static str, detected_by: &str, candidates: Vec<CoverageTool>) -> Self {
+        CoveragePlan { lang, detected_by: detected_by.to_string(), candidates }
+    }
+}
+
+/// A language whose branch coverage *can* be measured here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedCoverage {
+    pub lang: &'static str,
+    pub detected_by: String,
+    /// Installed tools, in candidate order. The first is the primary.
+    pub chosen: Vec<CoverageTool>,
+    /// Better tools that are absent — an upgrade offer, never a blocker.
+    pub extras: Vec<CoverageTool>,
+}
+
+impl SelectedCoverage {
+    /// The command to run: every installed tool's fragment, joined.
+    pub fn command(&self) -> String {
+        self.chosen.iter().map(|t| t.command).collect::<Vec<_>>().join(" ; ")
+    }
+}
+
+/// A language with no coverage tool available at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingCoverage {
+    pub lang: &'static str,
+    pub detected_by: String,
+    /// Every candidate, all absent.
+    pub candidates: Vec<CoverageTool>,
+}
+
+/// The result of matching the coverage plan against this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageStatus {
+    /// Languages with at least one installed coverage tool.
+    pub available: Vec<SelectedCoverage>,
+    /// Languages with none — must be surfaced, never counted as covered.
+    pub missing: Vec<MissingCoverage>,
+}
+
+impl CoverageStatus {
+    /// True when no coverage target was recognised at all.
+    pub fn is_empty(&self) -> bool {
+        self.available.is_empty() && self.missing.is_empty()
+    }
+}
+
+/// Detect the project's languages and, for each, the tools that could measure
+/// branch coverage.
+///
+/// Detection mirrors [`detect_lints`] (manifest-first, then top-level source
+/// files) so lint and coverage agree on which languages are present.
+pub fn detect_coverage(dir: &Path) -> Vec<CoveragePlan> {
+    let mut out: Vec<CoveragePlan> = Vec::new();
+
+    if has_file(dir, "Cargo.toml") {
+        out.push(CoveragePlan::new(
+            "rust",
+            "Cargo.toml",
+            vec![
+                CoverageTool::new(
+                    "cargo-llvm-cov",
+                    "LLVM branch coverage (requires nightly + llvm-tools-preview; stable fallback is line coverage)",
+                    "cargo llvm-cov --branch --fail-under-branches 100",
+                    "cargo install cargo-llvm-cov + rustup component add llvm-tools-preview --toolchain nightly",
+                ),
+                CoverageTool::new(
+                    "cargo-tarpaulin",
+                    "fallback line+branch coverage on stable Rust",
+                    "cargo tarpaulin --branch --fail-under 100",
+                    "cargo install cargo-tarpaulin",
+                ),
+            ],
+        ));
+    }
+
+    if has_file(dir, "pyproject.toml")
+        || has_file(dir, "setup.py")
+        || has_file(dir, "requirements.txt")
+        || has_ext(dir, "py")
+    {
+        out.push(CoveragePlan::new(
+            "python",
+            if has_file(dir, "pyproject.toml") { "pyproject.toml" } else { "*.py source" },
+            vec![
+                CoverageTool::new(
+                    "coverage",
+                    "branch coverage measurement + report",
+                    "coverage run --branch -m pytest -q && coverage report -m --fail-under=100",
+                    "pip install coverage pytest",
+                ),
+                CoverageTool::new(
+                    "pytest",
+                    "branch coverage via the pytest-cov plugin",
+                    "pytest --cov=. --cov-branch --cov-report=term-missing --fail-under=100 -q",
+                    "pip install pytest pytest-cov",
+                ),
+            ],
+        ));
+    }
+
+    if has_file(dir, "package.json") {
+        out.push(CoveragePlan::new(
+            "javascript",
+            "package.json",
+            vec![CoverageTool::new(
+                "npx",
+                "V8 branch coverage via c8, fetched on demand (Go-style: no install needed)",
+                "npx --yes c8 --100 npm test",
+                "",
+            )],
+        ));
+    }
+
+    if has_file(dir, "go.mod") {
+        out.push(CoveragePlan::new(
+            "go",
+            "go.mod",
+            vec![CoverageTool::new(
+                "go",
+                "statement coverage — Go has no branch metric, this is the closest available",
+                "go test -coverprofile=cover.out ./... && go tool cover -func=cover.out",
+                "",
+            )],
+        ));
+    }
+
+    let has_cpp_manifest = has_file(dir, "CMakeLists.txt")
+        || has_file(dir, "meson.build")
+        || has_file(dir, "configure.ac")
+        || has_file(dir, "CMakePresets.json");
+    let has_cpp_src = has_ext(dir, "cc") || has_ext(dir, "cpp") || has_ext(dir, "cxx");
+    if has_cpp_manifest || has_cpp_src {
+        out.push(CoveragePlan::new(
+            "cpp",
+            if has_cpp_manifest { "CMakeLists.txt" } else { "*.cpp/*.cc source" },
+            vec![
+                CoverageTool::new(
+                    "gcov",
+                    "GCC branch coverage (some exception-handling branches may be uncoverable — ledger them)",
+                    "g++ -O0 --coverage -fprofile-arcs -ftest-coverage <sources> -o /tmp/cov_test && /tmp/cov_test && gcov -b <sources>",
+                    "",
+                ),
+                CoverageTool::new(
+                    "lcov",
+                    "HTML/branch report over gcov data",
+                    "lcov --capture --directory . --output-file coverage.info --rc lcov_branch_coverage=1 && lcov --list coverage.info",
+                    "sudo apt-get install lcov",
+                ),
+            ],
+        ));
+    } else if has_ext(dir, "c") {
+        out.push(CoveragePlan::new(
+            "c",
+            "*.c source",
+            vec![
+                CoverageTool::new(
+                    "gcov",
+                    "GCC branch coverage",
+                    "gcc -O0 --coverage -fprofile-arcs -ftest-coverage <sources> -o /tmp/cov_test && /tmp/cov_test && gcov -b <sources>",
+                    "",
+                ),
+                CoverageTool::new(
+                    "lcov",
+                    "HTML/branch report over gcov data",
+                    "lcov --capture --directory . --output-file coverage.info --rc lcov_branch_coverage=1 && lcov --list coverage.info",
+                    "sudo apt-get install lcov",
+                ),
+            ],
+        ));
+    }
+
+    out
+}
+
+/// Match the coverage plan against what is installed, per language.
+///
+/// Same rule as [`partition`]: a language is `available` as soon as **one**
+/// candidate is installed.
+pub fn partition_coverage(plan: Vec<CoveragePlan>) -> CoverageStatus {
+    let mut available = Vec::new();
+    let mut missing = Vec::new();
+    for p in plan {
+        let mut chosen = Vec::new();
+        let mut absent = Vec::new();
+        for t in p.candidates {
+            if tool_available(t.tool) {
+                chosen.push(t);
+            } else {
+                absent.push(t);
+            }
+        }
+        if chosen.is_empty() {
+            missing.push(MissingCoverage {
+                lang: p.lang,
+                detected_by: p.detected_by,
+                candidates: absent,
+            });
+        } else {
+            available.push(SelectedCoverage {
+                lang: p.lang,
+                detected_by: p.detected_by,
+                chosen,
+                extras: absent,
+            });
+        }
+    }
+    CoverageStatus { available, missing }
+}
+
+/// Measure this project's branch-coverage readiness on this machine.
+pub fn coverage_status(dir: &Path) -> CoverageStatus {
+    partition_coverage(detect_coverage(dir))
+}
+
 /// Build the `/autoclean` prompt for this project.
 ///
 /// The shape is deliberately different from the old hardcoded string:
@@ -352,7 +611,12 @@ pub fn lint_status(dir: &Path) -> LintStatus {
 ///   offer to install rather than a silent skip;
 /// * an explicit "do not claim a clean bill of health you did not verify"
 ///   rule, so "no linter installed" can never be reported as "no findings".
-pub fn autoclean_prompt(dir: &Path) -> String {
+///
+/// When `with_coverage` is set (the `/autoclean coverage` opt-in), a second
+/// section is appended that drives the agent to measure branch coverage and
+/// write tests until it reaches 100% where possible — with an explicit
+/// uncovered-branch ledger for whatever cannot be covered.
+pub fn autoclean_prompt(dir: &Path, with_coverage: bool) -> String {
     let status = lint_status(dir);
 
     if status.is_empty() {
@@ -458,7 +722,133 @@ Never report 'no issues found' for code that was never checked.\n",
         "\nWhen every listed command is silent, re-run them all once more to confirm, then give a \
 short summary: what you fixed, and (if any) what you could not check and why.",
     );
+    if with_coverage {
+        append_coverage_section(dir, &mut s);
+    }
     s
+}
+
+/// Append the opt-in branch-coverage section to an `/autoclean` prompt.
+///
+/// The section mirrors the lint half: concrete per-language commands from the
+/// tools actually installed, an explicit missing-tool warning with an install
+/// offer, and a no-gaming rule so "100%" always means measured branches, not
+/// exclusions or lowered thresholds. Known metric limits are stated inline:
+/// Go measures statements (it has no branch metric), C++ exception-handling
+/// branches may be uncoverable, and Rust `--branch` needs nightly.
+fn append_coverage_section(dir: &Path, s: &mut String) {
+    let cov = coverage_status(dir);
+    if cov.is_empty() {
+        s.push_str(
+            "\n\nBranch coverage was requested, but no recognised coverage target was found, \
+so there is nothing to measure. Say so explicitly instead of guessing.",
+        );
+        return;
+    }
+
+    s.push_str(
+        "\n\nBranch coverage (opt-in): drive branch coverage to 100% where possible. For each \
+language below, run its coverage command, read the uncovered-branch report, write new tests \
+that exercise those branches, and re-run until the gate passes. Do not game the number: do \
+not add exclusions, do not lower thresholds, do not delete code to make the count. Repeat \
+at most a few rounds; if 100% is unreachable, keep the best result and ledger every \
+uncovered branch with its reason (dead code, defensive assert, platform-specific, C++ \
+exception-handling branch, Go statement-only limit). Re-run the lint commands above once \
+more at the end to confirm everything is still green.\n",
+    );
+
+    if !cov.available.is_empty() {
+        s.push_str("\nMeasure with these (each fails below 100%):\n");
+        for l in &cov.available {
+            s.push_str(&format!(
+                "\n* {lang} (detected via {by}) — measuring with {tools}:\n  {cmd}\n",
+                lang = l.lang,
+                by = l.detected_by,
+                tools = l
+                    .chosen
+                    .iter()
+                    .map(|t| format!("`{}` ({})", t.tool, t.purpose))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                cmd = l.command(),
+            ));
+        }
+        s.push_str(
+            "\nRust note: `--branch` needs nightly plus the llvm-tools component; without them \
+fall back to line coverage and say so. Go note: the percentage is statement coverage — \
+there is no branch metric to reach. C/C++ note: build the coverage binary with `-O0` and \
+run it before `gcov -b`; exception-handling branches that cannot be hit go in the ledger.",
+        );
+    } else {
+        s.push_str(
+            "\nNo coverage tool for this project is installed yet, so no branch coverage has been \
+measured. Deal with the install question below first, then measure whatever becomes available.\n",
+        );
+    }
+
+    let upgrades: Vec<(&str, &CoverageTool)> = cov
+        .available
+        .iter()
+        .flat_map(|l| l.extras.iter().map(move |t| (l.lang, t)))
+        .filter(|(_, t)| t.needs_install())
+        .collect();
+    if !upgrades.is_empty() {
+        s.push_str(
+            "\nThese coverage tools are also applicable but are not installed — an upgrade worth \
+offering, not a blocker:\n",
+        );
+        for (lang, t) in &upgrades {
+            s.push_str(&format!(
+                "  * {lang}: `{tool}` ({purpose}) — `{install}`\n",
+                lang = lang,
+                tool = t.tool,
+                purpose = t.purpose,
+                install = t.install,
+            ));
+        }
+    }
+
+    if !cov.missing.is_empty() {
+        s.push_str(
+            "\nIMPORTANT — a coverage tool this project needs is NOT installed, so its branch \
+coverage has NOT been measured. Do not describe that code as fully covered, and do not skip \
+it silently. Instead:\n",
+        );
+        for l in &cov.missing {
+            let list = l
+                .candidates
+                .iter()
+                .filter(|t| t.needs_install())
+                .map(|t| format!("`{}` ({})", t.tool, t.install))
+                .collect::<Vec<_>>()
+                .join(", or ");
+            let how = if list.is_empty() {
+                "ships with the toolchain".to_string()
+            } else {
+                format!("Install one: {list}")
+            };
+            s.push_str(&format!(
+                "  * {lang} (detected via {by}): none of {all} are available. {how}\n",
+                lang = l.lang,
+                by = l.detected_by,
+                all = l
+                    .candidates
+                    .iter()
+                    .map(|t| t.tool)
+                    .collect::<Vec<_>>()
+                    .join(" / "),
+                how = how,
+            ));
+        }
+        s.push_str(
+            "\nFor each missing coverage tool, call `ask_user_question` and ask whether to install \
+it (the install instruction is named above for each). If the operator agrees, use \
+`request_root` with intent `apt-install` and the named package — that queues an auditable \
+request; it does not escalate by itself. If the operator declines, or the install is \
+unavailable, say plainly in your final message which languages went unmeasured and why. \
+Never report '100% covered' for code that was never measured.\n",
+        );
+    }
 }
 
 #[cfg(test)]
@@ -634,7 +1024,7 @@ mod tests {
     fn a_fallback_keeps_the_language_out_of_the_unanalysed_bucket() {
         let t = Tmp::new("fallback");
         t.write("CMakeLists.txt").write("main.cpp");
-        let p = autoclean_prompt(&t.0);
+        let p = autoclean_prompt(&t.0, false);
         let st = lint_status(&t.0);
         let cpp_available = st.available.iter().any(|l| l.lang == "cpp");
         if cpp_available {
@@ -651,7 +1041,7 @@ mod tests {
     fn prompt_tells_the_model_not_to_claim_unanalysed_code_is_clean() {
         let t = Tmp::new("prompt");
         t.write("CMakeLists.txt").write("main.cpp");
-        let p = autoclean_prompt(&t.0);
+        let p = autoclean_prompt(&t.0, false);
         let cpp_unanalysed = lint_status(&t.0).missing.iter().any(|m| m.lang == "cpp");
         if cpp_unanalysed {
             assert!(p.contains("NOT installed"), "must flag it: {p}");
@@ -669,7 +1059,7 @@ mod tests {
     #[test]
     fn an_unrecognised_tree_says_so_instead_of_guessing() {
         let t = Tmp::new("empty");
-        let p = autoclean_prompt(&t.0);
+        let p = autoclean_prompt(&t.0, false);
         assert!(p.contains("no recognised build manifest"), "got: {p}");
     }
 
@@ -731,9 +1121,136 @@ mod tests {
     fn rust_projects_still_get_build_test_and_clippy() {
         let t = Tmp::new("rust");
         t.write("Cargo.toml").write("main.rs");
-        let p = autoclean_prompt(&t.0);
+        let p = autoclean_prompt(&t.0, false);
         assert!(p.contains("cargo build"), "must still build");
         assert!(p.contains("cargo test"), "must still test");
         assert!(p.contains("clippy"), "must now also lint");
+    }
+
+    /// Pick a coverage plan entry for `lang`, failing loudly if missed.
+    fn cov_for(dir: &Path, lang: &str) -> CoveragePlan {
+        detect_coverage(dir)
+            .into_iter()
+            .find(|p| p.lang == lang)
+            .unwrap_or_else(|| panic!("{lang} coverage not detected"))
+    }
+
+    /// Rust coverage leads with LLVM branch coverage and names the install.
+    #[test]
+    fn coverage_detects_rust_and_leads_with_llvm_branch_coverage() {
+        let t = Tmp::new("covrust");
+        t.write("Cargo.toml").write("main.rs");
+        let rust = cov_for(&t.0, "rust");
+        assert_eq!(rust.candidates[0].tool, "cargo-llvm-cov");
+        assert!(rust.candidates[0].command.contains("--branch"));
+        assert!(rust.candidates[0].command.contains("100"));
+        assert!(rust.candidates[0].needs_install());
+    }
+
+    /// Python coverage must carry the branch flag and a 100 gate.
+    #[test]
+    fn coverage_python_measures_branches_and_gates_at_100() {
+        let t = Tmp::new("covpy");
+        t.write("pyproject.toml");
+        let py = cov_for(&t.0, "python");
+        assert!(py.candidates.iter().any(|c| c.command.contains("--branch")),
+                "at least one python candidate must pass --branch");
+        assert!(py.candidates.iter().any(|c| c.command.contains("100")),
+                "at least one python candidate must gate at 100");
+    }
+
+    /// JS coverage goes through npx/c8 with a 100 gate and needs no install
+    /// (npx ships with node and fetches c8 on demand).
+    #[test]
+    fn coverage_js_uses_c8_100_via_npx_with_no_install() {
+        let t = Tmp::new("covjs");
+        t.write("package.json");
+        let js = cov_for(&t.0, "javascript");
+        let c8 = js.candidates.iter().find(|c| c.tool == "npx").expect("npx candidate");
+        assert!(c8.command.contains("c8") && c8.command.contains("--100"), "got: {}", c8.command);
+        assert!(!c8.needs_install(), "npx ships with node — nothing to install");
+    }
+
+    /// Go has no branch metric: the candidate must say statement-only and use
+    /// the coverprofile workflow.
+    #[test]
+    fn coverage_go_is_statement_only_via_coverprofile() {
+        let t = Tmp::new("covgo");
+        t.write("go.mod");
+        let go = cov_for(&t.0, "go");
+        let g = &go.candidates[0];
+        assert_eq!(g.tool, "go");
+        assert!(g.command.contains("-coverprofile"), "got: {}", g.command);
+        assert!(g.purpose.contains("no branch metric") || g.purpose.contains("statement"),
+                "must disclose the metric limit: {}", g.purpose);
+        assert!(!g.needs_install());
+    }
+
+    /// C coverage offers `gcov -b` with nothing to install.
+    #[test]
+    fn coverage_c_offers_gcov_branch_with_no_install() {
+        let t = Tmp::new("covc");
+        t.write("main.c");
+        let c = cov_for(&t.0, "c");
+        let gcov = c.candidates.iter().find(|x| x.tool == "gcov").expect("gcov candidate");
+        assert!(gcov.command.contains("gcov -b"), "got: {}", gcov.command);
+        assert!(!gcov.needs_install());
+    }
+
+    /// The opt-in flag must add a branch-coverage section, and the default
+    /// path must stay byte-clean of it (existing behaviour unchanged).
+    #[test]
+    fn coverage_section_is_opt_in_only() {
+        let t = Tmp::new("covopt");
+        t.write("Cargo.toml").write("main.rs");
+        let off = autoclean_prompt(&t.0, false);
+        let on = autoclean_prompt(&t.0, true);
+        assert!(!off.contains("Branch coverage"), "default prompt must not mention coverage");
+        assert!(on.contains("Branch coverage"), "opt-in prompt must add the section: {on}");
+        assert!(on.contains("100%"), "must state the target");
+        assert!(on.contains("Do not game"), "must forbid gaming the number: {on}");
+        assert!(on.contains("ledger"), "must demand an uncovered-branch ledger: {on}");
+        assert!(on.contains("Never report '100% covered'"),
+                "must forbid a false coverage bill: {on}");
+    }
+
+    /// Coverage partition obeys the same invariant as lint partition: chosen
+    /// tools are installed, extras/missing are not.
+    #[test]
+    fn coverage_missing_tools_are_separated_from_available_ones() {
+        let t = Tmp::new("covpart");
+        t.write("Cargo.toml");
+        let st = partition_coverage(detect_coverage(&t.0));
+        for l in &st.available {
+            for e in &l.extras {
+                assert!(!tool_available(e.tool), "{} installed but listed as an extra", e.tool);
+            }
+            let cmd = l.command();
+            for tool in &l.chosen {
+                assert!(cmd.contains(tool.command), "command missing {}", tool.tool);
+            }
+        }
+        for l in &st.missing {
+            for c in &l.candidates {
+                assert!(!tool_available(c.tool), "{} installed but reported missing", c.tool);
+            }
+        }
+    }
+
+    /// Lint and coverage agree on which languages exist: every lint language
+    /// in a mixed tree has a coverage plan too.
+    #[test]
+    fn lint_and_coverage_detect_the_same_languages() {
+        let t = Tmp::new("covagree");
+        t.write("Cargo.toml").write("pyproject.toml").write("go.mod").write("package.json");
+        let lints: Vec<&str> = detect_lints(&t.0).iter().map(|p| p.lang).collect();
+        let covs: Vec<&str> = detect_coverage(&t.0).iter().map(|p| p.lang).collect();
+        for lang in lints {
+            // C/C++ detection needs source files, which this tree lacks — every
+            // manifest-driven language must agree.
+            if ["rust", "python", "javascript", "go"].contains(&lang) {
+                assert!(covs.contains(&lang), "{lang} detected for lint but not coverage");
+            }
+        }
     }
 }

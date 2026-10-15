@@ -350,7 +350,7 @@ fn list_jobs(s: &mut GuiState) {
 const HELP_GUI: &str = "\
 commands:
   /help                 this list
-  /model <sel>          switch model      /models      list every model
+  /model [prefix]       recent-first picker   /models      list every model
   /usage                tokens this session
   /goal [obj]           show or start the standing goal
   /continue             drive the goal to completion
@@ -3158,7 +3158,6 @@ mod gui_completion_tests {
                         reasoning: false,
                         thinking_format: None,
                         supports_reasoning_effort: None,
-                        session_affinity_format: None,
                         thinking_level_map: Default::default(),
                         price_per_1k: None,
                     },
@@ -3173,7 +3172,6 @@ mod gui_completion_tests {
                         reasoning: false,
                         thinking_format: None,
                         supports_reasoning_effort: None,
-                        session_affinity_format: None,
                         thinking_level_map: Default::default(),
                         price_per_1k: None,
                     },
@@ -4022,7 +4020,6 @@ mod gui_design_parity_tests {
                     reasoning: false,
                     thinking_format: None,
                     supports_reasoning_effort: None,
-                    session_affinity_format: None,
                     thinking_level_map: Default::default(),
                     price_per_1k: None,
                 },
@@ -4037,7 +4034,6 @@ mod gui_design_parity_tests {
                     reasoning: false,
                     thinking_format: None,
                     supports_reasoning_effort: None,
-                    session_affinity_format: None,
                     thinking_level_map: Default::default(),
                     price_per_1k: None,
                 },
@@ -4052,7 +4048,6 @@ mod gui_design_parity_tests {
                     reasoning: false,
                     thinking_format: None,
                     supports_reasoning_effort: None,
-                    session_affinity_format: None,
                     thinking_level_map: Default::default(),
                     price_per_1k: None,
                 },
@@ -4263,7 +4258,6 @@ mod gui_design_parity_tests {
                 reasoning: false,
                 thinking_format: None,
                 supports_reasoning_effort: None,
-                session_affinity_format: None,
                 thinking_level_map: Default::default(),
                 price_per_1k: None,
             }],

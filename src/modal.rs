@@ -52,6 +52,13 @@ pub fn keyboard_held() -> bool {
     KEYBOARD_HELD.load(Ordering::SeqCst)
 }
 
+/// Test-only: pretend a modal owns (or released) the screen, so tick-pause
+/// behaviour can be probed without a tty (`Modal::enter` refuses non-ttys).
+#[cfg(test)]
+pub(crate) fn set_keyboard_held_for_test(v: bool) {
+    KEYBOARD_HELD.store(v, Ordering::SeqCst);
+}
+
 /// A key the user pressed in a modal dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
@@ -477,6 +484,7 @@ pub enum MenuAction {
     Security,
     Settings,
     Worktrees,
+    AutocleanCoverage,
     Help,
     About,
     Quit,
@@ -495,6 +503,7 @@ pub fn main_menu() -> Option<MenuAction> {
         ("s", "Security"),
         ("e", "Settings"),
         ("w", "Worktrees by default"),
+        ("c", "Autoclean branch coverage"),
         ("h", "Help"),
         ("a", "About"),
         ("q", "Quit"),
@@ -535,6 +544,7 @@ fn action_for(key: &str) -> MenuAction {
         "s" => MenuAction::Security,
         "e" => MenuAction::Settings,
         "w" => MenuAction::Worktrees,
+        "c" => MenuAction::AutocleanCoverage,
         "h" => MenuAction::Help,
         "a" => MenuAction::About,
         "q" => MenuAction::Quit,
@@ -835,11 +845,57 @@ pub fn session_selector(rows: &[SessionRow]) -> Option<SessionPick> {
     }
 }
 
+/// What a keypress does to the model picker's selection: move it, or commit
+/// (with the flat index), or nothing. Pure so the key map can be tested without
+/// a tty (see `model_picker_key_tests`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelPickAction {
+    Move(usize),
+    Commit(usize),
+    Cancel,
+    Ignore,
+}
+
+/// The model picker's key map, pure: given the row count, the current
+/// selection, and a key, decide what happens. `rows[i].0` — the flat index
+/// shown as `:N` — is what a digit jumps to and what Enter commits.
+///
+/// A digit jumps to the row whose *displayed* `:N` it names (the same numbering
+/// `list_models` prints and `config::select(":N")` resolves), so pressing `3`
+/// selects the row labelled `:3`. Both the `:N` label and the position are the
+/// same number here because rows are built in flat order; keying off the label
+/// (not the offset) keeps them in step if that ever changes.
+fn model_pick_action(rows: &[(usize, String, String, bool)], selected: usize, key: Key) -> ModelPickAction {
+    match key {
+        Key::Up | Key::Char('k') => ModelPickAction::Move(selected.saturating_sub(1)),
+        Key::Down | Key::Char('j') => ModelPickAction::Move((selected + 1).min(rows.len() - 1)),
+        Key::Home => ModelPickAction::Move(0),
+        Key::End => ModelPickAction::Move(rows.len().saturating_sub(1)),
+        Key::Enter | Key::Right => ModelPickAction::Commit(rows[selected].0),
+        Key::Esc | Key::CtrlC | Key::CtrlD => ModelPickAction::Cancel,
+        // A digit selects the row labelled `:N` (1-based on screen is `:0`-based
+        // in the label, so the digit IS the index). Out-of-range digits are
+        // ignored, exactly like the session picker's (`picker.rs`).
+        Key::Char(c) if c.is_ascii_digit() => {
+            let n = c.to_digit(10).unwrap_or(0) as usize;
+            match rows.iter().position(|r| r.0 == n) {
+                Some(i) => ModelPickAction::Move(i),
+                None => ModelPickAction::Ignore,
+            }
+        }
+        _ => ModelPickAction::Ignore,
+    }
+}
+
 /// Show a model picker on the alternate screen. `providers` is the catalog in
 /// `/models` order; `current` is the active `provider/model` label (e.g.
 /// `openai/gpt-fake`) to highlight, or `""` for none. Returns the chosen flat
 /// index into the provider→model list (matches `config::select(":N")`), or
 /// `None` if not a tty / the list is empty / cancelled.
+///
+/// Keys: Up/Down (or `j`/`k`) move, Home/End jump to the ends, a **digit**
+/// jumps to the row labelled `:N`, Enter/Right commit the highlighted row,
+/// Esc/ctrl-c/ctrl-d cancel.
 pub fn model_picker(providers: &[crate::config::Provider], current: &str) -> Option<usize> {
     let _modal = Modal::enter()?;
     let mut rows: Vec<(usize, String, String, bool)> = Vec::new();
@@ -866,15 +922,191 @@ pub fn model_picker(providers: &[crate::config::Provider], current: &str) -> Opt
                 format!("{marker} {:>3}  {:<w$}  {}{}  ", ix, term::cyan(pid), label, cur_mark)
             })
             .collect();
+        // The `:N` left of each row is a *key* now, not just an id: say so, or
+        // the digit shortcut stays as undiscoverable as the arrows were before.
+        // Appended inside the box (like the option dialog's hint) rather than
+        // printed outside, which would re-emit on every arrow keypress.
+        let mut lines = lines;
+        lines.push(String::new());
+        lines.push(term::dim("[↑↓/jk] move  [0-9] jump to that :N  [enter] pick  [esc] cancel").to_string());
         draw_box("pir — choose model", &lines);
-        match read_key()? {
-            Key::Up | Key::Char('k') => selected = selected.saturating_sub(1),
-            Key::Down | Key::Char('j') => selected = (selected + 1).min(rows.len() - 1),
-            Key::Home => selected = 0,
-            Key::End => selected = rows.len() - 1,
-            Key::Enter | Key::Right => return Some(rows[selected].0),
-            Key::Esc | Key::CtrlC | Key::CtrlD => return None,
-            _ => {}
+        match model_pick_action(&rows, selected, read_key()?) {
+            ModelPickAction::Move(i) => selected = i,
+            ModelPickAction::Commit(i) => return Some(i),
+            ModelPickAction::Cancel => return None,
+            ModelPickAction::Ignore => {}
+        }
+    }
+}
+
+/// What a keypress does to the *inline* model list: move the highlight, commit
+/// a row, cancel, or nothing. Pure so the key map can be tested without a tty.
+///
+/// `Commit(i)` carries a *row position* (0-based), the same position
+/// `model_history::format_rows` numbers on screen, so pressing `2` and typing
+/// `/model2` name the same model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InlineModelAction {
+    Move(usize),
+    Commit(usize),
+    Cancel,
+    Ignore,
+}
+
+/// The inline list's key map, pure: `n` rows, the current highlight, a key.
+///
+///   * Up/Down move, clamped at the ends (Home/End jump);
+///   * a digit `1`…`n` **commits** that row outright — the interactive twin of
+///     `/model2`, so both routes pick the same model with one keystroke;
+///   * Enter commits the highlighted row;
+///   * Esc/ctrl-c/ctrl-d cancel (no switch).
+fn inline_model_action(n: usize, selected: usize, key: Key) -> InlineModelAction {
+    if n == 0 {
+        return InlineModelAction::Ignore;
+    }
+    let last = n - 1;
+    match key {
+        Key::Up | Key::Char('k') => InlineModelAction::Move(selected.saturating_sub(1)),
+        Key::Down | Key::Char('j') => InlineModelAction::Move((selected + 1).min(last)),
+        Key::Home => InlineModelAction::Move(0),
+        Key::End => InlineModelAction::Move(last),
+        Key::Enter | Key::Right => InlineModelAction::Commit(selected.min(last)),
+        Key::Esc | Key::CtrlC | Key::CtrlD => InlineModelAction::Cancel,
+        Key::Char(c) if c.is_ascii_digit() => {
+            // `0` is not a row (the list is 1-based); out-of-range digits are
+            // ignored rather than clamped, so a fat-fingered `9` never silently
+            // switches to the last model.
+            let d = c.to_digit(10).unwrap_or(0) as usize;
+            if d >= 1 && d <= n {
+                InlineModelAction::Commit(d - 1)
+            } else {
+                InlineModelAction::Ignore
+            }
+        }
+        _ => InlineModelAction::Ignore,
+    }
+}
+
+/// Guard that puts the terminal in raw mode for an *inline* picker without
+/// taking the alternate screen: the list stays in the normal scrollback (it is
+/// a menu printed at the prompt, not a dialog that covers the session), but the
+/// arrow keys still arrive as keypresses instead of being line-buffered.
+struct InlineRaw {
+    active: bool,
+}
+
+impl InlineRaw {
+    fn enter() -> Option<InlineRaw> {
+        if !crate::term::is_terminal() {
+            return None;
+        }
+        // Claim the keyboard exactly like `Modal::enter`: the REPL's mid-turn
+        // reader also reads fd 0, and two readers on one tty is a race the
+        // operator loses.
+        KEYBOARD_HELD.store(true, Ordering::SeqCst);
+        if enable_raw_mode().is_err() {
+            KEYBOARD_HELD.store(false, Ordering::SeqCst);
+            return None;
+        }
+        // Drop keypresses queued *before* the picker opened — e.g. the Enter
+        // that submitted `/model`. Otherwise it is read as the first key and
+        // commits the highlighted row before the operator has seen the list.
+        while event::poll(Duration::ZERO).unwrap_or(false) {
+            let _ = event::read();
+        }
+        Some(InlineRaw { active: true })
+    }
+}
+
+impl Drop for InlineRaw {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        KEYBOARD_HELD.store(false, Ordering::SeqCst);
+        let _ = disable_raw_mode();
+    }
+}
+
+/// Print `labels` as a numbered list (one model per line) in the normal screen
+/// and let the operator pick with Up/Down (Enter commits) or by pressing the
+/// row's number. Returns the chosen position, or `None` when the list is empty,
+/// the terminal is not a tty, or the operator cancelled.
+///
+/// This is the bare-`/model` browse: the [`crate::model_history::TOP_N`] most
+/// recent models, in scrollback, instead of the alternate-screen catalog
+/// picker (`model_picker`, which `/models` still opens). Each Up/Down redraws
+/// only the block just printed, so the surrounding session is untouched.
+pub fn model_list_picker(labels: &[String], current: &str) -> Option<usize> {
+    if labels.is_empty() {
+        return None;
+    }
+    let _raw = InlineRaw::enter()?;
+    // Start on the active model (or the first row) so the first Up/Down moves
+    // somewhere meaningful, matching the alternate-screen picker.
+    let mut selected = labels.iter().position(|l| l == current).unwrap_or(0);
+
+    // The block is the models plus the key hint line.
+    let block = labels.len() + 1;
+    let mut out = io::stdout();
+
+    // Reserve `block` clean rows at the bottom of the screen and park the
+    // cursor on the block's first row. Printing straight down from wherever
+    // the prompt left the cursor ran the tail off the bottom of the screen (and
+    // over the persistent footer), which is what lost a row of the list. Park
+    // at the bottom row, emit `block` newlines to scroll exactly that many
+    // blank rows in, then step back up to the top of them. Absolute moves only,
+    // so this is independent of where the line editor thinks the cursor is.
+    if crate::term::is_terminal() {
+        let h = crate::term::terminal_height().max(3);
+        let block = block.min(h - 1).max(1);
+        let mut buf = format!("\x1b[{};1H", h);
+        for _ in 0..block {
+            buf.push_str("\r\n");
+        }
+        buf.push_str(&format!("\x1b[{}A\r", block));
+        let _ = out.write_all(buf.as_bytes());
+        let _ = out.flush();
+    }
+
+    let mut drawn = 0usize;
+    loop {
+        // Repaint the block in place: move back up over the previous frame and
+        // clear downward, then write the rows. Reusing `format_rows` for both
+        // the first paint and every redraw is what keeps the number on screen
+        // and the number in `/modelN` the same thing.
+        let mut buf = String::new();
+        if drawn > 0 {
+            buf.push_str(&format!("\r\x1b[{}A\x1b[J", drawn));
+        }
+        for row in crate::model_history::format_rows(labels, Some(selected), current) {
+            buf.push_str(&row);
+            buf.push_str("\r\n");
+        }
+        buf.push_str(&term::dim("[↑↓/jk] move  [1-5] pick  [enter] choose  [esc] cancel"));
+        buf.push_str("\r\n");
+        let _ = out.write_all(buf.as_bytes());
+        let _ = out.flush();
+        drawn = labels.len() + 1;
+
+        match inline_model_action(labels.len(), selected, read_key()?) {
+            InlineModelAction::Move(i) => selected = i,
+            InlineModelAction::Commit(i) => {
+                // Seal the block with a newline so the caller's next output and
+                // the idle prompt zone start *below* it. Without this the prompt
+                // rule is redrawn at the cursor (still inside the list) and cuts
+                // across its tail.
+                let _ = out.write_all(b"\r\n");
+                let _ = out.flush();
+                return Some(i);
+            }
+            InlineModelAction::Cancel => {
+                let _ = out.write_all(b"\r\n");
+                let _ = out.flush();
+                return None;
+            }
+            InlineModelAction::Ignore => {}
         }
     }
 }
@@ -1128,10 +1360,54 @@ pub fn thinking_picker(
     }
 }
 
+/// What one keypress means in the option list of [`question_dialog`].
+///
+/// Extracted so the mapping is unit-testable without a terminal — and so the
+/// tests pin the function the dialog actually calls (see `window_start`,
+/// which was once re-inlined in the dialog and left the suite asserting a
+/// copy nobody ran).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionKeyAction {
+    MoveUp,
+    MoveDown,
+    PageUp,
+    PageDown,
+    /// Space in a multi-select dialog: toggle the highlighted row.
+    Toggle,
+    /// A `1`-`9` digit: the 0-based option row it targets.
+    Digit(usize),
+    /// Confirm (Enter): choose the highlighted row / checked set.
+    Confirm,
+    /// Esc / ctrl-c / ctrl-d: dismiss without answering.
+    Dismiss,
+    /// Anything else — **including Left and Right** — does nothing. A decision
+    /// dialog must never answer on a sideways arrow: in plan review → on the
+    /// "Revise" row confirmed a rejection the operator never meant, and the
+    /// plan came back "NOT approved".
+    Ignore,
+}
+
+/// Classify one keypress in the option list of [`question_dialog`]. The loop
+/// below dispatches on this, so every mapping here is the live behaviour.
+fn classify_option_key(key: Key, multi: bool) -> OptionKeyAction {
+    match key {
+        Key::Up | Key::Char('k') => OptionKeyAction::MoveUp,
+        Key::Down | Key::Char('j') => OptionKeyAction::MoveDown,
+        Key::PageUp => OptionKeyAction::PageUp,
+        Key::PageDown => OptionKeyAction::PageDown,
+        Key::Char(' ') if multi => OptionKeyAction::Toggle,
+        Key::Char(c @ '1'..='9') => OptionKeyAction::Digit((c as usize) - ('1' as usize)),
+        Key::Enter => OptionKeyAction::Confirm,
+        Key::Esc | Key::CtrlC | Key::CtrlD => OptionKeyAction::Dismiss,
+        _ => OptionKeyAction::Ignore,
+    }
+}
+
 /// Show an `ask_user_question` dialog on the alternate screen and return the
 /// operator's answer (Feature 3). One question per dialog: a header title, the
 /// question body (wrapped), the option list (with descriptions), and a hint
-/// footer. Number keys jump straight to an option; arrows + Enter select.
+/// footer. Number keys jump straight to an option; Up/Down + Enter select
+/// (Left/Right are ignored, so → can never confirm the wrong row).
 /// For multi-select, Space toggles and Enter confirms.
 ///
 /// When the question has no options this becomes a free-text entry dialog, so
@@ -1142,18 +1418,35 @@ pub fn question_dialog(q: &crate::askuser::Question) -> Option<crate::askuser::A
     let _modal = Modal::enter()?;
     if q.options.is_empty() {
         // Free-text: reuse the secret-entry loop but echo the text (this is not
-        // a credential, so masking would be hostile).
+        // a credential, so masking would be hostile). A long question pages
+        // with PgUp/PgDn like the options branch — an uncapped draw would
+        // silently clip off the bottom of a small box.
         let mut buf = String::new();
+        let mut q_first = 0usize;
         loop {
-            let mut lines = wrap_lines(&q.question, 72);
+            let capacity = crate::term::terminal_height().saturating_sub(4).max(1);
+            let q_wrapped = wrap_lines(&q.question, 72);
+            // Chrome below the question: blank + input + blank + hint.
+            let q_budget = q_wrapped.len().min(capacity.saturating_sub(4)).max(1);
+            q_first = q_first.min(q_wrapped.len().saturating_sub(q_budget));
+            let mut lines = window_question(&q_wrapped, q_first, q_budget);
             lines.push(String::new());
             lines.push(format!("  {}", if buf.is_empty() { "(type your answer)".to_string() } else { buf.clone() }));
             lines.push(String::new());
-            lines.push(crate::term::dim("[enter] submit  [esc] dismiss  [backspace] delete").to_string());
+            let footer = if q_wrapped.len() > q_budget {
+                "[enter] submit  [esc] dismiss  [backspace] delete  [PgUp/PgDn] scroll"
+            } else {
+                "[enter] submit  [esc] dismiss  [backspace] delete"
+            };
+            lines.push(crate::term::dim(footer).to_string());
             draw_box_titled(&format!("⏸ pir — {} — waiting for you", q.header), &lines, true);
             match read_key()? {
                 Key::Enter => return Some(Answer::Text(buf)),
                 Key::Esc | Key::CtrlC => return Some(Answer::Dismissed),
+                Key::PageUp => q_first = q_first.saturating_sub(q_budget),
+                Key::PageDown => {
+                    q_first = (q_first + q_budget).min(q_wrapped.len().saturating_sub(q_budget));
+                }
                 Key::Char('\u{8}') => {
                     buf.pop();
                 }
@@ -1166,6 +1459,9 @@ pub fn question_dialog(q: &crate::askuser::Question) -> Option<crate::askuser::A
     let multi = q.multi_select;
     let mut selected = 0usize;
     let mut checked: Vec<bool> = vec![false; q.options.len()];
+    // First visible row of the question window: PgUp/PgDn page through a
+    // question taller than the box (plan bodies on small terminals).
+    let mut q_first = 0usize;
     loop {
         // Rows are laid out once, so the viewport is just a window over them
         // and the drawn text always matches the highlighted row.
@@ -1202,45 +1498,72 @@ pub fn question_dialog(q: &crate::askuser::Question) -> Option<crate::askuser::A
         // function the dialog never called: the fix they were written for
         // could regress without a single test noticing, because the only
         // code under test was the copy nobody ran.
-        let viewport = modal_body_rows();
+        // Everything the box must draw, budgeted so nothing is cut off the
+        // bottom (the screenshot bug: option 2 and the hint vanished because the
+        // viewport ignored the question and hint rows).
+        //
+        // The QUESTION is budgeted first: it is the decision payload (the
+        // whole plan body in plan review), while the option list can scroll.
+        // The old math sized the option viewport first (terminal - 9 rows)
+        // and left the question a single row, so every long question —
+        // every plan review — collapsed to "(question truncated) …" and the
+        // plan was never readable. Fixed chrome, in rows: blank + blank +
+        // hint = 3; the scroll notice (when the options overflow) and at
+        // least one option row come out of the same box.
+        let capacity = crate::term::terminal_height().saturating_sub(4).max(1);
+        let q_wrapped = wrap_lines(&q.question, 72);
+        let (q_budget, viewport, show_notice) =
+            dialog_layout(capacity, q_wrapped.len(), rows.len());
+        // A resize can shrink the box under the scroll offset: clamp it back
+        // into range every frame so the window never runs past the text.
+        q_first = q_first.min(q_wrapped.len().saturating_sub(q_budget));
+        let question_block = window_question(&q_wrapped, q_first, q_budget);
+        // The scroll keys are only advertised when there is anything to
+        // scroll to — a fitting question keeps the short hint.
+        let scroll_hint = if q_wrapped.len() > q_budget { "  [PgUp/PgDn] scroll" } else { "" };
+        let hint = if multi {
+            format!("[space] toggle  [enter] confirm  [1-9] toggle  [esc] dismiss{scroll_hint}")
+        } else {
+            format!("[enter] choose  [1-9] choose  [esc] dismiss{scroll_hint}")
+        };
         let first = window_start(selected, rows.len(), viewport);
         let visible: Vec<String> = rows[first..(first + viewport).min(rows.len())].to_vec();
 
-        let mut lines = wrap_lines(&q.question, 72);
+        let mut lines = question_block;
         lines.push(String::new());
         lines.extend(visible);
         lines.push(String::new());
-        let hint = if multi {
-            "[space] toggle  [enter] confirm  [1-9] toggle  [esc] dismiss"
-        } else {
-            "[enter] choose  [1-9] choose  [esc] dismiss"
-        };
         // Say so when the list is taller than the box, so a scroll is never a
         // silent truncation.
-        if first + viewport < rows.len() {
+        if show_notice {
             lines.push(crate::term::dim(&format!(
                 "… {} more (↑↓ to scroll)",
                 rows.len() - (first + viewport)
             )).to_string());
         }
-        lines.push(crate::term::dim(hint).to_string());
+        lines.push(crate::term::dim(&hint).to_string());
         draw_box_titled(&format!("⏸ pir — {} — waiting for you", q.header), &lines, true);
         let key = match read_key() {
             Some(k) => k,
             None => return Some(Answer::Dismissed),
         };
-        match key {
-            Key::Up | Key::Char('k') => selected = selected.saturating_sub(1),
-            Key::Down | Key::Char('j') => selected = (selected + 1).min(q.options.len() - 1),
-            Key::Char(' ') if multi => checked[selected] = !checked[selected],
-            Key::Char(c @ '1'..='9') => {
+        match classify_option_key(key, multi) {
+            OptionKeyAction::MoveUp => selected = selected.saturating_sub(1),
+            OptionKeyAction::MoveDown => selected = (selected + 1).min(q.options.len() - 1),
+            // Page through the question window (a no-op when it all fits —
+            // the offset clamps to 0 and the hint stays short).
+            OptionKeyAction::PageUp => q_first = q_first.saturating_sub(q_budget),
+            OptionKeyAction::PageDown => {
+                q_first = (q_first + q_budget).min(q_wrapped.len().saturating_sub(q_budget));
+            }
+            OptionKeyAction::Toggle => checked[selected] = !checked[selected],
+            OptionKeyAction::Digit(idx) => {
                 // The rows are numbered from 1 on screen (see the `{i})` label
                 // below), so the digit key must mean the same 1-based option.
                 // These used to disagree: the label printed the 0-based index
                 // while this handler subtracted 1, so pressing `1` answered the
                 // row labelled `0)` and any option past the ninth had no digit
                 // at all — "I can't get to 3-9".
-                let idx = (c as usize) - ('1' as usize);
                 if idx < q.options.len() {
                     if multi {
                         checked[idx] = !checked[idx];
@@ -1249,7 +1572,7 @@ pub fn question_dialog(q: &crate::askuser::Question) -> Option<crate::askuser::A
                     }
                 }
             }
-            Key::Enter | Key::Right => {
+            OptionKeyAction::Confirm => {
                 if multi {
                     let chosen: Vec<String> = q
                         .options
@@ -1262,10 +1585,105 @@ pub fn question_dialog(q: &crate::askuser::Question) -> Option<crate::askuser::A
                 }
                 return Some(Answer::Chosen(vec![q.options[selected].label.clone()]));
             }
-            Key::Esc | Key::CtrlC | Key::CtrlD => return Some(Answer::Dismissed),
-            _ => {}
+            OptionKeyAction::Dismiss => return Some(Answer::Dismissed),
+            OptionKeyAction::Ignore => {}
         }
     }
+}
+
+/// How many rows the question dialog can spend on **option rows**, given a
+/// terminal of `terminal_rows` rows and the number of rows its fixed chrome
+/// (question block + blank separators + hint + scroll notice) needs.
+///
+/// The bug this exists for: the dialog sized its option viewport with a flat
+/// `terminal_height - 6` and *then* prepended the wrapped question, a
+/// blank separator, the hint and (when scrolling) a "… N more" line into the
+/// same body. Those are all rows too, so the body overflowed `draw_box_titled`'s
+/// `h - 4` capacity and the renderer's `.take(body_h)` dropped rows **from the
+/// bottom** — the last visible option and the control hint vanished, leaving a
+/// dialog whose second option and bottom border the operator never saw.
+///
+/// The `-4` here matches `draw_box_titled`'s own capacity (2 border rows + 2
+/// title/footer rows) so the two can never disagree again; `chrome` covers
+/// every other non-option row. Always at least 1 so the list is never empty.
+fn option_viewport(terminal_rows: usize, chrome: usize) -> usize {
+    terminal_rows
+        .saturating_sub(4) // the box border + title/footer rows the renderer keeps
+        .saturating_sub(chrome)
+        .max(1)
+}
+
+/// Split the dialog's body budget (`capacity` rows) between the wrapped
+/// question block and the option viewport: `(question_rows, viewport_rows,
+/// show_scroll_notice)`.
+///
+/// The question is budgeted first — up to everything but the fixed chrome
+/// (blank + blank + hint), one option row, and one spare row for a possible
+/// scroll notice — because it carries the decision (a plan body), while the
+/// option list scrolls. The options then take the remainder; when they don't
+/// fit, the notice takes one row and the viewport shows a scrolling window
+/// (never zero rows). Total emitted rows (`question + blank + viewport +
+/// blank + notice? + hint`) never exceed `capacity`, so the renderer can't
+/// clip the hint or the last option off the bottom.
+///
+/// Built on [`option_viewport`] (same capacity contract); cut ends are
+/// marked by [`window_question`] instead of ending silently.
+fn dialog_layout(capacity: usize, q_lines: usize, option_rows: usize) -> (usize, usize, bool) {
+    let h = capacity.saturating_add(4);
+    // Question first: everything past chrome, one option row, one notice spare.
+    let q_budget = q_lines.min(h.saturating_sub(4 + 3 + 1 + 1)).max(1);
+    // Options take the rest after fixed chrome (blank + blank + hint).
+    let o_avail = capacity.saturating_sub(3 + q_budget);
+    let notice = option_rows > o_avail;
+    let viewport = option_viewport(h, 3 + q_budget + usize::from(notice));
+    (q_budget, viewport, notice)
+}
+
+/// The visible window of a wrapped question: `wrapped[first .. first+budget]`,
+/// with clipped ends marked so a cut never looks complete. When rows are cut
+/// above, row 0 names the count and the scroll keys; when cut below, the last
+/// row does. A 1-row window cut on both sides gets one combined marker.
+/// Always returns exactly `budget.max(1)` rows when the question is longer,
+/// or the whole question when it fits — so callers can size the box without
+/// re-measuring.
+///
+/// This is what makes long questions (plan bodies) readable on small
+/// terminals: instead of a fixed cap the dialog pages through the text with
+/// PgUp/PgDn (see `question_dialog`). The markers always name the keys, so a
+/// clipped view advertises its own escape.
+fn window_question(wrapped: &[String], first: usize, budget: usize) -> Vec<String> {
+    let budget = budget.max(1);
+    if wrapped.len() <= budget {
+        return wrapped.to_vec();
+    }
+    let first = first.min(wrapped.len().saturating_sub(budget));
+    let last = (first + budget).min(wrapped.len());
+    let mut out: Vec<String> = wrapped[first..last].to_vec();
+    debug_assert_eq!(out.len(), budget);
+    let cut_above = first;
+    let cut_below = wrapped.len() - last;
+    if budget == 1 {
+        // One row cannot show content plus two markers: name the cut(s).
+        out[0] = if cut_above > 0 && cut_below > 0 {
+            crate::term::dim(&format!(
+                "(question clipped above & below — PgUp/PgDn to scroll, {total} rows total)",
+                total = wrapped.len()
+            ))
+        } else if cut_above > 0 {
+            crate::term::dim(&format!("… ↑ ({cut_above} more above — PgUp/PgDn to scroll)"))
+        } else {
+            crate::term::dim(&format!("… ↓ ({cut_below} more below — PgUp/PgDn to scroll)"))
+        };
+        return out;
+    }
+    if cut_above > 0 {
+        out[0] = crate::term::dim(&format!("… ↑ ({cut_above} more above — PgUp/PgDn to scroll)"));
+    }
+    if cut_below > 0 {
+        let n = out.len();
+        out[n - 1] = crate::term::dim(&format!("… ↓ ({cut_below} more below — PgUp/PgDn to scroll)"));
+    }
+    out
 }
 
 /// The visible-window math, extracted so the behaviour is testable without
@@ -1280,19 +1698,6 @@ fn window_start(selected: usize, total: usize, viewport: usize) -> usize {
             .saturating_sub(viewport.saturating_sub(2).max(1))
             .min(total.saturating_sub(viewport))
     }
-
-/// How many body rows a modal box can show on this terminal.
-///
-/// `draw_box_titled` centres the box and keeps the title bar, so the body gets
-/// the height minus the 2 border rows and minus the 2 rows the title/footer
-/// text and the surrounding gap need. Kept in one place so a caller computing
-/// a viewport (the question dialog) can never disagree with the renderer about
-/// how many rows actually fit.
-fn modal_body_rows() -> usize {
-    let h = crate::term::terminal_height();
-    // title + blank separator + body + blank separator + hint
-    h.saturating_sub(6).max(1)
-}
 
 /// Wrap `text` to at most `width` visible characters per line, preserving
 /// explicit newlines. Used by the question dialog so a long question or option
@@ -1433,6 +1838,162 @@ mod keyboard_ownership_tests {
 
     // -- the question dialog -------------------------------------------------
 
+    /// The regression the screenshot exposed: the box must be tall enough for
+    /// **everything it draws** — the question, the options, and the hint. The
+    /// viewport used to be a flat `terminal_height - 6` that ignored the
+    /// question and hint rows, so a multi-line question pushed the last option
+    /// and the whole hint line off the bottom (`draw_box_titled` truncates with
+    /// `.take(body_h)`), and the operator saw a dialog with no second option and
+    /// no bottom border.
+    ///
+    /// This recomputes the row budget exactly as `question_dialog` does and
+    /// asserts the total never exceeds the renderer's capacity, so the hint can
+    /// never be the row that is cut — at every question scroll offset (PgUp/
+    /// PgDn only swap which rows show; markers replace content rows in place,
+    /// so the count is offset-independent, pinned here across offsets anyway).
+    #[test]
+    fn the_question_dialog_never_overflows_the_box() {
+        use super::{dialog_layout, window_question, wrap_lines};
+        for h in [10usize, 12, 24, 40] {
+            for question in [
+                "Ship it?",
+                "Approve this plan and start implementing?\n\nSaved to: \
+                 /home/s/pam/.pi/agent/plans/trivial-smoke-test.md\n\n# Trivial smoke test",
+                &"long ".repeat(120),
+            ] {
+                for options in [2usize, 5, 12] {
+                    // Mirror `question_dialog` exactly.
+                    let capacity = h.saturating_sub(4).max(1);
+                    let q_wrapped = wrap_lines(question, 72);
+                    let (q_budget, viewport, show_notice) =
+                        dialog_layout(capacity, q_wrapped.len(), options);
+                    for q_first in [0usize, 1, 7, usize::MAX] {
+                        let shown = options.min(viewport);
+                        let block = window_question(&q_wrapped, q_first, q_budget);
+                        // question + blank + options + blank + scroll? + hint
+                        let drawn = block.len() + 1 + shown + 1
+                            + usize::from(show_notice) + 1;
+                        assert!(
+                            drawn <= capacity,
+                            "the dialog draws {drawn} rows into a {capacity}-row box \
+                             (h={h}, q_first={q_first}, opts={options}) — \
+                             the hint would be cut off the bottom"
+                        );
+                        assert!(!block.is_empty(), "the question block is never empty");
+                    }
+                }
+            }
+        }
+    }
+
+    /// `option_viewport` must agree with the renderer's own capacity
+    /// (`draw_box_titled` uses `height - 4`). When the two disagreed the dialog
+    /// over-counted by 2 rows and cut the hint off. Pin the arithmetic.
+    #[test]
+    fn option_viewport_matches_the_renderer_capacity() {
+        use super::option_viewport;
+        // No chrome at all: the whole body is available.
+        assert_eq!(option_viewport(24, 0), 20, "24 - 4 border/title rows");
+        // Chrome is subtracted, not ignored.
+        assert_eq!(option_viewport(24, 6), 14);
+        // A degenerate terminal still yields a usable (>=1) viewport, never 0.
+        assert_eq!(option_viewport(4, 0), 1);
+        assert_eq!(option_viewport(0, 5), 1);
+    }
+
+    /// A clipped question is marked, never silent — a cut that looks complete
+    /// is its own bug. Same promise as the old fixed cap, now for a scrolling
+    /// window: fitting text passes through untouched, cut ends name the
+    /// direction, the count, and the scroll keys.
+    #[test]
+    fn window_question_marks_clipped_ends() {
+        use super::window_question;
+        let lines: Vec<String> = (0..10).map(|i| format!("line {i}")).collect();
+        assert_eq!(window_question(&lines, 0, 10), lines, "fits: unchanged");
+        assert_eq!(window_question(&lines, 0, 20), lines, "room to spare: unchanged");
+        // Cut below only: head intact, last row marked with the count.
+        let w = window_question(&lines, 0, 3);
+        assert_eq!(w.len(), 3);
+        assert_eq!(w[0], "line 0");
+        assert!(w[2].contains("7 more below"), "must name the cut: {w:?}");
+        assert!(w[2].contains("PgUp/PgDn"), "must name the keys: {w:?}");
+        assert!(!w[0].contains("more above"), "nothing cut above: {w:?}");
+        // Scrolled to the end: cut above only.
+        let w = window_question(&lines, 7, 3);
+        assert_eq!(w.len(), 3);
+        assert!(w[0].contains("7 more above"), "must name the cut: {w:?}");
+        assert_eq!(w[2], "line 9");
+        // Mid-scroll: both ends marked, middle row intact.
+        let w = window_question(&lines, 4, 3);
+        assert_eq!(w.len(), 3);
+        assert!(w[0].contains("more above"), "top cut unmarked: {w:?}");
+        assert!(w[2].contains("more below"), "bottom cut unmarked: {w:?}");
+        assert_eq!(w[1], "line 5");
+        // An out-of-range offset clamps to the last window, not an empty box.
+        let w = window_question(&lines, 999, 3);
+        assert_eq!(w.len(), 3);
+        assert_eq!(w[2], "line 9");
+        // Degenerate budget still returns one row.
+        assert_eq!(window_question(&lines, 0, 0).len(), 1);
+        // One row cut both ways: a single combined marker (no room for two).
+        let w = window_question(&lines, 5, 1);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("above & below"), "must name both cuts: {w:?}");
+        assert!(w[0].contains("10 rows total"), "must size the question: {w:?}");
+    }
+
+    /// The reported bug: on a 24-row terminal a long plan-review question got
+    /// a 1-row budget (the option math took terminal-9 first), so every plan
+    /// collapsed to "(question truncated) …" and was never readable. The
+    /// question is budgeted first now: a 20-row plan gets 15 rows and the
+    /// 2-option list scrolls instead.
+    #[test]
+    fn long_question_is_budgeted_before_the_option_list() {
+        use super::dialog_layout;
+        let capacity = 24usize.saturating_sub(4);
+        let (q, viewport, notice) = dialog_layout(capacity, 20, 4);
+        assert_eq!(q, 15, "the plan must get rows, not one: {q:?}/{viewport:?}/{notice:?}");
+        assert!(notice, "4 option rows cannot fit beside it: {q:?}/{viewport:?}/{notice:?}");
+        assert_eq!(viewport, 1, "one scrolling option row: {q:?}/{viewport:?}/{notice:?}");
+    }
+
+    /// A short question keeps every row and a fitting list never scrolls.
+    #[test]
+    fn short_question_and_fitting_list_do_not_scroll() {
+        use super::dialog_layout;
+        let capacity = 24usize.saturating_sub(4);
+        let (q, viewport, notice) = dialog_layout(capacity, 2, 4);
+        assert_eq!((q, notice), (2, false), "nothing to cut: {q:?}/{viewport:?}/{notice:?}");
+        assert!(viewport >= 4, "all options visible: {q:?}/{viewport:?}/{notice:?}");
+    }
+
+    /// Whatever the sizes, the emitted block (`question + blank + options +
+    /// blank + notice? + hint`) must fit the box on any usable terminal, the
+    /// viewport must never be empty, and the question must never vanish.
+    #[test]
+    fn dialog_layout_never_overflows_usable_terminals() {
+        use super::dialog_layout;
+        for h in [12usize, 16, 24, 40, 100] {
+            let capacity = h.saturating_sub(4);
+            for (q_lines, options) in [(1, 2), (5, 4), (20, 4), (50, 4), (3, 30), (20, 30)] {
+                let (q, viewport, notice) = dialog_layout(capacity, q_lines, options);
+                assert!(q >= 1, "h={h} question vanished");
+                assert!(viewport >= 1, "h={h} viewport empty");
+                let shown = options.min(viewport);
+                let total = q + 1 + shown + 1 + usize::from(notice) + 1;
+                assert!(
+                    total <= capacity,
+                    "h={h} q={q_lines} opts={options}: {total} rows exceed {capacity}"
+                );
+                assert_eq!(
+                    notice,
+                    options > capacity.saturating_sub(3 + q),
+                    "h={h}: notice must mean overflow exactly"
+                );
+            }
+        }
+    }
+
     /// The regression: options were numbered from 0 on screen while the digit
     /// keys counted from 1, so the hint "[1-9] choose" pointed at the wrong
     /// row and the tenth option onward had no digit at all. Pin the mapping
@@ -1547,6 +2108,77 @@ mod keyboard_ownership_tests {
             before,
             "a modal that never opened must not leave the keyboard claimed"
         );
+    }
+}
+
+#[cfg(test)]
+mod option_key_tests {
+    use super::{classify_option_key, Key, OptionKeyAction};
+
+    /// The reported bug: → in the plan-review dialog confirmed whatever row
+    /// was highlighted, so → on "Revise — keep planning" came back as
+    /// "the plan was NOT approved". Sideways arrows must never answer a
+    /// decision dialog — Enter (or a digit) chooses, arrows only move.
+    #[test]
+    fn sideways_arrows_never_answer_the_dialog() {
+        for key in [Key::Right, Key::Left] {
+            for multi in [false, true] {
+                assert_eq!(
+                    classify_option_key(key, multi),
+                    OptionKeyAction::Ignore,
+                    "{key:?} (multi={multi}) must do nothing, never confirm"
+                );
+            }
+        }
+    }
+
+    /// Only Enter confirms; only the dismiss keys dismiss. Everything else
+    /// that answers (digits, Space-toggle) keeps its existing meaning.
+    #[test]
+    fn confirm_and_dismiss_keys_keep_their_meaning() {
+        for multi in [false, true] {
+            assert_eq!(classify_option_key(Key::Enter, multi), OptionKeyAction::Confirm);
+            for key in [Key::Esc, Key::CtrlC, Key::CtrlD] {
+                assert_eq!(
+                    classify_option_key(key, multi),
+                    OptionKeyAction::Dismiss,
+                    "{key:?} must dismiss"
+                );
+            }
+        }
+    }
+
+    /// Digits target the row the label shows (1-based on screen → 0-based
+    /// index), and Space toggles only in a multi-select dialog.
+    #[test]
+    fn digits_and_space_keep_their_meaning() {
+        for multi in [false, true] {
+            for (digit, want) in [('1', 0), ('2', 1), ('9', 8)] {
+                assert_eq!(
+                    classify_option_key(Key::Char(digit), multi),
+                    OptionKeyAction::Digit(want),
+                    "pressing `{digit}` must target row {want}"
+                );
+            }
+            assert_eq!(
+                classify_option_key(Key::Char(' '), multi),
+                if multi { OptionKeyAction::Toggle } else { OptionKeyAction::Ignore },
+                "space toggles only when multi-select"
+            );
+        }
+    }
+
+    /// Navigation and paging are untouched by the fix.
+    #[test]
+    fn navigation_keys_are_untouched() {
+        for multi in [false, true] {
+            assert_eq!(classify_option_key(Key::Up, multi), OptionKeyAction::MoveUp);
+            assert_eq!(classify_option_key(Key::Char('k'), multi), OptionKeyAction::MoveUp);
+            assert_eq!(classify_option_key(Key::Down, multi), OptionKeyAction::MoveDown);
+            assert_eq!(classify_option_key(Key::Char('j'), multi), OptionKeyAction::MoveDown);
+            assert_eq!(classify_option_key(Key::PageUp, multi), OptionKeyAction::PageUp);
+            assert_eq!(classify_option_key(Key::PageDown, multi), OptionKeyAction::PageDown);
+        }
     }
 }
 
@@ -1687,5 +2319,218 @@ mod settings_editor_tests {
     #[test]
     fn every_editable_row_is_reachable() {
         assert_eq!(SettingsValues::ROWS, 5, "thinking, show, incremental, stop-skill, full-auto");
+    }
+}
+
+#[cfg(test)]
+mod model_picker_key_tests {
+    use super::{model_pick_action, Key, ModelPickAction};
+
+    /// A catalog laid out exactly as `model_picker` builds it: rows are
+    /// `(flat_index, provider, label, is_current)`, so the `:N` shown on screen
+    /// is the flat index — the very number `config::select(":N")` resolves.
+    fn rows() -> Vec<(usize, String, String, bool)> {
+        vec![
+            (0, "anthropic".into(), "Claude Sonnet 4.5".into(), true),
+            (1, "anthropic".into(), "Claude Haiku 4.5".into(), false),
+            (2, "openai".into(), "GPT-4.1".into(), false),
+            (3, "openai".into(), "GPT-4.1 mini".into(), false),
+        ]
+    }
+
+    /// The reported bug: `/model` lists `▸ :0  :1  :2  :3` but pressing a digit
+    /// did nothing, so the only way to reach a model was to arrow to it. A
+    /// digit must select the row whose `:N` label it names.
+    #[test]
+    fn a_digit_selects_the_row_labelled_with_that_index() {
+        let r = rows();
+        for (digit, want) in [('0', 0usize), ('1', 1), ('2', 2), ('3', 3)] {
+            assert_eq!(
+                model_pick_action(&r, 0, Key::Char(digit)),
+                ModelPickAction::Move(want),
+                "pressing {digit:?} must select the row labelled :{want}"
+            );
+        }
+    }
+
+    /// The digit selects the row *by its displayed index*, not by its screen
+    /// offset: with the list scrolled (a real catalog is far taller than the
+    /// box), the `:N` in the row text is what the operator is reading. Assert
+    /// the mapping uses `rows[i].0` so the two can never drift apart.
+    #[test]
+    fn digits_key_off_the_shown_index_not_the_position() {
+        // A window of the catalog starting at flat index 7.
+        let r: Vec<(usize, String, String, bool)> = (7..11)
+            .map(|i| (i, "p".into(), format!("m{i}"), false))
+            .collect();
+        assert_eq!(model_pick_action(&r, 0, Key::Char('7')), ModelPickAction::Move(0));
+        assert_eq!(model_pick_action(&r, 0, Key::Char('9')), ModelPickAction::Move(2));
+        // The digit still works from wherever the highlight already is.
+        assert_eq!(model_pick_action(&r, 3, Key::Char('8')), ModelPickAction::Move(1));
+    }
+
+    /// A digit with no matching row is inert (never a panic, never a wrap to a
+    /// wrong row) — same contract as the session picker's digit handling.
+    #[test]
+    fn out_of_range_digit_is_ignored() {
+        let r = rows();
+        assert_eq!(model_pick_action(&r, 1, Key::Char('9')), ModelPickAction::Ignore);
+        let empty_window: Vec<(usize, String, String, bool)> =
+            vec![(5, "p".into(), "m".into(), false)];
+        assert_eq!(model_pick_action(&empty_window, 0, Key::Char('0')), ModelPickAction::Ignore);
+    }
+
+    /// The digit path must not have clobbered the keys that already worked:
+    /// arrows, `j`/`k`, Home/End, and Enter/Esc.
+    #[test]
+    fn the_existing_keys_still_work() {
+        let r = rows();
+        assert_eq!(model_pick_action(&r, 1, Key::Down), ModelPickAction::Move(2));
+        assert_eq!(model_pick_action(&r, 1, Key::Char('j')), ModelPickAction::Move(2));
+        assert_eq!(model_pick_action(&r, 1, Key::Up), ModelPickAction::Move(0));
+        assert_eq!(model_pick_action(&r, 1, Key::Char('k')), ModelPickAction::Move(0));
+        assert_eq!(model_pick_action(&r, 2, Key::Home), ModelPickAction::Move(0));
+        assert_eq!(model_pick_action(&r, 0, Key::End), ModelPickAction::Move(3));
+        assert_eq!(model_pick_action(&r, 2, Key::Enter), ModelPickAction::Commit(2));
+        assert_eq!(model_pick_action(&r, 2, Key::Right), ModelPickAction::Commit(2));
+        assert_eq!(model_pick_action(&r, 2, Key::Esc), ModelPickAction::Cancel);
+        assert_eq!(model_pick_action(&r, 2, Key::CtrlC), ModelPickAction::Cancel);
+        assert_eq!(model_pick_action(&r, 2, Key::CtrlD), ModelPickAction::Cancel);
+        // Movement clamps at both ends rather than wrapping.
+        assert_eq!(model_pick_action(&r, 0, Key::Up), ModelPickAction::Move(0));
+        assert_eq!(model_pick_action(&r, 3, Key::Down), ModelPickAction::Move(3));
+    }
+
+    /// A digit commits what it selects only through the *next* Enter — the
+    /// picker reads the committed index from `rows[selected].0`, so the digit's
+    /// `Move` target and Enter's `Commit` must agree on the same row. Drive
+    /// that two-step interaction end to end (digit, then Enter) and assert the
+    /// flat index returned is the one named by the digit.
+    #[test]
+    fn digit_then_enter_commits_that_row() {
+        let r = rows();
+        let mut selected = 0usize;
+        match model_pick_action(&r, selected, Key::Char('2')) {
+            ModelPickAction::Move(i) => selected = i,
+            other => panic!("a digit must move the selection, got {other:?}"),
+        }
+        assert_eq!(selected, 2);
+        match model_pick_action(&r, selected, Key::Enter) {
+            ModelPickAction::Commit(i) => assert_eq!(i, 2, "Enter must commit the digit-selected row"),
+            other => panic!("Enter must commit, got {other:?}"),
+        }
+    }
+
+    /// The keys must be *discoverable*: the `:N` labels are keys now, so the box
+    /// has to say so. Without the hint the shortcut exists but nobody finds it —
+    /// the same "visible but unreachable" complaint, inverted.
+    #[test]
+    fn the_box_advertises_the_digit_shortcut() {
+        let src = include_str!("modal.rs");
+        let body = src
+            .split("pub fn model_picker(")
+            .nth(1)
+            .expect("model_picker must exist");
+        assert!(
+            body.contains("[0-9] jump"),
+            "the model picker box must advertise the digit shortcut"
+        );
+    }
+
+    /// `model_picker` must *dispatch through* `model_pick_action` rather than
+    /// re-inlining the key map. This is the regression the tests above cannot
+    /// catch: they call the pure function directly, so if the picker kept a
+    /// private match the digit handling could be reverted in the dialog and
+    /// every test here would stay green while proving nothing about the code
+    /// that runs. Assert the wiring where it is checkable (source).
+    #[test]
+    fn the_picker_dispatches_through_the_key_map() {
+        let src = include_str!("modal.rs");
+        let body = src
+            .split("pub fn model_picker(")
+            .nth(1)
+            .expect("model_picker must exist");
+        assert!(
+            body.contains("model_pick_action(&rows, selected, read_key()?)"),
+            "model_picker must dispatch through model_pick_action, not a private match"
+        );
+    }
+}
+
+#[cfg(test)]
+mod inline_model_list_tests {
+    use super::{inline_model_action, InlineModelAction, Key};
+
+    /// The whole point of the inline list: the *visible* row numbers are keys.
+    /// A digit commits the row it labels, so pressing `2` picks the same model
+    /// as typing `/model2` — one keystroke, no Enter.
+    #[test]
+    fn a_digit_commits_the_row_it_numbers() {
+        for (digit, want) in [('1', 0usize), ('2', 1), ('5', 4)] {
+            assert_eq!(
+                inline_model_action(5, 0, Key::Char(digit)),
+                InlineModelAction::Commit(want),
+                "digit {digit} must commit row {}",
+                want + 1
+            );
+        }
+    }
+
+    /// Out-of-range digits are inert: `0` is not a row (the list is 1-based),
+    /// and a digit past the end must never clamp onto the last model — a silent
+    /// switch to the wrong model is worse than doing nothing.
+    #[test]
+    fn digits_outside_the_list_are_ignored() {
+        assert_eq!(inline_model_action(5, 0, Key::Char('0')), InlineModelAction::Ignore);
+        assert_eq!(inline_model_action(5, 0, Key::Char('6')), InlineModelAction::Ignore);
+        assert_eq!(inline_model_action(5, 0, Key::Char('9')), InlineModelAction::Ignore);
+        // A short history (fewer than five) must not accept a digit it cannot show.
+        assert_eq!(inline_model_action(2, 0, Key::Char('3')), InlineModelAction::Ignore);
+        assert_eq!(inline_model_action(0, 0, Key::Char('1')), InlineModelAction::Ignore);
+    }
+
+    /// Arrows move the highlight and clamp at the ends (no wrap); Enter commits
+    /// whatever is highlighted, Esc/Ctrl-C/Ctrl-D cancel without switching.
+    #[test]
+    fn arrows_enter_and_cancel() {
+        assert_eq!(inline_model_action(5, 0, Key::Up), InlineModelAction::Move(0));
+        assert_eq!(inline_model_action(5, 1, Key::Up), InlineModelAction::Move(0));
+        assert_eq!(inline_model_action(5, 1, Key::Down), InlineModelAction::Move(2));
+        assert_eq!(inline_model_action(5, 4, Key::Down), InlineModelAction::Move(4));
+        assert_eq!(inline_model_action(5, 2, Key::Char('k')), InlineModelAction::Move(1));
+        assert_eq!(inline_model_action(5, 2, Key::Char('j')), InlineModelAction::Move(3));
+        assert_eq!(inline_model_action(5, 3, Key::Home), InlineModelAction::Move(0));
+        assert_eq!(inline_model_action(5, 0, Key::End), InlineModelAction::Move(4));
+        assert_eq!(inline_model_action(5, 2, Key::Enter), InlineModelAction::Commit(2));
+        assert_eq!(inline_model_action(5, 2, Key::Right), InlineModelAction::Commit(2));
+        assert_eq!(inline_model_action(5, 2, Key::Esc), InlineModelAction::Cancel);
+        assert_eq!(inline_model_action(5, 2, Key::CtrlC), InlineModelAction::Cancel);
+        assert_eq!(inline_model_action(5, 2, Key::CtrlD), InlineModelAction::Cancel);
+        // An unhandled key changes nothing.
+        assert_eq!(inline_model_action(5, 2, Key::Char('x')), InlineModelAction::Ignore);
+    }
+
+    /// The list must be driven by the pure key map, and must paint each model on
+    /// its own line via the shared row formatter (the same one that numbers the
+    /// rows `/modelN` addresses). Source-level, because the two assertions above
+    /// cannot see the code that actually runs.
+    #[test]
+    fn the_list_dispatches_through_the_key_map_and_the_row_formatter() {
+        let src = include_str!("modal.rs");
+        let body = src
+            .split("pub fn model_list_picker(")
+            .nth(1)
+            .expect("model_list_picker must exist");
+        assert!(
+            body.contains("inline_model_action(labels.len(), selected, read_key()?)"),
+            "model_list_picker must dispatch through inline_model_action"
+        );
+        assert!(
+            body.contains("crate::model_history::format_rows("),
+            "model_list_picker must render rows through the shared formatter"
+        );
+        // One row per line: the frame terminates each row with a newline rather
+        // than joining them.
+        assert!(body.contains(r#""\r\n""#), "each model must end on its own line");
     }
 }

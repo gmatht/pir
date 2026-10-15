@@ -68,14 +68,6 @@ pub struct Model {
     /// effort). Model-level wins; provider-level `compat` is the fallback.
     #[serde(default)]
     pub supports_reasoning_effort: Option<bool>,
-    /// pi `compat.sessionAffinityFormat` (e.g. `openai-nosession` on
-    /// opencode-go's muse-spark/grok/gpt-5.6-luna): when it says nosession,
-    /// pir must NOT send `x-opencode-session` for that model (Console Go
-    /// 400s `invalid_request_error` otherwise). `None` means "send the
-    /// session header as before". Model-level wins; provider-level `compat`
-    /// is the fallback (same merge rule as the other compat keys).
-    #[serde(default)]
-    pub session_affinity_format: Option<String>,
     /// pi `thinkingLevelMap`: pi level name (`off`, `minimal`, `low`,
     /// `medium`, `high`, `xhigh`, `max`) → provider value, or `None` when the
     /// level is explicitly unsupported/hidden (`null` in JSON). A missing key
@@ -106,21 +98,6 @@ impl Model {
     /// pi `compat.supportsReasoningEffort`, defaulting to true.
     pub fn supports_effort(&self) -> bool {
         self.supports_reasoning_effort.unwrap_or(true)
-    }
-
-    /// Whether this model opts out of the `x-opencode-session` routing header:
-    /// true when `compat.sessionAffinityFormat` says nosession (either
-    /// spelling, case-insensitive, e.g. `openai-nosession`). Console Go
-    /// rejects the header on such models with HTTP 400
-    /// (`invalid_request_error`); every other model keeps sending it.
-    pub fn no_session_affinity(&self) -> bool {
-        self.session_affinity_format
-            .as_deref()
-            .map(|s| {
-                let t = s.trim().to_ascii_lowercase();
-                t.contains("nosession") || t.contains("no_session") || t == "none"
-            })
-            .unwrap_or(false)
     }
 
     /// Whether `thinkingLevelMap` explicitly hides the `off` level (`off` is
@@ -514,7 +491,6 @@ fn space_bunny_model(thinking_format: &str, efforts: &[&str]) -> Model {
         reasoning: true,
         thinking_format: Some(thinking_format.to_string()),
         supports_reasoning_effort: Some(true),
-        session_affinity_format: None,
         thinking_level_map,
         price_per_1k: Some((0.0, 0.0)),
     }
@@ -831,7 +807,6 @@ fn load_providers_uncached() -> Result<Vec<Provider>, String> {
                             reasoning: parse_reasoning(mv),
                             thinking_format: parse_compat_str(mv, pval, "thinkingFormat", "thinking_format"),
                             supports_reasoning_effort: parse_compat_bool(mv, pval, "supportsReasoningEffort", "supports_reasoning_effort"),
-                            session_affinity_format: parse_compat_str(mv, pval, "sessionAffinityFormat", "session_affinity_format"),
                             thinking_level_map: parse_thinking_map(mv),
                             price_per_1k: None,
                         });
@@ -859,7 +834,6 @@ fn load_providers_uncached() -> Result<Vec<Provider>, String> {
                         reasoning: parse_reasoning(mv),
                         thinking_format: parse_compat_str(mv, pval, "thinkingFormat", "thinking_format"),
                         supports_reasoning_effort: parse_compat_bool(mv, pval, "supportsReasoningEffort", "supports_reasoning_effort"),
-                        session_affinity_format: parse_compat_str(mv, pval, "sessionAffinityFormat", "session_affinity_format"),
                         thinking_level_map: parse_thinking_map(mv),
                         price_per_1k: None,
                     });
@@ -914,8 +888,7 @@ fn maybe_add_fake_provider(providers: &mut Vec<Provider>) {
                 reasoning: false,
                 thinking_format: None,
                 supports_reasoning_effort: None,
-                session_affinity_format: None,
-                thinking_level_map: Default::default(),
+                        thinking_level_map: Default::default(),
                 price_per_1k: None,
             }],
         });
@@ -1028,8 +1001,7 @@ pub fn ollama_cloud_models() -> Vec<Model> {
             reasoning: false,
             thinking_format: None,
             supports_reasoning_effort: None,
-            session_affinity_format: None,
-            thinking_level_map: Default::default(),
+                thinking_level_map: Default::default(),
             price_per_1k: None,
         })
         .collect()
@@ -1154,8 +1126,7 @@ fn load_from_auth_fallback() -> Result<Vec<Provider>, String> {
                                 reasoning: false,
                                 thinking_format: None,
                                 supports_reasoning_effort: None,
-                                session_affinity_format: None,
-                                thinking_level_map: Default::default(),
+                                                        thinking_level_map: Default::default(),
                                 price_per_1k: None,
                             }],
                         });
@@ -2217,8 +2188,7 @@ mod select_tests {
             reasoning: false,
             thinking_format: None,
             supports_reasoning_effort: None,
-            session_affinity_format: None,
-            thinking_level_map: Default::default(),
+                thinking_level_map: Default::default(),
             price_per_1k: None,
         }
     }
@@ -2676,6 +2646,63 @@ mod worktree_settings_tests {
         assert!(err.contains("HOME"), "must show HOME: {err}");
     }
 
+    /// The live-verified `opencode-go` rule, pinned so the misdiagnosis cannot
+    /// come back: the models whose catalog entries say
+    /// `compat.sessionAffinityFormat: openai-nosession` (`muse-spark*`,
+    /// `grok-4.6/4.7`, `gpt-5.6/6-luna`) are exactly the `openai-responses`
+    /// ones. Against the real gateway they answer `200` on `/responses` **with**
+    /// `x-opencode-session`, and `400 ModelProtocolUnsupported` on
+    /// `/chat/completions`. So the discriminator is the per-model `api`
+    /// override (`model_api`), and the session header is required on every
+    /// route — not the reverse.
+    ///
+    /// Reading `sessionAffinityFormat` as a header opt-out produced a
+    /// `MissingSessionID` 400 on the routes it was applied to, which is what
+    /// the removed `PIR_OPENCODE_SESSION` kill-switch was papering over.
+    #[test]
+    fn nosession_models_are_responses_routed_not_header_suppressed() {
+        let p = Provider {
+            id: Some("opencode-go".into()),
+            name: None,
+            base_url: Some("https://opencode.ai/zen/go/v1".into()),
+            api_key: Some("k".into()),
+            // Provider-level default is chat-style, like the live store.
+            api: Some("openai-completions".into()),
+            models: vec![],
+        };
+        let mk = |id: &str, api: &str, _aff: Option<&str>| Model {
+            id: id.into(),
+            name: None,
+            api_override: Some(api.into()),
+            url_override: None,
+            no_reasoning_effort: false,
+            reasoning: true,
+            thinking_format: None,
+            supports_reasoning_effort: None,
+            thinking_level_map: Default::default(),
+            context: None,
+            max_tokens: None,
+            price_per_1k: None,
+        };
+        // The exact live shapes.
+        for (id, aff) in [
+            ("muse-spark-1.3-contributor", Some("openai-nosession")),
+            ("gpt-5.6-luna", Some("openai-nosession")),
+            ("grok-4.7", Some("openai-nosession")),
+        ] {
+            let m = mk(id, "openai-responses", aff);
+            assert_eq!(
+                p.model_api(&m),
+                Some(ApiKind::OpenAiResponses),
+                "{id} must route to /responses — that, not a missing header, is \
+                 what its 400 was about"
+            );
+        }
+        // A normal chat model keeps inheriting the provider API.
+        let chat = mk("deepseek-v4.1-flash", "openai-completions", None);
+        assert_eq!(p.model_api(&chat), Some(ApiKind::OpenAi));
+    }
+
     #[test]
     fn model_api_maps_responses_kind() {
         // opencode-go marks Responses-only models `openai-responses`; they
@@ -2697,8 +2724,7 @@ mod worktree_settings_tests {
             reasoning: false,
             thinking_format: None,
             supports_reasoning_effort: None,
-            session_affinity_format: None,
-            thinking_level_map: Default::default(),
+                thinking_level_map: Default::default(),
             context: None,
             max_tokens: None,
             price_per_1k: None,
@@ -2985,8 +3011,7 @@ mod worktree_settings_tests {
             reasoning: true,
             thinking_format: format.map(str::to_string),
             supports_reasoning_effort: None,
-            session_affinity_format: None,
-            thinking_level_map: map
+                thinking_level_map: map
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.map(str::to_string)))
                 .collect(),
@@ -3105,60 +3130,6 @@ mod worktree_settings_tests {
             off_none.mapped_effort(ThinkingLevel::Off),
             Some("none".to_string())
         );
-    }
-
-    #[test]
-    fn session_affinity_parses_model_over_provider_both_spellings() {
-        // The exact muse-spark catalog shape that 400s Console Go when the
-        // session header is sent: `compat.sessionAffinityFormat`.
-        let mv: Value = serde_json::json!({
-            "id": "muse-spark-1.3-contributor",
-            "compat": { "sessionAffinityFormat": "openai-nosession" }
-        });
-        let pval: Value = serde_json::json!({});
-        assert_eq!(
-            parse_compat_str(&mv, &pval, "sessionAffinityFormat", "session_affinity_format"),
-            Some("openai-nosession".to_string())
-        );
-        // snake_case spelling is accepted too.
-        let mv_snake: Value = serde_json::json!({
-            "id": "m",
-            "compat": { "session_affinity_format": "openai-nosession" }
-        });
-        assert_eq!(
-            parse_compat_str(&mv_snake, &pval, "sessionAffinityFormat", "session_affinity_format"),
-            Some("openai-nosession".to_string())
-        );
-        // Provider-level compat is the fallback; model-level wins.
-        let pval_prov: Value =
-            serde_json::json!({ "compat": { "sessionAffinityFormat": "openai-nosession" } });
-        let mv_plain: Value = serde_json::json!({ "id": "m" });
-        assert_eq!(
-            parse_compat_str(&mv_plain, &pval_prov, "sessionAffinityFormat", "session_affinity_format"),
-            Some("openai-nosession".to_string())
-        );
-        let mv_win: Value = serde_json::json!({
-            "id": "m",
-            "compat": { "sessionAffinityFormat": "openai-session" }
-        });
-        assert_eq!(
-            parse_compat_str(&mv_win, &pval_prov, "sessionAffinityFormat", "session_affinity_format"),
-            Some("openai-session".to_string())
-        );
-    }
-
-    #[test]
-    fn no_session_affinity_matches_nosession_variants() {
-        let mut m = compat_model(None, &[]);
-        assert!(!m.no_session_affinity(), "unset means send the header");
-        for v in ["openai-nosession", "OpenAI-NoSession", " openai-nosession ", "no_session", "none"] {
-            m.session_affinity_format = Some(v.to_string());
-            assert!(m.no_session_affinity(), "{v:?} must suppress the header");
-        }
-        for v in ["openai-session", "openai", ""] {
-            m.session_affinity_format = Some(v.to_string());
-            assert!(!m.no_session_affinity(), "{v:?} must keep the header");
-        }
     }
 
     #[test]

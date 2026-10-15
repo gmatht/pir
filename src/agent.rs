@@ -125,6 +125,14 @@ pub struct Agent {
     /// visible during "thinking" instead of being clobbered by competing stdout
     /// writers. The REPL owns the only other reference; it only ever writes.
     typeahead: Arc<Mutex<String>>,
+    /// Shared footer status for every spinner a turn creates (see
+    /// [`term::StatusCell`]). Each `Spinner::start_with_status` in the turn
+    /// loop is wired to this one cell, so code that runs mid-turn can replace
+    /// the footer's `running` label for a wait's duration — e.g.
+    /// `run_plan_tool` shows "waiting for plan approval" while blocked on the
+    /// operator instead of a `running` readout that reads as "working".
+    /// Last-writer-wins; sequential uses never interfere.
+    spinner_status: Arc<term::StatusCell>,
     /// Optional cumulative token budget (in/out combined). When set, a turn
     /// stops *before* the next model call once the budget is exceeded, printing
     /// a banner. Off by default (None) — opt in via `--budget N` or
@@ -578,6 +586,11 @@ pub struct SessionResume {
 impl SessionResume {
     /// Render a banner describing what was resumed: which session file, its
     /// first/last prompts, and the tail of its last assistant output.
+    ///
+    /// Records the directory the session ran in, and warns when it differs
+    /// from the current one: resuming a session from another checkout keeps
+    /// the old conversation but the agent acts on *this* tree, so a silent
+    /// cross-directory resume reads like the wrong project answering.
     pub fn banner(&self, session: &Path) -> String {
         let name = session
             .file_name()
@@ -588,6 +601,24 @@ impl SessionResume {
         let mut out = String::new();
         out.push_str(&term::bold(&format!("resumed session: {name}  ({} turns)", self.turns)));
         out.push('\n');
+        let session_cwd = crate::session::read_status(session).map(|m| m.cwd).unwrap_or_default();
+        if !session_cwd.is_empty() {
+            let here = crate::session::session_cwd();
+            if !here.is_empty() && here != session_cwd {
+                out.push_str(&format!(
+                    "{} {} (this shell is in {})\n",
+                    term::yellow("⚠ session dir:"),
+                    term::yellow(&session_cwd),
+                    here,
+                ));
+            } else {
+                out.push_str(&format!(
+                    "{} session dir: {}\n",
+                    term::dim("·"),
+                    term::dim(&session_cwd)
+                ));
+            }
+        }
         if !self.first_prompt.is_empty() {
             out.push_str(&format!(
                 "{} first prompt: {}\n",
@@ -683,7 +714,10 @@ fn build_system_prompt(cwd: &Path) -> String {
            decision genuinely blocks progress); returns their answer as the tool result\n\
          - load_skill: Load a skill's full instructions (skills are listed in the Skills\n\
            section below) before doing work the skill covers\n\
-         - plan_write: In plan mode, record a markdown plan for the operator to approve\n\
+         - plan_write: Records a markdown plan AND opens the operator's approval dialog.\n\
+           Call this whenever the operator asks for a plan, an approach, or something\n\
+           to approve — writing the plan out in prose does NOT open the dialog and is\n\
+           not an answer to that request. Works whether or not plan mode is on.\n\
          - agent: Delegate a self-contained task to a sub-agent and get back only its report\n\
          - web_fetch: Fetch a public http/https URL and return its readable text\n\
          - web_search: Search the web (provider-independent) for titles, URLs and snippets\n\
@@ -1037,6 +1071,7 @@ impl Agent {
             quiet_req,
             cancel,
             typeahead,
+            spinner_status: Arc::new(term::StatusCell::default()),
             last_prompt: String::new(),
             continuations: Vec::new(),
             token_budget: None,
@@ -2420,7 +2455,17 @@ impl Agent {
             ],
             multi_select: false,
         };
-        let answer = crate::askuser::ask(&q).unwrap_or(crate::askuser::Answer::Dismissed);
+        let answer = {
+            // While blocked on the operator the footer must say what the turn
+            // is actually doing: it otherwise sits on `running`, which reads
+            // as "working" when the agent is really idle awaiting a human.
+            // Cleared the moment the dialog resolves (every path below), so a
+            // later wait (e.g. the retry countdown) starts from a clean cell.
+            self.spinner_status.set("waiting for plan approval");
+            let a = crate::askuser::ask(&q).unwrap_or(crate::askuser::Answer::Dismissed);
+            self.spinner_status.clear();
+            a
+        };
         let approved = matches!(&answer, crate::askuser::Answer::Chosen(v) if v.first().map(|s| s.starts_with("Approve")).unwrap_or(false));
         if approved {
             let notice = self.set_plan_mode(false);
@@ -3221,11 +3266,12 @@ impl Agent {
             // spinner also goes silent instead of keeping its "thinking" line on
             // the now-backgrounded terminal.
             if !self.silent() {
-                *spinner.borrow_mut() = Some(term::Spinner::start_with(
+                *spinner.borrow_mut() = Some(term::Spinner::start_with_status(
                     "thinking",
                     self.typeahead.clone(),
                     tty,
                     self.quiet_req.clone(),
+                    self.spinner_status.clone(),
                     // Count from the turn's start, not this spinner's creation:
                     // a fresh spinner is built every model round, so timing from
                     // "now" would restart the clock at 0s and a long turn would
@@ -3366,6 +3412,28 @@ impl Agent {
                 // indistinguishable from a dead process. Writing the status into
                 // the cell makes every tick show the *current* seconds remaining,
                 // so the wait visibly counts down.
+                //
+                // That only works if a spinner is alive to do the ticking, and on
+                // this path it usually is NOT: the first streamed token already ran
+                // `stop_spinner()`, which `take()`s the spinner out of the slot, so
+                // nothing is repainting the footer and the screen holds the last
+                // frame that spinner drew (`running · 2s`) for the whole backoff —
+                // the reported freeze. Re-create one here when the slot is empty.
+                // The elapsed readout still counts from the turn's start (see
+                // `turn_start`), so it does not restart at 0s, and `stopped_here` is
+                // left as-is: if the retry then streams more text, `stop_spinner` is
+                // a no-op (it already fired for this model call) and the footer is
+                // taken down by the turn's own teardown — the same end state as before.
+                if spinner.borrow().is_none() {
+                    *spinner.borrow_mut() = Some(term::Spinner::start_with_status(
+                        "running",
+                        self.typeahead.clone(),
+                        tty,
+                        self.quiet_req.clone(),
+                        self.spinner_status.clone(),
+                        turn_start,
+                    ));
+                }
                 if let Some(s) = spinner.borrow().as_ref() {
                     if w.remaining.is_zero() {
                         // Wait over: drop the override so the footer returns to
@@ -3747,11 +3815,12 @@ impl Agent {
             // prompt stays visible for the whole turn — not just while waiting
             // for tokens. The next model call's spinner replaces this one.
             if !self.silent() {
-                *spinner.borrow_mut() = Some(term::Spinner::start_with(
+                *spinner.borrow_mut() = Some(term::Spinner::start_with_status(
                     "running",
                     self.typeahead.clone(),
                     tty,
                     self.quiet_req.clone(),
+                    self.spinner_status.clone(),
                     turn_start,
                 ));
             }
@@ -3870,11 +3939,12 @@ impl Agent {
             // streamed token erases it in place via `\r`. `self.typeahead` is
             // rendered on the spinner line so typed-ahead input stays visible.
             if !self.silent() {
-                *spinner.borrow_mut() = Some(term::Spinner::start_with(
+                *spinner.borrow_mut() = Some(term::Spinner::start_with_status(
                     "thinking",
                     self.typeahead.clone(),
                     tty,
                     self.quiet_req.clone(),
+                    self.spinner_status.clone(),
                     // Count from the turn's start, not this spinner's creation:
                     // a fresh spinner is built every model round, so timing from
                     // "now" would restart the clock at 0s and a long turn would
@@ -4509,23 +4579,14 @@ fn make_client(provider: &Provider, cancel: Arc<AtomicBool>) -> Result<Client, S
     // by provider id so a user catalog can never collide with it by model id.
     client.set_fake(provider.pid() == "fake");
     // OpenCode Go routes (and prompt-caches) on a stable per-conversation
-    // session id (`x-opencode-session`; see opencode.ai/docs/go). The log
-    // stem doesn't exist yet at construction time, so mint the same shape
-    // (`pir-<ts>-sh<pid>`) here; `OPENCODE_SESSION_ID` pins it explicitly
-    // (e.g. to keep cache hits across resumed sessions). Other providers
-    // never see the header (`set_session_id` is only called for Go).
+    // session id (`x-opencode-session`; see opencode.ai/docs/go), which the
+    // gateway 400s when missing. Resolved (and first-use pinned) by
+    // `Client::opencode_session_id`: `OPENCODE_SESSION_ID` pins it
+    // explicitly, else it is minted once per process so turns, background
+    // jobs and titler calls share it. Other providers never see the header
+    // (`set_session_id` is only called for Go).
     if provider.pid() == "opencode-go" {
-        let id = std::env::var("OPENCODE_SESSION_ID")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| {
-                format!(
-                    "pir-{}-sh{}",
-                    crate::term::timestamp_compact(),
-                    crate::term::parent_shell_pid()
-                )
-            });
-        client.set_session_id(Some(id));
+        client.set_session_id(crate::provider::Client::opencode_session_id());
     }
     Ok(client)
 }
@@ -4799,7 +4860,6 @@ mod reload_tests {
                 reasoning: false,
                 thinking_format: None,
                 supports_reasoning_effort: None,
-                session_affinity_format: None,
                 thinking_level_map: Default::default(),
                 price_per_1k: None,
             }],
@@ -5084,6 +5144,33 @@ mod prompt_parity_tests {
         assert!(
             p.contains("custom tools depending on the project"),
             "custom-tools note missing"
+        );
+    }
+
+    /// A request phrased as "give me a plan to approve" must be answered by a
+    /// `plan_write` CALL, not by prose: only the tool opens the operator's
+    /// approval dialog (agent.rs `run_plan_tool` -> `askuser::ask`). A session
+    /// that described a plan in text and never called the tool left the operator
+    /// with a running spinner and no invitation. The system prompt must say so,
+    /// and must say it works outside plan mode.
+    #[test]
+    fn plan_write_entry_says_it_opens_the_approval_dialog() {
+        let p = prompt();
+        let line = p
+            .lines()
+            .find(|l| l.contains("- plan_write:"))
+            .expect("plan_write entry present");
+        assert!(
+            line.contains("approval dialog"),
+            "the entry must say plan_write opens the approval dialog: {line:?}"
+        );
+        assert!(
+            p.contains("writing the plan out in prose does NOT open the dialog"),
+            "the entry must warn that prose does not open the dialog"
+        );
+        assert!(
+            p.contains("whether or not plan mode is on"),
+            "the entry must say the tool works outside plan mode"
         );
     }
 
@@ -5455,6 +5542,49 @@ mod goal_bootstrap_tests {
         crate::askuser::uninstall();
         assert!(!a.plan_mode(), "an approved plan leaves plan mode");
         assert!(out.content.contains("APPROVED"), "got: {}", out.content);
+        match old {
+            Some(v) => unsafe { std::env::set_var("PIR_PLANS_DIR", v) },
+            None => unsafe { std::env::remove_var("PIR_PLANS_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// While blocked on plan approval the footer must say so: it otherwise
+    /// sits on `running`, which reads as "working" when the agent is really
+    /// idle awaiting a human. The renderer runs while `run_plan_tool` is
+    /// blocked, so it observes exactly what the operator would see.
+    #[test]
+    fn plan_write_shows_waiting_status_while_blocked_on_approval() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("pir_plan_status_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let old = std::env::var_os("PIR_PLANS_DIR");
+        // SAFETY: test-local env mutation under the shared env lock.
+        unsafe { std::env::set_var("PIR_PLANS_DIR", &dir); }
+        let _g = crate::askuser::ask_lock();
+        let mut a = fresh_agent();
+        a.set_plan_mode(true);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let seen_in = seen.clone();
+        let status = a.spinner_status.clone();
+        crate::askuser::install(std::sync::Arc::new(move |_| {
+            *seen_in.lock().unwrap() = status.get();
+            crate::askuser::Answer::Chosen(vec!["Approve — implement it".into()])
+        }));
+        let out = a
+            .run_plan_tool("plan_write", &serde_json::json!({"content": "# Plan\nbody"}))
+            .unwrap();
+        crate::askuser::uninstall();
+        assert!(out.content.contains("APPROVED"), "got: {}", out.content);
+        assert_eq!(
+            seen.lock().unwrap().as_deref(),
+            Some("waiting for plan approval"),
+            "the footer must name the wait while blocked on the operator"
+        );
+        assert!(
+            a.spinner_status.get().is_none(),
+            "the status must clear once the dialog resolves"
+        );
         match old {
             Some(v) => unsafe { std::env::set_var("PIR_PLANS_DIR", v) },
             None => unsafe { std::env::remove_var("PIR_PLANS_DIR") },
@@ -7030,5 +7160,244 @@ mod real_turn_nudge_tests {
             up_to_ret.contains("s.stop()"),
             "the transport-error return must stop the spinner before unwinding"
         );
+    }
+
+    /// Env that turns [`a_retry_keeps_the_footer_spinner_alive`] into the in-pty
+    /// probe (its child half).
+    const RETRY_SPINNER_PROBE_ENV: &str = "PIR_RETRY_SPINNER_PROBE";
+    /// Marker the in-pty child prints when a spinner survived the retry.
+    const RETRY_SPINNER_OK: &str = "RETRY-SPINNER-ALIVE";
+
+    /// Whether `script(1)` is available to allocate the pty this test needs.
+    /// A *capability* check, not an OS gate: any host with util-linux `script`
+    /// (or the BSD one) runs it, and one without skips with a message.
+    fn pty_harness_available() -> bool {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg("command -v script")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// **Regression: the footer must keep counting down while a request is
+    /// being retried.**
+    ///
+    /// The reported symptom: the footer sat frozen on a stale `running · 0s`
+    /// frame for the whole, growing backoff (30s → 60s → 120s …),
+    /// indistinguishable from a dead process. The cause was display, not
+    /// liveness: the countdown went out through `term::out` — which scrolls into
+    /// the content region — and the spinner's next tick repainted the footer over
+    /// it, so the only thing left on screen was the last frame the spinner drew.
+    /// It now writes into the spinner's `StatusCell`, which every tick redraws.
+    ///
+    /// This test pins that behaviour end-to-end. It is deliberately **not** a
+    /// source-level guard: the whole failure mode was that the code *looked*
+    /// right and did nothing, so only driving a real retry and reading the pty
+    /// can tell. Measured directly, it shows the ticking footer:
+    ///
+    /// ```text
+    /// ⠹ attempt 1 failed — retrying in 2s (Ctrl-C to stop) · 0s · <cwd>
+    /// ```
+    ///
+    /// **Must run under a pty**: `tty` gates both the spinner and `on_retry`, so a
+    /// bare harness would pass vacuously. The child re-execs this test binary with
+    /// the probe env set; the parent greps the pty output for the child's verdict.
+    ///
+    /// The failure it drives is **pre-output** on purpose: a failure *after*
+    /// visible text is fatal by design (`emitted_text` in `provider.rs`), so it
+    /// never reaches `on_retry` at all.
+    #[test]
+    fn a_retry_keeps_the_footer_spinner_alive() {
+        if std::env::var_os(RETRY_SPINNER_PROBE_ENV).is_none() {
+            if !pty_harness_available() {
+                eprintln!("skipping: no script(1) to allocate a pty");
+                return;
+            }
+            let exe = std::env::current_exe().expect("test binary path");
+            let probe = format!(
+                "{} --exact --nocapture {}",
+                exe.display(),
+                "agent::real_turn_nudge_tests::a_retry_keeps_the_footer_spinner_alive"
+            );
+            let log = std::env::temp_dir()
+                .join(format!("pir-retry-spin-{}.log", std::process::id()));
+            let mut sc = std::process::Command::new("script");
+            // util-linux `script` takes `-qec <cmd> <file>`; BSD/macOS `script`
+            // takes `-q <file> <cmd> <args…>`. Same pty either way.
+            if cfg!(target_os = "macos") {
+                sc.arg("-q").arg(&log).arg("sh").arg("-c").arg(&probe);
+            } else {
+                sc.arg("-qec").arg(&probe).arg(&log);
+            }
+            let out = sc
+                .env(RETRY_SPINNER_PROBE_ENV, "1")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("script(1) runs");
+            let painted = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+            .replace('\r', "");
+            assert!(
+                painted.contains(RETRY_SPINNER_OK),
+                "the child did not report a live spinner during the retry — the \
+                 footer would freeze on its last drawn frame (the reported \
+                 `running · 2s`). Child output:\n{painted}"
+            );
+            // And the footer text really was painted by a tick, not just a live
+            // thread: the countdown override reached the screen. (The ellipsis of
+            // the braille spinner varies, so match the stable middle.)
+            assert!(
+                painted.contains("attempt 1 failed — retrying in 2s"),
+                "the retry countdown never reached the footer — the screen would \
+                 show a stale frame for the whole backoff. Child output:\n{painted}"
+            );
+            return;
+        }
+        // Child half: report success only if a spinner really was alive.
+        if retry_spinner_probe() {
+            println!("{RETRY_SPINNER_OK}");
+        }
+    }
+
+    /// The in-pty body of [`a_retry_keeps_the_footer_spinner_alive`]: drive a real
+    /// turn against a mock provider that emits an empty delta and then drops
+    /// the connection, and report whether a spinner was alive *during the retry*.
+    ///
+    /// Anthropic-shaped on purpose: its parser forwards even an empty
+    /// `text_delta` to `on_text`, which stops the thinking spinner, while
+    /// `emitted_text` stays false — so the RST that follows is a pre-output
+    /// transport failure and the provider retries with no live spinner. That
+    /// is the exact freeze: on unfixed code `on_retry` finds an empty slot and
+    /// the footer never repaints.
+    fn retry_spinner_probe() -> bool {
+        use std::io::{Read, Write};
+        use std::sync::atomic::AtomicUsize;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = hits.clone();
+        let _srv = std::thread::spawn(move || {
+            for _ in 0..8 {
+                let Ok((mut sock, _)) = listener.accept() else { return };
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf);
+                let n = hits_srv.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // Empty delta, then RST (not FIN: a clean close would end
+                    // the stream as "(empty response)" instead of failing the
+                    // attempt). A failure after visible text is fatal by
+                    // design, so only this pre-output shape reaches `on_retry`.
+                    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n\
+                        event: content_block_delta\r\n\
+                        data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"\"}}\r\n\r\n";
+                    let _ = sock.write_all(head.as_bytes());
+                    let _ = sock.flush();
+                    {
+                        use std::os::unix::io::AsRawFd;
+                        let fd = sock.as_raw_fd();
+                        let ling = libc::linger { l_onoff: 1, l_linger: 0 };
+                        unsafe {
+                            libc::setsockopt(
+                                fd,
+                                libc::SOL_SOCKET,
+                                libc::SO_LINGER,
+                                &ling as *const _ as *const libc::c_void,
+                                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                            );
+                        }
+                    }
+                    drop(sock);
+                } else {
+                    // Retry: a complete Anthropic frame, so the turn can finish.
+                    let frame = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n\
+                        event: message_start\r\n\
+                        data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\r\n\r\n\
+                        event: content_block_delta\r\n\
+                        data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\" recovered\"}}\r\n\r\n\
+                        event: content_block_stop\r\n\
+                        data: {\"type\":\"content_block_stop\"}\r\n\r\n";
+                    let _ = sock.write_all(frame.as_bytes());
+                    let _ = sock.flush();
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    break;
+                }
+            }
+        });
+
+        // A short backoff so the retry wait is observable, with no attempt cap.
+        // SAFETY: test-local env mutation; this runs in its own pty-held child.
+        unsafe {
+            std::env::set_var("PIR_RETRY_BASE_SECS", "2");
+            std::env::remove_var("PIR_MAX_ATTEMPTS");
+        }
+        let p = crate::config::Provider {
+            id: Some("mock".into()),
+            name: None,
+            base_url: Some(format!("http://{addr}")),
+            api_key: Some("k".into()),
+            api: Some("anthropic".into()),
+            models: vec![crate::config::Model {
+                id: "m1".into(),
+                name: Some("m1".into()),
+                context: Some(128_000),
+                max_tokens: Some(1024),
+                api_override: None,
+                url_override: None,
+                no_reasoning_effort: false,
+                reasoning: false,
+                thinking_format: None,
+                supports_reasoning_effort: None,
+                thinking_level_map: Default::default(),
+                price_per_1k: None,
+            }],
+        };
+        let m = p.models[0].clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut a = Agent::new(
+            p,
+            m,
+            true,
+            false, // not quiet: the spinner only runs with live output
+            crate::notify::shared_bus(),
+            None,
+            cancel.clone(),
+            Arc::new(Mutex::new(String::new())),
+        )
+        .expect("agent");
+
+        let handle = std::thread::spawn(move || {
+            let _ = a.turn("hello");
+        });
+        // Observe a live spinner during the retry wait, after the empty delta
+        // stopped the original one. `hits >= 2` means the retry connection
+        // reached the mock, so the backoff (and `on_retry`) already ran: on
+        // unfixed code the slot is empty and nothing repaints; the fix
+        // re-creates the spinner there. This is the assertion that fails on
+        // the unfixed code.
+        let mut live = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while std::time::Instant::now() < deadline {
+            if hits.load(Ordering::SeqCst) >= 2 && term::live_spinner_threads() > 0 {
+                live = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        cancel.store(true, Ordering::SeqCst);
+        let _ = handle.join();
+        // SAFETY: restore the environment.
+        unsafe {
+            std::env::remove_var("PIR_RETRY_BASE_SECS");
+            std::env::remove_var("PIR_MAX_ATTEMPTS");
+        }
+        live
     }
 }

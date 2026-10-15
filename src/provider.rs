@@ -6,6 +6,7 @@ use smol::channel::{bounded as smol_channel, Receiver as SmolRx};
 use smol::future;
 use smol::io::AsyncBufRead;
 use smol::io::AsyncBufReadExt;
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use smol::Timer;
@@ -303,7 +304,8 @@ pub struct Client {
     /// OpenCode Go requests (routing + prompt caching; see
     /// opencode.ai/docs/go). Set by `make_client` for the `opencode-go`
     /// provider only — `None` everywhere else, so no other provider ever sees
-    /// the header. `OPENCODE_SESSION_ID` overrides the generated value.
+    /// the header. Resolved by [`opencode_session_id`] (`OPENCODE_SESSION_ID`
+    /// pins it explicitly).
     session_id: Option<String>,
     /// Offline scripted model (see `crate::fake`): when set, `chat`/`complete`
     /// synthesize turns locally and never touch the network. Wired by
@@ -396,6 +398,37 @@ impl Client {
         self.session_id = id.filter(|s| !s.is_empty());
     }
 
+    /// The process's OpenCode Go session id for `x-opencode-session`
+    /// (opencode.ai/docs/go: required, stable per conversation).
+    ///
+    /// Resolution: `OPENCODE_SESSION_ID` when set (explicit pin, e.g. to keep
+    /// cache hits across resumed sessions); else mint `pir-<ts>-sh<pid>` once
+    /// and export it, so every later caller in this process — the turn client,
+    /// the titler light-calls, spawned children — shares one stable id.
+    ///
+    /// Always returns `Some`: the gateway 400s `MissingSessionID` on every
+    /// `opencode-go` route when the header is absent, including the routes
+    /// whose catalog entries say `compat.sessionAffinityFormat:
+    /// openai-nosession` (verified live: those 400 on a *protocol* mismatch,
+    /// not on this header — see `request_headers`). There is deliberately no
+    /// way to suppress it; `PIR_OPENCODE_SESSION` used to provide one and only
+    /// ever produced the 400 it was meant to cure.
+    pub fn opencode_session_id() -> Option<String> {
+        if let Ok(v) = std::env::var("OPENCODE_SESSION_ID")
+            && !v.trim().is_empty() {
+                return Some(v);
+            }
+        let id = format!(
+            "pir-{}-sh{}",
+            crate::term::timestamp_compact(),
+            crate::term::parent_shell_pid()
+        );
+        // SAFETY: pinning our own process env so concurrent paths share the
+        // id; test callers hold TEST_ENV_LOCK and restore it (see below).
+        unsafe { std::env::set_var("OPENCODE_SESSION_ID", &id) };
+        Some(id)
+    }
+
     /// pir's User-Agent: the vendor (opencode.ai/docs/go) asks clients to
     /// identify with their own agent name rather than a generic SDK/HTTP
     /// one, and uses it for routing/abuse decisions. Sent on every request.
@@ -403,17 +436,22 @@ impl Client {
         format!("pir/{}", env!("CARGO_PKG_VERSION"))
     }
 
-    /// Apply auth + session + identity headers for `kind` to a request
-    /// builder. Shared by `chat` and `complete` so the two can never drift
-    /// (a missing auth header on one path used to be a whole bug class).
-    /// Auth + session + identity headers for `kind` as plain pairs — the
-    /// single source both transports apply, so the two backends can never
+    /// Apply auth + session + identity headers for `kind` as plain pairs —
+    /// the single source both transports apply, so the two backends can never
     /// drift (a missing auth header on one path used to be a whole bug class).
-    /// Pass the target model so per-model `compat.sessionAffinityFormat`
-    /// (`openai-nosession`) can suppress `x-opencode-session` for just that
-    /// model (Console Go 400s `invalid_request_error` when it is sent);
-    /// `None` keeps the legacy always-send behavior (tests, `complete`).
-    fn request_headers(&self, kind: ApiKind, model: Option<&crate::config::Model>) -> Vec<(String, String)> {
+    /// `x-opencode-session` goes out whenever a session id is set (Go only —
+    /// `set_session_id` is never called for other providers), per
+    /// opencode.ai/docs/go, which 400s `MissingSessionID` when it is missing.
+    ///
+    /// There are no per-model exceptions. Suppressing this header on catalog
+    /// `compat.sessionAffinityFormat: openai-nosession` models was a
+    /// misdiagnosis: verified live against the gateway, those models 400 on a
+    /// *protocol* mismatch (`ModelProtocolUnsupported` — they are the
+    /// `openai-responses` entries, so they must be routed to `/responses` via
+    /// their per-model `api` override), and they accept this header fine on
+    /// the correct route. Suppressing it produced the same `MissingSessionID`
+    /// 400 it was meant to cure.
+    fn request_headers(&self, kind: ApiKind) -> Vec<(String, String)> {
         let mut out = vec![("user-agent".to_string(), Self::user_agent())];
         match kind {
             ApiKind::Anthropic => {
@@ -424,14 +462,9 @@ impl Client {
                 out.push(("Authorization".to_string(), format!("Bearer {}", self.api_key)));
             }
         }
-        // Per-model opt-out wins over the provider-level session id: a model
-        // whose catalog entry says `openai-nosession` never sends the header,
-        // every other model keeps sending it exactly as before.
-        let nosession = model.map(|m| m.no_session_affinity()).unwrap_or(false);
-        if let Some(id) = &self.session_id
-            && !nosession {
-                out.push(("x-opencode-session".to_string(), id.clone()));
-            }
+        if let Some(id) = &self.session_id {
+            out.push(("x-opencode-session".to_string(), id.clone()));
+        }
         out
     }
 
@@ -544,7 +577,7 @@ impl Client {
                 return Err("complete: lsb-curl backend unavailable (no loadable libcurl.so.4)".to_string());
             };
             let url = url.clone();
-            let headers = self.request_headers(kind, None);
+            let headers = self.request_headers(kind);
             let body_str = body.to_string();
             let txt = smol::unblock(move || {
                 let hrefs: Vec<(&str, &str)> =
@@ -740,7 +773,7 @@ impl Client {
                 );
             };
             let url = url.clone();
-            let headers = self.request_headers(kind, model_meta);
+            let headers = self.request_headers(kind);
             let body_str = body.to_string();
             let cancel_flag = cancel.clone();
             // Non-blocking: just starts the transfer thread. A spawn failure
@@ -1749,6 +1782,10 @@ fn is_read_timeout(e: &std::io::Error) -> bool {
 ///   so nothing the tools said is silently lost).
 /// - calls left without results gain a synthetic error result, so no
 ///   `tool_calls` dangles.
+/// - a reused call id is emitted only once: the second `ToolUse` is dropped
+///   and its result demoted to text, so the Responses flat `input` list keeps
+///   its exactly-one-`function_call_output`-per-`function_call` invariant
+///   (the gateway 400s `Duplicate function_call_output` otherwise).
 /// - result blocks are emitted immediately after their assistant message
 ///   (ahead of any user text from the same message), keeping the
 ///   assistant → tool adjacency strict providers require.
@@ -1888,14 +1925,24 @@ fn dump_payload_to(path: &std::path::Path, body: &Value) {
 
 fn sanitize_history(history: &[Message]) -> Vec<Message> {
     // Emit synthetic error results for still-open calls, closing them.
-    fn close_open(out: &mut Vec<Message>, open: &mut Vec<String>) {
+    // Ids already answered (in `done`) are skipped: re-emitting them would
+    // put two `function_call_output` items for one `call_id` on the wire,
+    // and the Responses gateway 400s `Duplicate function_call_output`.
+    fn close_open(out: &mut Vec<Message>, open: &mut Vec<String>, done: &mut HashSet<String>) {
         if open.is_empty() {
             return;
         }
         let ids = std::mem::take(open);
+        let fresh: Vec<String> = ids.into_iter().filter(|id| !done.contains(id)).collect();
+        if fresh.is_empty() {
+            return;
+        }
+        for id in &fresh {
+            done.insert(id.clone());
+        }
         out.push(Message {
             role: Role::User,
-            blocks: ids
+            blocks: fresh
                 .into_iter()
                 .map(|id| Block::ToolResult {
                     tool_use_id: id,
@@ -1908,6 +1955,17 @@ fn sanitize_history(history: &[Message]) -> Vec<Message> {
         });
     }
 
+    // Every call id already given a result (matched or synthesized). A second
+    // pair for the same id would serialize to a duplicate
+    // `function_call_output` and 400, so the second result is demoted to
+    // plain text (content preserved).
+    let mut done: HashSet<String> = HashSet::new();
+    // Every call id already emitted as a `ToolUse` block. A reused id (the
+    // provider recycling a `call_...` value, or a duplicated transcript
+    // entry) must not be emitted twice: the second `function_call` item
+    // would break the one-output-per-call pairing the gateway validates.
+    let mut seen_calls: HashSet<String> = HashSet::new();
+
     let mut out: Vec<Message> = Vec::with_capacity(history.len());
     // Call ids from the latest assistant message still awaiting results.
     let mut open: Vec<String> = Vec::new();
@@ -1916,15 +1974,24 @@ fn sanitize_history(history: &[Message]) -> Vec<Message> {
             Role::Assistant => {
                 // A new assistant message breaks adjacency: close any calls
                 // the previous one left dangling first.
-                close_open(&mut out, &mut open);
+                close_open(&mut out, &mut open, &mut done);
                 let mut calls = Vec::new();
+                let mut blocks = Vec::new();
                 for b in &m.blocks {
                     if let Block::ToolUse { id, .. } = b {
+                        // A reused call id would serialize to a second
+                        // `function_call` item for the same call: drop it.
+                        if !seen_calls.insert(id.clone()) {
+                            continue;
+                        }
                         calls.push(id.clone());
                     }
+                    blocks.push(b.clone());
                 }
-                if !m.blocks.is_empty() {
-                    out.push(m.clone());
+                if !blocks.is_empty() {
+                    let mut msg = m.clone();
+                    msg.blocks = blocks;
+                    out.push(msg);
                 }
                 open = calls;
             }
@@ -1932,53 +1999,115 @@ fn sanitize_history(history: &[Message]) -> Vec<Message> {
                 let mut texts = Vec::new();
                 let mut uses = Vec::new();
                 let mut matched = Vec::new();
-                let mut orphans = Vec::new();
+                // Results with no open call *yet*. Kept as original blocks (not
+                // demoted to text immediately) so a result answering a folded
+                // `ToolUse` from this same message can still pair with it below.
+                // Whatever is left over becomes "[pir: unpaired ...]" text.
+                let mut unmatched = Vec::new();
                 for b in &m.blocks {
                     match b {
                         Block::ToolUse { .. } => uses.push(b.clone()),
-                        Block::ToolResult { tool_use_id, content, .. } => {
-                            if open.contains(tool_use_id) {
+                        Block::ToolResult { tool_use_id, .. } => {
+                            // `claimed` dedupes within this one message: `open`
+                            // is only drained after classification, so without it
+                            // two results for the same id in a single message
+                            // would both match and serialize as a duplicate pair.
+                            let fresh = open.contains(tool_use_id)
+                                && !done.contains(tool_use_id)
+                                && !matched.iter().any(|x| matches!(x,
+                                    Block::ToolResult { tool_use_id: other, .. }
+                                    if other == tool_use_id));
+                            if fresh {
                                 matched.push(b.clone());
                             } else {
-                                orphans.push(Block::Text(format!(
-                                    "[pir: unpaired tool result for call '{tool_use_id}' — \
-                                    no matching tool call in history:]\n{content}"
-                                )));
+                                unmatched.push(b.clone());
                             }
                         }
                         _ => texts.push(b.clone()),
                     }
                 }
                 if !uses.is_empty() {
+                    // Results classified above already answer calls in `open`:
+                    // consume them BEFORE `close_open`, or it synthesizes a
+                    // second output for the same call_id and the gateway 400s
+                    // `Duplicate function_call_output`. (The later emit block
+                    // re-drains harmlessly via the set/retain idempotence.)
+                    for b in &matched {
+                        if let Block::ToolResult { tool_use_id, .. } = b {
+                            open.retain(|id| id != tool_use_id);
+                            done.insert(tool_use_id.clone());
+                        }
+                    }
                     // Resume-fold artifact: these belong to an assistant message.
-                    close_open(&mut out, &mut open);
-                    let ids: Vec<String> = uses
-                        .iter()
-                        .filter_map(|b| match b {
-                            Block::ToolUse { id, .. } => Some(id.clone()),
-                            _ => None,
-                        })
-                        .collect();
-                    out.push(Message { role: Role::Assistant, blocks: uses });
+                    close_open(&mut out, &mut open, &mut done);
+                    let mut kept = Vec::new();
+                    let mut ids: Vec<String> = Vec::new();
+                    for b in &uses {
+                        if let Block::ToolUse { id, .. } = b {
+                            // A reused call id would serialize to a second
+                            // `function_call` item for the same call: drop it.
+                            if !seen_calls.insert(id.clone()) {
+                                continue;
+                            }
+                            ids.push(id.clone());
+                        }
+                        kept.push(b.clone());
+                    }
+                    if !kept.is_empty() {
+                        out.push(Message { role: Role::Assistant, blocks: kept });
+                    }
                     open = ids;
+                    // The folded `ToolUse`s may answer the results held back
+                    // above: retry each unmatched result against the lifted
+                    // calls. A hit pairs here exactly once; whatever is left
+                    // is a genuine orphan and becomes text (content kept).
+                    let mut still_unmatched = Vec::new();
+                    for b in unmatched {
+                        if let Block::ToolResult { tool_use_id, .. } = &b {
+                            let fresh = open.contains(tool_use_id)
+                                && !done.contains(tool_use_id)
+                                && !matched.iter().any(|x| matches!(x,
+                                    Block::ToolResult { tool_use_id: other, .. }
+                                    if other == tool_use_id));
+                            if fresh {
+                                matched.push(b);
+                                continue;
+                            }
+                        }
+                        still_unmatched.push(b);
+                    }
+                    unmatched = still_unmatched;
+                }
+                // Anything never paired is genuinely orphaned: demote to
+                // text, content preserved, no ToolResult survives to 400.
+                for b in unmatched {
+                    match b {
+                        Block::ToolResult { tool_use_id, content, .. } => {
+                            texts.push(Block::Text(format!(
+                                "[pir: unpaired tool result for call '{tool_use_id}' — \
+                                no matching tool call in history:]\n{content}"
+                            )));
+                        }
+                        other => texts.push(other),
+                    }
                 }
                 if !matched.is_empty() {
                     for b in &matched {
                         if let Block::ToolResult { tool_use_id, .. } = b {
                             open.retain(|id| id != tool_use_id);
+                            done.insert(tool_use_id.clone());
                         }
                     }
                     out.push(Message { role: Role::User, blocks: matched });
                     // A results message always carries a turn's *complete* set
                     // of results, so a partial consume means corruption: close
                     // the rest now, while still adjacent to their calls.
-                    close_open(&mut out, &mut open);
+                    close_open(&mut out, &mut open, &mut done);
                 } else if !open.is_empty() {
                     // New turn content with calls still open and no results
                     // here: close them first so adjacency holds.
-                    close_open(&mut out, &mut open);
+                    close_open(&mut out, &mut open, &mut done);
                 }
-                texts.extend(orphans);
                 if !texts.is_empty() {
                     out.push(Message { role: Role::User, blocks: texts });
                 }
@@ -1986,7 +2115,7 @@ fn sanitize_history(history: &[Message]) -> Vec<Message> {
         }
     }
     // Dangling calls at the very end (e.g. trim cut right after them).
-    close_open(&mut out, &mut open);
+    close_open(&mut out, &mut open, &mut done);
     out
 }
 
@@ -3230,14 +3359,14 @@ mod tests {
     fn request_headers_single_source() {
         // Both transports apply this vec: auth must never drift between them.
         let client = Client::new(ApiKind::OpenAi, "http://x", "k".to_string());
-        let h = client.request_headers(ApiKind::OpenAi, None);
+        let h = client.request_headers(ApiKind::OpenAi);
         assert!(
             h.contains(&("user-agent".to_string(), format!("pir/{}", env!("CARGO_PKG_VERSION")))),
             "user-agent present: {h:?}"
         );
         assert!(h.contains(&("Authorization".to_string(), "Bearer k".to_string())), "bearer: {h:?}");
         let a = Client::new(ApiKind::Anthropic, "http://x", "k".to_string());
-        let h = a.request_headers(ApiKind::Anthropic, None);
+        let h = a.request_headers(ApiKind::Anthropic);
         assert!(h.contains(&("x-api-key".to_string(), "k".to_string())), "api key: {h:?}");
         assert!(
             h.contains(&("anthropic-version".to_string(), "2023-06-01".to_string())),
@@ -4547,7 +4676,7 @@ mod tests {
             let mut client =
                 Client::new(ApiKind::OpenAi, &format!("http://{addr}"), "k".to_string());
             configure(&mut client);
-            let headers = client.request_headers(ApiKind::OpenAi, None);
+            let headers = client.request_headers(ApiKind::OpenAi);
             let hrefs: Vec<(&str, &str)> =
                 headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
             let mut all = hrefs;
@@ -4579,44 +4708,72 @@ mod tests {
     }
 
     #[test]
-    fn nosession_model_suppresses_session_header() {
-        // `compat.sessionAffinityFormat: openai-nosession` (muse-spark):
-        // Console Go 400s `invalid_request_error` when the header is sent,
-        // so it must be dropped for exactly these models — while siblings
-        // on the same provider keep it.
-        let client = Client::new(ApiKind::OpenAiResponses, "http://x", "k".to_string());
-        let mut nosession = reasoning_model(None, &[]);
-        nosession.session_affinity_format = Some("openai-nosession".to_string());
-        let h = client.request_headers(ApiKind::OpenAiResponses, Some(&nosession));
+    fn session_header_sends_whenever_set_no_model_exceptions() {
+        // The gateway 400s when `x-opencode-session` is MISSING
+        // (opencode.ai/docs/go), so a set session id always goes out — no
+        // per-model exceptions. Suppressing it on catalog
+        // `compat.sessionAffinityFormat: openai-nosession` models was a
+        // misdiagnosis (those models 400 on a protocol mismatch, not this
+        // header), and the `PIR_OPENCODE_SESSION` escape hatch that grew out
+        // of it has been removed because it only ever caused that same 400.
+        let mut client = Client::new(ApiKind::OpenAiResponses, "http://x", "k".to_string());
+        client.set_session_id(Some("sess-1".to_string()));
+        let h = client.request_headers(ApiKind::OpenAiResponses);
         assert!(
             h.contains(&("Authorization".to_string(), "Bearer k".to_string())),
             "auth stays: {h:?}"
         );
         assert!(
-            !h.iter().any(|(k, _)| k == "x-opencode-session"),
-            "nosession model must not send the header even without a session id: {h:?}"
-        );
-        // With a session id set (the opencode-go case): still suppressed.
-        let mut client = client;
-        client.set_session_id(Some("sess-1".to_string()));
-        let h = client.request_headers(ApiKind::OpenAiResponses, Some(&nosession));
-        assert!(
-            !h.iter().any(|(k, _)| k == "x-opencode-session"),
-            "nosession model must not send the header with a session id: {h:?}"
-        );
-        // A normal model on the same provider keeps the header.
-        let plain = reasoning_model(None, &[]);
-        let h = client.request_headers(ApiKind::OpenAiResponses, Some(&plain));
-        assert!(
             h.contains(&("x-opencode-session".to_string(), "sess-1".to_string())),
-            "normal model keeps the header: {h:?}"
+            "set session id must go out: {h:?}"
         );
-        // `None` model (complete(), legacy tests): legacy always-send.
-        let h = client.request_headers(ApiKind::OpenAiResponses, None);
+        // No session id (every other provider): header absent.
+        let bare = Client::new(ApiKind::OpenAiResponses, "http://x", "k".to_string());
+        let h = bare.request_headers(ApiKind::OpenAiResponses);
         assert!(
-            h.contains(&("x-opencode-session".to_string(), "sess-1".to_string())),
-            "None model keeps legacy behavior: {h:?}"
+            !h.iter().any(|(k, _)| k == "x-opencode-session"),
+            "unset session id must not invent a header: {h:?}"
         );
+    }
+
+    #[test]
+    fn opencode_session_id_pins_and_mints() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old_id = std::env::var_os("OPENCODE_SESSION_ID");
+        // SAFETY: test-local env mutation under the shared env lock.
+        unsafe { std::env::remove_var("OPENCODE_SESSION_ID") };
+        // Explicit pin wins and is exported untouched (no minting).
+        unsafe { std::env::set_var("OPENCODE_SESSION_ID", "pinned-42") };
+        assert_eq!(Client::opencode_session_id().as_deref(), Some("pinned-42"));
+        // A stale `PIR_OPENCODE_SESSION=off` from the environment must NOT
+        // suppress the id any more: the kill-switch is gone because it only
+        // ever produced the `MissingSessionID` 400 it was meant to cure (the
+        // gateway requires this header on every `opencode-go` route, including
+        // the `openai-nosession` ones — those 400 on protocol, not this
+        // header). Leaving the var set here is the regression guard.
+        unsafe { std::env::set_var("PIR_OPENCODE_SESSION", "off") };
+        assert_eq!(
+            Client::opencode_session_id().as_deref(),
+            Some("pinned-42"),
+            "the removed kill-switch must no longer suppress the header"
+        );
+        unsafe { std::env::remove_var("PIR_OPENCODE_SESSION") };
+        // Unpinned: mint `pir-<ts>-sh<pid>` and export it, so every later
+        // caller in this process (turn client, titler, children) shares it.
+        unsafe { std::env::remove_var("OPENCODE_SESSION_ID") };
+        let minted = Client::opencode_session_id().expect("must mint");
+        assert!(minted.starts_with("pir-") && minted.contains("-sh"), "mint shape: {minted:?}");
+        assert_eq!(
+            std::env::var("OPENCODE_SESSION_ID").as_deref(),
+            Ok(minted.as_str()),
+            "first mint must pin the process env"
+        );
+        assert_eq!(Client::opencode_session_id().as_deref(), Some(minted.as_str()));
+        match old_id {
+            Some(v) => unsafe { std::env::set_var("OPENCODE_SESSION_ID", v) },
+            None => unsafe { std::env::remove_var("OPENCODE_SESSION_ID") },
+        }
+        unsafe { std::env::remove_var("PIR_OPENCODE_SESSION") };
     }
 
     #[test]
@@ -4813,6 +4970,216 @@ mod tests {
         }
     }
 
+    /// Every `function_call` / `function_call_output` id in a Responses
+    /// payload must pair exactly once. Duplicate ids in either list are what
+    /// the gateway rejects with HTTP 400 `Duplicate function_call_output`.
+    fn assert_responses_pairs_valid(body: &Value) {
+        let items = body.get("input").and_then(Value::as_array).expect("input");
+        let mut calls: Vec<String> = Vec::new();
+        let mut outputs: Vec<String> = Vec::new();
+        for it in items {
+            match it.get("type").and_then(Value::as_str) {
+                Some("function_call") => calls.push(
+                    it.get("call_id").and_then(Value::as_str).unwrap_or("").to_string(),
+                ),
+                Some("function_call_output") => outputs.push(
+                    it.get("call_id").and_then(Value::as_str).unwrap_or("").to_string(),
+                ),
+                _ => {}
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for id in &calls {
+            assert!(seen.insert(id), "duplicate function_call for '{id}'");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for id in &outputs {
+            assert!(seen.insert(id), "duplicate function_call_output for '{id}'");
+            assert!(
+                calls.contains(id),
+                "output for '{id}' has no matching function_call"
+            );
+        }
+        for id in &calls {
+            assert!(
+                outputs.contains(id),
+                "function_call '{id}' has no matching output"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_reused_call_id_keeps_single_pair() {
+        // The reported 400: the provider (or a duplicated transcript) reused
+        // one `call_id` for two pairs. The flattened Responses `input` must
+        // still carry exactly one call item and one output item for it; the
+        // second result's content is preserved as plain text.
+        let h = vec![
+            user_text("hi"),
+            asst_tool("c1", "bash"),
+            user_result("c1", "first"),
+            asst_tool("c1", "bash"),
+            user_result("c1", "second"),
+        ];
+        let clean = sanitize_history(&h);
+        let client = Client::new(ApiKind::OpenAiResponses, "http://x", "k".to_string());
+        let (_url, body) = client.responses_request(
+            "m",
+            16,
+            "sys",
+            &clean,
+            &[],
+            crate::config::ThinkingLevel::Off,
+            true,
+            None,
+        );
+        assert_responses_pairs_valid(&body);
+        assert!(
+            clean.iter().any(|m| m.text().contains("second")),
+            "second result content must survive as text: {clean:?}"
+        );
+    }
+
+    #[test]
+    fn sanitize_two_results_in_one_message_keep_first() {
+        // Two results for one id inside a single user message: `open` is only
+        // drained after classification, so without an in-batch guard both
+        // would match and serialize as a duplicate pair.
+        let h = vec![
+            user_text("hi"),
+            asst_tool("c1", "bash"),
+            Message {
+                role: Role::User,
+                blocks: vec![
+                    Block::ToolResult {
+                        tool_use_id: "c1".to_string(),
+                        content: "first".to_string(),
+                        is_error: false,
+                    },
+                    Block::ToolResult {
+                        tool_use_id: "c1".to_string(),
+                        content: "second".to_string(),
+                        is_error: false,
+                    },
+                ],
+            },
+        ];
+        let clean = sanitize_history(&h);
+        let client = Client::new(ApiKind::OpenAiResponses, "http://x", "k".to_string());
+        let (_url, body) = client.responses_request(
+            "m",
+            16,
+            "sys",
+            &clean,
+            &[],
+            crate::config::ThinkingLevel::Off,
+            true,
+            None,
+        );
+        assert_responses_pairs_valid(&body);
+    }
+
+    #[test]
+    fn sanitize_synthetic_result_never_duplicates_answered_id() {
+        // `close_open` must not synthesize a result for an id that was already
+        // answered: the synthetic second output would 400 the same way.
+        // (Shape: call, result, then a dangling same-id call — e.g. a retry
+        // transcript that re-issued the call without a fresh id.)
+        let h = vec![
+            user_text("hi"),
+            asst_tool("c1", "bash"),
+            user_result("c1", "ok"),
+            asst_tool("c1", "bash"),
+        ];
+        let clean = sanitize_history(&h);
+        let client = Client::new(ApiKind::OpenAiResponses, "http://x", "k".to_string());
+        let (_url, body) = client.responses_request(
+            "m",
+            16,
+            "sys",
+            &clean,
+            &[],
+            crate::config::ThinkingLevel::Off,
+            true,
+            None,
+        );
+        assert_responses_pairs_valid(&body);
+    }
+
+    #[test]
+    fn sanitize_folded_use_after_matched_result_keeps_single_output() {
+        // The reported `Duplicate function_call_output` 400, minimal shape:
+        // a result answering an open call, then a later message carrying a
+        // folded `ToolUse` for the same call. The fold branch's `close_open`
+        // used to fire while the already-matched result was still pending,
+        // synthesizing a SECOND output for the same `call_id` alongside the
+        // real one. Consuming matched results first keeps exactly one output
+        // (the real result), and `c3`'s orphan content survives as text.
+        let h = vec![
+            Message {
+                role: Role::User,
+                blocks: vec![
+                    Block::ToolResult {
+                        tool_use_id: "c2".to_string(),
+                        content: "stale".to_string(),
+                        is_error: false,
+                    },
+                    Block::Text("go".to_string()),
+                ],
+            },
+            asst_tool("c1", "bash"),
+            Message {
+                role: Role::User,
+                blocks: vec![
+                    Block::ToolResult {
+                        tool_use_id: "c3".to_string(),
+                        content: "other".to_string(),
+                        is_error: false,
+                    },
+                    Block::ToolResult {
+                        tool_use_id: "c1".to_string(),
+                        content: "real-result".to_string(),
+                        is_error: false,
+                    },
+                    Block::ToolUse {
+                        id: "c1".to_string(),
+                        name: "bash".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                ],
+            },
+        ];
+        let clean = sanitize_history(&h);
+        let client = Client::new(ApiKind::OpenAiResponses, "http://x", "k".to_string());
+        let (_url, body) = client.responses_request(
+            "m",
+            16,
+            "sys",
+            &clean,
+            &[],
+            crate::config::ThinkingLevel::Off,
+            true,
+            None,
+        );
+        assert_responses_pairs_valid(&body);
+        // The real result (not a synthetic "skipped") is the surviving output.
+        let outputs: Vec<&str> = body
+            .get("input")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter(|it| it.get("type").and_then(Value::as_str) == Some("function_call_output"))
+            .filter_map(|it| it.get("output").and_then(Value::as_str))
+            .collect();
+        assert_eq!(outputs, vec!["real-result"], "exactly the real output: {clean:?}");
+        assert!(
+            clean.iter().any(|m| m.text().contains("stale"))
+                && clean.iter().any(|m| m.text().contains("other")),
+            "orphan contents must survive as text: {clean:?}"
+        );
+    }
+
+
     /// Reasoning model builders mirroring `models-store.json` entries.
     fn reasoning_model(
         format: Option<&str>,
@@ -4829,7 +5196,6 @@ mod tests {
             reasoning: true,
             thinking_format: format.map(str::to_string),
             supports_reasoning_effort: None,
-            session_affinity_format: None,
             thinking_level_map: map
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.map(str::to_string)))

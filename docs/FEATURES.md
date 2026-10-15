@@ -631,7 +631,7 @@ the running session immediately and is saved where it can carry into the next on
 
 | row | changes | persisted as |
 |---|---|---|
-| model | *(not editable here — `/model` and the model picker own this)* | — |
+| model | *(not editable here — `/model` lists the top five and `/models` opens the full picker)* | — |
 | thinking | the reasoning level, cycled through only the levels the current model actually offers | `<log>.thinking` |
 | show thinking | whether streamed reasoning is displayed | `<log>.thinking` |
 | incremental md | in-place markdown rendering vs. one dump at the end of the turn | `<log>.incmd` |
@@ -721,11 +721,29 @@ supported feature aimed at exactly this problem:
 Two deliberate limits. The title is set **once per process** (guarded by a
 latch), so the prompt path still pays for at most one `zellij` spawn per
 session. And a title the operator set by hand is **never** overwritten: only a
-title that is empty or already `pir:`-prefixed is claimed. A consequence worth
-stating: because the latch holds for the process's lifetime, a `/rewind` to a
-*different* transcript does not re-title the pane — the sidecar still tracks the
-new transcript, so `pir -r @<session>` stays correct, and only the title goes
-stale until the next `pir` starts in that pane.
+title that is empty, already `pir:`-prefixed, zellij's own default, or the
+shell's OSC title is claimed. The default case is the one that matters for
+resurrects — a pane zellij just brought back reports its title as the bare
+command name (`"pir"`), which zellij filled in rather than the operator typing,
+so it counts as claimable exactly like an empty title. Without that, no
+resurrected pane was ever claimed and every attach started fresh. The shell-OSC
+case (`🐧<dir>`, from `PROMPT_COMMAND`) matters the same way for shell-started
+pirs: a pir launched from a shell prompt still carries the shell's title when
+the first prompt claims it, and the guard used to read that as operator-chosen
+and bail — measured live as pane 13 titled `🐧pir`, never claimed. An explicit
+`rename-pane` sticks over shell OSC output (probed live), so claiming there
+cannot clobber a real operator rename. A consequence worth stating: because the
+latch holds for the process's lifetime, a `/rewind` to a *different* transcript
+does not re-title the pane — the sidecar still tracks the new transcript, so
+`pir -r @<session>` stays correct, and only the title goes stale until the next
+`pir` starts in that pane.
+
+A second, quieter break in the same read: `list-panes -a -j` reuses small ids
+across plugins and terminals (measured live: id 0 is both the `zellij:link`
+plugin and a terminal, id 2 both `status-bar` and a terminal), and plugins come
+first — so an unfiltered id match read the *plugin's* title (`(.) -
+zellij:link`) and bailed on every low-id pane. The title read now matches
+terminals only.
 
 **Rebuild priority.** A `pir:` title is the *authoritative* pane→transcript key —
 it was written by the pane itself and survives a session that has exited, so it
@@ -916,6 +934,56 @@ line mid-turn, the TUI footer, and the one-line echo at submit.
 
 ---
 
+## 17. Choosing a model: `/model`, the top five, and `/model2`
+
+**As you type `/model`, the five most recently used models are listed one per
+line, above the prompt:**
+
+```
+   1 anthropic/claude-sonnet-4-5  •current
+   2 openai/gpt-4.1
+   3 commandcode/stealth/space-bunny-alpha
+   4 openrouter/stealth/space-bunny-alpha
+   5 ollama-cloud/qwen3-coder
+❯ /model[↑↓ select · enter to pick]
+```
+
+It is an **inline** block, not the alternate-screen dialog: it stays in the
+session's scrollback, which is where everything else the REPL prints lives. The
+space for it is reserved once, when the prompt opens, by scrolling only the
+rows *above* the prompt — so the prompt and footer never move and the line
+editor's cursor bookkeeping stays correct while the block is painted.
+
+`↑`/`↓` (or `j`/`k`) move the highlight without touching what you typed; `Enter`
+commits the highlighted row; typing a number after `/model` (`/model2`) picks
+that row. `Esc`, or editing the line away from `/model`, clears the block.
+
+**`/model2` selects the second row directly** — the number on screen and the
+number in the command are the same thing, because both index the same top-five
+list (`model_history::top_matching`). That is why the digits are 1-based and
+`/model0` is rejected rather than silently meaning "the first": an off-by-one
+there would switch to a model the operator did not name.
+
+`/model <prefix>` narrows the block to the matching recents (and the same
+arrows/Enter commit them). The routes that already existed are unchanged:
+
+| command | effect |
+|---|---|
+| `/model <prefix>` | narrow the block to matching recents; a prefix matching exactly one recent model switches straight to it |
+| `/model` + Enter with no highlight | opens the full-catalog picker (e.g. on a first run, when there is nothing recent to browse) |
+| `/models` | the full-catalog alternate-screen picker, always |
+| `/default-model <sel>` | set the default for new sessions |
+
+All routes converge on the same switch implementation, so the confirmation line
+(`→ provider/model`) and the session-persistence note cannot differ between
+them.
+
+History is `~/.pi/agent/model-history.json` (most-recent-first, capped, with the
+`fake` test provider never recorded), so the list reflects what this operator
+actually reaches for rather than a fixed catalog order.
+
+---
+
 ## 13. Slash commands added
 
 | command | effect |
@@ -930,6 +998,8 @@ line mid-turn, the TUI footer, and the one-line echo at submit.
 | `/limits` (or `/resources`) | show the resource limits, their basis, and the detected cgroup backend |
 | `/checkpoints` | list the rewindable turn boundaries |
 | `/rewind <#>` | restore the tree and the conversation to a checkpoint |
+| `/model` | list the five most recently used models, one per line, above the prompt as you type (↑/↓ then Enter, or the row's number) |
+| `/model<N>` (e.g. `/model2`) | switch straight to the Nth of that top-five list |
 
 `/plan`, `/skills` and `/scratchpad` are all registered in the `match cmd`
 dispatch in `src/main.rs`, so tab-completion picks them up automatically (the

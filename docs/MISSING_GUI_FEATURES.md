@@ -165,7 +165,7 @@ The GUI implements ~21 commands. These are present in `src/tui.rs` or
 | `/mcp` | `src/main.rs:4031` | MCP server status |
 | `/skills` | `src/main.rs:4197` | Skills catalog |
 | `/taste` | `src/main.rs:4104` | Taste preferences |
-| `/login`, `/logout` | `src/main.rs:3181`, `3266` | Credential management |
+| `/login`, `/logout` | `src/main.rs:3601`, `3741` | Credential management (`/login P KEY [MODEL]` works in one line) |
 | `/l` | `src/main.rs:3083` | Set the persisted default model |
 | `/project`, `/create` | `src/main.rs:3408`, `3464` | Sandbox-user provisioning |
 | `/autoclean` | `src/main.rs:3677` | Retention cleanup |

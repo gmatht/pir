@@ -36,6 +36,9 @@ pub struct PickItem {
     /// Controlling terminal the session was started from (`pts/7`), or empty
     /// when unknown. Shown in preference to the pid, which is recycled.
     pub tty: String,
+    /// Working directory the session ran in (absolute). Shown after the
+    /// tty/pid tag so two panes on one terminal are distinguishable.
+    pub cwd: String,
     pub from_here: bool,
     pub mtime: SystemTime,
     pub path: std::path::PathBuf,
@@ -512,24 +515,35 @@ fn draw(items: &[PickRow], selected: usize, preview: &SessionPreview, drawn_rows
                 } else {
                     term::dim(&tag)
                 };
+                // The session's directory, shortened to the last two
+                // components: two panes on one terminal are otherwise
+                // indistinguishable here (same tty tag, similar preview).
+                let dir = short_cwd(&it.cwd);
+                let dir_s = if it.from_here {
+                    term::cyan(&dir)
+                } else {
+                    term::dim(&dir)
+                };
                 let age = rel_time(it.mtime);
                 if idx == selected {
                     format!(
-                        "{} {:<2} {:<labelw$} {} {}",
+                        "{} {:<2} {:<labelw$} {} {} {}",
                         term::cyan(marker),
                         idx,
                         label,
                         tag_s,
+                        dir_s,
                         term::dim(&age),
                         labelw = aw,
                     )
                 } else {
                     format!(
-                        "{} {:<2} {:<labelw$} {} {}",
+                        "{} {:<2} {:<labelw$} {} {} {}",
                         marker,
                         idx,
                         term::dim(&label),
                         tag_s,
+                        dir_s,
                         term::dim(&age),
                         labelw = aw,
                     )
@@ -661,6 +675,22 @@ fn rel_time(t: SystemTime) -> String {
         return format!("{}h", secs / 3600);
     }
     format!("{}d", secs / 86_400)
+}
+
+/// Shorten an absolute session cwd for the picker row: the last two path
+/// components (`fx`, `projects/fx`), or "" when no cwd was recorded. Full
+/// paths would blow the row width; the tail is what distinguishes sibling
+/// checkouts (`backends-sh-fb0` vs `fx`).
+fn short_cwd(cwd: &str) -> String {
+    if cwd.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<&str> = cwd.split('/').filter(|p| !p.is_empty()).collect();
+    match parts.as_slice() {
+        [] => String::new(),
+        [a] => a.to_string(),
+        [.., a, b] => format!("{a}/{b}"),
+    }
 }
 
 /// A single keypress (or control key) read in raw mode.
@@ -866,6 +896,7 @@ mod row_tests {
             name: name.to_string(),
             shell_pid: 1,
             tty: "pts/0".into(),
+            cwd: "/w".into(),
             from_here: false,
             mtime: std::time::SystemTime::now(),
             path: std::path::PathBuf::from(name),

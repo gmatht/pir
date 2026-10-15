@@ -91,6 +91,15 @@ pub struct SessionMeta {
     /// Why the turn ended early (only set when `status == interrupted`).
     #[serde(default)]
     pub reason: String,
+    /// Working directory the session was started from (absolute, canonicalized
+    /// leniently). Bare `pir -r` matches on this first: two panes in the same
+    /// multiplexer share one controlling tty but sit in different checkouts,
+    /// and without a cwd the resolver cannot tell them apart — it silently
+    /// cross-resumes the other pane's session (the backends-sh-fb0/fx
+    /// incident). Empty for statuses written before this field existed;
+    /// legacy sidecars decode to "" and the resolver skips the cwd rung.
+    #[serde(default)]
+    pub cwd: String,
 }
 
 pub fn status_path(log: &Path) -> PathBuf {
@@ -186,10 +195,25 @@ pub fn write_status(
         last_prompt: last_prompt.to_string(),
         goal_pending,
         reason: reason.to_string(),
+        cwd: session_cwd(),
     };
     if let Ok(s) = serde_json::to_string_pretty(&meta) {
         let _ = fs::write(status_path(log), s);
     }
+}
+
+/// The working directory to record for this session.
+///
+/// `std::env::current_dir()` at status-write time: `pir` never `chdir`s
+/// itself (only spawned children get a `current_dir`), so the process cwd is
+/// the operator's launch/checkout directory for the life of the session.
+/// Canonicalized leniently so `/mnt/wsl/x` and `/mnt/wsl/x/` compare equal
+/// and symlinked checkouts still match.
+pub fn session_cwd() -> String {
+    if let Ok(cwd) = std::env::current_dir() {
+        return crate::security::canonicalize_lenient(&cwd).to_string_lossy().to_string();
+    }
+    String::new()
 }
 
 /// Best-effort build stamp of the currently-running binary, e.g.
@@ -639,10 +663,11 @@ mod tests {
         let _ = std::fs::remove_file(&log);
     }
 
-    /// Status files written before the `tty` field existed must still parse,
-    /// decoding the new field to empty (which the resolver treats as "unknown
-    /// terminal" and handles via the pid fallback). This is the upgrade path
-    /// for every session already on disk.
+    /// Status files written before the `tty`/`cwd` fields existed must still
+    /// parse, decoding the new fields to empty (the resolver treats a missing
+    /// tty as "unknown terminal" via the pid fallback, and a missing cwd as
+    /// "no directory recorded", skipping the cwd rung). This is the upgrade
+    /// path for every session already on disk.
     #[test]
     fn legacy_status_without_tty_still_parses() {
         let log = tmp_log("legacy");
@@ -660,6 +685,31 @@ mod tests {
         assert_eq!(m.pid, 3773);
         assert_eq!(m.last_prompt, "Fix pir.");
         assert!(m.tty.is_empty(), "a missing tty decodes to empty, not a parse error");
+        assert!(m.cwd.is_empty(), "a missing cwd decodes to empty, not a parse error");
+
+        let _ = std::fs::remove_file(status_path(&log));
+        let _ = std::fs::remove_file(&log);
+    }
+
+    /// The `cwd` field must survive a write/read round-trip: it is what bare
+    /// `pir -r` matches on first, so losing it silently degrades resume back
+    /// to the cross-pane behaviour it was added to fix. The value recorded is
+    /// what the code under test itself computed (`session_cwd()`), not a
+    /// recomputation from the test's own inputs.
+    #[test]
+    fn status_roundtrips_cwd() {
+        let log = tmp_log("cwd");
+        write_status(&log, SessionStatus::Active, 42, "hi", false, "");
+        let m = read_status(&log).expect("status readable");
+        assert_eq!(
+            m.cwd,
+            session_cwd(),
+            "cwd must round-trip through the status sidecar"
+        );
+        assert!(
+            !m.cwd.is_empty(),
+            "a real process always has a cwd to record"
+        );
 
         let _ = std::fs::remove_file(status_path(&log));
         let _ = std::fs::remove_file(&log);
