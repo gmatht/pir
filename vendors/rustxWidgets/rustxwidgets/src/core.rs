@@ -1030,12 +1030,12 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     /// `label_prefix` is prepended to each submenu label (e.g. "\u{3164}" for
     /// GTK4 to prevent mnemonic accelerator assignment; pass "" for other backends).
     pub fn build_menu_model(&self, submenus: &[crate::common::SubmenuDef], label_prefix: &str) -> Result<crate::common::Menu, Error> {
-        fn build_items(app: &App, items: &[crate::common::MenuItemDef], prefix: &str) -> Result<crate::common::Menu, Error> {
+        fn build_items(app: &App, items: &[crate::common::MenuItemDef], prefix: &str, label_prefix: &str) -> Result<crate::common::Menu, Error> {
             let mut menu = app.new_menu()?;
             for item in items {
                 if let Some(children) = item.submenu {
-                    let sub = build_items(app, children, prefix)?;
-                    menu.append_submenu(item.label, &sub);
+                    let sub = build_items(app, children, prefix, label_prefix)?;
+                    menu.append_submenu(&format!("{label_prefix}{}", item.label), &sub);
                 } else {
                     menu.append(item.label, &format!("{}.{}", prefix, item.action));
                 }
@@ -1044,10 +1044,26 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         }
         let mut root = self.new_menu()?;
         for sm in submenus {
-            let sub = build_items(self, sm.items, sm.prefix)?;
-            root.append_submenu(sm.label, &sub);
+            let sub = build_items(self, sm.items, sm.prefix, label_prefix)?;
+            root.append_submenu(&format!("{label_prefix}{}", sm.label), &sub);
         }
         Ok(root)
+    }
+
+    /// Create a tree view: the reference in-memory impl today, a native
+    /// backend tree (GTK `TreeView`, NWG tree-view, …) once backends provide
+    /// one. Callers program against `Box<dyn TreeView>` either way, so no
+    /// caller code changes when a backend goes native. State (roots,
+    /// expansion, selection) lives in the returned object.
+    pub fn create_tree(&self) -> Box<dyn crate::tree::TreeView> {
+        Box::new(crate::tree::MemoryTree::new())
+    }
+
+    /// Build a `Vec<TreeNode>` from anything implementing `TreeModel`
+    /// (mirrors `build_menu_model` for menus). Pure model transform — no
+    /// backend involved.
+    pub fn build_tree_model(&self, model: &dyn crate::tree::TreeModel) -> Vec<crate::tree::TreeNode> {
+        model.roots()
     }
 
     /// Create a new Dialog.

@@ -3,7 +3,7 @@
 // Platform-specific type re-exports using cfg
 macro_rules! platform_module {
     ($backend:path, $Orientation:ident) => {
-        pub use $backend::{Window, BoxWidget, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, DropDown, CheckButton, RadioButton, TextView, Orientation as $Orientation};
+        pub use $backend::{Window, BoxWidget, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, Orientation as $Orientation};
         pub type PlatformWindow = Window;
         pub type PlatformWidgetBox = BoxWidget;
         pub type PlatformLabel = Label;
@@ -13,10 +13,6 @@ macro_rules! platform_module {
         pub type PlatformSimpleAction = SimpleAction;
         pub type PlatformMenuBar = MenuBar;
         pub type PlatformDialog = Dialog;
-        pub type PlatformDropDown = DropDown;
-        pub type PlatformCheckButton = CheckButton;
-        pub type PlatformRadioButton = RadioButton;
-        pub type PlatformTextView = TextView;
     };
 }
 
@@ -58,7 +54,6 @@ mod platform {
 macro_rules! common_types_mod {
     () => {
         use super::platform::*;
-        use crate::core::Widget;
 
         #[derive(Clone)]
         pub struct Window { pub inner: PlatformWindow }
@@ -89,6 +84,11 @@ macro_rules! common_types_mod {
         }
         impl WidgetBox {
             pub fn append(&self, child: &impl AsRef<*mut std::os::raw::c_void>) { self.inner.append(child); }
+            /// Recursively show this box and everything under it. Only GTK3
+            /// needs it (widgets start hidden; only `window.present()`'s
+            /// blanket show_all reveals what exists then) — every other
+            /// backend creates visible widgets, so their impl is a no-op.
+            pub fn show_all(&self) { self.inner.show_all(); }
             pub fn set_child_hexpand(&self, child: &impl AsRef<*mut std::os::raw::c_void>, expand: bool) { self.inner.set_child_hexpand(child, expand); }
             pub fn set_child_vexpand(&self, child: &impl AsRef<*mut std::os::raw::c_void>, expand: bool) { self.inner.set_child_vexpand(child, expand); }
             pub fn set_hexpand(&self, expand: bool) { self.inner.set_hexpand(expand); }
@@ -101,7 +101,6 @@ macro_rules! common_types_mod {
             pub fn get_text(&self) -> Option<String> { self.inner.get_text() }
             pub fn set_visible(&self, visible: bool) { self.inner.set_visible(visible); }
             pub fn set_markup(&self, markup: &str) { self.inner.set_markup(markup); }
-            pub fn raw_handle(&self) -> *mut std::os::raw::c_void { self.inner.raw_handle() }
         }
         impl AsRef<*mut std::os::raw::c_void> for Label {
             fn as_ref(&self) -> &*mut std::os::raw::c_void { self.inner.as_ref() }
@@ -124,6 +123,7 @@ macro_rules! common_types_mod {
             pub fn set_halign(&self, align: i32) { self.inner.set_halign(align); }
             pub fn set_valign(&self, align: i32) { self.inner.set_valign(align); }
             pub fn set_width_chars(&self, n: i32) { self.inner.set_width_chars(n); }
+            pub fn set_placeholder_text(&self, text: &str) { self.inner.set_placeholder_text(text); }
             pub fn connect_activate<F: FnMut(*mut std::os::raw::c_void) + 'static>(&self, f: F) -> Result<u64, crate::Error> { self.inner.connect_activate(f) }
             pub fn connect_focus_in_event<F: FnMut(*mut std::os::raw::c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, crate::Error> { self.inner.connect_focus_in_event(f) }
             pub fn connect_focus_out_event<F: FnMut(*mut std::os::raw::c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, crate::Error> { self.inner.connect_focus_out_event(f) }

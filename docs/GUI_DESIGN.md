@@ -3,7 +3,7 @@
 **Status:** implemented. Most rows of the parity matrix in §4 are enforced by a
 test named in the row; the four rows marked *(no test)* (S5, S9, C6, G3) are
 implemented but pinned only by their source comment, and are called out as such
-rather than claimed. `cargo test --features gui` passes **835 tests, 0 failed**
+rather than claimed. `cargo test --features gui` passes **925 tests, 0 failed**
 at the time of writing (780 in the default, non-GUI build).
 
 **What this is.** The GUI (`src/gui.rs`) is not "a window with a session
@@ -55,6 +55,7 @@ The single most important constraint on the design. Verified in
 | `gtk_scrolled_window_get_vadjustment` | **yes** (`symbols.rs:431`) | the scroll position can be *read* |
 | `gtk_adjustment_set_value` | **NO** — zero hits in the whole tree | the scroll position cannot be *set* |
 | mouse-wheel / scroll `EventController` | **NO** — no gesture symbols | no programmatic scroll, and no wheel event to intercept |
+| text-view click coordinates (`window_to_buffer_coords`, `get_iter_at_location`) + button-release event | **yes** (added for G6) | link clicks resolve to buffer positions; hover cursors still **NO** (no cursor-symbol plumbing — links are underlined, clicks work, the pointer just doesn't change) |
 | text-buffer tags (`create_tag`/`apply_tag`) | **NO** | no per-range colour; `ConvKind` colour is unreachable on Linux |
 | `TextView::set_markup` on GTK | **NO** (`backends_gtk_adapter_impl.rs:646-658`) | the palette is Windows-only today |
 | `Button`, `CheckButton`, `DropDown`, `Dialog` | **yes** | graphical affordances are buildable |
@@ -123,11 +124,11 @@ Rows are grouped by kind, not by implementation order.
 | # | Feature (from the TUI or the toolkit) | GUI mechanism | Test |
 |---|---|---|---|
 | **S1** | Scrollback reachable at all | `ScrolledWindow` wrapping the TextView; **read** the v-adjustment each drain | `scrolled_window_can_report_its_scroll_position` (display), `sync_follow_reports_whether_the_pane_must_be_pinned_to_the_bottom` |
-| **S2** | Follow-the-tail without stealing the user's place | `follow: bool` in `GuiState`, set false when the user scrolls away, re-armed on scroll-to-bottom | `follow_is_disarmed_by_scrolling_away_and_rearmed_at_the_bottom` |
+| **S2** | Follow-the-tail without stealing the user's place | `follow: bool` in `GuiState`, set false when the user scrolls away, re-armed on scroll-to-bottom; `sync_textview` holds the buffer while frozen (appends would pin GTK to the bottom) and the live path catches up on re-arm | `follow_is_disarmed_by_scrolling_away_and_rearmed_at_the_bottom`, `frozen_sync_holds_the_pane_and_rearming_catches_up` (display) |
 | **S3** | Every push resets scroll to bottom (the TUI's actual behaviour, `tui.rs:241`) | only when `follow` is armed — see S2 for why this differs | `a_fresh_state_follows_the_tail` |
 | **S4** | 4000-line scrollback cap | `GuiState::push`, already present | `scrolling_back_keeps_the_cursor_inside_the_buffer` |
 | **S5** | 200k-line log-drain cap shifts the write cursor | already fixed, documented at `drain_session_log` | *(no test — pinned by the comment at `drain_session_log`)* |
-| **S6** | Keyboard scroll for a GUI (replaces the TUI's phantom PageUp) | `GuiScroll` model + `Page_Up`/`Page_Down`/`Home`/`End` in the pane's key handler | `gui_scroll_model_is_bounded_and_clamps` |
+| **S6** | Keyboard scroll for a GUI (replaces the TUI's phantom PageUp) | `GuiScroll` model + `Page_Up`/`Page_Down`/`Home`/`End` in the pane's key handler and the View menu, both through `scroll_page_up/down/home/end`; the frozen branch of `sync_textview` paints the windowed slice (no `gtk_adjustment_set_value` exists) | `gui_scroll_model_is_bounded_and_clamps`, `scroll_commands_move_the_window_and_arm_follow_at_the_edges`, `keyboard_scroll_paints_the_windowed_slice` (display) |
 | **S7** | Markdown rendering of assistant text (`md::render`, `tui.rs:1697`) | `md::render` at drain time, so the pane matches the TUI's text | `assistant_text_is_markdown_rendered_like_the_tui` |
 | **S8** | Per-line prefix + colour palette (`ConvKind::into_line`, `tui.rs:165`) | prefix glyph always; colour on Windows only (§2) | `kind_colours_match_the_tui_palette` |
 | **S9** | `show_thinking` seeded from the agent's persisted setting (`tui.rs:252`) | `GuiState::show_thinking` read at session start | *(no test — the seeding at `spawn_session` is a source-level claim)* |
@@ -177,10 +178,11 @@ These have no TUI counterpart; they are the reason to have a GUI at all.
 | # | Feature | GUI mechanism | Test |
 |---|---|---|---|
 | **G1** | Model picker | `DropDown` fed from `providers` | `model_picker_lists_exactly_the_configured_models` |
-| **G2** | A real menu bar (File / Session / View / Help) | `MenuBar` + `SimpleAction` + GMenu model | `menu_bar_defines_every_action_the_gui_can_perform` |
+| **G2** | A real menu bar (File / Session / View / Help) | `MenuBar` + `SimpleAction` + GMenu model, returned by `build_menu_bar` and appended to `root` above the tabs; `MENU_VIEW_ACTIONS` (scroll to bottom / page up / down, mark finished) built into the same bar via the scroll helpers | `menu_bar_defines_every_action_the_gui_can_perform`, `menu_bar_is_attached_to_the_window`, `view_actions_are_built_into_the_menu` (integration) |
 | **G3** | Send / Cancel buttons | `Button` + `on_click`, routed through the same functions as the keys | *(no test — the buttons are wired to `run_foreground_turn` / the cancel flag)* |
 | **G4** | Question dialog is answerable | existing `question_dialog` | existing behaviour + `the_ask_renderer_is_installed_before_the_window_is_built` (source guard) |
 | **G5** | `focus-out` must not re-grab focus (TUI has no focus; a GUI must not trap the mouse) | only re-focus on tab change | `focus_out_does_not_regrab_focus` |
+| **G6** | Links in the agent log are clickable (open in the browser) | `md::extract_links` inventory at push time (`line_links`, parallel to `conv`); `sync_textview` resolves spans against the exact inserted text (`buf_links`, parallel to the buffer — blocks render multi-line, so buffer lines never map 1:1 to model lines); left-button release → `link_hit_at` coords → span lookup → `open_link_safely` (`xdg-open`, http/https only, no shell, detached) | `link_spans_resolve_against_inserted_text`, `link_spans_use_successive_search_for_repeated_text`, `link_spans_stay_in_step_with_conv_on_push_clear_trim`, `lookup_link_hits_only_inside_a_span`, `click_handler_checks_selection_before_opening`, `opener_only_allows_http_https` |
 
 ---
 
@@ -220,8 +222,8 @@ Each item names the row it closes and the test that holds it.
 | Row | Change | Test |
 |---|---|---|
 | **S1** | `scrolled_window_vpos()` reads the adjustment; the scroller is retained on `GuiWidgets` | `scrolled_window_can_report_its_scroll_position` |
-| **S2, S3** | `GuiState.follow`; armed on append only when the user was at the bottom; disarmed by a real upward scroll, re-armed at the bottom | `follow_is_disarmed_by_scrolling_away_and_rearmed_at_the_bottom`, `sync_follow_reports_whether_the_pane_must_be_pinned_to_the_bottom` |
-| **S6** | `GuiScroll { offset, page }` with `page_up/page_down/home/end`, clamped | `gui_scroll_model_is_bounded_and_clamps` |
+| **S2, S3** | `GuiState.follow`; armed on append only when the user was at the bottom; disarmed by a real upward scroll, re-armed at the bottom; the frozen branch holds the buffer, the live branch catches up | `follow_is_disarmed_by_scrolling_away_and_rearmed_at_the_bottom`, `sync_follow_reports_whether_the_pane_must_be_pinned_to_the_bottom`, `frozen_sync_holds_the_pane_and_rearming_catches_up` (display) |
+| **S6** | `GuiScroll { offset, page }` with `page_up/page_down/home/end`, clamped; wired to keys + View menu via `scroll_page_up/down/home/end`, painted as a windowed slice | `gui_scroll_model_is_bounded_and_clamps`, `scroll_commands_move_the_window_and_arm_follow_at_the_edges`, `keyboard_scroll_paints_the_windowed_slice` (display) |
 | **S7** | `md::render` applied to assistant text in `drain_session_log` | `assistant_text_is_markdown_rendered_like_the_tui` |
 | **S9** | `show_thinking` seeded from `agent.show_thinking()` | *(no test)* |
 | **T6** | window title set to `pir — running` / `pir — idle` | `window_title_reports_running_or_idle` |
@@ -232,9 +234,10 @@ Each item names the row it closes and the test that holds it.
 | **C2** | `help_documents_every_command_the_gui_handles` | new |
 | **K6** | Tab claimed only when completion changes the buffer | new |
 | **G1** | model `DropDown` | `model_picker_lists_exactly_the_configured_models` |
-| **G2** | `MenuBar` from `MENU_ACTIONS` | `menu_bar_defines_every_action_the_gui_can_perform` |
+| **G2** | `MenuBar` from `MENU_ACTIONS` + `MENU_VIEW_ACTIONS`, returned and appended above the tabs | `menu_bar_defines_every_action_the_gui_can_perform`, `menu_bar_is_attached_to_the_window` + `view_actions_are_built_into_the_menu` (integration) |
 | **G3** | Cancel/Send buttons sharing the key path | *(no test)* |
 | **G5** | focus re-grab removed from `focus-out` | `focus_out_does_not_regrab_focus` |
+| **G6** | clickable links: `extract_links` + `pango_visible_text` (md), 6 new loader symbols + `TextView::link_hit_at`/`buffer_has_selection`/`connect_button_release` (toolkit), `line_links`/`buf_links` + `resolve_link_spans` + `connect_link_clicks` + `open_link_safely` (gui) | `link_spans_resolve_against_inserted_text`, `link_spans_use_successive_search_for_repeated_text`, `link_spans_stay_in_step_with_conv_on_push_clear_trim`, `lookup_link_hits_only_inside_a_span`, `click_handler_checks_selection_before_opening`, `opener_only_allows_http_https` |
 
 ### Deliberately not done
 
@@ -247,6 +250,9 @@ Each item names the row it closes and the test that holds it.
   in the loader. S1/S2 use *read* access only.
 - **Mouse-wheel interception.** No scroll gesture symbols exist, so the GUI
   takes GTK's native wheel behaviour rather than intercepting it.
+- **Link hover cursor.** Clicks work (G6), but the pointer does not change
+  over a link — no cursor-symbol plumbing exists in the loader, and that is a
+  separate piece of work.
 - **Tooltips.** No tooltip symbols exist.
 - **The TUI fixes in §3.** Recorded and verified, but §3 is the TUI's bug list,
   not this pass's scope; the GUI already handles all three correctly.
@@ -270,10 +276,11 @@ for t in $(grep -oE '`[a-z_]{12,}`' docs/GUI_DESIGN.md | tr -d '`' | sort -u); d
 done
 ```
 
-(`src/` only: three identifiers the grep reports — `connect_activate`,
-`gtk_adjustment_set_value`, `gtk_scrolled_window_get_vadjustment` — are toolkit
-symbols defined under `vendors/`, not tests, and are expected to be absent from
-`src/`.)
+(`src/` only: identifiers the grep reports — `connect_activate`,
+`gtk_adjustment_set_value`, `gtk_scrolled_window_get_vadjustment`,
+`window_to_buffer_coords`, `get_iter_at_location`, `buffer_has_selection`,
+`connect_button_release` — are toolkit symbols defined under `vendors/`, not
+tests, and are expected to be absent from `src/`.)
 
 Three of the §3 claims are verifiable in one line each:
 

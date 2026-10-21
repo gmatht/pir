@@ -1107,7 +1107,7 @@ fn render_list_item<'a>(node: &'a AstNode<'a>, marker: &str, ctx: &mut RenderCtx
         // unpadded (like pi) instead of stacking the outer continuation pad.
         let is_list = matches!(c.data.borrow().value, NodeValue::List(_));
         if is_list {
-            let mut nested = RenderCtx { color: ctx.color, indent: ctx.indent + 1, in_list: true };
+            let nested = RenderCtx { color: ctx.color, indent: ctx.indent + 1, in_list: true };
             render_node(c, &nested, &mut body);
         } else {
             render_node(c, ctx, &mut body);
@@ -2016,6 +2016,831 @@ impl StreamingRenderer {
                     !cell.is_empty() && cell.chars().all(|c| c == '-' || c == ':' || c == ' ')
                 })
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pango backend (GTK GUI rich-text pane)
+// ---------------------------------------------------------------------------
+
+/// Pango palette mirroring the terminal one above: warm-yellow headings,
+/// steel-blue links, teal code/bullets, dim-gray borders/quotes.
+const P_HEADING: &str = "#f0c674";
+const P_LINK: &str = "#81a2be";
+const P_ACCENT: &str = "#8abeb7";
+const P_MUTED: &str = "#808080";
+const P_CODE_BG: &str = "#2d2d2d";
+
+/// Escape text for Pango markup (only `&`, `<`, `>` are special).
+fn pango_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Render CommonMark `md` to a Pango-markup string for the GTK conversation
+/// pane (used when the `gui-rich-text` cargo feature is on). Structure mirrors
+/// [`render`]: headings, bullets, fenced code, blockquotes, links, tables —
+/// but inline styles become Pango spans instead of ANSI escapes, and there is
+/// no syntax highlighting (code blocks are a single teal-on-dark span).
+///
+/// The output is *markup*, not plain text: insert it with
+/// `TextView::append_markup` (`gtk_text_buffer_insert_markup`), never with
+/// `append_text` (which would show the tags literally). All literal text is
+/// escaped, so model output containing `<`/`&` stays intact.
+pub fn render_pango(md: &str) -> String {
+    let mut opts = PdOptions::empty();
+    opts.insert(PdOptions::ENABLE_TABLES);
+    opts.insert(PdOptions::ENABLE_STRIKETHROUGH);
+    opts.insert(PdOptions::ENABLE_TASKLISTS);
+    opts.insert(PdOptions::ENABLE_SMART_PUNCTUATION);
+    let parser = PdParser::new_ext(md, opts);
+    let mut r = PangoRenderer::default();
+    r.run(parser);
+    let collapsed = collapse_blank(&r.out);
+    collapsed.trim_end().to_string() + "\n"
+}
+
+/// Walks pulldown's event stream emitting Pango markup (parallel to
+/// [`PdRenderer`'s ANSI walk, but without colour flags, style stacks, or
+/// syntax highlighting — every inline element maps to one span).
+#[derive(Default)]
+struct PangoRenderer {
+    in_list: bool,
+    in_blockquote: bool,
+    list_stack: Vec<Option<(u64, u64)>>,
+    pending_link: Option<String>,
+    link_buf: Option<String>,
+    heading_extra_close: bool,
+    in_code: bool,
+    code_buf: String,
+    code_lang: String,
+    /// Table capture state, mirroring PdRenderer's: while inside a table,
+    /// cell text accumulates in table_cur_cell and rows in table_cells.
+    /// At End(Table) the grid is painted as one monospace Pango span.
+    table_active: bool,
+    table_in_cell: bool,
+    table_cells: Vec<Vec<String>>,
+    table_cur_cell: String,
+    /// Deferred paragraph blank, mirroring PdRenderer's `para_blank` flag
+    /// explicitly instead of inferring it from trailing output.
+    para_blank: bool,
+    out: String,
+}
+
+impl PangoRenderer {
+    fn run(&mut self, parser: PdParser<'_>) {
+        for ev in parser {
+            match ev {
+                PdEvent::Start(tag) => self.on_start(tag),
+                PdEvent::End(end) => self.on_end(end),
+                PdEvent::Text(t) => self.push_text(&pango_escape(&t)),
+                // Inline code: teal monospace span.
+                PdEvent::Code(t) => self.emit(&format!(
+                    "<span foreground=\"{P_ACCENT}\" font_family=\"monospace\">{}</span>",
+                    pango_escape(&t)
+                )),
+                PdEvent::SoftBreak | PdEvent::HardBreak => {
+                    if self.in_blockquote {
+                        self.out.push('\n');
+                        self.out.push_str("│ ");
+                    } else {
+                        self.out.push('\n');
+                    }
+                }
+                PdEvent::Rule => {
+                    self.take_para_blank();
+                    self.end_line();
+                    self.out.push_str(&format!(
+                        "<span foreground=\"{P_MUTED}\">",
+                    ));
+                    self.out.push_str(&"─".repeat(40));
+                    self.out.push_str("</span>\n\n");
+                }
+                // Render literal HTML as escaped text (same choice as the
+                // terminal renderer: never let model output become markup).
+                PdEvent::Html(t) | PdEvent::InlineHtml(t) => {
+                    self.push_text(&pango_escape(&t))
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Route escaped text into code buffer / link buffer / table cell /
+    /// main output.
+    fn push_text(&mut self, s: &str) {
+        if self.in_code {
+            self.code_buf.push_str(s);
+        } else if self.table_in_cell {
+            self.table_cur_cell.push_str(s);
+        } else if let Some(buf) = self.link_buf.as_mut() {
+            buf.push_str(s);
+        } else {
+            self.out.push_str(s);
+        }
+    }
+
+    /// Emit a (possibly already-markup) segment into the link buffer while a
+    /// link is open, into the table cell while a cell is open, else the main
+    /// output.
+    fn emit(&mut self, s: &str) {
+        if let Some(buf) = self.link_buf.as_mut() {
+            buf.push_str(s);
+        } else if self.table_in_cell {
+            self.table_cur_cell.push_str(s);
+        } else {
+            self.out.push_str(s);
+        }
+    }
+
+    fn end_line(&mut self) {
+        if !self.out.is_empty() && !self.out.ends_with('\n') {
+            self.out.push('\n');
+        }
+    }
+
+    fn take_para_blank(&mut self) {
+        if self.para_blank {
+            self.para_blank = false;
+            self.end_line();
+            self.out.push('\n');
+        }
+    }
+
+    fn end_block(&mut self) {
+        self.para_blank = false;
+        self.end_line();
+        self.out.push('\n');
+    }
+
+    fn open_span(&mut self, attrs: &str) {
+        self.emit(&format!("<span {attrs}>"));
+    }
+
+    fn close_span(&mut self) {
+        self.emit("</span>");
+    }
+
+    fn on_start(&mut self, tag: PdTag<'_>) {
+        match tag {
+            PdTag::Heading { level, .. } => {
+                self.take_para_blank();
+                let n = (level as usize).min(6);
+                let size = match n {
+                    1 => "x-large",
+                    2 => "large",
+                    _ => "medium",
+                };
+                // h1/h2: no markers (like the terminal renderer); h3+ keeps
+                // styled `### ` markers.
+                if n >= 3 {
+                    self.out.push_str(&format!(
+                        "<span foreground=\"{P_HEADING}\" weight=\"bold\">{} </span>",
+                        pango_escape(&"#".repeat(n))
+                    ));
+                }
+                self.open_span(&format!(
+                    "foreground=\"{P_HEADING}\" weight=\"bold\" size=\"{size}\""
+                ));
+                if n == 1 {
+                    // Pango has no underline-size coupling issue here; keep
+                    // the h1 underline the terminal renderer uses.
+                    // (Re-opened as a nested span so close order stays valid.)
+                    self.open_span("underline=\"single\"");
+                }
+                // Remember nesting so End(Heading) closes the right count.
+                self.heading_extra_close = n == 1;
+            }
+            PdTag::Paragraph => self.take_para_blank(),
+            PdTag::BlockQuote(_) => {
+                self.take_para_blank();
+                self.in_blockquote = true;
+                self.out.push_str(&format!(
+                    "<span foreground=\"{P_MUTED}\">│ </span><span foreground=\"{P_MUTED}\" style=\"italic\">"
+                ));
+            }
+            PdTag::CodeBlock(kind) => {
+                self.take_para_blank();
+                self.code_lang = match kind {
+                    pulldown_cmark::CodeBlockKind::Fenced(info) => {
+                        info.trim().to_string()
+                    }
+                    pulldown_cmark::CodeBlockKind::Indented => String::new(),
+                };
+                self.in_code = true;
+                self.code_buf.clear();
+                self.out.push_str(&format!(
+                    "<span foreground=\"{P_MUTED}\">```{}</span>\n",
+                    pango_escape(&self.code_lang)
+                ));
+            }
+            PdTag::List(start) => {
+                self.take_para_blank();
+                if !self.out.is_empty() && !self.out.ends_with('\n') {
+                    self.out.push('\n');
+                }
+                self.list_stack.push(start.map(|s| (s, 0u64)));
+            }
+            PdTag::Item => {
+                self.in_list = true;
+                let marker = self.item_marker();
+                self.out.push_str(&marker);
+            }
+            PdTag::Table(_) => {
+                self.take_para_blank();
+                self.table_active = true;
+                self.table_cells.clear();
+            }
+            PdTag::TableHead => self.table_cells.push(Vec::new()),
+            PdTag::TableRow => self.table_cells.push(Vec::new()),
+            PdTag::TableCell => {
+                self.table_in_cell = true;
+                self.table_cur_cell.clear();
+            }
+            PdTag::Emphasis => self.open_span("style=\"italic\""),
+            PdTag::Strong => self.open_span("weight=\"bold\""),
+            PdTag::Strikethrough => self.open_span("strikethrough=\"true\""),
+            PdTag::Link { dest_url, .. } => {
+                self.pending_link = Some(dest_url.to_string());
+                self.link_buf = Some(String::new());
+                self.emit(&format!(
+                    "<span foreground=\"{P_LINK}\" underline=\"single\">"
+                ));
+            }
+            PdTag::Image { .. } => {}
+            _ => {}
+        }
+    }
+
+    fn on_end(&mut self, end: PdTagEnd) {
+        match end {
+            PdTagEnd::Heading(_) => {
+                self.close_span();
+                if self.heading_extra_close {
+                    self.close_span();
+                    self.heading_extra_close = false;
+                }
+                self.out.push('\n');
+                self.out.push('\n');
+            }
+            PdTagEnd::Emphasis | PdTagEnd::Strong | PdTagEnd::Strikethrough => {
+                self.close_span();
+            }
+            PdTagEnd::Paragraph => {
+                if !self.in_list {
+                    self.end_line();
+                    self.para_blank = true;
+                }
+            }
+            PdTagEnd::BlockQuote(_) => {
+                self.in_blockquote = false;
+                self.close_span();
+                self.end_block();
+            }
+            PdTagEnd::CodeBlock => {
+                if self.in_code {
+                    // Unescape back: code_buf holds ESCAPED text (pushed via
+                    // push_text). Re-emit as one teal monospace block.
+                    let body = std::mem::take(&mut self.code_buf);
+                    for line in body.lines() {
+                        self.out.push_str(&format!(
+                            "<span foreground=\"{P_ACCENT}\" font_family=\"monospace\" background=\"{P_CODE_BG}\">  {line}</span>\n"
+                        ));
+                    }
+                    if body.trim().is_empty() {
+                        self.out.push('\n');
+                    }
+                    self.out.push_str(&format!(
+                        "<span foreground=\"{P_MUTED}\">```</span>\n"
+                    ));
+                    self.in_code = false;
+                }
+                if !self.in_list {
+                    self.end_block();
+                }
+            }
+            PdTagEnd::List(_) => {
+                self.list_stack.pop();
+                if self.list_stack.is_empty() {
+                    self.end_block();
+                }
+            }
+            PdTagEnd::Item => {
+                self.in_list = false;
+                self.out.push('\n');
+            }
+            PdTagEnd::Table => {
+                self.table_active = false;
+                self.flush_table_pango();
+                self.end_block();
+            }
+            PdTagEnd::TableHead | PdTagEnd::TableRow => {}
+            PdTagEnd::TableCell => {
+                if self.table_active
+                    && !self.table_cur_cell.replace('\n', " ").trim().is_empty()
+                    && let Some(row) = self.table_cells.last_mut()
+                {
+                    // Cell text already holds nested Pango spans (bold/links
+                    // route through emit into table_cur_cell); keep them —
+                    // gtk_text_buffer_insert_markup parses the whole cell.
+                    // Newlines cannot survive inside one grid line.
+                    let cell = self
+                        .table_cur_cell
+                        .replace('\n', " ")
+                        .trim()
+                        .to_string();
+                    row.push(cell);
+                }
+                self.table_cur_cell.clear();
+                self.table_in_cell = false;
+            }
+            PdTagEnd::Link => {
+                // The link text (with any nested spans) was buffered in
+                // link_buf while the opening span went straight to out, so
+                // the text sits inside the span. Close the span, then flush
+                // the buffered text and the dimmed URL, like the no-color
+                // terminal's `text (url)`.
+                if let Some(url) = self.pending_link.take() {
+                    let text = self.link_buf.take().unwrap_or_default();
+                    self.out.push_str(&text);
+                    self.close_span();
+                    self.out.push_str(&format!(
+                        " <span foreground=\"{P_MUTED}\">({})</span>",
+                        pango_escape(&url)
+                    ));
+                } else {
+                    self.close_span();
+                    if let Some(text) = self.link_buf.take() {
+                        self.out.push_str(&text);
+                    }
+                }
+            }
+            PdTagEnd::Image => {}
+            _ => {}
+        }
+    }
+
+    fn item_marker(&mut self) -> String {
+        let depth = self.list_stack.len();
+        let pad = "    ".repeat(depth.saturating_sub(1));
+        let marker = match self.list_stack.last_mut() {
+            Some(Some((base, count))) => {
+                let idx = *count;
+                *count += 1;
+                format!("{}. ", *base + idx)
+            }
+            _ => "- ".to_string(),
+        };
+        format!(
+            "{pad}<span foreground=\"{P_ACCENT}\">{}</span>",
+            pango_escape(&marker)
+        )
+    }
+
+    /// Paint the captured table as a monospace Unicode box-drawing grid.
+    ///
+    /// Why monospace, not GtkTextTagTable + GtkGrid widgets: the conversation
+    /// pane is a single TextView fed by `gtk_text_buffer_insert_markup`. Real
+    /// widget grids (GtkGrid/GtkTable with child anchors) cannot live inside
+    /// that text flow, and per-range GtkTextTags would need a parallel tag
+    /// table + apply pass per row. A monospace grid needs no toolkit changes
+    /// at all: pad cells to equal widths (measured on *visible* text, with
+    /// Pango tags stripped), wrap the whole grid in one
+    /// `font_family="monospace"` span so columns align, and bold the header
+    /// row. Same Unicode borders as the terminal's `table_grid`, so the pane
+    /// matches the REPL shape.
+    fn flush_table_pango(&mut self) {
+        if self.table_cells.is_empty() {
+            return;
+        }
+        let rows = std::mem::take(&mut self.table_cells);
+        self.out.push_str(&pango_table_grid(&rows));
+    }
+}
+
+/// Strip Pango tags to measure *visible* text width (mirrors
+/// `crate::term::visible_len` for ANSI).
+fn pango_visible_len(s: &str) -> usize {
+    pango_visible_text(s).chars().count()
+}
+
+/// Strip Pango tags and unescape `&lt;`/`&gt;`/`&amp;`, yielding the text the
+/// buffer actually shows for `markup`. The GUI's link click resolver searches
+/// this (not the markdown source): Pango markup shifts bytes, so spans
+/// computed on the source would point at the wrong characters.
+///
+/// Unknown entities are passed through verbatim (same choice as the width
+/// measurer above, which counts each `&…;` as one char): a literal `&nbsp;`
+/// in model output stays searchable rather than vanishing.
+pub fn pango_visible_text(s: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    let mut entity = String::new();
+    let mut in_entity = false;
+    for c in s.chars() {
+        if in_tag {
+            if c == '>' {
+                in_tag = false;
+            }
+            continue;
+        }
+        if in_entity {
+            if c == ';' {
+                in_entity = false;
+                match entity.as_str() {
+                    "lt" => out.push('<'),
+                    "gt" => out.push('>'),
+                    "amp" => out.push('&'),
+                    _ => {
+                        out.push('&');
+                        out.push_str(&entity);
+                        out.push(';');
+                    }
+                }
+                entity.clear();
+            } else {
+                entity.push(c);
+            }
+            continue;
+        }
+        match c {
+            '<' => in_tag = true,
+            '&' => in_entity = true,
+            _ => out.push(c),
+        }
+    }
+    // An unterminated entity/tag at the end is literal text, not markup.
+    if in_entity {
+        out.push('&');
+        out.push_str(&entity);
+    }
+    out
+}
+
+/// Render captured rows as a monospace Pango grid. Header row is bold; the
+/// whole grid rides in one monospace span so `│` columns line up. Cell spans
+/// (bold/links from inline markdown) survive: widths are measured on visible
+/// text and padding is plain spaces outside the spans.
+fn pango_table_grid(rows: &[Vec<String>]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    let widths: Vec<usize> = (0..cols)
+        .map(|ci| {
+            rows.iter()
+                .map(|r| r.get(ci).map_or(0, |s| pango_visible_len(s)))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+
+    let mut body = String::new();
+    // Top border.
+    body.push('┌');
+    for (i, w) in widths.iter().enumerate() {
+        body.push_str(&"─".repeat(w + 2));
+        body.push(if i + 1 == cols { '┐' } else { '┬' });
+    }
+    body.push('\n');
+
+    for (ri, row) in rows.iter().enumerate() {
+        body.push('│');
+        for (ci, w) in widths.iter().enumerate() {
+            let cell = row.get(ci).cloned().unwrap_or_default();
+            let pad = w.saturating_sub(pango_visible_len(&cell));
+            body.push(' ');
+            if ri == 0 {
+                body.push_str("<b>");
+            }
+            body.push_str(&cell);
+            if ri == 0 {
+                body.push_str("</b>");
+            }
+            body.push_str(&" ".repeat(pad));
+            body.push(' ');
+            body.push('│');
+        }
+        body.push('\n');
+
+        if ri + 1 == rows.len() {
+            body.push('└');
+            for (i, w) in widths.iter().enumerate() {
+                body.push_str(&"─".repeat(w + 2));
+                body.push(if i + 1 == cols { '┘' } else { '┴' });
+            }
+            body.push('\n');
+        } else if ri == 0 {
+            // Header separator.
+            body.push('├');
+            for (i, w) in widths.iter().enumerate() {
+                body.push_str(&"─".repeat(w + 2));
+                body.push(if i + 1 == cols { '┤' } else { '┼' });
+            }
+            body.push('\n');
+        }
+    }
+    format!("<span font_family=\"monospace\">{body}</span>")
+}
+
+// ---------------------------------------------------------------------------
+// Link inventory (GTK GUI clickable links)
+// ---------------------------------------------------------------------------
+
+/// One hyperlink found in markdown source: the visible `text` and the
+/// sanitized `url` it points at. For bare URLs (`https://…` with no
+/// `[text](…)` wrapper) `text == url`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtractedLink {
+    pub text: String,
+    pub url: String,
+}
+
+/// Longest bare-URL run scanned: a pathological line of megabytes must not
+/// blow up the pane's link map.
+const MAX_BARE_URL_LEN: usize = 2048;
+
+/// Inventory every clickable link in `md`: `[text](url)` markdown links plus
+/// bare `http(s)://` runs in non-code text.
+///
+/// Markdown links come from pulldown `Link` events with the same options as
+/// [`render_pango`], so contexts where brackets are literal (code spans,
+/// fenced code blocks) never count. Bare URLs are scanned out of Text events
+/// outside code blocks — pulldown's `autolink` stays off (as in every other
+/// renderer here), so without this pass a pasted `https://…` would never be
+/// clickable.
+///
+/// Every URL passes `sanitize_url` (safe scheme, no control characters), so
+/// `javascript:` and friends never reach the GUI's opener. Control characters
+/// are also rejected inside link *text* lookups downstream: the GUI resolves
+/// each pair against the buffer line it actually inserted (see
+/// `gui::link_byte_ranges`), and a pair whose text is not found tags nothing.
+///
+/// Returns `(text, url)` pairs with NO spans on purpose: Pango markup shifts
+/// byte offsets between markdown source and buffer, so spans computed here
+/// would point at the wrong characters. Span resolution belongs to the layer
+/// that owns the buffer coordinates.
+pub fn extract_links(md: &str) -> Vec<ExtractedLink> {
+    let mut opts = PdOptions::empty();
+    opts.insert(PdOptions::ENABLE_TABLES);
+    opts.insert(PdOptions::ENABLE_STRIKETHROUGH);
+    opts.insert(PdOptions::ENABLE_TASKLISTS);
+    opts.insert(PdOptions::ENABLE_SMART_PUNCTUATION);
+    let parser = PdParser::new_ext(md, opts);
+    let mut out = Vec::new();
+    // Visible text outside code, scanned for bare URLs afterwards. Link
+    // destinations never arrive as Text events, so the `(url)` suffix the pane
+    // shows for a markdown link is NOT re-reported as a bare URL — one pair
+    // per link, plus one pair per genuinely bare URL.
+    let mut eligible = String::new();
+    let mut in_code_block = false;
+    let mut link_url: Option<String> = None;
+    let mut link_buf: Option<String> = None;
+    for ev in parser {
+        match ev {
+            PdEvent::Start(tag) => match tag {
+                PdTag::Link { dest_url, .. } => {
+                    link_url = Some(dest_url.to_string());
+                    link_buf = Some(String::new());
+                }
+                PdTag::CodeBlock(_) => in_code_block = true,
+                _ => {}
+            },
+            PdEvent::End(tag) => match tag {
+                PdTagEnd::Link => {
+                    if let Some(dest) = link_url.take() {
+                        let text = link_buf.take().unwrap_or_default().trim().to_string();
+                        if let Some(url) = sanitize_url(&dest) {
+                            // `[](url)` has no visible text of its own; the
+                            // pane shows only the dimmed `(url)` suffix, so
+                            // the URL itself is the clickable text.
+                            let text = if text.is_empty() { url.clone() } else { text };
+                            out.push(ExtractedLink { text, url });
+                        }
+                    } else {
+                        link_buf = None;
+                    }
+                }
+                PdTagEnd::CodeBlock => in_code_block = false,
+                _ => {}
+            },
+            PdEvent::Text(t) => {
+                if let Some(buf) = link_buf.as_mut() {
+                    buf.push_str(&t);
+                } else if !in_code_block {
+                    // No separator between events: a URL split across two Text
+                    // events by inline emphasis is still one visible run, and
+                    // a fake run glued across a block boundary simply fails to
+                    // resolve downstream (fail-safe — it tags nothing).
+                    eligible.push_str(&t);
+                }
+            }
+            PdEvent::Code(t) => {
+                // Inline code inside link text IS visible (`[`x`](u)` shows
+                // `x (u)`), so it joins the link's text; anywhere else code is
+                // not linkifiable text and is skipped.
+                if let Some(buf) = link_buf.as_mut() {
+                    buf.push_str(&t);
+                }
+            }
+            PdEvent::Html(t) | PdEvent::InlineHtml(t) => {
+                // Rendered as escaped literal text (same choice as
+                // PangoRenderer), so it is visible and scannable.
+                if let Some(buf) = link_buf.as_mut() {
+                    buf.push_str(&t);
+                } else if !in_code_block {
+                    eligible.push_str(&t);
+                }
+            }
+            _ => {}
+        }
+    }
+    for url in find_bare_urls(&eligible) {
+        if sanitize_url(&url).is_some() {
+            out.push(ExtractedLink { text: url.clone(), url });
+        }
+    }
+    out
+}
+
+/// Scan non-code visible text for bare `http://` / `https://` runs.
+///
+/// Trailing sentence punctuation (`.,;:!?'"`, `]`, `}`) is trimmed — it is
+/// never part of the target. A trailing `)` is trimmed only when unbalanced,
+/// so Wikipedia-style `…_(disambiguation)` URLs survive intact.
+fn find_bare_urls(text: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut search_from = 0;
+    while search_from < text.len() {
+        let rest = &text[search_from..];
+        let http = rest.find("http://");
+        let https = rest.find("https://");
+        let (rel, scheme_len) = match (http, https) {
+            (Some(a), Some(b)) if a < b => (a, 7),
+            (Some(_), Some(b)) => (b, 8),
+            (Some(a), None) => (a, 7),
+            (None, Some(b)) => (b, 8),
+            (None, None) => break,
+        };
+        let abs = search_from + rel;
+        let run: String = text[abs..]
+            .chars()
+            .take(MAX_BARE_URL_LEN)
+            .take_while(|c| !c.is_whitespace() && !matches!(c, '<' | '>' | '"' | '\'' | '`'))
+            .collect();
+        // Advance past the run (never zero: the scheme itself matched, and
+        // `run` is char-derived so `abs + len` is always a boundary).
+        search_from = abs + run.len().max(1);
+        let mut url = run;
+        while matches!(
+            url.chars().last(),
+            Some('.' | ',' | ';' | ':' | '!' | '?' | '\'' | ']' | '}')
+        ) {
+            url.pop();
+        }
+        while url.ends_with(')')
+            && url.bytes().filter(|&b| b == b')').count()
+                > url.bytes().filter(|&b| b == b'(').count()
+        {
+            url.pop();
+        }
+        if url.len() > scheme_len {
+            urls.push(url);
+        }
+    }
+    urls
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    #[test]
+    fn visible_text_strips_tags_and_unescapes_entities() {
+        let vis = pango_visible_text(
+            "<span foreground=\"#d4d4d4\">  </span>see <span foreground=\"#81a2be\" underline=\"single\">a &amp; b</span> &lt;done&gt;",
+        );
+        assert_eq!(vis, "  see a & b <done>", "got: {vis:?}");
+        // Width still agrees with the stripped text.
+        assert_eq!(pango_visible_len("<b>ab</b> &amp;"), "ab &".chars().count());
+    }
+
+    #[test]
+    fn extract_links_finds_markdown_links_and_bare_urls() {
+        let links = extract_links("see [docs](https://example.com/a) and https://bare.example/b.");
+        assert_eq!(links.len(), 2, "got: {links:?}");
+        assert_eq!(
+            links[0],
+            ExtractedLink {
+                text: "docs".into(),
+                url: "https://example.com/a".into()
+            }
+        );
+        // Trailing sentence punctuation is not part of the URL.
+        assert_eq!(
+            links[1],
+            ExtractedLink {
+                text: "https://bare.example/b".into(),
+                url: "https://bare.example/b".into()
+            }
+        );
+    }
+
+    #[test]
+    fn extract_links_rejects_unsafe_schemes() {
+        let links = extract_links("[x](javascript:alert(1)) and [y](ftp://f.example/z)");
+        assert!(links.is_empty(), "unsafe schemes must never reach the opener: {links:?}");
+    }
+
+    #[test]
+    fn extract_links_ignores_code_and_keeps_parens() {
+        // Fenced/inline code is not linkifiable text; the pane shows it as
+        // literal code, so a click there must not open anything.
+        let links = extract_links("`https://code.example/x` and\n```\nhttps://fence.example/y\n```\n");
+        assert!(links.is_empty(), "code URLs must not be clickable: {links:?}");
+        // Balanced parens survive (Wikipedia-style targets).
+        let links = extract_links("https://en.example/wiki/X_(disambiguation)");
+        assert_eq!(links.len(), 1, "got: {links:?}");
+        assert!(links[0].url.ends_with("(disambiguation)"), "got: {links:?}");
+    }
+
+    #[test]
+    fn extract_links_empty_text_uses_url_as_text() {
+        // `[](url)` shows only the pane's dimmed `(url)` suffix — the URL
+        // itself is the clickable text, so resolution still finds it.
+        let links = extract_links("[](https://empty.example/q)");
+        assert_eq!(links.len(), 1, "got: {links:?}");
+        assert_eq!(links[0].text, "https://empty.example/q");
+    }
+
+    #[test]
+    fn extract_links_does_not_double_report_markdown_destinations() {
+        // The `(url)` suffix the pane renders for a markdown link is display
+        // text, not a second link: one pair per link.
+        let links = extract_links("[docs](https://example.com/a)");
+        assert_eq!(links.len(), 1, "got: {links:?}");
+    }
+}
+
+#[cfg(test)]
+mod pango_tests {
+    use super::*;
+
+    #[test]
+    fn pango_bold_italic_code_render_as_spans() {
+        let m = render_pango("**bold** and *ital* and `code`");
+        assert!(m.contains("<span weight=\"bold\">bold</span>"), "got: {m:?}");
+        assert!(m.contains("<span style=\"italic\">ital</span>"), "got: {m:?}");
+        assert!(m.contains("font_family=\"monospace\""), "got: {m:?}");
+        assert!(!m.contains("**"), "raw markers must not survive: {m:?}");
+    }
+
+    #[test]
+    fn pango_escapes_model_angle_brackets() {
+        let m = render_pango("<b>not bold</b> & stuff");
+        assert!(m.contains("&lt;b&gt;"), "got: {m:?}");
+        assert!(!m.contains("<b>not bold</b>"), "raw tags must not survive: {m:?}");
+    }
+
+    #[test]
+    fn pango_heading_and_list_render_without_markers() {
+        let m = render_pango("# Title\n\n- one\n- two\n");
+        assert!(m.contains("Title"), "got: {m:?}");
+        assert!(!m.contains("# Title"), "h1 marker must not survive: {m:?}");
+        assert!(m.contains("one") && m.contains("two"), "got: {m:?}");
+    }
+
+    #[test]
+    fn pango_table_renders_monospace_grid() {        // A markdown table becomes an aligned Unicode grid in one monospace
+        // span — not the old "[table — see plain pane]" placeholder, and not
+        // raw pipes.
+        let m = render_pango("| a | b |\n|---|---|\n| 1 | 2 |\n");
+        assert!(m.contains("font_family=\"monospace\""), "got: {m:?}");
+        assert!(m.contains('┌') && m.contains('┐'), "got: {m:?}");
+        assert!(m.contains('│'), "got: {m:?}");
+        assert!(m.contains('└') && m.contains('┘'), "got: {m:?}");
+        assert!(m.contains('a') && m.contains('b'), "got: {m:?}");
+        assert!(!m.contains("[table — see plain pane]"), "got: {m:?}");
+    }
+
+    #[test]
+    fn pango_table_header_is_bold_and_columns_align() {
+        let m = render_pango("| name | age |\n|---|---|\n| al | 30 |\n| bo | 4 |\n");
+        assert!(m.contains("<b>"), "header must be bold: {m:?}");
+        // "bo" padded to "name" width: pipes line up.
+        let body_line = m.lines().find(|l| l.contains("bo")).expect("row must exist");
+        let head_line = m.lines().find(|l| l.contains("name")).expect("header must exist");
+        // Strip tags naively for the alignment check: visible pipe columns match.
+        let vis = |l: &str| pango_visible_len(l);
+        assert_eq!(vis(head_line), vis(body_line), "columns must align:\n{head_line}\n{body_line}");
     }
 }
 

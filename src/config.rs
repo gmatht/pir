@@ -470,6 +470,50 @@ const SPACE_BUNNY_COMMANDCODE_BASE_URL: &str = "https://api.commandcode.ai/provi
 const SPACE_BUNNY_OPENROUTER_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const SPACE_BUNNY_COMMANDCODE_EFFORTS: &[&str] = &["low", "medium", "high"];
 
+/// Laguna S 2.1 free (Poolside, open-weight coding agent model) on the
+/// CommandCode route only (verified live 2026-10-15: the `/models` catalog
+/// lists `poolside/laguna-s-2.1-free`, 256K context, chat+responses
+/// endpoints, and `/responses` answers with the operator's subscription key).
+/// 32,768 completion tokens per the OpenRouter model card; price $0/$0.
+const LAGUNA_FREE_MODEL_ID: &str = "poolside/laguna-s-2.1-free";
+const LAGUNA_FREE_CONTEXT: u64 = 256_000;
+const LAGUNA_FREE_MAX_TOKENS: u64 = 32_768;
+const LAGUNA_FREE_COMMANDCODE_EFFORTS: &[&str] = &["low", "medium", "high"];
+
+/// Test/peer-crate constructor for the Laguna free model (kept beside the
+/// private builder so `provider.rs` wire-shape tests exercise the real
+/// catalog entry, not a retyped copy that could drift).
+pub(crate) fn laguna_free_model_for_test() -> Model {
+    laguna_free_model()
+}
+
+fn laguna_free_model() -> Model {    let mut thinking_level_map = std::collections::BTreeMap::new();
+    for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
+        let value = if LAGUNA_FREE_COMMANDCODE_EFFORTS.contains(&level) {
+            Some(level.to_string())
+        } else {
+            None
+        };
+        thinking_level_map.insert(level.to_string(), value);
+    }
+    Model {
+        id: LAGUNA_FREE_MODEL_ID.to_string(),
+        name: Some("Laguna S 2.1 Free".to_string()),
+        context: Some(LAGUNA_FREE_CONTEXT),
+        max_tokens: Some(LAGUNA_FREE_MAX_TOKENS),
+        api_override: None,
+        url_override: None,
+        no_reasoning_effort: false,
+        reasoning: true,
+        // Same wire shape as the CommandCode space-bunny route: plain
+        // `reasoning_effort` on `/chat/completions` (see `apply_openai_thinking`).
+        thinking_format: Some("openai".to_string()),
+        supports_reasoning_effort: Some(true),
+        thinking_level_map,
+        price_per_1k: Some((0.0, 0.0)),
+    }
+}
+
 fn space_bunny_model(thinking_format: &str, efforts: &[&str]) -> Model {
     let mut thinking_level_map = std::collections::BTreeMap::new();
     for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
@@ -528,6 +572,20 @@ fn operator_home() -> std::path::PathBuf {
     std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default()
 }
 
+/// Read the `apiKey` from one home directory's command code credential
+/// store (`<base>/.commandcode/auth.json`). Pure file read, no env involved
+/// (so tests exercise it without touching process globals). Any failure
+/// (absent, unreadable, malformed, empty key) is a silent `None`.
+fn commandcode_store_file(base: &std::path::Path) -> Option<String> {
+    let raw = fs::read_to_string(base.join(".commandcode").join("auth.json")).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    v.get("apiKey")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_string)
+}
+
 /// Read the `apiKey` from command code's own credential store
 /// (`~/.commandcode/auth.json`).
 ///
@@ -548,13 +606,21 @@ fn commandcode_store_key() -> Option<String> {
     if cfg!(test) && std::env::var_os("PIR_TEST_COMMANDCODE_STORE").is_none() {
         return None;
     }
-    let raw = fs::read_to_string(operator_home().join(".commandcode").join("auth.json")).ok()?;
-    let v: Value = serde_json::from_str(&raw).ok()?;
-    v.get("apiKey")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|k| !k.is_empty())
-        .map(str::to_string)
+    // The operator home first (normal case: the human who ran `cmd login`),
+    // then the live `$HOME` as a fallback. The fallback covers a stale-sudo
+    // shell (`SUDO_USER` set but sitting at root's own home with root's own
+    // `.commandcode` store — seen live: the route silently stayed absent and
+    // every `commandcode/…` selector failed with "no model matches"). Order is
+    // load-bearing: an explicit operator home always wins over `$HOME`.
+    let invoker = operator_home();
+    if let Some(key) = commandcode_store_file(&invoker) {
+        return Some(key);
+    }
+    let live = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    match live {
+        Some(h) if h != invoker => commandcode_store_file(&h),
+        _ => None,
+    }
 }
 
 fn space_bunny_api_key(provider_id: &str) -> Option<String> {
@@ -603,14 +669,13 @@ fn merge_space_bunny(providers: &mut Vec<Provider>) {
             .or_else(|| space_bunny_api_key(provider_id));
         let Some(key) = key else { continue };
         let Some(existing) = existing_index.map(|index| &mut providers[index]) else {
-            providers.push(space_bunny_provider(
-                provider_id,
-                name,
-                base_url,
-                key,
-                thinking_format,
-                efforts,
-            ));
+            let mut provider =
+                space_bunny_provider(provider_id, name, base_url, key, thinking_format, efforts);
+            // Fresh CommandCode provider: laguna rides along from the start.
+            if provider_id == "commandcode" {
+                provider.models.push(laguna_free_model());
+            }
+            providers.push(provider);
             continue;
         };
 
@@ -631,6 +696,15 @@ fn merge_space_bunny(providers: &mut Vec<Provider>) {
             existing
                 .models
                 .push(space_bunny_model(thinking_format, efforts));
+        }
+        // Laguna S 2.1 free rides the CommandCode route only (same key, same
+        // base URL). Appended after space-bunny so the existing default order
+        // is unchanged; `/model laguna` / `/model commandcode/laguna` resolves
+        // via the usual substring match.
+        if provider_id == "commandcode"
+            && !existing.models.iter().any(|model| model.id == LAGUNA_FREE_MODEL_ID)
+        {
+            existing.models.push(laguna_free_model());
         }
     }
 }
@@ -3133,6 +3207,101 @@ mod worktree_settings_tests {
     }
 
     #[test]
+    fn laguna_free_rides_commandcode_route_only() {
+        // `commandcode/poolside/laguna-s-2.1-free`: Poolside's open-weight
+        // coding model, free on the CommandCode route (verified live against
+        // the /models catalog + /responses, 2026-10-15). 256K context, 32K
+        // output, plain `reasoning_effort` (low/medium/high) like the
+        // CommandCode space-bunny route — never on OpenRouter.
+        let m = laguna_free_model();
+        assert_eq!(m.id, LAGUNA_FREE_MODEL_ID);
+        assert_eq!(m.name.as_deref(), Some("Laguna S 2.1 Free"));
+        assert_eq!(m.context, Some(LAGUNA_FREE_CONTEXT));
+        assert_eq!(m.max_tokens, Some(LAGUNA_FREE_MAX_TOKENS));
+        assert!(m.reasoning);
+        assert_eq!(m.thinking_format.as_deref(), Some("openai"));
+        assert_eq!(m.supports_reasoning_effort, Some(true));
+        assert_eq!(m.price_per_1k, Some((0.0, 0.0)));
+        assert_eq!(level_names(&m.supported_levels()), vec!["low", "medium", "high"]);
+
+        // Merge into an existing user-owned commandcode entry (custom base
+        // URL preserved): laguna is appended, space-bunny untouched.
+        // Isolated like the sibling route tests: the lock + a scratch
+        // PI_DIR/HOME keep a parallel test's OPENROUTER_API_KEY (or the
+        // operator's real ~/.commandcode store) from adding a second route.
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("pir_laguna_merge_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("agent")).unwrap();
+        let old_dir = std::env::var_os("PI_DIR");
+        let old_home = std::env::var_os("HOME");
+        let old_openrouter = std::env::var_os("OPENROUTER_API_KEY");
+        let old_cmd = std::env::var_os("CMD_API_KEY");
+        let old_commandcode = std::env::var_os("COMMANDCODE_API_KEY");
+        let old_invoking = std::env::var_os("PIR_INVOKING_HOME");
+        unsafe {
+            std::env::set_var("PI_DIR", &dir);
+            std::env::set_var("HOME", &dir);
+            std::env::remove_var("PIR_INVOKING_HOME");
+            std::env::remove_var("OPENROUTER_API_KEY");
+            std::env::remove_var("CMD_API_KEY");
+            std::env::remove_var("COMMANDCODE_API_KEY");
+        }
+        let mut providers = vec![Provider {
+            id: Some("commandcode".to_string()),
+            name: Some("User CommandCode".to_string()),
+            base_url: Some("https://proxy.example/v1".to_string()),
+            api_key: Some("catalog-key".to_string()),
+            api: Some("openai".to_string()),
+            models: vec![space_bunny_model("openai", SPACE_BUNNY_COMMANDCODE_EFFORTS)],
+        }];
+        merge_space_bunny(&mut providers);
+        assert_eq!(providers.len(), 1);
+        let cc = &providers[0];
+        assert_eq!(cc.base_url.as_deref(), Some("https://proxy.example/v1"));
+        assert!(cc.models.iter().any(|m| m.id == SPACE_BUNNY_MODEL_ID));
+        let laguna = cc
+            .models
+            .iter()
+            .find(|m| m.id == LAGUNA_FREE_MODEL_ID)
+            .expect("laguna must merge onto the commandcode route");
+        assert_eq!(laguna.context, Some(LAGUNA_FREE_CONTEXT));
+        // Full label resolves through the normal selector.
+        let (p, sel) = select(&providers, "commandcode/poolside/laguna-s-2.1-free")
+            .expect("laguna label must resolve");
+        assert_eq!(p.pid(), "commandcode");
+        assert_eq!(sel.id, LAGUNA_FREE_MODEL_ID);
+        // Bare-id substring match finds exactly one (no openrouter twin).
+        let (p2, _) = select(&providers, "laguna").expect("laguna must resolve");
+        assert_eq!(p2.pid(), "commandcode");
+        match old_dir {
+            Some(value) => unsafe { std::env::set_var("PI_DIR", value) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        match old_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match old_openrouter {
+            Some(value) => unsafe { std::env::set_var("OPENROUTER_API_KEY", value) },
+            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
+        }
+        match old_cmd {
+            Some(value) => unsafe { std::env::set_var("CMD_API_KEY", value) },
+            None => unsafe { std::env::remove_var("CMD_API_KEY") },
+        }
+        match old_commandcode {
+            Some(value) => unsafe { std::env::set_var("COMMANDCODE_API_KEY", value) },
+            None => unsafe { std::env::remove_var("COMMANDCODE_API_KEY") },
+        }
+        match old_invoking {
+            Some(value) => unsafe { std::env::set_var("PIR_INVOKING_HOME", value) },
+            None => unsafe { std::env::remove_var("PIR_INVOKING_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn space_bunny_route_metadata_matches_published_limits() {
         let routes = [
             (
@@ -3262,6 +3431,16 @@ mod worktree_settings_tests {
             p.pid() == "commandcode"
                 && p.models.iter().any(|m| m.id == SPACE_BUNNY_MODEL_ID)
         }));
+        // Laguna free rides the CommandCode route only: present there, never
+        // on OpenRouter.
+        assert!(both_routes.iter().any(|p| {
+            p.pid() == "commandcode"
+                && p.models.iter().any(|m| m.id == LAGUNA_FREE_MODEL_ID)
+        }));
+        assert!(!both_routes.iter().any(|p| {
+            p.pid() == "openrouter"
+                && p.models.iter().any(|m| m.id == LAGUNA_FREE_MODEL_ID)
+        }));
 
         match old_dir {
             Some(value) => unsafe { std::env::set_var("PI_DIR", value) },
@@ -3382,6 +3561,89 @@ mod worktree_settings_tests {
             None => unsafe { std::env::remove_var("PIR_TEST_COMMANDCODE_STORE") },
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commandcode_store_falls_back_to_live_home() {
+        // The live "no model matches 'commandcode/…'" report: a stale-sudo
+        // shell (`SUDO_USER` set, `PIR_INVOKING_HOME` pointing at a home with
+        // no `.commandcode` store) while the real key sits under the live
+        // `$HOME`. The operator home still wins when both have keys.
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("PIR_TEST_COMMANDCODE_STORE", "1"); }
+        let root = std::env::temp_dir().join(format!("pir_cc_fallback_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let invoker = root.join("invoker");
+        let live = root.join("live");
+        std::fs::create_dir_all(invoker.join(".commandcode")).unwrap();
+        std::fs::create_dir_all(live.join(".commandcode")).unwrap();
+
+        // Pure helper first: missing dir, flat real-store shape, empty key.
+        assert_eq!(commandcode_store_file(&root.join("nowhere")), None);
+        std::fs::write(
+            live.join(".commandcode").join("auth.json"),
+            serde_json::json!({ "apiKey": "live-key", "userId": "u_1" }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            commandcode_store_file(&live).as_deref(),
+            Some("live-key")
+        );
+        std::fs::write(
+            invoker.join(".commandcode").join("auth.json"),
+            serde_json::json!({ "apiKey": "   " }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(commandcode_store_file(&invoker), None);
+
+        let old_home = std::env::var_os("HOME");
+        let old_invoker = std::env::var_os("PIR_INVOKING_HOME");
+        let old_cmd = std::env::var_os("CMD_API_KEY");
+        let old_commandcode = std::env::var_os("COMMANDCODE_API_KEY");
+        unsafe {
+            std::env::remove_var("CMD_API_KEY");
+            std::env::remove_var("COMMANDCODE_API_KEY");
+            std::env::set_var("HOME", &live);
+            std::env::set_var("PIR_INVOKING_HOME", &invoker);
+        }
+        // Invoker store empty, live $HOME has the key → fallback finds it.
+        assert_eq!(
+            commandcode_store_key().as_deref(),
+            Some("live-key")
+        );
+        // Invoker store populated → it wins over the live home.
+        std::fs::write(
+            invoker.join(".commandcode").join("auth.json"),
+            serde_json::json!({ "apiKey": "invoker-key" }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            commandcode_store_key().as_deref(),
+            Some("invoker-key")
+        );
+        // Neither has a key → silent None, route stays absent.
+        std::fs::remove_file(invoker.join(".commandcode").join("auth.json")).unwrap();
+        std::fs::remove_file(live.join(".commandcode").join("auth.json")).unwrap();
+        assert_eq!(commandcode_store_key(), None);
+
+        match old_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match old_invoker {
+            Some(value) => unsafe { std::env::set_var("PIR_INVOKING_HOME", value) },
+            None => unsafe { std::env::remove_var("PIR_INVOKING_HOME") },
+        }
+        match old_cmd {
+            Some(value) => unsafe { std::env::set_var("CMD_API_KEY", value) },
+            None => unsafe { std::env::remove_var("CMD_API_KEY") },
+        }
+        match old_commandcode {
+            Some(value) => unsafe { std::env::set_var("COMMANDCODE_API_KEY", value) },
+            None => unsafe { std::env::remove_var("COMMANDCODE_API_KEY") },
+        }
+        unsafe { std::env::remove_var("PIR_TEST_COMMANDCODE_STORE"); }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -183,6 +183,20 @@ pub fn step_pick(candidates: &[String], arg: &str, up: bool) -> Option<String> {
     candidates.get(idx).cloned()
 }
 
+/// Whether Up/Down on this line should drive the inline `/model` picker
+/// rather than history recall: only when the operator *typed* the line. A
+/// history-recalled `/model` line (up-arrowed to, not typed) keeps navigating
+/// history, so arrowing *onto* `/model foo` and pressing Up again reaches
+/// older prompts instead of trapping in the picker.
+///
+/// Pure, so both front-ends (the rustyline `ModelPickHandler` and the TUI idle
+/// loop) share one definition and can never disagree about when the arrows
+/// are rewired. Callers pass the line up to the cursor, exactly as they do
+/// for [`pick_next`].
+pub fn arrows_drive_picker(line: &str, recalled: bool) -> bool {
+    !recalled && parse_model_line(line).is_some()
+}
+
 /// One picker keypress, pure: given the idle line, the cursor byte offset,
 /// and the current candidates, return the rebuilt buffer after an Up (`up =
 /// true`) / Down step, or `None` when picking is inactive here (not a
@@ -297,6 +311,29 @@ pub(crate) fn filter_ranked(entries: &[Entry], prefix: &str, n: usize) -> Vec<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The up-arrow trap: a `/model` line the operator typed rewires the
+    /// arrows to the picker, but a `/model` line that arrived via history
+    /// recall (up-arrowed to, not typed) must keep navigating history — so
+    /// arrowing *onto* `/model foo` and pressing Up again reaches older
+    /// prompts instead of stepping through models.
+    #[test]
+    fn recalled_model_line_does_not_rewire_arrows() {
+        // Typed lines (not recalled) rewire: bare, prefixed, and short form.
+        assert!(arrows_drive_picker("/model", false));
+        assert!(arrows_drive_picker("/model foo", false));
+        assert!(arrows_drive_picker("/m foo", false));
+        assert!(arrows_drive_picker("  /model foo", false));
+        // Recalled lines never rewire — even a bare `/model`.
+        assert!(!arrows_drive_picker("/model", true));
+        assert!(!arrows_drive_picker("/model foo", true));
+        assert!(!arrows_drive_picker("/m foo", true));
+        // Not a model line: never rewired, typed or recalled.
+        assert!(!arrows_drive_picker("hello", false));
+        assert!(!arrows_drive_picker("hello", true));
+        assert!(!arrows_drive_picker("", false));
+        assert!(!arrows_drive_picker("/models", false));
+    }
 
     fn entries() -> Vec<Entry> {
         // Deliberately out of recency order: ranking sorts by `last_used`.

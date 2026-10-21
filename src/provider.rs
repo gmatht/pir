@@ -487,8 +487,18 @@ impl Client {
     /// no thinking budget — a hard failure is returned as `Err` and treated as
     /// "no opinion" by the caller. Honours `PIR_STALL_TIMEOUT_SECS`/the cancel
     /// flag like the streaming path, so a stuck provider can't hang the turn.
-    pub fn complete(&self, model: &str, system: &str, prompt: &str) -> Result<String, String> {
-        self.complete_with(model, system, prompt, 12)
+    pub fn complete(
+        &self,
+        model: &str,
+        system: &str,
+        prompt: &str,
+        // Per-model API override (the session model may differ in API family
+        // from the client's provider default; without this a Responses-family
+        // model on an OpenAi-kind client sends a chat body and 400s
+        // `ModelProtocolUnsupported` — verified live).
+        api_override: Option<ApiKind>,
+    ) -> Result<String, String> {
+        self.complete_with(model, system, prompt, 12, api_override)
     }
 
     /// Like [`Client::complete`], but with an explicit output-token budget.
@@ -501,75 +511,15 @@ impl Client {
         system: &str,
         prompt: &str,
         max_out: u32,
+        api_override: Option<ApiKind>,
     ) -> Result<String, String> {
         if self.fake {
             let _ = (model, system, prompt);
             return Ok("fake ok".to_string());
         }
-        let kind = self.kind;
-        let max_key = if model.starts_with("o1")
-            || model.starts_with("o3")
-            || model.starts_with("o4")
-            || model.contains("gpt-5")
-        {
-            "max_completion_tokens"
-        } else {
-            "max_tokens"
-        };
-        let (url, body) = match kind {
-            ApiKind::Anthropic => (
-                format!("{}/messages", self.base_url),
-                json!({
-                    "model": model,
-                    "max_tokens": max_out,
-                    "stream": false,
-                    "system": system,
-                    "messages": [{ "role": "user", "content": prompt }],
-                }),
-            ),
-            ApiKind::OpenAi => {
-                let mut url = self.base_url.trim_end_matches('/').to_string();
-                if !url.ends_with("/chat/completions") && !url.contains('?') {
-                    url.push_str("/chat/completions");
-                }
-                // Build the object with an explicit `Map` so `max_key` is
-                // inserted as the *value* of the variable ("max_tokens" for
-                // classic models, "max_completion_tokens" for o-series/gpt-5).
-                // A bare `max_key:` inside `json!` emits a literal "max_key"
-                // field, silently dropping the output cap (the bug this fixes);
-                // `openai_request` already builds its body this `Map` way.
-                let mut obj = Map::new();
-                obj.insert("model".into(), json!(model));
-                obj.insert(max_key.into(), json!(max_out));
-                obj.insert("stream".into(), json!(false));
-                obj.insert(
-                    "messages".into(),
-                    json!([
-                        { "role": "system", "content": system },
-                        { "role": "user", "content": prompt },
-                    ]),
-                );
-                (url, Value::Object(obj))
-            }
-            ApiKind::OpenAiResponses => {
-                let mut url = self.base_url.trim_end_matches('/').to_string();
-                if !url.ends_with("/responses") && !url.contains('?') {
-                    url.push_str("/responses");
-                }
-                (
-                    url,
-                    json!({
-                        "model": model,
-                        "input": [
-                            { "role": "system", "content": system },
-                            { "role": "user", "content": prompt },
-                        ],
-                        "max_output_tokens": max_out,
-                        "stream": false,
-                    }),
-                )
-            }
-        };
+        let kind = api_override.unwrap_or(self.kind);
+        let (url, body) =
+            Self::complete_body(&self.base_url, model, system, prompt, max_out, kind);
         smol::block_on(async {
             // Buffered POST through the host libcurl on a worker thread;
             // non-2xx maps through `http_status_detail`.
@@ -638,6 +588,82 @@ impl Client {
         })
     }
 
+    /// Pure body builder for [`Client::complete_with`], split out so tests
+    /// assert on the exact payload the wire path sends (a test that rebuilt
+    /// the body itself could pass while the shipped builder regressed).
+    fn complete_body(
+        base_url: &str,
+        model: &str,
+        system: &str,
+        prompt: &str,
+        max_out: u32,
+        kind: ApiKind,
+    ) -> (String, Value) {
+        let max_key = if model.starts_with("o1")
+            || model.starts_with("o3")
+            || model.starts_with("o4")
+            || model.contains("gpt-5")
+        {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        match kind {
+            ApiKind::Anthropic => (
+                format!("{}/messages", base_url.trim_end_matches('/')),
+                json!({
+                    "model": model,
+                    "max_tokens": max_out,
+                    "stream": false,
+                    "system": system,
+                    "messages": [{ "role": "user", "content": prompt }],
+                }),
+            ),
+            ApiKind::OpenAi => {
+                let mut url = base_url.trim_end_matches('/').to_string();
+                if !url.ends_with("/chat/completions") && !url.contains('?') {
+                    url.push_str("/chat/completions");
+                }
+                // Build the object with an explicit `Map` so `max_key` is
+                // inserted as the *value* of the variable ("max_tokens" for
+                // classic models, "max_completion_tokens" for o-series/gpt-5).
+                // A bare `max_key:` inside `json!` emits a literal "max_key"
+                // field, silently dropping the output cap (the bug this fixes);
+                // `openai_request` already builds its body this `Map` way.
+                let mut obj = Map::new();
+                obj.insert("model".into(), json!(model));
+                obj.insert(max_key.into(), json!(max_out));
+                obj.insert("stream".into(), json!(false));
+                obj.insert(
+                    "messages".into(),
+                    json!([
+                        { "role": "system", "content": system },
+                        { "role": "user", "content": prompt },
+                    ]),
+                );
+                (url, Value::Object(obj))
+            }
+            ApiKind::OpenAiResponses => {
+                let mut url = base_url.trim_end_matches('/').to_string();
+                if !url.ends_with("/responses") && !url.contains('?') {
+                    url.push_str("/responses");
+                }
+                (
+                    url,
+                    json!({
+                        "model": model,
+                        "input": [
+                            { "role": "system", "content": system },
+                            { "role": "user", "content": prompt },
+                        ],
+                        "max_output_tokens": responses_output_floor(max_out),
+                        "stream": false,
+                    }),
+                )
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn chat(
         &self,
@@ -680,6 +706,25 @@ impl Client {
         // (request builders + context estimate) uses the cleaned sequence.
         let clean = sanitize_history(history);
         let history: &[Message] = &clean;
+        // Combined-context guard (see `fit_output_budget`): the agent
+        // pre-clamps with a history-only estimate, but system + tool specs
+        // ride alongside history and are uncounted there. Re-clamp here with
+        // the full estimate so an over-window body never reaches the gateway
+        // (it 400s `invalid parameters`, param null); fail fast with an
+        // actionable message when nothing can fit.
+        let eff_ctx = model_meta
+            .and_then(|m| m.context)
+            .filter(|c| *c > 0)
+            .or_else(|| if model_ctx > 0 { Some(model_ctx) } else { None })
+            .unwrap_or(200_000);
+        let max_tokens = match fit_output_budget(
+            max_tokens,
+            estimate_request_tokens(system, &clean, tools),
+            eff_ctx,
+        ) {
+            Ok(m) => m,
+            Err(e) => return Err(e),
+        };
         smol::block_on(async {
         let kind = api_override.unwrap_or(self.kind);
         let (url, body) = match kind {
@@ -1765,6 +1810,61 @@ fn is_timeout(error: &str) -> bool {
 fn is_read_timeout(e: &std::io::Error) -> bool {
     matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)
 }
+/// Floor for the Responses `max_output_tokens` field on one-shot calls.
+/// Verified live against the gateway (2026-10-20, muse-spark): values below
+/// 16 are rejected with HTTP 400 "`max_output_tokens` The number must be
+/// `>= 16`". `Client::complete`'s 12-token default is sized for one-word
+/// verdicts, so without this every background classifier on a Responses
+/// model 400s deterministically.
+fn responses_output_floor(max_out: u32) -> u32 {
+    max_out.max(16)
+}
+
+/// Cheap input-size estimate for a request about to go out: system prompt +
+/// history (same `bytes/4` rule as `agent::approx_tokens`, including its
+/// 32-token per-message overhead) + the serialized tool specs. The agent's
+/// `trim` budget only counts history, so system + tools are the uncounted
+/// remainder that can push a just-under-budget history over the window.
+fn estimate_request_tokens(system: &str, history: &[Message], tools: &[ToolSpec]) -> u64 {
+    let mut bytes = system.len();
+    for m in history {
+        bytes += 32;
+        for b in &m.blocks {
+            bytes += match b {
+                Block::Text(t) => t.len(),
+                Block::Thinking { text } => text.len(),
+                Block::ToolUse { input, .. } => input.to_string().len() + 64,
+                Block::ToolResult { content, .. } => content.len() + 64,
+            };
+        }
+    }
+    for t in tools {
+        bytes += t.name.len() + t.description.len() + t.schema.to_string().len() + 64;
+    }
+    (bytes / 4) as u64
+}
+
+/// Clamp the output budget so input + output provably fits `ctx`, or refuse
+/// to send. Verified live (2026-10-20, muse-spark): `max_output_tokens` at
+/// or near the full context window 400s with the gateway's generic
+/// "The request contains invalid parameters" (`param: null`), and so does an
+/// input that already exceeds the window. The agent pre-clamps with a
+/// history-only estimate; this re-clamps with the full estimate (system +
+/// tools included) right where the body is built, so a miscount upstream
+/// becomes a smaller reply — not a rejected turn. When even the smallest
+/// reply (16 tokens, the Responses floor) cannot fit, sending anything is a
+/// certain 400, so fail fast with an actionable message (`/compact`) instead
+/// of the gateway's opaque sentence.
+fn fit_output_budget(max_tokens: u64, est_input: u64, ctx: u64) -> Result<u64, String> {
+    let sys_head = 2_000u64; // tokenizer drift + framing, same headroom as the agent
+    let room = ctx.saturating_sub(est_input).saturating_sub(sys_head);
+    if room < 16 {
+        return Err(format!(
+            "request input is too large (~{est_input} tokens est.) for the model's              {ctx}-token context window — even the smallest reply won't fit              (the provider would reject this with HTTP 400); /compact the              session or trim history and retry"
+        ));
+    }
+    Ok(max_tokens.min(room))
+}
 /// Repair orphaned tool blocks before serializing a request.
 ///
 /// Several paths can leave `history` with tool calls that have no results or
@@ -1999,6 +2099,11 @@ fn sanitize_history(history: &[Message]) -> Vec<Message> {
                 let mut texts = Vec::new();
                 let mut uses = Vec::new();
                 let mut matched = Vec::new();
+                // Calls lifted out of this message by the fold branch below.
+                // They are the NEXT round's (the fold merged them in here), so
+                // their results legitimately arrive in LATER messages — the
+                // post-emit close must spare them (see below).
+                let mut lifts: Vec<String> = Vec::new();
                 // Results with no open call *yet*. Kept as original blocks (not
                 // demoted to text immediately) so a result answering a folded
                 // `ToolUse` from this same message can still pair with it below.
@@ -2057,6 +2162,10 @@ fn sanitize_history(history: &[Message]) -> Vec<Message> {
                         out.push(Message { role: Role::Assistant, blocks: kept });
                     }
                     open = ids;
+                    // Calls lifted out of this message are the NEXT round's:
+                    // their results legitimately arrive in LATER messages, so
+                    // the emit closes below must spare them (see `lifts`).
+                    lifts = open.clone();
                     // The folded `ToolUse`s may answer the results held back
                     // above: retry each unmatched result against the lifted
                     // calls. A hit pairs here exactly once; whatever is left
@@ -2101,12 +2210,38 @@ fn sanitize_history(history: &[Message]) -> Vec<Message> {
                     out.push(Message { role: Role::User, blocks: matched });
                     // A results message always carries a turn's *complete* set
                     // of results, so a partial consume means corruption: close
-                    // the rest now, while still adjacent to their calls.
-                    close_open(&mut out, &mut open, &mut done);
+                    // the rest now, while still adjacent to their calls — but
+                    // NEVER calls this message itself just lifted (`lifts`):
+                    // those are the next round's and their real results arrive
+                    // in later messages. Closing them here synthesizes a bogus
+                    // "skipped" output and orphans the real result (which then
+                    // demotes to unpaired text).
+                    let mut shut: Vec<String> = Vec::new();
+                    let mut keep: Vec<String> = Vec::new();
+                    for id in std::mem::take(&mut open) {
+                        if lifts.contains(&id) {
+                            keep.push(id);
+                        } else {
+                            shut.push(id);
+                        }
+                    }
+                    open = keep;
+                    close_open(&mut out, &mut shut, &mut done);
                 } else if !open.is_empty() {
                     // New turn content with calls still open and no results
-                    // here: close them first so adjacency holds.
-                    close_open(&mut out, &mut open, &mut done);
+                    // here: close them first so adjacency holds — again
+                    // sparing just-lifted next-round calls (same reason).
+                    let mut shut: Vec<String> = Vec::new();
+                    let mut keep: Vec<String> = Vec::new();
+                    for id in std::mem::take(&mut open) {
+                        if lifts.contains(&id) {
+                            keep.push(id);
+                        } else {
+                            shut.push(id);
+                        }
+                    }
+                    open = keep;
+                    close_open(&mut out, &mut shut, &mut done);
                 }
                 if !texts.is_empty() {
                     out.push(Message { role: Role::User, blocks: texts });
@@ -4530,7 +4665,7 @@ mod tests {
                 let _ = sock.flush();
             });
             let client = Client::new(ApiKind::OpenAi, &format!("http://{addr}"), "k".to_string());
-            let out = client.complete_with(model, "sys", "hi", 77);
+            let out = client.complete_with(model, "sys", "hi", 77, None);
             assert!(out.is_ok(), "complete_with must succeed: {out:?}");
             srv.join().expect("server");
             String::from_utf8_lossy(&captured.lock().unwrap()).to_string()
@@ -5179,6 +5314,221 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sanitize_consecutive_assistant_then_folded_user_keeps_single_pair() {
+        // The sh2loop `Duplicate function_call_output` 400 (2026-10-15,
+        // call_00_1eryrf6r7n2mzb1pnsp7jmb5): `load_session` folds a user line
+        // with the FOLLOWING assistant line, so a tool round followed by a
+        // text-only assistant note and the next round arrives as an
+        // assistant-alone message (calls still open) plus a folded user
+        // message (the real results plus the next round's use). The fold
+        // branch must consume the matched results BEFORE `close_open` (or it
+        // synthesizes a second output for answered calls and the gateway 400s
+        // the whole turn), and the post-emit closes must spare the just-lifted
+        // next-round calls (or they get a bogus "skipped" result while the
+        // real result demotes to unpaired text).
+        let h = vec![
+            user_text("hi"),
+            Message {
+                role: Role::Assistant,
+                blocks: vec![
+                    Block::Text("plan".to_string()),
+                    Block::ToolUse {
+                        id: "c1".to_string(),
+                        name: "bash".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                    Block::ToolUse {
+                        id: "c2".to_string(),
+                        name: "bash".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                ],
+            },
+            Message {
+                role: Role::User,
+                blocks: vec![
+                    Block::ToolResult {
+                        tool_use_id: "c1".to_string(),
+                        content: "r1".to_string(),
+                        is_error: false,
+                    },
+                    Block::ToolResult {
+                        tool_use_id: "c2".to_string(),
+                        content: "r2".to_string(),
+                        is_error: false,
+                    },
+                    Block::Text("progress".to_string()),
+                    Block::ToolUse {
+                        id: "c3".to_string(),
+                        name: "bash".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                ],
+            },
+            user_result("c3", "r3"),
+        ];
+        let clean = sanitize_history(&h);
+        let client = Client::new(ApiKind::OpenAiResponses, "http://x", "k".to_string());
+        let (_url, body) = client.responses_request(
+            "m",
+            16,
+            "sys",
+            &clean,
+            &[],
+            crate::config::ThinkingLevel::Off,
+            true,
+            None,
+        );
+        assert_responses_pairs_valid(&body);
+        let outputs: Vec<&str> = body
+            .get("input")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter(|it| it.get("type").and_then(Value::as_str) == Some("function_call_output"))
+            .filter_map(|it| it.get("output").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            outputs,
+            vec!["r1", "r2", "r3"],
+            "real results must survive exactly once: {clean:?}"
+        );
+        assert!(
+            !clean.iter().any(|m| m.text().contains("skipped")),
+            "no synthetic output for answered calls: {clean:?}"
+        );
+    }
+
+
+    /// Reasoning model builders mirroring `models-store.json` entries.
+    #[test]
+    fn full_window_output_budget_clamps_instead_of_400() {
+        // Live gateway probe (2026-10-20, muse-spark `openai-responses`):
+        // `max_output_tokens` at/near the full context window 400s with the
+        // generic "The request contains invalid parameters" (`param: null`);
+        // so does an input that already exceeds the window. `chat()` must
+        // clamp with the full estimate (system + history + tools) before any
+        // builder runs, and refuse with an actionable message when even 16
+        // tokens cannot fit — never emit the certain-400 body.
+        let client = Client::new(ApiKind::OpenAiResponses, "http://x", "k".to_string());
+        let m = reasoning_model(None, &[]);
+        let (_url, body) = client.responses_request(
+            "m",
+            16,
+            "sys",
+            &[user_text("hi")],
+            &[],
+            crate::config::ThinkingLevel::Off,
+            true,
+            Some(&m),
+        );
+        // Sanity: a small body passes the guard untouched.
+        assert_eq!(body["max_output_tokens"], serde_json::json!(16));
+        // The guard itself, unit level: full-window budget clamps to the room
+        // left after input + headroom, not the requested value.
+        assert_eq!(fit_output_budget(1_048_576, 28, 1_048_576).unwrap(), 1_046_548);
+        assert_eq!(fit_output_budget(131_072, 28, 1_048_576).unwrap(), 131_072);
+        // Input over the window refuses fast (actionable, not the gateway's
+        // opaque sentence): even the smallest reply cannot fit.
+        let err = fit_output_budget(16, 2_000_000, 1_048_576).unwrap_err();
+        assert!(err.contains("/compact"), "actionable message: {err}");
+    }
+
+    #[test]
+    fn chat_clamps_full_window_output_budget_on_the_wire() {
+        // End-to-end half of `full_window_output_budget_clamps_instead_of_400`:
+        // `chat()` must clamp before the builders run, so the body on the wire
+        // never carries the certain-400 full-window budget. Asserts on the
+        // captured request (what the code itself sent), not a recomputation.
+        if lsb_curl::Curl::load().is_err() {
+            eprintln!("SKIP: no loadable libcurl");
+            return;
+        }
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap_srv = captured.clone();
+        let _srv = thread::spawn(move || {
+            let Some(mut sock) = accept_within(&listener, 30) else { return };
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let head_end = loop {
+                let n = sock.read(&mut tmp).expect("read");
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(p) = find_subslice(&buf, b"\r\n\r\n") {
+                    break p + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+            let len: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            while buf.len() < head_end + len {
+                let n = sock.read(&mut tmp).expect("read body");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            *cap_srv.lock().unwrap() = buf[head_end..].to_vec();
+            let frame = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"}}}]}\n\ndata: [DONE]\n\n";
+            let _ = sock.write_all(frame.as_bytes());
+            let _ = sock.flush();
+            thread::sleep(Duration::from_millis(200));
+        });
+        let client = Client::new(ApiKind::OpenAi, &format!("http://{addr}"), "k".to_string());
+        let mut text = String::new();
+        let res = client.chat(
+            "m",
+            1_048_576,
+            "sys",
+            &[user_text("hi")],
+            &[],
+            &mut |t: &str| text.push_str(t),
+            crate::config::ThinkingLevel::Off,
+            1_048_576,
+            &mut |_s: &str| {},
+            None,
+            None,
+            true,
+            None,
+            &mut |_w: &RetryWait| {},
+            &mut |_n: &str| {},
+        );
+        assert!(res.is_ok(), "chat must succeed: {res:?}");
+        let wire = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+        assert!(
+            !wire.contains("1048576"),
+            "full-window budget must not go out on the wire: {wire}"
+        );
+        assert!(wire.contains("\"max_tokens\""), "budget key present: {wire}");
+    }
+
+    #[test]
+    fn complete_responses_enforces_output_floor() {
+        // `Client::complete`'s 12-token default 400s on Responses models
+        // ("`max_output_tokens` must be `>= 16`", verified live) — every
+        // background classifier on such a model failed deterministically.
+        assert_eq!(responses_output_floor(12), 16);
+        assert_eq!(responses_output_floor(16), 16);
+        assert_eq!(responses_output_floor(77), 77);
+        let (_url, body) = Client::complete_body(
+            "http://x",
+            "m",
+            "sys",
+            "hi",
+            12,
+            ApiKind::OpenAiResponses,
+        );
+        assert_eq!(body["max_output_tokens"], serde_json::json!(16));
+    }
 
     /// Reasoning model builders mirroring `models-store.json` entries.
     fn reasoning_model(
@@ -5387,6 +5737,24 @@ mod tests {
         assert!(body.get("reasoning").is_none());
         assert_eq!(body["stream_options"], json!({ "include_usage": true }));
         assert_eq!(body["tools"][0]["function"]["name"], json!("lookup"));
+
+        // Laguna free: same CommandCode wire shape, real model id and budget.
+        let laguna = crate::config::laguna_free_model_for_test();
+        let (url, body) = client.openai_request(
+            &laguna.id,
+            32,
+            "sys",
+            &[],
+            &tools,
+            L::High,
+            Some(&laguna),
+        );
+        assert_eq!(url, "https://route.example/v1/chat/completions");
+        assert_eq!(body["model"], json!("poolside/laguna-s-2.1-free"));
+        assert_eq!(body["max_tokens"], json!(32));
+        assert_eq!(body["reasoning_effort"], json!("high"));
+        assert!(body.get("reasoning").is_none());
+        assert_eq!(body["tools"][0]["function"]["name"], json!("lookup"));
     }
 
     #[test]
@@ -5492,7 +5860,3 @@ mod tests {
         );
     }
 }
-
-
-
-

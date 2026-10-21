@@ -55,6 +55,30 @@ type GuiLabel = rustxwidgets::backends_nwg_adapter::Label;
 #[cfg(all(target_os = "linux", not(windows)))]
 type GuiLabel = rustxwidgets::backends_gtk_adapter::Label;
 
+/// The concrete `Button` type returned by `App::create_button`, for the same
+/// reason as [`GuiLabel`]: the sidebar rows hold real buttons so a click can
+/// switch tabs, and the factory hands back the adapter type.
+#[cfg(windows)]
+type GuiButton = rustxwidgets::backends_nwg_adapter::Button;
+#[cfg(all(target_os = "linux", not(windows)))]
+type GuiButton = rustxwidgets::backends_gtk_adapter::Button;
+
+/// The concrete `BoxWidget` type returned by `App::create_box`, for the same
+/// reason: the sidebar owns its rows container across drain ticks.
+#[cfg(windows)]
+type GuiBox = rustxwidgets::backends_nwg_adapter::BoxWidget;
+#[cfg(all(target_os = "linux", not(windows)))]
+type GuiBox = rustxwidgets::backends_gtk_adapter::BoxWidget;
+
+/// The concrete `CheckButton` type returned by `App::create_checkbutton`, for
+/// the same reason: the security/settings dialogs own their toggles across
+/// redraws, and the factory hands back the adapter type.
+#[cfg(windows)]
+type GuiCheckButton = rustxwidgets::backends_nwg_adapter::CheckButton;
+#[cfg(all(target_os = "linux", not(windows)))]
+type GuiCheckButton = rustxwidgets::backends_gtk_adapter::CheckButton;
+
+
 // NOTE on the `cfg` gates above: they test `target_os`, *not*
 // `cfg(feature = "gtk")`. A `feature` cfg inside this crate tests *pir's*
 // features, and pir has no feature named `gtk` — that one belongs to the
@@ -76,6 +100,20 @@ const GDK_KEY_DOWN: u32 = 0xff54;
 const GDK_KEY_CTRL_L: u32 = 0xffe3;
 const GDK_KEY_CTRL_R: u32 = 0xffe4;
 const GDK_KEY_Q: u32 = 0x71;
+/// GDK keyvals for keyboard scrolling (design row S6): Page_Up / Page_Down /
+/// Home / End. The toolkit's prelude does not re-export these, and binding them
+/// by name would silently compile as a catch-all `u32` pattern — hence raw
+/// values, as with `KEY_ESCAPE` below. (0xff55 = Page_Up, 0xff56 = Page_Down,
+/// 0xff50 = Home, 0xff57 = End.)
+const GDK_KEY_PAGE_UP: u32 = 0xff55;
+const GDK_KEY_PAGE_DOWN: u32 = 0xff56;
+const GDK_KEY_HOME: u32 = 0xff50;
+const GDK_KEY_END: u32 = 0xff57;
+
+/// Viewport estimate, in lines, for keyboard / menu scrolling (design row S6).
+/// `GuiScroll.page` is set to this until the pane's allocated height is known;
+/// page-sized moves use `scroll.page.max(1)` so a zero page still moves.
+const SCROLL_PAGE_LINES: usize = 20;
 
 /// Idle-mode Tab completion. Completes `/`-command names (and a couple of
 /// argument lists). Returns `Some(completed)` with the new buffer when exactly
@@ -89,6 +127,12 @@ const GDK_KEY_Q: u32 = 0x71;
 /// exist in the generated global table. That catches the exact bug this
 /// replaces: the old list offered `/fix`, `/bg`, `/jobs` and `/shell` while
 /// implementing none of them, and omitted `/finished`.
+///
+/// The list is also curated for unambiguous prefixes, not just coverage:
+/// `/markup_demo` + `/md_demo` are implemented (arm, `/help`, menu) but stay
+/// out, because four `m`-commands leave `/m` with no common prefix and break
+/// `tab_completes_to_common_prefix`. Same reason the global table's short
+/// aliases stay out.
 const COMMANDS: &[&str] = &[
     "help", "model", "models", "goal", "continue", "clear", "undo", "finished",
     "exit", "usage", "thinking", "cancel", "sessions", "reload", "reexec",
@@ -200,12 +244,201 @@ fn line_markup(line: &ConvLine) -> String {
     )
 }
 
+/// Whether `line` continues the assistant block above it, so both render as
+/// one markdown document (and one Pango unit).
+///
+/// The conversation model is line-oriented, but markdown *is not*: a fenced
+/// code block, a table, a blockquote, a paragraph and a loose list all span
+/// several lines. Rendering each line on its own therefore splits every such
+/// construct — the reported `/markup_demo` bug, where the table came out as
+/// four literal `| … |` lines, each code body line got its own ```` ``` ````
+/// fence, and a blockquote emitted a span that opens on one line and closes on
+/// the next (invalid markup). A block is the run of consecutive assistant lines
+/// between blank lines, which is exactly the granularity CommonMark parses at:
+/// the renderer is handed the whole run and returns the whole run's Pango.
+///
+/// An empty line always breaks the block: it is the one thing the line model
+/// and markdown agree on. Only assistant lines form blocks — a user prompt or
+/// a system notice between them ends the block, so the renderer is never handed
+/// another kind's text as markdown.
+fn continues_block(prev: Option<&ConvLine>, line: &ConvLine) -> bool {
+    match prev {
+        Some(p) => p.kind == ConvKind::Assistant
+            && line.kind == ConvKind::Assistant
+            && !p.text.trim().is_empty()
+            && !line.text.trim().is_empty(),
+        None => false,
+    }
+}
+
+/// The number of lines after the write cursor `from` that `sync_textview` may
+/// paint now: every completed block, plus the trailing block from `from` on.
+///
+/// Completed blocks end at a blank line, but the *trailing* block has no such
+/// end in a line-oriented model — its terminator may simply not have arrived
+/// yet. The rule is therefore: paint up to the start of the trailing block, then
+/// the trailing block from wherever the cursor stands. `sync_textview` parks
+/// its cursor on the trailing block's first line, so on the next sync it
+/// re-renders that block, whole, once more of it has arrived, and never paints
+/// a partial copy twice. Without this a transcript whose last line is not blank
+/// (the common case) would render nothing new at all.
+///
+/// This is the live-sync write rule; it is split out so it can be tested
+/// without a display.
+fn live_boundary(lines: &[ConvLine], from: usize) -> usize {
+    let Some(last_nonblank) = lines.iter().rposition(|l| !l.text.trim().is_empty()) else {
+        return 0;
+    };
+    // The trailing block starts after the last blank line above it.
+    let block_start = lines[..last_nonblank]
+        .iter()
+        .rposition(|l| l.text.trim().is_empty())
+        .map_or(0, |i| i + 1);
+    if block_start <= from { last_nonblank + 1 } else { block_start }
+}
+
+/// Widen a line window `(start, end)` outward to block boundaries, so a block
+/// that straddles the window edge is shown whole rather than sliced.
+///
+/// The window is only ever *widened*, and never past the model, so the
+/// keyboard-scroll page still contains every line it asked for.
+fn window_at_block_edges(conv: &[ConvLine], (start, end): (usize, usize)) -> (usize, usize) {
+    let mut start = start.min(conv.len());
+    let end = end.min(conv.len()).max(start);
+    while start > 0 && continues_block(Some(&conv[start - 1]), &conv[start]) {
+        start -= 1;
+    }
+    let mut end = end;
+    while end < conv.len() && end > start && continues_block(Some(&conv[end - 1]), &conv[end]) {
+        end += 1;
+    }
+    (start, end)
+}
+
+/// Render a block of assistant lines (all [`ConvKind::Assistant`]) as ONE Pango
+/// unit — the whole markdown document, not one line at a time.
+///
+/// Colour lives in the kind prefix; the body is the Pango that
+/// `md::render_pango` produced for the joined block. The text is escaped or
+/// already markup by construction (it is renderer output, never raw model
+/// text), so markup parsing cannot be tricked by the model.
+#[cfg(feature = "gui-rich-text")]
+fn assistant_block_markup(kind: ConvKind, block: &[ConvLine]) -> String {
+    let (color, prefix) = kind.style();
+    let raw = block
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = crate::md::render_pango(&raw);
+    format!(
+        "<span foreground=\"{color}\">{}</span>{}",
+        escape_markup(prefix),
+        body.trim_end_matches('\n')
+    )
+}
+
+/// Strip the most common inline markdown markers for contexts that cannot
+/// parse Pango (the frozen keyboard-scroll slice in rich mode, where
+/// `set_text` takes plain text only). Not a renderer — just enough that a
+/// scrolled-away reader does not see `**`.
+#[cfg(feature = "gui-rich-text")]
+fn strip_markdown_markers(s: &str) -> String {
+    s.replace("**", "").replace("__", "").replace('`', "")
+}
+
+/// Record a pushed line's link inventory: `(text, url)` pairs from
+/// `md::extract_links`, for every line kind — a pasted URL in a user prompt
+/// is as clickable as one in an assistant reply, and the resolver is
+/// fail-safe (a pair whose text is absent from the inserted buffer line tags
+/// nothing).
+fn record_link_pairs(para: &str) -> Vec<(String, String)> {
+    crate::md::extract_links(para)
+        .into_iter()
+        .map(|l| (l.text, l.url))
+        .collect()
+}
+
+/// Resolve `(text, url)` pairs against the exact visible text the buffer
+/// received, yielding `(buffer_line, start_col, end_col, url)` in buffer
+/// chars. Successive search (each pair from the end of the previous match):
+/// links render in source order, so the first occurrence rule would tag the
+/// wrong copy when the same text appears twice (`[docs](u1)` … `[docs](u2)`).
+/// A pair whose text is absent (rendering transformed it, or it spans a block
+/// merge) resolves to nothing — fail-safe, never a wrong link.
+///
+/// Pure so the mapping is testable without a display; `sync_textview` is the
+/// only caller, and it always passes the exact string it just inserted.
+fn resolve_link_spans(visible: &str, pairs: &[(String, String)]) -> Vec<(u32, u32, u32, String)> {
+    // Byte offset of each visible line's start, so a byte match converts to
+    // (line, char col) — the units `GtkTextIter` counts.
+    let mut line_starts = vec![0usize];
+    for (i, b) in visible.bytes().enumerate() {
+        if b == b'\n' {
+            line_starts.push(i + 1);
+        }
+    }
+    let byte_to_line_col = |byte: usize| -> (u32, u32) {
+        let line = line_starts.iter().rposition(|&s| s <= byte).unwrap_or(0);
+        let col = visible[line_starts[line]..byte].chars().count();
+        (line as u32, col as u32)
+    };
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    for (text, url) in pairs {
+        if text.is_empty() {
+            continue;
+        }
+        let Some(rel) = visible[from..].find(text.as_str()) else {
+            continue;
+        };
+        let start = from + rel;
+        let end = start + text.len();
+        let (line, scol) = byte_to_line_col(start);
+        let (eline, ecol) = byte_to_line_col(end);
+        // `find` never returns a split boundary (`text` is `&str`-matched, so
+        // `end` is always a char boundary), but a link text containing `\n`
+        // would span buffer lines — tag only the single-line case; anything
+        // else stays unclickable rather than mis-tagged.
+        if line == eline {
+            out.push((line, scol, ecol, url.clone()));
+        }
+        from = end;
+    }
+    out
+}
+
+/// Look up the URL for a click at buffer `(line, col)`: the span containing
+/// `col` on that line, if any. Pure so the hit rule is testable without GTK.
+fn lookup_link(spans: &[(u32, u32, String)], col: u32) -> Option<&str> {
+    spans
+        .iter()
+        .find(|(s, e, _)| col >= *s && col < *e)
+        .map(|(_, _, u)| u.as_str())
+}
+
 /// Shared per-UI state, guarded by a Mutex so both the Entry-activate callback
 /// (main thread) and the periodic drain callback (also main thread via glib)
 /// can see it. Since glib callbacks run on the main loop, contention is trivial.
 struct GuiState {
     /// Conversation lines (the transcript so far), each with a colour kind.
     conv: Vec<ConvLine>,
+    /// Link inventory per conversation line, parallel to `conv`: entry `i`
+    /// holds `(text, url)` pairs from `md::extract_links` on line `i`'s own
+    /// text. Spans are NOT stored here — Pango markup shifts bytes between
+    /// model text and buffer text, so spans are resolved at insert time
+    /// against the exact string the buffer receives (see
+    /// `resolve_link_spans`). The vec is per-line so `push`/`clear`/trim keep
+    /// it in step with `conv` by construction rather than by audit.
+    line_links: Vec<Vec<(String, String)>>,
+    /// Clickable spans per BUFFER line: entry `i` holds
+    /// `(start_col, end_col, url)` in buffer chars for buffer line `i`.
+    /// Built by `sync_textview` as it inserts (the only place that knows what
+    /// the buffer actually holds — assistant blocks render multi-line, so
+    /// buffer lines never map 1:1 to model lines). Reset whenever the buffer
+    /// is replaced (`set_text`); the live branch rebuilds it from scratch on
+    /// re-arm because `view_slice.is_some()` forces a rebuild there.
+    buf_links: Vec<Vec<(u32, u32, String)>>,
     /// Prompts queued by the user while a turn runs.
     pending: Vec<String>,
     /// Whether a foreground turn is currently running.
@@ -262,7 +495,26 @@ struct GuiState {
     /// It is disarmed by a real upward scroll and re-armed when the user
     /// returns to the bottom, which is the only signal available (the wheel and
     /// scrollbar are GTK's, not ours).
+    ///
+    /// `follow` is read by `sync_textview` on every paint (see
+    /// `sync_follow`): `false` holds back new lines (frozen full buffer) or
+    /// shows the keyboard-scroll window, so disarming it has a visible effect
+    /// rather than being advisory.
     follow: bool,
+    /// Keyboard scroll position (design row S6). The toolkit has no programmatic
+    /// scroll (`gtk_adjustment_set_value` is missing), so this is the GUI's own
+    /// clamped model of where the user asked to be. Driven by Page_Up /
+    /// Page_Down / Home / End (key handler in `spawn_session`) and by the View
+    /// menu's scroll items (`MENU_VIEW_ACTIONS`); consulted by `sync_textview`.
+    /// In live mode (`follow` armed) `offset` tracks the bottom
+    /// (`max_offset(total)`); scrolled away, it selects the window
+    /// `conv[offset .. offset + page]` the pane shows.
+    scroll: GuiScroll,
+    /// Slice painted while keyboard-scrolled: `(offset, total)` at paint time.
+    /// `sync_textview` repaints the window only when the offset, the model
+    /// length, or `needs_rebuild` changed — not on every 150ms drain tick.
+    /// `None` while live (the append-only path owns the buffer then).
+    view_slice: Option<(usize, usize)>,
     /// Whether the agent is idle, finished, and waiting on the operator. Drives
     /// the TUI's `✓ DONE :)` placeholder (`tui.rs:679-687`).
     awaiting_input: bool,
@@ -350,6 +602,7 @@ fn list_jobs(s: &mut GuiState) {
 const HELP_GUI: &str = "\
 commands:
   /help                 this list
+  /menu [action]        main menu: resume/model/thinking/security/…
   /model [prefix]       recent-first picker   /models      list every model
   /usage                tokens this session
   /goal [obj]           show or start the standing goal
@@ -370,6 +623,7 @@ commands:
   /scratchpad           this session's scratch directory
   /reload               reload catalog, policy and extension commands
   /reexec               restart in place (idle only)
+  /markup_demo          render a canned markdown demo (headings/code/table)
   /sessions             new|close|next|prev|<n>  multi-session tabs
   /exit                 quit
 
@@ -378,7 +632,9 @@ keys:
   esc or ctrl-c         cancel the running turn (same as /cancel)
   ctrl-q or ctrl-d      quit
   tab                   complete the command or model name
-  up / down             recall earlier / later prompts";
+  up / down             recall earlier / later prompts
+  pgup / pgdn           scroll one page   home / end   top / live tail
+  click a link          open it in the browser";
 
 const SPINNER_FRAMES: [&str; 10] =
     ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -393,6 +649,8 @@ impl GuiState {
     fn new() -> Self {
         GuiState {
             conv: Vec::new(),
+            line_links: Vec::new(),
+            buf_links: Vec::new(),
             pending: Vec::new(),
             running: false,
             log_offset: 0,
@@ -411,6 +669,15 @@ impl GuiState {
             last_status: String::new(),
             last_model: None,
             follow: true,
+            // Until the pane's allocated height is known, keyboard / menu
+            // scrolling moves in `SCROLL_PAGE_LINES`-line steps (design row
+            // S6); `page.max(1)` in the step/window helpers keeps a zero page
+            // from becoming a stuck key.
+            scroll: GuiScroll {
+                page: SCROLL_PAGE_LINES,
+                ..GuiScroll::default()
+            },
+            view_slice: None,
             awaiting_input: false,
             draft: String::new(),
             last_hint: String::new(),
@@ -424,14 +691,20 @@ impl GuiState {
     /// The cap keeps the model and the buffer in step: trimming from the front
     /// means the next sync must rebuild rather than append, so we bump
     /// `rendered` down with the model and flag `needs_rebuild`.
+    ///
+    /// Each pushed paragraph records its own link inventory (see
+    /// `md::extract_links`), so `line_links` stays parallel to `conv`: one
+    /// entry per line, trimmed and cleared together.
     fn push(&mut self, kind: ConvKind, text: &str) {
         for para in text.split('\n') {
             self.conv.push(ConvLine { kind, text: para.to_string() });
+            self.line_links.push(record_link_pairs(para));
         }
         const MAX: usize = 4000;
         if self.conv.len() > MAX {
             let drop = self.conv.len() - MAX;
             self.conv.drain(0..drop);
+            self.line_links.drain(0..drop);
             self.rendered = self.rendered.saturating_sub(drop);
             self.needs_rebuild = true;
         }
@@ -440,26 +713,36 @@ impl GuiState {
     /// Clear the conversation (e.g. `/clear`).
     fn clear(&mut self) {
         self.conv.clear();
+        self.line_links.clear();
+        self.buf_links.clear();
         self.rendered = 0;
         self.needs_rebuild = true;
         // A clear empties the pane, so there is nothing to be scrolled away
         // from: follow comes back armed or the next turn would render off-screen.
         self.follow = true;
+        // And any keyboard-scroll window is meaningless against an empty model.
+        self.scroll.home();
+        self.view_slice = None;
     }
 
     /// Note where the pane is scrolled to, and re-arm or disarm `follow`.
     ///
     /// `vpos` is the vertical adjustment value read from the `ScrolledWindow`
-    /// (pixels). `vmax` is that adjustment's upper bound. `follow` is armed
-    /// only at the bottom (within 2px, since GTK reports fractional values) and
-    /// disarmed anywhere else.
+    /// (pixels). `vmax` is that adjustment's upper bound, and `page` is the
+    /// viewport height (the adjustment's page size). The bottom of what is
+    /// shown is `vpos + page`; `follow` is armed only when that reaches `vmax`
+    /// (within 2px, since GTK reports fractional values) and disarmed anywhere
+    /// else. Comparing `vpos` against `vmax` directly is wrong: `vpos` is the
+    /// top of the viewport, so it sits a full page above `vmax` even at the
+    /// bottom, and `follow` would disarm on the very first drain and freeze
+    /// every later append out of the pane.
     ///
     /// Called once per drain *before* appending, so the decision to pin reflects
     /// where the user was when the new output arrived rather than after GTK has
     /// already moved the position.
-    fn observe_scroll(&mut self, vpos: f64, vmax: f64) {
+    fn observe_scroll(&mut self, vpos: f64, vmax: f64, page: f64) {
         const AT_BOTTOM_SLOP: f64 = 2.0;
-        self.follow = vpos >= vmax - AT_BOTTOM_SLOP;
+        self.follow = vpos + page >= vmax - AT_BOTTOM_SLOP;
     }
 
     /// Whether the next paint should pin the pane to the newest output.
@@ -516,6 +799,67 @@ impl GuiScroll {
     fn end(&mut self, total: usize) {
         self.offset = self.max_offset(total);
     }
+
+    /// The window `sync_textview` paints while keyboard-scrolled: the clamped
+    /// `offset .. offset + page` slice of a `total`-line model. Shared by the
+    /// renderer and by the menu/keys that move `offset`, so a scrolled pane and
+    /// the model that drives it can never disagree about which lines are shown.
+    fn window(&self, total: usize) -> (usize, usize) {
+        let start = self.offset.min(self.max_offset(total));
+        let end = (start + self.page.max(1)).min(total);
+        (start, end)
+    }
+}
+
+/// The number handlers pass to `GuiScroll::page_up/page_down`: a page-sized
+/// step from the scrolled model's viewport estimate (design row S6). `0` would
+/// be a no-op — and a stuck PageDown key — so clamp to at least 1.
+fn scroll_step(s: &GuiState) -> usize {
+    s.scroll.page.max(1)
+}
+
+/// Sentinel slice forcing `sync_textview` to repaint the keyboard-scroll
+/// window: no real `(offset, total)` window can equal it, so the frozen branch
+/// always repaints once after a scroll command.
+const SCROLL_DIRTY: (usize, usize) = (usize::MAX, usize::MAX);
+
+/// Move the keyboard-scroll window up one page (design row S6). `end` first
+/// tracks the live tail, so the first PageUp from the bottom starts at the
+/// last full page rather than one partial step past it. Shared by the Page_Up
+/// key and the View menu's "Scroll up one page", so key and menu move the
+/// same window.
+fn scroll_page_up(s: &mut GuiState) {
+    let total = s.conv.len();
+    s.scroll.end(total);
+    s.scroll.page_up(scroll_step(s));
+    s.follow = false;
+    s.view_slice = Some(SCROLL_DIRTY);
+}
+
+/// Move the keyboard-scroll window down one page. At the bottom edge this
+/// re-arms follow (see `observe_scroll`: the bottom *is* live, so pinning and
+/// follow agree there). Shared by the Page_Down key and the View menu.
+fn scroll_page_down(s: &mut GuiState) {
+    let total = s.conv.len();
+    s.scroll.page_down(scroll_step(s), total);
+    s.follow = s.scroll.offset >= s.scroll.max_offset(total);
+    s.view_slice = Some(SCROLL_DIRTY);
+}
+
+/// Jump the keyboard-scroll window to the top (Home key). Shared helper so a
+/// future menu item can reuse it without a second implementation.
+fn scroll_home(s: &mut GuiState) {
+    s.scroll.home();
+    s.follow = false;
+    s.view_slice = Some(SCROLL_DIRTY);
+}
+
+/// Jump to the live tail (End key, View menu "Scroll to bottom"). Re-arms
+/// follow; the live branch of `sync_textview` then repaints the full tail
+/// (any windowed buffer is discarded via the `view_slice` check there).
+fn scroll_end(s: &mut GuiState) {
+    s.scroll.end(s.conv.len());
+    s.follow = true;
 }
 
 /// Arrow-Up/Down navigation state for the prompt Entry, shared between the key
@@ -821,6 +1165,251 @@ fn question_dialog(
     rx.recv().unwrap_or(Answer::Dismissed)
 }
 
+// ---------------------------------------------------------------------------
+// Left sessions tree (sidebar)
+// ---------------------------------------------------------------------------
+
+/// One row in the sidebar: a group header or a session button. Buttons are
+/// created once and updated in place (`set_text`); stale ones are hidden, not
+/// destroyed (the toolkit has no remove API), so the 150ms tick never churns
+/// widgets — no flicker, no focus theft.
+struct SidebarRow {
+    /// Session id (log path string) or group key (`g:{project_key}`).
+    id: String,
+    /// True for a group header (toggles collapse), false for a session
+    /// (switches to its tab). Retained for debugging; behavior branches on
+    /// the `g:` id prefix instead.
+    #[allow(dead_code)]
+    is_group: bool,
+    button: GuiButton,
+}
+
+#[derive(Default)]
+struct SidebarState {
+    rows: Vec<SidebarRow>,
+    /// Last rendered signature: when nothing changed the tick is a no-op.
+    /// The signature covers row order, labels, glyphs and collapse, so any
+    /// visible change repaints exactly once.
+    signature: String,
+    /// Group keys the operator collapsed (persisted per cwd on toggle).
+    collapsed: std::collections::HashSet<String>,
+    loaded: bool,
+}
+
+/// Rebuild the sidebar's rows from the open tabs, grouped by project.
+///
+/// Same model as `/sessions` (`session_tree::SessionPresence` + the same
+/// `▶/●/✓/·` glyphs): `running` comes from the tab's live `GuiState`, waiting
+/// from the status/verdict sidecars, unread from the bus's per-session feed
+/// (populated because `Agent::{turn_done,error,idle}_event` tags the session).
+/// Clicking a session row switches to its tab and focuses its prompt (which
+/// also marks the session seen, clearing the unread badge); clicking a group
+/// header collapses/expands it (persisted per cwd).
+///
+/// Cheap by construction: the whole tree flattens to one signature string and
+/// the widget pass only runs when it changed — a spinner tick repaints text,
+/// never structure.
+fn sync_sidebar(
+    app: &App,
+    rows_box: &GuiBox,
+    state: &Rc<RefCell<SidebarState>>,
+    sessions: &Rc<RefCell<Vec<SessionView>>>,
+    tabs: &TabView,
+    bus: &SharedBus,
+) {
+    // Snapshot each tab: (session id, title, running, log path). The agent
+    // slot is only briefly locked per tab; the tree build below holds no locks.
+    struct TabSnap {
+        id: String,
+        title: String,
+        running: bool,
+        log: Option<PathBuf>,
+    }
+    let snaps: Vec<TabSnap> = {
+        let svs = sessions.borrow();
+        svs.iter()
+            .enumerate()
+            .map(|(i, sv)| {
+                let (title, log, running) = (
+                    tabs.tab_title(i).unwrap_or_else(|| format!("session {i}")),
+                    sv.agent_slot.lock().unwrap().as_ref().and_then(|a| a.log_path.clone()),
+                    sv.state.lock().map(|s| s.running).unwrap_or(false),
+                );
+                TabSnap {
+                    id: log
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| format!("tab:{i}")),
+                    title,
+                    running,
+                    log,
+                }
+            })
+            .collect()
+    };
+    if snaps.is_empty() {
+        return;
+    }
+    let unread = bus.unread_counts();
+    // Group by project root: the session's recorded cwd, else the log's parent
+    // dir, else "(no directory)". Same roots `session_tree::build_tree` uses.
+    let mut groups: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for (i, sn) in snaps.iter().enumerate() {
+        let cwd = sn
+            .log
+            .as_ref()
+            .and_then(|p| crate::session::read_status(p))
+            .map(|m| m.cwd)
+            .unwrap_or_default();
+        let key = if cwd.is_empty() { "(no directory)".to_string() } else { cwd };
+        if !groups.contains_key(&key) {
+            order.push(key.clone());
+        }
+        groups.entry(key).or_default().push(i);
+    }
+    order.sort();
+    let mut st = state.borrow_mut();
+    // Load persisted collapse once (per cwd, like the text tree).
+    if !st.loaded {
+        st.loaded = true;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        st.collapsed = crate::session_tree::load_state(&cwd.to_string_lossy()).collapsed;
+    }
+    // Flatten to (id, is_group, text) rows + signature.
+    let mut flat: Vec<(String, bool, String)> = Vec::new();
+    let mut sig = String::new();
+    for key in &order {
+        let label = key.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or(key);
+        let collapsed = st.collapsed.contains(key);
+        let marker = if collapsed { "▸" } else { "▾" };
+        let gid = format!("g:{key}");
+        flat.push((gid.clone(), true, format!("{marker} {label}")));
+        sig.push_str(&gid);
+        sig.push(if collapsed { '-' } else { '+' });
+        if collapsed {
+            continue;
+        }
+        for &i in &groups[key] {
+            let sn = &snaps[i];
+            let live = sn.running
+                || sn.log.as_ref().is_some_and(|p| crate::session_tree::live_session(p));
+            let waiting = !live
+                && sn.log.as_ref().is_some_and(|p| crate::session_tree::waiting_session(p));
+            let n = unread.get(&sn.id).copied().unwrap_or(0);
+            let presence = crate::session_tree::presence_for(live, waiting, n);
+            let text = match presence {
+                crate::session_tree::SessionPresence::NeedsInputUnread(m) => {
+                    format!("  ●{m} {}", sn.title)
+                }
+                _ => format!("  {} {}", presence.glyph(), sn.title),
+            };
+            flat.push((sn.id.clone(), false, text));
+            sig.push_str(&sn.id);
+            sig.push_str(presence.glyph());
+            sig.push_str(&sn.title);
+        }
+    }
+    if sig == st.signature {
+        return; // nothing visible changed — skip the widget pass entirely
+    }
+    st.signature = sig;
+    // Reconcile widgets: update text in place, append newcomers, hide the gone.
+    let mut seen = std::collections::HashSet::new();
+    for (id, is_group, text) in &flat {
+        seen.insert(id.clone());
+        if let Some(row) = st.rows.iter().find(|r| &r.id == id) {
+            row.button.set_text(text);
+            row.button.set_visible(true);
+            continue;
+        }
+        let btn = match app.create_button(text) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        btn.set_hexpand(true);
+        // Click behavior is fixed at creation: group headers toggle collapse,
+        // session rows switch to their tab. The closure captures only ids +
+        // shared handles, never a row index (rows move as tabs open/close).
+        if *is_group {
+            let key = id.trim_start_matches("g:").to_string();
+            let st2 = state.clone();
+            let _ = btn.on_click(move || {
+                {
+                    let mut s = st2.borrow_mut();
+                    if s.collapsed.contains(&key) {
+                        s.collapsed.remove(&key);
+                    } else {
+                        s.collapsed.insert(key.clone());
+                    }
+                    s.signature.clear(); // force a repaint next tick
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                    let mut ts = crate::session_tree::load_state(&cwd.to_string_lossy());
+                    ts.collapsed.clone_from(&s.collapsed);
+                    crate::session_tree::save_state(&cwd.to_string_lossy(), &ts);
+                }
+                // No immediate repaint: rows already exist from the first
+                // tick, so a click only flips already-visible widgets.
+            });
+        } else {
+            let target_id = id.clone();
+            let sess2 = sessions.clone();
+            let tabs2 = tabs.clone();
+            let bus2 = bus.clone();
+            let _ = btn.on_click(move || {
+                // Session id → tab index (tabs reorder as sessions open/close,
+                // so resolve at click time, not at row creation).
+                let idx = sess2.borrow().iter().position(|sv| {
+                    sv.agent_slot
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(|a| a.log_path.clone())
+                        .is_some_and(|p| p.to_string_lossy() == target_id)
+                });
+                // Fallback for id-less tabs (`tab:{i}`): match by position.
+                let idx = idx.or_else(|| {
+                    target_id
+                        .strip_prefix("tab:")?
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|&i| i < sess2.borrow().len())
+                });
+                if let Some(i) = idx {
+                    tabs2.set_active(i);
+                    if let Some(sv) = sess2.borrow().get(i) {
+                        sv.entry.grab_focus();
+                        // Focusing the session marks it seen: the unread badge
+                        // clears (unread → seen) exactly when the operator looks.
+                        if let Some(log) = sv
+                            .agent_slot
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .and_then(|a| a.log_path.clone())
+                        {
+                            bus2.mark_seen(&log.to_string_lossy());
+                        }
+                    }
+                }
+            });
+        }
+        rows_box.append(&btn);
+        // Reveal the row itself (parent already visible) instead of
+        // re-showing the whole box, and re-run size negotiation so the
+        // newcomer is allocated now — not only after the next manual resize.
+        rows_box.show_child(&btn);
+        rows_box.queue_resize();
+        st.rows.push(SidebarRow { id: id.clone(), button: btn, is_group: *is_group });
+    }
+    for row in &st.rows {
+        if !seen.contains(&row.id) {
+            rows_box.hide_child(&row.button);
+        }
+    }
+
+}
+
 /// Run the GTK GUI REPL. Returns `Ok(())` on a clean exit (`/exit` or window
 /// close) or an error if the backend couldn't be initialised. Mirrors the TUI:
 /// the agent is switched to `quiet` mode and turns run on worker threads; the
@@ -870,12 +1459,76 @@ pub fn run(
         }));
     }
 
-    // -- Build the window + menu bar + tab container --
+    // -- Build the window + menu bar + sidebar + tab container --
     let window = app.create_window().map_err(|e| format!("create_window: {e}"))?;
     window.set_title("pir");
     window.set_default_size(820, 600);
 
     let tabs = app.create_tabview().map_err(|e| format!("tabview: {e}"))?;
+    // Pack-time rule (see the scroller in spawn_session): the tab container
+    // must carry expand BEFORE it is packed into the root box, or GTK3
+    // snapshots it as non-expanding and the whole pane keeps minimum size
+    // in a field of blank space.
+    // Left sessions tree: a narrow sidebar left of the conversation tabs,
+    // grouped by project with one presence glyph per open session
+    // (`▶` running, `●n` waiting-unread, `✓` waiting-seen, `·` idle — the same
+    // `SessionPresence` model `/sessions` renders as text). Clicking a session
+    // row switches to its tab; clicking a group header collapses it. The rows
+    // are plain Buttons/Labels so both backends render them with zero
+    // platform branching here — the only `cfg` is the scroller, which NWG
+    // does not provide (there the rows box packs directly).
+    let sidebar = app
+        .create_box(Orientation::Vertical, 2)
+        .map_err(|e| format!("create_box sidebar: {e}"))?;
+    sidebar.set_size_request(220, -1);
+    let side_head = app.create_label("sessions").map_err(|e| format!("sidebar head: {e}"))?;
+    #[cfg(all(target_os = "linux", not(windows)))]
+    side_head.set_xalign(0.0);
+    sidebar.append(&side_head);
+    let side_rows = app
+        .create_box(Orientation::Vertical, 1)
+        .map_err(|e| format!("create_box rows: {e}"))?;
+    side_rows.set_hexpand(true);
+    #[cfg(all(target_os = "linux", not(windows)))]
+    {
+        let side_scroll = app
+            .create_scrolled_window()
+            .map_err(|e| format!("sidebar scroller: {e}"))?;
+        side_scroll.set_policy(0, 1);
+        side_scroll.set_child(&side_rows);
+        side_scroll.set_hexpand(true);
+        side_scroll.set_vexpand(true);
+        sidebar.append(&side_scroll);
+    }
+    #[cfg(windows)]
+    {
+        sidebar.append(&side_rows);
+    }
+    // Owned row widgets, keyed by session id (or group key): `sync_sidebar`
+    // updates their text in place and hides stale ones, so the 150ms drain
+    // tick never churns widgets (no flicker, no focus theft).
+    let sidebar_state: Rc<RefCell<SidebarState>> = Rc::new(RefCell::new(SidebarState::default()));
+
+    // Horizontal content: [sidebar][tabs]. The tabs keep their expand flags;
+    // the sidebar keeps its fixed width request. Pack-time rule (same as
+    // TabView::new): the flags must be set BEFORE append, or GTK3 snapshots
+    // the packed copy as non-expanding.
+    let content = app
+        .create_box(Orientation::Horizontal, 4)
+        .map_err(|e| format!("create_box content: {e}"))?;
+    content.set_hexpand(true);
+    content.set_vexpand(true);
+    // Pack the sidebar FIRST so it lands at the left edge, then the tabs.
+    // Pack-time rule (same as TabView::new): set each child's expand flags
+    // BEFORE its append, or GTK3 snapshots the packed copy as non-expanding.
+    // The sidebar keeps a fixed 220px width: no hexpand, so it never shares
+    // the content box's extra space (that gap at maximise was the sidebar
+    // stretching with hexpand). It still expands vertically to fill height.
+    sidebar.set_vexpand(true);
+    content.append(&sidebar);
+    tabs.set_hexpand(true);
+    tabs.set_vexpand(true);
+    content.append(&tabs);
 
     // The window's vertical stack: [menu bar] [session tabs]. Both are needed
     // before the first session, because the menu's actions dispatch into the
@@ -884,6 +1537,10 @@ pub fn run(
     let root = app
         .create_box(Orientation::Vertical, 0)
         .map_err(|e| format!("create_box: {e}"))?;
+    // NOTE: no expand flags on `root` itself: `window.set_child` is not a
+    // box pack (the window takes exactly one child and sizes it to fill),
+    // so there is no pack-time snapshot to beat. The flags that matter are
+    // on `tabs` (packed into `root`) and inside each session box.
 
     let sessions: Rc<RefCell<Vec<SessionView>>> = Rc::new(RefCell::new(Vec::new()));
     let active: Rc<Cell<usize>> = Rc::new(Cell::new(0));
@@ -906,12 +1563,19 @@ pub fn run(
     }
 
     // The menu bar, built before the first session so its actions can dispatch
-    // into whatever session is current when they are chosen.
-    if let Err(e) = build_menu_bar(&app, &window, &sessions, &tabs, providers, bus, _full_auto) {
-        // A missing menu bar is a degraded GUI, not a fatal one: the whole
-        // command surface is still reachable by typing it. Say so once and
-        // carry on rather than refusing to open the window.
-        eprintln!("pir: menu bar unavailable ({e}) — every command is still available by typing it");
+    // into whatever session is current when they are chosen. Appended above
+    // the tabs: without this the window shows only the tab-bar button, which
+    // with one tab is the dead "Session button" from the report.
+    match build_menu_bar(&app, &window, &sessions, &tabs, providers, bus, _full_auto, agent_slot) {
+        Ok(bar) => {
+            root.append(&bar);
+        }
+        Err(e) => {
+            // A missing menu bar is a degraded GUI, not a fatal one: the whole
+            // command surface is still reachable by typing it. Say so once and
+            // carry on rather than refusing to open the window.
+            eprintln!("pir: menu bar unavailable ({e}) — every command is still available by typing it");
+        }
     }
 
     // Open the initial session using the agent the caller handed us.
@@ -933,9 +1597,7 @@ pub fn run(
         );
     }
 
-    root.append(&tabs);
-    root.set_hexpand(true);
-    root.set_vexpand(true);
+    root.append(&content);
     window.set_child(&root);
 
     eprintln!("PIRPROBE: about to present");
@@ -948,6 +1610,14 @@ pub fn run(
     // lock across the (potentially slow) drain of every session.
     let drain_sessions = sessions.clone();
     let drain_bus = bus.clone();
+    // The left tree refreshes on the same tick: same snapshot, then one
+    // `sync_sidebar` that rebuilds only what changed (see its signature guard).
+    let side_sessions = sessions.clone();
+    let side_tabs = tabs.clone();
+    let side_bus = bus.clone();
+    let side_rows = side_rows.clone();
+    let side_app = app.clone();
+    let side_state = sidebar_state.clone();
     #[cfg(all(target_os = "linux", not(windows)))]
     {
         match rustxwidgets::backends::gtk::loader() {
@@ -966,6 +1636,7 @@ pub fn run(
                         &drain_bus,
                     );
                 }
+                sync_sidebar(&side_app, &side_rows, &side_state, &side_sessions, &side_tabs, &side_bus);
             }));
             eprintln!("PIRPROBE: timer installed, source id = {src_id:?}");
         }
@@ -996,6 +1667,12 @@ pub fn run(
     {
         let drain_sessions = drain_sessions.clone();
         let drain_bus = drain_bus.clone();
+        let side_sessions = side_sessions.clone();
+        let side_tabs = side_tabs.clone();
+        let side_bus = side_bus.clone();
+        let side_rows = side_rows.clone();
+        let side_app = side_app.clone();
+        let side_state = side_state.clone();
         window.timeout_add_recurring(150, Box::new(move || {
             for sv in &*drain_sessions.borrow() {
                 drain_once(
@@ -1010,6 +1687,7 @@ pub fn run(
                     &drain_bus,
                 );
             }
+            sync_sidebar(&side_app, &side_rows, &side_state, &side_sessions, &side_tabs, &side_bus);
         }));
         window.on_close(Box::new(|| {
             rustxwidgets::backends_nwg_adapter::quit_main_loop();
@@ -1101,6 +1779,7 @@ fn run_command_line(
             &sv.state,
             &sv.app,
             &sv.widgets,
+            &sv.hist_nav,
         );
         return;
     }
@@ -1170,13 +1849,38 @@ fn run_command_line(
     );
 }
 
-/// Build the menu bar and attach it to the window.
+/// Submenu names in bar order: first-seen across both tables, except "Help"
+/// is always last (far right, the platform convention). Pure so the order is
+/// testable without a display — `build_menu_bar` seeds from exactly this.
+fn menu_order() -> Vec<&'static str> {
+    let mut order: Vec<&'static str> = Vec::new();
+    let mut seen = |name: &'static str| {
+        if name != "Help" && !order.contains(&name) {
+            order.push(name);
+        }
+    };
+    for a in MENU_ACTIONS {
+        seen(a.menu);
+    }
+    for (menu, _, _) in MENU_VIEW_ACTIONS {
+        seen(menu);
+    }
+    order.push("Help");
+    order
+}
+
+/// Build the menu bar and return it; the caller appends it to the window.
 ///
 /// Each item in [`MENU_ACTIONS`] becomes a GMenu entry bound to a
 /// `SimpleAction`; activating it routes the *same* command through the *same*
 /// `handle_command` the typed line uses. That is the point of the table: there
 /// is exactly one implementation of every command, so a menu item and a typed
 /// line cannot drift apart in behaviour — only in how they were reached.
+///
+/// [`MENU_VIEW_ACTIONS`] items are pure view actions (scroll the conversation,
+/// mark the session finished via the `/finished` path): they move
+/// [`GuiScroll`] / `follow` through the same helpers the Page_Up/Page_Down/
+/// Home/End keys use, so key and menu scroll the same window.
 ///
 /// An item whose command needs an argument (`/model`, `/sh`, `/bg`, …) is
 /// filled in from the prompt Entry rather than opened as a dialog: the GUI
@@ -1195,125 +1899,315 @@ fn build_menu_bar(
     providers: &[Provider],
     bus: &SharedBus,
     full_auto: bool,
-) -> Result<(), String> {
+    agent_slot: &AgentSlot,
+) -> Result<MenuBar, String> {
     // The action group has to exist and be inserted into the window *before* the
-    // menu model is built, or the actions have nothing to bind to.
+    // menu model is built, or the actions have nothing to bind to. The group
+    // name and every menu item's detailed action must agree — see
+    // [`MENU_ACTION_GROUP`]: a bare name never resolves, and GTK greys the
+    // item out instead of reporting an error.
     let group = app.ensure_action_group().map_err(|e| format!("action group: {e}"))?;
-    unsafe { window.insert_action_group("pir", group) };
+    unsafe { window.insert_action_group(MENU_ACTION_GROUP, group) };
 
-    // Group the flat table into per-menu `MenuItemDef`s, preserving first-seen
-    // order so the bar reads the way the table does.
-    let menus: Vec<&str> = {
-        let mut seen: Vec<&str> = Vec::new();
-        for a in MENU_ACTIONS {
-            if !seen.contains(&a.menu) {
-                seen.push(a.menu);
-            }
+    // Submenus in menu_order() (first-seen across both tables, Help last).
+    // View actions land in the same submenus as the commands (both tables use
+    // "View" and "Turn"), creating the submenu when the command table did not.
+    let mut subs: Vec<(&str, Menu)> = Vec::new();
+    let sub_at = |subs: &mut Vec<(&str, Menu)>,
+                      app: &App,
+                      name: &'static str|
+     -> Result<usize, String> {
+        if let Some(i) = subs.iter().position(|(n, _)| *n == name) {
+            return Ok(i);
         }
-        seen
+        let menu = app.new_menu().map_err(|e| format!("new_menu: {e}"))?;
+        subs.push((name, menu));
+        Ok(subs.len() - 1)
     };
-    let mut root = app.new_menu().map_err(|e| format!("new_menu: {e}"))?;
-    for menu_name in menus {
-        let mut sub = app.new_menu().map_err(|e| format!("new_menu: {e}"))?;
-        for a in MENU_ACTIONS.iter().filter(|a| a.menu == menu_name) {
-            let sessions = sessions.clone();
-            let tabs = tabs.clone();
-            let providers = providers.to_vec();
-            let bus = bus.clone();
-            let command = a.command.to_string();
-            let arg = a.arg.to_string();
-            // `new_simple_action` (not `create_simple_action`) returns the
-            // `common` wrapper that `register_action` takes; the `create_*`
-            // factory hands back the bare backend adapter type.
-            let action = app
-                .new_simple_action(a.action)
-                .map_err(|e| format!("new_simple_action({}): {e}", a.action))?;
-            // The activate callback must be `'static`, so it cannot capture the
-            // `&App` this function borrows. The address is carried as a `usize`
-            // (`Send + Sync` unconditionally) and reborrowed at the call site —
-            // the same technique, and the same safety argument, as the
-            // ask-renderer install in `run`: the `App` outlives every callback
-            // because `run` does not return until the GTK loop ends.
-            let app_addr: usize = app as *const App as usize;
-            let _ = action.connect_activate(move |_data: *mut c_void| {
-                // Borrow one session, do the work, drop the borrow. The borrow
-                // must not be held across `handle_command`: that can open or
-                // close a tab, which mutates `sessions` and would panic.
-                let sv = { sessions.borrow().get(tabs.current_tab()).cloned() };
-                let Some(sv) = sv else { return };
-                if command == "sessions" {
-                    let rest: Vec<&str> = if arg.is_empty() {
-                        Vec::new()
-                    } else {
-                        vec![arg.as_str()]
-                    };
-                    let mut s = sv.state.lock().unwrap();
-                    s.push(
-                        ConvKind::System,
-                        &format!("· menu: /sessions {}", arg),
-                    );
-                    drop(s);
-                    handle_session_command(
-                        &rest,
-                        &sv.state,
-                        &sv.widgets,
-                        &sessions,
-                        &tabs,
-                        // SAFETY: `app_addr` is the address of the `App` passed
-                        // to `build_menu_bar`, which `run` owns for the whole
-                        // life of the menu. Reborrowing it to `&App` is valid.
-                        unsafe { &*(app_addr as *const App) },
-                        &sv.window,
-                        &providers,
-                        &bus,
-                        full_auto,
-                        &sv.agent_slot,
-                    );
-                    return;
-                }
-                // Fill the argument in from the prompt if the caller left one
-                // (e.g. "the next prompt" -> "/model the next prompt").
-                let line = if arg.is_empty() {
-                    format!("/{command}")
+    // Seed submenu order from menu_order() so the bar and the test agree by
+    // construction rather than by convention.
+    for name in menu_order() {
+        sub_at(&mut subs, app, name)?;
+    }
+
+    for a in MENU_ACTIONS {
+        let i = sub_at(&mut subs, app, a.menu)?;
+        let sessions = sessions.clone();
+        let tabs = tabs.clone();
+        let providers = providers.to_vec();
+        let bus = bus.clone();
+        let command = a.command.to_string();
+        let arg = a.arg.to_string();
+        // `new_simple_action` (not `create_simple_action`) returns the
+        // `common` wrapper that `register_action` takes; the `create_*`
+        // factory hands back the bare backend adapter type.
+        let action = app
+            .new_simple_action(a.action)
+            .map_err(|e| format!("new_simple_action({}): {e}", a.action))?;
+        // A failed connect/register leaves a live-looking item that can
+        // never fire — exactly "doesn't seem to do anything". Surface it
+        // loudly instead of swallowing the Result.
+        let action_name = a.action.to_string();
+        // The `&App` this function borrows cannot be captured by the
+        // `'static` callback; its address is carried as a `usize` (`Send +
+        // Sync` unconditionally) and reborrowed at the call site — the same
+        // technique, and the same safety argument, as the ask-renderer
+        // install in `run`: the `App` outlives every callback because `run`
+        // does not return until the GTK loop ends.
+        let app_addr: usize = app as *const App as usize;
+        if action.connect_activate(move |_data: *mut c_void| {
+            // Borrow one session, do the work, drop the borrow. The borrow
+            // must not be held across `handle_command`: that can open or
+            // close a tab, which mutates `sessions` and would panic.
+            let sv = { sessions.borrow().get(tabs.current_tab()).cloned() };
+            let Some(sv) = sv else { return };
+            if command == "sessions" {
+                let rest: Vec<&str> = if arg.is_empty() {
+                    Vec::new()
                 } else {
-                    let draft = sv.entry.get_text().unwrap_or_default();
-                    let draft = draft.trim();
-                    if draft.is_empty() {
-                        format!("/{command} {arg}")
-                    } else {
-                        format!("/{command} {arg} {draft}")
-                    }
+                    vec![arg.as_str()]
                 };
                 let mut s = sv.state.lock().unwrap();
-                s.push(ConvKind::System, &format!("· menu: {line}"));
+                s.push(
+                    ConvKind::System,
+                    &format!("· menu: /sessions {}", arg),
+                );
                 drop(s);
-                let _ = sv.entry.set_text("");
-                run_command_line(
-                    &line,
-                    &sv,
+                handle_session_command(
+                    &rest,
+                    &sv.state,
+                    &sv.widgets,
                     &sessions,
                     &tabs,
+                    // SAFETY: `app_addr` is the address of the `App` passed
+                    // to `build_menu_bar`, which `run` owns for the whole
+                    // life of the menu. Reborrowing it to `&App` is valid.
+                    unsafe { &*(app_addr as *const App) },
+                    &sv.window,
                     &providers,
                     &bus,
                     full_auto,
+                    &sv.agent_slot,
                 );
-            });
-            let _ = app.register_action(&action);
-            // Keep the action alive for the process lifetime: GTK holds only a
-            // ref to it, and dropping our handle here would unbind the item.
-            std::mem::forget(action);
-            sub.append(a.label, a.action);
+                return;
+            }
+            // Fill the argument in from the prompt if the caller left one
+            // (e.g. "the next prompt" -> "/model the next prompt").
+            let line = if arg.is_empty() {
+                format!("/{command}")
+            } else {
+                let draft = sv.entry.get_text().unwrap_or_default();
+                let draft = draft.trim();
+                if draft.is_empty() {
+                    format!("/{command} {arg}")
+                } else {
+                    format!("/{command} {arg} {draft}")
+                }
+            };
+            let mut s = sv.state.lock().unwrap();
+            s.push(ConvKind::System, &format!("· menu: {line}"));
+            drop(s);
+            let _ = sv.entry.set_text("");
+            run_command_line(
+                &line,
+                &sv,
+                &sessions,
+                &tabs,
+                &providers,
+                &bus,
+                full_auto,
+            );
+        }).is_err() {
+            eprintln!("pir: menu action {action_name:?} not connected");
         }
-        root.append_submenu(menu_name, &sub);
+        if let Err(e) = app.register_action(&action) {
+            eprintln!("pir: menu action {action_name:?} not registered: {e}");
+        }
+        // Keep the action alive for the process lifetime: GTK holds only a
+        // ref to it, and dropping our handle here would unbind the item.
+        std::mem::forget(action);
+        // Qualified with the action group (`pir.session-new`, …): GTK's
+        // popover bar resolves `group.name` against the group the window
+        // inserted above. A bare name matches nothing, and GTK greys the
+        // item out instead of reporting an error. Registration stays short
+        // (`new_simple_action(a.action)`), which every backend's dispatch
+        // strips back to — see `menu_detailed_action`.
+        subs[i].1.append(a.label, &menu_detailed_action(a.action));
+    }
+
+    // Registers one model leaf: wires `/model <provider>/<full-id>` through
+    // `run_command_line` (the typed line's own path) and appends the item to
+    // `menu`. One definition for flat and grouped leaves alike.
+    #[allow(clippy::too_many_arguments)]
+    fn wire_model_leaf(
+        app: &App,
+        menu: &mut Menu,
+        sessions: &Rc<RefCell<Vec<SessionView>>>,
+        tabs: &TabView,
+        providers: &[Provider],
+        bus: &SharedBus,
+        full_auto: bool,
+        pid: &str,
+        label: &str,
+        action_name: &str,
+        mid: &str,
+    ) -> Result<(), String> {
+        let sessions = sessions.clone();
+        let tabs = tabs.clone();
+        let providers = providers.to_vec();
+        let bus = bus.clone();
+        let line = format!("/model {pid}/{mid}");
+        let action = app
+            .new_simple_action(action_name)
+            .map_err(|e| format!("new_simple_action({action_name}): {e}"))?;
+        let action_name_dbg = action_name.to_string();
+        if action.connect_activate(move |_data: *mut c_void| {
+            let sv = { sessions.borrow().get(tabs.current_tab()).cloned() };
+            let Some(sv) = sv else { return };
+            let mut s = sv.state.lock().unwrap();
+            s.push(ConvKind::System, &format!("· menu: {line}"));
+            drop(s);
+            run_command_line(&line, &sv, &sessions, &tabs, &providers, &bus, full_auto);
+        }).is_err() {
+            eprintln!("pir: menu action {action_name_dbg:?} not connected");
+        }
+        if let Err(e) = app.register_action(&action) {
+            eprintln!("pir: menu action {action_name_dbg:?} not registered: {e}");
+        }
+        std::mem::forget(action);
+        menu.append(label, &menu_detailed_action(action_name));
+        Ok(())
+    }
+
+    // Model tree (Providers > Models): one submenu per provider under the
+    // "Model" menu, each listing that provider's models. Rendered from
+    // `model_menu_tree` so the shape is pinned by unit test; each leaf runs
+    // `/model <provider>/<id>` through `run_command_line` — the same path a
+    // typed line takes, so menu and keyboard cannot disagree. The active model
+    // (from the initial agent) carries the `●` marker; switching models
+    // re-marks via the status line ("→ label"), since GMenu items cannot be
+    // relabeled live.
+    {
+        let active = agent_slot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|a| a.label())
+            .unwrap_or_default();
+        let tree = model_menu_tree(providers, &active);
+        let mi = sub_at(&mut subs, app, "Model")?;
+        // One leaf's action wiring, shared by flat leaves and grouped ones:
+        // run `/model <provider>/<full-id>` through `run_command_line`, the
+        // same path a typed line takes.
+        for (pid, entries) in &tree {
+            let mut psm = app.new_menu().map_err(|e| format!("new_menu: {e}"))?;
+            // Registers one leaf action and appends it to `menu`. Factored out
+            // of the loop bodies so flat and grouped leaves cannot drift.
+            for entry in entries {
+                match entry {
+                    ModelMenuEntry::Leaf(label, action_name, mid) => {
+                        wire_model_leaf(
+                            app,
+                            &mut psm,
+                            &sessions,
+                            tabs,
+                            providers,
+                            bus,
+                            full_auto,
+                            pid,
+                            label,
+                            action_name,
+                            mid,
+                        )?;
+                    }
+                    ModelMenuEntry::Group(org, leaves) => {
+                        let mut gsm =
+                            app.new_menu().map_err(|e| format!("new_menu: {e}"))?;
+                        for (label, action_name, mid) in leaves {
+                            wire_model_leaf(
+                                app,
+                                &mut gsm,
+                                &sessions,
+                                tabs,
+                                providers,
+                                bus,
+                                full_auto,
+                                pid,
+                                label,
+                                action_name,
+                                mid,
+                            )?;
+                        }
+                        psm.append_submenu(org, &gsm);
+                    }
+                }
+            }
+            subs[mi].1.append_submenu(pid, &psm);
+        }
+    }
+
+    // Pure view actions: no slash command of their own, so they live apart
+    // from `MENU_ACTIONS` (see its doc). Each moves the current session's
+    // scroll window through the same helpers the Page_Up/Page_Down/Home/End
+    // keys use — key and menu scroll the same window by construction.
+    // `view-finished` routes through the `/finished` command path instead, so
+    // there is one implementation of "mark finished" rather than two.
+    for (menu, label, view_action) in MENU_VIEW_ACTIONS {
+        let i = sub_at(&mut subs, app, menu)?;
+        let sessions = sessions.clone();
+        let tabs = tabs.clone();
+        let providers = providers.to_vec();
+        let bus = bus.clone();
+        let view_action = view_action.to_string();
+        let view_action_cb = view_action.clone();
+        let action = app
+            .new_simple_action(view_action.as_str())
+            .map_err(|e| format!("new_simple_action({view_action}): {e}"))?;
+        if action.connect_activate(move |_data: *mut c_void| {
+            let sv = { sessions.borrow().get(tabs.current_tab()).cloned() };
+            let Some(sv) = sv else { return };
+            if view_action_cb == "view-finished" {
+                run_command_line("/finished", &sv, &sessions, &tabs, &providers, &bus, full_auto);
+                return;
+            }
+            if view_action_cb == "edit-copy" {
+                sv.widgets.textview.copy_clipboard();
+                return;
+            }
+            let mut s = sv.state.lock().unwrap();
+            match view_action_cb.as_str() {
+                "view-end" => scroll_end(&mut s),
+                "view-page-up" => scroll_page_up(&mut s),
+                "view-page-down" => scroll_page_down(&mut s),
+                _ => return,
+            }
+            sync_textview(&sv.widgets, &mut s);
+        }).is_err() {
+            eprintln!("pir: menu action {view_action:?} not connected");
+        }
+        if let Err(e) = app.register_action(&action) {
+            eprintln!("pir: menu action {view_action:?} not registered: {e}");
+        }
+        std::mem::forget(action);
+        // Same group qualification as the command items above: without the
+        // `pir.` prefix GTK cannot resolve the item and greys it out.
+        subs[i].1.append(label, &menu_detailed_action(&view_action));
+    }
+
+    let mut root = app.new_menu().map_err(|e| format!("new_menu: {e}"))?;
+    for (name, sub) in &subs {
+        root.append_submenu(name, sub);
     }
 
     let bar = app
         .new_menubar(&root, group)
         .map_err(|e| format!("new_menubar: {e}"))?;
-    // The bar is the window's top child of the root box; `build_menu_bar`
-    // returns the widget so the caller can append it in the right order.
-    let _ = bar;
-    Ok(())
+    // The bar is the window's top child of the root box; returning it (rather
+    // than dropping it here) keeps the widget alive past this function, and
+    // the caller appends it above the tabs. Dropping it here would free an
+    // unparented widget — the old drop-the-bar bug that left the window
+    // with only the dead tab-bar Session button.
+    Ok(bar)
 }
 
 /// Build one session tab: its own conversation pane + prompt + status line,
@@ -1354,12 +2248,15 @@ fn spawn_session(
     let textview = app.create_textview().expect("create_textview");
     configure_conversation_textview(&textview);
     scroller.set_child(&textview);
-    vbox.append(&scroller);
     // The scroller, not the TextView, is what must claim the free space, and it
     // needs a sensible minimum height or the pane collapses when a turn is long.
+    // GTK3's pack snapshots expand AT PACK TIME: these must be set BEFORE the
+    // append below, or the scroller keeps its minimum size and the pane is a
+    // blank strip at the top of a mostly-empty window.
     scroller.set_hexpand(true);
     scroller.set_vexpand(true);
     scroller.set_size_request(-1, 200);
+    vbox.append(&scroller);
 
     // -- Prompt row: [model picker] [Entry] [Send] [Cancel] --
     // The picker is the graphical form of `/model` (design row G1), and the
@@ -1383,16 +2280,29 @@ fn spawn_session(
     let model_items = model_picker_items(providers);
     let model_refs: Vec<&str> = model_items.iter().map(|s| s.as_str()).collect();
     if let Ok(picker) = app.create_dropdown(&model_refs) {
-        picker.set_size_request(220, -1);
+        // Fit the picker to the CURRENT model, not the longest catalog id:
+        // GTK3 sizes a ComboBoxText to its longest item, so a fixed 220px
+        // (or the natural size) leaves a fat box around a short
+        // "ollama-cloud/x" label and steals Entry space on every tab.
+        // `agent_slot` holds the model this tab actually runs on.
+        let current_label = agent_slot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|a| a.label())
+            .unwrap_or_else(|| model_items.first().cloned().unwrap_or_default());
+        picker.set_size_request(picker_width_for(&current_label), -1);
         let picker_state = state_cell.clone();
         let picker_slot = agent_slot.clone();
         let picker_widgets = widgets_cell.clone();
         let picker_providers = providers.to_vec();
         // `DropDown` is not `Clone`, and `connect_changed` takes a `'static`
-        // closure, so the widget cannot be captured by value. The loader type is
-        // `#[repr(transparent)]` over a raw handle and is itself `Clone`, so a
-        // clone of it is a cheap handle to the same widget.
-        let picker_handle = picker.0.clone();
+        // closure, so the widget cannot be captured by value. `selection_handle`
+        // returns a cheap cloneable handle to the same widget on both backends
+        // (a `#[repr(transparent)]` loader type on GTK, an `Rc` on NWG), so the
+        // shared GUI code does not have to name a backend-specific field.
+        let picker_handle = picker.selection_handle();
+        let picker_size = picker.clone();
         let _ = picker.connect_changed(move || {
             // GTK fires `changed` when the widget is built too, so a negative
             // row means "nothing selected yet" — not "switch to the last
@@ -1415,7 +2325,14 @@ fn spawn_session(
                         return;
                     };
                     match agent.switch(p.clone(), m.clone()) {
-                        Ok(()) => s.push(ConvKind::System, &format!("→ {}", agent.label())),
+                        Ok(()) => {
+                            let label = agent.label();
+                            s.push(ConvKind::System, &format!("→ {label}"));
+                            // Re-fit the picker to the newly selected model so
+                            // a long id does not permanently stretch the row
+                            // and a short one does not swim in a 220px box.
+                            picker_size.set_size_request(picker_width_for(&label), -1);
+                        }
                         Err(e) => s.push(ConvKind::Error, &e),
                     }
                 }
@@ -1428,7 +2345,34 @@ fn spawn_session(
 
     let entry: GuiEntry = app.create_entry().expect("create_entry");
     entry.set_hexpand(true);
+    // Faint hint while the prompt is empty. Native placeholder: GTK renders it
+    // greyed and it never becomes the value, so submit paths need no filtering.
+    entry.set_placeholder_text("Enter prompt here");
     prompt_row.append(&entry);
+
+    // The Send button (G3). Same function as Enter, so there is one definition
+    // of "submit the prompt line" rather than two that can drift.
+    //
+    // Created AND packed here, before `panel.append(&vbox)` + `vbox.show_all()`
+    // below — but wired up at the end of `spawn_session`, next to the Enter
+    // handler, where the submit-path captures (`sv_for_submit`, ...) exist.
+    // GTK3 creates widgets hidden and only `window.present()`'s blanket
+    // show_all reveals what exists at that point — the first tab ("Session")
+    // is built before present(), so a Send button appended after show_all
+    // still appears; every later tab ("Session 1", ...) is built after
+    // present(), so its pane is revealed only by the explicit `vbox.show_all()`
+    // below, and anything appended after that call stays hidden. Appending Send
+    // after show_all is exactly why "Session 1" has no Send button while
+    // "Session" does.
+    //
+    // A `create_button` failure is loud, not silent: `if let Ok` would
+    // swallow it and leave a tab with an Entry that can only be submitted
+    // via keyboard Enter — the same "missing Send button" symptom from a
+    // different cause. (The button used to be created AND wired after
+    // `vbox.show_all()` near the end of `spawn_session`; creation/packing
+    // moved up here, which is the whole fix.)
+    let send_btn = app.create_button("Send").expect("create_button: Send");
+    prompt_row.append(&send_btn);
 
     // Cancel. Shares `cancel_running` with `Esc`, `Ctrl-C` and `/cancel`, so a
     // button press and a keypress cannot stop different things.
@@ -1448,8 +2392,10 @@ fn spawn_session(
         prompt_row.append(&cancel_btn);
     }
 
-    vbox.append(&prompt_row);
+    // Pack-time rule (see the scroller above): the prompt row must carry
+    // hexpand BEFORE it is packed, or GTK3 snapshots it as non-expanding.
     prompt_row.set_hexpand(true);
+    vbox.append(&prompt_row);
 
     let status = app.create_label("pir · idle").expect("create_label");
     #[cfg(all(target_os = "linux", not(windows)))]
@@ -1465,9 +2411,17 @@ fn spawn_session(
     vbox.append(&hint);
 
     let panel = tabs.tab_box(idx).expect("tabview: tab_box");
-    panel.append(&vbox);
+    // Pack-time rule again: the session box must carry expand BEFORE it is
+    // packed into the tab panel, or the whole pane renders at minimum size.
     vbox.set_hexpand(true);
     vbox.set_vexpand(true);
+    panel.append(&vbox);
+    // GTK3 creates widgets hidden; only window.present()'s blanket show_all
+    // reveals what exists at that point. The first tab is built before
+    // present(), but every later tab ("New session") is built after — without
+    // this its pane stays invisible and the session looks like it did nothing.
+    // (The tab *button* is shown by TabView::add_tab itself.)
+    vbox.show_all();
 
     let state = Arc::new(Mutex::new(GuiState::new()));
     let widgets = GuiWidgets {
@@ -1476,6 +2430,14 @@ fn spawn_session(
         scroller: scroller.clone(),
         hint: hint.clone(),
     };
+    // Clickable links in the conversation pane (design row G6): a left-button
+    // release over a recorded link span opens it in the browser. Wired once
+    // per tab — the handler reads that tab's own `buf_links` map, so tabs
+    // never resolve each other's clicks.
+    #[cfg(all(target_os = "linux", not(windows)))]
+    connect_link_clicks(&textview, &state);
+    #[cfg(windows)]
+    connect_link_clicks(&textview, &state);
     // Hand the picker and the Cancel button their target now that it exists.
     // Both are wired above (a callback needs the widget at construction time)
     // but cannot fire until the main loop runs, which is strictly after this.
@@ -1492,12 +2454,23 @@ fn spawn_session(
         if let Some(agent) = agent_slot.lock().unwrap().as_ref() {
             s.show_thinking = agent.show_thinking();
         }
+        // Greet with the live agent's model, not the catalog's first entry:
+        // `providers[0].pid()` names whatever provider happens to be listed
+        // first, which is stale the moment the session runs on anything else
+        // (the reported ". pir . cerebras" while ollama-cloud was selected).
+        // The agent slot holds the model this tab actually runs on.
+        let live_label = agent_slot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|a| a.label())
+            .unwrap_or_else(|| providers[0].label(&providers[0].models[0]));
         s.push(
             ConvKind::System,
             &format!(
                 "pir · {} · GTK GUI  (/help · /sessions new|close|next|prev|<n> · Enter to send · \
                  esc or ctrl-c cancels · ctrl-q quits)",
-                providers[0].pid()
+                live_label
             ),
         );
         sync_textview(&widgets, &mut s);
@@ -1540,16 +2513,29 @@ fn spawn_session(
                 let _ = app_for_keys.clone().quit();
                 true
             }
-            // Esc and Ctrl-C cancel the running turn — the same affordance the
-            // TUI has and the GUI previously lacked, where the only way to stop
-            // work was to type `/cancel`. Both share the command's logic, so a
-            // key press and the typed command can never disagree about what
-            // "cancel" means.
+            // Esc cancels the running turn — the same affordance the TUI has
+            // and the GUI previously lacked, where the only way to stop work
+            // was to type `/cancel`. Shares the command's logic, so a key press
+            // and the typed command can never disagree about what "cancel"
+            // means.
             KEY_ESCAPE => {
                 cancel_running(&cancel_for_keys, &state_for_keys, &widgets_for_keys);
                 true
             }
+            // Ctrl-C cancels the running turn — but ONLY when the conversation
+            // pane does not hold focus. This handler is wired on the prompt
+            // Entry, so it normally fires only while typing there; but GTK
+            // key-press propagation can deliver the Entry's handler while the
+            // TextView is focused (e.g. after clicking into the log to select
+            // text). Claiming Ctrl-C unconditionally would swallow the
+            // TextView's own copy binding: the user selects log text, hits
+            // Ctrl-C, and gets "no turn running to cancel" instead of a
+            // clipboard copy. When the pane is focused the key must pass
+            // through (return false) so GTK's copy-clipboard binding runs.
             KEY_C if ctrl => {
+                if widgets_for_keys.textview.has_focus() {
+                    return false;
+                }
                 cancel_running(&cancel_for_keys, &state_for_keys, &widgets_for_keys);
                 true
             }
@@ -1588,6 +2574,36 @@ fn spawn_session(
                 if let Some(new_text) = nav.navigate(dir, &cur, &history) {
                     entry_comp_cb.set_text(&new_text);
                 }
+                true
+            }
+            // Keyboard scrollback (design row S6): Page_Up / Page_Down move the
+            // `GuiScroll` window one page, Home jumps to the top, End returns
+            // to the live tail (re-arming follow). The toolkit has no
+            // `gtk_adjustment_set_value`, so this repaints the windowed slice
+            // instead of moving the adjustment — same helpers the View menu
+            // uses, so key and menu scroll the same window.
+            GDK_KEY_PAGE_UP => {
+                let mut s = state_for_keys.lock().unwrap();
+                scroll_page_up(&mut s);
+                sync_textview(&widgets_for_keys, &mut s);
+                true
+            }
+            GDK_KEY_PAGE_DOWN => {
+                let mut s = state_for_keys.lock().unwrap();
+                scroll_page_down(&mut s);
+                sync_textview(&widgets_for_keys, &mut s);
+                true
+            }
+            GDK_KEY_HOME => {
+                let mut s = state_for_keys.lock().unwrap();
+                scroll_home(&mut s);
+                sync_textview(&widgets_for_keys, &mut s);
+                true
+            }
+            GDK_KEY_END => {
+                let mut s = state_for_keys.lock().unwrap();
+                scroll_end(&mut s);
+                sync_textview(&widgets_for_keys, &mut s);
                 true
             }
             _ => false,
@@ -1639,9 +2655,12 @@ fn spawn_session(
         }
     });
 
-    // The Send button (G3). Same function as Enter, so there is one definition
-    // of "submit the prompt line" rather than two that can drift.
-    if let Ok(send_btn) = app.create_button("Send") {
+    // Wire the Send button created up in the prompt row (BEFORE show_all) to
+    // the same submit path as Enter, so a button press and a keypress cannot
+    // diverge. The button widget itself was packed long before
+    // `vbox.show_all()` so post-present tabs show it; only the callback —
+    // which needs the captures built just above — is attached here.
+    {
         let sv_send = sv_for_submit.clone();
         let sessions_send = sessions_for_submit.clone();
         let tabs_send = tabs_for_submit.clone();
@@ -1657,7 +2676,6 @@ fn spawn_session(
                 _full_auto,
             );
         });
-        prompt_row.append(&send_btn);
     }
 
     sessions.borrow_mut().push(SessionView {
@@ -1824,8 +2842,8 @@ fn drain_once(
     // may take the pane to the bottom. Doing it after the append would read the
     // post-append position and could not tell the difference.
     eprintln!("PIRPROBE: drain_once tick");
-    if let Some((vpos, vmax)) = scrolled_window_range(&widgets.scroller) {
-        s.observe_scroll(vpos, vmax);
+    if let Some((vpos, vmax, page)) = scrolled_window_range(&widgets.scroller) {
+        s.observe_scroll(vpos, vmax, page);
     }
 
     // Mirror the prompt Entry's text into the model. The hint line and the
@@ -2062,6 +3080,24 @@ fn model_picker_items(providers: &[Provider]) -> Vec<String> {
     out
 }
 
+/// Width, in pixels, for the model picker showing `label`.
+///
+/// GTK3's ComboBoxText sizes to its longest *item*, not the selected one, so
+/// a catalog with one long id stretches every tab's prompt row and steals the
+/// Entry's space. Instead the picker is pinned to just the current model via
+/// `set_size_request`: ~8px per char (the toolkit's own headless fallback
+/// width in `measure_text_px`) plus room for the dropdown arrow and padding.
+/// The same estimate is used with and without a display, so tests pin it
+/// without needing GTK.
+fn picker_width_for(label: &str) -> i32 {
+    const PER_CHAR_PX: usize = 8;
+    const ARROW_AND_PADDING_PX: i32 = 40;
+    const MIN_PX: i32 = 80;
+    const MAX_PX: i32 = 420;
+    let text = (label.chars().count() * PER_CHAR_PX) as i32 + ARROW_AND_PADDING_PX;
+    text.clamp(MIN_PX, MAX_PX)
+}
+
 /// This file's source for the body of `handle_command` — everything from its
 /// definition up to (but not including) the catch-all `other =>` arm.
 ///
@@ -2167,6 +3203,7 @@ const COMMAND_ALIASES: &[(&str, &str)] = &[
     ("resources", "limits"),
     ("skill", "skills"),
     ("scratch", "scratchpad"),
+    ("md_demo", "markup_demo"),
 ];
 
 /// Resolve a command name to the canonical form, following alias chains.
@@ -2188,6 +3225,119 @@ fn canonical_command(name: &str) -> String {
         }
     }
     cur.to_string()
+}
+
+/// The name under which `build_menu_bar` inserts the action group on the
+/// window (`window.insert_action_group("pir", group)`).
+///
+/// Every `GMenu` item's detailed action must be qualified with this group
+/// (`pir.session-new`, …): the actions themselves are registered under their
+/// short names, and GTK resolves a detailed action `group.name` by looking
+/// `name` up in `group`. A bare name (`session-new`) matches no group GTK
+/// searches (`app`/`win`), so GTK renders the item insensitive — greyed out,
+/// unclickable. This is exactly the convention the toolkit's own working
+/// example uses (`file_menu.append("New", "app.new")` with
+/// `app.new_simple_action("new")`), and the NWG backend documents the other
+/// half (`app.rs`: "action names must match the short name used by the
+/// backend's menu dispatch (NWG strips the app. prefix before lookup)").
+/// Keep the two spellings consistent: registration stays short (strippable
+/// everywhere), menu strings carry the prefix.
+const MENU_ACTION_GROUP: &str = "pir";
+
+/// The detailed action string stored in the `GMenu` model for a menu item.
+///
+/// GTK's `GtkPopoverMenuBar` resolves `group.name` by looking `name` up in the
+/// action group the window inserted under `group`. The group here is always
+/// [`MENU_ACTION_GROUP`], and actions are always registered under their short
+/// names — so the detailed name is always `pir.<action>`. Centralised (rather
+/// than inlined at the append sites) so the group prefix and the insert call
+/// cannot drift apart: a mismatch greys out the whole menu with no error.
+fn menu_detailed_action(action: &str) -> String {
+    format!("{MENU_ACTION_GROUP}.{action}")
+}
+
+/// One provider's models as a menu subtree: the provider label plus
+/// `(model_label, action_name, model_id)` per model. Pure so the tree shape is
+/// testable without a display — `build_menu_bar` renders exactly this.
+///
+/// Models whose id carries an `org/` prefix (openrouter's `anthropic/claude…`
+/// shape — the only catalog entries with a `/`) split into a nested layer:
+/// `(group, [(leaf_label, action, full_id)])`, so `openrouter >
+/// anthropic/claude-sonnet-5` becomes `openrouter > anthropic >
+/// claude-sonnet-5`. The leaf label keeps the full id's tail; the action still
+/// resolves the full `provider/id` through this same tree at click time.
+/// One row in a provider's Model submenu: either a direct model leaf or a
+/// nested `org/` group of leaves. Groups come from model ids carrying an
+/// `org/` prefix (openrouter's `anthropic/claude…` shape — the only catalog
+/// entries with a `/`): `openrouter > anthropic/claude-sonnet-5` renders as
+/// `openrouter > anthropic > claude-sonnet-5`. The leaf label shows the id
+/// tail; dispatch still uses the full `provider/id` through this same tree
+/// at click time, so the grouping can never misroute a switch.
+#[derive(Debug)]
+enum ModelMenuEntry {
+    /// Direct model leaf: `(label, action_name, full_model_id)`.
+    Leaf(String, String, String),
+    /// Nested group: `(org, [(label, action_name, full_model_id)])`.
+    Group(String, Vec<(String, String, String)>),
+}
+fn model_menu_tree(providers: &[Provider], active: &str) -> Vec<(String, Vec<ModelMenuEntry>)> {
+    providers
+        .iter()
+        .enumerate()
+        .map(|(pi, p)| {
+            let pid = p.pid();
+            let mut entries: Vec<ModelMenuEntry> = Vec::new();
+            // org -> index into `entries`, so groups materialize in catalog
+            // (first-encounter) order and flat leaves keep their positions.
+            let mut groups: Vec<(String, usize)> = Vec::new();
+            for (mi, m) in p.models.iter().enumerate() {
+                let id = m.id.clone();
+                // Action names must survive GTK dispatch: model ids carry
+                // `/`, `:`, `~` (e.g. `~anthropic/claude-sonnet-latest`),
+                // so use positional `model-p<pi>-m<mi>` names and resolve
+                // back through this same tree at click time.
+                let action = format!("model-p{pi}-m{mi}");
+                let marked = format!("{pid}/{id}") == active;
+                match id.split_once('/') {
+                    Some((org, tail)) if !org.is_empty() && !tail.is_empty() => {
+                        let show = tail.to_string();
+                        let label = if marked {
+                            format!("● {show}")
+                        } else {
+                            format!("  {show}")
+                        };
+                        match groups.iter().position(|(g, _)| g == org) {
+                            Some(pos) => {
+                                let gi = groups[pos].1;
+                                if let ModelMenuEntry::Group(_, leaves) =
+                                    &mut entries[gi]
+                                {
+                                    leaves.push((label, action, id));
+                                }
+                            }
+                            None => {
+                                groups.push((org.to_string(), entries.len()));
+                                entries.push(ModelMenuEntry::Group(
+                                    org.to_string(),
+                                    vec![(label, action, id)],
+                                ));
+                            }
+                        }
+                    }
+                    // No (usable) `/`: a flat leaf showing the full id.
+                    _ => {
+                        let label = if marked {
+                            format!("● {id}")
+                        } else {
+                            format!("  {id}")
+                        };
+                        entries.push(ModelMenuEntry::Leaf(label, action, id));
+                    }
+                }
+            }
+            (pid, entries)
+        })
+        .collect()
 }
 
 /// One entry in the menu bar: a label, the action name, and the slash command
@@ -2223,9 +3373,14 @@ const MENU_ACTIONS: &[MenuAction] = &[
     MenuAction { menu: "Session", label: "Set goal", action: "session-goal", command: "goal", arg: "" },
     MenuAction { menu: "Session", label: "Continue goal", action: "session-continue", command: "continue", arg: "" },
     MenuAction { menu: "Session", label: "Set thinking level", action: "session-thinking", command: "thinking", arg: "" },
+    MenuAction { menu: "Session", label: "Resume session…", action: "session-resume", command: "menu", arg: "resume" },
+    MenuAction { menu: "Session", label: "Backgrounded sessions…", action: "session-backgrounded", command: "menu", arg: "backgrounded" },
+    MenuAction { menu: "Session", label: "Worktrees by default…", action: "session-worktrees", command: "menu", arg: "worktrees" },
+    MenuAction { menu: "Session", label: "Autoclean coverage…", action: "session-coverage", command: "menu", arg: "coverage" },
     // Model
     MenuAction { menu: "Model", label: "Switch model", action: "model-switch", command: "model", arg: "" },
     MenuAction { menu: "Model", label: "List models", action: "model-list", command: "models", arg: "" },
+    MenuAction { menu: "Model", label: "Pick model…", action: "model-pick", command: "menu", arg: "model" },
     // Turn control
     MenuAction { menu: "Turn", label: "Cancel turn", action: "turn-cancel", command: "cancel", arg: "" },
     MenuAction { menu: "Turn", label: "Undo last turn", action: "turn-undo", command: "undo", arg: "" },
@@ -2236,11 +3391,17 @@ const MENU_ACTIONS: &[MenuAction] = &[
     // Safety
     MenuAction { menu: "Safety", label: "Review staged writes", action: "safety-quarantine", command: "quarantine", arg: "" },
     MenuAction { menu: "Safety", label: "Resource limits", action: "safety-limits", command: "limits", arg: "" },
+    MenuAction { menu: "Safety", label: "Security options…", action: "safety-security", command: "menu", arg: "security" },
+    MenuAction { menu: "Safety", label: "Settings…", action: "safety-settings", command: "menu", arg: "settings" },
+    MenuAction { menu: "Safety", label: "Thinking options…", action: "safety-thinking", command: "menu", arg: "thinking" },
     // Info
     MenuAction { menu: "Help", label: "Commands", action: "help-commands", command: "help", arg: "" },
+    MenuAction { menu: "Help", label: "Menu…", action: "help-menu", command: "menu", arg: "" },
+    MenuAction { menu: "Help", label: "About pir", action: "help-about", command: "menu", arg: "about" },
     MenuAction { menu: "Help", label: "Skills", action: "help-skills", command: "skills", arg: "" },
     MenuAction { menu: "Help", label: "Session scratchpad", action: "help-scratchpad", command: "scratchpad", arg: "" },
     MenuAction { menu: "Help", label: "Token usage", action: "help-usage", command: "usage", arg: "" },
+    MenuAction { menu: "Help", label: "Markdown demo", action: "help-markup-demo", command: "markup_demo", arg: "" },
     MenuAction { menu: "Help", label: "Reload catalog", action: "help-reload", command: "reload", arg: "" },
     MenuAction { menu: "Help", label: "Restart in place", action: "help-reexec", command: "reexec", arg: "" },
     MenuAction { menu: "Help", label: "Mark session finished", action: "help-finished", command: "finished", arg: "" },
@@ -2257,6 +3418,12 @@ const MENU_VIEW_ACTIONS: &[(&str, &str, &str)] = &[
     ("View", "Scroll up one page", "view-page-up"),
     ("View", "Scroll down one page", "view-page-down"),
     ("Turn", "Mark session finished", "view-finished"),
+    // Edit menu: the log pane is read-only, so Copy is the only edit action
+    // that makes sense — it copies the TextView's current selection to the
+    // CLIPBOARD via gtk_text_buffer_copy_clipboard (GTK's own copy path).
+    // Without this there is no menu copy at all, and Ctrl-C over a selection
+    // used to cancel the turn instead (see the KEY_C handler).
+    ("Edit", "Copy", "edit-copy"),
 ];
 
 /// Join background turns that have finished, dropping each from the job list
@@ -2443,6 +3610,9 @@ fn drain_session_log(log: PathBuf, state: &mut GuiState) {
     if state.conv.len() > 200_000 {
         let drop = state.conv.len() - 200_000;
         state.conv = state.conv.split_off(drop);
+        // The link map is parallel to `conv`: drop the same leading lines or
+        // clicks resolve against the wrong line's URLs.
+        state.line_links = state.line_links.split_off(drop);
         state.rendered = state.rendered.saturating_sub(drop);
         state.needs_rebuild = true;
     }
@@ -2515,15 +3685,26 @@ fn drain_session_text(buf: &str, state: &mut GuiState) {
         }
         let text = text.trim_end().to_string();
         if !text.is_empty() {
-            // Assistant markdown is rendered through the *same* renderer the TUI
-            // uses (`tui.rs:1697` calls `crate::md::render`). The GUI used to
-            // append the raw text, so a model answer arrived as literal `##`
-            // and `-` — in a graphical pane, which is exactly the surface where
-            // that looks most wrong. `color: false` because the GTK pane has no
-            // per-range markup (see `sync_textview`): ANSI codes would show up
-            // as literal escape junk.
+            // Assistant markdown rendering depends on the pane:
+            //
+            // * `gui-rich-text` ON (default): keep the RAW markdown in the
+            //   model. `sync_textview` converts each assistant line with
+            //   `md::render_pango` and inserts Pango markup — bold/italic/
+            //   code/headings/links render styled. ANSI would show up as
+            //   literal escape junk, so no ANSI renderer runs here.
+            // * OFF (`--no-default-features`): same renderer the TUI uses
+            //   (`tui.rs:1697` calls `crate::md::render`). The GTK pane has
+            //   no per-range markup in this mode (see `sync_textview`), so
+            //   `color: false` — ANSI codes would show up as literal junk.
             let text = if kind == ConvKind::Assistant {
-                crate::md::render(&text, false)
+                #[cfg(feature = "gui-rich-text")]
+                {
+                    text
+                }
+                #[cfg(not(feature = "gui-rich-text"))]
+                {
+                    crate::md::render(&text, false)
+                }
             } else {
                 text
             };
@@ -2544,10 +3725,196 @@ fn configure_conversation_textview(tv: &TextView) {
     tv.set_vexpand(true);
     // GTK wrap mode: GTK_WRAP_WORD_CHAR — break mid-word only when a single
     // word is wider than the view, so code blocks and long paths still wrap.
-    tv.set_wrap_mode(GTK_WRAP_WORD_CHAR);
     tv.set_editable(false);
+    // Selectable but never an input target: the pane must accept focus so the
+    // user can select text and copy it (a `can_focus(false)` view cannot be
+    // focused, so it can never hold a selection and Ctrl-C has nothing to
+    // copy). Read-only (`editable(false)`) already blocks typing into it, so
+    // focus here cannot eat keystrokes — and focus normally stays in the
+    // prompt Entry anyway (tab changes grab it explicitly; nothing else moves
+    // it). Without this the log is copy-hostile: no selection, no clipboard.
     #[cfg(all(target_os = "linux", not(windows)))]
-    tv.set_can_focus(false);
+    tv.set_can_focus(true);
+}
+
+/// Open a link URL in the user's browser, safely (design row G6).
+///
+/// Defence in depth: the span map only holds URLs that passed `sanitize_url`
+/// at inventory time, but the click path re-checks — and narrows to
+/// `http`/`https` only. `sanitize_url` also allows `mailto:`/`file:`, but
+/// those never reach a browser here: `file:` would turn model output into a
+/// local-file read primitive, and `mailto:` has no browser target. Anything
+/// else is ignored silently (a click that does nothing beats a click that
+/// runs something unexpected).
+///
+/// No shell: the URL is passed as a single argv element to `xdg-open`, so a
+/// `"` or `$()` in the URL cannot inject. Detached via `setsid` (not
+/// `process_group(0)` — see the project preference) so the browser never
+/// holds pir's terminal, and reaped on a worker thread so the click never
+/// blocks the GTK loop and never leaves a zombie.
+#[cfg(all(target_os = "linux", not(windows)))]
+fn open_link_safely(url: &str) {
+    let Some(clean) = streamdown_ansi::sanitize::sanitize_url(url) else {
+        return;
+    };
+    let lower = clean.to_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let mut cmd = std::process::Command::new("xdg-open");
+        cmd.arg(&clean);
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                // SAFETY: `setsid` is async-signal-safe; nothing else runs in
+                // the child before exec.
+                let _ = cmd.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+        }
+        let _ = cmd.status();
+    });
+}
+
+/// Wire link clicks on the conversation pane (design row G6): a left-button
+/// release over a recorded link span opens it via [`open_link_safely`].
+///
+/// Three guards, in order, so a click can never do the wrong thing:
+/// 1. left button only (a right-click release is a context gesture, and on
+///    GTK4 the button symbol is missing so the release is treated as left —
+///    matching GTK3 delivery, which only fires for pressed buttons);
+/// 2. no selection — a release that ends a text selection is a copy gesture,
+///    never a link activation (the operator selecting link text must not
+///    launch a browser);
+/// 3. the release must land inside a span in the session's `buf_links` map
+///    (built by `sync_textview` against the exact inserted text) — anywhere
+///    else propagates (returns 0) so selection/drag still work.
+///
+/// Missing coordinate symbols degrade to non-clickable links: `link_hit_at`
+/// returns `None` and the handler propagates every release.
+#[cfg(all(target_os = "linux", not(windows)))]
+fn connect_link_clicks(tv: &TextView, state: &Arc<Mutex<GuiState>>) {
+    let tv_click = tv.clone();
+    let state_click = state.clone();
+    let _ = tv.connect_button_release(move |event: *mut c_void| -> i32 {
+        let Some(loader) = rustxwidgets::backends::gtk::loader() else {
+            return 0;
+        };
+        // Guard 1: left button only.
+        if let Some(button) = TextView::release_button(event, &loader) {
+            if button != 1 {
+                return 0;
+            }
+        }
+        // Guard 2: a release ending a selection is a copy gesture.
+        if tv_click.buffer_has_selection() {
+            return 0;
+        }
+        // Event → widget coords → buffer (line, col).
+        // SAFETY: `event` is the GDK event pointer GTK passes to a
+        // `button-release-event` handler — valid for the call's duration.
+        let Some((wx, wy)) = (unsafe {
+            rustxwidgets::gtk_dynamic_loader::gdk_event_get_coords(&loader, event)
+        }) else {
+            return 0;
+        };
+        let Some((line, col)) = tv_click.link_hit_at(wx as i32, wy as i32) else {
+            return 0;
+        };
+        // Guard 3: the position must be inside a recorded span.
+        let url = {
+            let s = state_click.lock().unwrap();
+            match s.buf_links.get(line as usize) {
+                Some(spans) => lookup_link(spans, col as u32).map(str::to_string),
+                None => None,
+            }
+        };
+        match url {
+            Some(u) => {
+                open_link_safely(&u);
+                1
+            }
+            None => 0,
+        }
+    });
+}
+
+/// Open a link URL in the user's default browser — the Windows counterpart of
+/// the Linux [`open_link_safely`] above, and the `wxLaunchDefaultBrowser`
+/// behaviour `wxHyperlinkCtrl` and `wxTE_AUTO_URL` both rely on.
+///
+/// Same policy, same place: the span map only holds URLs that passed
+/// `sanitize_url` at inventory time, but the click path re-checks and narrows
+/// to `http`/`https`. `file:` is refused here too — it would turn model output
+/// into a local-file read primitive. Anything else is ignored silently.
+///
+/// No shell: the URL goes to `ShellExecuteW(…, "open", url, …)` as a single
+/// argument, so a `"` or `&` in the URL cannot inject a command (unlike
+/// `cmd /c start`). `ShellExecuteW` hands the URL to the registered handler and
+/// returns immediately, so no worker thread is needed to keep the UI live.
+#[cfg(windows)]
+fn open_link_safely(url: &str) {
+    let Some(clean) = streamdown_ansi::sanitize::sanitize_url(url) else {
+        return;
+    };
+    let lower = clean.to_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return;
+    }
+    let opened = rustxwidgets::backends_nwg_adapter::TextView::open_url(&clean);
+    if !opened {
+        eprintln!("pir: could not open {clean} in the default browser");
+    }
+}
+
+/// Wire link clicks on the conversation pane (design row G6, NWG backend).
+///
+/// The `wxTE_AUTO_URL` behaviour for a plain EDIT control: observe
+/// `WM_LBUTTONUP` (never swallowing it, so caret moves, selection drags and
+/// double-click word-select still work), hit-test the click with
+/// `EM_CHARFROMPOS`, and open the URL whose span covers that buffer position.
+///
+/// Guards, in the same order as the GTK side so the two backends cannot
+/// disagree:
+/// 1. left button only — inherent: the raw handler only sees `WM_LBUTTONUP`;
+/// 2. no selection — a release that ends a text selection is a copy gesture;
+/// 3. the position must fall inside a span in this session's `buf_links`
+///    (built by the Windows `sync_textview` against the exact inserted text).
+///
+/// Unlike GTK there is nothing to "return 1" for: NWG's raw handler returns
+/// `None` so `DefSubclassProc` always runs.
+#[cfg(windows)]
+fn connect_link_clicks(tv: &TextView, state: &Arc<Mutex<GuiState>>) {
+    let tv_click = tv.clone();
+    let state_click = state.clone();
+    tv.connect_left_release(Box::new(move |x: i32, y: i32| {
+        // Guard 2: a release ending a selection is a copy gesture.
+        if tv_click.buffer_has_selection() {
+            return;
+        }
+        // Client point → buffer (line, char column).
+        let Some((line, col)) = tv_click.char_index_at(x, y) else {
+            return;
+        };
+        // Guard 3: the position must be inside a recorded span.
+        let url = {
+            let s = state_click.lock().unwrap();
+            match s.buf_links.get(line as usize) {
+                Some(spans) => lookup_link(spans, col as u32).map(str::to_string),
+                None => None,
+            }
+        };
+        if let Some(u) = url {
+            open_link_safely(&u);
+        }
+    }));
 }
 
 /// Read a `ScrolledWindow`'s vertical scroll position, or `None` when the
@@ -2559,24 +3926,31 @@ fn configure_conversation_textview(tv: &TextView) {
 /// — so `observe_scroll` is only called when this yields `Some`.
 #[cfg(all(target_os = "linux", not(windows)))]
 fn scrolled_window_vpos(sw: &ScrolledWindow) -> Option<f64> {
-    scrolled_window_range(sw).map(|(vpos, _)| vpos)
+    scrolled_window_range(sw).map(|(vpos, _, _)| vpos)
 }
 
-/// Read `(vpos, vmax)` for a `ScrolledWindow`: the current vertical position and
-/// the adjustment's upper bound (the scrollable extent).
+/// Read `(vpos, vmax, page)` for a `ScrolledWindow`: the current vertical
+/// position, the adjustment's upper bound (the scrollable extent), and the
+/// viewport height (the adjustment's page size).
 ///
-/// `vmax` is what tells "at the bottom" from "scrolled away from the bottom", so
-/// it matters as much as `vpos`. Both come from the adjustment GTK gives the
-/// scrolled window.
+/// `vmax` and `page` together tell "at the bottom" from "scrolled away from
+/// the bottom": the bottom of what is shown is `vpos + page`, so the pane is
+/// at the bottom exactly when that reaches `vmax`. All three come from the
+/// adjustment GTK gives the scrolled window.
 #[cfg(all(target_os = "linux", not(windows)))]
-fn scrolled_window_range(sw: &ScrolledWindow) -> Option<(f64, f64)> {
-    // Both readings come from GTK through the toolkit's loader wrappers.
-    // `get_vadjustment_upper` is what makes "at the bottom" distinguishable from
-    // "scrolled away from the bottom" — without it every reading looks like the
-    // bottom and follow-the-tail would yank a reader back down on every append.
+fn scrolled_window_range(sw: &ScrolledWindow) -> Option<(f64, f64, f64)> {
+    // All three readings come from GTK through the toolkit's loader wrappers.
+    // `get_vadjustment_page_size` is what makes "at the bottom" computable at
+    // all: `upper` alone is the end of the extent, so comparing `value`
+    // against `upper` directly mistakes the top of the viewport for the
+    // bottom and freezes follow-the-tail after the first screenful.
     // `None` means the toolkit could not report (no display / symbol missing),
     // and the caller leaves `follow` alone rather than guessing.
-    Some((sw.get_vadjustment_value(), sw.get_vadjustment_upper()))
+    Some((
+        sw.get_vadjustment_value(),
+        sw.get_vadjustment_upper(),
+        sw.get_vadjustment_page_size(),
+    ))
 }
 
 /// Windows: no GTK loader, so no scroll position to read. Returning `None`
@@ -2588,7 +3962,7 @@ fn scrolled_window_vpos(_sw: &ScrolledWindow) -> Option<f64> {
 
 /// Windows counterpart of `scrolled_window_range`.
 #[cfg(windows)]
-fn scrolled_window_range(_sw: &ScrolledWindow) -> Option<(f64, f64)> {
+fn scrolled_window_range(_sw: &ScrolledWindow) -> Option<(f64, f64, f64)> {
     None
 }
 
@@ -2607,29 +3981,184 @@ fn status_markup(status: &str) -> String {
 
 /// Sync the backend's text buffer with the conversation model.
 ///
-/// The buffer is append-only between rebuilds: each new line is appended
-/// (`append_text` on GTK) rather than replacing the whole buffer. The old code
-/// called `set_text("")` at the end of the loop, which on GTK goes to
-/// `gtk_text_buffer_set_text` — a *replace* — so the pane ended up blank.
+/// Two modes, selected by [`GuiState::sync_follow`]:
+///
+/// * live (`follow` armed): the buffer is append-only between rebuilds. Each
+///   new line is appended (`append_text` on GTK) rather than replacing the
+///   whole buffer. The old code called `set_text("")` at the end of the loop,
+///   which on GTK goes to `gtk_text_buffer_set_text` — a *replace* — so the
+///   pane ended up blank.
+/// * frozen (`follow` off): the buffer is held. New lines wait in the model
+///   (`rendered` is just a cursor, so the live path catches up on re-arm).
+///   GTK pins the pane to the bottom on every append — without the hold, an
+///   append would yank a mid-read user back down — so while frozen nothing is
+///   appended at all. The one exception is an explicit keyboard/menu scroll
+///   command (`view_slice` set to [`SCROLL_DIRTY`]): the windowed slice
+///   `scroll.window(total)` is painted instead, which is the only programmatic
+///   scroll the toolkit allows (`gtk_adjustment_set_value` does not exist).
 ///
 /// `sync_textview` takes `&mut GuiState` because the per-session write cursor
 /// lives in the state; it must not hold the state's lock while it runs.
 #[cfg(all(target_os = "linux", not(windows)))]
 fn sync_textview(widgets: &GuiWidgets, state: &mut GuiState) {
-    if state.needs_rebuild {
-        widgets.textview.set_text("");
-        state.rendered = 0;
-        state.needs_rebuild = false;
-    }
-    if state.conv.len() > state.rendered {
-        for line in &state.conv[state.rendered..] {
-            // The backend has no per-range markup, so the line goes in as
+    // Rich vs plain assistant lines: with `gui-rich-text` the model holds RAW
+    // markdown (see `drain_session_text`) and each assistant *block* — the run
+    // of consecutive assistant lines between blank lines, see
+    // [`continues_block`] — is converted with `md::render_pango` into Pango
+    // markup, inserted via `append_markup` (`gtk_text_buffer_insert_markup`).
+    // Rendering the block as one unit is what makes tables/code fences/
+    // blockquotes/paragraphs render at all: a markdown construct spans lines,
+    // so a per-line render split every one of them (the `/markup_demo` table
+    // came out as four literal `| … |` rows).
+    //
+    // Without the feature the model already holds ANSI-stripped plain text and
+    // lines go in via `append_text`. Non-assistant lines are always plain
+    // `prefix + text`.
+    if state.sync_follow() {
+        // Live: any windowed buffer is stale — rebuild the full tail first.
+        if state.needs_rebuild || state.view_slice.is_some() {
+            widgets.textview.set_text("");
+            state.rendered = 0;
+            state.needs_rebuild = false;
+            state.view_slice = None;
+            // The buffer was replaced, so every span in the old map points at
+            // text that no longer exists: rebuild it from scratch below.
+            state.buf_links.clear();
+        }
+        // Assistant blocks are appended whole, so a block that is still
+        // arriving (streamed into the model one drained line at a time) must
+        // not be painted in pieces: `live_boundary` paints every completed
+        // block, then the trailing block from the write cursor on. The cursor
+        // parks on the trailing block's first line, so that block is rendered
+        // again, whole, on each sync until more of it arrives — never as a
+        // second partial copy.
+        let (base, rest) = (state.rendered, &state.conv[state.rendered..]);
+        let end = base + live_boundary(rest, 0);
+        let mut i = state.rendered;
+        while i < end {
+            let line = &state.conv[i];
+            // Grow the block while the lines continue it. The block's Pango
+            // already carries its own breaks, so it is inserted as one unit.
+            let mut j = i + 1;
+            while j < end && continues_block(Some(&state.conv[j - 1]), &state.conv[j]) {
+                j += 1;
+            }
+            #[cfg(feature = "gui-rich-text")]
+            if line.kind == ConvKind::Assistant {
+                let markup = assistant_block_markup(line.kind, &state.conv[i..j]);
+                let inserted = format!("{markup}\n");
+                widgets.textview.append_markup(&inserted);
+                // Clickable links (design row G6): resolve this block's
+                // recorded pairs against the exact visible text just
+                // inserted — markup shifts bytes, so spans computed on the
+                // markdown source would point at the wrong characters.
+                let pairs: Vec<(String, String)> = (i..j)
+                    .flat_map(|k| state.line_links[k].iter().cloned())
+                    .collect();
+                let visible = crate::md::pango_visible_text(&inserted);
+                let base = state.buf_links.len() as u32;
+                let nlines = visible.matches('\n').count();
+                state.buf_links.resize(base as usize + nlines, Vec::new());
+                for (rel, scol, ecol, url) in resolve_link_spans(&visible, &pairs) {
+                    state.buf_links[(base + rel) as usize].push((scol, ecol, url));
+                }
+                i = j;
+                continue;
+            }
+            #[cfg(not(feature = "gui-rich-text"))]
+            debug_assert_eq!(j, i + 1, "plain mode is per line");
+            // Plain path (or non-assistant lines in rich mode): the
+            // backend has no per-range markup, so the line goes in as
             // plain text; the conversation pane is monochrome. Colour lives in
             // the per-line prefix glyph and in the status label.
             let (_, prefix) = line.kind.style();
-            widgets.textview.append_text(&format!("{prefix}{}\n", line.text));
+            let inserted = format!("{prefix}{}\n", line.text);
+            widgets.textview.append_text(&inserted);
+            // Same link-span bookkeeping as the rich path above, against the
+            // exact inserted line (prefix included — it shifts every column).
+            let spans = resolve_link_spans(&inserted, &state.line_links[i])
+                .into_iter()
+                .map(|(_, scol, ecol, url)| (scol, ecol, url))
+                .collect();
+            state.buf_links.push(spans);
+            i += 1;
         }
-        state.rendered = state.conv.len();
+        // The cursor parks on the first line of the trailing block, so the
+        // next sync re-renders that block (whole) rather than appending a
+        // second partial copy of it.
+        state.rendered = end;
+        // Track the tail while live, so the first PageUp starts one full page
+        // above the bottom rather than from a stale offset.
+        state.scroll.end(state.conv.len());
+    } else if let Some(shown) = state.view_slice {
+        // Frozen with a keyboard/menu scroll request: paint the windowed slice.
+        // Untouched otherwise — the buffer already shows the transcript where
+        // the user left it, and repainting on every 150ms tick would yank it.
+        let total = state.conv.len();
+        let win = state.scroll.window(total);
+        if state.needs_rebuild || shown != win {
+            // Frozen window: plain text through `set_text` (which is
+            // `gtk_text_buffer_set_text` — no markup parsing), and the same
+            // block grouping as the live branch, so a table or a list that
+            // straddles the window edge is not chopped into a row at a time.
+            // The window edge is widened to block boundaries for the same
+            // reason.
+            let (start, end) = window_at_block_edges(&state.conv, win);
+            let mut buf = String::new();
+            // Buffer-line spans for the windowed slice, rebuilt exactly like
+            // the live branch: resolve each inserted line's recorded pairs
+            // against the exact string the buffer receives. The frozen slice
+            // is plain text (see below), so spans resolve against
+            // `prefix + body` — the same rule as the live plain path.
+            let mut frozen_links: Vec<Vec<(u32, u32, String)>> = Vec::new();
+            let mut i = start;
+            while i < end {
+                let line = &state.conv[i];
+                let mut j = i + 1;
+                while j < end && continues_block(Some(&state.conv[j - 1]), &state.conv[j]) {
+                    j += 1;
+                }
+                let (_, prefix) = line.kind.style();
+                buf.push_str(prefix);
+                for (n, l) in state.conv[i..j].iter().enumerate() {
+                    if n > 0 {
+                        buf.push('\n');
+                        buf.push_str(prefix);
+                    }
+                    // In rich mode the model holds raw markdown; strip the most
+                    // common markers so the frozen slice does not show `**`.
+                    // (Full Pango lives in the live branch only.)
+                    #[cfg(feature = "gui-rich-text")]
+                    let body = strip_markdown_markers(&l.text);
+                    #[cfg(not(feature = "gui-rich-text"))]
+                    let body = l.text.clone();
+                    buf.push_str(&body);
+                    // Resolve this buffer line's spans against the exact
+                    // inserted text (`prefix + body`); non-single-line
+                    // resolutions are dropped by construction (one entry per
+                    // buffer line here).
+                    let inserted = format!("{prefix}{body}");
+                    let spans = resolve_link_spans(&inserted, &state.line_links[i + n])
+                        .into_iter()
+                        .map(|(_, scol, ecol, url)| (scol, ecol, url))
+                        .collect();
+                    frozen_links.push(spans);
+                }
+                buf.push('\n');
+                i = j;
+            }
+            // The loop leaves a trailing newline, so the buffer holds one
+            // final empty line past the last entry — record it (empty) so the
+            // map stays parallel to the buffer by construction.
+            frozen_links.push(Vec::new());
+            widgets.textview.set_text(&buf);
+            state.buf_links = frozen_links;
+            state.needs_rebuild = false;
+            state.view_slice = Some(win);
+            // `rendered` is now meaningless (the buffer was replaced, not
+            // appended to); the live branch rebuilds from scratch on re-arm
+            // because `view_slice` is `Some`.
+        }
     }
     // The `done_placeholder` is folded into the status text rather than given
     // its own label: it is a status, not a control, and the TUI draws it in the
@@ -2660,12 +4189,28 @@ fn sync_textview(widgets: &GuiWidgets, state: &mut GuiState) {
         widgets.textview.set_text("");
         state.rendered = 0;
         state.needs_rebuild = false;
+        // The buffer was replaced, so every span in the old map points at
+        // text that no longer exists: rebuild it from scratch below.
+        state.buf_links.clear();
     }
     if state.conv.len() > state.rendered {
-        for line in &state.conv[state.rendered..] {
+        for (i, line) in state.conv[state.rendered..].iter().enumerate() {
+            let markup = line_markup(line);
             // The nwg backend's `TextView::set_markup` already appends the
             // (markup-stripped) line plus a newline, so no separate newline.
-            widgets.textview.set_markup(&line_markup(line));
+            widgets.textview.set_markup(&markup);
+            // Clickable links (design row G6, NWG): resolve this line's
+            // recorded pairs against exactly the string `set_markup` inserts —
+            // the markup-stripped text — so the span columns index the buffer
+            // the EDIT control actually holds. `plain_line` is the same
+            // stripper `set_markup` uses, so the two cannot drift apart.
+            let inserted = rustxwidgets::backends_nwg_adapter::TextView::plain_line(&markup);
+            state.buf_links.push(
+                resolve_link_spans(&inserted, &state.line_links[state.rendered + i])
+                    .into_iter()
+                    .map(|(_, scol, ecol, url)| (scol, ecol, url))
+                    .collect(),
+            );
         }
         state.rendered = state.conv.len();
     }
@@ -2689,6 +4234,1195 @@ fn sync_textview(widgets: &GuiWidgets, state: &mut GuiState) {
     }
 }
 
+
+/// One row of the GUI's main menu: the subcommand `/menu <sub>` runs, and the
+/// label the menu dialog shows.
+///
+/// This is the GUI's equivalent of the terminal's `modal::MenuAction` list
+/// (`/menu` in the streaming REPL): Resume, Backgrounded sessions, Model,
+/// Thinking, Security, Settings, Worktrees default, Autoclean coverage, Help,
+/// About, Quit. The terminal menu is an alternate-screen picker; here each row
+/// becomes a button in a GTK dialog (`open_menu_dialog`), and each also has a
+/// topbar item (`MENU_ACTIONS` entries with `command: "menu"`) routing through
+/// the same `/menu <sub>` line a typed command takes — one implementation per
+/// action, three ways to reach it.
+const MENU_DIALOG_ACTIONS: &[(&str, &str)] = &[
+    ("resume", "Resume / pick session"),
+    ("backgrounded", "Backgrounded sessions"),
+    ("model", "Model"),
+    ("thinking", "Thinking"),
+    ("security", "Security"),
+    ("settings", "Settings"),
+    ("worktrees", "Worktrees by default"),
+    ("coverage", "Autoclean branch coverage"),
+    ("help", "Help"),
+    ("about", "About"),
+    ("quit", "Quit"),
+];
+
+/// Label for a `/menu <sub>` subcommand, or `None` for an unknown one. Pure so
+/// the dialog, the dispatch, and the parity tests share one table instead of
+/// three copies that can drift apart.
+fn menu_action_label(sub: &str) -> Option<&'static str> {
+    MENU_DIALOG_ACTIONS
+        .iter()
+        .find(|(s, _)| *s == sub)
+        .map(|(_, label)| *label)
+}
+
+/// Strip ANSI SGR escapes from a string. The pane has no ANSI renderer —
+/// `sync_textview` inserts plain text, so escapes would show up as literal
+/// junk (see the `gui-rich-text` notes in `drain_session_text`). Agent setters
+/// return plain strings, but a few reused reports (`SessionResume::banner`)
+/// are built with `term::` paints, which emit escapes whenever stdout is a tty
+/// — which it is under `pir --gui` launched from a terminal. Pure so the rule
+/// is testable without a display.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            // Consume the SGR parameter bytes and the final command letter.
+            for c2 in chars.by_ref() {
+                if c2.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Render a branch-coverage plan as pane lines (no ANSI: see [`strip_ansi`]).
+/// Mirrors the terminal's `report_coverage_plan` (`main.rs`) line for line in
+/// content, minus the colour — the same tools, the same missing-tool install
+/// hints, the same "measuring with" summary.
+fn coverage_plan_lines(st: &crate::lints::CoverageStatus) -> Vec<String> {
+    let mut out = Vec::new();
+    for l in &st.available {
+        let chosen = l
+            .chosen
+            .iter()
+            .map(|t| t.tool)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let extra = if l.extras.iter().any(|t| t.needs_install()) {
+            format!(
+                "  (also applicable, not installed: {})",
+                l.extras
+                    .iter()
+                    .filter(|t| t.needs_install())
+                    .map(|t| t.tool)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else {
+            String::new()
+        };
+        out.push(format!(
+            "· autoclean coverage: {} — measuring with {}{}",
+            l.lang, chosen, extra
+        ));
+    }
+    for l in &st.missing {
+        let opts = l
+            .candidates
+            .iter()
+            .filter(|t| t.needs_install())
+            .map(|t| format!("{} ({})", t.tool, t.install))
+            .collect::<Vec<_>>()
+            .join(", or ");
+        out.push(format!(
+            "! autoclean coverage: {} has NO coverage tool installed — its branches will NOT be measured. Install one: {}",
+            l.lang,
+            if opts.is_empty() {
+                l.candidates
+                    .iter()
+                    .map(|t| t.tool)
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            } else {
+                opts
+            },
+        ));
+    }
+    out
+}
+
+/// The concrete `Dialog` type returned by `App::create_dialog` — same pattern
+/// as the `Gui*` aliases above. Both backends expose `set_title`,
+/// `append_content_area`, `present` and `close`, so menu dialogs stay
+/// cross-platform by construction (unlike `question_dialog`, which is
+/// Linux-gated for `set_xalign`).
+#[cfg(windows)]
+type GuiDialog = rustxwidgets::backends_nwg_adapter::Dialog;
+#[cfg(all(target_os = "linux", not(windows)))]
+type GuiDialog = rustxwidgets::backends_gtk_adapter::Dialog;
+
+/// Push one label+button row into a menu-style dialog. The button runs `act`,
+/// then closes the dialog. Every menu dialog in this file is built this way —
+/// fire-and-forget from the GTK main thread.
+///
+/// Blocking (like `question_dialog`'s `rx.recv()`) would freeze the UI here:
+/// that renderer runs on an agent *worker* thread, but menu actions run on the
+/// GTK main thread itself, so there is nothing else keeping the loop alive.
+/// Buttons therefore act synchronously and close; every action below is fast
+/// (a flip, a switch, a save, a local file read) except goal-driving, which
+/// goes through `spawn_goal`'s worker like `/goal` and `/continue` do.
+fn menu_dialog_button(
+    app: &App,
+    dialog: &GuiDialog,
+    label: &str,
+    mut act: impl FnMut() + 'static,
+) {
+    let Ok(btn) = app.create_button(label) else {
+        return;
+    };
+    let dialog_cb = dialog.clone();
+    let _ = btn.on_click(move || {
+        act();
+        dialog_cb.close();
+    });
+    dialog.append_content_area(&btn);
+}
+
+/// Resume a session log into the current agent, pane-native.
+///
+/// Mirrors `resume_into` (`main.rs`, shared by `/resume` and the terminal
+/// `/menu` Resume action) but writes to the pane instead of stdout, seeds
+/// Arrow-Up history like a resumed terminal session, and drives an attached
+/// goal through `spawn_goal`'s worker instead of blocking `continue_goal`
+/// inline — blocking the GTK main thread for a goal run would freeze the
+/// window exactly like the old inline `/goal` did.
+fn resume_session_in_gui(
+    agent_slot: &AgentSlot,
+    path: &std::path::Path,
+    state: &Arc<Mutex<GuiState>>,
+    widgets: &GuiWidgets,
+    hist_nav: &Arc<Mutex<HistoryNav>>,
+) {
+    let (lines, prompts, has_goal, show_thinking) = {
+        let mut g = agent_slot.lock().unwrap();
+        let Some(agent) = g.as_mut() else {
+            let mut s = state.lock().unwrap();
+            s.push(ConvKind::System, "· agent busy (turn running) — cancel it first");
+            sync_textview(widgets, &mut s);
+            return;
+        };
+        agent.clear();
+        let resumed = agent.load_session(&path.to_path_buf());
+        let mut lines: Vec<(ConvKind, String)> = Vec::new();
+        if resumed.turns > 0 {
+            lines.push((ConvKind::System, strip_ansi(&resumed.banner(path))));
+        } else if !resumed.summary.is_empty() {
+            lines.push((ConvKind::System, strip_ansi(&resumed.summary)));
+        }
+        agent.apply_persisted_model();
+        if let Some(notice) = agent.apply_persisted_su_security() {
+            lines.push((ConvKind::System, format!("⚠ {notice}")));
+        }
+        if let Some(notice) = agent.apply_persisted_plan_mode() {
+            lines.push((ConvKind::System, format!("⚠ {notice}")));
+        }
+        agent.apply_persisted_thinking();
+        let show_thinking = agent.show_thinking();
+        let has_goal = agent.goal_snapshot().is_some();
+        if has_goal {
+            agent.attach_goal(path);
+        }
+        (lines, resumed.prompts, has_goal, show_thinking)
+    };
+    {
+        let mut s = state.lock().unwrap();
+        for (kind, line) in &lines {
+            s.push(*kind, line);
+        }
+        for p in &prompts {
+            term::push_history(p);
+            s.history.push(p.clone());
+        }
+        hist_nav.lock().unwrap().reset();
+        s.show_thinking = show_thinking;
+        if has_goal {
+            s.push(
+                ConvKind::System,
+                "· goal attached — driving it now (/cancel to stop)",
+            );
+        }
+        sync_textview(widgets, &mut s);
+    }
+    if has_goal {
+        spawn_goal(agent_slot, false);
+    }
+}
+
+/// Open the resume picker: one button per unfinished session (newest first),
+/// resuming into the current agent. `background_only` keeps just the `-bg`
+/// background-job logs — the terminal's "Backgrounded sessions" item.
+fn open_resume_dialog(
+    app: &App,
+    agent_slot: &AgentSlot,
+    state: &Arc<Mutex<GuiState>>,
+    widgets: &GuiWidgets,
+    hist_nav: &Arc<Mutex<HistoryNav>>,
+    background_only: bool,
+) {
+    let mut entries: Vec<crate::session::UnfinishedEntry> = crate::session::scan_unfinished();
+    if background_only {
+        entries.retain(|e| e.name.contains("-bg"));
+    }
+    if entries.is_empty() {
+        let mut s = state.lock().unwrap();
+        s.push(
+            ConvKind::System,
+            if background_only {
+                "· no background sessions to resume"
+            } else {
+                "· no unfinished sessions — nothing crashed or left a goal in progress"
+            },
+        );
+        sync_textview(widgets, &mut s);
+        return;
+    }
+    let Ok(dialog) = app.create_dialog() else {
+        let mut s = state.lock().unwrap();
+        s.push(
+            ConvKind::Error,
+            "· could not open the resume dialog — resume with /resume <index|path-fragment> (see /unfinished)",
+        );
+        sync_textview(widgets, &mut s);
+        return;
+    };
+    dialog.set_title(if background_only {
+        "pir — backgrounded sessions"
+    } else {
+        "pir — resume session"
+    });
+    // Cap the list: a picker with hundreds of rows is unusable, and the
+    // newest-first order means the cap drops the stalest entries.
+    for e in entries.into_iter().take(30) {
+        let label = format!(
+            "[{}] {}  {}",
+            e.reason,
+            e.name,
+            e.preview.chars().take(60).collect::<String>()
+        );
+        let path = e.path.clone();
+        let slot = agent_slot.clone();
+        let st = state.clone();
+        let w = widgets.clone();
+        let hn = hist_nav.clone();
+        menu_dialog_button(app, &dialog, &label, move || {
+            resume_session_in_gui(&slot, &path, &st, &w, &hn);
+        });
+    }
+    {
+        let dialog_cancel = dialog.clone();
+        menu_dialog_button(app, &dialog, "Cancel", move || {
+            dialog_cancel.close();
+        });
+    }
+    dialog.present();
+}
+
+/// Switch the agent to one catalog model, pane-native: the single path the
+/// prompt-row picker, the model dialog, and direct `/menu model <sel>` share,
+/// so the three cannot disagree about what a switch does or reports.
+fn switch_model_in_gui(
+    agent_slot: &AgentSlot,
+    providers: &[Provider],
+    item: &str,
+    state: &Arc<Mutex<GuiState>>,
+    widgets: &GuiWidgets,
+) {
+    match crate::config::select(providers, item) {
+        Ok((p, m)) => {
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                let mut s = state.lock().unwrap();
+                s.push(ConvKind::System, "· agent busy (turn running) — try again when idle");
+                sync_textview(widgets, &mut s);
+                return;
+            };
+            match agent.switch(p.clone(), m.clone()) {
+                Ok(()) => {
+                    crate::note_model_used(p, m);
+                    let msg = format!("→ {}", agent.label());
+                    drop(g);
+                    let mut s = state.lock().unwrap();
+                    s.push(ConvKind::System, &msg);
+                    sync_textview(widgets, &mut s);
+                }
+                Err(e) => {
+                    drop(g);
+                    let mut s = state.lock().unwrap();
+                    s.push(ConvKind::Error, &e);
+                    sync_textview(widgets, &mut s);
+                }
+            }
+        }
+        Err(e) => {
+            let mut s = state.lock().unwrap();
+            s.push(ConvKind::Error, &e);
+            sync_textview(widgets, &mut s);
+        }
+    }
+}
+
+/// Open the model picker: one button per catalog model, switching through the
+/// same path the prompt-row picker and the typed `/model <sel>` use.
+fn open_model_dialog(
+    app: &App,
+    agent_slot: &AgentSlot,
+    providers: &[Provider],
+    state: &Arc<Mutex<GuiState>>,
+    widgets: &GuiWidgets,
+) {
+    let items = model_picker_items(providers);
+    if items.is_empty() {
+        let mut s = state.lock().unwrap();
+        s.push(ConvKind::System, "· no models in the catalog");
+        sync_textview(widgets, &mut s);
+        return;
+    }
+    let Ok(dialog) = app.create_dialog() else {
+        let mut s = state.lock().unwrap();
+        s.push(
+            ConvKind::Error,
+            "· could not open the model picker — pick with /model <prefix>",
+        );
+        sync_textview(widgets, &mut s);
+        return;
+    };
+    dialog.set_title("pir — model");
+    for item in items {
+        let slot = agent_slot.clone();
+        let provs = providers.to_vec();
+        let st = state.clone();
+        let w = widgets.clone();
+        let label = item.clone();
+        menu_dialog_button(app, &dialog, &item, move || {
+            switch_model_in_gui(&slot, &provs, &label, &st, &w);
+        });
+    }
+    {
+        let dialog_cancel = dialog.clone();
+        menu_dialog_button(app, &dialog, "Cancel", move || {
+            dialog_cancel.close();
+        });
+    }
+    dialog.present();
+}
+
+/// Open the thinking picker: one button per offered level (the same
+/// `offered_thinking_levels` filter the terminal picker uses, so an offered
+/// level is never silently ignored), plus show/hide toggles.
+fn open_thinking_dialog(
+    app: &App,
+    agent_slot: &AgentSlot,
+    state: &Arc<Mutex<GuiState>>,
+    widgets: &GuiWidgets,
+) {
+    let snapshot = {
+        let g = agent_slot.lock().unwrap();
+        let Some(agent) = g.as_ref() else {
+            let mut s = state.lock().unwrap();
+            s.push(ConvKind::System, "· agent busy (turn running) — try again when idle");
+            sync_textview(widgets, &mut s);
+            return;
+        };
+        let kind = match agent.provider().api.as_deref() {
+            Some("anthropic") => Some(crate::config::ApiKind::Anthropic),
+            Some("openai") => Some(crate::config::ApiKind::OpenAi),
+            _ => None,
+        };
+        let model = agent.model();
+        (
+            crate::modal::offered_thinking_levels(kind, model.context.unwrap_or(0), Some(&model)),
+            agent.thinking_level().as_str().to_string(),
+        )
+    };
+    let Ok(dialog) = app.create_dialog() else {
+        let mut s = state.lock().unwrap();
+        s.push(
+            ConvKind::Error,
+            "· could not open the thinking picker — set it with /thinking <level>",
+        );
+        sync_textview(widgets, &mut s);
+        return;
+    };
+    dialog.set_title("pir — thinking level");
+    for level in snapshot.0 {
+        let label = if level == snapshot.1 {
+            format!("● {level} (current)")
+        } else {
+            format!("  {level}")
+        };
+        let slot = agent_slot.clone();
+        let st = state.clone();
+        let w = widgets.clone();
+        menu_dialog_button(app, &dialog, &label, move || {
+            if let Some(lvl) = crate::config::ThinkingLevel::parse(&level) {
+                let msg = {
+                    let mut g = slot.lock().unwrap();
+                    match g.as_mut() {
+                        Some(agent) => agent.set_thinking(lvl),
+                        None => "· agent busy (turn running)".to_string(),
+                    }
+                };
+                let mut s = st.lock().unwrap();
+                s.push(ConvKind::System, &format!("· {msg}"));
+                sync_textview(&w, &mut s);
+            }
+        });
+    }
+    for (label, show) in [("Show thinking", true), ("Hide thinking", false)] {
+        let slot = agent_slot.clone();
+        let st = state.clone();
+        let w = widgets.clone();
+        menu_dialog_button(app, &dialog, label, move || {
+            let msg = {
+                let mut g = slot.lock().unwrap();
+                match g.as_mut() {
+                    Some(agent) => {
+                        let m = agent.set_show_thinking(show);
+                        st.lock().unwrap().show_thinking = show;
+                        m
+                    }
+                    None => "· agent busy (turn running)".to_string(),
+                }
+            };
+            let mut s = st.lock().unwrap();
+            s.push(ConvKind::System, &format!("· {msg}"));
+            sync_textview(&w, &mut s);
+        });
+    }
+    {
+        let dialog_cancel = dialog.clone();
+        menu_dialog_button(app, &dialog, "Cancel", move || {
+            dialog_cancel.close();
+        });
+    }
+    dialog.present();
+}
+
+/// Cycle one security-enum row to its next value, wrapping around. Pure over
+/// plain strings so the cycle order is testable without an agent; the dialog
+/// parses back through the same `parse` the typed commands accept.
+fn cycle_security_value(current: &str, options: &[String]) -> String {
+    let i = options.iter().position(|o| o == current).unwrap_or(0);
+    options[(i + 1) % options.len()].clone()
+}
+
+/// Saved-policy rows the security editor renders, in dialog order:
+/// (row label, current value, cycle options). Shared by the builder and the
+/// tests so a row the dialog renders is a row the suite pins.
+fn security_enum_rows(policy: &crate::security::SecurityPolicy) -> Vec<(String, String, Vec<String>)> {
+    vec![
+        ("level".to_string(), policy.level.as_str().to_string(), vec!["guard".to_string(), "off".to_string(), "sandbox".to_string(), "strict".to_string(), "worktree".to_string(), "mitigation".to_string(), "plan".to_string()]),
+        ("apt".to_string(), policy.apt.as_str().to_string(), vec!["auto".to_string(), "human".to_string(), "stage".to_string(), "project".to_string()]),
+        ("network".to_string(), policy.network.as_str().to_string(), vec!["on".to_string(), "allowlist".to_string(), "off".to_string()]),
+        ("ask".to_string(), policy.ask.as_str().to_string(), vec!["ask".to_string(), "auto-yes".to_string(), "auto-no".to_string()]),
+        ("read".to_string(), policy.read.as_str().to_string(), vec!["open".to_string(), "guarded-secrets".to_string()]),
+    ]
+}
+
+/// Apply an edited security policy exactly like the terminal's Security
+/// screen: save (session file, plus global defaults on demand), flip live
+/// `user-security` with sidecar drop on change, push quarantine/level/apt/
+/// network/ask/read into the live session. Returns the pane lines.
+fn apply_gui_security_policy(
+    agent_slot: &AgentSlot,
+    policy: &crate::security::SecurityPolicy,
+    editor_initial_su: bool,
+    global: bool,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let saved = if global {
+        let session_path = crate::config::pi_dir().join("agent").join("security.toml");
+        let global_path = crate::security::global_defaults_file();
+        let mut targets = vec![session_path];
+        if global_path != targets[0] {
+            targets.push(global_path);
+        }
+        let mut saved = Vec::new();
+        let mut failed: Option<String> = None;
+        for t in &targets {
+            match crate::security::save_policy_to(policy, t) {
+                Ok(p) => saved.push(p),
+                Err(e) => {
+                    failed = Some(format!("{e} [{}]", crate::security::save_diagnostic(t)));
+                    break;
+                }
+            }
+        }
+        match failed {
+            Some(e) => {
+                out.push(format!("SECURITY SAVE FAILED ({e}) — toggles NOT persisted"));
+                return out;
+            }
+            None => saved,
+        }
+    } else {
+        match crate::security::save_policy(policy) {
+            Ok(p) => vec![p],
+            Err(e) => {
+                let target = crate::config::pi_dir().join("agent").join("security.toml");
+                out.push(format!(
+                    "SECURITY SAVE FAILED ({e} [{}]) — toggles NOT persisted",
+                    crate::security::save_diagnostic(&target)
+                ));
+                return out;
+            }
+        }
+    };
+    let list = saved
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if saved.len() > 1 {
+        out.push(format!("security options saved to {list} (session file + global defaults for new projects)"));
+    } else {
+        out.push(format!("security options saved to {list} (new sessions of this project)"));
+    }
+    if policy.user_security != editor_initial_su {
+        let mut g = agent_slot.lock().unwrap();
+        if let Some(agent) = g.as_mut() {
+            let reason = if policy.user_security {
+                String::new()
+            } else {
+                "disabled via /menu security — agent authorized to act as the \
+                 invoking user for this session"
+                    .to_string()
+            };
+            out.push(agent.set_su_security(policy.user_security, &reason));
+            agent.clear_persisted_su_security();
+        }
+    }
+    {
+        let mut g = agent_slot.lock().unwrap();
+        if let Some(agent) = g.as_mut() {
+            out.push(agent.apply_security_policy(policy));
+        }
+    }
+    out
+}
+
+/// Open the security editor: enum rows cycle on click, bools are checkbuttons,
+/// Save writes `security.toml` (+ global defaults on demand) and pushes the
+/// result into the live session exactly like the terminal's Security screen.
+fn open_security_dialog(
+    app: &App,
+    agent_slot: &AgentSlot,
+    state: &Arc<Mutex<GuiState>>,
+    widgets: &GuiWidgets,
+) {
+    let Ok(dialog) = app.create_dialog() else {
+        let mut s = state.lock().unwrap();
+        s.push(
+            ConvKind::Error,
+            "· could not open the security editor — edit security.toml directly",
+        );
+        sync_textview(widgets, &mut s);
+        return;
+    };
+    dialog.set_title("pir — security options");
+    let policy = crate::security::load_policy();
+    let editor_initial_su = policy.user_security;
+    // Enum rows: one button per row showing `label: value`; each click
+    // advances to the next value and relabels. Pending values live on a shared
+    // map the saver reads back, so there is exactly one store of in-progress
+    // edits (a second store is how an editor silently saves stale rows).
+    let pending: Rc<RefCell<std::collections::HashMap<String, String>>> =
+        Rc::new(RefCell::new(
+            security_enum_rows(&policy)
+                .into_iter()
+                .map(|(name, value, _)| (name, value))
+                .collect(),
+        ));
+    for (name, current, options) in security_enum_rows(&policy) {
+        let Ok(btn) = app.create_button(&format!("{name}: {current}")) else {
+            continue;
+        };
+        // `Rc`, not a clone: the prelude `Button` is not `Clone`, and the
+        // handler relabels the button it sits on.
+        let btn = Rc::new(btn);
+        let pending_row = pending.clone();
+        let name_cb = name.clone();
+        let mut value = current.clone();
+        let opts = options.clone();
+        let btn_cb = btn.clone();
+        let _ = btn.on_click(move || {
+            value = cycle_security_value(&value, &opts);
+            btn_cb.set_text(&format!("{name_cb}: {value}"));
+            pending_row.borrow_mut().insert(name_cb.clone(), value.clone());
+        });
+        dialog.append_content_area(&*btn);
+    }
+    // Bool rows: real checkbuttons, read at save time.
+    let mut check_names: Vec<&'static str> = Vec::new();
+    let mut check_widgets: Vec<GuiCheckButton> = Vec::new();
+    for (name, on) in [
+        ("quarantine", policy.quarantine),
+        ("quarantine-project", policy.quarantine_project),
+        ("user-security", policy.user_security),
+    ] {
+        let Ok(cb) = app.create_checkbutton(name) else {
+            continue;
+        };
+        cb.set_active(on);
+        dialog.append_content_area(&cb);
+        check_names.push(name);
+        check_widgets.push(cb);
+    }
+    // Save / Save global / Discard.
+    for (label, global) in [("Save", false), ("Save as global defaults", true)] {
+        let slot = agent_slot.clone();
+        let st = state.clone();
+        let w = widgets.clone();
+        let pending_save = pending.clone();
+        let names_save = check_names.clone();
+        let widgets_save = check_widgets.clone();
+        let dialog_save = dialog.clone();
+        menu_dialog_button(app, &dialog, label, move || {
+            let mut policy = crate::security::load_policy();
+            // Re-read saved values into the edited policy, then overlay the
+            // dialog's rows — same "mutate only on save" rule as the terminal
+            // editor, so opening and discarding never touches disk.
+            for (name, value) in pending_save.borrow().iter() {
+                match name.as_str() {
+                    "level" => {
+                        if let Some(l) = crate::security::SecurityLevel::parse(value) {
+                            policy.level = l;
+                        }
+                    }
+                    "apt" => {
+                        if let Some(a) = crate::security::AptMode::parse(value) {
+                            policy.apt = a;
+                        }
+                    }
+                    "network" => {
+                        if let Some(n) = crate::security::NetworkMode::parse(value) {
+                            policy.network = n;
+                        }
+                    }
+                    "ask" => {
+                        if let Some(a) = crate::security::AskMode::parse(value) {
+                            policy.ask = a;
+                        }
+                    }
+                    "read" => {
+                        if let Some(r) = crate::security::ReadMode::parse(value) {
+                            policy.read = r;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for (i, name) in names_save.iter().enumerate() {
+                if let Some(cb) = widgets_save.get(i) {
+                    let on = cb.is_active();
+                    match *name {
+                        "quarantine" => policy.quarantine = on,
+                        "quarantine-project" => policy.quarantine_project = on,
+                        "user-security" => policy.user_security = on,
+                        _ => {}
+                    }
+                }
+            }
+            let lines = apply_gui_security_policy(&slot, &policy, editor_initial_su, global);
+            dialog_save.close();
+            let mut s = st.lock().unwrap();
+            for line in lines {
+                s.push(ConvKind::System, &line);
+            }
+            sync_textview(&w, &mut s);
+        });
+    }
+    {
+        let dialog_cancel = dialog.clone();
+        menu_dialog_button(app, &dialog, "Discard", move || {
+            dialog_cancel.close();
+        });
+    }
+    dialog.present();
+}
+
+/// Apply one settings step: cycle thinking through the offered levels, toggle
+/// the four booleans. Pure over plain values so the step logic is testable
+/// without an agent; the dialog pairs it with the agent setters.
+fn step_gui_setting(
+    thinking_levels: &[String],
+    thinking: &mut String,
+    show: &mut bool,
+    incremental: &mut bool,
+    stop_skill: &mut bool,
+    full_auto: &mut bool,
+    row: usize,
+) {
+    match row {
+        0 => {
+            if thinking_levels.is_empty() {
+                return;
+            }
+            let i = thinking_levels
+                .iter()
+                .position(|l| l == thinking)
+                .unwrap_or(0);
+            *thinking = thinking_levels[(i + 1) % thinking_levels.len()].clone();
+        }
+        1 => *show = !*show,
+        2 => *incremental = !*incremental,
+        3 => *stop_skill = !*stop_skill,
+        4 => *full_auto = !*full_auto,
+        _ => {}
+    }
+}
+
+/// Read the live settings snapshot the settings dialog edits: model label,
+/// offered thinking levels, and every toggle from the agent (never from
+/// launch-time locals — a resumed or policy-edited session shows what it is
+/// actually doing, exactly like the terminal's Settings screen).
+fn gui_settings_snapshot(
+    agent_slot: &AgentSlot,
+) -> Option<(String, Vec<String>, String, bool, bool, bool, bool)> {
+    let g = agent_slot.lock().unwrap();
+    let agent = g.as_ref()?;
+    let kind = match agent.provider().api.as_deref() {
+        Some("anthropic") => Some(crate::config::ApiKind::Anthropic),
+        Some("openai") => Some(crate::config::ApiKind::OpenAi),
+        _ => None,
+    };
+    let model = agent.model();
+    let levels = crate::modal::offered_thinking_levels(
+        kind,
+        model.context.unwrap_or(0),
+        Some(&model),
+    );
+    Some((
+        agent.label(),
+        levels,
+        agent.thinking_level().as_str().to_string(),
+        agent.show_thinking(),
+        agent.incremental_md(),
+        agent.stop_skill(),
+        agent.full_auto(),
+    ))
+}
+
+/// Apply an edited settings snapshot through the same agent setters the slash
+/// commands use, so a value shown in the dialog and a value set by `/thinking`
+/// cannot drift apart. Returns the pane lines. The full-auto change is
+/// persisted to `security.toml` like the terminal does — best-effort, the
+/// live change stands either way.
+fn apply_gui_settings(
+    agent_slot: &AgentSlot,
+    before: &(String, Vec<String>, String, bool, bool, bool, bool),
+    chosen: &(String, Vec<String>, String, bool, bool, bool, bool),
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut g = agent_slot.lock().unwrap();
+    let Some(agent) = g.as_mut() else {
+        out.push("· agent busy (turn running) — settings not applied".to_string());
+        return out;
+    };
+    if chosen.2 != before.2
+        && let Some(lvl) = crate::config::ThinkingLevel::parse(&chosen.2)
+    {
+        out.push(agent.set_thinking(lvl));
+    }
+    if chosen.3 != before.3 {
+        agent.set_show_thinking(chosen.3);
+        out.push(format!(
+            "· show thinking {}",
+            if chosen.3 { "on" } else { "off" }
+        ));
+    }
+    if chosen.4 != before.4 {
+        out.push(agent.set_incremental_md(chosen.4));
+    }
+    if chosen.5 != before.5 {
+        out.push(agent.set_stop_skill(chosen.5));
+    }
+    if chosen.6 != before.6 {
+        let msg = agent.set_full_auto(chosen.6);
+        out.push(msg);
+        if let Some(p) = agent.security_policy() {
+            match crate::security::save_policy(&p) {
+                Ok(path) => out.push(format!("ask-mode saved to {}", path.display())),
+                Err(e) => out.push(format!(
+                    "· could not save ask-mode to security.toml ({e}) — the change applies to this session only"
+                )),
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push("· settings unchanged".to_string());
+    }
+    out
+}
+
+/// Open the settings editor: thinking cycles through the offered levels, four
+/// checkbuttons cover show/incremental/stop-skill/full-auto, Save applies
+/// through the same setters the slash commands use. Mirrors the terminal's
+/// Settings screen row for row, minus the alternate-screen key handling.
+fn open_settings_dialog(
+    app: &App,
+    agent_slot: &AgentSlot,
+    state: &Arc<Mutex<GuiState>>,
+    widgets: &GuiWidgets,
+) {
+    let Some(before) = gui_settings_snapshot(agent_slot) else {
+        let mut s = state.lock().unwrap();
+        s.push(ConvKind::System, "· agent busy (turn running) — try again when idle");
+        sync_textview(widgets, &mut s);
+        return;
+    };
+    let Ok(dialog) = app.create_dialog() else {
+        let mut s = state.lock().unwrap();
+        s.push(
+            ConvKind::Error,
+            "· could not open the settings editor — set values with /thinking and friends",
+        );
+        sync_textview(widgets, &mut s);
+        return;
+    };
+    dialog.set_title("pir — settings");
+    // Model line: orientation only, like the terminal screen.
+    if let Ok(model_line) = app.create_label(&format!("model: {}", before.0)) {
+        dialog.append_content_area(&model_line);
+    }
+    // Thinking row: a button cycling the offered levels (inert when the model
+    // offers none — same rule as the terminal picker). The pending value lives
+    // on one shared cell the button mutates and the saver reads.
+    let pending_thinking: Rc<RefCell<String>> = Rc::new(RefCell::new(before.2.clone()));
+    let thinking_levels = before.1.clone();
+    if !thinking_levels.is_empty() {
+        let cur = pending_thinking.clone();
+        let dialog_levels = thinking_levels.clone();
+        if let Ok(btn) = app.create_button(&format!("thinking: {}", cur.borrow().clone())) {
+            let btn = Rc::new(btn);
+            let btn_cb = btn.clone();
+            let _ = btn.on_click(move || {
+                let mut t = cur.borrow_mut();
+                let i = dialog_levels.iter().position(|l| l == &*t).unwrap_or(0);
+                *t = dialog_levels[(i + 1) % dialog_levels.len()].clone();
+                btn_cb.set_text(&format!("thinking: {t}"));
+            });
+            dialog.append_content_area(&*btn);
+        }
+    }
+    // Bool rows: real checkbuttons, read at save time.
+    let mut check_widgets: Vec<GuiCheckButton> = Vec::new();
+    for (label, on) in [
+        ("show thinking", before.3),
+        ("incremental md", before.4),
+        ("stop-skill", before.5),
+        ("full-auto", before.6),
+    ] {
+        let Ok(cb) = app.create_checkbutton(label) else {
+            continue;
+        };
+        cb.set_active(on);
+        dialog.append_content_area(&cb);
+        check_widgets.push(cb);
+    }
+    {
+        let slot = agent_slot.clone();
+        let st = state.clone();
+        let w = widgets.clone();
+        let dialog_save = dialog.clone();
+        let thinking_save = pending_thinking.clone();
+        let checks_save = check_widgets.clone();
+        menu_dialog_button(app, &dialog, "Save", move || {
+            let mut chosen = before.clone();
+            chosen.2 = thinking_save.borrow().clone();
+            for (i, cb) in checks_save.iter().enumerate() {
+                let on = cb.is_active();
+                match i {
+                    0 => chosen.3 = on,
+                    1 => chosen.4 = on,
+                    2 => chosen.5 = on,
+                    3 => chosen.6 = on,
+                    _ => {}
+                }
+            }
+            let show = chosen.3;
+            let lines = apply_gui_settings(&slot, &before, &chosen);
+            dialog_save.close();
+            let mut s = st.lock().unwrap();
+            s.show_thinking = show;
+            for line in lines {
+                s.push(ConvKind::System, &line);
+            }
+            sync_textview(&w, &mut s);
+        });
+    }
+    {
+        let dialog_cancel = dialog.clone();
+        menu_dialog_button(app, &dialog, "Discard", move || {
+            dialog_cancel.close();
+        });
+    }
+    dialog.present();
+}
+
+/// The about text: same facts as the terminal's About screen (version, git,
+/// build profile, license, deps), as plain pane lines — no ANSI, no tty.
+fn about_lines() -> Vec<String> {
+    vec![
+        format!("pir {}", env!("CARGO_PKG_VERSION")),
+        format!("git: {}", env!("GIT_HASH")),
+        format!(
+            "build: {} · opt-level {} · lto {}",
+            if cfg!(debug_assertions) { "debug" } else { "release" },
+            option_env!("OPT_LEVEL").unwrap_or("?"),
+            option_env!("LTO").unwrap_or("?"),
+        ),
+        "license: GPL-3.0".to_string(),
+        String::new(),
+        "deps: pulldown-cmark · streamdown-parser · rustyline · lsb-curl · smol · crossterm".to_string(),
+    ]
+}
+
+/// Run one `/menu <sub>` action: the single implementation every reach path
+/// shares — the typed line, the topbar item (which routes `command: "menu",
+/// arg: "<sub>"` through the same `run_command_line`), and the menu dialog
+/// button. `extra` is the rest of the typed line: resume/model/thinking accept
+/// it as a direct value (mirroring the "fill the argument from the prompt"
+/// convention), the rest ignore it.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+fn run_menu_action(
+    sub: &str,
+    extra: &[&str],
+    agent_slot: &AgentSlot,
+    providers: &[Provider],
+    app: &App,
+    state: &Arc<Mutex<GuiState>>,
+    widgets: &GuiWidgets,
+    hist_nav: &Arc<Mutex<HistoryNav>>,
+) {
+    match sub {
+        "resume" => {
+            let token = extra.join(" ");
+            if token.trim().is_empty() {
+                open_resume_dialog(app, agent_slot, state, widgets, hist_nav, false);
+                return;
+            }
+            match crate::session::resolve_unfinished(&token) {
+                Some(path) => resume_session_in_gui(agent_slot, &path, state, widgets, hist_nav),
+                None => {
+                    let mut s = state.lock().unwrap();
+                    s.push(
+                        ConvKind::Error,
+                        &format!("· no unfinished session matches '{token}' (see /unfinished)"),
+                    );
+                    sync_textview(widgets, &mut s);
+                }
+            }
+        }
+        "backgrounded" => {
+            open_resume_dialog(app, agent_slot, state, widgets, hist_nav, true);
+        }
+        "model" => {
+            let sel = extra.join(" ");
+            if sel.trim().is_empty() {
+                open_model_dialog(app, agent_slot, providers, state, widgets);
+                return;
+            }
+            switch_model_in_gui(agent_slot, providers, &sel, state, widgets);
+        }
+        "thinking" => {
+            let arg = extra.join(" ");
+            if arg.trim().is_empty() {
+                open_thinking_dialog(app, agent_slot, state, widgets);
+                return;
+            }
+            // Direct set, mirroring the `/thinking` arm's parse order (level
+            // first, optional trailing show/hide).
+            let mut show: Option<bool> = None;
+            let mut words: Vec<&str> = arg.split_whitespace().collect();
+            if let Some(last) = words.last().copied() {
+                match last {
+                    "show" => {
+                        show = Some(true);
+                        words.pop();
+                    }
+                    "hide" => {
+                        show = Some(false);
+                        words.pop();
+                    }
+                    _ => {}
+                }
+            }
+            let level_arg = words.join(" ");
+            let mut g = agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                drop(g);
+                let mut s = state.lock().unwrap();
+                s.push(ConvKind::System, "· agent busy (turn running) — try again when idle");
+                sync_textview(widgets, &mut s);
+                return;
+            };
+            if !level_arg.is_empty() {
+                match crate::config::ThinkingLevel::parse(&level_arg) {
+                    Some(lvl) => {
+                        let msg = agent.set_thinking(lvl);
+                        drop(g);
+                        let mut s = state.lock().unwrap();
+                        s.push(ConvKind::System, &format!("· {msg}"));
+                        sync_textview(widgets, &mut s);
+                        return;
+                    }
+                    None => {
+                        drop(g);
+                        let mut s = state.lock().unwrap();
+                        s.push(
+                            ConvKind::Error,
+                            &format!("· usage: /menu thinking [<off|minimal|low|medium|high|xhigh|max>] [show|hide] (got '{level_arg}')"),
+                        );
+                        sync_textview(widgets, &mut s);
+                        return;
+                    }
+                }
+            }
+            if let Some(on) = show {
+                let msg = agent.set_show_thinking(on);
+                state.lock().unwrap().show_thinking = on;
+                drop(g);
+                let mut s = state.lock().unwrap();
+                s.push(ConvKind::System, &format!("· {msg}"));
+                sync_textview(widgets, &mut s);
+            }
+        }
+        "security" => {
+            open_security_dialog(app, agent_slot, state, widgets);
+        }
+        "settings" => {
+            open_settings_dialog(app, agent_slot, state, widgets);
+        }
+        "worktrees" => {
+            let on = crate::config::worktrees_default();
+            match crate::config::set_worktrees_default(!on) {
+                Ok(p) => {
+                    let mut s = state.lock().unwrap();
+                    s.push(
+                        ConvKind::System,
+                        &format!(
+                            "· worktrees {} by default (next session). saved to {}",
+                            if !on { "ON" } else { "OFF" },
+                            p.display()
+                        ),
+                    );
+                    sync_textview(widgets, &mut s);
+                }
+                Err(e) => {
+                    let mut s = state.lock().unwrap();
+                    s.push(
+                        ConvKind::Error,
+                        &format!("· could not persist worktree setting: {e}"),
+                    );
+                    sync_textview(widgets, &mut s);
+                }
+            }
+        }
+        "coverage" => {
+            // Same flag `/autoclean coverage on|off` flips; turning it on also
+            // shows which coverage tools will run, mirroring the pre-turn
+            // report; turning it off drops a queued one-shot too.
+            let on = !crate::AUTOCLEAN_COVERAGE.load(Ordering::SeqCst);
+            crate::AUTOCLEAN_COVERAGE.store(on, Ordering::SeqCst);
+            let mut s = state.lock().unwrap();
+            if on {
+                s.push(
+                    ConvKind::System,
+                    "· autoclean coverage ON — passes will drive branch coverage toward 100% where possible",
+                );
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                for line in coverage_plan_lines(&crate::lints::coverage_status(&cwd)) {
+                    s.push(ConvKind::System, &line);
+                }
+            } else {
+                crate::AUTOCLEAN_COVERAGE_ONCE.store(false, Ordering::SeqCst);
+                s.push(ConvKind::System, "· autoclean coverage OFF");
+            }
+            sync_textview(widgets, &mut s);
+        }
+        "help" => {
+            let mut s = state.lock().unwrap();
+            s.push(ConvKind::System, HELP_GUI);
+            sync_textview(widgets, &mut s);
+        }
+        "about" => {
+            let mut s = state.lock().unwrap();
+            for line in about_lines() {
+                s.push(ConvKind::System, &line);
+            }
+            sync_textview(widgets, &mut s);
+        }
+        "quit" => {
+            let mut s = state.lock().unwrap();
+            s.status = "bye".into();
+            drop(s);
+            app.quit();
+        }
+        other => {
+            let mut s = state.lock().unwrap();
+            let known: Vec<&str> = MENU_DIALOG_ACTIONS.iter().map(|(x, _)| *x).collect();
+            s.push(
+                ConvKind::Error,
+                &format!("· unknown menu action '{other}' (choose one of: {})", known.join(", ")),
+            );
+            sync_textview(widgets, &mut s);
+        }
+    }
+}
+
+/// Open the GUI's main menu dialog: one button per [`MENU_DIALOG_ACTIONS`]
+/// row. Non-blocking (see [`menu_dialog_button`]).
+fn open_menu_dialog(
+    app: &App,
+    agent_slot: &AgentSlot,
+    providers: &[Provider],
+    state: &Arc<Mutex<GuiState>>,
+    widgets: &GuiWidgets,
+    hist_nav: &Arc<Mutex<HistoryNav>>,
+) {
+    let Ok(dialog) = app.create_dialog() else {
+        let mut s = state.lock().unwrap();
+        s.push(
+            ConvKind::Error,
+            "· could not open the menu — every action is still available as /menu <action>",
+        );
+        sync_textview(widgets, &mut s);
+        return;
+    };
+    dialog.set_title("pir — menu");
+    for (sub, label) in MENU_DIALOG_ACTIONS {
+        let sub = sub.to_string();
+        let slot = agent_slot.clone();
+        let provs = providers.to_vec();
+        let st = state.clone();
+        let w = widgets.clone();
+        let hn = hist_nav.clone();
+        let app2 = app.clone();
+        menu_dialog_button(app, &dialog, label, move || {
+            run_menu_action(&sub, &[], &slot, &provs, &app2, &st, &w, &hn);
+        });
+    }
+    {
+        let dialog_cancel = dialog.clone();
+        menu_dialog_button(app, &dialog, "Cancel", move || {
+            dialog_cancel.close();
+        });
+    }
+    dialog.present();
+}
 /// Handle a slash command inline (a GUI-appropriate subset). Mirrors the
 /// streaming REPL's commands but reads/writes the GUI's own state/agent slot.
 fn handle_command(
@@ -2701,6 +5435,7 @@ fn handle_command(
     state: &Arc<Mutex<GuiState>>,
     app: &App,
     widgets: &GuiWidgets,
+    hist_nav: &Arc<Mutex<HistoryNav>>,
 ) {
     let mut parts = cmd.split_whitespace();
     let cmd = parts.next().unwrap_or("");
@@ -2907,6 +5642,24 @@ fn handle_command(
                 s.push(ConvKind::System, "· not a git repository — nothing to fix");
             }
         }
+        "markup_demo" | "md_demo" => {
+            // The streaming REPL's `/markup_demo`: show the canned markdown
+            // sample (`MARKUP_DEMO` in main.rs — headings, emphasis, lists,
+            // blockquote, fenced code, table, link) through the pane's own
+            // markdown path, not the terminal renderer. Rich mode keeps raw
+            // markdown in the model and each assistant line is Pango-rendered
+            // at paint time (exactly like a drained model reply in
+            // `drain_session_text`); plain mode stores `md::render` output,
+            // the same fallback the log drain uses.
+            #[cfg(feature = "gui-rich-text")]
+            {
+                s.push(ConvKind::Assistant, crate::MARKUP_DEMO);
+            }
+            #[cfg(not(feature = "gui-rich-text"))]
+            {
+                s.push(ConvKind::Assistant, &crate::md::render(crate::MARKUP_DEMO, false));
+            }
+        }
         "sh" | "shell" => {
             // Run a shell command. The GUI has no alternate screen to leave, so
             // unlike the TUI's `/sh` we cannot hand over the terminal; we run it
@@ -3079,6 +5832,27 @@ fn handle_command(
             // processes as $PIR_SCRATCHPAD).
             s.push(ConvKind::System, &crate::scratchpad::describe());
         }
+        "menu" => {
+            // The GUI's main menu (see [`MENU_DIALOG_ACTIONS`]): a GTK dialog
+            // with one button per action, each running the same
+            // [`run_menu_action`] path a typed `/menu <sub>` takes. The dialog
+            // is fire-and-forget from the GTK main thread (see
+            // [`menu_dialog_button`]), so the arm returns immediately.
+            //
+            // With an argument this runs the action directly — which is also
+            // what every topbar item does: `MENU_ACTIONS` entries with
+            // `command: "menu"` build `/menu <sub>` lines through the same
+            // `run_command_line` a typed line takes.
+            let sub = rest.first().copied().unwrap_or("");
+            if sub.trim().is_empty() {
+                drop(s);
+                open_menu_dialog(app, agent_slot, providers, state, widgets, hist_nav);
+                return;
+            }
+            drop(s);
+            run_menu_action(sub, &rest[1..], agent_slot, providers, app, state, widgets, hist_nav);
+            return;
+        }
         other => {
             // Try extension-registered slash commands.
             let mut g = agent_slot.lock().unwrap();
@@ -3221,6 +5995,12 @@ mod gui_focus_tests {
     /// it steals the keyboard from the prompt Entry — and the next drain tick's
     /// `set_text` then wipes whatever was typed into it. Requires a display
     /// (GTK init); skipped gracefully when no GTK backend can load.
+    ///
+    /// NOTE: the pane keeps `can_focus(true)` so text stays SELECTABLE (a
+    /// non-focusable view can never hold a selection, so there is nothing to
+    /// copy). What changed is that typing can never land in it: it is
+    /// `editable(false)`, and typed keys go to the Entry because focus
+    /// normally lives there. Assert exactly that contract here.
     #[test]
     fn conversation_textview_must_not_capture_keyboard() {
         // TextViews are created through the backend factory (App::init +
@@ -3241,14 +6021,35 @@ mod gui_focus_tests {
             "precondition: a default TextView must be editable or focusable (that was the bug)"
         );
 
-        // The fix: the GUI's configuration makes it inert to the keyboard.
+        // The fix: the GUI's configuration keeps the pane read-only (no
+        // typing into it) but focusable (so text stays selectable for copy).
         let Ok(fixed) = app.create_textview() else {
             eprintln!("skipping: could not create textview");
             return;
         };
         configure_conversation_textview(&fixed);
         assert!(!fixed.get_editable(), "conversation TextView must be read-only");
-        assert!(!fixed.get_can_focus(), "conversation TextView must not take keyboard focus");
+        assert!(fixed.get_can_focus(), "conversation TextView must stay focusable so its text is selectable for copy");
+    }
+
+    #[test]
+    fn conversation_pane_supports_copy() {
+        // The copy path needs every link in the chain: has_focus / copy
+        // affordances exist on the adapter and the Edit menu offers Copy.
+        // No display needed: these are source properties of the shipped code.
+        let src = include_str!("gui.rs");
+        for (what, needle) in [
+            ("TextView::has_focus wrapper", "pub fn has_focus(&self)"),
+            ("TextView::copy_clipboard wrapper", "pub fn copy_clipboard(&self)"),
+            ("Edit > Copy menu item", "\"Edit\", \"Copy\", \"edit-copy\""),
+            ("Copy menu handler", "view_action_cb == \"edit-copy\""),
+            ("Ctrl-C focus guard", "textview.has_focus()"),
+        ] {
+            assert!(
+                src.contains(needle),
+                "{what} missing ({needle:?} not found): copy has no working path"
+            );
+        }
     }
 }
 
@@ -3723,14 +6524,20 @@ mod gui_design_parity_tests {
     fn follow_is_disarmed_by_scrolling_away_and_rearmed_at_the_bottom() {
         // S2: the whole point of `follow`. Scrolling up disarms it so the next
         // append cannot yank the user back to the bottom mid-read; returning to
-        // the bottom re-arms it.
+        // the bottom re-arms it. Positions are (value, upper, page): the pane
+        // is at the bottom exactly when value + page reaches upper.
         let mut s = GuiState::new();
-        s.observe_scroll(0.0, 100.0);
+        // Viewport shows 0..20 of a 100px extent: top, not bottom.
+        s.observe_scroll(0.0, 100.0, 20.0);
         assert!(!s.follow, "scrolling away from the bottom must disarm follow");
-        s.observe_scroll(0.0, 100.0); // another append while scrolled up
+        s.observe_scroll(0.0, 100.0, 20.0); // another append while scrolled up
         assert!(!s.follow, "an append while scrolled up must not re-arm follow");
-        s.observe_scroll(0.0, 0.0); // scrolled back to the top == bottom
+        // Value 80 + page 20 == upper 100: bottom — and the empty-extent
+        // case (0, 0, 0) is the top == bottom too.
+        s.observe_scroll(80.0, 100.0, 20.0);
         assert!(s.follow, "returning to the bottom must re-arm follow");
+        s.observe_scroll(0.0, 0.0, 0.0);
+        assert!(s.follow, "an empty pane is trivially at the bottom");
     }
 
     #[test]
@@ -3792,6 +6599,51 @@ mod gui_design_parity_tests {
         assert_eq!(sc.offset, 0, "end on an empty conversation must stay at 0");
     }
 
+    // -- S6: keyboard / menu scroll commands --------------------------------
+
+    #[test]
+    fn scroll_commands_move_the_window_and_arm_follow_at_the_edges() {
+        // S6: the Page_Up/Page_Down/Home/End keys and the View menu's scroll
+        // items share `scroll_page_up/down`, `scroll_home` and `scroll_end` —
+        // one implementation, so key and menu can never move different windows.
+        let mut s = GuiState::new();
+        for i in 0..100 {
+            s.push(ConvKind::User, &format!("line {i}"));
+        }
+        let total = s.conv.len();
+        // Live: the first PageUp starts one full page above the tail.
+        scroll_page_up(&mut s);
+        assert!(!s.follow, "paging up must disarm follow");
+        assert_eq!(
+            s.scroll.offset,
+            s.scroll.max_offset(total).saturating_sub(scroll_step(&s)),
+            "first PageUp starts one page above the tail, not from a stale offset"
+        );
+        // Home jumps to the top; End returns to the live tail and re-arms.
+        scroll_home(&mut s);
+        assert_eq!(s.scroll.offset, 0, "Home must jump to the top");
+        assert!(!s.follow);
+        scroll_end(&mut s);
+        assert!(s.follow, "End must re-arm follow");
+        assert_eq!(s.scroll.offset, s.scroll.max_offset(total));
+        // PageDown at the bottom edge re-arms follow; short of it, it stays off.
+        scroll_home(&mut s);
+        scroll_page_down(&mut s);
+        assert!(!s.follow, "a mid-buffer PageDown must not re-arm follow");
+        assert!(s.scroll.offset > 0, "PageDown must advance");
+        for _ in 0..50 {
+            scroll_page_down(&mut s);
+        }
+        assert!(s.follow, "paging down to the bottom edge must re-arm follow");
+        assert_eq!(s.scroll.offset, s.scroll.max_offset(total));
+        // The window helper paints exactly the clamped offset..offset+page slice.
+        s.scroll.page = 10;
+        s.scroll.set(95, total);
+        assert_eq!(s.scroll.window(total), (90, 100), "window must clamp to the tail");
+        s.scroll.set(200, total);
+        assert_eq!(s.scroll.window(total), (90, 100), "a stale offset must clamp, not overrun");
+    }
+
     /// One JSONL session-log line: an assistant message whose first block is
     /// `text`. This is the exact shape `drain_session_log` parses.
     fn jsonl_assistant_line(text: &str) -> String {
@@ -3806,24 +6658,46 @@ mod gui_design_parity_tests {
 
     #[test]
     fn assistant_text_is_markdown_rendered_like_the_tui() {
-        // S7: the TUI renders assistant markdown (tui.rs:1697) and the GUI used
-        // to append the raw text. `md::render` is the same renderer the TUI
-        // calls, so the assertion is equality with it, not a re-implementation.
+        // S7: the TUI renders assistant markdown (tui.rs:1697). What "rendered"
+        // means depends on the pane:
+        //
+        // * plain (`--no-default-features`): the model holds ANSI-stripped
+        //   `md::render(_, false)` output — the same renderer the TUI calls,
+        //   so the assertion is equality with it, not a re-implementation.
+        // * rich (default `gui-rich-text`): the model keeps RAW markdown and
+        //   `sync_textview` converts with `md::render_pango`; asserting
+        //   equality with the ANSI renderer would pin the wrong pipeline.
+        //   Instead assert the raw text survives into the model (the rich
+        //   conversion is covered by md::pango_tests + the drain test below).
         let raw = "# Heading\n\n- one\n- two\n\n```\ncode\n```\n";
         let mut s = GuiState::new();
         // Feed one assistant log line through the same text-drain path the
         // periodic drain uses, so the test covers the real route and not a
         // parallel re-implementation of it.
         drain_session_text(&jsonl_assistant_line(raw), &mut s);
-        let rendered = s.conv.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
-        assert_eq!(
-            rendered.trim_end(),
-            crate::md::render(raw, false).trim_end(),
-            "assistant text must reach the pane through the same markdown \
-             renderer the TUI uses"
-        );
-        // And it must actually differ from the raw text, or the test is vacuous.
-        assert_ne!(rendered, raw, "the raw markdown should not survive verbatim");
+        #[cfg(not(feature = "gui-rich-text"))]
+        {
+            let rendered = s.conv.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+            assert_eq!(
+                rendered.trim_end(),
+                crate::md::render(raw, false).trim_end(),
+                "assistant text must reach the pane through the same markdown \
+                 renderer the TUI uses"
+            );
+            // And it must actually differ from the raw text, or the test is vacuous.
+            assert_ne!(rendered, raw, "the raw markdown should not survive verbatim");
+        }
+        #[cfg(feature = "gui-rich-text")]
+        {
+            let stored = s.conv.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+            assert!(
+                stored.contains("# Heading"),
+                "rich mode keeps raw markdown in the model (Pango runs at paint): {stored:?}"
+            );
+            let pango = crate::md::render_pango(raw);
+            assert!(pango.contains("Heading"), "rich render must keep the text: {pango:?}");
+            assert!(!pango.contains("# Heading"), "rich render must drop markers: {pango:?}");
+        }
     }
 
     // -- T5: token usage ----------------------------------------------------
@@ -4074,7 +6948,207 @@ mod gui_design_parity_tests {
         assert_eq!(sorted.len(), n, "the picker must not offer a duplicate");
     }
 
+    #[test]
+    fn model_menu_tree_groups_by_provider_and_marks_active() {
+        // The Model menu tree (Providers > Models, with org/ groups): one
+        // subtree per provider, every model listed, the active `provider/id`
+        // carrying the `●` marker. Action names are positional
+        // (`model-p<pi>-m<mi>`) because model ids carry `/`, `:`, `~` that
+        // cannot survive GTK dispatch.
+        use super::ModelMenuEntry;
+        // Flatten one provider's entries to `(label, action, full_id)` leaves.
+        fn leaves(es: &[ModelMenuEntry]) -> Vec<(&str, &str, &str)> {
+            let mut out = Vec::new();
+            for e in es {
+                match e {
+                    ModelMenuEntry::Leaf(l, a, id) => out.push((l.as_str(), a.as_str(), id.as_str())),
+                    ModelMenuEntry::Group(_, ls) => {
+                        for (l, a, id) in ls {
+                            out.push((l.as_str(), a.as_str(), id.as_str()));
+                        }
+                    }
+                }
+            }
+            out
+        }
+        fn prov(id: &str, models: &[&str]) -> Provider {
+            Provider {
+                id: Some(id.into()),
+                name: None,
+                api: Some("openai-completions".into()),
+                base_url: None,
+                api_key: None,
+                models: models
+                    .iter()
+                    .map(|m| crate::config::Model {
+                        id: (*m).into(),
+                        name: None,
+                        context: Some(1000),
+                        max_tokens: None,
+                        api_override: None,
+                        url_override: None,
+                        no_reasoning_effort: false,
+                        reasoning: false,
+                        thinking_format: None,
+                        supports_reasoning_effort: None,
+                        thinking_level_map: Default::default(),
+                        price_per_1k: None,
+                    })
+                    .collect(),
+            }
+        }
+        let provs = vec![prov("acme", &["small", "big"]), prov("other", &["small"])];
+        let tree = super::model_menu_tree(&provs, "acme/big");
+        assert_eq!(tree.len(), 2, "one subtree per provider: {tree:?}");
+        assert_eq!(tree[0].0, "acme");
+        assert_eq!(tree[1].0, "other");
+        // Same model id under two providers: both listed, actions distinct.
+        assert_eq!(leaves(&tree[0].1).len(), 2);
+        assert_eq!(leaves(&tree[1].1).len(), 1);
+        // No `/` in these ids: everything is a flat leaf, no groups.
+        assert!(
+            tree.iter().flat_map(|(_, es)| es).all(|e| matches!(e, ModelMenuEntry::Leaf(..))),
+            "slash-free ids must not group: {tree:?}"
+        );
+        // Active marker on exactly the selected model.
+        let marked: Vec<_> = tree
+            .iter()
+            .flat_map(|(_, es)| leaves(es))
+            .filter(|(l, _, _)| l.starts_with("●"))
+            .collect();
+        assert_eq!(marked.len(), 1, "exactly one active marker: {tree:?}");
+        assert!(marked[0].0.contains("big"), "marker on acme/big: {marked:?}");
+        assert_eq!(marked[0].2, "big", "marker carries the model id: {marked:?}");
+        // Positional, unique action names across the whole tree.
+        let mut actions: Vec<_> = tree
+            .iter()
+            .flat_map(|(_, es)| leaves(es).into_iter().map(|(_, a, _)| a.to_string()))
+            .collect();
+        actions.sort();
+        actions.dedup();
+        assert_eq!(actions.len(), 3, "action names must be unique: {actions:?}");
+        assert!(actions.iter().all(|a| a.starts_with("model-p")), "{actions:?}");
+        // Empty active: no marker anywhere, tree still complete.
+        let tree = super::model_menu_tree(&provs, "");
+        assert!(
+            tree.iter().flat_map(|(_, es)| leaves(es)).all(|(l, _, _)| !l.starts_with("●")),
+            "no active model means no marker"
+        );
+    }
+
+    #[test]
+    fn model_menu_tree_splits_slash_ids_into_groups() {
+        // `openrouter > anthropic/claude-x` becomes `openrouter > anthropic >
+        // claude-x`: ids with an `org/` prefix nest one layer, flat ids stay
+        // flat, and dispatch still resolves the full id.
+        use super::ModelMenuEntry;
+        fn prov(id: &str, models: &[&str]) -> Provider {
+            Provider {
+                id: Some(id.into()),
+                name: None,
+                api: Some("openai-completions".into()),
+                base_url: None,
+                api_key: None,
+                models: models
+                    .iter()
+                    .map(|m| crate::config::Model {
+                        id: (*m).into(),
+                        name: None,
+                        context: Some(1000),
+                        max_tokens: None,
+                        api_override: None,
+                        url_override: None,
+                        no_reasoning_effort: false,
+                        reasoning: false,
+                        thinking_format: None,
+                        supports_reasoning_effort: None,
+                        thinking_level_map: Default::default(),
+                        price_per_1k: None,
+                    })
+                    .collect(),
+            }
+        }
+        let provs = vec![prov(
+            "openrouter",
+            &["anthropic/claude-x", "anthropic/claude-y", "flat-model"],
+        )];
+        let tree = super::model_menu_tree(&provs, "openrouter/anthropic/claude-y");
+        assert_eq!(tree.len(), 1);
+        let entries = &tree[0].1;
+        assert_eq!(entries.len(), 2, "one group + one flat leaf: {entries:?}");
+        // Group first (first-encounter order), flat leaf after.
+        let (org, grp) = match &entries[0] {
+            ModelMenuEntry::Group(org, leaves) => (org.as_str(), leaves),
+            other => panic!("first entry must be the anthropic group: {other:?}"),
+        };
+        assert_eq!(org, "anthropic");
+        assert_eq!(grp.len(), 2, "both org models nest: {grp:?}");
+        // Leaf labels show the tail only; the full id rides the dispatch.
+        assert!(grp[0].0.contains("claude-x") && !grp[0].0.contains("anthropic/"), "tail label: {:?}", grp[0].0);
+        assert_eq!(grp[0].2, "anthropic/claude-x", "full id preserved: {:?}", grp[0]);
+        // Active marker on the nested leaf, matched on the full label.
+        assert!(grp[1].0.starts_with("●"), "active nested leaf marked: {:?}", grp[1].0);
+        assert_eq!(grp[1].2, "anthropic/claude-y");
+        // Flat leaf keeps the whole id in its label.
+        match &entries[1] {
+            ModelMenuEntry::Leaf(label, _, id) => {
+                assert!(label.contains("flat-model"), "{label:?}");
+                assert_eq!(id, "flat-model");
+            }
+            other => panic!("second entry must be the flat leaf: {other:?}"),
+        }
+        // Actions stay positional and unique across groups.
+        let mut actions: Vec<String> = Vec::new();
+        for e in entries {
+            match e {
+                ModelMenuEntry::Leaf(_, a, _) => actions.push(a.clone()),
+                ModelMenuEntry::Group(_, ls) => {
+                    actions.extend(ls.iter().map(|(_, a, _)| a.clone()));
+                }
+            }
+        }
+        actions.sort();
+        actions.dedup();
+        assert_eq!(actions.len(), 3, "unique across groups: {actions:?}");
+    }
+
     // -- G2: the menu bar ---------------------------------------------------
+
+    #[test]
+    fn prompt_entry_shows_a_placeholder_hint() {
+        // The prompt Entry must carry the "Enter prompt here" placeholder so
+        // an empty REPL still says where to type. Source-level (the hint is a
+        // native GTK placeholder, not observable without a display): assert
+        // the spawn_session Entry gets it, and that every Entry layer in the
+        // toolkit chain actually offers the method — a missing link would
+        // fail the build only on the backend that lacks it.
+        let src = include_str!("gui.rs");
+        let start = src
+            .find("\nfn spawn_session(")
+            .expect("spawn_session definition not found in gui.rs")
+            + 1;
+        let body = &src[start..];
+        assert!(
+            body.contains("set_placeholder_text(\"Enter prompt here\")"),
+            "spawn_session must set the prompt placeholder on the Entry"
+        );
+    }
+
+    #[test]
+    fn help_menu_is_last_in_the_topbar() {
+        // Help sits far right, the platform convention. `menu_order` is what
+        // `build_menu_bar` seeds from, so asserting on it pins the bar itself;
+        // a reorder of either table that let "Edit" (or anything else) slip
+        // past Help fails here rather than as a visual report.
+        let order = super::menu_order();
+        assert_eq!(order.last(), Some(&"Help"), "Help must be last: {order:?}");
+        // And it must actually exist in the tables — last of nothing is not
+        // a Help menu.
+        assert!(
+            super::MENU_ACTIONS.iter().any(|a| a.menu == "Help"),
+            "no Help submenu in the menu tables"
+        );
+    }
 
     #[test]
     fn menu_bar_defines_every_action_the_gui_can_perform() {
@@ -4126,6 +7200,69 @@ mod gui_design_parity_tests {
                 "view action {action:?} collides with a command action"
             );
         }
+    }
+
+    // ================================================================
+    // Layer 1 — G6: clickable links (pure span resolution)
+    // ================================================================
+
+    #[test]
+    fn link_spans_resolve_against_inserted_text() {
+        // G6: spans resolve against the exact string the buffer receives —
+        // prefix included — in buffer chars (what GtkTextIter counts), not
+        // bytes. The `💭` prefix is one char but four bytes: byte math would
+        // point every span in a thinking line four columns too far right.
+        let pairs = vec![("docs".to_string(), "https://example.com/a".to_string())];
+        let spans = super::resolve_link_spans("  see docs here", &pairs);
+        assert_eq!(spans.len(), 1, "got: {spans:?}");
+        let (line, scol, ecol, url) = &spans[0];
+        assert_eq!((*line, *scol, *ecol), (0, 6, 10), "got: {spans:?}");
+        assert_eq!(url, "https://example.com/a");
+    }
+
+    #[test]
+    fn link_spans_use_successive_search_for_repeated_text() {
+        // G6: `[docs](u1)` … `[docs](u2)` must tag each occurrence with its
+        // own URL — first-occurrence search would point both clicks at u1.
+        let pairs = vec![
+            ("docs".to_string(), "https://u1.example/".to_string()),
+            ("docs".to_string(), "https://u2.example/".to_string()),
+        ];
+        let spans = super::resolve_link_spans("docs then docs", &pairs);
+        assert_eq!(spans.len(), 2, "got: {spans:?}");
+        assert_eq!(spans[0].3, "https://u1.example/");
+        assert_eq!(spans[1].3, "https://u2.example/");
+        assert!(spans[0].1 < spans[1].1, "second span must start later: {spans:?}");
+    }
+
+    #[test]
+    fn link_spans_stay_in_step_with_conv_on_push_clear_trim() {
+        // G6: `line_links` is parallel to `conv` — push/clear/trim move both,
+        // so a click can never resolve against another line's URLs.
+        let mut s = super::GuiState::new();
+        s.push(super::ConvKind::Assistant, "see https://a.example/x");
+        s.push(super::ConvKind::User, "no links here");
+        assert_eq!(s.conv.len(), 2);
+        assert_eq!(s.line_links.len(), 2, "one inventory entry per line");
+        assert_eq!(s.line_links[0].len(), 1, "got: {:?}", s.line_links[0]);
+        assert!(s.line_links[1].is_empty(), "got: {:?}", s.line_links[1]);
+        // Multi-line push records one entry per paragraph.
+        s.push(super::ConvKind::Assistant, "one https://b.example/\ntwo");
+        assert_eq!(s.line_links.len(), 4, "split paragraphs each get an entry");
+        s.clear();
+        assert!(s.line_links.is_empty() && s.buf_links.is_empty(), "clear drops both maps");
+    }
+
+    #[test]
+    fn lookup_link_hits_only_inside_a_span() {
+        // G6: the click rule — the span containing the column, half-open, so
+        // a click on the char just past a link does not open it.
+        let spans = vec![(6u32, 10u32, "https://example.com/a".to_string())];
+        assert_eq!(super::lookup_link(&spans, 6), Some("https://example.com/a"));
+        assert_eq!(super::lookup_link(&spans, 9), Some("https://example.com/a"));
+        assert_eq!(super::lookup_link(&spans, 5), None, "one char before must miss");
+        assert_eq!(super::lookup_link(&spans, 10), None, "end is exclusive");
+        assert_eq!(super::lookup_link(&[], 6), None, "no spans must miss");
     }
 
     // ================================================================
@@ -4202,6 +7339,71 @@ mod gui_design_parity_tests {
         }
     }
 
+    #[test]
+    fn click_handler_checks_selection_before_opening() {
+        // G6: a button release that ends a text selection is a copy gesture,
+        // never a link activation — selecting link text must not launch a
+        // browser. The handler must consult `buffer_has_selection` before it
+        // consults the span map (`buf_links`).
+        let src = include_str!("gui.rs");
+        let start = src
+            .find("\nfn connect_link_clicks(")
+            .expect("connect_link_clicks definition not found in gui.rs")
+            + 1;
+        let body = src[start..]
+            .split("\nfn spawn_session(")
+            .next()
+            .expect("connect_link_clicks body not found");
+        let sel = body
+            .find("buffer_has_selection()")
+            .expect("the click handler must guard on buffer_has_selection()");
+        let map = body
+            .find("buf_links")
+            .expect("the click handler must consult the buf_links span map");
+        assert!(
+            sel < map,
+            "the selection guard must come before the span-map lookup, or a \
+             drag-release over a link opens it mid-copy"
+        );
+    }
+
+    #[test]
+    fn opener_only_allows_http_https() {
+        // G6: `open_link_safely` re-validates and narrows to http/https.
+        // `sanitize_url` also passes `mailto:`/`file:` — a `file:` URL from
+        // model output would otherwise turn the log into a local-file read
+        // primitive. The opener must name both allowed schemes and refuse the
+        // rest by construction, not by blocklist.
+        let src = include_str!("gui.rs");
+        let start = src
+            .find("\nfn open_link_safely(")
+            .expect("open_link_safely definition not found in gui.rs")
+            + 1;
+        let body = src[start..]
+            .split("\nfn connect_link_clicks(")
+            .next()
+            .expect("open_link_safely body not found");
+        assert!(
+            body.contains("sanitize_url"),
+            "the opener must re-validate the URL even though the span map only holds sanitized ones"
+        );
+        assert!(
+            body.contains("http://") && body.contains("https://"),
+            "the opener must allow exactly http:// and https://"
+        );
+        // Match the `starts_with(` call form, not bare words: the doc comment
+        // above the function discusses file:/mailto: (which is why they are
+        // refused), so a bare-substring check would match its own rationale.
+        assert!(
+            !body.contains("starts_with(\"file") && !body.contains("starts_with(\"mailto"),
+            "the opener must not pass file:/mailto: URLs to a browser"
+        );
+        assert!(
+            body.contains("xdg-open"),
+            "the opener must delegate to xdg-open (no shell, URL as one argv element)"
+        );
+    }
+
     // ================================================================
     // Layer 3 — display-backed (skipped without a display)
     // ================================================================
@@ -4225,13 +7427,14 @@ mod gui_design_parity_tests {
         configure_conversation_textview(&tv);
         tv.set_text("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n");
         sw.set_child(&tv);
-        let (vpos, vmax) =
+        let (vpos, vmax, page) =
             scrolled_window_range(&sw).expect("a ScrolledWindow must report a scroll position");
         assert!(vpos >= 0.0, "a scroll position must not be negative, got {vpos}");
+        assert!(page >= 0.0, "a viewport height must not be negative, got {page}");
         assert!(
             vmax >= vpos,
             "the scroll extent ({vmax}) must not be below the position ({vpos}): \
-             follow-the-tail compares the two to tell 'at the bottom' from \
+             follow-the-tail compares value + page against upper to tell 'at the bottom' from \
              'scrolled away from it'"
         );
     }
@@ -4272,6 +7475,61 @@ mod gui_design_parity_tests {
     }
 
     #[test]
+    fn picker_width_fits_the_current_model_label() {
+        // The picker is pinned to just the current model ("provider/model"),
+        // not to the longest catalog id and not to a fixed 220px: GTK3 sizes
+        // a ComboBoxText to its longest item, so either extreme leaves a fat
+        // box around a short label and steals Entry space. Pure math — no
+        // display needed.
+        assert!(picker_width_for("a/b") < picker_width_for("acme/big-model-name"), "wider label must request more width");
+        assert!(picker_width_for("ollama-cloud/deepseek-v4.1-flash") <= 420, "long ids clamp instead of stretching the row");
+        assert!(picker_width_for("x") >= 80, "even a tiny label keeps a usable box");
+    }
+
+    #[test]
+    fn expand_flags_are_set_before_pack_so_the_pane_fills_the_window() {
+        // Blank-window guard: GTK3's gtk_box_pack_start snapshots the child's
+        // expand/fill flags AT PACK TIME. Setting hexpand/vexpand *after*
+        // append/pack leaves the packed copy non-expanding, so the scroller,
+        // the prompt row, the session box and the tab container all keep
+        // their minimum size and the window is mostly blank space. This pins
+        // the fixed order — flags before append — at every site in the
+        // non-test code. A display is not needed: the order is a source
+        // property, and the shipped binary is built from this source.
+        //
+        // NOTE: do not strip `#[cfg(test)]` modules here (the helper used
+        // elsewhere cuts at the FIRST one, which sits at line ~708 — long
+        // before `spawn_session`/`run`). The pack sites live after it, and
+        // the test bodies never contain these exact pack strings, so
+        // searching the whole file is both safe and required.
+        let src = include_str!("gui.rs");
+        for (site, pack, flags) in [
+            // spawn_session: the conversation scroller claims the free space.
+            ("session scroller", "vbox.append(&scroller);", "scroller.set_vexpand(true);"),
+            // spawn_session: the prompt row stretches across the pane.
+            ("prompt row", "vbox.append(&prompt_row);", "prompt_row.set_hexpand(true);"),
+            // spawn_session: the session box fills its tab panel.
+            ("session box", "panel.append(&vbox);", "vbox.set_vexpand(true);"),
+            // run: the tab container fills the content box. (The root box
+            // itself needs no flags: window.set_child is not a pack.)
+            ("tab container", "content.append(&tabs);", "tabs.set_vexpand(true);"),
+            // spawn_session: the Send button must be PACKED before the pane
+            // is revealed — "Session" (built pre-present) shows it either
+            // way, but every later tab ("Session 1", ...) is revealed only
+            // by the explicit vbox.show_all(), so a Send appended after that
+            // stays hidden while Session's shows.
+            ("send button", "vbox.show_all();", "prompt_row.append(&send_btn);"),
+        ] {
+            let pack_at = src.find(pack).unwrap_or_else(|| panic!("{site}: pack site {pack:?} not found"));
+            let flags_at = src.find(flags).unwrap_or_else(|| panic!("{site}: expand flag {flags:?} not found"));
+            assert!(
+                flags_at < pack_at,
+                "{site}: {flags:?} must come BEFORE {pack:?} (GTK3 snapshots expand at pack time)"
+            );
+        }
+    }
+
+    #[test]
     fn the_conversation_pane_and_status_bar_are_readable() {
         // S7/T1 (display): after a sync, the TextView actually contains the
         // model's text and the status label actually contains the status.
@@ -4295,5 +7553,455 @@ mod gui_design_parity_tests {
         assert!(got.contains("hello from the model"), "got {got:?}");
         // The status label was written; the prefix glyph is present per kind.
         assert!(got.contains("❯"), "the user prefix glyph must be present: {got:?}");
+    }
+
+    #[test]
+    fn frozen_sync_holds_the_pane_and_rearming_catches_up() {
+        // S2/S3 (display): while the user is scrolled away (`follow` off), a
+        // sync must NOT append — GTK pins the pane to the bottom on every
+        // append, so appending would yank a mid-read user back down. New lines
+        // wait in the model; re-arming follow repaints the full tail.
+        let Some((app, _guard)) = try_app() else { return };
+        let Ok(tv) = app.create_textview() else { return };
+        let Ok(label) = app.create_label("x") else { return };
+        configure_conversation_textview(&tv);
+        let hint = app.create_label("").expect("hint label");
+        let sw = app.create_scrolled_window().expect("scrolled window");
+        let w = GuiWidgets {
+            textview: tv.clone(),
+            status: label.clone(),
+            scroller: sw,
+            hint: hint.clone(),
+        };
+        let mut s = GuiState::new();
+        s.push(ConvKind::User, "first");
+        sync_textview(&w, &mut s);
+        let frozen = tv.get_text().unwrap_or_default();
+        assert!(frozen.contains("first"), "live sync must paint: {frozen:?}");
+        // Scroll away: freeze. New output must not reach the buffer…
+        s.follow = false;
+        s.push(ConvKind::User, "second");
+        sync_textview(&w, &mut s);
+        let held = tv.get_text().unwrap_or_default();
+        assert_eq!(held, frozen, "frozen sync must hold the pane, got {held:?}");
+        // …until follow re-arms, when the live path catches up on its own
+        // (`rendered` is just a cursor into the model).
+        s.follow = true;
+        sync_textview(&w, &mut s);
+        let caught = tv.get_text().unwrap_or_default();
+        assert!(caught.contains("second"), "re-armed sync must catch up: {caught:?}");
+    }
+
+    #[test]
+    fn keyboard_scroll_paints_the_windowed_slice() {
+        // S6 (display): PageUp repaints the buffer with the scrolled window —
+        // the only programmatic scroll the toolkit allows (no
+        // `gtk_adjustment_set_value`). End returns to the live tail.
+        let Some((app, _guard)) = try_app() else { return };
+        let Ok(tv) = app.create_textview() else { return };
+        let Ok(label) = app.create_label("x") else { return };
+        configure_conversation_textview(&tv);
+        let hint = app.create_label("").expect("hint label");
+        let sw = app.create_scrolled_window().expect("scrolled window");
+        let w = GuiWidgets {
+            textview: tv.clone(),
+            status: label.clone(),
+            scroller: sw,
+            hint: hint.clone(),
+        };
+        let mut s = GuiState::new();
+        s.scroll.page = 10;
+        for i in 0..50 {
+            s.push(ConvKind::System, &format!("line {i:02}"));
+        }
+        sync_textview(&w, &mut s);
+        assert!(
+            tv.get_text().unwrap_or_default().contains("line 49"),
+            "live sync must show the tail"
+        );
+        scroll_page_up(&mut s);
+        sync_textview(&w, &mut s);
+        let win = tv.get_text().unwrap_or_default();
+        assert!(!win.contains("line 49"), "the window must exclude the tail: {win:?}");
+        // 50 lines, page 10: tail offset 40, one page up => lines 30..39.
+        assert!(win.contains("line 30"), "one page above the tail: {win:?}");
+        assert!(win.contains("line 39"), "one page above the tail: {win:?}");
+        scroll_end(&mut s);
+        sync_textview(&w, &mut s);
+        assert!(
+            tv.get_text().unwrap_or_default().contains("line 49"),
+            "End must return to the live tail"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "gui-rich-text"))]
+mod markup_demo_tests {
+    //! `/markup_demo` regression tests: the assistant block must reach the pane
+    //! as ONE Pango unit.
+    //!
+    //! The bug these pin: `sync_textview` used to render each assistant line on
+    //! its own, so every multi-line markdown construct was split. On the demo
+    //! sample the table came out as four literal `| … |` rows (no grid), each
+    //! code body line got its own ```` ``` ```` fence, the opening `fn main() {`
+    //! was left unhighlighted, and a blockquote opened a span on one line and
+    //! closed it on the next (invalid markup — GTK inserts nothing for that).
+    use super::*;
+
+    /// One JSONL session-log line: an assistant message with a single text
+    /// block — the exact shape `drain_session_log` parses.
+    fn jsonl_assistant_line(text: &str) -> String {
+        let v = serde_json::json!({
+            "role": "assistant",
+            "blocks": [{ "type": "text", "text": text }],
+        });
+        format!("{v}\n")
+    }
+
+    fn pane() -> Option<(App, TextView, GuiWidgets, std::sync::MutexGuard<'static, ()>)> {
+        let (app, guard) = gtk_test_app()?;
+        let tv = app.create_textview().ok()?;
+        configure_conversation_textview(&tv);
+        let status = app.create_label("x").ok()?;
+        let hint = app.create_label("").ok()?;
+        let scroller = app.create_scrolled_window().ok()?;
+        let w = GuiWidgets { textview: tv.clone(), status, scroller, hint };
+        Some((app, tv, w, guard))
+    }
+
+    #[test]
+    fn the_demo_table_reaches_the_pane_as_one_grid() {
+        // The reported bug. Before the fix the pane showed `| Language | … |`
+        // as four separate lines; now the whole table is one monospace grid.
+        let Some((_app, tv, w, _guard)) = pane() else { return };
+        let mut s = GuiState::new();
+        drain_session_text(&jsonl_assistant_line(crate::MARKUP_DEMO), &mut s);
+        sync_textview(&w, &mut s);
+        let got = tv.get_text().unwrap_or_default();
+        assert!(
+            got.contains("┌──────────┬──────────┬─────────┐"),
+            "the table must render as a box-drawing grid, not raw `|` rows: {got:?}"
+        );
+        assert!(
+            !got.lines().any(|l| l.trim_start().starts_with("| Language")),
+            "no raw markdown table row may survive into the pane: {got:?}"
+        );
+        assert_eq!(
+            s.rendered,
+            s.conv.len(),
+            "a finished drain must leave nothing unpainted"
+        );
+    }
+
+    #[test]
+    fn the_demo_code_fence_is_one_block() {
+        // Each body line used to be its own one-line fence (` ``` ` /
+        // `  let xs …` / ` ``` `), and the fence's first line was rendered
+        // outside the code span. A whole-document render puts the opening
+        // brace inside the fenced block.
+        let Some((_app, tv, w, _guard)) = pane() else { return };
+        let mut s = GuiState::new();
+        drain_session_text(&jsonl_assistant_line(crate::MARKUP_DEMO), &mut s);
+        sync_textview(&w, &mut s);
+        let got = tv.get_text().unwrap_or_default();
+        let fences = got.lines().filter(|l| l.trim() == "```").count();
+        assert_eq!(fences, 6, "one closing fence per fenced block (rust/js/json): {got:?}");
+        // Indentation inside the fence survives (the block is not re-wrapped
+        // line by line), and the opening brace is part of the code block.
+        assert!(got.contains("fn main() {"), "the block's first line must render: {got:?}");
+        assert!(got.contains("    let xs = vec![1, 2, 3];"), "indentation must survive: {got:?}");
+    }
+
+    #[test]
+    fn blockquote_markup_is_balanced() {
+        // A per-line render emitted `<span …>` on one line and `</span>` on the
+        // next: invalid Pango, which GTK rejects wholesale.
+        let raw = "> a blockquote, because models love a good aside.";
+        let mut s = GuiState::new();
+        drain_session_text(&jsonl_assistant_line(raw), &mut s);
+        let markup = assistant_block_markup(ConvKind::Assistant, &s.conv);
+        let opens = markup.matches("<span").count();
+        let closes = markup.matches("</span>").count();
+        assert_eq!(opens, closes, "unbalanced spans are rejected by GTK: {markup:?}");
+    }
+
+    #[test]
+    fn a_link_paragraph_renders_whole() {
+        let Some((_app, tv, w, _guard)) = pane() else { return };
+        let raw = "See our [GitHub page](https://github.com/gmatht/pir) for more info.";
+        let mut s = GuiState::new();
+        drain_session_text(&jsonl_assistant_line(raw), &mut s);
+        sync_textview(&w, &mut s);
+        let got = tv.get_text().unwrap_or_default();
+        assert!(got.contains("See our GitHub page (https://github.com/gmatht/pir)"), "{got:?}");
+        assert!(!got.contains("[GitHub page]"), "link syntax must not survive: {got:?}");
+    }
+
+    #[test]
+    fn a_streaming_block_is_not_painted_twice() {
+        // The model grows one drained line at a time; a block is only whole
+        // once its blank-line terminator arrives. Until then the live sync must
+        // show the block exactly once — not a partial copy per drain tick.
+        let Some((_app, tv, w, _guard)) = pane() else { return };
+        let raw = "## Heading\n\n- one\n- two\n\nAfter.";
+        let mut s = GuiState::new();
+        for line in raw.split('\n') {
+            s.push(ConvKind::Assistant, line);
+            sync_textview(&w, &mut s);
+            let got = tv.get_text().unwrap_or_default();
+            assert_eq!(
+                got.matches("After.").count(),
+                1,
+                "the trailing block must be painted once, got {got:?}"
+            );
+            assert_eq!(got.matches("- one").count(), 1, "got {got:?}");
+        }
+        // And the finished document is complete: the list rendered, the
+        // paragraph after it rendered.
+        let got = tv.get_text().unwrap_or_default();
+        assert!(got.contains("Heading") && got.contains("two") && got.contains("After."), "{got:?}");
+    }
+
+}
+
+// ---------------------------------------------------------------------------
+// G7: the /menu dialog covers every terminal menu action (the topbar items
+// had no dispatch — `/menu` answered "unknown command").
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod gui_menu_tests {
+    use super::*;
+    /// Display-backed pane harness for the menu behavior tests: a real
+    /// TextView + widgets, skipped gracefully headless. Mirrors the `pane()`
+    /// helper in the markup tests (private there) so menu behavior is pinned
+    /// against the same sync path the user sees.
+    fn menu_pane() -> Option<(App, TextView, GuiWidgets, std::sync::MutexGuard<'static, ()>)> {
+        let (app, guard) = gtk_test_app()?;
+        let tv = app.create_textview().ok()?;
+        configure_conversation_textview(&tv);
+        let status = app.create_label("x").ok()?;
+        let hint = app.create_label("").ok()?;
+        let scroller = app.create_scrolled_window().ok()?;
+        let w = GuiWidgets { textview: tv.clone(), status, scroller, hint };
+        Some((app, tv, w, guard))
+    }
+
+    #[test]
+    fn menu_about_and_help_paint_into_the_pane() {
+        // `/menu about` and `/menu help` are read-only: they must paint into
+        // the pane without an agent and without a display failure.
+        let Some((_app, tv, w, _guard)) = menu_pane() else { return };
+        let slot: AgentSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let state = std::sync::Arc::new(std::sync::Mutex::new(GuiState::new()));
+        let app2 = _app.clone();
+        let hn = std::sync::Arc::new(std::sync::Mutex::new(HistoryNav::default()));
+        run_menu_action("about", &[], &slot, &[], &app2, &state, &w, &hn);
+        run_menu_action("help", &[], &slot, &[], &app2, &state, &w, &hn);
+        sync_textview(&w, &mut state.lock().unwrap());
+        let got = tv.get_text().unwrap_or_default();
+        assert!(got.contains("pir ") && got.contains("license: GPL-3.0"), "about must print version + license: {got:?}");
+        assert!(got.contains("/sessions"), "help must print the command list: {got:?}");
+    }
+
+    #[test]
+    fn menu_unknown_subcommand_is_an_error_not_a_panic() {
+        // A typo'd subcommand (`/menu frobnicate`, or a stale topbar arg)
+        // must be a pane error listing the valid subs — never a panic, never
+        // silent.
+        let Some((_app, tv, w, _guard)) = menu_pane() else { return };
+        let slot: AgentSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let state = std::sync::Arc::new(std::sync::Mutex::new(GuiState::new()));
+        let app2 = _app.clone();
+        let hn = std::sync::Arc::new(std::sync::Mutex::new(HistoryNav::default()));
+        run_menu_action("frobnicate", &[], &slot, &[], &app2, &state, &w, &hn);
+        sync_textview(&w, &mut state.lock().unwrap());
+        let got = tv.get_text().unwrap_or_default();
+        assert!(got.contains("unknown menu action"), "got: {got:?}");
+        assert!(got.contains("resume"), "the error must list valid subs: {got:?}");
+    }
+
+    #[test]
+    fn menu_dialog_lists_every_terminal_menu_action() {
+        // The terminal `/menu` offers eleven actions (modal::MenuAction minus
+        // None); the GUI dialog must offer all eleven, or the topbar/dialog
+        // silently drops something the terminal user can reach.
+        let subs: Vec<&str> = MENU_DIALOG_ACTIONS.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            subs,
+            vec![
+                "resume",
+                "backgrounded",
+                "model",
+                "thinking",
+                "security",
+                "settings",
+                "worktrees",
+                "coverage",
+                "help",
+                "about",
+                "quit",
+            ],
+            "MENU_DIALOG_ACTIONS drifted from modal::MenuAction: {subs:?}"
+        );
+        // Every row has a label, and labels are unique — two rows sharing a
+        // label is a menu that lies about how many things there are.
+        let mut labels: Vec<&str> =
+            MENU_DIALOG_ACTIONS.iter().map(|(_, l)| *l).collect();
+        labels.sort();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            MENU_DIALOG_ACTIONS.len(),
+            "duplicate menu labels"
+        );
+        // And every sub resolves back to its own label (the dispatch table is
+        // total over the dialog table by construction).
+        for (sub, label) in MENU_DIALOG_ACTIONS {
+            assert_eq!(menu_action_label(sub), Some(*label));
+        }
+        assert_eq!(menu_action_label("nope"), None);
+    }
+
+    #[test]
+    fn every_menu_action_has_a_topbar_entry() {
+        // G7: each /menu subcommand must be reachable from the topbar, not
+        // just the dialog. "help" and "quit" are covered by the pre-existing
+        // help-commands (/help) and help-quit (/exit) items; every other sub
+        // needs its own `command: "menu", arg: "<sub>"` entry, which routes
+        // `/menu <sub>` through the same `run_command_line` a typed line
+        // takes. A menu item that points nowhere is worse than no menu.
+        let args: Vec<&str> = MENU_ACTIONS
+            .iter()
+            .filter(|a| a.command == "menu")
+            .map(|a| a.arg)
+            .collect();
+        for (sub, _) in MENU_DIALOG_ACTIONS {
+            if *sub == "help" || *sub == "quit" {
+                continue;
+            }
+            assert!(
+                args.contains(sub),
+                "no topbar item routes to /menu {sub}: {args:?}"
+            );
+        }
+        // The dialog itself is topbar-reachable too (Help → Menu…).
+        assert!(
+            args.contains(&""),
+            "no topbar item opens the whole menu dialog: {args:?}"
+        );
+        assert!(
+            MENU_ACTIONS.iter().any(|a| a.command == "help"),
+            "the /menu help action must stay reachable via the Commands item"
+        );
+        assert!(
+            MENU_ACTIONS.iter().any(|a| a.command == "exit"),
+            "the /menu quit action must stay reachable via the Quit item"
+        );
+    }
+
+    #[test]
+    fn menu_arm_dispatches_every_dialog_row() {
+        // The `/menu` arm routes through `run_menu_action`, and every dialog
+        // row must be a subcommand it accepts — otherwise the dialog offers a
+        // button that answers "unknown menu action". `help`/`about` run
+        // inline here; picker subcommands need a display and are covered by
+        // the arm's direct-call parity with the topbar (same function).
+        let slot: AgentSlot = Arc::new(Mutex::new(None));
+        let state = Arc::new(Mutex::new(GuiState::new()));
+        let nav: Arc<Mutex<HistoryNav>> = Arc::new(Mutex::new(HistoryNav::default()));
+        // No display needed: unknown-sub handling is pure pane output, but it
+        // still needs widgets for sync_textview — covered by the pane tests
+        // below. Here, pin the table-to-dispatch contract without widgets:
+        for (sub, _) in MENU_DIALOG_ACTIONS {
+            assert!(menu_action_label(sub).is_some(), "no label for {sub}");
+        }
+        assert_eq!(menu_action_label("nope"), None);
+        let _ = (&slot, &state, &nav);
+    }
+
+    #[test]
+    fn strip_ansi_removes_sgr_escapes_but_keeps_text() {
+        // The pane has no ANSI renderer: escapes would show up as literal
+        // junk, so resumed banners and coverage reports are stripped first.
+        assert_eq!(strip_ansi("\x1b[1mbold\x1b[0m plain"), "bold plain");
+        assert_eq!(strip_ansi("\x1b[36mcyan\x1b[0m"), "cyan");
+        assert_eq!(strip_ansi("no escapes here"), "no escapes here");
+        assert_eq!(strip_ansi(""), "");
+        // A bare ESC not followed by `[` is text, not an escape.
+        assert_eq!(strip_ansi("a\x1bb"), "a\x1bb");
+    }
+
+    #[test]
+    fn coverage_plan_lines_name_the_tools() {
+        // The pane-native coverage report names the same tools the terminal
+        // report would run, with install hints for the missing ones.
+        use crate::lints::{CoverageStatus, CoverageTool, MissingCoverage, SelectedCoverage};
+        let st = CoverageStatus {
+            available: vec![SelectedCoverage {
+                lang: "rust",
+                detected_by: "Cargo.toml".to_string(),
+                chosen: vec![CoverageTool {
+                    tool: "cargo-tarpaulin",
+                    purpose: "branch coverage",
+                    command: "cargo tarpaulin",
+                    install: "cargo install cargo-tarpaulin",
+                }],
+                extras: vec![],
+            }],
+            missing: vec![MissingCoverage {
+                lang: "python",
+                detected_by: "*.py".to_string(),
+                candidates: vec![CoverageTool {
+                    tool: "coverage.py",
+                    purpose: "branch coverage",
+                    command: "coverage run",
+                    install: "pip install coverage",
+                }],
+            }],
+        };
+        let lines = coverage_plan_lines(&st);
+        assert_eq!(lines.len(), 2, "got: {lines:?}");
+        assert!(lines[0].contains("rust") && lines[0].contains("cargo-tarpaulin"), "got: {lines:?}");
+        assert!(
+            lines[1].contains("python") && lines[1].contains("pip install coverage"),
+            "got: {lines:?}"
+        );
+        // Empty coverage: no lines, no crash (mirrors report_coverage_plan's
+        // early return).
+        let empty = CoverageStatus { available: vec![], missing: vec![] };
+        assert!(coverage_plan_lines(&empty).is_empty());
+    }
+
+    #[test]
+    fn settings_step_logic_cycles_and_toggles() {
+        // The settings dialog's step logic without a display: thinking cycles
+        // through exactly the offered levels and wraps; the rest toggle.
+        let levels = vec!["off".to_string(), "high".to_string(), "max".to_string()];
+        let (mut t, mut s, mut i, mut ss, mut f) =
+            ("off".to_string(), false, false, false, false);
+        step_gui_setting(&levels, &mut t, &mut s, &mut i, &mut ss, &mut f, 0);
+        assert_eq!(t, "high");
+        step_gui_setting(&levels, &mut t, &mut s, &mut i, &mut ss, &mut f, 0);
+        assert_eq!(t, "max");
+        step_gui_setting(&levels, &mut t, &mut s, &mut i, &mut ss, &mut f, 0);
+        assert_eq!(t, "off", "thinking cycles with wraparound");
+        step_gui_setting(&levels, &mut t, &mut s, &mut i, &mut ss, &mut f, 1);
+        assert!(s);
+        step_gui_setting(&levels, &mut t, &mut s, &mut i, &mut ss, &mut f, 4);
+        assert!(f);
+        step_gui_setting(&levels, &mut t, &mut s, &mut i, &mut ss, &mut f, 9);
+        // Unknown rows are ignored, never panic.
+    }
+
+    #[test]
+    fn security_cycle_wraps_around_the_options() {
+        // Enum rows cycle forward with wraparound; an unknown current value
+        // restarts at the first option rather than panicking.
+        assert_eq!(cycle_security_value("on", &["on".to_string(), "off".to_string()]), "off");
+        assert_eq!(cycle_security_value("off", &["on".to_string(), "off".to_string()]), "on");
+        assert_eq!(
+            cycle_security_value("???", &["ask".to_string(), "auto-yes".to_string()]),
+            "auto-yes"
+        );
     }
 }

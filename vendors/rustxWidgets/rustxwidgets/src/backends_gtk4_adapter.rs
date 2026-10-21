@@ -94,6 +94,8 @@ impl BoxWidget {
     pub fn set_hexpand(&self, e: bool) { self.0.set_hexpand(e); }
     pub fn set_vexpand(&self, e: bool) { self.0.set_vexpand(e); }
     pub fn set_visible(&self, v: bool) { self.0.set_visible(v); }
+    /// GTK4 widgets are visible by default; kept for the cross-backend rule.
+    pub fn show_all(&self) { self.0.set_visible(true); }
     pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
     pub fn raw_handle(&self) -> *mut std::ffi::c_void { self.0.as_ptr() as *mut _ }
 }
@@ -148,6 +150,7 @@ impl Entry {
     pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
     pub fn set_visible(&self, v: bool) { self.0.set_visible(v); }
     pub fn set_width_chars(&self, n: i32) { self.0.set_width_chars(n); }
+    pub fn set_placeholder_text(&self, t: &str) { self.0.set_placeholder_text(Some(t)); }
     pub fn set_halign(&self, a: i32) { self.0.set_halign(if a == 1 { gtk4::Align::Start } else { gtk4::Align::Fill }); }
     pub fn set_valign(&self, a: i32) { self.0.set_valign(if a == 1 { gtk4::Align::Start } else { gtk4::Align::Fill }); }
     pub fn set_margin_start(&self, p: i32) { self.0.set_margin_start(p); }

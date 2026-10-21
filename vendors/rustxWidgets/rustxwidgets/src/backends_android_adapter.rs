@@ -196,6 +196,8 @@ mod android_adapter {
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
             });
         }
+        /// Kept for the cross-backend rule; Android views are visible by default.
+        pub fn show_all(&self) {}
     }
 
     #[repr(transparent)]
@@ -236,6 +238,9 @@ mod android_adapter {
         }
 
         pub fn set_width_chars(&self, _n: i32) {}
+
+        /// Placeholder hint: no-op on Android (future: EditText.setHint).
+        pub fn set_placeholder_text(&self, _text: &str) {}
 
         pub fn set_size_request(&self, _w: i32, _h: i32) {}
 

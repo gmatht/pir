@@ -62,7 +62,9 @@ lsb-curl = { path = "vendor/lsb-curl" }
 # with a conversation pane + footer pane (thinking + live draft prompt) and
 # in-app scrollback. OFF by default — build/run with `--features tui`; pass
 # `--no-tui` (or just build without the feature) to use the streaming REPL.
-default = []
+# Rich-text GUI pane is ON by default (see `gui-rich-text` below);
+# `--no-default-features` builds the plain-text pane instead.
+default = ["gui-rich-text"]
 tui = ["dep:ratatui"]
 # Swap the markdown renderer backend to comrak (a heavier CommonMark/GFM
 # parser). OFF by default: the default backend is pulldown-cmark (smaller
@@ -78,6 +80,13 @@ comrak-backend = ["dep:comrak"]
 # backend at all, so App::init() fails for every platform.
 gui = ["dep:rustxwidgets", "rustxwidgets/gtk"]
 pancurses = ["dep:rustxwidgets", "rustxwidgets/pancurses"]
+# Rich-text conversation pane in the GTK GUI: assistant markdown is converted
+# to Pango markup (bold/italic/code/headings/links) and inserted with
+# gtk_text_buffer_insert_markup. ON by default (`default` includes it);
+# `--no-default-features` falls back to the plain-text pane (ANSI-stripped
+# md::render + TextView append_text). The flag only affects the GUI: the
+# streaming REPL and TUI keep their ANSI renderer either way.
+gui-rich-text = []
 
 [profile.release]
 strip = true

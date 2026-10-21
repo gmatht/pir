@@ -1487,6 +1487,7 @@ fn read_idle_line(
                             // immediately followed by an LF.
                             if b == 0x0a || !(i < n as usize && tmp[i] == 0x0a) {
                                 buf.push('\n');
+                                hist_idx = -1; // pasted text is typed text: it abandons recall
                             }
                             crate::term::reset_quit_presses();
                         } else {
@@ -1498,6 +1499,7 @@ fn read_idle_line(
                     }
                     0x7f | 0x08 => {
                         buf.pop();
+                        hist_idx = -1; // an edit abandons recall: the line is typed now
                         update_tui_typeahead(&buf, ctx.typeahead);
                         update_tui_hint(state, &buf);
                         crate::term::reset_quit_presses();
@@ -1576,10 +1578,16 @@ fn read_idle_line(
                         }
                         // Inline `/model` picker: Up/Down steps through the top-N
                         // recent models in place (same `pick_next` core as the
-                        // streaming REPL). Any other line keeps history recall.
-                        // Either way the footer hint re-renders so the `▸`
-                        // selection mark tracks the move.
-                        let picked = if is_up || is_down {
+                        // streaming REPL) — but only for a line the operator
+                        // typed. A history-recalled `/model` line (hist_idx >=
+                        // 0: up-arrowed to, not typed) keeps navigating
+                        // history, so arrowing *onto* `/model foo` and pressing
+                        // Up again reaches older prompts instead of trapping
+                        // in the picker. Either way the footer hint re-renders
+                        // so the `▸` selection mark tracks the move.
+                        let picked = if (is_up || is_down)
+                            && crate::model_history::arrows_drive_picker(&buf, hist_idx >= 0)
+                        {
                             let arg = crate::model_history::parse_model_line(&buf)
                                 .map(|(_, a)| a)
                                 .unwrap_or_default();
@@ -1630,6 +1638,7 @@ fn read_idle_line(
                     }
                     c if (0x20..0x7f).contains(&c) => {
                         buf.push(c as char);
+                        hist_idx = -1; // an edit abandons recall: the line is typed now
                         state.awaiting_input = false;
                         update_tui_typeahead(&buf, ctx.typeahead);
                         update_tui_hint(state, &buf);
@@ -1640,6 +1649,7 @@ fn read_idle_line(
                             .or_else(|| crate::config::complete_model_buffer(&buf, ctx.providers))
                         {
                             buf = completed;
+                            hist_idx = -1; // a completion is an edit: the line is typed now
                             update_tui_typeahead(&buf, ctx.typeahead);
                             update_tui_hint(state, &buf);
                         }
@@ -1677,6 +1687,7 @@ fn read_idle_line(
                             utf8.push(c);
                             if let Some(ch) = decode_utf8(&mut utf8) {
                                 buf.push(ch);
+                                hist_idx = -1; // an edit abandons recall: the line is typed now
                                 state.awaiting_input = false;
                                 update_tui_typeahead(&buf, ctx.typeahead);
                                 update_tui_hint(state, &buf);
@@ -2490,6 +2501,24 @@ mod tui_completion_tests {
         update_tui_hint(&mut s, "/model a/new");
         assert!(s.hint.contains("▸1 a/new"), "selection marked: {:?}", s.hint);
         restore_picker_history(old, dir);
+    }
+
+    /// The up-arrow trap: a `/model` line the operator typed rewires Up/Down
+    /// to the picker, but a `/model` line that arrived via history recall
+    /// (up-arrowed to, `hist_idx >= 0`) keeps navigating history — so arrowing
+    /// *onto* `/model foo` and pressing Up again reaches older prompts instead
+    /// of stepping through models.
+    #[test]
+    fn tui_arrows_ignore_recalled_model_lines() {
+        // Typed (hist_idx == -1): the picker owns the arrows.
+        assert!(crate::model_history::arrows_drive_picker("/model", false));
+        assert!(crate::model_history::arrows_drive_picker("/model a/new", false));
+        // Recalled (hist_idx >= 0): history owns the arrows, even on a bare
+        // `/model` or an exact model label.
+        assert!(!crate::model_history::arrows_drive_picker("/model", true));
+        assert!(!crate::model_history::arrows_drive_picker("/model a/new", true));
+        // Non-model lines never rewire either way.
+        assert!(!crate::model_history::arrows_drive_picker("hello", false));
     }
 
     /// Up/Down on a `/model` line steps through the recents in place (same

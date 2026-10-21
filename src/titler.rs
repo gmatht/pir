@@ -355,13 +355,18 @@ fn tiny_request(
     user: &str,
 ) -> (String, Value) {
     let body = match api_kind {
+        // Responses floor: the gateway 400s `max_output_tokens` below 16
+        // ("The number must be `>= 16`", verified live) — and every light
+        // caller passes 12/24, so without this the title/verdict pipeline
+        // on a Responses light model fails on every call (silently: these
+        // callers treat failure as "skip").
         config::ApiKind::OpenAiResponses => json!({
             "model": model_id,
             "input": [
                 { "role": "system", "content": system },
                 { "role": "user", "content": user },
             ],
-            "max_output_tokens": max_tokens,
+            "max_output_tokens": max_tokens.max(16),
             "stream": false,
         }),
         _ => json!({
@@ -784,5 +789,20 @@ mod tests {
             !h.iter().any(|(k, _)| *k == "x-opencode-session"),
             "blank session id must not go out: {h:?}"
         );
+    }
+
+    /// The Responses one-shot budget honors the 16-token floor: the gateway
+    /// 400s anything below ("must be `>= 16`", verified live), and every
+    /// light caller passes a smaller budget — without the floor the whole
+    /// title/verdict pipeline on a Responses light model fails every call.
+    #[test]
+    fn tiny_request_responses_enforces_output_floor() {
+        let (_url, body) = tiny_request("http://x", config::ApiKind::OpenAiResponses, "m", 12, "s", "u");
+        assert_eq!(body["max_output_tokens"], serde_json::json!(16));
+        let (_url, body) = tiny_request("http://x", config::ApiKind::OpenAiResponses, "m", 24, "s", "u");
+        assert_eq!(body["max_output_tokens"], serde_json::json!(24));
+        // Chat path untouched.
+        let (_url, body) = tiny_request("http://x", config::ApiKind::OpenAi, "m", 12, "s", "u");
+        assert_eq!(body["max_tokens"], serde_json::json!(12));
     }
 }

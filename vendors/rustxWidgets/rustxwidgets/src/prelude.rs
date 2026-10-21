@@ -1,4 +1,5 @@
 pub use crate::core::{App, DrawContext, Error, HandlerId, Widget};
+pub use crate::tree::{MemoryTree, TreeModel, TreeNode, TreeStatus, TreeView};
 #[cfg(all(feature = "gtk4-rs", target_os = "linux", not(feature = "zork")))]
 pub use crate::common::{Window, WidgetBox, Label, Entry, Canvas, Menu, MenuBar, SimpleAction, Dialog, Orientation};
 #[cfg(all(feature = "gtk4-rs", target_os = "linux", not(feature = "zork")))]
@@ -10,7 +11,7 @@ pub use crate::backends_gtk_adapter::{Button, Grid, DropDown, CheckButton, Radio
 #[cfg(all(windows, not(feature = "zork")))]
 pub use crate::common::{Window, WidgetBox, Entry, Canvas, Menu, MenuBar, SimpleAction, Dialog, Orientation};
 #[cfg(all(windows, not(feature = "zork")))]
-pub use crate::backends_nwg_adapter::{Button, Grid, DropDown, CheckButton, RadioButton, TextView, Label, Appendable, TabView};
+pub use crate::backends_nwg_adapter::{Button, Grid, DropDown, CheckButton, RadioButton, TextView, Label, Appendable, TabView, ScrolledWindow};
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
 pub use crate::common::{Window, WidgetBox, Label, Entry, Canvas, Menu, MenuBar, SimpleAction, Dialog, Orientation};
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]

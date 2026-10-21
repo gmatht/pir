@@ -18,6 +18,7 @@ use crate::config;
 use crate::term;
 #[allow(dead_code)]
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
@@ -49,6 +50,13 @@ pub struct AgentEvent {
     /// The last user prompt that produced this turn (truncated; may be empty),
     /// shown in the notification body so the user knows *what* finished.
     pub prompt: String,
+    /// Session this event belongs to: the transcript path as a string. Empty
+    /// means "unknown session" (legacy callers, global pop-ups) — those events
+    /// route to the global feed only and never light up a tree badge. The
+    /// agent fills this in at `notify_on_exit`; the tree's `unread_counts`
+    /// keys on it.
+    #[allow(dead_code)]
+    pub session: String,
 }
 
 impl AgentEvent {
@@ -67,6 +75,7 @@ impl AgentEvent {
             message: String::new(),
             project,
             prompt,
+            session: String::new(),
         }
     }
 
@@ -79,6 +88,7 @@ impl AgentEvent {
             message,
             project,
             prompt,
+            session: String::new(),
         }
     }
 
@@ -91,7 +101,17 @@ impl AgentEvent {
             message: String::new(),
             project,
             prompt,
+            session: String::new(),
         }
+    }
+
+    /// Attach the session this event belongs to (transcript path string).
+    /// The agent calls this at `notify_on_exit`; the bus routes a session-tagged
+    /// event to that session's per-session feed (the tree's unread badge) as
+    /// well as the global on-screen feed.
+    pub fn with_session(mut self, session: &str) -> Self {
+        self.session = session.to_string();
+        self
     }
 
     /// Short human-readable line, used by most notifiers and the on-screen feed.
@@ -394,7 +414,16 @@ pub struct NotifyBus {
     /// Bounded recent-event log for on-screen rendering. Guarded so background
     /// agents can append concurrently with the REPL draining it.
     feed: Mutex<Vec<AgentEvent>>,
+    /// Per-session unread feed: session id (transcript path string) → pending
+    /// events the operator has not yet seen. A session-tagged event lands here
+    /// AND in the global `feed`; selecting/previewing the session in the tree
+    /// calls [`NotifyBus::mark_seen`], which drains only that session's entry
+    /// — the unread→seen transition in `SessionPresence`. Bounded per session
+    /// (not just globally) so one chatty session can't evict another's badge.
+    feed_by_session: Mutex<HashMap<String, Vec<AgentEvent>>>,
     max_feed: usize,
+    /// Per-session bound for `feed_by_session`.
+    max_feed_per_session: usize,
 }
 
 impl NotifyBus {
@@ -404,7 +433,9 @@ impl NotifyBus {
         NotifyBus {
             config: RwLock::new((policy, external)),
             feed: Mutex::new(Vec::new()),
+            feed_by_session: Mutex::new(HashMap::new()),
             max_feed: 64,
+            max_feed_per_session: 8,
         }
     }
 
@@ -463,10 +494,23 @@ impl NotifyBus {
         if policy.allows(&event, oneshot, true) {
             drop(g);
             if let Ok(mut feed) = self.feed.lock() {
-                feed.push(event);
+                feed.push(event.clone());
                 if feed.len() > self.max_feed {
                     let drop = feed.len() - self.max_feed;
                     feed.drain(0..drop);
+                }
+            }
+            // Route session-tagged events to the per-session feed as well, so
+            // the tree can badge the exact session that finished. Events with
+            // no session stay global-only.
+            if !event.session.is_empty()
+                && let Ok(mut per) = self.feed_by_session.lock()
+            {
+                let entry = per.entry(event.session.clone()).or_default();
+                entry.push(event);
+                if entry.len() > self.max_feed_per_session {
+                    let drop = entry.len() - self.max_feed_per_session;
+                    entry.drain(0..drop);
                 }
             }
         }
@@ -475,10 +519,48 @@ impl NotifyBus {
     /// Drain pending on-screen notifications, returning them for the caller to
     /// render above the prompt. The feed is cleared. Safe to call from the REPL
     /// loop between prompts; background agents keep appending concurrently.
+    ///
+    /// Compat shim: drains the GLOBAL feed only. The per-session feeds are
+    /// left intact — a global drain renders the line on screen but does not
+    /// mark any session seen (only focusing the session via [`NotifyBus::mark_seen`]
+    /// / [`NotifyBus::drain_session`] does that). The tree calls `mark_seen`
+    /// when the operator selects a session, so the unread→seen transition
+    /// tracks actual attention, not screen scrollback.
     pub fn drain_feed(&self) -> Vec<AgentEvent> {
         match self.feed.lock() {
             Ok(mut feed) => std::mem::take(&mut *feed),
             Err(_) => Vec::new(),
+        }
+    }
+
+    /// Pending unread count per session id. Drives `SessionPresence`:
+    /// a non-empty count on a waiting session renders `NeedsInputUnread(n)`.
+    pub fn unread_counts(&self) -> HashMap<String, u32> {
+        match self.feed_by_session.lock() {
+            Ok(per) => per
+                .iter()
+                .filter(|(_, v)| !v.is_empty())
+                .map(|(k, v)| (k.clone(), v.len() as u32))
+                .collect(),
+            Err(_) => HashMap::new(),
+        }
+    }
+
+    /// Drain one session's pending notifications (for rendering in its detail
+    /// pane). Like [`NotifyBus::mark_seen`], this clears the unread badge.
+    pub fn drain_session(&self, session: &str) -> Vec<AgentEvent> {
+        match self.feed_by_session.lock() {
+            Ok(mut per) => per.remove(session).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Mark a session seen: clear its pending notifications without returning
+    /// them. The tree calls this when the operator focuses a session, moving
+    /// it from `NeedsInputUnread` to `NeedsInputSeen`.
+    pub fn mark_seen(&self, session: &str) {
+        if let Ok(mut per) = self.feed_by_session.lock() {
+            per.remove(session);
         }
     }
 

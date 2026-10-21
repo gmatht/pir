@@ -55,6 +55,9 @@ impl ConditionalEventHandler for ResetQuitPresses {
         _ctx: &EventContext,
     ) -> Option<Cmd> {
         reset_quit_presses();
+        // Any non-arrow key is typing, not recalling: the next Up/Down on a
+        // `/model` line must rewire to the picker again.
+        MODEL_ARROW_NAV.with(|s| s.set(ModelArrowNav::Fresh));
         None
     }
 }
@@ -632,6 +635,43 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// What the last Up/Down did at the idle prompt: drove the inline `/model`
+/// picker, navigated history, or neither (any other key was pressed since).
+/// The picker only rewires arrows for a `/model` line the operator typed; a
+/// line that arrived via history recall (up-arrowed to, not typed) keeps
+/// navigating history, so arrowing *onto* `/model foo` and pressing Up again
+/// reaches older prompts instead of trapping in the picker.
+///
+/// Reset by any other key (via [`ResetQuitPresses`], which already observes
+/// every unmatched key) and by each new prompt (in [`open_input_zone`],
+/// alongside the highlight reset) — so the state can never leak from one
+/// line into the next.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ModelArrowNav {
+    /// No arrow navigation yet on this line (fresh prompt, or a non-arrow
+    /// key was pressed since): a `/model` line here was typed.
+    Fresh,
+    /// The last Up/Down engaged the picker.
+    Picking,
+    /// The last Up/Down navigated history: the current line may have
+    /// arrived via recall, so the arrows stay on history.
+    Recalling,
+}
+
+thread_local! {
+    static MODEL_ARROW_NAV: std::cell::Cell<ModelArrowNav> =
+        const { std::cell::Cell::new(ModelArrowNav::Fresh) };
+}
+
+/// Whether Up/Down on this line should attempt the inline `/model` picker
+/// rather than declining to history recall: only when the operator typed the
+/// line (`Fresh` prompt or still picking), never when it arrived via history
+/// recall. Pure, so the up-arrow-trap rule is unit-testable without driving
+/// rustyline (whose `EventContext` cannot be constructed outside its crate).
+fn model_picker_engages(line: &str, nav: ModelArrowNav) -> bool {
+    nav != ModelArrowNav::Recalling && crate::model_history::arrows_drive_picker(line, false)
+}
+
 /// Move the live list's highlight by one row (Up/Down on a `/model`-family
 /// draft). Returns `true` when the draft is a live `/model` line with
 /// candidates, i.e. the key was consumed by the picker rather than history
@@ -840,6 +880,9 @@ pub fn open_input_zone() {
     // keystrokes that set it, never to the next line.
     PREVIEW_SEL.with(|s| s.set(None));
     PREVIEW_ARG.with(|a| a.borrow_mut().clear());
+    // ...and with no arrow navigation: a `/model` line on the new prompt
+    // was typed (or is empty), never recalled.
+    MODEL_ARROW_NAV.with(|s| s.set(ModelArrowNav::Fresh));
 }
 
 /// A single full-width footer line: `── <status> ──…──`. The status text
@@ -1644,7 +1687,16 @@ impl ConditionalEventHandler for ModelPickHandler {
         reset_quit_presses();
         let line = ctx.line();
         let pos = ctx.pos();
-        let parsed = crate::model_history::parse_model_line(&line[..pos.min(line.len())]);
+        // Only rewire arrows for a `/model` line the operator typed. A line
+        // that arrived via history recall (the previous Up/Down navigated
+        // history) keeps navigating: decline so rustyline runs its default
+        // recall instead of trapping the operator in the picker.
+        let nav = MODEL_ARROW_NAV.with(|s| s.get());
+        let parsed = if model_picker_engages(&line[..pos.min(line.len())], nav) {
+            crate::model_history::parse_model_line(&line[..pos.min(line.len())])
+        } else {
+            None
+        };
         // Any live `/model` line (bare, numbered, or prefixed) shows the block,
         // so the arrows move *its* highlight and leave the draft alone: the
         // operator's typed line stays exactly what they typed, and Enter (or a
@@ -1659,6 +1711,7 @@ impl ConditionalEventHandler for ModelPickHandler {
                 // `Repaint` refreshes the line, which re-runs `hint()` and so
                 // the preview paint — exactly what we want after moving the
                 // marker.
+                MODEL_ARROW_NAV.with(|s| s.set(ModelArrowNav::Picking));
                 return Some(Cmd::Repaint);
             }
         }
@@ -1667,11 +1720,23 @@ impl ConditionalEventHandler for ModelPickHandler {
         // argument, so the arrows still do something useful.
         let arg = parsed.map(|(_, a)| a).unwrap_or_default();
         let cands = crate::model_history::top_matching(&arg, crate::model_history::TOP_N);
-        let picked = crate::model_history::pick_next(line, pos, &cands, self.up)?;
-        // Replace the whole buffer, cursor to end: kill + insert is total
-        // (also when the buffer is empty-ish), and `next_cmd` opens the undo
-        // group for `Replace`, so one Ctrl-U/Ctrl-_ undoes the whole step.
-        Some(Cmd::Replace(Movement::WholeBuffer, Some(picked)))
+        let picked = crate::model_history::pick_next(line, pos, &cands, self.up);
+        match picked {
+            Some(next) => {
+                MODEL_ARROW_NAV.with(|s| s.set(ModelArrowNav::Picking));
+                // Replace the whole buffer, cursor to end: kill + insert is total
+                // (also when the buffer is empty-ish), and `next_cmd` opens the undo
+                // group for `Replace`, so one Ctrl-U/Ctrl-_ undoes the whole step.
+                Some(Cmd::Replace(Movement::WholeBuffer, Some(next)))
+            }
+            None => {
+                // Declining runs rustyline's default (history recall for
+                // Up/Down), so the effective navigation is history from here:
+                // a recalled `/model` line keeps recalling on the next press.
+                MODEL_ARROW_NAV.with(|s| s.set(ModelArrowNav::Recalling));
+                None
+            }
+        }
     }
 }
 
@@ -5894,6 +5959,29 @@ mod tests {
             None => unsafe { std::env::remove_var("PI_DIR") },
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The up-arrow trap, REPL side: the picker engages a typed `/model`
+    /// line (`Fresh` prompt, or still `Picking` after a prior step) but never
+    /// a line that arrived via history recall (`Recalling` — what a prior
+    /// history-navigating Up leaves behind). A non-model line never engages.
+    /// Tests the decision function directly: rustyline's `EventContext`
+    /// cannot be constructed outside its crate, so the handler itself is
+    /// covered by the same predicate the TUI test drives end to end.
+    #[test]
+    fn recalled_model_line_declines_to_history_recall() {
+        // Typed lines engage: fresh prompt, or mid-picker.
+        assert!(model_picker_engages("/model", ModelArrowNav::Fresh));
+        assert!(model_picker_engages("/model", ModelArrowNav::Picking));
+        assert!(model_picker_engages("/model a/new", ModelArrowNav::Fresh));
+        assert!(model_picker_engages("/m foo", ModelArrowNav::Fresh));
+        // Recalled lines never engage — even a bare `/model`.
+        assert!(!model_picker_engages("/model", ModelArrowNav::Recalling));
+        assert!(!model_picker_engages("/model a/new", ModelArrowNav::Recalling));
+        // Non-model lines never engage in any state.
+        assert!(!model_picker_engages("hello", ModelArrowNav::Fresh));
+        assert!(!model_picker_engages("hello", ModelArrowNav::Recalling));
+        assert!(!model_picker_engages("", ModelArrowNav::Fresh));
     }
 
     /// The inline picker: before Enter, a `/model` line hints the top-N

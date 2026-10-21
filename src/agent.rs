@@ -1696,7 +1696,12 @@ impl Agent {
              current state, and any pending work. Do not include any preamble or meta commentary.\n\n{}",
             transcript
         );
-        match self.client.complete(&self.model.id, &sys, &compact_prompt) {
+        match self.client.complete(
+            &self.model.id,
+            &sys,
+            &compact_prompt,
+            self.provider.model_api(&self.model),
+        ) {
             Ok(summary) if !summary.trim().is_empty() => {
                 let s = summary.trim().to_string();
                 self.history.clear();
@@ -4148,7 +4153,10 @@ impl Agent {
         let user = format!(
             "Last user prompt: {last_user}\nLast assistant output: {last_asst}\nword (done or retry):"
         );
-        let resp = self.client.complete(&self.model.id, system, &user).unwrap_or_default();
+        let resp = self
+            .client
+            .complete(&self.model.id, system, &user, self.provider.model_api(&self.model))
+            .unwrap_or_default();
         let w = resp.trim().to_lowercase();
         let first = w.split_whitespace().next().unwrap_or("").trim_matches(|c: char| !c.is_alphanumeric());
         first == "done" || first.contains("done")
@@ -4363,13 +4371,20 @@ impl Agent {
     /// started yet, e.g. a fresh one-shot path).
     pub fn turn_done_event(&self) -> AgentEvent {
         let duration = self.turn_started.map(|t| t.elapsed()).unwrap_or(std::time::Duration::ZERO);
-        AgentEvent::turn_done(
+        let ev = AgentEvent::turn_done(
             duration,
             self.usage.input,
             self.usage.output,
             self.project_label(),
             self.last_prompt.clone(),
-        )
+        );
+        // Tag the session so the bus can route this to the session's
+        // per-session feed (the left tree's unread badge) as well as the
+        // global on-screen feed. Without the tag the tree never lights up.
+        match &self.log_path {
+            Some(p) => ev.with_session(&p.to_string_lossy()),
+            None => ev,
+        }
     }
 
     /// End-of-turn: announce any writes the agent staged into SYSTEM trees
@@ -4419,12 +4434,20 @@ impl Agent {
     /// Build the `Idle` event (returned to the REPL prompt). Carries the same
     /// project / last-prompt context so on-screen feed lines identify it.
     pub fn idle_event(&self) -> AgentEvent {
-        AgentEvent::idle(self.project_label(), self.last_prompt.clone())
+        let ev = AgentEvent::idle(self.project_label(), self.last_prompt.clone());
+        match &self.log_path {
+            Some(p) => ev.with_session(&p.to_string_lossy()),
+            None => ev,
+        }
     }
 
     /// Build an `Error` event from a turn's error message.
     pub fn error_event(&self, message: String) -> AgentEvent {
-        AgentEvent::error(message, self.project_label(), self.last_prompt.clone())
+        let ev = AgentEvent::error(message, self.project_label(), self.last_prompt.clone());
+        match &self.log_path {
+            Some(p) => ev.with_session(&p.to_string_lossy()),
+            None => ev,
+        }
     }
 
     /// Persist this session's liveness/end-status sidecar so unfinished

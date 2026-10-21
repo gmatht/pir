@@ -72,6 +72,13 @@ pub struct Entry {
     /// First user prompt, for the picker/`/sessions` list.
     #[serde(default)]
     pub preview: String,
+    /// Canonical project root for the session (VCS top-level, else the cwd
+    /// itself, else empty). Keyed alongside `cwd` so a warm start never
+    /// re-walks the filesystem for `.git`/`.jj` markers: misses recompute it
+    /// via `session_tree::derive_project_root` (cheap, bounded 8-level walk)
+    /// and write it back. `#[serde(default)]` keeps v2 indexes readable.
+    #[serde(default)]
+    pub project_root: String,
 }
 
 /// The on-disk index: `{ "version": 1, "entries": { "<path>": Entry } }`.
@@ -86,7 +93,7 @@ struct IndexFile {
 }
 
 /// Bumped on any change to [`Entry`]; a mismatch means "rebuild".
-const INDEX_VERSION: u32 = 2;
+const INDEX_VERSION: u32 = 3;
 
 /// Name of the index file, written next to the global sessions dir's parent so
 /// it covers the global store. The project-local store is indexed in the same
@@ -204,7 +211,7 @@ mod tests {
         let mut i = Index { entries: HashMap::new(), dirty: Vec::new() };
         i.entries.insert(
             "/a.jsonl".into(),
-            Entry { mtime: 100, bytes: 10, tty: "pts/3".into(), cwd: "/w".into(), preview: "hi".into() },
+            Entry { mtime: 100, bytes: 10, tty: "pts/3".into(), cwd: "/w".into(), preview: "hi".into(), project_root: "/w".into() },
         );
         let hit = i.lookup(Path::new("/a.jsonl"), 10, 100).expect("exact match hits");
         assert_eq!(hit.tty, "pts/3");
@@ -232,7 +239,7 @@ mod tests {
             assert!(i.lookup(Path::new("/x.jsonl"), 5, 7).is_none(), "empty index misses");
             i.put(
                 Path::new("/x.jsonl"),
-                Entry { mtime: 7, bytes: 5, tty: "pts/9".into(), cwd: "/x".into(), preview: "p".into() },
+                Entry { mtime: 7, bytes: 5, tty: "pts/9".into(), cwd: "/x".into(), preview: "p".into(), project_root: "/x".into() },
             );
             assert_eq!(i.dirty_len(), 1);
             i.save();

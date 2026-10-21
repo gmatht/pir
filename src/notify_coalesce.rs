@@ -234,6 +234,7 @@ mod tests {
             message: String::new(),
             project: "t".into(),
             prompt: prompt.into(),
+            session: String::new(),
         }
     }
 
@@ -414,6 +415,7 @@ mod live_reap_tests {
                 message: String::new(),
                 project: "t".into(),
                 prompt: "p".into(),
+                session: String::new(),
             });
         }
         std::thread::sleep(COALESCE_WINDOW + Duration::from_millis(400));
@@ -446,6 +448,7 @@ mod live_reap_tests {
                 message: String::new(),
                 project: "t".into(),
                 prompt: "p".into(),
+                session: String::new(),
             });
         }
         std::thread::sleep(COALESCE_WINDOW + Duration::from_millis(400));

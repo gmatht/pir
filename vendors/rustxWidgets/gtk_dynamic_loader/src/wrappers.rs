@@ -171,6 +171,33 @@ impl BoxWidget {
             unsafe { f(self.inner, if visible { 1 } else { 0 }); }
         }
     }
+
+    /// Recursively show this box and everything under it. GTK3 creates
+    /// widgets hidden; use after building content post-`present()`, whose
+    /// blanket `show_all` only reveals what exists at that point.
+    pub fn show_all(&self) {
+        guard_widget!(self, "BoxWidget", "show_all");
+        unsafe { crate::wrappers::widget_show_all(&self.loader, self.inner); }
+    }
+    /// Show one direct child without re-showing the whole subtree: for
+    /// rows appended after present(), whose parent is already visible.
+    pub fn show_child(&self, child: &impl AsRef<*mut c_void>) {
+        guard_widget!(self, "BoxWidget", "show_child");
+        unsafe { crate::wrappers::widget_show(&self.loader, *child.as_ref()); }
+    }
+    /// Hide one direct child without unparenting it: pack options are kept,
+    /// so re-showing restores the layout exactly.
+    pub fn hide_child(&self, child: &impl AsRef<*mut c_void>) {
+        guard_widget!(self, "BoxWidget", "hide_child");
+        unsafe { crate::wrappers::widget_hide(&self.loader, *child.as_ref()); }
+    }
+    /// Re-run size negotiation after late appends so newcomers are allocated
+    /// (not left 1x1/invisible until the next manual resize forces a fresh
+    /// allocate pass).
+    pub fn queue_resize(&self) {
+        guard_widget!(self, "BoxWidget", "queue_resize");
+        unsafe { crate::wrappers::widget_queue_resize(&self.loader, self.inner); }
+    }
 }
 
 impl AsRef<*mut c_void> for BoxWidget { fn as_ref(&self) -> &*mut c_void { &self.inner } }
@@ -272,10 +299,13 @@ impl Window {
                         // waits for and dispatches one source.  WSLg virtual
                         // compositors can be slow to respond, so we err on
                         // the side of over-pumping rather than under-pumping.
+                        let pump_start = std::time::Instant::now();
+                        let pump_budget = std::time::Duration::from_secs(10);
                         for _ in 0..500 {
                             let allocated = get_aw.map_or(1, |f| f(self.inner));
                             let mapped = get_mapped.map_or(1, |f| f(self.inner));
                             if allocated > 0 && mapped != 0 { break; }
+                            if pump_start.elapsed() > pump_budget { break; }
                             iter(std::ptr::null_mut(), 1);
                         }
                         // Phase 2: all blocking iterations.  On virtual displays
@@ -286,6 +316,7 @@ impl Window {
                         // iterations = ~8s max wait at 16ms/tick, covering
                         // even the slowest virtual compositors.
                         for _ in 0..500 {
+                            if pump_start.elapsed() > pump_budget { break; }
                             iter(std::ptr::null_mut(), 1);
                         }
                         // Force a redraw on the window to ensure the canvas
@@ -293,12 +324,13 @@ impl Window {
                         // schedules an idle handler that calls snapshot() on
                         // the widget tree, which invokes our draw function.
                         if let Some(qd) = loader.symbols.gtk_widget_queue_draw {
-                            unsafe { qd(self.inner); }
+                            qd(self.inner);
                         }
                         // Phase 3: all blocking iterations for the queued
                         // redraw to be processed (allocation idle, frame
                         // clock tick dispatch).
                         for _ in 0..500 {
+                            if pump_start.elapsed() > pump_budget { break; }
                             iter(std::ptr::null_mut(), 1);
                         }
                         // Phase 4: Force a frame clock cycle via
@@ -312,17 +344,18 @@ impl Window {
                             loader.symbols.gtk_widget_get_frame_clock,
                             loader.symbols.gdk_frame_clock_request_phase,
                         ) {
-                            let clock = unsafe { get_fc(self.inner) };
+                            let clock = get_fc(self.inner);
                             if !clock.is_null() {
                                 // GDK_FRAME_CLOCK_PHASE_PAINT = 16 triggers
                                 // the snapshot/paint cycle which calls the
                                 // DrawingArea draw function.
-                                unsafe { request_phase(clock, 16); }
+                                request_phase(clock, 16);
                                 // All blocking iterations to let the frame
                                 // clock process the requested phase.  On
                                 // virtual displays only blocking iterations
                                 // dispatch timer sources.
                                 for _ in 0..500 {
+                                    if pump_start.elapsed() > pump_budget { break; }
                                     iter(std::ptr::null_mut(), 1);
                                 }
                             }
@@ -335,9 +368,9 @@ impl Window {
                             loader.symbols.gtk_widget_get_display,
                             loader.symbols.gdk_display_sync,
                         ) {
-                            let display = unsafe { get_disp(self.inner) };
+                            let display = get_disp(self.inner);
                             if !display.is_null() {
-                                unsafe { disp_sync(display); }
+                                disp_sync(display);
                             }
                         }
                     }
@@ -473,6 +506,14 @@ impl Button {
         guard_widget!(self, "Button", "set_visible");
         if let Some(f) = self.loader.symbols.gtk_widget_set_visible {
             unsafe { f(self.inner, if visible { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn is_visible(&self) -> bool {
+        guard_widget_or!(self, "Button", "is_visible", false);
+        match self.loader.symbols.gtk_widget_get_visible {
+            Some(f) => unsafe { f(self.inner) != 0 },
+            None => false,
         }
     }
 
@@ -1188,6 +1229,21 @@ impl ScrolledWindow {
         )
     }
 
+    /// The vertical adjustment's page size: the height of the visible viewport.
+    ///
+    /// The bottom of the visible viewport is `value + page_size`; comparing it
+    /// against `upper` is how a caller tells "at the bottom" from "scrolled
+    /// away". `upper` alone is the end of the scrollable extent, not the
+    /// bottom of what is shown — without the page size every reading looks
+    /// like the top and follow-the-tail freezes after the first screenful.
+    pub fn get_vadjustment_page_size(&self) -> f64 {
+        guard_widget_or!(self, "ScrolledWindow", "get_vadjustment_page_size", 0.0);
+        self.adj_upper(
+            self.loader.symbols.gtk_scrolled_window_get_vadjustment,
+            self.loader.symbols.gtk_adjustment_get_page_size,
+        )
+    }
+
     fn adj_value(&self, get_adj: Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void>, get_val: Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> f64>) -> f64 {
         get_adj.and_then(|f| {
             let adj = unsafe { f(self.inner) };
@@ -1627,6 +1683,18 @@ impl Entry {
         if let Some(w) = self.loader.symbols.gtk_entry_set_width_chars { unsafe { w(self.inner, n); } }
     }
 
+    /// Faint hint shown while the entry is empty ("Enter prompt here").
+    /// Native placeholder: GTK renders it greyed and it never becomes the
+    /// value, so no submit-path filtering is needed. Missing symbol (older
+    /// GTK) degrades to no hint rather than an error.
+    pub fn set_placeholder_text(&self, text: &str) {
+        guard_widget!(self, "Entry", "set_placeholder_text");
+        if let Some(f) = self.loader.symbols.gtk_entry_set_placeholder_text {
+            let c = CString::new(text).unwrap();
+            unsafe { f(self.inner, c.as_ptr()); }
+        }
+    }
+
     pub fn set_size_request(&self, w: i32, h: i32) {
         guard_widget!(self, "Entry", "set_size_request");
         if w < 150 {
@@ -1993,6 +2061,38 @@ pub unsafe fn widget_set_visible(loader: &Arc<Loader>, widget: *mut c_void, visi
 pub unsafe fn widget_show_all(loader: &Arc<Loader>, widget: *mut c_void) {
     if let Some(show_all) = loader.symbols.gtk_widget_show_all {
         unsafe { show_all(widget); }
+    }
+}
+
+/// Show one widget (GTK3 `gtk_widget_show` / GTK4 `gtk_widget_set_visible`).
+/// Unlike show_all this is NOT recursive: use it for a single row whose
+/// parent is already visible, so a late-appended child appears without
+/// re-showing the whole subtree.
+pub unsafe fn widget_show(loader: &Arc<Loader>, widget: *mut c_void) {
+    if let Some(show) = loader.symbols.gtk_widget_show {
+        unsafe { show(widget); }
+    } else if let Some(set_visible) = loader.symbols.gtk_widget_set_visible {
+        unsafe { set_visible(widget, 1); }
+    }
+}
+
+/// Hide one widget without unparenting it (GTK3 `gtk_widget_hide`).
+/// The widget keeps its pack options, so re-showing restores the layout.
+pub unsafe fn widget_hide(loader: &Arc<Loader>, widget: *mut c_void) {
+    if let Some(hide) = loader.symbols.gtk_widget_hide {
+        unsafe { hide(widget); }
+    } else if let Some(set_visible) = loader.symbols.gtk_widget_set_visible {
+        unsafe { set_visible(widget, 0); }
+    }
+}
+
+/// Re-run size negotiation for a widget and schedule a redraw (GTK
+/// `gtk_widget_queue_resize`). Call after late appends so a container that
+/// already allocated does not keep the newcomer at 1x1 / invisible until
+/// the next manual resize forces a fresh allocate pass.
+pub unsafe fn widget_queue_resize(loader: &Arc<Loader>, widget: *mut c_void) {
+    if let Some(qr) = loader.symbols.gtk_widget_queue_resize {
+        unsafe { qr(widget); }
     }
 }
 
@@ -2782,7 +2882,6 @@ impl MenuBar {
 
     /// Diagnostic: check which action names exist in the given GActionMap.
     pub fn debug_check_actions(&self, group_ptr: *mut c_void, out_path: &str) {
-        use std::io::Write;
         let symbols = &self.loader.symbols;
         let lookup = match symbols.g_action_map_lookup_action {
             Some(f) => f,
@@ -2802,7 +2901,6 @@ impl MenuBar {
 
     /// Diagnostic: check if submenu links exist for all root GMenu items.
     pub fn debug_check_submenu_links(model_ptr: *mut c_void, loader: &crate::loader::Loader, out_path: &str) {
-        use std::io::Write;
         let symbols = &loader.symbols;
         let get_n_items = match symbols.g_menu_model_get_n_items {
             Some(f) => f,
@@ -3508,14 +3606,213 @@ impl TextView {
         }
     }
 
+    /// Append Pango `markup` to the end of the buffer, leaving existing text
+    /// intact — the rich-text counterpart of [`TextView::append_text`].
+    /// GTK validates the markup: on error it inserts nothing rather than raw
+    /// tags, so callers should only pass markup they generated (e.g. from
+    /// `md::render_pango`), never raw model text.
+    pub fn append_markup(&self, markup: &str) {
+        if markup.is_empty() {
+            return;
+        }
+        guard_widget!(self, "TextView", "append_markup");
+        let symbols = &self.loader.symbols;
+        let (Some(get_buf), Some(get_end), Some(insert)) = (
+            symbols.gtk_text_view_get_buffer,
+            symbols.gtk_text_buffer_get_end_iter,
+            symbols.gtk_text_buffer_insert_markup,
+        ) else {
+            return;
+        };
+        unsafe {
+            let buf = get_buf(self.inner);
+            if buf.is_null() {
+                return;
+            }
+            let mut end_iter: [u8; 256] = [0; 256];
+            get_end(buf, end_iter.as_mut_ptr() as *mut c_void);
+            let sanitized: String = markup.chars().filter(|&c| c != '\0').collect();
+            let Ok(c) = CString::new(sanitized) else { return };
+            insert(
+                buf,
+                end_iter.as_mut_ptr() as *mut c_void,
+                c.as_ptr(),
+                -1,
+            );
+        }
+    }
+
     pub fn set_size_request(&self, w: i32, h: i32) {
         guard_widget!(self, "TextView", "set_size_request");
         if let Some(sr) = self.loader.symbols.gtk_widget_set_size_request { unsafe { sr(self.inner, w, h); } }
     }
 
+    /// Whether this TextView currently holds keyboard focus. Used by the GUI
+    /// to decide whether Ctrl-C means "copy the selection" (TextView focused)
+    /// or "cancel the turn" (prompt Entry focused).
+    pub fn has_focus(&self) -> bool {
+        guard_widget_or!(self, "TextView", "has_focus", false);
+        match self.loader.symbols.gtk_widget_has_focus {
+            Some(f) => unsafe { f(self.inner) != 0 },
+            None => false,
+        }
+    }
+
+    /// Whether this TextView *is* the window's focus widget (checked against
+    /// the toplevel window, since focus may live on a child). Same use as
+    /// [`TextView::has_focus`], but robust when GTK reports focus on the
+    /// inner text widget rather than the TextView itself.
+    pub fn is_focus_widget(&self, window: *mut c_void) -> bool {
+        guard_widget_or!(self, "TextView", "is_focus_widget", false);
+        if window.is_null() {
+            return self.has_focus();
+        }
+        match (
+            self.loader.symbols.gtk_window_get_focus,
+            self.loader.symbols.gtk_widget_is_focus,
+        ) {
+            (Some(get_focus), Some(is_focus)) => unsafe {
+                let focused = get_focus(window);
+                !focused.is_null() && (is_focus(self.inner) != 0 || focused == self.inner)
+            },
+            _ => self.has_focus(),
+        }
+    }
+
+    /// Copy the current selection to the CLIPBOARD (GTK's own Ctrl-C path).
+    /// No-op when there is no selection or the symbols are missing.
+    pub fn copy_clipboard(&self) {
+        guard_widget!(self, "TextView", "copy_clipboard");
+        let symbols = &self.loader.symbols;
+        // GDK_SELECTION_CLIPBOARD = 69 ("CLIPBOARD" atom). GTK3 exposes it
+        // only via gdk_atom_intern; hard-code the well-known value rather
+        // than dlopening libgdk for one constant (matches gdk_atom_intern
+        // ("CLIPBOARD") on every GTK3 build).
+        const GDK_SELECTION_CLIPBOARD: i32 = 69;
+        let (Some(get_buf), Some(get_clip), Some(copy)) = (
+            symbols.gtk_text_view_get_buffer,
+            symbols.gtk_widget_get_clipboard,
+            symbols.gtk_text_buffer_copy_clipboard,
+        ) else {
+            return;
+        };
+        unsafe {
+            let buf = get_buf(self.inner);
+            if buf.is_null() {
+                return;
+            }
+            let clip = get_clip(self.inner, GDK_SELECTION_CLIPBOARD);
+            if clip.is_null() {
+                return;
+            }
+            copy(buf, clip);
+        }
+    }
+
     pub fn set_hexpand(&self, expand: bool) {
         guard_widget!(self, "TextView", "set_hexpand");
         if let Some(set_hex) = self.loader.symbols.gtk_widget_set_hexpand { unsafe { set_hex(self.inner, if expand { 1 } else { 0 }); } }
+    }
+
+    /// Whether the buffer currently holds a selection. The GUI's link click
+    /// handler consults this first: a button release that ends a selection is
+    /// a copy gesture, never a link activation. Missing symbol ⇒ `false`
+    /// (fail closed: a click on a link still opens it).
+    pub fn buffer_has_selection(&self) -> bool {
+        guard_widget_or!(self, "TextView", "buffer_has_selection", false);
+        let symbols = &self.loader.symbols;
+        let (Some(get_buf), Some(has_sel)) = (
+            symbols.gtk_text_view_get_buffer,
+            symbols.gtk_text_buffer_get_has_selection,
+        ) else {
+            return false;
+        };
+        unsafe {
+            let buf = get_buf(self.inner);
+            if buf.is_null() {
+                return false;
+            }
+            has_sel(buf) != 0
+        }
+    }
+
+    /// Resolve a `button-release-event` at widget coordinates (`wx`, `wy`) to
+    /// a buffer position: `(line, line_char_offset)`. The caller owns the
+    /// per-line URL map and does the range lookup — this only maps the click
+    /// to buffer coordinates. `None` when the coordinate symbols are missing
+    /// (clicks then never open links) or the position is invalid.
+    pub fn link_hit_at(&self, wx: i32, wy: i32) -> Option<(i32, i32)> {
+        guard_widget_or!(self, "TextView", "link_hit_at", None);
+        let symbols = &self.loader.symbols;
+        let (Some(to_buffer), Some(at_location), Some(get_line), Some(get_col)) = (
+            symbols.gtk_text_view_window_to_buffer_coords,
+            symbols.gtk_text_view_get_iter_at_location,
+            symbols.gtk_text_iter_get_line,
+            symbols.gtk_text_iter_get_line_offset,
+        ) else {
+            return None;
+        };
+        unsafe {
+            let mut bx: i32 = 0;
+            let mut by: i32 = 0;
+            // GTK_TEXT_WINDOW_TEXT = 2 (GTK3's text window; GTK4 ignores it).
+            to_buffer(self.inner, 2, wx, wy, &mut bx, &mut by);
+            let mut iter: [u8; 256] = [0; 256];
+            if at_location(self.inner, iter.as_mut_ptr() as *mut c_void, bx, by) == 0 {
+                return None;
+            }
+            let line = get_line(iter.as_mut_ptr() as *mut c_void);
+            let col = get_col(iter.as_mut_ptr() as *mut c_void);
+            if line < 0 || col < 0 {
+                return None;
+            }
+            Some((line, col))
+        }
+    }
+
+    /// Which mouse button a `button-release-event` is for (1 = left). `None`
+    /// when the symbol is missing — the caller then treats the release as a
+    /// left click (GTK3 delivers button releases to this handler only for
+    /// pressed buttons anyway).
+    pub fn release_button(event: *mut c_void, loader: &Arc<Loader>) -> Option<u32> {
+        match loader.symbols.gdk_event_get_button {
+            Some(f) => {
+                let mut button: u32 = 0;
+                if unsafe { f(event, &mut button) } != 0 {
+                    Some(button)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    }
+
+    /// Connect a `button-release-event` handler. The closure receives the raw
+    /// GDK event pointer and returns 1 to stop propagation, 0 to propagate.
+    /// Follows the `Entry::connect_button_press` pattern; also enables the
+    /// button-release event mask (GTK3) so the signal fires at all.
+    pub fn connect_button_release<F: FnMut(*mut c_void) -> i32 + 'static>(
+        &self,
+        f: F,
+    ) -> Result<u64, Error> {
+        guard_widget_or!(
+            self,
+            "TextView",
+            "connect_button_release",
+            Err(Error::Other("textview dropped".into()))
+        );
+        // GDK_BUTTON_RELEASE_MASK = 1 << 3: without it GTK3 never delivers
+        // button-release-event to a TextView.
+        unsafe { crate::wrappers::widget_add_events(&self.loader, self.inner, 1 << 3) };
+        let boxed: Box<dyn FnMut(*mut c_void) -> i32> = Box::new(f);
+        let res = unsafe {
+            crate::signals::connect_signal_bool(&self.loader.symbols, self.inner, "button-release-event", boxed)
+        };
+        match res {
+            Ok(id) => Ok(id),
+            Err(e) => Err(Error::Other(e)),
+        }
     }
 
     pub fn set_vexpand(&self, expand: bool) {

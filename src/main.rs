@@ -29,6 +29,7 @@ mod scratchpad;
 mod resource;
 mod session;
 mod session_index;
+mod session_tree;
 mod sixel;
 mod skills;
 mod lints;
@@ -378,6 +379,11 @@ SPACE BUNNY ALPHA (free preview)
     pir -m commandcode/stealth/space-bunny-alpha     (CMD_API_KEY / COMMANDCODE_API_KEY or auth.json `commandcode`)
   Both routes expose 1M context and up to 524,288 output tokens. Reasoning is mandatory;
   OpenRouter uses nested `reasoning: {effort}`, while Command Code uses `reasoning_effort`.
+
+LAGUNA S 2.1 (free, Command Code route only)
+  Poolside's open-weight coding agent model, free while capacity lasts:
+    pir -m commandcode/poolside/laguna-s-2.1-free     (CMD_API_KEY / COMMANDCODE_API_KEY or auth.json `commandcode`)
+  256K context, up to 32,768 output tokens, plain `reasoning_effort` (low/medium/high).
 
 PER-PROJECT USERS
   `pir project init` creates a non-login user ai_<project> owning the cwd so
@@ -2681,7 +2687,10 @@ Install one: {}",
 /// emphasis, ordered/unordered lists, blockquotes, fenced code blocks in
 /// multiple languages (rust, js, json), an inline-code span, a GFM table, and a
 /// link — i.e. exactly the shapes a model produces.
-const MARKUP_DEMO: &str = r#"# pir markup demo
+///
+/// `pub(crate)` so the GUI's `/markup_demo` arm pushes the same sample through
+/// the pane's own markdown path (there is one sample, not two that can drift).
+pub(crate) const MARKUP_DEMO: &str = r#"# pir markup demo
 
 This **reply** was rendered _just like_ an `agent` response — streamed through
 the same incremental renderer, not a one-shot `md::render`.
@@ -3806,7 +3815,7 @@ fn handle_command(
                 Err(e) => eprintln!("{e}"),
             }
         }
-        "sessions" => print!("{}", list_sessions()),
+        "sessions" => print!("{}", list_sessions_tree(bus.unread_counts())),
         "bg" => {
             let prompt: String = rest.join(" ");
             if prompt.trim().is_empty() {
@@ -5074,6 +5083,120 @@ fn list_models(providers: &[Provider]) -> String {
     out
 }
 
+/// Grouped left-tree rendering of the session list (what `/sessions` shows).
+///
+/// Same sessions as [`list_sessions`], grouped by project root with one
+/// [`session_tree::SessionPresence`] glyph per row (`▶` running, `●n`
+/// waiting-unread, `✓` waiting-seen, `·` idle) — the identical model and
+/// glyphs the graphical tree renders, so flat and tree never disagree.
+/// `unread` is the bus's per-session pending counts (empty = no badges).
+/// Indices match the flat list's positional order (newest-first across ALL
+/// groups) so `pir -r <idx>` keeps working while the tree is shown.
+fn list_sessions_tree(unread: std::collections::HashMap<String, u32>) -> String {
+    let my_pid = term::parent_shell_pid();
+    let my_tty = term::parent_shell_tty();
+    let sessions = match scan_sessions() {
+        Some(s) => s,
+        None => return term::dim("(no session log directory found)\n").to_string(),
+    };
+    if sessions.is_empty() {
+        return term::dim("(no sessions yet)\n").to_string();
+    }
+    let here = match &my_tty {
+        Some(t) => format!("highlighted = from this shell, {t}"),
+        None => format!("highlighted = from this shell, sh{my_pid}"),
+    };
+    // Flat positional index (what `pir -r <idx>` resolves): newest-first
+    // across all sessions, independent of grouping — computed BEFORE grouping
+    // so the numbers match `list_sessions` exactly.
+    let mut flat = sessions.clone();
+    flat.sort_by(|a, b| b.mtime.cmp(&a.mtime).then(b.bytes.cmp(&a.bytes)));
+    let order: std::collections::HashMap<std::path::PathBuf, usize> = flat
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.path.clone(), i))
+        .collect();
+
+    let rows: Vec<session_tree::ScanRow> = sessions
+        .iter()
+        .map(|s| session_tree::ScanRow {
+            path: s.path.clone(),
+            name: s.name.clone(),
+            shell_pid: s.shell_pid,
+            tty: s.tty.clone(),
+            cwd: s.cwd.clone(),
+            mtime: s.mtime,
+            bytes: s.bytes,
+            preview: s.preview.clone(),
+            local: s.local,
+            from_here: session_is_from_here(s, my_pid, my_tty.as_deref()),
+        })
+        .collect();
+    let groups = session_tree::build_tree(&rows, &unread);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let state = session_tree::load_state(&cwd.to_string_lossy());
+
+    let mut out = String::new();
+    out.push_str(&format!("{} ({here})\n", term::bold("sessions")));
+    for g in &groups {
+        let expanded = state.is_expanded(&g.key);
+        let marker = if expanded { "▾" } else { "▸" };
+        // Per-group attention summary, so a collapsed group still advertises
+        // waiting sessions (the badge is never silently hidden).
+        let running = g.sessions.iter().filter(|s| s.live).count();
+        let waiting: usize = g
+            .sessions
+            .iter()
+            .filter(|s| matches!(s.presence, session_tree::SessionPresence::NeedsInputUnread(_) | session_tree::SessionPresence::NeedsInputSeen))
+            .count();
+        let summary = match (running, waiting) {
+            (0, 0) => format!("{} session{}", g.sessions.len(), if g.sessions.len() == 1 { "" } else { "s" }),
+            (r, 0) => format!("{} session{}, {r} running", g.sessions.len(), if g.sessions.len() == 1 { "" } else { "s" }),
+            (0, w) => format!("{} session{}, {w} waiting", g.sessions.len(), if g.sessions.len() == 1 { "" } else { "s" }),
+            (r, w) => format!("{} session{}, {r} running, {w} waiting", g.sessions.len(), if g.sessions.len() == 1 { "" } else { "s" }),
+        };
+        let header = if g.local {
+            term::cyan(&g.label)
+        } else {
+            term::dim(&g.label).to_string()
+        };
+        out.push_str(&format!("{marker} {header}  {}\n", term::dim(&summary)));
+        if !expanded {
+            continue;
+        }
+        for s in &g.sessions {
+            let idx = order.get(&PathBuf::from(&s.id)).copied().unwrap_or(usize::MAX);
+            let marker = if s.from_here { term::cyan("▸") } else { " ".to_string() };
+            let (glyph, title) = match s.presence {
+                session_tree::SessionPresence::Running => {
+                    (term::cyan("▶").to_string(), s.title.clone())
+                }
+                session_tree::SessionPresence::NeedsInputUnread(n) => {
+                    (term::yellow(&format!("●{n}")), term::bold(&s.title))
+                }
+                session_tree::SessionPresence::NeedsInputSeen => {
+                    ("✓".to_string(), term::dim(&s.title).to_string())
+                }
+                session_tree::SessionPresence::Idle => ("·".to_string(), term::dim(&s.title).to_string()),
+            };
+            let detail = if s.cwd_tail.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", s.cwd_tail)
+            };
+            out.push_str(&format!(
+                "  {marker} {:>2}  {glyph}  {title}{}\n",
+                if idx == usize::MAX { "–".to_string() } else { idx.to_string() },
+                term::dim(&detail),
+            ));
+        }
+    }
+    out.push_str(&term::dim(
+        "resume with: pir -r <idx|time|preview>  (omit token => latest from this shell/dir)\n",
+    ));
+    out
+}
+
 fn list_sessions() -> String {
     let my_pid = term::parent_shell_pid();
     let my_tty = term::parent_shell_tty();
@@ -5397,6 +5520,7 @@ fn resolve_resume(token: Option<&str>) -> Option<PathBuf> {
     }
 }
 
+#[derive(Clone)]
 struct Session {
     path: PathBuf,
     name: String,
@@ -5583,6 +5707,7 @@ fn scan_sessions() -> Option<Vec<Session>> {
                             tty: tty.clone(),
                             cwd: cwd.clone(),
                             preview: preview.clone(),
+                            project_root: crate::session_tree::derive_project_root(&cwd).0,
                         },
                     );
                     (tty, cwd, preview)

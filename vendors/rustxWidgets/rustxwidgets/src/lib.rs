@@ -1,9 +1,15 @@
 //! rustxwidgets: cross-platform thin GUI abstraction (GTK-dlopen on Linux, NWG on Windows)
-#![warn(missing_docs)]
+//!
+//! `missing_docs` is allowed (not warned): this is an internal path-dependency
+//! crate, never published, so rustdoc output is never rendered for it. The
+//! public API is documented where behavior is non-obvious via inline comments;
+//! requiring doc comments on all ~350 public items would be pure noise.
+#![allow(missing_docs)]
 
 pub mod prelude;
 pub mod core;
 pub mod common;
+pub mod tree;
 pub mod overflow;
 pub mod lifecycle_stress;
 pub mod backends;

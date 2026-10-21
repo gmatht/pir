@@ -99,7 +99,7 @@ mod gtk_adapter {
                 }
             }
         }
-        pub fn on_event_key(&self, mut cb: Box<dyn FnMut(u32, u32) -> i32>) {
+        pub fn on_event_key(&self, cb: Box<dyn FnMut(u32, u32) -> i32>) {
             if let Some(loader) = crate::backends::gtk::loader() {
                 let win_ptr = *self.0.as_ref();
                 if !win_ptr.is_null() {
@@ -220,6 +220,7 @@ mod gtk_adapter {
         pub fn get_text(&self) -> Option<String> { self.0.get_text() }
         pub fn set_text(&self, text: &str) { self.0.set_text(text); }
         pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
+        pub fn is_visible(&self) -> bool { self.0.is_visible() }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
         pub fn set_font_style(&self, weight: i32, italic: bool) { self.0.set_font_style(weight, italic); }
@@ -274,6 +275,49 @@ mod gtk_adapter {
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
+        /// Recursively show this box and everything under it (GTK3's
+        /// `gtk_widget_show_all`). Needed for content created after
+        /// `window.present()`: its blanket show_all only reveals what exists
+        /// at that point, so a later tab's pane would otherwise stay hidden.
+        pub fn show_all(&self) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                let ptr = *self.0.as_ref();
+                if !ptr.is_null() {
+                    unsafe { gtk_dynamic_loader::widget_show_all(&loader, ptr); }
+                }
+            }
+        }
+        /// Show one direct child without re-showing the whole subtree: for
+        /// rows appended after present(), whose parent is already visible.
+        pub fn show_child(&self, child: &impl AsRef<*mut c_void>) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                let p = *child.as_ref();
+                if !p.is_null() {
+                    unsafe { gtk_dynamic_loader::widget_show(&loader, p); }
+                }
+            }
+        }
+        /// Hide one direct child without unparenting it: pack options are
+        /// kept, so re-showing restores the layout exactly.
+        pub fn hide_child(&self, child: &impl AsRef<*mut c_void>) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                let p = *child.as_ref();
+                if !p.is_null() {
+                    unsafe { gtk_dynamic_loader::widget_hide(&loader, p); }
+                }
+            }
+        }
+        /// Re-run size negotiation after late appends so newcomers are
+        /// allocated (not left 1x1/invisible until the next manual resize
+        /// forces a fresh allocate pass).
+        pub fn queue_resize(&self) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                let ptr = *self.0.as_ref();
+                if !ptr.is_null() {
+                    unsafe { gtk_dynamic_loader::widget_queue_resize(&loader, ptr); }
+                }
+            }
+        }
         pub fn set_child_hexpand(&self, child: &impl AsRef<*mut c_void>, expand: bool) {
             if let Some(loader) = crate::backends::gtk::loader() {
                 let child_ptr = *child.as_ref();
@@ -321,6 +365,7 @@ mod gtk_adapter {
         /// Clear selection / park cursor — stops the tap select-all flash.
         pub fn select_region(&self, start: i32, end: i32) { self.inner.select_region(start, end); }
         pub fn set_width_chars(&self, n: i32) { self.inner.set_width_chars(n); }
+        pub fn set_placeholder_text(&self, text: &str) { self.inner.set_placeholder_text(text); }
         pub fn set_size_request(&self, w: i32, h: i32) { self.inner.set_size_request(w, h); }
         pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, Error> { self.inner.connect_changed(f).map_err(|e| Error::Backend(format!("{}", e))) }
         pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {
@@ -571,6 +616,10 @@ mod gtk_adapter {
     impl AsRef<*mut c_void> for DropDown { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
 
     impl DropDown {
+        /// A cheap, cloneable handle to this dropdown, for a `'static` callback
+        /// that needs to read `get_active()` later. The loader type is
+        /// `#[repr(transparent)]` over the raw handle and is itself `Clone`.
+        pub fn selection_handle(&self) -> GDropDown { self.0.clone() }
         pub fn set_active(&self, index: Option<u32>) {
             if let Some(idx) = index { self.0.set_active(idx); }
         }
@@ -649,6 +698,44 @@ mod gtk_adapter {
         pub fn set_text(&self, text: &str) { self.0.set_text(text); }
         pub fn get_text(&self) -> Option<String> { self.0.get_text() }
         pub fn append_text(&self, text: &str) { self.0.append_text(text); }
+        /// Append Pango markup (rich text). No-op when the loader lacks
+        /// `gtk_text_buffer_insert_markup`; the caller decides the fallback.
+        pub fn append_markup(&self, markup: &str) { self.0.append_markup(markup); }
+        /// Whether this pane currently holds keyboard focus (copy path).
+        pub fn has_focus(&self) -> bool { self.0.has_focus() }
+        /// Whether this pane is the window's focus widget (copy path).
+        pub fn is_focus_widget(&self, window: *mut c_void) -> bool {
+            self.0.is_focus_widget(window)
+        }
+        /// Copy the current selection to the CLIPBOARD (copy path).
+        pub fn copy_clipboard(&self) { self.0.copy_clipboard() }
+        /// Whether the buffer holds a selection (link click guard: a release
+        /// ending a selection is a copy gesture, never a link activation).
+        pub fn buffer_has_selection(&self) -> bool { self.0.buffer_has_selection() }
+        /// Resolve a `button-release-event` at widget coords to a buffer
+        /// `(line, line_char_offset)`, else `None`. The caller owns the
+        /// per-line URL map and does the range lookup.
+        pub fn link_hit_at(&self, wx: i32, wy: i32) -> Option<(i32, i32)> {
+            self.0.link_hit_at(wx, wy)
+        }
+        /// Which mouse button a release event is for (1 = left), `None` when
+        /// the symbol is missing (caller treats it as a left click).
+        pub fn release_button(
+            event: *mut c_void,
+            loader: &std::sync::Arc<gtk_dynamic_loader::Loader>,
+        ) -> Option<u32> {
+            GTextView::release_button(event, loader)
+        }
+        /// Connect a `button-release-event` handler (1 = stop, 0 = propagate).
+        pub fn connect_button_release<F: FnMut(*mut c_void) -> i32 + 'static>(
+            &self,
+            f: F,
+        ) -> Result<(), Error> {
+            self.0
+                .connect_button_release(f)
+                .map(|_| ())
+                .map_err(|e| Error::Backend(format!("{e}")))
+        }
         pub fn set_editable(&self, editable: bool) { self.0.set_editable(editable); }
         pub fn get_editable(&self) -> bool { self.0.get_editable() }
         pub fn get_can_focus(&self) -> bool { self.0.get_can_focus() }
@@ -1047,6 +1134,12 @@ mod gtk_adapter {
         /// `get_vadjustment_value` is how a caller tells "at the bottom" from
         /// "scrolled away from the bottom" — i.e. follow-the-tail.
         pub fn get_vadjustment_upper(&self) -> f64 { self.0.get_vadjustment_upper() }
+
+        /// Height of the visible viewport, in pixels. The bottom of what is
+        /// shown is `value + page_size`; `upper` alone is the end of the
+        /// extent. Without this every reading looks like the top and
+        /// follow-the-tail freezes after the first screenful.
+        pub fn get_vadjustment_page_size(&self) -> f64 { self.0.get_vadjustment_page_size() }
     }
 
     impl AsRef<*mut c_void> for ScrolledWindow { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
@@ -1285,11 +1378,16 @@ mod gtk_adapter {
             let outer = create_box(gtk_dynamic_loader::Orientation::Vertical, 0)?;
             let tab_bar = create_box(gtk_dynamic_loader::Orientation::Horizontal, 4)?;
             let content = create_box(gtk_dynamic_loader::Orientation::Vertical, 0)?;
+            // GTK3's gtk_box_pack_start snapshots the child's expand/fill
+            // flags AT PACK TIME into the child's pack options. Setting
+            // hexpand/vexpand *after* append/pack leaves the packed copy at
+            // non-expanding, so the child keeps its minimum size and the
+            // window fills with blank space. Set the flags BEFORE append.
+            tab_bar.set_hexpand(true);
+            content.set_hexpand(true);
+            content.set_vexpand(true);
             outer.append(&tab_bar);
             outer.append(&content);
-            outer.set_child_hexpand(&tab_bar, true);
-            outer.set_child_hexpand(&content, true);
-            outer.set_child_vexpand(&content, true);
             Ok(TabView {
                 outer,
                 tab_bar,
@@ -1304,9 +1402,28 @@ mod gtk_adapter {
         pub fn add_tab(&self, title: &str) -> Result<usize, Error> {
             let idx = self.panels.borrow().len();
             let btn = create_button(title)?;
+            // Same pack-time rule as TabView::new: the tab button must carry
+            // hexpand BEFORE it is packed, or the pack snapshots it as
+            // non-expanding.
+            btn.set_hexpand(true);
             self.tab_bar.append(&btn);
-            self.tab_bar.set_child_hexpand(&btn, true);
+            // GTK3 creates widgets hidden; only window.present()'s blanket
+            // show_all reveals what exists at that point. A tab added later
+            // (every "New session") must be shown explicitly or its button
+            // stays invisible and the session looks like it did nothing.
+            btn.set_visible(true);
             let panel = create_box(gtk_dynamic_loader::Orientation::Vertical, 0)?;
+            // Attach the panel to the visible content box. Without this the
+            // panel `tab_box()` hands out is an orphaned subtree: the session
+            // pane (conversation TextView + prompt Entry) is built into it but
+            // never reaches the screen, leaving an empty grey block with only
+            // the session tab button.
+            //
+            // Same pack-time rule as above: expand flags BEFORE append, or the
+            // packed copy keeps the panel at minimum size (blank window).
+            panel.set_hexpand(true);
+            panel.set_vexpand(true);
+            self.content.append(&panel);
             panel.set_visible(false);
             let my_index = Rc::new(Cell::new(idx));
             let panels = self.panels.clone();
@@ -1319,10 +1436,32 @@ mod gtk_adapter {
             self.buttons.borrow_mut().push(btn);
             self.panels.borrow_mut().push(panel.clone());
             self.indices.borrow_mut().push(my_index);
+            // The panel starts hidden and `set_active` reveals the current
+            // one, but nothing ever shows the *content*: GTK3 keeps widgets
+            // created after present() hidden (only present()'s blanket
+            // show_all reveals what exists then), so the pane
+            // `spawn_session` fills next must be shown explicitly or the new
+            // tab is a blank hole even after switching to it.
+            panel.show_all();
             if idx == 0 {
                 tv_set_active(&self.panels, &self.active, 0, &self.tab_changed);
             }
             Ok(idx)
+        }
+
+        /// Whether the tab button at `idx` is actually shown.
+        ///
+        /// GTK3 creates widgets hidden: only `window.present()`'s blanket
+        /// `show_all` (plus explicit `set_visible` calls) makes them appear.
+        /// A button added to an already-presented window — every "New session"
+        /// tab — stays invisible unless something shows it, so the tab "does
+        /// nothing" from the operator's side even though the model updated.
+        pub fn tab_button_visible(&self, idx: usize) -> bool {
+            self.buttons
+                .borrow()
+                .get(idx)
+                .map(|b| b.is_visible())
+                .unwrap_or(false)
         }
         pub fn tab_box(&self, idx: usize) -> Result<BoxWidget, Error> {
             Ok(self.panels.borrow()
@@ -1330,6 +1469,14 @@ mod gtk_adapter {
                 .ok_or_else(|| Error::Backend(format!("tab index {idx} out of range")))?
                 .clone())
         }
+        /// Let the container holding this TabView give it the free space.
+        ///
+        /// GTK3 snapshots expand at pack time, so the caller (pir's `run`)
+        /// must set these BEFORE `root.append(&tabs)`. Without them the tab
+        /// container keeps its minimum size and the window is mostly blank.
+        pub fn set_hexpand(&self, expand: bool) { self.outer.set_hexpand(expand); }
+        /// See [`TabView::set_hexpand`].
+        pub fn set_vexpand(&self, expand: bool) { self.outer.set_vexpand(expand); }
         pub fn set_on_tab_changed(&self, cb: Box<dyn FnMut(usize)>) {
             *self.tab_changed.borrow_mut() = Some(cb);
         }

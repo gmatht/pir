@@ -131,8 +131,6 @@ mod pancurses_adapter {
     #[derive(Clone)]
     pub struct BoxWidget {
         pub(crate) id: usize,
-        pub(crate) orientation: Orientation,
-        pub(crate) spacing: i32,
     }
 
     #[derive(Clone, Copy, PartialEq)]
@@ -160,6 +158,8 @@ mod pancurses_adapter {
 
         pub fn set_child_vexpand(&self, _child: &impl AsRef<*mut c_void>, _expand: bool) {}
         pub fn set_child_hexpand(&self, _child: &impl AsRef<*mut c_void>, _expand: bool) {}
+        /// Text UIs have no hidden-widget state; kept for the cross-backend rule.
+        pub fn show_all(&self) {}
     }
 
     // -- Grid --
@@ -225,6 +225,8 @@ mod pancurses_adapter {
         pub fn set_visible(&self, _visible: bool) {}
         pub fn set_size_request(&self, _w: i32, _h: i32) {}
         pub fn set_width_chars(&self, _w: i32) {}
+        /// Placeholder hint: no-op (no text-entry widget to render it in).
+        pub fn set_placeholder_text(&self, _text: &str) {}
         pub fn set_margin_start(&self, _margin: i32) {}
         pub fn set_margin_top(&self, _margin: i32) {}
         pub fn add_class(&self, _class_name: &str) {}
@@ -738,7 +740,7 @@ mod pancurses_adapter {
     pub fn create_box(orientation: Orientation, spacing: i32) -> Result<BoxWidget, Error> {
         let horizontal = orientation == Orientation::Horizontal;
         crate::backends::pancurses::create_box(horizontal, spacing)
-            .map(|id| BoxWidget { id, orientation, spacing })
+            .map(|id| BoxWidget { id })
             .map_err(|e| Error::Backend(format!("{}", e)))
     }
 

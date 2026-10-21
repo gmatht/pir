@@ -52,12 +52,14 @@ mod gtk_backend {
     }
 
     pub fn init() -> Result<Box<dyn crate::backends::BackendApp>, Box<dyn StdError + Send + Sync>> {
-        let backend = std::env::var("BACKEND").unwrap_or_default();
         #[cfg(feature = "gtk4-rs")]
-        if backend == "gtk4" {
-            match gtk_dynamic_loader::Loader::new_gtk4rs() {
-                Ok(loader) => return GtkApp::new_with_loader(loader).map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync>),
-                Err(e) => { eprintln!("gtk4-rs backend failed: {e}, falling back to dlopen"); }
+        {
+            let backend = std::env::var("BACKEND").unwrap_or_default();
+            if backend == "gtk4" {
+                match gtk_dynamic_loader::Loader::new_gtk4rs() {
+                    Ok(loader) => return GtkApp::new_with_loader(loader).map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync>),
+                    Err(e) => { eprintln!("gtk4-rs backend failed: {e}, falling back to dlopen"); }
+                }
             }
         }
         match GtkApp::new_default() {

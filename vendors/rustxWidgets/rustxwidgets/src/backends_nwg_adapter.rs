@@ -306,6 +306,11 @@ mod nwg_adapter {
                 }
             }
         }
+        /// Layout hint: NWG lays the parent box out itself, so expand flags
+        /// have no per-widget equivalent. Present so the shared GUI code (and
+        /// the GTK parity of every call site) compiles unchanged.
+        pub fn set_hexpand(&self, _expand: bool) {}
+        pub fn set_vexpand(&self, _expand: bool) {}
         pub fn set_font_style(&self, weight: i32, italic: bool) {
             if let Some(hwnd) = self.inner.handle.hwnd() {
                 unsafe {
@@ -340,6 +345,11 @@ mod nwg_adapter {
         pub fn remove_class(&self, _class: &str) {}
         pub fn set_text(&self, text: &str) { self.inner.set_text(text); }
         pub fn get_text(&self) -> Option<String> { Some(self.inner.text()) }
+        /// Show or hide the button. NWG creates controls visible by default,
+        /// so this is normally a no-op for freshly added tab buttons — it
+        /// exists to keep the cross-backend `add_tab` contract ("added tabs
+        /// are shown") compilable and honest on every platform.
+        pub fn set_visible(&self, visible: bool) { self.inner.set_visible(visible); }
     }
 
     impl AsRef<*mut c_void> for Button {
@@ -479,6 +489,10 @@ mod nwg_adapter {
     }
 
     impl BoxWidget {
+        /// Layout hint: the NWG box lays its children out itself, so a size
+        /// request has no per-box equivalent. Present so shared GUI code (and
+        /// every GTK parity call site) compiles unchanged.
+        pub fn set_size_request(&self, _w: i32, _h: i32) {}
         pub fn append(&self, child: &impl Appendable) {
             let hwnds = child.collect_hwnds();
             for &ptr in &hwnds {
@@ -509,6 +523,36 @@ mod nwg_adapter {
             let mut hex = self.child_hexpand.borrow_mut();
             if let Some(idx) = children.iter().position(|&c| c == ptr) {
                 hex[idx] = expand;
+            }
+        }
+        /// Show one direct child (NWG controls are visible by default; this
+        /// re-shows one hidden by `hide_child`).
+        pub fn show_child(&self, child: &impl AsRef<*mut c_void>) {
+            use winapi::um::winuser::{SetWindowPos, SWP_SHOWWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER};
+            let hwnd = *child.as_ref() as *mut winapi::shared::windef::HWND__;
+            if !hwnd.is_null() {
+                unsafe { SetWindowPos(hwnd as _, std::ptr::null_mut(), 0, 0, 0, 0,
+                    SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER); }
+            }
+            self.layout_refresh();
+        }
+        /// Hide one direct child without unparenting it.
+        pub fn hide_child(&self, child: &impl AsRef<*mut c_void>) {
+            use winapi::um::winuser::{SetWindowPos, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER};
+            let hwnd = *child.as_ref() as *mut winapi::shared::windef::HWND__;
+            if !hwnd.is_null() {
+                unsafe { SetWindowPos(hwnd as _, std::ptr::null_mut(), 0, 0, 0, 0,
+                    SWP_HIDEWINDOW | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER); }
+            }
+        }
+        /// Re-run layout after late appends.
+        pub fn queue_resize(&self) {
+            self.layout_refresh();
+        }
+        fn layout_refresh(&self) {
+            let (w, h) = (self.last_w.get(), self.last_h.get());
+            if w > 0 && h > 0 {
+                self.layout(0, 0, w, h);
             }
         }
         pub fn layout(&self, _x: i32, _y: i32, w: i32, h: i32) {
@@ -599,6 +643,19 @@ mod nwg_adapter {
     pub fn set_visible(&self, v: bool) {
         if let Some(f) = &self.frame { f.set_visible(v); }
     }
+        /// Recursively show this box's children. NWG creates controls visible
+        /// by default (builders pass `VISIBLE`), so this is normally a no-op —
+        /// it exists to keep the cross-backend rule ("content added after the
+        /// window is shown must be shown explicitly") compilable on Windows.
+        pub fn show_all(&self) {
+            for &child in self.children.borrow().iter() {
+                if !child.is_null() && !self.hwnd.is_null() {
+                    unsafe {
+                        winapi::um::winuser::ShowWindow(child as _, winapi::um::winuser::SW_SHOW);
+                    }
+                }
+            }
+        }
         pub fn set_hexpand(&self, _expand: bool) {}
         pub fn remove(&self, child: &impl AsRef<*mut c_void>) {
             let ptr = *child.as_ref();
@@ -741,6 +798,10 @@ mod nwg_adapter {
                 }
             }
         }
+        /// Placeholder hint: no-op on NWG (the vendored native-windows-gui
+        /// exposes no cue-banner API; wiring EM_SETCUEBANNER via raw SendMessage
+        /// is future work). GTK renders it natively.
+        pub fn set_placeholder_text(&self, _text: &str) {}
         pub fn set_visible(&self, v: bool) { self.inner.set_visible(v); }
         pub fn grab_focus(&self) {
             let _ = self.inner.set_focus();
@@ -917,6 +978,21 @@ mod nwg_adapter {
         pub(crate) _handler: Rc<nwg::EventHandler>,
     }
 
+    /// A cheap, cloneable view of a `DropDown`'s selection, for `'static`
+    /// callbacks that must read the current row later (the model picker's
+    /// `changed` handler). The GTK adapter returns its loader handle from
+    /// `DropDown::selection_handle`, whose `get_active()` yields `i32`; this
+    /// yields `i32` too (negative = nothing selected), so the shared GUI code
+    /// reads a selection the same way on both backends.
+    #[derive(Clone)]
+    pub struct SelectionHandle(pub(crate) Rc<nwg::ComboBox<String>>);
+
+    impl SelectionHandle {
+        pub fn get_active(&self) -> i32 {
+            self.0.selection().map(|i| i as i32).unwrap_or(-1)
+        }
+    }
+
     impl DropDown {
         pub fn set_active(&self, index: Option<u32>) {
             self.inner.set_selection(index.map(|i| i as usize));
@@ -927,11 +1003,34 @@ mod nwg_adapter {
         pub fn get_active(&self) -> u32 {
             self.inner.selection().unwrap_or(0) as u32
         }
+        /// A cheap, cloneable handle to this dropdown (NWG's `DropDown` is an
+        /// `Rc`-backed control), for a `'static` callback that needs to read
+        /// the selection later. Mirrors the GTK adapter's method of the same
+        /// name so the shared GUI code can capture one handle on either
+        /// backend.
+        pub fn selection_handle(&self) -> SelectionHandle { SelectionHandle(self.inner.clone()) }
         pub fn connect_changed(&self, _f: impl FnMut() + 'static) -> Result<u64, Error> {
             Ok(0)
         }
         pub fn set_hexpand(&self, _expand: bool) {}
         pub fn set_vexpand(&self, _expand: bool) {}
+        /// Resize the combo box: the GUI re-fits the model picker to the
+        /// current model label so a long id cannot stretch the prompt row.
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            let Some(hwnd) = self.inner.handle.hwnd() else { return };
+            unsafe {
+                let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+                winapi::um::winuser::GetWindowRect(hwnd as _, &mut rect);
+                winapi::um::winuser::SetWindowPos(
+                    hwnd as _,
+                    std::ptr::null_mut(),
+                    0, 0,
+                    if w > 0 { w } else { rect.right - rect.left },
+                    if h > 0 { h } else { rect.bottom - rect.top },
+                    winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE,
+                );
+            }
+        }
     }
 
     impl AsRef<*mut c_void> for DropDown {
@@ -1021,6 +1120,11 @@ mod nwg_adapter {
         pub(crate) inner: Rc<nwg::TextBox>,
         pub(crate) changed_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>>,
         pub(crate) _handler: Rc<nwg::EventHandler>,
+        /// Raw `WM_LBUTTONUP` subclasses added by `connect_left_release`.
+        /// NWG unbinds a raw handler when its `RawEventHandler` is dropped, so
+        /// the handles must live as long as the control (same pattern as
+        /// `_handler`).
+        pub(crate) raw_handlers: Rc<RefCell<Vec<nwg::RawEventHandler>>>,
     }
 
     impl TextView {
@@ -1034,7 +1138,147 @@ mod nwg_adapter {
         /// engine, so tags/entities are stripped (the GTK backend keeps colour).
         pub fn set_markup(&self, markup: &str) {
             let cur = self.inner.text();
-            self.inner.set_text(&format!("{}{}\n", cur, strip_pango(markup)));
+            self.inner.set_text(&format!("{}{}\n", cur, plain_line(markup)));
+        }
+
+        /// The exact text [`TextView::set_markup`] inserts for `markup`, minus
+        /// the trailing newline: markup-stripped, entity-decoded plain text.
+        ///
+        /// Public so the GUI can resolve clickable-link spans against the
+        /// string the buffer actually receives (Pango markup shifts bytes, so
+        /// spans computed on the markup would point at the wrong characters).
+        /// One implementation, shared with `set_markup`, so the two cannot
+        /// drift apart.
+        pub fn plain_line(markup: &str) -> String { plain_line(markup) }
+
+        /// Whether the control currently has a text selection. The GUI's link
+        /// click handler consults this first: a button release that ends a
+        /// selection is a copy gesture, never a link activation (`EM_GETSEL`
+        /// returns distinct start/end indices when anything is selected).
+        pub fn buffer_has_selection(&self) -> bool {
+            let Some(hwnd) = self.inner.handle.hwnd() else { return false };
+            unsafe {
+                let mut start: u32 = 0;
+                let mut end: u32 = 0;
+                winapi::um::winuser::SendMessageW(
+                    hwnd, winapi::um::winuser::EM_GETSEL as u32,
+                    &mut start as *mut u32 as usize, &mut end as *mut u32 as isize,
+                );
+                start != end
+            }
+        }
+
+        /// Map a client-area point to a buffer position `(line, char_col)` —
+        /// the `wxTextCtrl` hit-test behind `wxTE_AUTO_URL` clicks.
+        /// `EM_CHARFROMPOS` yields the character index at the point;
+        /// `EM_LINEFROMCHAR` and `EM_LINEINDEX` turn it into (line, column).
+        /// `None` when the point is outside the text.
+        pub fn char_index_at(&self, x: i32, y: i32) -> Option<(i32, i32)> {
+            use winapi::um::winuser::{EM_CHARFROMPOS, EM_LINEFROMCHAR, EM_LINEINDEX};
+            let hwnd = self.inner.handle.hwnd()?;
+            // lParam packs the client point: x in LOWORD, y in HIWORD.
+            let lparam = ((y as isize & 0xFFFF) << 16) | (x as isize & 0xFFFF);
+            unsafe {
+                let index = winapi::um::winuser::SendMessageW(hwnd, EM_CHARFROMPOS as u32, 0, lparam);
+                if index < 0 {
+                    return None;
+                }
+                let index = index as usize;
+                let line = winapi::um::winuser::SendMessageW(hwnd, EM_LINEFROMCHAR as u32, index, 0);
+                let line_start = winapi::um::winuser::SendMessageW(hwnd, EM_LINEINDEX as u32, line as usize, 0);
+                if line < 0 || line_start < 0 {
+                    return None;
+                }
+                Some((line as i32, (index - line_start as usize) as i32))
+            }
+        }
+
+        /// Run `cb(client_x, client_y)` on every left-button release.
+        ///
+        /// The `EVT_HYPERLINK` equivalent for a plain EDIT control: a raw
+        /// `WM_LBUTTONUP` subclass on the control. Returning `None` from the
+        /// handler lets `DefSubclassProc` run, so the caret move / selection
+        /// drag / double-click word select all keep working — the click is
+        /// *observed*, never swallowed (which is also why the GTK side's
+        /// "return 1 to stop" has no counterpart here).
+        ///
+        /// The `RawEventHandler` is retained on the TextView: NWG unbinds a
+        /// handler when it is dropped, and the callback must outlive this call.
+        pub fn connect_left_release(&self, cb: Box<dyn FnMut(i32, i32)>) {
+            use std::sync::atomic::AtomicU32;
+            static NEXT_HANDLER_ID: AtomicU32 = AtomicU32::new(0);
+            let Some(hwnd) = self.inner.handle.hwnd() else { return };
+            // NWG reserves handler ids <= 0xFFFF; also unique per HWND, which
+            // the counter guarantees globally.
+            let id = 0x10000 | (NEXT_HANDLER_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as usize & 0xFFFF);
+            let mut cb = cb;
+            let cb = std::rc::Rc::new(std::cell::RefCell::new(Some(cb)));
+            let cb2 = cb.clone();
+            let handle = nwg::ControlHandle::Hwnd(hwnd);
+            match nwg::bind_raw_event_handler(&handle, id, move |_hwnd, msg, _wparam, lparam| {
+                if msg == winapi::um::winuser::WM_LBUTTONUP {
+                    let x = (lparam as u32 & 0xFFFF) as u16 as i16 as i32;
+                    let y = ((lparam as u32 >> 16) & 0xFFFF) as u16 as i16 as i32;
+                    // NWG's raw callback is `Fn`, so the user callback lives
+                    // behind a RefCell (same pattern as `timeout_add_recurring`).
+                    if let Some(f) = cb2.borrow_mut().as_mut() {
+                        f(x, y);
+                    }
+                }
+                None // always propagate: observing must not change EDIT behaviour
+            }) {
+                Ok(handler) => self.raw_handlers.borrow_mut().push(handler),
+                Err(e) => eprintln!("rustxwidgets: TextView click handler not bound ({e})"),
+            }
+        }
+
+        /// Whether this control currently holds keyboard focus. The GUI uses
+        /// it to decide whether Ctrl-C means "copy the selection" (pane
+        /// focused) or "cancel the turn" (prompt Entry focused).
+        pub fn has_focus(&self) -> bool {
+            let Some(hwnd) = self.inner.handle.hwnd() else { return false };
+            unsafe { winapi::um::winuser::GetFocus() == hwnd }
+        }
+
+        /// Whether this control is the window's focus widget. On NWG there are
+        /// no child focus proxies, so this is just [`TextView::has_focus`] —
+        /// present so the shared GUI code compiles unchanged.
+        pub fn is_focus_widget(&self, _window: *mut c_void) -> bool {
+            self.has_focus()
+        }
+
+        /// Copy the current selection to the clipboard (the Edit menu's Copy,
+        /// and Ctrl-C over a selection). Uses the control's own
+        /// `WM_COPY`, which is the EDIT control's native copy path.
+        pub fn copy_clipboard(&self) {
+            let Some(hwnd) = self.inner.handle.hwnd() else { return };
+            unsafe {
+                winapi::um::winuser::SendMessageW(hwnd, winapi::um::winuser::WM_COPY, 0, 0);
+            }
+        }
+
+        /// Open `url` in the user's default browser (`ShellExecuteW("open")` —
+        /// the `wxLaunchDefaultBrowser` equivalent).
+        ///
+        /// Deliberately policy-free: the scheme allow-list lives in the caller
+        /// (pir's `open_link_safely`), because `rustxwidgets` has no markdown
+        /// or sanitizer dependency. Returns false when the shell refused.
+        pub fn open_url(url: &str) -> bool {
+            use std::os::windows::ffi::OsStrExt;
+            let wide: Vec<u16> = std::ffi::OsStr::new(url).encode_wide().chain(std::iter::once(0)).collect();
+            let op: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+            unsafe {
+                let r = winapi::um::shellapi::ShellExecuteW(
+                    std::ptr::null_mut(),
+                    op.as_ptr(),
+                    wide.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    winapi::um::winuser::SW_SHOWNORMAL,
+                );
+                // ShellExecuteW returns a value > 32 on success.
+                (r as isize) > 32
+            }
         }
     }
 
@@ -1047,7 +1291,12 @@ mod nwg_adapter {
     pub fn create_textview(parent: *mut c_void) -> Result<TextView, Error> {
         let (inner, changed_cb, handler) = crate::backends::nwg::create_textview(parent)
             .map_err(|e| Error::Backend(format!("{}", e)))?;
-        Ok(TextView { inner: Rc::new(inner), changed_cb, _handler: Rc::new(handler) })
+        Ok(TextView {
+            inner: Rc::new(inner),
+            changed_cb,
+            _handler: Rc::new(handler),
+            raw_handlers: Rc::new(RefCell::new(Vec::new())),
+        })
     }
 
     // ========== Dialog ==========
@@ -1703,6 +1952,28 @@ mod nwg_adapter {
             // NWG: always show both scrollbars
         }
 
+        /// Minimum client height for the viewport. The NWG scroller owns a
+        /// frame the parent box places, so this resizes that frame's client
+        /// area when it exists and no-ops otherwise (a fixed-size window still
+        /// lays it out on present()).
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            if self.hwnd.is_null() { return; }
+            unsafe {
+                let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+                winapi::um::winuser::GetWindowRect(self.hwnd as _, &mut rect);
+                let (cur_w, cur_h) = (rect.right - rect.left, rect.bottom - rect.top);
+                winapi::um::winuser::SetWindowPos(
+                    self.hwnd as _,
+                    std::ptr::null_mut(),
+                    0, 0,
+                    if w > 0 { w } else { cur_w },
+                    if h > 0 { h } else { cur_h },
+                    winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE,
+                );
+            }
+            self.update_scroll_range();
+        }
+
         pub fn set_vexpand(&self, _v: bool) {}
         pub fn set_hexpand(&self, _h: bool) {}
 
@@ -2226,8 +2497,13 @@ mod nwg_adapter {
 
     /// Strip a Pango markup string down to plain text (remove `<span ...>` tags
     /// and decode the common entities). Used by the nwg `TextView::set_markup`
-    /// shim so conversation lines render legibly without a markup engine.
-    fn strip_pango(s: &str) -> String {
+    /// shim so conversation lines render legibly without a markup engine, and
+    /// exposed as `TextView::plain_line` so the GUI can resolve clickable-link
+    /// spans against exactly the string the buffer receives.
+    ///
+    /// Module-level (not an associated fn) so both `set_markup` and
+    /// `TextView::plain_line` call the same implementation.
+    pub(super) fn plain_line(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
         let bytes = s.as_bytes();
         let mut i = 0;
@@ -2382,6 +2658,11 @@ fn tv_set_active(
 }
 
 impl TabView {
+    /// Layout hints: the NWG tab view's outer box is laid out by its parent,
+    /// so expand flags have no per-widget effect. Present so shared GUI code
+    /// compiles unchanged on Windows.
+    pub fn set_hexpand(&self, _expand: bool) {}
+    pub fn set_vexpand(&self, _expand: bool) {}
     pub fn new(parent: *mut std::ffi::c_void) -> Result<Self, crate::core::Error> {
         let outer = create_box(Orientation::Vertical, 0, parent)?;
         let tab_bar = create_box(Orientation::Horizontal, 4, outer.hwnd)?;
@@ -2434,6 +2715,11 @@ impl TabView {
         let idx = self.panels.borrow().len();
         let btn = create_button(self.tab_bar.hwnd, title)?;
         self.tab_bar.append(&btn);
+        // Match the GTK backend: show the new tab button explicitly. NWG
+        // creates controls visible by default, so this is a no-op in practice,
+        // but it keeps the cross-backend contract ("added tabs are shown")
+        // honest if that default ever changes.
+        btn.set_visible(true);
         self.tab_bar.set_child_hexpand(&btn, true);
         let panel = create_box(Orientation::Vertical, 0, self.content.hwnd)?;
         panel.set_visible(false);

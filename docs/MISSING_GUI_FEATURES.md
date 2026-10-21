@@ -150,20 +150,23 @@ leave the write cursor past the end of the model.
 
 ## Severity 4 — commands the TUI/REPL has and the GUI does not
 
-The GUI implements ~21 commands. These are present in `src/tui.rs` or
-`src/main.rs` and absent from `handle_command` (`src/gui.rs:1443`):
+The GUI implements ~40 commands. These are present in `src/tui.rs` or
+`src/main.rs` and absent from `handle_command`:
+
+> `/usage`, `/sessions`, `/reload`, `/checkpoints`, `/rewind`, `/quarantine`,
+> `/limits` (+ `/resources` alias), `/skills`, and `/scratchpad` all landed in
+> the GUI after this table was written — each has a `handle_command` arm (or,
+> for `/sessions`, the tab-manager path), Tab completion, `/help` text, and a
+> menu entry. `/markup_demo` + `/md_demo` landed too (arm, `/help`, menu) but
+> stay out of Tab completion on purpose: four `m`-commands leave `/m` with no
+> common prefix, which broke `tab_completes_to_common_prefix`.
 
 | Command | Where it exists | Notes for the GUI |
 |---|---|---|
 | `/resume` | `src/main.rs:3386` | Session picker; GUI has `/sessions` for tabs but no resume-across-restart |
-| `/menu` | `src/main.rs:2687` | Interactive alt-screen menu — needs a GUI dialog equivalent |
-| `/rewind` | `src/main.rs:4248` | Checkpoint rewind; pure logic, no UI needed beyond a confirm |
-| `/checkpoints` | `src/main.rs:4239` | Same |
+| `/menu` | `src/main.rs:2687` | Interactive alt-screen menu — has a GUI dialog equivalent (`/menu` opens a button dialog; every action also has a topbar item) |
 | `/plan` | `src/main.rs:3961` | Reads the plan document |
-| `/quarantine` | `src/main.rs:3469` | Reviews staged system-tree writes — **security-relevant**, reviewable only from the terminal today |
-| `/limits`, `/resources` | `src/main.rs:3872` | cgroup/sandbox limits |
 | `/mcp` | `src/main.rs:4031` | MCP server status |
-| `/skills` | `src/main.rs:4197` | Skills catalog |
 | `/taste` | `src/main.rs:4104` | Taste preferences |
 | `/login`, `/logout` | `src/main.rs:3601`, `3741` | Credential management (`/login P KEY [MODEL]` works in one line) |
 | `/l` | `src/main.rs:3083` | Set the persisted default model |

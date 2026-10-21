@@ -8,13 +8,6 @@ mod pancurses_backend {
     use std::io::Write;
 
     // ── SGR escape sequences matching ratatui output ──────────────
-    const SGR_FG_BLACK: &str = "\x1b[38;5;0m";
-    const SGR_FG_CYAN: &str = "\x1b[38;5;6m";
-    const SGR_FG_YELLOW: &str = "\x1b[38;5;3m";
-    const SGR_FG_DARK_GRAY: &str = "\x1b[38;5;8m";
-    const SGR_BG_CYAN: &str = "\x1b[48;5;6m";
-    const SGR_BG_YELLOW: &str = "\x1b[48;5;3m";
-    const SGR_BG_DARK_GRAY: &str = "\x1b[48;5;8m";
     const SGR_BOLD: &str = "\x1b[1m";
     const SGR_UNDERLINE: &str = "\x1b[4m";
     const SGR_RESET: &str = "\x1b[0m";
@@ -338,7 +331,6 @@ mod pancurses_backend {
                                 if sub_idx < submenu_items.len() {
                                     let (_, items) = &submenu_items[sub_idx];
                                     let dy = n.rect.y + 1;
-                                    let dx = n.rect.x + 1;
                                     // find horizontal position of this submenu label
                                     let mut mx = n.rect.x + 1;
                                     for i in 0..sub_idx {
@@ -568,7 +560,7 @@ mod pancurses_backend {
                                                                             match dir_char {
                                                                                 'A' => { if *cursor_row > 0 { *cursor_row -= 1; None } else { Some(u32::MAX) } }
                                                                                 'B' => { if *cursor_row + 1 < total_rows { *cursor_row += 1; None } else { Some(u32::MAX - 1) } }
-                                                                                'C' => { *cursor_col += 1; None }
+                                                                                'C' => { if *cursor_col + 1 < total_cols { *cursor_col += 1; } None }
                                                                                 'D' => { if *cursor_col > 0 { *cursor_col -= 1; } None }
                                                                                 _ => None,
                                                                             }
@@ -841,7 +833,7 @@ mod pancurses_backend {
                                     spreadsheet_prepare_move(state, fid, false);
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, ref cursor_row, .. } = n.kind {
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
                                             if *cursor_col > 0 { *cursor_col -= 1; }
                                         }
                                     }
@@ -896,8 +888,8 @@ mod pancurses_backend {
                                     spreadsheet_prepare_move(state, fid, false);
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, .. } = n.kind {
-                                            *cursor_col += 1;
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
+                                            if *cursor_col + 1 < total_cols { *cursor_col += 1; }
                                         }
                                     }
                                     if was_editing {
@@ -1076,109 +1068,6 @@ mod pancurses_backend {
                             for cb in cbs.iter_mut() { cb(row, col); }
                             with_state(|state| state.cursor_move_callbacks = cbs);
                         }
-                    }
-                    Some(Input::KeyLeft) => {
-                        with_state(|state| {
-                            if state.menu_open {
-                                if state.active_submenu > 0 {
-                                    state.active_submenu -= 1;
-                                    state.active_item = 0;
-                                }
-                            } else if let Some(fid) = state.focus_id {
-                                if is_spreadsheet_focused(state, fid) {
-                                    spreadsheet_commit_edit(state, fid);
-                                    if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
-                                            if *cursor_col > 0 { *cursor_col -= 1; }
-                                        }
-                                    }
-                                    spreadsheet_scroll_to_cursor(state, fid);
-                                } else if let Some(n) = state.node_mut(fid) {
-                                    if let PcWidgetKind::Entry { ref mut cursor, .. } = n.kind {
-                                        if *cursor > 0 { *cursor -= 1; }
-                                    }
-                                }
-                            }
-                        });
-                    }
-                    Some(Input::KeyRight) => {
-                        with_state(|state| {
-                            if state.menu_open {
-                                if let Some(mid) = state.menu_bar_id {
-                                    if let Some(n) = state.node(mid) {
-                                        if let PcWidgetKind::MenuBar { labels, .. } = &n.kind {
-                                            if state.active_submenu + 1 < labels.len() {
-                                                state.active_submenu += 1;
-                                                state.active_item = 0;
-                                            }
-                                        }
-                                    }
-                                }
-                            } else if let Some(fid) = state.focus_id {
-                                if is_spreadsheet_focused(state, fid) {
-                                    spreadsheet_commit_edit(state, fid);
-                                    if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
-                                            if *cursor_col + 1 < total_cols { *cursor_col += 1; }
-                                        }
-                                    }
-                                } else if let Some(n) = state.node_mut(fid) {
-                                    if let PcWidgetKind::Entry { ref mut cursor, ref buffer } = n.kind {
-                                        if *cursor < buffer.len() { *cursor += 1; }
-                                    }
-                                }
-                            }
-                        });
-                    }
-                    Some(Input::KeyUp) => {
-                        with_state(|state| {
-                            if state.menu_open {
-                                if let Some(mid) = state.menu_bar_id {
-                                    if let Some(n) = state.node(mid) {
-                                        if let PcWidgetKind::MenuBar { submenu_items, .. } = &n.kind {
-                                            let si = state.active_submenu;
-                                            if si < submenu_items.len() && state.active_item > 0 {
-                                                state.active_item -= 1;
-                                            }
-                                        }
-                                    }
-                                }
-                            } else if let Some(fid) = state.focus_id {
-                                if is_spreadsheet_focused(state, fid) {
-                                    spreadsheet_commit_edit(state, fid);
-                                    if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
-                                            if *cursor_row > 0 { *cursor_row -= 1; }
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                    }
-                    Some(Input::KeyDown) => {
-                        with_state(|state| {
-                            if state.menu_open {
-                                if let Some(mid) = state.menu_bar_id {
-                                    if let Some(n) = state.node(mid) {
-                                        if let PcWidgetKind::MenuBar { submenu_items, .. } = &n.kind {
-                                            let si = state.active_submenu;
-                                            if si < submenu_items.len() && state.active_item + 1 < submenu_items[si].1.len() {
-                                                state.active_item += 1;
-                                            }
-                                        }
-                                    }
-                                }
-                            } else if let Some(fid) = state.focus_id {
-                                if is_spreadsheet_focused(state, fid) {
-                                    spreadsheet_commit_edit(state, fid);
-                                    if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, total_rows, .. } = n.kind {
-                                            if *cursor_row + 1 < total_rows { *cursor_row += 1; }
-                                        }
-                                    }
-                                }
-                            }
-                        });
                     }
                     Some(Input::KeySLeft) => {
                         with_state(|state| {
@@ -1858,7 +1747,6 @@ mod pancurses_backend {
                     // - normal rows: yellow fg
                     // - boundary (last main) row: underline + fg
                     let is_footer = label_str.starts_with('_');
-                    let is_header = label_str.starts_with('~');
                     // Boundary rows: last header row and last main row before footers.
                     // Uses header_row_count/main_row_count directly (matching ratatui's
                     // last_display_main_row logic) instead of next-label heuristics
@@ -1927,13 +1815,6 @@ mod pancurses_backend {
                                 }
                             }
                         }
-                        // Determine last rendered x position for row-fill detection
-                        let last_col_end = if col_positions.is_empty() {
-                            rect.x + 1 + 5
-                        } else {
-                            let last_idx = col_positions.len() - 1;
-                            col_positions[last_idx].1 + column_layout[last_idx].1 as i32
-                        };
                         let mut vi = 0;
                         let mut prev_overflowed = false;
                         let mut defer_sgr_reset = false;
@@ -2544,7 +2425,7 @@ mod pancurses_backend {
                     let br = row_offset + max_data_rows as i32;
                     out.push_str(&sgr_cup(br, rect.x));
                     out.push_str("└");
-                    for i in 1..rect.w - 1 {
+                    for _ in 1..rect.w - 1 {
                         out.push('─');
                     }
                     out.push_str("┘");
@@ -2704,7 +2585,7 @@ mod pancurses_backend {
 
     fn spreadsheet_scroll_to_cursor(state: &mut PcState, fid: usize) {
         if let Some(n) = state.node_mut(fid) {
-            if let PcWidgetKind::Spreadsheet { ref mut top_row, ref mut left_col, ref cursor_row, ref cursor_col, ref mut column_layout, ref cells, ref margin_cols, ref main_cols, .. } = n.kind {
+            if let PcWidgetKind::Spreadsheet { ref mut left_col, ref cursor_col, ref mut column_layout, ref cells, ref margin_cols, ref main_cols, .. } = n.kind {
                 // When a column layout was explicitly set (e.g. by corro's
                 // pnc_backend.rs), do not overwrite it — the application code
                 // has already computed the correct columns and widths.

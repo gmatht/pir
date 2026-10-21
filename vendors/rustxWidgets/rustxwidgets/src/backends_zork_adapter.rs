@@ -153,6 +153,8 @@ impl BoxWidget {
 
     pub fn set_child_vexpand(&self, _child: &impl AsRef<*mut c_void>, _expand: bool) {}
     pub fn set_child_hexpand(&self, _child: &impl AsRef<*mut c_void>, _expand: bool) {}
+    /// Text UIs have no hidden-widget state; kept for the cross-backend rule.
+    pub fn show_all(&self) {}
 }
 
 // -- Grid --
@@ -224,6 +226,8 @@ impl Entry {
     pub fn set_visible(&self, _visible: bool) {}
         pub fn set_size_request(&self, _w: i32, _h: i32) {}
         pub fn set_width_chars(&self, _w: i32) {}
+        /// Placeholder hint: no-op (no text-entry widget to render it in).
+        pub fn set_placeholder_text(&self, _text: &str) {}
         pub fn on_key_raw(&self, _cb: Box<dyn FnMut(u32, u32) -> bool>) {}
         pub fn set_margin_start(&self, _margin: i32) {}
         pub fn set_margin_top(&self, _margin: i32) {}

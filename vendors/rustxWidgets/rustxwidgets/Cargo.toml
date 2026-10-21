@@ -26,7 +26,9 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 native-windows-gui = { version = "1.0", features = ["flexbox", "menu", "combobox", "textbox", "scroll-bar"] }
-winapi = { version = "0.3", features = ["winuser", "windef", "processenv", "winbase", "wincon", "handleapi"] }
+# `shellapi` is needed by `TextView::open_url` (ShellExecuteW) — the
+# wxWidgets `wxLaunchDefaultBrowser` equivalent behind clickable links.
+winapi = { version = "0.3", features = ["winuser", "windef", "processenv", "winbase", "wincon", "handleapi", "shellapi"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.21", default-features = false, features = ["invocation"] }

@@ -487,6 +487,8 @@ impl AsElement for BoxWidget {
 
         pub fn set_hexpand(&self, _expand: bool) {
         }
+        /// DOM nodes are visible by default; kept for the cross-backend rule.
+        pub fn show_all(&self) {}
     }
 
     pub fn create_box(orientation: Orientation, spacing: i32) -> Result<BoxWidget, Error> {
@@ -600,6 +602,11 @@ impl AsElement for BoxWidget {
 
         pub fn set_width_chars(&self, n: i32) {
             self.elem.set_size(n as u32);
+        }
+
+        /// Placeholder hint: native HTML `placeholder` attribute.
+        pub fn set_placeholder_text(&self, text: &str) {
+            self.elem.set_placeholder(text);
         }
 
         pub fn set_size_request(&self, w: i32, h: i32) {
