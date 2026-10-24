@@ -1176,7 +1176,7 @@ fn update_tui_hint(state: &mut TuiState, buf: &str) {
 fn complete_idle(buf: &str) -> Option<String> {
     let commands = [
         "help", "model", "models", "goal", "continue", "clear", "fix", "undo", "bg", "jobs",
-        "thinking", "cancel", "shell", "exit", "reload", "reexec",
+        "thinking", "cancel", "shell", "exit", "reload", "reexec", "compact",
     ];
     if buf == "/thinking" {
         return Some("/thinking ".to_string());
@@ -1848,6 +1848,58 @@ fn handle_command(
             }
         }
         "h" | "help" => state.push(ConvKind::System, HELP_TUI),
+        "compact" => {
+            // `/compact` — summarise the conversation so far and replace the
+            // history with the summary, freeing the context window. The TUI had
+            // no arm for it (it was not even completable), so a session that hit
+            // the agent's own "run /compact" advice named a command the TUI
+            // could not run. The summariser is one long blocking model call, so
+            // it runs inside the turn worker's slot discipline rather than
+            // inline on the draw path.
+            let arg = rest.first().copied().unwrap_or("").trim().to_ascii_lowercase();
+            let mut g = ctx.agent_slot.lock().unwrap();
+            let Some(agent) = g.as_mut() else {
+                state.push(ConvKind::System, "· agent busy (turn running) — /compact needs the history, try when idle");
+                return;
+            };
+            match arg.as_str() {
+                "status" | "stat" => {
+                    let used = agent.context_tokens() as u64;
+                    let cap = agent.context_budget() as u64;
+                    let pct = if cap > 0 { (used * 100) / cap } else { 0 };
+                    state.push(
+                        ConvKind::System,
+                        &format!(
+                            "· context ~{used} / {cap} tokens used ({pct}%) across {} messages{}",
+                            agent.history_messages(),
+                            if agent.needs_compaction() {
+                                " — near the cap: /compact to summarise"
+                            } else {
+                                ""
+                            }
+                        ),
+                    );
+                }
+                "on" | "auto" => {
+                    agent.set_auto_compact(true);
+                    state.push(ConvKind::System, "· auto-compact ON");
+                }
+                "off" => {
+                    agent.set_auto_compact(false);
+                    state.push(ConvKind::System, "· auto-compact OFF");
+                }
+                "" => {
+                    state.push(ConvKind::System, "· compacting conversation — this calls the model…");
+                    let out = agent.compact();
+                    state.push(ConvKind::System, &format!("· {out}"));
+                }
+                other => state.push(
+                    ConvKind::Error,
+                    &format!("usage: /compact [status|on|off] — got {other:?}"),
+                ),
+            }
+        }
+
         // `/model<N>` / `/m<N>`: pick the Nth of the top-N recent list directly
         // (`/model2` = the second), mirroring the streaming REPL. Handled before
         // the `"m" | "model"` arm because the token is the whole command word.
@@ -2128,7 +2180,7 @@ fn handle_command(
 
 const HELP_TUI: &str = "\
 commands: /help /model /model<N> /models /goal [obj] /continue /clear /finished /fix /undo [all] \
-/bg <text> /jobs /cancel /reload
+/bg <text> /jobs /cancel /reload /compact [status|on|off]
 /model lists the five most recent models (↑/↓ on the /model line, or type /model2
        for the second); /models opens the full-catalog picker
 /reexec  exec the current binary in place (streaming REPL only; TUI/GUI must restart manually)
@@ -2355,6 +2407,28 @@ mod tui_completion_tests {
         // "mo" is already the full prefix of both; second Tab (now "model" + space
         // is needed) stays at the common prefix until disambiguated.
         assert_eq!(complete_idle("/mod"), Some("/model".to_string()));
+    }
+
+    /// `/compact` existed only in the streaming REPL: the TUI had no arm for it
+    /// and did not complete it, so the agent's own "run /compact to summarise"
+    /// advice named a command the TUI could not run. Both reach paths — the
+    /// completion list and the dispatch — are checked here.
+    #[test]
+    fn compact_is_completable_and_dispatched() {
+        assert_eq!(complete_idle("/comp"), Some("/compact".to_string()));
+        let src = include_str!("tui.rs");
+        let start = src
+            .find("\nfn handle_command(")
+            .expect("handle_command definition")
+            + 1;
+        let body = src[start..]
+            .split("\nconst HELP_TUI")
+            .next()
+            .expect("handle_command body");
+        assert!(
+            body.contains("\n        \"compact\" =>"),
+            "/compact must have a dispatch arm in the TUI, not just a completion entry"
+        );
     }
 
     #[test]

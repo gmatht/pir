@@ -3,8 +3,8 @@
 **Status:** implemented. Most rows of the parity matrix in §4 are enforced by a
 test named in the row; the four rows marked *(no test)* (S5, S9, C6, G3) are
 implemented but pinned only by their source comment, and are called out as such
-rather than claimed. `cargo test --features gui` passes **925 tests, 0 failed**
-at the time of writing (780 in the default, non-GUI build).
+rather than claimed. `cargo test --features gui` passes **997 tests, 0 failed**
+at the time of writing (900 in the default, non-GUI build; 924 with `--features tui`).
 
 **What this is.** The GUI (`src/gui.rs`) is not "a window with a session
 button". It is a port of the TUI (`src/tui.rs`) to GTK, and it already is one:
@@ -55,6 +55,7 @@ The single most important constraint on the design. Verified in
 | `gtk_scrolled_window_get_vadjustment` | **yes** (`symbols.rs:431`) | the scroll position can be *read* |
 | `gtk_adjustment_set_value` | **NO** — zero hits in the whole tree | the scroll position cannot be *set* |
 | mouse-wheel / scroll `EventController` | **NO** — no gesture symbols | no programmatic scroll, and no wheel event to intercept |
+| NWG (Windows) text hit-test (`EM_CHARFROMPOS`/`EM_LINEFROMCHAR`/`EM_LINEINDEX`) + raw `WM_LBUTTONUP` subclass + `ShellExecuteW` | **yes** (added for G6) | the Windows pane is a plain EDIT control, so the `wxTextCtrl` + `wxTE_AUTO_URL` model applies: URLs are detected at insert time and clicks open them; EDIT cannot style ranges, so links are not blue/underlined there |
 | text-view click coordinates (`window_to_buffer_coords`, `get_iter_at_location`) + button-release event | **yes** (added for G6) | link clicks resolve to buffer positions; hover cursors still **NO** (no cursor-symbol plumbing — links are underlined, clicks work, the pointer just doesn't change) |
 | text-buffer tags (`create_tag`/`apply_tag`) | **NO** | no per-range colour; `ConvKind` colour is unreachable on Linux |
 | `TextView::set_markup` on GTK | **NO** (`backends_gtk_adapter_impl.rs:646-658`) | the palette is Windows-only today |
@@ -143,7 +144,7 @@ Rows are grouped by kind, not by implementation order.
 | **T4** | Workspace + model while idle | `idle_status` | `idle_status_carries_workspace_and_model_like_the_tui_footer` |
 | **T5** | Token usage after a turn | `drain_once` sets `"{in} in / {out} out tokens"` | `token_usage_is_reported_after_a_turn` |
 | **T6** | `pir — running` / `pir — idle` pane title (`tui.rs:653`) | window title tracks the running flag | `window_title_reports_running_or_idle` |
-| **T7** | Hint line: `[Tab] levels: …` / `[Tab] completes commands` (`update_tui_hint`, `tui.rs:1140`) | a real hint label under the status bar | `hint_offers_thinking_levels_then_completion_help` |
+| **T7** | Hint line: `[Tab] levels: …` (`update_tui_hint`, `tui.rs:1140`), and for every other draft the completion candidates: one ⇒ `[Tab] completes to /menu`, several ⇒ the list (a failed Tab adds `[Tab] N matches` / `no match`) | a real hint label under the status bar, refreshed on Tab immediately and on the drain tick otherwise | `hint_offers_thinking_levels_then_completion_help`, `a_draft_shows_what_it_can_be_completed_to`, `the_completion_list_is_exactly_what_tab_matches`, `typing_a_prefix_paints_the_completion_hint` (display) |
 | **T8** | `✓ DONE :)` done-placeholder (`tui.rs:681`) | shown in the status bar when idle and awaiting input | `done_placeholder_shows_only_when_idle_and_awaiting_input` |
 
 ### 4.3 Commands
@@ -182,7 +183,59 @@ These have no TUI counterpart; they are the reason to have a GUI at all.
 | **G3** | Send / Cancel buttons | `Button` + `on_click`, routed through the same functions as the keys | *(no test — the buttons are wired to `run_foreground_turn` / the cancel flag)* |
 | **G4** | Question dialog is answerable | existing `question_dialog` | existing behaviour + `the_ask_renderer_is_installed_before_the_window_is_built` (source guard) |
 | **G5** | `focus-out` must not re-grab focus (TUI has no focus; a GUI must not trap the mouse) | only re-focus on tab change | `focus_out_does_not_regrab_focus` |
-| **G6** | Links in the agent log are clickable (open in the browser) | `md::extract_links` inventory at push time (`line_links`, parallel to `conv`); `sync_textview` resolves spans against the exact inserted text (`buf_links`, parallel to the buffer — blocks render multi-line, so buffer lines never map 1:1 to model lines); left-button release → `link_hit_at` coords → span lookup → `open_link_safely` (`xdg-open`, http/https only, no shell, detached) | `link_spans_resolve_against_inserted_text`, `link_spans_use_successive_search_for_repeated_text`, `link_spans_stay_in_step_with_conv_on_push_clear_trim`, `lookup_link_hits_only_inside_a_span`, `click_handler_checks_selection_before_opening`, `opener_only_allows_http_https` |
+| **G6** | Links in the agent log are clickable (open in the browser) | `md::extract_links` inventory at push time (`line_links`, parallel to `conv`); `sync_textview` resolves spans against the exact inserted text (`buf_links`, parallel to the buffer — blocks render multi-line, so buffer lines never map 1:1 to model lines); left-button release → `link_hit_at` coords → span lookup → `open_link_safely` (`xdg-open`, http/https only, no shell, detached). **NWG/Windows** (the `wxTextCtrl` + `wxTE_AUTO_URL` model, since the pane is a plain EDIT control): spans resolve against `TextView::plain_line` (the same stripper `set_markup` inserts), a raw `WM_LBUTTONUP` subclass observes clicks without swallowing them, `EM_CHARFROMPOS` hit-tests, and `open_link_safely` calls `ShellExecuteW("open")` with the same http/https-only policy | `link_spans_resolve_against_inserted_text`, `link_spans_use_successive_search_for_repeated_text`, `link_spans_stay_in_step_with_conv_on_push_clear_trim`, `lookup_link_hits_only_inside_a_span`, `click_handler_checks_selection_before_opening`, `opener_only_allows_http_https`, `link_spans_resolve_against_nwg_plain_line_text`, `windows_sync_builds_link_spans_from_the_inserted_text`, `windows_click_handler_guards_like_the_gtk_one` |
+| **G7** | New Project: open a project directory (existing, or a new one) | `project_launch::target` resolves/creates the path (`~` expanded, files refused, a missing path only created after an explicit confirm); `project_launch::launch` starts a **new detached pir process** with that cwd (`setsid`, stdio nulled, reaped off-thread) — a new process rather than a repointed tab because `Agent::new`, `session::session_cwd()`, the `Registry` cwd, the session log and `workspace_label()` all read the *process* cwd; reached from the sidebar **New Project** button, `Session ▸ New project…`, and `/new-project [dir]` (same handler). The picker offers the native folder chooser (`FileChooserNative` `SELECT_FOLDER` / NWG `OpenDirectory`) plus a typed path for new directories | `new_project_is_reachable_from_button_menu_and_command`, `project_launch_detaches_and_never_moves_this_process`, `the_sidebar_carries_a_new_project_button` (display), `project_launch::tests::*` (4) |
+
+---
+
+### 4.6 Compaction (`/compact`)
+
+Compaction is the escape hatch from a full context window, so it must exist on
+every front end and it must provably fit the window it is rescuing.
+
+| # | Feature | Mechanism | Test |
+|---|---|---|---|
+| **C7** | `/compact` reachable from the GUI | `handle_command` arm (`status` / `on` / `off` / no-arg), `COMMANDS`, `HELP_GUI`, and two Turn-menu entries; the summariser runs on a worker (`spawn_compact`) and reports through a transcript notice | `compact_is_reachable_from_the_gui`, `goal_and_continue_are_spawned_not_run_inline` (also pins that the arm never calls `compact()` inline) |
+| **C8** | `/compact` reachable from the TUI | `complete_idle` + a `handle_command` arm + `HELP_TUI` (it existed only in the streaming REPL) | `compact_is_completable_and_dispatched` (feature `tui`) |
+| **C9** | The summary request fits the window it is rescuing | `Agent::compact_transcript` fits the transcript to *window − system − output − reserve*, keeping the newest messages, abridging tool results to head+tail, eliding the older middle, and stating what it dropped | `compact_transcript_is_fitted_to_the_request_window`, `transcript_fitting_keeps_the_newest_messages_first` |
+| **C10** | The output budget never over-commits the window, and never loses its tail | `agent::output_budget_for` is the single rule for `max_tokens`, `trim` and `context_budget`; `Client::complete_with` measures its own prompt against the same window | `output_budget_shrinks_as_the_history_fills_the_window`, `context_budget_matches_what_needs_compaction_uses` |
+
+**What was actually wrong.** The reported symptom was
+
+```
+compaction failed: HTTP 400: Model does not support this protocol.
+```
+
+on a session at ~911k est. tokens with a 1M window. Two independent defects
+produced a *failed* compaction exactly when it was needed:
+
+1. **The summariser sent the whole conversation verbatim.** Tool results go
+   into `history` at up to 100k chars each (`read_file`), and the transcript
+   repeated every one of them. Measured on the session that failed
+   (`.pir/sessions/pir-20261019-133811-sh805959.jsonl`): 6 `read_file` results of
+   exactly 100 000 chars each — 600k chars ≈ 150k tokens from six calls alone —
+   and the history had reached ~911k est. tokens when `/compact` was run. The
+   summariser then serialised that same conversation again, verbatim, with tool
+   calls written out as JSON and every result repeated, so the prompt exceeded
+   the 1M-token window before the provider could answer it.
+2. **The output budget reserved the catalog's `max_tokens` unconditionally.**
+   For a model whose `max_tokens` equals its context (the `ollama-cloud`
+   fallback catalog lists 1M-context models with a 32k output cap, but a
+   catalog entry with a 1M output cap — the shape the live gateway reported
+   "requested output 131072" against — reserves the entire window), `trim`'s
+   input budget became zero; for every other model the reserve was a constant
+   while the history grew, so the window's last few percent were unreachable —
+   the exact state a session is in when it needs compaction. Asking for *less* output never makes a request
+   bigger, so the reserve now shrinks with the history
+   (`output_budget_for`), and the request fits by construction.
+
+The gateway's `400` text is opaque either way ("Model does not support this
+protocol", "input plus the requested output exceeds the context window"), which
+is why this is pinned by arithmetic tests on the *values the agent computes*,
+not by matching an error string: `output_budget_for` is asserted to keep
+`input + output + reserve ≤ ctx` for the live numbers (918101 input, 131072
+output, 1048576 window), and the transcript fitter is asserted to produce a
+prompt whose `estimate_request_tokens` plus the output budget fits.
 
 ---
 
@@ -227,7 +280,7 @@ Each item names the row it closes and the test that holds it.
 | **S7** | `md::render` applied to assistant text in `drain_session_log` | `assistant_text_is_markdown_rendered_like_the_tui` |
 | **S9** | `show_thinking` seeded from `agent.show_thinking()` | *(no test)* |
 | **T6** | window title set to `pir — running` / `pir — idle` | `window_title_reports_running_or_idle` |
-| **T7** | hint label + `hint_text(draft)` port of `update_tui_hint` | `hint_offers_thinking_levels_then_completion_help` |
+| **T7** | hint label + `hint_text(draft, tab_note)`; `completion_candidates`/`completion_hint` show what Tab would complete, so a prefix is discoverable instead of silent | `hint_offers_thinking_levels_then_completion_help`, `a_draft_shows_what_it_can_be_completed_to` |
 | **T8** | done-placeholder in the status bar | `done_placeholder_shows_only_when_idle_and_awaiting_input` |
 | **T5** | usage string built by a pure helper | `token_usage_is_reported_after_a_turn` |
 | **C1** | `gui_completion_is_a_superset_of_the_tuis` | new |
@@ -235,9 +288,11 @@ Each item names the row it closes and the test that holds it.
 | **K6** | Tab claimed only when completion changes the buffer | new |
 | **G1** | model `DropDown` | `model_picker_lists_exactly_the_configured_models` |
 | **G2** | `MenuBar` from `MENU_ACTIONS` + `MENU_VIEW_ACTIONS`, returned and appended above the tabs | `menu_bar_defines_every_action_the_gui_can_perform`, `menu_bar_is_attached_to_the_window` + `view_actions_are_built_into_the_menu` (integration) |
+| **G7** | `/menu` itself: the terminal's menu as a clickable strip above the menu bar (`build_menu_strip`, one item per `MENU_DIALOG_ACTIONS` row in the terminal's order, each running `run_menu_action`), the dialog's rows stacked in a vertical box, `/menu` in Tab completion and in `/help`, and a bare `/model` opening the picker instead of printing the model | `every_menu_action_has_a_topbar_entry` (strip is built from the table and runs the shared dispatcher), `slash_menu_is_offered_by_tab_and_help`, `every_gui_command_is_documented_in_its_own_help`, `menu_dialog_lists_every_terminal_menu_action` |
 | **G3** | Cancel/Send buttons sharing the key path | *(no test)* |
 | **G5** | focus re-grab removed from `focus-out` | `focus_out_does_not_regrab_focus` |
-| **G6** | clickable links: `extract_links` + `pango_visible_text` (md), 6 new loader symbols + `TextView::link_hit_at`/`buffer_has_selection`/`connect_button_release` (toolkit), `line_links`/`buf_links` + `resolve_link_spans` + `connect_link_clicks` + `open_link_safely` (gui) | `link_spans_resolve_against_inserted_text`, `link_spans_use_successive_search_for_repeated_text`, `link_spans_stay_in_step_with_conv_on_push_clear_trim`, `lookup_link_hits_only_inside_a_span`, `click_handler_checks_selection_before_opening`, `opener_only_allows_http_https` |
+| **G6** | clickable links: `extract_links` + `pango_visible_text` (md), 6 new loader symbols + `TextView::link_hit_at`/`buffer_has_selection`/`connect_button_release` (toolkit), `line_links`/`buf_links` + `resolve_link_spans` + `connect_link_clicks` + `open_link_safely` (gui); **NWG**: `TextView::plain_line`/`char_index_at`/`connect_left_release`/`open_url` (+ `buffer_has_selection`, `has_focus`, `copy_clipboard`) in the nwg adapter, plus the missing Windows layout shims the shared GUI already called | `link_spans_resolve_against_inserted_text`, `link_spans_use_successive_search_for_repeated_text`, `link_spans_stay_in_step_with_conv_on_push_clear_trim`, `lookup_link_hits_only_inside_a_span`, `click_handler_checks_selection_before_opening`, `opener_only_allows_http_https`, `link_spans_resolve_against_nwg_plain_line_text`, `windows_sync_builds_link_spans_from_the_inserted_text`, `windows_click_handler_guards_like_the_gtk_one` |
+| **G7** | `src/project_launch.rs` (shared by GUI and terminal `/new-project`): `target()` + `launch()`; sidebar header row with the **New Project** button; picker dialog (current workspace pre-filled, Browse…, Open, Cancel); `Session ▸ New project…`; `/new-project` in both dispatches; `select_folder` threaded through the loader → adapters → `App` | `new_project_is_reachable_from_button_menu_and_command`, `project_launch_detaches_and_never_moves_this_process`, `the_sidebar_carries_a_new_project_button`, `project_launch::tests::*` |
 
 ### Deliberately not done
 
@@ -250,6 +305,16 @@ Each item names the row it closes and the test that holds it.
   in the loader. S1/S2 use *read* access only.
 - **Mouse-wheel interception.** No scroll gesture symbols exist, so the GUI
   takes GTK's native wheel behaviour rather than intercepting it.
+- **A tab that points at another project.** Every workspace-derived value (the agent's
+  registry cwd, the session log, `workspace_label()`, the git root, the security policy)
+  reads the *process* cwd, so repointing one tab would repoint them all. G7 therefore
+  opens a new process; making cwd per-tab is a much larger change across code shared
+  with the TUI and REPL, and would change what the multi-project sidebar means.
+- **Link styling on Windows.** The NWG pane is a plain EDIT control: clicks work (G6), but it
+  cannot colour or underline a range, so links there look like ordinary text. The
+  `wxTE_RICH2` equivalent (switching the pane to NWG's `RichTextBox`, `CFE_LINK` +
+  `EM_AUTOURLDETECT`) would give styling and is the natural next step; it is a separate
+  change because it reworks the pane control, not just the click path.
 - **Link hover cursor.** Clicks work (G6), but the pointer does not change
   over a link — no cursor-symbol plumbing exists in the loader, and that is a
   separate piece of work.
@@ -280,7 +345,9 @@ done
 `gtk_adjustment_set_value`, `gtk_scrolled_window_get_vadjustment`,
 `window_to_buffer_coords`, `get_iter_at_location`, `buffer_has_selection`,
 `connect_button_release` — are toolkit symbols defined under `vendors/`, not
-tests, and are expected to be absent from `src/`.)
+tests, and are expected to be absent from `src/`; likewise the nwg adapter's
+`char_index_at` and `connect_left_release`, and `select_folder` (the folder
+chooser added for G7).)
 
 Three of the §3 claims are verifiable in one line each:
 

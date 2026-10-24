@@ -1000,7 +1000,56 @@ actually reaches for rather than a fixed catalog order.
 | `/rewind <#>` | restore the tree and the conversation to a checkpoint |
 | `/model` | list the five most recently used models, one per line, above the prompt as you type (↑/↓ then Enter, or the row's number) |
 | `/model<N>` (e.g. `/model2`) | switch straight to the Nth of that top-five list |
+| `/opencode-keys [status\|rotate]` | show or rotate the opencode key pool (extension command, see §18) |
 
 `/plan`, `/skills` and `/scratchpad` are all registered in the `match cmd`
 dispatch in `src/main.rs`, so tab-completion picks them up automatically (the
-completion list is generated from that dispatch by `build.rs`).
+completion list is generated from that dispatch by `build.rs`). Extension
+commands like `/opencode-keys` (and `/ollama-webtools`, `/ollama-cloud-usage`)
+are registered at runtime by their extension and complete the same way.
+
+## 18. Rotating opencode-go keys (`opencode-keys.json`)
+
+The operator keeps several opencode keys in `~/.pi/agent/opencode-keys.json`:
+
+```json
+{
+  "keys": [
+    { "name": "w4", "key": "sk-…" },
+    { "name": "w6", "key": "oc_sk_…" }
+  ],
+  "activeKeyIndex": 4,
+  "cooldownMinutes": 60,
+  "cooldowns": { "0": 1787905989800 },
+  "quotaBlockedUntil": { "1": 1787909595629 }
+}
+```
+
+`keys` is the pool, `activeKeyIndex` the key new requests use, and the two
+timestamp maps (epoch millis, keyed by stringified index) mark recently failed
+keys: `cooldowns` (rate-limited / rejected once — skipped for
+`cooldownMinutes`) and `quotaBlockedUntil` (quota-exhausted — skipped until
+the stored time). Unknown fields (`watchdogEnabled`, …) belong to the external
+subscription manager and are preserved untouched — a rotation never drops a
+field pir doesn't understand.
+
+- The `opencode-go` provider resolves to the pool's current usable key at
+  catalog load (active index when usable, else the first usable key), and
+  every request sends with the pool's current key. Without the file (or with
+  every key cooling down) the static catalog/`auth.json` key is used, exactly
+  as before.
+- Quota-exhausted, 401/unauthorized, and 429 failures fail over automatically:
+  the dead key is marked (quota → `quotaBlockedUntil`, auth/rate-limit →
+  `cooldowns`), the pool advances to the next usable key, and the request
+  retries immediately — no backoff wait (a dead key gets replaced, not waited
+  on). Only pre-output failures rotate (mid-stream output must never be
+  duplicated); when the pool is exhausted the original error surfaces.
+- `/opencode-keys` (default `status`) shows the pool: active key, usable /
+  cooling-down / quota-blocked per key. `/opencode-keys rotate` moves to the
+  next usable key. The same surface is available to the model as the
+  `opencode_key_status` / `opencode_key_rotate` tools, and the startup banner
+  names the active key and usable count (`[opencode-keys] pool: active …`).
+- Concurrent pir processes share the rotation: every mutation persists
+  `activeKeyIndex` + the timestamp maps immediately, and each attempt re-reads
+  the file when the active index moved (adopting it only when the on-disk
+  keys match, so a moved config can never cross-contaminate).

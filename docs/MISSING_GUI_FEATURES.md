@@ -164,7 +164,7 @@ The GUI implements ~40 commands. These are present in `src/tui.rs` or
 | Command | Where it exists | Notes for the GUI |
 |---|---|---|
 | `/resume` | `src/main.rs:3386` | Session picker; GUI has `/sessions` for tabs but no resume-across-restart |
-| `/menu` | `src/main.rs:2687` | Interactive alt-screen menu — has a GUI dialog equivalent (`/menu` opens a button dialog; every action also has a topbar item) |
+| `/menu` | `src/main.rs:2687` | Interactive alt-screen menu — has a GUI dialog equivalent (`/menu` opens a button dialog, and the "Menu" strip above the tabs lists every action in the terminal's order) |
 | `/plan` | `src/main.rs:3961` | Reads the plan document |
 | `/mcp` | `src/main.rs:4031` | MCP server status |
 | `/taste` | `src/main.rs:4104` | Taste preferences |
@@ -232,6 +232,12 @@ verified with `cargo test --features gui --bin pir -- --test-threads=8`
 | **5.1** dead, wrong `/sessions` arm | Removed. `/sessions` is dispatched by `handle_session_command` before `handle_command` is reached, so the arm was unreachable — and its message ("use `pir -r` from a terminal") was wrong for a GUI that has tabs. |
 | **5.2** header comment claimed a "scrollable" TextView | Now true (see 1.1). |
 | **5.3** unused `ON_GTK` | Removed; the `cfg(feature = "gtk")` warning it documented moved onto the type aliases it actually explains, and `GTK_WRAP_WORD_CHAR` is now used instead of a bare `2`. |
+
+| **compact** `/compact` missing (GUI *and* TUI) | The agent printed "run /compact to summarise and free the window", and neither the GUI nor the TUI had an arm for it — in the GUI it was not even completable. Both now dispatch it (`status` / `on` / `off` / no-arg); the GUI runs the summariser on a worker (`spawn_compact`, the `spawn_goal` shape) because it is the longest single model call a session makes. |
+
+`/compact` itself was also broken for the sessions that need it most — see
+`docs/GUI_DESIGN.md` §4.6: the summariser sent the whole conversation verbatim,
+so the one request whose job is to fit the window was itself too big for it.
 
 Tests added, so these cannot silently regress:
 

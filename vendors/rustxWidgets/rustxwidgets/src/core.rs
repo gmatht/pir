@@ -359,6 +359,12 @@ impl App {
         crate::backends_gtk_adapter::open_file(title)
     }
 
+    /// Folder chooser (the GUI's "New Project"). `Ok(None)` = cancelled.
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
+    pub fn select_folder(&self, title: &str) -> Result<Option<String>, Error> {
+        crate::backends_gtk_adapter::select_folder(title)
+    }
+
     #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     pub fn save_file(&self, title: &str) -> Result<Option<String>, Error> {
         crate::backends_gtk_adapter::save_file(title)
@@ -484,6 +490,13 @@ impl App {
     pub fn open_file(&self, title: &str) -> Result<Option<String>, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::open_file(title, parent)
+    }
+
+    /// Folder chooser (the GUI's "New Project"). `Ok(None)` = cancelled.
+    #[cfg(all(windows, not(feature = "zork")))]
+    pub fn select_folder(&self, title: &str) -> Result<Option<String>, Error> {
+        let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
+        crate::backends_nwg_adapter::select_folder(title, parent)
     }
 
     #[cfg(all(windows, not(feature = "zork")))]

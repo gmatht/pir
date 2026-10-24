@@ -13,6 +13,14 @@ pub enum ApiKind {
     /// `/chat/completions` calls to these models fail, so they need their own
     /// request shape, streaming events, and usage envelope.
     OpenAiResponses,
+    /// Google Generative AI (`:generateContent` / `:streamGenerateContent`):
+    /// used by models whose catalog entry says `google-generative-ai`
+    /// (opencode's gemini-3.x/4.x, opencode-go's gemini-4-argon-contributor).
+    /// OpenAI-style bodies 400 `ModelProtocolUnsupported` on them (verified
+    /// live), so they need their own request shape (`contents`/`systemInstruction`,
+    /// `tools.functionDeclarations`), streaming events, and usage envelope
+    /// (`usageMetadata`).
+    Google,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -282,6 +290,10 @@ impl ThinkingLevel {
                 Some(ApiKind::OpenAi) => self.oai_effort().is_some(),
                 // Same effort names ride `reasoning.effort` on Responses.
                 Some(ApiKind::OpenAiResponses) => self.oai_effort().is_some(),
+                // Google takes no pir thinking params (native thinking is a
+                // per-request `thinkingConfig`pir doesn't model) — offering
+                // levels would silently do nothing.
+                Some(ApiKind::Google) => false,
                 Some(ApiKind::Anthropic) => self.anthropic_budget(ctx).is_some(),
                 None => true,
             },
@@ -306,6 +318,7 @@ impl Provider {
         match api.as_deref() {
             Some(a) if a.contains("anthropic") => Some(ApiKind::Anthropic),
             Some(a) if a.contains("responses") => Some(ApiKind::OpenAiResponses),
+            Some(a) if a.contains("google") || a.contains("gemini") => Some(ApiKind::Google),
             Some(_) => Some(ApiKind::OpenAi),
             None if base.contains("anthropic.com") => Some(ApiKind::Anthropic),
             None if base.is_empty() => None,
@@ -326,6 +339,8 @@ impl Provider {
                 Some(ApiKind::Anthropic)
             } else if a.contains("responses") {
                 Some(ApiKind::OpenAiResponses)
+            } else if a.contains("google") || a.contains("gemini") {
+                Some(ApiKind::Google)
             } else {
                 Some(ApiKind::OpenAi)
             };
@@ -934,6 +949,7 @@ fn load_providers_uncached() -> Result<Vec<Provider>, String> {
 
     merge_ollama_cloud(&mut providers);
     merge_space_bunny(&mut providers);
+    merge_opencode_keys(&mut providers);
     apply_prices(&mut providers);
     maybe_add_fake_provider(&mut providers);
     Ok(providers)
@@ -1209,6 +1225,7 @@ fn load_from_auth_fallback() -> Result<Vec<Provider>, String> {
     }
 
     merge_space_bunny(&mut providers);
+    merge_opencode_keys(&mut providers);
     apply_prices(&mut providers);
     if providers.is_empty() { Err("No providers found in auth.json".into()) } else { maybe_add_fake_provider(&mut providers); Ok(providers) }
 }
@@ -1259,6 +1276,378 @@ fn collect_api_keys(
         {
             map.insert(id.to_lowercase(), key.to_string());
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rotating opencode-go key pool (`~/.pi/agent/opencode-keys.json`)
+// ---------------------------------------------------------------------------
+//
+// The operator keeps several opencode keys in one file (written by hand or by
+// an external subscripton manager):
+//
+// ```json
+// {
+//   "keys": [{ "name": "w4", "key": "sk-…" }, …],
+//   "activeKeyIndex": 4,
+//   "cooldownMinutes": 60,
+//   "cooldowns": { "0": 1787905989800 },
+//   "quotaBlockedUntil": { "1": 1787909595629 }
+// }
+// ```
+//
+// `keys` is the pool, `activeKeyIndex` the key new requests should use, and
+// the two timestamp maps (epoch millis, keyed by stringified index) mark keys
+// that recently failed: `cooldowns` (rate-limited / rejected once — skip for
+// `cooldownMinutes`) and `quotaBlockedUntil` (quota-exhausted — skip until
+// the stored time). Unknown fields (`watchdogEnabled`, …) belong to the
+// external manager and are preserved untouched: the pool is loaded into a
+// `KeyPool` that keeps the raw `Value` and writes it back in place, so a
+// rotation never drops a field pir doesn't understand.
+//
+// Reads: [`load_opencode_key_pool`] (None when the file is absent or has no
+// keys — every caller treats that as "no pool, static key as before").
+// Selection: [`KeyPool::current_usable_key`] (active index when usable, else
+// the first usable key). Writes: [`KeyPool::rotate_manual`] (operator /
+// extension `/opencode-keys rotate`) and [`KeyPool::rotate_on_error`]
+// (automatic failover in `provider.rs` on quota/auth/rate-limit errors).
+// Every mutation persists `activeKeyIndex` + the timestamp maps immediately,
+// so concurrent pir processes share the rotation state (last writer wins).
+
+/// Path of the opencode key-pool file.
+pub fn opencode_keys_path() -> PathBuf {
+    pi_dir().join("agent").join("opencode-keys.json")
+}
+
+/// Epoch millis now. Timestamp basis for `cooldowns` / `quotaBlockedUntil`.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// A loaded `opencode-keys.json` pool. Mutations ([`KeyPool::rotate_manual`],
+/// [`KeyPool::rotate_on_error`], [`KeyPool::mark_quota`],
+/// [`KeyPool::mark_cooldown`]) update the raw value and write the file, so
+/// the on-disk state is always the rotation state every process agrees on.
+#[derive(Debug)]
+pub struct KeyPool {
+    path: PathBuf,
+    raw: Value,
+    keys: Vec<(String, String)>,
+    active: usize,
+    cooldown_minutes: u64,
+}
+
+impl KeyPool {
+    /// How many keys are in the pool.
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Whether the pool has no keys.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// The active index as stored (`activeKeyIndex`), clamped into range.
+    pub fn active_index(&self) -> usize {
+        self.active.min(self.keys.len().saturating_sub(1))
+    }
+
+    /// Display name of key `idx` (`name`, else `#idx`).
+    pub fn key_name(&self, idx: usize) -> String {
+        self.keys
+            .get(idx)
+            .map(|(n, _)| {
+                let n = n.trim();
+                if n.is_empty() {
+                    format!("#{idx}")
+                } else {
+                    format!("#{idx} ({n})")
+                }
+            })
+            .unwrap_or_else(|| format!("#{idx}"))
+    }
+
+    /// Whether `other` holds the same keys (same values, same order). The
+    /// concurrent-rotation refresh in `Client::key_pool_key` only adopts the
+    /// on-disk pool when this holds — a file with different keys is a
+    /// different pool (config moved under us), and adopting its active index
+    /// would point at the wrong key and persist marks into the wrong file.
+    pub fn same_keys(&self, other: &KeyPool) -> bool {
+        self.keys == other.keys
+    }
+
+    /// Epoch millis until which `cooldowns[idx]` skips the key (0 = usable).
+    fn cooldown_until(&self, idx: usize) -> u64 {
+        let entry = self
+            .raw
+            .get("cooldowns")
+            .and_then(|c| c.get(idx.to_string()))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        entry.saturating_add(self.cooldown_minutes.saturating_mul(60_000))
+    }
+
+    /// Epoch millis until which `quotaBlockedUntil[idx]` skips the key.
+    fn quota_until(&self, idx: usize) -> u64 {
+        self.raw
+            .get("quotaBlockedUntil")
+            .and_then(|q| q.get(idx.to_string()))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    }
+
+    /// Indices usable right now: not cooling down and not quota-blocked.
+    pub fn usable_indices(&self, now: u64) -> Vec<usize> {
+        (0..self.keys.len())
+            .filter(|&i| now >= self.cooldown_until(i) && now >= self.quota_until(i))
+            .collect()
+    }
+
+    /// Count of keys usable right now (for status lines that load the pool).
+    pub fn usable_indices_count(&self) -> usize {
+        self.usable_indices(now_ms()).len()
+    }
+
+    /// The key new requests should use: the active index when usable, else the
+    /// first usable key. `None` when every key is cooling down / blocked.
+    pub fn current_usable_key(&self) -> Option<(usize, String)> {
+        let now = now_ms();
+        let usable = self.usable_indices(now);
+        if usable.is_empty() {
+            return None;
+        }
+        let idx = if usable.contains(&self.active_index()) {
+            self.active_index()
+        } else {
+            usable[0]
+        };
+        self.keys.get(idx).map(|(_, k)| (idx, k.clone()))
+    }
+
+    /// Write the raw value back to the pool file (pretty, like the hand-kept
+    /// rest of `~/.pi/agent`). Best-effort: a write failure is reported, never
+    /// panics — the in-memory rotation still applies to this process.
+    fn save(&self) -> Result<(), String> {
+        let text = serde_json::to_string_pretty(&self.raw).map_err(|e| e.to_string())?;
+        fs::write(&self.path, text).map_err(|e| {
+            format!("cannot write {}: {e}", self.path.display())
+        })
+    }
+
+    /// Record the active index in the raw value and persist.
+    fn save_active(&mut self, idx: usize) -> Result<(), String> {
+        self.active = idx;
+        if let Some(obj) = self.raw.as_object_mut() {
+            obj.insert("activeKeyIndex".into(), Value::from(idx as u64));
+        }
+        self.save()
+    }
+
+    /// Mark `idx` as recently rate-limited / rejected: skipped for
+    /// `cooldownMinutes` from now. Persists.
+    pub fn mark_cooldown(&mut self, idx: usize) {
+        let now = now_ms();
+        if let Some(obj) = self.raw.as_object_mut() {
+            let entry = obj
+                .entry("cooldowns")
+                .or_insert_with(|| Value::Object(Default::default()));
+            if !entry.is_object() {
+                *entry = Value::Object(Default::default());
+            }
+            entry
+                .as_object_mut()
+                .unwrap()
+                .insert(idx.to_string(), Value::from(now));
+        }
+        let _ = self.save();
+    }
+
+    /// Mark `idx` as quota-exhausted: skipped until `cooldownMinutes` from
+    /// now. Persists.
+    pub fn mark_quota(&mut self, idx: usize) {
+        let until = now_ms().saturating_add(self.cooldown_minutes.saturating_mul(60_000));
+        if let Some(obj) = self.raw.as_object_mut() {
+            let entry = obj
+                .entry("quotaBlockedUntil")
+                .or_insert_with(|| Value::Object(Default::default()));
+            if !entry.is_object() {
+                *entry = Value::Object(Default::default());
+            }
+            entry
+                .as_object_mut()
+                .unwrap()
+                .insert(idx.to_string(), Value::from(until));
+        }
+        let _ = self.save();
+    }
+
+    /// Move the active index to the next usable key after the current one
+    /// (wrapping). Returns the new `(index, name)`. When nothing else is
+    /// usable the pool is left unchanged and `None` is returned. Persists.
+    pub fn rotate_manual(&mut self, _reason: &str) -> Option<(usize, String)> {
+        let now = now_ms();
+        let usable = self.usable_indices(now);
+        if usable.is_empty() {
+            return None;
+        }
+        let cur = self.active_index();
+        // First usable index strictly after `cur` (wrapping); a pool whose
+        // only usable key is the current one stays put (`None` — rotating to
+        // the same key would be a no-op that rewrites the file).
+        let next = usable
+            .iter()
+            .find(|&&i| i > cur)
+            .or_else(|| usable.first())
+            .copied()?;
+        if next == cur {
+            return None;
+        }
+        let name = self.key_name(next);
+        let _ = self.save_active(next);
+        Some((next, name))
+    }
+
+    /// Automatic failover for a failed request that used key `used_idx`:
+    /// classify `err`, mark the failed key (quota → `quotaBlockedUntil`,
+    /// auth / rate-limit → `cooldowns`), reload the file first so a
+    /// concurrent process's marks aren't clobbered, then advance to the next
+    /// usable key. Returns the new `(index, name, cause)` when a *different*
+    /// key took over, `None` when the error isn't rotation-worthy or the pool
+    /// is exhausted (the mark is still persisted, so `/opencode-keys` shows
+    /// it). The caller retries the request on `Some`, surfaces `err` on
+    /// `None`.
+    pub fn rotate_on_error(&mut self, used_idx: usize, err: &str) -> Option<(usize, String, &'static str)> {
+        let l = err.to_lowercase();
+        let quota = ["usage limit", "weekly usage", "quota exceeded", "quota_exceeded", "insufficient_quota", "upgrade for higher limits", "billing"]
+            .iter()
+            .any(|s| l.contains(s));
+        let auth = err.starts_with("HTTP 401") || l.contains("invalid_api_key") || l.contains("unauthorized");
+        let rate = err.starts_with("HTTP 429");
+        let cause: &'static str = if quota {
+            "quota-exhausted"
+        } else if auth {
+            "rejected (401/unauthorized)"
+        } else if rate {
+            "rate-limited (429)"
+        } else {
+            return None;
+        };
+        // Re-read the file so marks written by a concurrent pir process since
+        // this pool was loaded survive this rotation (last writer still wins
+        // on `activeKeyIndex`, but nobody's failure marks are lost).
+        if let Some(fresh) = load_opencode_key_pool_from(&self.path)
+            && !fresh.keys.is_empty()
+        {
+            *self = fresh;
+        }
+        let cur = used_idx.min(self.keys.len().saturating_sub(1));
+        if quota {
+            self.mark_quota(cur);
+        } else {
+            self.mark_cooldown(cur);
+        }
+        let now = now_ms();
+        let usable = self.usable_indices(now);
+        let next = usable
+            .iter()
+            .find(|&&i| i != cur)
+            .or_else(|| usable.first().filter(|&&i| i != cur))
+            .copied()?;
+        let name = self.key_name(next);
+        let _ = self.save_active(next);
+        Some((next, name, cause))
+    }
+
+    /// One-line-per-key status for `/opencode-keys` and the startup report.
+    pub fn status(&self) -> String {
+        let now = now_ms();
+        let usable = self.usable_indices(now);
+        let mut out = format!(
+            "opencode-keys pool ({}): {} keys, active {} — {} usable",
+            self.path.display(),
+            self.keys.len(),
+            self.key_name(self.active_index()),
+            usable.len(),
+        );
+        for i in 0..self.keys.len() {
+            let state = if now < self.quota_until(i) {
+                let mins = (self.quota_until(i).saturating_sub(now) + 59_999) / 60_000;
+                format!("quota-blocked (~{mins}m left)")
+            } else if now < self.cooldown_until(i) {
+                let mins = (self.cooldown_until(i).saturating_sub(now) + 59_999) / 60_000;
+                format!("cooling down (~{mins}m left)")
+            } else {
+                "usable".to_string()
+            };
+            let marker = if i == self.active_index() { "*" } else { " " };
+            out.push_str(&format!("\n {marker} {}: {state}", self.key_name(i)));
+        }
+        out
+    }
+}
+
+/// Load the pool from an explicit path (the shared helper; [`load_opencode_key_pool`]
+/// resolves the live path). `None` on absent / unreadable / malformed / keyless.
+fn load_opencode_key_pool_from(path: &Path) -> Option<KeyPool> {
+    let raw: Value = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
+    let keys: Vec<(String, String)> = raw
+        .get("keys")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|k| {
+            let key = k.get("key").and_then(Value::as_str)?.trim();
+            if key.is_empty() {
+                return None;
+            }
+            let name = k
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            Some((name, key.to_string()))
+        })
+        .collect();
+    if keys.is_empty() {
+        return None;
+    }
+    let active = raw
+        .get("activeKeyIndex")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let cooldown_minutes = raw
+        .get("cooldownMinutes")
+        .and_then(Value::as_u64)
+        .filter(|&m| m > 0)
+        .unwrap_or(60);
+    let keys_len = keys.len();
+    Some(KeyPool {
+        path: path.to_path_buf(),
+        raw,
+        keys,
+        active: active.min(keys_len.saturating_sub(1)),
+        cooldown_minutes,
+    })
+}
+
+/// Load the operator's opencode key pool, if the file exists and holds keys.
+/// Absent / malformed / keyless → `None` (callers fall back to the static key).
+pub fn load_opencode_key_pool() -> Option<KeyPool> {
+    load_opencode_key_pool_from(&opencode_keys_path())
+}
+
+/// Point the `opencode-go` provider at the pool's current usable key. Called
+/// from both catalog load paths (store + auth fallback) so the rotation state
+/// is the source of truth whenever the file exists; without a file (or with
+/// every key cooling down) the static catalog/auth key is left untouched.
+pub fn merge_opencode_keys(providers: &mut [Provider]) {
+    let Some(pool) = load_opencode_key_pool() else { return };
+    let Some((_, key)) = pool.current_usable_key() else { return };
+    if let Some(p) = providers.iter_mut().find(|p| p.pid() == "opencode-go") {
+        p.api_key = Some(key);
     }
 }
 
@@ -2806,8 +3195,11 @@ mod worktree_settings_tests {
         assert_eq!(p.model_api(&mk("openai-responses")), Some(ApiKind::OpenAiResponses));
         assert_eq!(p.model_api(&mk("openai-completions")), Some(ApiKind::OpenAi));
         assert_eq!(p.model_api(&mk("anthropic-messages")), Some(ApiKind::Anthropic));
+        assert_eq!(p.model_api(&mk("google-generative-ai")), Some(ApiKind::Google));
         p.api = Some("openai-responses".into());
         assert_eq!(p.kind(), Some(ApiKind::OpenAiResponses));
+        p.api = Some("google-generative-ai".into());
+        assert_eq!(p.kind(), Some(ApiKind::Google));
     }
 
     /// `load_providers` must carry each model's own `api`/`baseUrl` into
@@ -3809,5 +4201,192 @@ mod default_model_tests {
         ] {
             assert_eq!(selector_from_settings(&v), None, "must reject {v}");
         }
+    }
+}
+
+#[cfg(test)]
+mod opencode_key_pool_tests {
+    use super::*;
+
+    /// Write `doc` to `<dir>/opencode-keys.json` and load it back: asserts on
+    /// the pool the loader itself built (not a recomputation from the test's
+    /// own JSON parsing).
+    fn pool_from_doc(doc: &Value) -> (TempfileGuard, KeyPool) {
+        let dir = std::env::temp_dir().join(format!(
+            "pir-keypool-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("opencode-keys.json");
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let pool = load_opencode_key_pool_from(&path).expect("test pool must load");
+        (TempfileGuard { dir }, pool)
+    }
+
+    struct TempfileGuard {
+        dir: PathBuf,
+    }
+
+    impl Drop for TempfileGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn three_key_doc() -> Value {
+        json!({
+            "keys": [
+                { "name": "a", "key": "sk-a" },
+                { "name": "b", "key": "sk-b" },
+                { "name": "c", "key": "sk-c" },
+            ],
+            "activeKeyIndex": 1,
+            "cooldownMinutes": 60,
+            "watchdogEnabled": true,
+        })
+    }
+
+    #[test]
+    fn active_key_is_current_when_usable() {
+        let (_g, pool) = pool_from_doc(&three_key_doc());
+        let (idx, key) = pool.current_usable_key().expect("all usable");
+        assert_eq!((idx, key.as_str()), (1, "sk-b"), "active index wins");
+    }
+
+    #[test]
+    fn blocked_active_falls_through_to_first_usable() {
+        let (_g, mut pool) = pool_from_doc(&three_key_doc());
+        pool.mark_quota(1); // active key quota-blocked for cooldownMinutes
+        let (idx, key) = pool.current_usable_key().expect("b/c usable");
+        assert_eq!((idx, key.as_str()), (0, "sk-a"));
+    }
+
+    #[test]
+    fn exhausted_pool_yields_none() {
+        let (_g, mut pool) = pool_from_doc(&three_key_doc());
+        pool.mark_quota(0);
+        pool.mark_quota(1);
+        pool.mark_quota(2);
+        assert!(pool.current_usable_key().is_none(), "all blocked");
+    }
+
+    #[test]
+    fn quota_error_marks_and_advances() {
+        let (_g, mut pool) = pool_from_doc(&three_key_doc());
+        let err = "HTTP 429: you have reached your weekly usage limit";
+        let (next, name, cause) = pool.rotate_on_error(1, err).expect("must rotate");
+        assert_eq!(next, 0, "next usable after the failed key");
+        assert!(name.contains("(a)"), "named: {name}");
+        assert_eq!(cause, "quota-exhausted");
+        // The failed key is quota-blocked, and the rotation persisted.
+        assert!(pool.quota_until(1) > now_ms());
+        let reloaded = load_opencode_key_pool_from(&pool.path).expect("reload");
+        assert_eq!(reloaded.active_index(), 0, "activeKeyIndex persisted");
+    }
+
+    #[test]
+    fn auth_error_cools_down_not_quota() {
+        let (_g, mut pool) = pool_from_doc(&three_key_doc());
+        let (next, _, cause) = pool
+            .rotate_on_error(0, "HTTP 401: invalid_api_key")
+            .expect("must rotate");
+        assert_eq!(cause, "rejected (401/unauthorized)");
+        assert_eq!(next, 1);
+        assert!(pool.quota_until(0) == 0, "auth is a cooldown, not quota");
+        assert!(pool.cooldown_until(0) > now_ms(), "cooling down");
+    }
+
+    #[test]
+    fn non_rotation_errors_leave_pool_alone() {
+        let (_g, mut pool) = pool_from_doc(&three_key_doc());
+        assert!(
+            pool.rotate_on_error(1, "HTTP 500: internal error").is_none(),
+            "500s are retried on the SAME key, not rotated"
+        );
+        assert_eq!(pool.current_usable_key().unwrap().0, 1, "active unchanged");
+    }
+
+    #[test]
+    fn same_keys_guards_adoption() {
+        // The concurrent-rotation refresh must only adopt an on-disk pool
+        // with identical keys: a different key set is a different pool.
+        let (_g, pool) = pool_from_doc(&three_key_doc());
+        let (_h, same) = pool_from_doc(&three_key_doc());
+        assert!(pool.same_keys(&same));
+        let other_doc = json!({
+            "keys": [{ "name": "x", "key": "sk-x" }],
+            "activeKeyIndex": 0,
+            "cooldownMinutes": 60,
+        });
+        let (_i, other) = pool_from_doc(&other_doc);
+        assert!(!pool.same_keys(&other), "different keys must not adopt");
+    }
+
+    #[test]
+    fn unknown_fields_survive_rotation() {
+        let (_g, mut pool) = pool_from_doc(&three_key_doc());
+        pool.rotate_manual("test").expect("rotates");
+        let raw: Value =
+            serde_json::from_str(&fs::read_to_string(&pool.path).unwrap()).unwrap();
+        assert_eq!(
+            raw.get("watchdogEnabled"),
+            Some(&Value::Bool(true)),
+            "foreign fields preserved"
+        );
+    }
+
+    #[test]
+    fn merge_points_opencode_go_at_pool_key() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "pir-keypool-merge-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(dir.join("agent"));
+        std::fs::write(
+            dir.join("agent").join("opencode-keys.json"),
+            three_key_doc().to_string(),
+        )
+        .unwrap();
+        let old = std::env::var_os("PI_DIR");
+        // SAFETY: edition 2024 marks env mutation unsafe; tests hold the
+        // shared env lock and restore below.
+        unsafe { std::env::set_var("PI_DIR", &dir) };
+        let mut providers = vec![Provider {
+            id: Some("opencode-go".into()),
+            name: None,
+            base_url: Some("https://opencode.ai/zen/go/v1".into()),
+            api_key: Some("static-key".into()),
+            api: Some("openai".into()),
+            models: vec![Model {
+                id: "m".into(),
+                name: None,
+                context: Some(1000),
+                max_tokens: None,
+                api_override: None,
+                url_override: None,
+                no_reasoning_effort: false,
+                reasoning: false,
+                thinking_format: None,
+                supports_reasoning_effort: None,
+                thinking_level_map: Default::default(),
+                price_per_1k: None,
+            }],
+        }];
+        merge_opencode_keys(&mut providers);
+        match old {
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            providers[0].api_key.as_deref(),
+            Some("sk-b"),
+            "pool's active key replaces the static one"
+        );
     }
 }

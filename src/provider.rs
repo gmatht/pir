@@ -292,6 +292,15 @@ pub struct Client {
     kind: ApiKind,
     base_url: String,
     api_key: String,
+    /// Rotating opencode key pool (`~/.pi/agent/opencode-keys.json`), set by
+    /// `make_client` for the `opencode-go` provider only. When present, each
+    /// retry-loop attempt sends with [`key_pool_key`] — the pool's current
+    /// usable key — and quota/auth/rate-limit failures call
+    /// [`KeyPool::rotate_on_error`] to fail over to the next usable key and
+    /// retry *without* the backoff wait (a sick key doesn't get room; it gets
+    /// replaced). `None` everywhere else: other providers keep their static
+    /// `api_key` and their existing retry behavior exactly.
+    key_pool: Option<std::sync::Mutex<crate::config::KeyPool>>,
     /// Runtime-dlopen'd host libcurl (built once; `Curl` is `Send + Sync`,
     /// cheap to share per attempt via `Arc`). `None` when the host has no
     /// loadable `libcurl.so.4` (e.g. Windows) — requests then fail with a
@@ -377,6 +386,7 @@ impl Client {
             kind,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
+            key_pool: None,
             lsb_curl: lsb_curl::Curl::load().ok().map(Arc::new),
             backend: HttpBackend::default(),
             session_id: None,
@@ -396,6 +406,64 @@ impl Client {
     /// Called by `make_client` for providers that want it; ignored elsewhere.
     pub fn set_session_id(&mut self, id: Option<String>) {
         self.session_id = id.filter(|s| !s.is_empty());
+    }
+
+    /// Attach the rotating opencode key pool (`opencode-keys.json`). Called by
+    /// `make_client` for the `opencode-go` provider only; ignored elsewhere.
+    /// `None` clears the pool (static `api_key` behavior as before).
+    pub fn set_key_pool(&mut self, pool: Option<crate::config::KeyPool>) {
+        self.key_pool = pool.map(std::sync::Mutex::new);
+    }
+
+    /// The key this attempt sends with: the pool's current usable key when a
+    /// pool is attached, else the client's static `api_key`. Pure w.r.t. the
+    /// network — it re-reads the pool file when a stale rotation is detected
+    /// (see below), so concurrent pir processes converge instead of pinning a
+    /// key one of them already marked bad.
+    ///
+    /// Rotation detection: when the pool file's `activeKeyIndex` moved since
+    /// the last attempt (a concurrent process rotated), the in-memory pool is
+    /// refreshed from disk before selecting — otherwise two processes would
+    /// each sit on their own active key and the second retirement would undo
+    /// the first. A refresh failure keeps the in-memory state (better than
+    /// failing the request).
+    ///
+    /// The on-disk pool is only adopted when it holds the SAME keys (same
+    /// values, same order) — i.e. this pool, rotated. A file with different
+    /// keys is a different pool (the config moved under us, e.g. a test
+    /// swapping `PI_DIR` mid-request), and adopting its active index would
+    /// point at the wrong key and persist marks into the wrong file —
+    /// verified live: a test that restored `PI_DIR` before `chat` made the
+    /// client adopt the operator's real pool and write marks into the real
+    /// file. [`KeyPool::same_keys`] is the guard.
+    fn key_pool_key(&self) -> Option<(usize, String)> {
+        let pool = self.key_pool.as_ref()?.lock().ok()?;
+        // Fast path: active index matches the file's (no concurrent rotation).
+        let on_disk = crate::config::load_opencode_key_pool();
+        drop(pool);
+        // Refresh under the lock when the file moved, then select.
+        if let Some(fresh) = on_disk
+            && let Ok(mut pool) = self.key_pool.as_ref()?.lock() {
+                if fresh.active_index() != pool.active_index() && fresh.same_keys(&pool) {
+                    *pool = fresh;
+                }
+                return pool.current_usable_key();
+            }
+        self.key_pool.as_ref()?.lock().ok()?.current_usable_key()
+    }
+
+    /// Ask the pool to fail over after a failed attempt that sent with
+    /// `used_idx`. Returns the replacement `(index, name, cause)` when a
+    /// *different* key took over (the caller retries immediately — no backoff;
+    /// a dead key gets replaced, not waited on), `None` when the error isn't
+    /// rotation-worthy or every key is cooling down / blocked (the mark is
+    /// still persisted, so `/opencode-keys` and the next attempt see it).
+    fn rotate_pool(&self, used_idx: usize, err: &str) -> Option<(usize, String, &'static str)> {
+        self.key_pool
+            .as_ref()?
+            .lock()
+            .ok()?
+            .rotate_on_error(used_idx, err)
     }
 
     /// The process's OpenCode Go session id for `x-opencode-session`
@@ -452,14 +520,21 @@ impl Client {
     /// the correct route. Suppressing it produced the same `MissingSessionID`
     /// 400 it was meant to cure.
     fn request_headers(&self, kind: ApiKind) -> Vec<(String, String)> {
+        self.request_headers_with_key(kind, &self.api_key)
+    }
+
+    /// [`request_headers`] for an explicit key — the failover path re-sends
+    /// the same attempt with the pool's current key (see [`key_pool_key`]) so
+    /// headers never pin a retired key.
+    fn request_headers_with_key(&self, kind: ApiKind, api_key: &str) -> Vec<(String, String)> {
         let mut out = vec![("user-agent".to_string(), Self::user_agent())];
         match kind {
             ApiKind::Anthropic => {
-                out.push(("x-api-key".to_string(), self.api_key.clone()));
+                out.push(("x-api-key".to_string(), api_key.to_string()));
                 out.push(("anthropic-version".to_string(), "2023-06-01".to_string()));
             }
-            ApiKind::OpenAi | ApiKind::OpenAiResponses => {
-                out.push(("Authorization".to_string(), format!("Bearer {}", self.api_key)));
+            ApiKind::OpenAi | ApiKind::OpenAiResponses | ApiKind::Google => {
+                out.push(("Authorization".to_string(), format!("Bearer {api_key}")));
             }
         }
         if let Some(id) = &self.session_id {
@@ -498,13 +573,25 @@ impl Client {
         // `ModelProtocolUnsupported` — verified live).
         api_override: Option<ApiKind>,
     ) -> Result<String, String> {
-        self.complete_with(model, system, prompt, 12, api_override)
+        // A one-word verdict: 12 tokens of output, measured against the
+        // provider's default window only to keep the shared body builder honest
+        // (the classifier prompts are tiny; a caller that passes a transcript
+        // must use `complete_with`, which takes the real window).
+        self.complete_with(model, system, prompt, 12, api_override, 200_000)
     }
 
     /// Like [`Client::complete`], but with an explicit output-token budget.
     /// The 12-token default is sized for one-word verdicts (the goal/retry
     /// classifiers); a real generation (e.g. `/compact`'s session summary)
     /// needs room to write, so callers pass their own budget.
+    ///
+    /// A one-shot completion is not exempt from the combined window: `prompt`
+    /// here can be a whole conversation transcript, so `max_out` alone does not
+    /// make the request legal. With no tools in the body the input is
+    /// `system + prompt`, and `ctx` is the window to fit it into — the call is
+    /// refused, loudly and before it is sent, rather than 400ing at the gateway
+    /// with an opaque message. `Client::complete` passes its 12-token verdict
+    /// budget, so the measurement can never turn it into a rejection.
     pub fn complete_with(
         &self,
         model: &str,
@@ -512,14 +599,57 @@ impl Client {
         prompt: &str,
         max_out: u32,
         api_override: Option<ApiKind>,
+        ctx: u64,
     ) -> Result<String, String> {
         if self.fake {
             let _ = (model, system, prompt);
             return Ok("fake ok".to_string());
         }
         let kind = api_override.unwrap_or(self.kind);
-        let (url, body) =
-            Self::complete_body(&self.base_url, model, system, prompt, max_out, kind);
+        let max_out = fit_output_budget(
+            max_out as u64,
+            estimate_prompt_tokens(system, prompt),
+            ctx.max(1),
+        )?;
+        // Protocol fallback: a model whose catalog entry misstates its API
+        // family (or a stale client built for another provider default) gets a
+        // 400 `ModelProtocolUnsupported` on the first shape — retry once with
+        // the flipped OpenAI-family wire shape instead of failing outright.
+        // Only OpenAI-family kinds flip (Anthropic has a single wire shape,
+        // so its 400s stay fatal), and exactly once per kind so a genuinely
+        // broken request still surfaces instead of ping-ponging.
+        let flipped = match kind {
+            ApiKind::OpenAi => Some(ApiKind::OpenAiResponses),
+            ApiKind::OpenAiResponses => Some(ApiKind::OpenAi),
+            // Google and Anthropic each have a single wire shape — a
+            // protocol 400 on them is a real error, not a flipped kind.
+            ApiKind::Google | ApiKind::Anthropic => None,
+        };
+        let mut kinds = vec![kind];
+        if let Some(f) = flipped {
+            kinds.push(f);
+        }
+        let mut last_err = String::new();
+        for (i, eff) in kinds.iter().enumerate() {
+            let (url, body) =
+                Self::complete_body(&self.base_url, model, system, prompt, max_out, *eff);
+            match self.complete_once(&url, &body, *eff) {
+                Ok(v) => return Self::complete_text(&v, *eff),
+                Err(e) if i == 0 && is_protocol_mismatch(&e) && flipped.is_some() => {
+                    last_err = e;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err)
+    }
+
+    /// One attempt of [`Client::complete_with`]: POST `body` to `url` with the
+    /// pool/static key and return the parsed JSON. Pure transport — the caller
+    /// decides the kind, the fallback, and how the value is read.
+    fn complete_once(&self, url: &str, body: &Value, kind: ApiKind) -> Result<Value, String> {
+        let url = url.to_string();
         smol::block_on(async {
             // Buffered POST through the host libcurl on a worker thread;
             // non-2xx maps through `http_status_detail`.
@@ -527,7 +657,15 @@ impl Client {
                 return Err("complete: lsb-curl backend unavailable (no loadable libcurl.so.4)".to_string());
             };
             let url = url.clone();
-            let headers = self.request_headers(kind);
+            // Opencode key-pool failover for one-shot calls (titler, verdict
+            // classifiers): same current-usable-key rule as the streaming
+            // path, no rotation (one-shots don't retry — their callers treat
+            // a hard error as "no opinion").
+            let attempt_key: String = self
+                .key_pool_key()
+                .map(|(_, k)| k)
+                .unwrap_or_else(|| self.api_key.clone());
+            let headers = self.request_headers_with_key(kind, &attempt_key);
             let body_str = body.to_string();
             let txt = smol::unblock(move || {
                 let hrefs: Vec<(&str, &str)> =
@@ -550,42 +688,48 @@ impl Client {
                 }
             })
             .await?;
-            let v: Value =
-                serde_json::from_str(&txt).map_err(|e| format!("complete: {e}"))?;
-            let raw = match kind {
-                ApiKind::Anthropic => v
-                    .pointer("/content/0/text")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                ApiKind::OpenAi => v
-                    .pointer("/choices/0/message/content")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                // Non-streaming Responses object: first message item's first
-                // output-text part. Missing/empty shapes read as no opinion.
-                ApiKind::OpenAiResponses => v
-                    .get("output")
-                    .and_then(Value::as_array)
-                    .and_then(|items| {
-                        items.iter().find_map(|it| {
-                            (it.get("type").and_then(Value::as_str) == Some("message"))
-                                .then(|| {
-                                    it.get("content").and_then(Value::as_array).and_then(|parts| {
-                                        parts.iter().find_map(|p| {
-                                            (p.get("type").and_then(Value::as_str)
-                                                == Some("output_text"))
-                                            .then(|| p.get("text").and_then(Value::as_str))
-                                            .flatten()
-                                        })
+            serde_json::from_str(&txt).map_err(|e| format!("complete: {e}"))
+        })
+    }
+
+    /// Read the reply text out of a one-shot response object, per API kind
+    /// (Responses objects nest message items with output-text parts; Google
+    /// `generateContent` nests `candidates[].content.parts[].text`).
+    /// Missing/empty shapes read as no opinion (`Err`), exactly as before —
+    /// the response came back 200, so this is a parse verdict, not a retry.
+    fn complete_text(v: &Value, kind: ApiKind) -> Result<String, String> {
+        let raw = match kind {
+            ApiKind::Anthropic => v
+                .pointer("/content/0/text")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            ApiKind::OpenAi => v
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            ApiKind::Google => google_text(v),
+            ApiKind::OpenAiResponses => v
+                .get("output")
+                .and_then(Value::as_array)
+                .and_then(|items| {
+                    items.iter().find_map(|it| {
+                        (it.get("type").and_then(Value::as_str) == Some("message"))
+                            .then(|| {
+                                it.get("content").and_then(Value::as_array).and_then(|parts| {
+                                    parts.iter().find_map(|p| {
+                                        (p.get("type").and_then(Value::as_str)
+                                            == Some("output_text"))
+                                        .then(|| p.get("text").and_then(Value::as_str))
+                                        .flatten()
                                     })
                                 })
-                                .flatten()
-                        })
+                            })
+                            .flatten()
                     })
-                    .map(str::to_string),
-            };
-            raw.ok_or_else(|| "complete: empty response".to_string())
-        })
+                })
+                .map(str::to_string),
+        };
+        raw.ok_or_else(|| "complete: empty response".to_string())
     }
 
     /// Pure body builder for [`Client::complete_with`], split out so tests
@@ -596,7 +740,7 @@ impl Client {
         model: &str,
         system: &str,
         prompt: &str,
-        max_out: u32,
+        max_out: u64,
         kind: ApiKind,
     ) -> (String, Value) {
         let max_key = if model.starts_with("o1")
@@ -661,6 +805,10 @@ impl Client {
                     }),
                 )
             }
+            ApiKind::Google => (
+                google_url(base_url, model, false),
+                google_complete_body(model, system, prompt, max_out),
+            ),
         }
     }
 
@@ -766,6 +914,19 @@ impl Client {
                     model_meta,
                 ),
             },
+            // Google takes no thinking params and no per-call effort switch:
+            // the native `thinkingConfig` is unmodeled, so pir sends none
+            // (same rule as non-reasoning models) and ignores the effort flag.
+            // URL follows the same per-model-override convention as the other
+            // builders (see `openai_request_at`); the `:streamGenerateContent`
+            // action suffix is appended by `google_url`.
+            ApiKind::Google => {
+                let base = url_override.unwrap_or(&self.base_url).to_string();
+                (
+                    google_url(&base, model, true),
+                    google_stream_body(model, max_tokens, system, history, tools),
+                )
+            }
         };
         // Byte-identical replay support for speed diagnosis (see fn docs).
         maybe_dump_payload(&body);
@@ -818,7 +979,17 @@ impl Client {
                 );
             };
             let url = url.clone();
-            let headers = self.request_headers(kind);
+            // Opencode key-pool failover: each attempt sends with the pool's
+            // current usable key (`activeKeyIndex` when usable, else the first
+            // usable key). Without a pool this is the static `api_key`, so
+            // every other provider's behavior is unchanged.
+            let pool_key = self.key_pool_key();
+            let attempt_key: String = pool_key
+                .as_ref()
+                .map(|(_, k)| k.clone())
+                .unwrap_or_else(|| self.api_key.clone());
+            let attempt_idx: Option<usize> = pool_key.map(|(i, _)| i);
+            let headers = self.request_headers_with_key(kind, &attempt_key);
             let body_str = body.to_string();
             let cancel_flag = cancel.clone();
             // Non-blocking: just starts the transfer thread. A spawn failure
@@ -899,6 +1070,18 @@ impl Client {
                             )
                             .await
                         }
+                        ApiKind::Google => {
+                            stream_google(
+                                &mut reader,
+                                &mut on_text_wrap,
+                                &mut emitted_text,
+                                &mut saw_tool_calls,
+                                &cancel,
+                                &cancel_rx,
+                                &mut on_think_wrap,
+                            )
+                            .await
+                        }
                     };
                     // libcurl only learns the HTTP status after the transfer
                     // ends. A non-2xx is therefore discovered here, after the
@@ -938,6 +1121,34 @@ impl Client {
                     if e == "request cancelled" {
                         return Err(e);
                     }
+                    // Opencode key-pool failover runs FIRST, before the
+                    // retryable/fatal split below: a quota-exhausted key is
+                    // "fatal" for that key (`is_retryable` returns false so a
+                    // static key doesn't spin forever), but for a pool it just
+                    // means "mark this key, try the next one". Auth (401) and
+                    // rate-limit (429) failures rotate the same way. All three
+                    // only rotate when nothing was shown yet (mid-stream output
+                    // must never be duplicated) and when a *different* key took
+                    // over; otherwise the error flows into the normal path.
+                    // Failover retries immediately — no backoff wait: a dead
+                    // key gets replaced, not waited on (the mark carries the
+                    // cooldown, so the dead key isn't reused too soon).
+                    if !emitted_text && !saw_tool_calls
+                        && let Some(used) = attempt_idx
+                            && let Some((_next, name, cause)) = self.rotate_pool(used, &e) {
+                                let failed_attempt = attempt + 1;
+                                if let Some(max) = max_attempts()
+                                    && u64::from(failed_attempt) >= max {
+                                        return Err(format!(
+                                            "gave up after {failed_attempt} attempts (PIR_MAX_ATTEMPTS={max}): {e}"
+                                        ));
+                                    }
+                                on_notice(&format!(
+                                    "\n\u{1f504} opencode key #{used} {cause} — switched to {name}, retrying now\n"
+                                ));
+                                attempt += 1;
+                                continue;
+                            }
                     // Mid-stream failures after visible output stay fatal:
                     // re-issuing would duplicate already-printed text. A
                     // pre-output stall (no bytes yet) retries forever with
@@ -1507,6 +1718,20 @@ pub(crate) fn http_status_detail(code: u16, body: &str) -> String {
     format!("HTTP {code}: {collapsed}")
 }
 
+/// True when a one-shot failure means "wrong wire shape for this model, try
+/// the other one". The opencode-go gateway answers a chat-style body sent to
+/// a Responses-family model (or vice versa) with HTTP 400 carrying
+/// `ModelProtocolUnsupported` / "does not support this protocol" (verified
+/// live against the gateway). Only the OpenAI family flips: Anthropic models
+/// have a single wire shape, so their 400s stay fatal. Matched case-
+/// insensitively over the already-formatted `http_status_detail` string (the
+/// `error.message` text survives in it verbatim), so both the streaming and
+/// the one-shot path classify the same failure the same way.
+fn is_protocol_mismatch(error: &str) -> bool {
+    let l = error.to_lowercase();
+    l.contains("modelprotocolunsupported") || l.contains("does not support this protocol")
+}
+
 /// Map an `lsb_curl` failure to the retry/stall/REPL strings the client
 /// produces. `Aborted` (our chunk callback stopped the transfer) is always a
 /// cooperative cancel — the callback only aborts when the shared `cancel`
@@ -1707,6 +1932,7 @@ impl smol::io::AsyncBufRead for ChannelBody {
             this.pos = 0;
         }
     }
+
 }
 
 /// Terminal result of a background lsb-curl transfer, shared with `chat`.
@@ -1816,8 +2042,195 @@ fn is_read_timeout(e: &std::io::Error) -> bool {
 /// `>= 16`". `Client::complete`'s 12-token default is sized for one-word
 /// verdicts, so without this every background classifier on a Responses
 /// model 400s deterministically.
-fn responses_output_floor(max_out: u32) -> u32 {
+fn responses_output_floor(max_out: u64) -> u64 {
     max_out.max(16)
+}
+
+// ---------------------------------------------------------------------------
+// Google Generative AI wire shape (`google-generative-ai` catalog entries)
+// ---------------------------------------------------------------------------
+//
+// Native Gemini protocol over the opencode gateway (verified live against
+// `opencode.ai/inference/go/v1`): `POST {base}/models/{id}:generateContent`
+// for one-shots, `POST {base}/models/{id}:streamGenerateContent?alt=sse` for
+// streaming. OpenAI-style bodies 400 `ModelProtocolUnsupported` on both, so
+// these models get their own builders and parsers rather than riding the
+// protocol fallback (which only flips the two OpenAI shapes).
+//
+// Request shape: `systemInstruction` + flat `contents[]` (`role`/`parts[]`),
+// tools as `tools[].functionDeclarations[]` (OpenAPI-ish schemas, same field
+// names OpenAI uses, so pir's tool specs pass through nearly verbatim).
+// Gemini roles are `user`/`model` (no `system` role — the system prompt goes
+// in `systemInstruction`); pir assistant messages map to `model`, everything
+// else to `user` (tool results ride as `user` text parts, like the Responses
+// flat list). No thinking params: native thinking is a per-request
+// `thinkingConfig` pir doesn't model, so pir sends none (same rule as
+// non-reasoning models).
+
+/// Endpoint for a Google model: `:generateContent` one-shot or
+/// `:streamGenerateContent?alt=sse` streaming, appended unless the base
+/// already names an action (or a query string).
+pub(crate) fn google_url(base_url: &str, model: &str, stream: bool) -> String {
+    let mut url = base_url.trim_end_matches('/').to_string();
+    if url.contains(":generateContent")
+        || url.contains(":streamGenerateContent")
+        || url.contains('?')
+    {
+        return url;
+    }
+    url.push_str(&format!(
+        "/models/{model}{}",
+        if stream { ":streamGenerateContent?alt=sse" } else { ":generateContent" }
+    ));
+    url
+}
+
+/// One-shot `generateContent` body: system instruction + a single user
+/// content with the prompt. Output cap rides `generationConfig.maxOutputTokens`
+/// (no 16-floor: the gateway enforces none on this route, verified live).
+/// `pub(crate)` so the titler's tiny path sends the same payload the turn
+/// path does instead of a retyped copy that could drift.
+pub(crate) fn google_complete_body(model: &str, system: &str, prompt: &str, max_out: u64) -> Value {
+    let mut body = Map::new();
+    body.insert("model".into(), json!(model));
+    if !system.trim().is_empty() {
+        body.insert(
+            "systemInstruction".into(),
+            json!({ "parts": [{ "text": system }] }),
+        );
+    }
+    body.insert(
+        "contents".into(),
+        json!([{ "role": "user", "parts": [{ "text": prompt }] }]),
+    );
+    body.insert(
+        "generationConfig".into(),
+        json!({ "maxOutputTokens": max_out.max(1) }),
+    );
+    Value::Object(body)
+}
+
+/// First text part of the first text-bearing candidate:
+/// `candidates[].content.parts[]` with `text`. Reasoning/thought parts and
+/// empty candidates are skipped; a reply that carries only thoughts reads as
+/// no opinion (the caller treats that as "skip"). `pub(crate)` so the
+/// titler reads envelopes with the same function the turn path uses.
+pub(crate) fn google_text(v: &Value) -> Option<String> {
+    v.get("candidates")?.as_array()?.iter().find_map(|c| {
+        c.get("content")?
+            .get("parts")?
+            .as_array()?
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .find(|t| !t.trim().is_empty())
+            .map(str::to_string)
+    })
+}
+
+/// Streaming `streamGenerateContent` body: system instruction + converted
+/// history + tool declarations. Same shape as the one-shot plus `contents`
+/// from [`google_contents`] and `tools` from [`google_tools`].
+fn google_stream_body(
+    model: &str,
+    max_tokens: u64,
+    system: &str,
+    history: &[Message],
+    tools: &[ToolSpec],
+) -> Value {
+    let mut body = Map::new();
+    body.insert("model".into(), json!(model));
+    if !system.trim().is_empty() {
+        body.insert(
+            "systemInstruction".into(),
+            json!({ "parts": [{ "text": system }] }),
+        );
+    }
+    body.insert("contents".into(), Value::Array(google_contents(history)));
+    if !tools.is_empty() {
+        body.insert(
+            "tools".into(),
+            json!([{ "functionDeclarations": google_tools(tools) }]),
+        );
+    }
+    body.insert(
+        "generationConfig".into(),
+        json!({ "maxOutputTokens": max_tokens.max(1) }),
+    );
+    Value::Object(body)
+}
+
+/// pir history → Gemini `contents[]`. Assistant messages become `model`,
+/// everything else `user`; every block becomes a text part (tool uses as
+/// `name(input-json)` lines, tool results as their content, thinking as its
+/// text) so nothing the turn said is dropped — Gemini has no tool-call
+/// message role to preserve, and abridging here would lose context the
+/// summary paths depend on. Empty messages are skipped.
+fn google_contents(history: &[Message]) -> Vec<Value> {
+    history
+        .iter()
+        .filter(|m| !m.is_empty())
+        .map(|m| {
+            let role = match m.role {
+                Role::Assistant => "model",
+                _ => "user",
+            };
+            let mut text = String::new();
+            for b in &m.blocks {
+                let s = match b {
+                    Block::Text(t) => t.clone(),
+                    Block::Thinking { text } => text.clone(),
+                    Block::ToolUse { name, id, input } => {
+                        format!("[tool call {name} id={id} input={input}]")
+                    }
+                    Block::ToolResult { tool_use_id, content, is_error } => {
+                        format!(
+                            "[tool result id={tool_use_id}{} content={content}]",
+                            if *is_error { " error=true" } else { "" }
+                        )
+                    }
+                };
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&s);
+            }
+            json!({ "role": role, "parts": [{ "text": text }] })
+        })
+        .collect()
+}
+
+/// pir tool specs → Gemini `functionDeclarations[]`. Field names (`name`,
+/// `description`, `parameters`) already match OpenAPI, so the specs pass
+/// through verbatim.
+fn google_tools(tools: &[ToolSpec]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|t| {
+            json!({
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.schema,
+            })
+        })
+        .collect()
+}
+
+/// Usage from a Google response envelope (`usageMetadata`): input and output
+/// token counts. Cached counts ride inside the gateway's billing object, not
+/// the standard envelope, so they are not tracked (a 200 with no usage still
+/// yields its text).
+fn google_usage(v: &Value) -> Usage {
+    let u = v.get("usageMetadata");
+    Usage {
+        input: u
+            .and_then(|u| u.get("promptTokenCount"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        output: u
+            .and_then(|u| u.get("candidatesTokenCount"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    }
 }
 
 /// Cheap input-size estimate for a request about to go out: system prompt +
@@ -1825,7 +2238,11 @@ fn responses_output_floor(max_out: u32) -> u32 {
 /// 32-token per-message overhead) + the serialized tool specs. The agent's
 /// `trim` budget only counts history, so system + tools are the uncounted
 /// remainder that can push a just-under-budget history over the window.
-fn estimate_request_tokens(system: &str, history: &[Message], tools: &[ToolSpec]) -> u64 {
+///
+/// `pub(crate)` so callers that build their own *complete* request (the
+/// `/compact` summariser) can size it with the same estimate the wire path
+/// uses, instead of guessing.
+pub(crate) fn estimate_request_tokens(system: &str, history: &[Message], tools: &[ToolSpec]) -> u64 {
     let mut bytes = system.len();
     for m in history {
         bytes += 32;
@@ -1865,6 +2282,13 @@ fn fit_output_budget(max_tokens: u64, est_input: u64, ctx: u64) -> Result<u64, S
     }
     Ok(max_tokens.min(room))
 }
+/// Token estimate for a request that carries no tool specs (a one-shot
+/// completion): the system prompt plus one prompt string, at the same `bytes/4`
+/// ratio as [`estimate_request_tokens`].
+pub(crate) fn estimate_prompt_tokens(system: &str, prompt: &str) -> u64 {
+    ((system.len() + prompt.len() + 32) / 4) as u64
+}
+
 /// Repair orphaned tool blocks before serializing a request.
 ///
 /// Several paths can leave `history` with tool calls that have no results or
@@ -2303,6 +2727,40 @@ fn sse_kind_responses(ev: &str) -> &'static str {
         "response.completed" => "usage",
         "response.failed" | "error" => "error",
         _ => "other",
+    }
+}
+
+/// Chunk-log kind for a Google `streamGenerateContent` SSE frame, classified
+/// from the payload itself (these frames carry no `event:` name): a frame
+/// whose parts hold a `functionCall` is tool progress, one with non-empty
+/// `text` is text, a usage-only frame is usage, an error object is error.
+fn sse_kind_google(v: &Value) -> &'static str {
+    if v.get("error").is_some() {
+        return "error";
+    }
+    let mut has_text = false;
+    let mut has_tool = false;
+    if let Some(parts) = v
+        .pointer("/candidates/0/content/parts")
+        .and_then(Value::as_array)
+    {
+        for p in parts {
+            if p.get("functionCall").is_some() {
+                has_tool = true;
+            }
+            if p.get("text").and_then(Value::as_str).map(|t| !t.is_empty()).unwrap_or(false) {
+                has_text = true;
+            }
+        }
+    }
+    if has_tool {
+        "tool"
+    } else if has_text {
+        "text"
+    } else if v.get("usageMetadata").is_some() {
+        "usage"
+    } else {
+        "other"
     }
 }
 
@@ -2920,6 +3378,156 @@ async fn stream_responses<R: AsyncBufRead + Unpin>(
     Ok((Message { role: Role::Assistant, blocks }, usage))
 }
 
+/// Stream `streamGenerateContent` SSE frames (`data: {...}` per chunk, no
+/// `event:` names; a bare `[DONE]`-style terminator is not sent — the stream
+/// ends with EOF / connection close, and a final frame carries
+/// `finishReason`). Same robustness contract as [`stream_openai`] (cancel
+/// race, stall watchdog, EOF flush): text parts stream via `on_text`,
+/// `functionCall` parts accumulate into tool calls (one `Block::ToolUse` per
+/// call id), thought parts and `thoughtSignature` strings are skipped (pir
+/// has no thinking display for Google — see `apply` sites), and the latest
+/// `usageMetadata` wins for usage. A frame carrying `error` fails the turn
+/// immediately (gateway rejection, e.g. a bad key) rather than parsing as
+/// content; mid-stream output keeps the fatal-error rule (no replays), so
+/// this returns `Err` and the caller decides.
+async fn stream_google<R: AsyncBufRead + Unpin>(
+    r: &mut R,
+    on_text: &mut dyn FnMut(&str),
+    emitted_text: &mut bool,
+    saw_tool_calls: &mut bool,
+    cancel: &Arc<AtomicBool>,
+    cancel_rx: &SmolRx<()>,
+    on_think: &mut dyn FnMut(&str),
+) -> Result<(Message, Usage), String> {
+    let _ = on_think;
+    let mut usage = Usage::default();
+    let mut text = String::new();
+    let mut calls: Vec<(String, String, Value)> = Vec::new(); // (id, name, args-obj)
+    let mut chunks = ChunkLog::open();
+    let mut line = String::new();
+    let mut last_byte = Instant::now();
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("request cancelled".to_string());
+        }
+        if last_byte.elapsed() > stall_timeout() {
+            return Err("stream: stalled (no data for 180s)".to_string());
+        }
+        line.clear();
+        enum Step {
+            Line(std::io::Result<usize>),
+            Cancel,
+            Stall,
+        }
+        let step = future::or(
+            async { Step::Line(r.read_line(&mut line).await) },
+            future::or(
+                async {
+                    let _ = cancel_rx.recv().await;
+                    Step::Cancel
+                },
+                async {
+                    Timer::after(stall_timeout()).await;
+                    Step::Stall
+                },
+            ),
+        )
+        .await;
+        let n = match step {
+            Step::Cancel => return Err("request cancelled".to_string()),
+            Step::Stall => return Err("stream: stalled (no data for 180s)".to_string()),
+            Step::Line(Ok(n)) => n,
+            Step::Line(Err(e)) => {
+                if cancel.load(Ordering::SeqCst) {
+                    return Err("request cancelled".to_string());
+                }
+                return Err(format!("stream: {e}"));
+            }
+        };
+        if n == 0 {
+            if last_byte.elapsed() > stall_timeout() {
+                return Err("stream: stalled (no data for 180s)".to_string());
+            }
+            break;
+        }
+        last_byte = Instant::now();
+        let trimmed = line.trim_end();
+        // Google frames carry no `event:` name; a stray one is ignored.
+        if trimmed.strip_prefix("event:").is_some() {
+            continue;
+        }
+        let Some(data) = trimmed.strip_prefix("data:") else { continue };
+        let data = data.trim();
+        if data == "[DONE]" {
+            break;
+        }
+        let v: Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        chunks.event(sse_kind_google(&v), data.len());
+        if let Some(err) = v.get("error") {
+            let msg = err
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown API error");
+            return Err(msg.to_string());
+        }
+        if v.get("usageMetadata").is_some() {
+            usage = google_usage(&v);
+        }
+        let parts = v
+            .pointer("/candidates/0/content/parts")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for p in parts {
+            if let Some(fc) = p.get("functionCall") {
+                let name = fc.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                let args = fc.get("args").cloned().unwrap_or(json!({}));
+                // Gemini re-sends the full args object per call; latest wins
+                // (no string-append like OpenAI's delta fragments).
+                let id = fc
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_default();
+                match calls.iter_mut().find(|(i, n, _)| *n == name && (*i == id || i.is_empty() || id.is_empty())) {
+                    Some(slot) => {
+                        if slot.0.is_empty() {
+                            slot.0 = id;
+                        }
+                        slot.2 = args;
+                    }
+                    None => calls.push((id, name, args)),
+                }
+                continue;
+            }
+            if let Some(t) = p.get("text").and_then(Value::as_str).filter(|t| !t.is_empty()) {
+                *emitted_text = true;
+                on_text(t);
+                text.push_str(t);
+            }
+            // `thoughtSignature` strings and thought parts carry no display
+            // text — skipped (no thinking display for Google).
+        }
+    }
+    // Flush dangling state if the stream was cut early.
+    let mut blocks: Vec<Block> = Vec::new();
+    if !text.trim().is_empty() {
+        blocks.push(Block::Text(std::mem::take(&mut text)));
+    }
+    for (n, (id, name, args)) in calls.into_iter().enumerate() {
+        let id = if id.is_empty() { format!("call-{n}") } else { id };
+        let name = if name.is_empty() { "unknown_tool".to_string() } else { name };
+        blocks.push(Block::ToolUse { id, name, input: args });
+        *saw_tool_calls = true;
+    }
+    if blocks.is_empty() {
+        blocks.push(Block::Text("(empty response)".into()));
+    }
+    Ok((Message { role: Role::Assistant, blocks }, usage))
+}
 
 #[cfg(test)]
 mod tests {
@@ -2966,6 +3574,8 @@ mod tests {
         }
         fn consume(self: std::pin::Pin<&mut Self>, _amt: usize) {}
     }
+
+
 
     #[test]
     fn cancel_aborts_inflight_stream() {
@@ -4665,7 +5275,7 @@ mod tests {
                 let _ = sock.flush();
             });
             let client = Client::new(ApiKind::OpenAi, &format!("http://{addr}"), "k".to_string());
-            let out = client.complete_with(model, "sys", "hi", 77, None);
+            let out = client.complete_with(model, "sys", "hi", 77, None, 200_000);
             assert!(out.is_ok(), "complete_with must succeed: {out:?}");
             srv.join().expect("server");
             String::from_utf8_lossy(&captured.lock().unwrap()).to_string()
@@ -4960,6 +5570,219 @@ mod tests {
         assert!(l2.ends_with(" reasoning 200"), "{l2:?}");
         assert!(l1.split_whitespace().next().unwrap().parse::<u128>().is_ok(), "leading ms: {l1:?}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn key_pool_fails_over_on_quota_and_sends_second_key() {
+        // Failover regression: the mock answers the FIRST connection with a
+        // quota-exhausted body (exactly the error class `is_retryable` treats
+        // as fatal, so a static key would end the turn) and the SECOND with a
+        // minimal OpenAI SSE frame. The test asserts on what the code under
+        // test ITSELF sent: both Authorization headers, captured server-side,
+        // must name different keys — a recomputation from the test's own
+        // inputs would pass while the shipped retry-loop regressed.
+        if lsb_curl::Curl::load().is_err() {
+            eprintln!("SKIP: no loadable libcurl");
+            return;
+        }
+        let _lock = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Isolated PI_DIR so the temp pool is the only file the pool sees.
+        let dir = std::env::temp_dir().join(format!("pir-pool-failover-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(dir.join("agent"));
+        let doc = serde_json::json!({
+            "keys": [
+                { "name": "bad", "key": "sk-bad" },
+                { "name": "good", "key": "sk-good" },
+            ],
+            "activeKeyIndex": 0,
+            "cooldownMinutes": 60,
+        });
+        std::fs::write(dir.join("agent").join("opencode-keys.json"), doc.to_string()).unwrap();
+        let old = std::env::var_os("PI_DIR");
+        // SAFETY: edition 2024 marks env mutation unsafe; tests hold the
+        // shared env lock and restore below.
+        unsafe { std::env::set_var("PI_DIR", &dir) };
+        let pool = crate::config::load_opencode_key_pool().expect("temp pool loads");
+        // NOTE: PI_DIR stays pointed at the temp dir for the whole test —
+        // restoring it before `chat` ran made `key_pool_key`'s concurrent-
+        // rotation check load the operator's REAL pool and adopt its active
+        // index. That check is correct in production (PI_DIR never moves
+        // mid-process); the test just has to not move it either.
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_srv = seen.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        let _srv = thread::spawn(move || {
+            use std::io::Read as _;
+            for first in [true, false] {
+                let Some(mut sock) = accept_within(&listener, 30) else { return };
+                // Capture the full request head (like `head_for` above) so
+                // the test asserts on the Authorization header the client
+                // ITSELF sent — not on a marker the mock chose.
+                sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let head_end = loop {
+                    let n = sock.read(&mut tmp).expect("read");
+                    if n == 0 {
+                        break None;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(p) = find_subslice(&buf, b"\r\n\r\n") {
+                        break Some(p + 4);
+                    }
+                };
+                let head_end = head_end.expect("complete headers");
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                let auth = head
+                    .lines()
+                    .find(|l| l.to_lowercase().starts_with("authorization:"))
+                    .unwrap_or("")
+                    .to_string();
+                seen_srv.lock().unwrap().push(auth);
+                // Drain the body (Content-Length) like a real server, so
+                // libcurl doesn't see a broken transfer.
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(str::to_string)
+                    })
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                while buf.len() < head_end + len {
+                    let n = sock.read(&mut tmp).expect("read body");
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                use std::io::Write as _;
+                if first {
+                    let body = r#"{"error":{"message":"you have reached your weekly usage limit"}}"#;
+                    let frame = format!(
+                        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(frame.as_bytes());
+                } else {
+                    let sse = "{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"recovered\"}}]}\n\n";
+                    let frame = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {sse}data: [DONE]\n\n");
+                    let _ = sock.write_all(frame.as_bytes());
+                }
+                let _ = sock.flush();
+            }
+        });
+        // Drive the failover through the real `chat` retry loop, with the pool
+        // attached exactly as `make_client` does for `opencode-go`.
+        let mut client = Client::new(ApiKind::OpenAi, &format!("http://{addr}"), "sk-bad".to_string());
+        client.set_key_pool(Some(pool));
+        // Instant retries: no backoff wait in the test.
+        let old_base = std::env::var_os("PIR_RETRY_BASE_SECS");
+        let old_max = std::env::var_os("PIR_MAX_ATTEMPTS");
+        unsafe {
+            std::env::set_var("PIR_RETRY_BASE_SECS", "0");
+            std::env::set_var("PIR_MAX_ATTEMPTS", "5");
+        }
+        let mut text = String::new();
+        let mut notices = String::new();
+        let res = client.chat(
+            "test-model",
+            16,
+            "sys",
+            &[Message { role: Role::User, blocks: vec![Block::Text("hi".into())] }],
+            &[],
+            &mut |t: &str| text.push_str(t),
+            crate::config::ThinkingLevel::Off,
+            0,
+            &mut |_s: &str| {},
+            None,
+            None,
+            true,
+            None,
+            &mut |_w: &RetryWait| {},
+            &mut |n: &str| notices.push_str(n),
+        );
+        match old_base {
+            Some(v) => unsafe { std::env::set_var("PIR_RETRY_BASE_SECS", v) },
+            None => unsafe { std::env::remove_var("PIR_RETRY_BASE_SECS") },
+        }
+        match old_max {
+            Some(v) => unsafe { std::env::set_var("PIR_MAX_ATTEMPTS", v) },
+            None => unsafe { std::env::remove_var("PIR_MAX_ATTEMPTS") },
+        }
+        match old {
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(res.is_ok(), "failover must recover, got {res:?}");
+        assert!(text.contains("recovered"), "second key answers: {text:?}");
+        assert!(
+            notices.contains("opencode key #0 quota-exhausted"),
+            "failover notice names the dead key + cause: {notices:?}"
+        );
+        let attempts = seen.lock().unwrap().clone();
+        assert_eq!(
+            attempts,
+            vec![
+                "Authorization: Bearer sk-bad".to_string(),
+                "Authorization: Bearer sk-good".to_string()
+            ],
+            "first attempt sends the active key, failover resends with the next usable key"
+        );
+        // The dead key stayed marked: it is quota-blocked on disk.
+        assert!(
+            notices.contains("switched to #1 (good)"),
+            "notice names the replacement: {notices:?}"
+        );
+    }
+
+    #[test]
+    fn key_pool_sends_current_usable_key() {
+        // Effective-key probe: a pool whose active key is quota-blocked must
+        // send with the first usable key — asserted via `request_headers_with_key`
+        // on the value `key_pool_key` ITSELF returned (not a recomputation).
+        if lsb_curl::Curl::load().is_err() {
+            eprintln!("SKIP: no loadable libcurl");
+            return;
+        }
+        let _lock = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("pir-pool-key-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(dir.join("agent"));
+        let doc = serde_json::json!({
+            "keys": [
+                { "name": "bad", "key": "sk-bad" },
+                { "name": "good", "key": "sk-good" },
+            ],
+            "activeKeyIndex": 0,
+            "cooldownMinutes": 60,
+        });
+        std::fs::write(dir.join("agent").join("opencode-keys.json"), doc.to_string()).unwrap();
+        let old = std::env::var_os("PI_DIR");
+        // SAFETY: edition 2024 marks env mutation unsafe; tests hold the
+        // shared env lock and restore below.
+        unsafe { std::env::set_var("PI_DIR", &dir) };
+        let mut pool = crate::config::load_opencode_key_pool().expect("temp pool loads");
+        // NOTE: PI_DIR stays on the temp dir for the whole test (see the
+        // failover test: restoring it early made `key_pool_key` load a
+        // different pool file).
+        pool.mark_quota(0);
+        let mut client = Client::new(ApiKind::OpenAi, "http://x", "static".to_string());
+        client.set_key_pool(Some(pool));
+        let (idx, key) = client.key_pool_key().expect("good usable");
+        assert_eq!((idx, key.as_str()), (1, "sk-good"));
+        let h = client.request_headers_with_key(ApiKind::OpenAi, &key);
+        assert!(
+            h.contains(&("Authorization".to_string(), "Bearer sk-good".to_string())),
+            "wire headers carry the pool key: {h:?}"
+        );
+        match old {
+            Some(v) => unsafe { std::env::set_var("PI_DIR", v) },
+            None => unsafe { std::env::remove_var("PI_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5400,7 +6223,6 @@ mod tests {
         );
     }
 
-
     /// Reasoning model builders mirroring `models-store.json` entries.
     #[test]
     fn full_window_output_budget_clamps_instead_of_400() {
@@ -5528,6 +6350,404 @@ mod tests {
             ApiKind::OpenAiResponses,
         );
         assert_eq!(body["max_output_tokens"], serde_json::json!(16));
+    }
+
+    #[test]
+    fn google_streaming_parses_tool_call_and_usage() {
+        // End-to-end Google streaming through `chat` against a mock serving
+        // the live-captured `streamGenerateContent` SSE shape: a tool-call
+        // frame (functionCall + usageMetadata), then a text frame with a
+        // `finishReason` and final usage. Asserts on what the code itself
+        // produced: streamed text, the tool-use block (name + args object),
+        // and usage from the trailing metadata — plus the request-target,
+        // which must name the `:streamGenerateContent` action.
+        if lsb_curl::Curl::load().is_err() {
+            eprintln!("SKIP: no loadable libcurl");
+            return;
+        }
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap_srv = captured.clone();
+        let _srv = thread::spawn(move || {
+            let Some(mut sock) = accept_within(&listener, 30) else { return };
+            sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let head_end = loop {
+                let n = sock.read(&mut tmp).expect("read");
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(p) = find_subslice(&buf, b"\r\n\r\n") {
+                    break p + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+            let len: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            while buf.len() < head_end + len {
+                let n = sock.read(&mut tmp).expect("read body");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            *cap_srv.lock().unwrap() = buf;
+            // Frame 1 (live-captured shape): functionCall + usage.
+            let f1 = r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call_1","name":"calc","args":{"expression":"2+2"}}}]}}],"usageMetadata":{"promptTokenCount":39,"candidatesTokenCount":16}}"#;
+            // Frame 2: finish + final usage (latest usageMetadata wins).
+            let f2 = r#"{"candidates":[{"finishReason":"STOP","content":{"role":"model","parts":[{"text":""}]}}],"usageMetadata":{"promptTokenCount":95,"candidatesTokenCount":22}}"#;
+            let frame = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {f1}\n\ndata: {f2}\n\n"
+            );
+            let _ = sock.write_all(frame.as_bytes());
+            let _ = sock.flush();
+            thread::sleep(Duration::from_millis(200));
+        });
+        let mut client = Client::new(ApiKind::Google, &format!("http://{addr}"), "k".to_string());
+        client.set_backend(HttpBackend::LsbCurl);
+        let mut text = String::new();
+        let res = client.chat(
+            "gem",
+            128,
+            "sys",
+            &[Message { role: Role::User, blocks: vec![Block::Text("hi".into())] }],
+            &[crate::plugin::ToolSpec {
+                name: "calc",
+                description: "calculate",
+                schema: serde_json::json!({"type": "object", "properties": {"expression": {"type": "string"}}}),
+            }],
+            &mut |t: &str| text.push_str(t),
+            crate::config::ThinkingLevel::Off,
+            0,
+            &mut |_s: &str| {},
+            None,
+            None,
+            true,
+            None,
+            &mut |_w: &RetryWait| {},
+            &mut |_n: &str| {},
+        );
+        assert!(res.is_ok(), "google stream must complete: {res:?}");
+        let (msg, usage) = res.unwrap();
+        let uses = msg.tool_uses();
+        assert_eq!(uses.len(), 1, "one tool call: {msg:?}");
+        assert_eq!(uses[0].1, "calc", "tool name: {msg:?}");
+        assert_eq!(
+            uses[0].2.get("expression").and_then(Value::as_str),
+            Some("2+2"),
+            "args object passed through: {msg:?}"
+        );
+        assert_eq!((usage.input, usage.output), (95, 22), "latest usage wins: {usage:?}");
+        let wire = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+        let request_line = wire.lines().next().unwrap_or("").to_string();
+        assert!(
+            request_line.contains(":streamGenerateContent"),
+            "streaming action URL: {request_line}"
+        );
+        // The request body carries functionDeclarations for the tool.
+        let payload = wire.split("\r\n\r\n").nth(1).unwrap_or("{}");
+        let v: Value = serde_json::from_str(payload).expect("json body");
+        assert_eq!(
+            v["tools"][0]["functionDeclarations"][0]["name"],
+            serde_json::json!("calc"),
+            "tool declarations sent: {v}"
+        );
+    }
+
+    /// Drive one `complete_with` against a two-connection mock: the first
+    /// connection answers 400 with the gateway's protocol-mismatch body, the
+    /// second answers 200 with `ok_body`. Returns `(result, request_paths)`
+    /// — the result the client produced and the request-target of every
+    /// attempt the client ITSELF sent, so the test asserts on wire behavior,
+    /// not on a recomputation from its own inputs.
+    fn complete_with_fallback_probe(
+        kind: ApiKind,
+        ok_body: &'static str,
+    ) -> (Result<String, String>, Vec<String>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_srv = seen.clone();
+        let srv = thread::spawn(move || {
+            for first in [true, false] {
+                let Some(mut sock) = accept_within(&listener, 30) else { return };
+                sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let head_end = loop {
+                    let n = sock.read(&mut tmp).expect("read");
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(p) = find_subslice(&buf, b"\r\n\r\n") {
+                        break p + 4;
+                    }
+                };
+                // Request-target (path) of this attempt, e.g.
+                // `POST /chat/completions HTTP/1.1`.
+                let target = String::from_utf8_lossy(&buf[..head_end])
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                seen_srv.lock().unwrap().push(target);
+                // Drain the body (Content-Length) like a real server.
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                while buf.len() < head_end + len {
+                    let n = sock.read(&mut tmp).expect("read body");
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                if first {
+                    // The gateway's exact protocol-mismatch shape (verified
+                    // live): chat body naming a Responses model, or vice versa.
+                    let body = r#"{"type":"error","error":{"type":"ModelProtocolUnsupported","message":"Model does not support this protocol."}}"#;
+                    let _ = sock.write_all(
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                } else {
+                    let _ = sock.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ok_body}",
+                            ok_body.len()
+                        )
+                        .as_bytes(),
+                    );
+                }
+                let _ = sock.flush();
+            }
+        });
+        let client = Client::new(kind, &format!("http://{addr}"), "k".to_string());
+        let out = client.complete_with("m", "sys", "hi", 77, None, 200_000);
+        srv.join().expect("server");
+        let paths = seen.lock().unwrap().clone();
+        (out, paths)
+    }
+
+    #[test]
+    fn complete_with_falls_back_from_chat_to_responses() {
+        // The /compact failure that motivated the fallback: a Responses-family
+        // model reached through a chat-kind one-shot (stale client default,
+        // wrong catalog mapping) 400s `ModelProtocolUnsupported` — the client
+        // must retry once on `/responses` and parse the Responses envelope.
+        // Asserts on what the code under test ITSELF did: two attempts, first
+        // to the chat endpoint, second to `/responses`, reply text extracted
+        // from the Responses object shape.
+        if lsb_curl::Curl::load().is_err() {
+            eprintln!("SKIP: no loadable libcurl");
+            return;
+        }
+        let ok = r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"summarised"}]}]}"#;
+        let (out, paths) = complete_with_fallback_probe(ApiKind::OpenAi, ok);
+        assert_eq!(out.as_deref(), Ok("summarised"), "fallback must parse: {out:?}");
+        assert_eq!(paths.len(), 2, "exactly one retry: {paths:?}");
+        assert!(
+            paths[0].contains("/chat/completions"),
+            "first attempt chat-shaped: {paths:?}"
+        );
+        assert!(
+            paths[1].contains("/responses"),
+            "retry flipped to Responses: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn complete_with_falls_back_from_responses_to_chat() {
+        // The reverse misclassification: a chat-family model reached through a
+        // Responses-kind one-shot. Same gateway 400, flipped the other way —
+        // the retry must hit `/chat/completions` and parse the chat envelope.
+        if lsb_curl::Curl::load().is_err() {
+            eprintln!("SKIP: no loadable libcurl");
+            return;
+        }
+        let ok = r#"{"choices":[{"message":{"content":"hello"}}]}"#;
+        let (out, paths) = complete_with_fallback_probe(ApiKind::OpenAiResponses, ok);
+        assert_eq!(out.as_deref(), Ok("hello"), "fallback must parse: {out:?}");
+        assert_eq!(paths.len(), 2, "exactly one retry: {paths:?}");
+        assert!(
+            paths[0].contains("/responses"),
+            "first attempt Responses-shaped: {paths:?}"
+        );
+        assert!(
+            paths[1].contains("/chat/completions"),
+            "retry flipped to chat: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn complete_with_anthropic_mismatch_stays_fatal() {
+        // Anthropic has a single wire shape — there is nothing to flip to, so
+        // a protocol 400 must surface as-is after exactly one attempt (no
+        // retry, no hang waiting for a second connection the mock never gets).
+        if lsb_curl::Curl::load().is_err() {
+            eprintln!("SKIP: no loadable libcurl");
+            return;
+        }
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        let seen: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let seen_srv = seen.clone();
+        let srv = thread::spawn(move || {
+            let Some(mut sock) = accept_within(&listener, 30) else { return };
+            drain_request(&mut sock);
+            *seen_srv.lock().unwrap() += 1;
+            let body = r#"{"type":"error","error":{"type":"ModelProtocolUnsupported","message":"Model does not support this protocol."}}"#;
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = sock.flush();
+        });
+        let client = Client::new(ApiKind::Anthropic, &format!("http://{addr}"), "k".to_string());
+        let out = client.complete_with("m", "sys", "hi", 77, None, 200_000);
+        srv.join().expect("server");
+        assert!(
+            out.as_ref().is_err_and(|e| is_protocol_mismatch(e)),
+            "protocol error must surface: {out:?}"
+        );
+        assert_eq!(*seen.lock().unwrap(), 1, "no retry for Anthropic");
+    }
+
+    #[test]
+    fn complete_with_non_protocol_400_stays_fatal() {
+        // Only the protocol mismatch flips. Any other 400 (bad request, quota,
+        // auth) must surface after exactly one attempt — the fallback must not
+        // turn every client error into a doubled request.
+        if lsb_curl::Curl::load().is_err() {
+            eprintln!("SKIP: no loadable libcurl");
+            return;
+        }
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        let seen: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let seen_srv = seen.clone();
+        let srv = thread::spawn(move || {
+            let Some(mut sock) = accept_within(&listener, 30) else { return };
+            drain_request(&mut sock);
+            *seen_srv.lock().unwrap() += 1;
+            let body = r#"{"error":{"message":"invalid_request: bad input"}}"#;
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = sock.flush();
+        });
+        let client = Client::new(ApiKind::OpenAi, &format!("http://{addr}"), "k".to_string());
+        let out = client.complete_with("m", "sys", "hi", 77, None, 200_000);
+        srv.join().expect("server");
+        assert!(
+            out.as_ref().is_err_and(|e| !is_protocol_mismatch(e)),
+            "plain 400 must surface unchanged: {out:?}"
+        );
+        assert_eq!(*seen.lock().unwrap(), 1, "no retry for plain 400s");
+    }
+
+    #[test]
+    fn complete_google_hits_generate_content_and_parses() {
+        // The Gemini wire shape (verified live against the gateway): one-shot
+        // POSTs `{base}/models/{id}:generateContent` with `systemInstruction`
+        // + single-user `contents` and reads `candidates[0].content.parts`
+        // text. Asserts on the captured request (what the code itself sent)
+        // and on the parsed reply.
+        if lsb_curl::Curl::load().is_err() {
+            eprintln!("SKIP: no loadable libcurl");
+            return;
+        }
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap_srv = captured.clone();
+        let srv = thread::spawn(move || {
+            let Some(mut sock) = accept_within(&listener, 30) else { return };
+            sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let head_end = loop {
+                let n = sock.read(&mut tmp).expect("read");
+                if n == 0 {
+                    break 0;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(p) = find_subslice(&buf, b"\r\n\r\n") {
+                    break p + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+            let len: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            while buf.len() < head_end + len {
+                let n = sock.read(&mut tmp).expect("read body");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            *cap_srv.lock().unwrap() = buf;
+            // A realistic generateContent envelope: reasoning part first
+            // (skipped), then the message text the client must extract.
+            let body = br#"{"candidates":[{"content":{"role":"model","parts":[{"thoughtSignature":"abc"},{"text":"gen-ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}"#;
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = sock.write_all(body);
+            let _ = sock.flush();
+        });
+        let client = Client::new(ApiKind::Google, &format!("http://{addr}/v1"), "k".to_string());
+        let out = client.complete_with("gem", "sys", "hi", 64, None, 200_000);
+        srv.join().expect("server");
+        assert_eq!(out.as_deref(), Ok("gen-ok"), "google one-shot must parse: {out:?}");
+        let wire = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+        // Request line names the generateContent action for the model …
+        let request_line = wire.lines().next().unwrap_or("").to_string();
+        assert!(
+            request_line.contains("/models/gem:generateContent"),
+            "action URL: {request_line}"
+        );
+        // … and the JSON body carries the native shape (system instruction,
+        // contents, generationConfig) — never OpenAI keys.
+        let payload = wire.split("\r\n\r\n").nth(1).unwrap_or("{}");
+        let v: Value = serde_json::from_str(payload).expect("json body");
+        assert_eq!(v["systemInstruction"]["parts"][0]["text"], json!("sys"));
+        assert_eq!(v["contents"][0]["parts"][0]["text"], json!("hi"));
+        assert_eq!(v["generationConfig"]["maxOutputTokens"], json!(64));
+        assert!(v.get("messages").is_none(), "no chat shape: {v}");
+        assert!(v.get("input").is_none(), "no Responses shape: {v}");
     }
 
     /// Reasoning model builders mirroring `models-store.json` entries.
@@ -5859,4 +7079,5 @@ mod tests {
             "a cancel must be forwarded to the parsers"
         );
     }
+
 }

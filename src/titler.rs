@@ -369,6 +369,10 @@ fn tiny_request(
             "max_output_tokens": max_tokens.max(16),
             "stream": false,
         }),
+        // Wired to the `:generateContent` endpoint via `google_url` below;
+        // titlers and verdict classifiers on a Google light model send the
+        // same native shape as the turn path.
+        config::ApiKind::Google => crate::provider::google_complete_body(model_id, system, user, max_tokens),
         _ => json!({
             "model": model_id,
             "max_tokens": max_tokens,
@@ -395,6 +399,9 @@ fn tiny_request(
             }
             u
         }
+        // The action URL comes from the shared builder so the tiny path
+        // hits the same endpoint the turn path does.
+        config::ApiKind::Google => crate::provider::google_url(base_url, model_id, false),
     };
     (url, body)
 }
@@ -417,7 +424,7 @@ fn tiny_headers<'a>(
             headers.push(("x-api-key", api_key));
             headers.push(("anthropic-version", "2023-06-01"));
         }
-        config::ApiKind::OpenAi | config::ApiKind::OpenAiResponses => {
+        config::ApiKind::OpenAi | config::ApiKind::OpenAiResponses | config::ApiKind::Google => {
             headers.push(("Authorization", bearer));
         }
     }
@@ -483,6 +490,9 @@ fn tiny_text(api_kind: config::ApiKind, v: &Value) -> Option<String> {
                 })
             })
             .map(str::to_string),
+        // Same reader the turn path uses: first text part of the first
+        // text-bearing candidate.
+        config::ApiKind::Google => crate::provider::google_text(v),
     }
 }
 

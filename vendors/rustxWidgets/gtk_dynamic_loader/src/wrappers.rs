@@ -1442,6 +1442,18 @@ impl FileChooserNative {
         Self::new(loader, title, parent, 1, "Save", None)
     }
 
+    /// A folder chooser (`GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER` = 2).
+    ///
+    /// Used by the GUI's "New Project" button to pick a workspace directory.
+    /// Like `open`/`save` it returns the chosen path from `get_filename`
+    /// (on a folder action that is the folder, not a file).
+    ///
+    /// # Safety
+    /// `parent` must be a valid GtkWindow pointer or null.
+    pub unsafe fn select_folder(loader: Arc<Loader>, title: &str, parent: *mut c_void) -> Result<Self, Error> {
+        Self::new(loader, title, parent, 2, "Select folder", None)
+    }
+
     fn new(loader: Arc<Loader>, title: &str, parent: *mut c_void, action: i32, accept_label: &str, cancel_label: Option<&str>) -> Result<Self, Error> {
         let symbols = &loader.symbols;
         let ctor = symbols.gtk_file_chooser_native_new.ok_or(Error::MissingSymbol("gtk_file_chooser_native_new".into()))?;

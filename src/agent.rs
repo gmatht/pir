@@ -554,6 +554,59 @@ impl Agent {
     }
 }
 
+/// Reserve for the system prompt when budgeting history: it is sent alongside
+/// `history` (plus the tool specs) but is not counted in it. Rough on purpose —
+/// it guards against tokenizer drift, not against a measured payload.
+pub(crate) const SYS_PROMPT_RESERVE: usize = 2_000;
+
+/// The output-token budget one model call may ask for when the history is
+/// `history_tokens` (the `bytes/4` estimate used everywhere in this file).
+///
+/// This is the one place the output side is derived, so `trim`, `max_tokens`
+/// and `context_budget` cannot disagree about how much of the window the reply
+/// is allowed to take.
+///
+/// The window is a **combined** limit: input + requested output must fit inside
+/// `model.context`, and a provider rejects the whole request with HTTP 400 when
+/// they don't. Reserving the catalog's `max_tokens` unconditionally — what
+/// `trim` used to do — has two failure modes, both seen live:
+///
+///  * a catalog entry whose `max_tokens` equals its context window (the
+///    `ollama-cloud` fallback catalog ships `32768`/`1000000`, and a model that
+///    declares 1M context with a 1M output cap leaves *no* room for input) makes
+///    the input budget zero, and
+///  * the reserve is a *constant* while the history grows continuously, so the
+///    history is trimmed to the same size no matter how full the window already
+///    is, and the last few percent of the window can never be used — which is
+///    exactly where a session lands right before it needs compaction.
+///
+/// So the reserve shrinks as the history approaches the window: a small
+/// conversation may still get the model's full `max_tokens`; a nearly-full one
+/// asks for at least `MIN_OUTPUT_FLOOR` (or the whole remainder, if that is
+/// all there is). Asking for *less* output never makes a request bigger, and it
+/// turns "input + output no longer fits" from a hard failure into a smaller
+/// reply.
+pub(crate) fn output_budget_for(history_tokens: usize, ctx: usize, max_tokens: u64) -> u64 {
+    let room = ctx
+        .saturating_sub(history_tokens)
+        .saturating_sub(SYS_PROMPT_RESERVE);
+    // Clamp the *cap* only (a wire field is a u32); never let the clamp decide
+    // whether a request fits, which `room` alone must.
+    let cap = (max_tokens.max(1) as usize).min(u32::MAX as usize);
+    let target = cap.min(room);
+    // Below a usable reply size, shrink only as far as there is any window
+    // left: a request that asks for 16 tokens still completes (and reports
+    // truncation), while one that asks for more than the window can hold is
+    // rejected outright.
+    let floor = MIN_OUTPUT_FLOOR.min(room);
+    target.max(floor) as u64
+}
+
+/// The smallest output budget worth sending: enough for a short answer plus a
+/// call's worth of tool JSON. Below this a reply is not worth a round-trip, but
+/// it is still better than a certain HTTP 400 (see [`output_budget_for`]).
+pub(crate) const MIN_OUTPUT_FLOOR: usize = 4_096;
+
 /// How many consecutive stalled (empty) responses are retried before giving up.
 ///
 /// A stall is a *transport* failure — a dropped connection, a truncated SSE
@@ -1642,10 +1695,15 @@ impl Agent {
     /// tiny catalog entry still leaves room to work.
     pub fn context_budget(&self) -> usize {
         let ctx = self.model.context.unwrap_or(200_000) as usize;
-        let out_reserve = self.model.max_tokens.unwrap_or(8192) as usize;
-        let sys_reserve = 2_000;
+        // Reserve exactly what the *last* model call would ask for output: the
+        // budget shrinks as the history grows (see `output_budget_for`), so a
+        // fixed `max_tokens` reserve would leave the window's last few percent
+        // permanently unreachable and report "near the cap" while `trim` still
+        // considered the history fine.
+        let out_reserve =
+            output_budget_for(0, ctx, self.model.max_tokens.unwrap_or(8192)) as usize;
         ctx.saturating_sub(out_reserve)
-            .saturating_sub(sys_reserve)
+            .saturating_sub(SYS_PROMPT_RESERVE)
             .max(8192)
     }
 
@@ -1666,41 +1724,35 @@ impl Agent {
         }
         let before_tokens = approx_tokens(&self.history);
         let sys = self.system.clone();
-        let msgs: Vec<Message> = self.history.clone();
-        let mut transcript = String::new();
-        for m in &msgs {
-            let role = match m.role {
-                Role::User => "User",
-                Role::Assistant => "Assistant",
-            };
-            let text = m.text();
-            if !text.trim().is_empty() {
-                transcript.push_str(&format!("{role}: {text}\n"));
-            }
-            for (_, name, input) in m.tool_uses() {
-                transcript.push_str(&format!("{role} called tool `{name}` with {input}\n"));
-            }
-            for b in &m.blocks {
-                if let Block::ToolResult { content, is_error, .. } = b {
-                    let tag = if *is_error { "Tool error" } else { "Tool result" };
-                    transcript.push_str(&format!("{tag}: {content}\n"));
-                }
-            }
-        }
-        if transcript.is_empty() {
+        let ctx = self.model.context.unwrap_or(200_000);
+        // The summary is a real generation, not a one-word verdict: give it the
+        // same output budget a normal turn would ask for at this history size.
+        let out_budget = output_budget_for(before_tokens, ctx as usize, self.model.max_tokens.unwrap_or(8192))
+            .max(MIN_COMPACT_REPLY_TOKENS as u64);
+        // The transcript is *the whole conversation*, so it is the one prompt
+        // that is guaranteed to be the size of the window it has to fit into.
+        // Build it for the space the request actually leaves: whatever the
+        // window holds after the system prompt and the wanted output. A
+        // transcript that is not fitted is rejected by the provider outright
+        // ("input plus the requested output exceeds the context window"), which
+        // is the one moment compaction is needed and must not fail.
+        let room = (ctx as usize)
+            .saturating_sub(sys.len() / 4)
+            .saturating_sub(out_budget as usize)
+            .saturating_sub(SYS_PROMPT_RESERVE);
+        let transcript = self.compact_transcript(room);
+        if transcript.trim().is_empty() {
             return "nothing to compact (empty conversation)".to_string();
         }
-        let compact_prompt = format!(
-            "Summarize the following coding session so far in a concise but complete way. \
-             Include: the user's goal(s), key decisions, files touched, important code/commands, \
-             current state, and any pending work. Do not include any preamble or meta commentary.\n\n{}",
-            transcript
-        );
-        match self.client.complete(
+        let compact_prompt = format!("{COMPACT_INSTRUCTIONS}\n\n{transcript}");
+        let sent_tokens = crate::provider::estimate_prompt_tokens(&sys, &compact_prompt);
+        match self.client.complete_with(
             &self.model.id,
             &sys,
             &compact_prompt,
+            out_budget.min(u32::MAX as u64) as u32,
             self.provider.model_api(&self.model),
+            ctx,
         ) {
             Ok(summary) if !summary.trim().is_empty() => {
                 let s = summary.trim().to_string();
@@ -1719,8 +1771,54 @@ impl Agent {
                 )
             }
             Ok(_) => "compaction produced empty summary; history unchanged".to_string(),
-            Err(e) => format!("compaction failed: {e} (history unchanged)"),
+            Err(e) => format!(
+                "compaction failed: {e} (history unchanged — summarising with ~{} est. tokens of \
+                 transcript, which fits a {}-token window)",
+                sent_tokens, ctx
+            ),
         }
+    }
+
+    /// Render the conversation for the summariser, **fitted to `room` tokens**
+    /// (the `bytes/4` estimate).
+    ///
+    /// Compaction is what rescues a session that has outgrown its window, so it
+    /// is exactly the path that cannot afford to send an oversized request.
+    /// The old transcript was every tool result verbatim, and for a real coding
+    /// session that is several times the size of the window — a single truncated
+    /// `read_file` result is 100k chars ≈ 25k tokens, and a dozen of them fill a
+    /// 1M-token window — so `/compact` failed with the very HTTP 400 it exists
+    /// to recover from.
+    ///
+    /// What survives, in priority order: user prompts in full (the goals and
+    /// constraints are what the summary must not lose), assistant prose, then
+    /// each tool call by name with the head and tail of its result — the same
+    /// abridging a human sees (`abridge_output`), so a build log still reports
+    /// how it ended. The most recent messages are kept first; the older middle
+    /// is elided before either end.
+    fn compact_transcript(&self, room: usize) -> String {
+        let mut budget = room.max(1_000);
+        loop {
+            let out = render_transcript(&self.history, budget);
+            // `budget` counts tokens; the rendered string is ~4 bytes per token.
+            if out.len() / 4 <= room || budget <= 500 {
+                return out;
+            }
+            // Shrink by a quarter and retry, so the result is the largest
+            // transcript that fits rather than an arbitrary one.
+            budget = budget * 3 / 4;
+        }
+    }
+
+    /// Record a one-off notice in this session's transcript without adding it
+    /// to `history`.
+    ///
+    /// Used by the GUI's `/compact`: the summariser runs on a worker that cannot
+    /// touch the widgets, so its outcome (compacted / failed) is written here and
+    /// the pane's log tail renders it, exactly as the terminal REPL prints it.
+    /// A notice is never replayed to the model (see `log_notice`).
+    pub fn log_notice(&mut self, text: &str) {
+        log_notice(&mut self.log, text);
     }
 
     /// Set the cumulative token budget (in+out, in tokens). Off by default;
@@ -2018,6 +2116,12 @@ impl Agent {
                         level.as_str()
                     ),
                 },
+                // Google takes no pir thinking params (native thinking is a
+                // per-request `thinkingConfig` pir doesn't model).
+                Some(ApiKind::Google) => format!(
+                    "thinking: {}  (Google models ignore pir thinking levels; no thinking params will be sent){hidden_note}",
+                    level.as_str()
+                ),
                 None => format!("thinking: {}{hidden_note}", level.as_str()),
             }
         } else {
@@ -3381,21 +3485,17 @@ impl Agent {
             // The provider enforces a *combined* context limit: text input +
             // tool input + requested output must fit in `model.context`. To
             // avoid a hard HTTP 400 ("maximum context length is N tokens"),
-            // clamp the output budget so the total request provably fits,
-            // leaving a little headroom for the system prompt (which is sent
-            // alongside `history` but not counted in it). This is the belt to
-            // `trim`'s suspenders: `trim` drops old turns from `history`, and
-            // this guarantees the remaining room is never over-committed on the
-            // output side. `approx_tokens` is a cheap `bytes/4` estimate, so a
-            // generous (2k) system headroom guards against tokenizer drift.
+            // shrink the output budget as the history approaches the window —
+            // see `output_budget_for` for why a fixed `max_tokens` reserve is
+            // wrong in both directions (a catalog entry with a 1M output cap on
+            // a 1M window reserves the entire window for the reply; a healthy
+            // session loses the last few percent of its window and then cannot
+            // even compact, because the compaction request carries the same
+            // oversized reserve).
             let ctx = self.model.context.unwrap_or(200_000);
-            let sys_head = 2_000u64;
             let est_input = approx_tokens(&self.history) as u64;
-            let out_cap = ctx
-                .saturating_sub(est_input)
-                .saturating_sub(sys_head)
-                .max(1024);
-            let max_tokens = self.model.max_tokens.unwrap_or(8192).min(out_cap);
+            let max_tokens =
+                output_budget_for(est_input as usize, ctx as usize, self.model.max_tokens.unwrap_or(8192));
             // Live retry countdown. The provider calls this ~1/sec while
             // backing off between attempts (plus once with `remaining == 0`
             // when the wait ends). Rendered in place on the current line —
@@ -4483,23 +4583,13 @@ impl Agent {
 
     /// Crude context management: past ~budget tokens, keep the first user
     /// request plus the newest self-consistent tail, eliding the middle.
+    ///
+    /// The budget it trims to is [`Self::context_budget`] — the same number
+    /// `/compact status` reports and `needs_compaction` compares against, so the
+    /// REPL never says "near the context cap" about a history `trim` considers
+    /// fine.
     fn trim(&mut self) {
-        let ctx = self.model.context.unwrap_or(200_000) as usize;
-        // The provider enforces a *combined* limit: text input + tool input +
-        // output must fit in `ctx`. So the input budget must reserve room for
-        // the model's actual `max_tokens` output (not a hardcoded 8k) plus a
-        // little headroom for the system prompt (sent alongside history but not
-        // counted in it). Without this, a large output budget (e.g. 64k) pushes
-        // the total request past the model's hard context window and the
-        // provider rejects it with HTTP 400 "maximum context length is N tokens"
-        // — exactly the error this fix addresses. `max_tokens` is the same value
-        // handed to the provider call in `turn()`.
-        let out_reserve = self.model.max_tokens.unwrap_or(8192) as usize;
-        let sys_reserve = 2_000; // rough system-prompt headroom (not in history)
-        let budget = ctx
-            .saturating_sub(out_reserve)
-            .saturating_sub(sys_reserve)
-            .max(8192);
+        let budget = self.context_budget();
         if approx_tokens(&self.history) <= budget {
             return;
         }
@@ -4561,7 +4651,7 @@ fn make_client(provider: &Provider, cancel: Arc<AtomicBool>) -> Result<Client, S
             Some(b) => b.trim_end_matches('/').to_string(),
             None => match kind {
                 ApiKind::Anthropic => "https://api.anthropic.com/v1".to_string(),
-                ApiKind::OpenAi | ApiKind::OpenAiResponses => {
+                ApiKind::OpenAi | ApiKind::OpenAiResponses | ApiKind::Google => {
                     return Err(format!("provider '{}' has no baseUrl", provider.pid()))
                 }
             },
@@ -4610,8 +4700,151 @@ fn make_client(provider: &Provider, cancel: Arc<AtomicBool>) -> Result<Client, S
     // (`set_session_id` is only called for Go).
     if provider.pid() == "opencode-go" {
         client.set_session_id(crate::provider::Client::opencode_session_id());
+        // Rotating key pool (`~/.pi/agent/opencode-keys.json`): when the file
+        // exists and holds usable keys, each request sends with the pool's
+        // current key and quota/auth/rate-limit failures fail over to the
+        // next usable key automatically (see `Client::key_pool_key` /
+        // `rotate_pool`). Without the file the catalog key above is the only
+        // key, exactly as before.
+        client.set_key_pool(config::load_opencode_key_pool());
     }
     Ok(client)
+}
+
+/// What the summariser is asked for. Kept next to the transcript builder so
+/// `/compact` and its test cannot disagree about the request's fixed part.
+const COMPACT_INSTRUCTIONS: &str = "Summarize the following coding session so far in a concise but complete way. \
+     Include: the user's goal(s), key decisions, files touched, important code/commands, \
+     current state, and any pending work. Do not include any preamble or meta commentary.";
+
+/// Output tokens a summary is allowed to lose to the window's remainder: below
+/// this a summary is not worth the call, so the transcript is shrunk instead.
+const MIN_COMPACT_REPLY_TOKENS: usize = 1_024;
+
+/// Render `history` as a summariser transcript no larger than `budget` est.
+/// tokens.
+///
+/// Free function (takes the slice) so the fitting rules are unit-testable
+/// without a live `Agent`. Each message is emitted whole or not at all; tool
+/// results are abridged to a head+tail preview, which is where the size is.
+fn render_transcript(history: &[Message], budget: usize) -> String {
+    let half = history.len() / 2;
+    // Most recent first: the live state matters most when something must go.
+    // Reserve, from the newest message backwards, until the budget or the half
+    // the tail is allowed to take (so the opening request always has a share).
+    let tail_cap = budget.saturating_mul(3) / 4;
+    let mut tail_used = 0usize;
+    let mut tail: Vec<String> = Vec::new();
+    let mut elided = false;
+    for m in history.iter().skip(half).rev() {
+        match render_message(m, tail_cap, tail_used) {
+            Some((text, cost)) => {
+                tail_used += cost;
+                tail.push(text);
+            }
+            None => {
+                // Too big to add, but keep going: an even newer message is
+                // already reserved, and an *older* one this large is exactly
+                // what should be elided while newer state survives.
+                elided = true;
+            }
+        }
+    }
+    tail.reverse();
+    // The opening request and early decisions get what is left.
+    let mut head_used = SYS_PROMPT_RESERVE.min(budget);
+    let mut head = String::new();
+    for m in history.iter().take(half) {
+        match render_message(m, budget, head_used) {
+            Some((text, cost)) => {
+                head_used += cost;
+                head.push_str(&text);
+            }
+            None => {
+                elided = true;
+            }
+        }
+    }
+    let body = tail.concat();
+    // If the ends alone overran the budget (a single huge newest message), drop
+    // the head first: recent state beats the opening request.
+    let (mut head, mut body) = (head, body);
+    if (head.len() + body.len()) / 4 > budget {
+        head.clear();
+        elided = true;
+        // Re-fit the tail alone against the whole budget.
+        let mut used = 0usize;
+        let mut fit: Vec<String> = Vec::new();
+        for m in history.iter().skip(half).rev() {
+            match render_message(m, budget, used) {
+                Some((text, cost)) => {
+                    used += cost;
+                    fit.push(text);
+                }
+                None => elided = true,
+            }
+        }
+        fit.reverse();
+        body = fit.concat();
+        if body.len() / 4 > budget {
+            // Even one message is too large: clip it to the budget.
+            let cut = body.floor_char_boundary(budget.saturating_mul(4));
+            body.truncate(cut);
+            body.push_str("\n[pir: transcript clipped to fit the summary request]\n");
+        }
+    }
+    let mut out = head;
+    if elided {
+        out.push_str("[pir: some earlier messages elided to fit the summary request]\n");
+    }
+    out.push_str(&body);
+    out
+}
+
+/// One message as transcript text plus its estimated token cost, or `None` when
+/// emitting it would not fit `budget - used`.
+fn render_message(m: &Message, budget: usize, used: usize) -> Option<(String, usize)> {
+    let mut text = String::new();
+    let role = match m.role {
+        Role::User => "User",
+        Role::Assistant => "Assistant",
+    };
+    let body = m.text();
+    if !body.trim().is_empty() {
+        // A single very long message is clipped to half the budget (its own
+        // tool calls and results are appended after it).
+        let keep_bytes = budget.saturating_mul(4) / 2;
+        if body.len() > keep_bytes {
+            let cut = body.floor_char_boundary(keep_bytes);
+            text.push_str(&format!("{role}: {}… [clipped]\n", &body[..cut]));
+        } else {
+            text.push_str(&format!("{role}: {body}\n"));
+        }
+    }
+    for (_, name, input) in m.tool_uses() {
+        text.push_str(&format!("{role} called tool `{name}` with {input}\n"));
+    }
+    for b in &m.blocks {
+        if let Block::ToolResult { content, is_error, .. } = b {
+            let tag = if *is_error { "Tool error" } else { "Tool result" };
+            text.push_str(&format!("{tag}: {}\n", abridge_output(content)));
+        }
+    }
+    // Cost what the message *is*, not what was shown of it: a 100k-char tool
+    // result abridged to 30 lines still occupies the model's window, so
+    // charging only the preview would let the fitter pass a transcript the
+    // provider rejects.
+    let mut cost = text.len() / 4;
+    for b in &m.blocks {
+        if let Block::ToolResult { content, .. } = b {
+            let shown = abridge_output(content).len() / 4;
+            cost += (content.len() / 4).saturating_sub(shown);
+        }
+    }
+    if used + cost > budget {
+        return None;
+    }
+    Some((text, cost))
 }
 
 fn approx_tokens(history: &[Message]) -> usize {
@@ -4938,9 +5171,149 @@ mod reload_tests {
         let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let a = test_agent();
         let ctx = a.model.context.unwrap_or(200_000) as usize;
-        let out = a.model.max_tokens.unwrap_or(8192) as usize;
-        let expect = ctx.saturating_sub(out).saturating_sub(2_000).max(8192);
+        let out = a.model.max_tokens.unwrap_or(8192) as u64;
+        // The reserve is what the *request* will ask for at an empty history,
+        // not the raw catalog value: a model whose `max_tokens` is as large as
+        // its window (the ollama-cloud fallback catalog) must not reserve the
+        // whole window for a reply, or `trim` would find no room for input.
+        let expect = ctx
+            .saturating_sub(output_budget_for(0, ctx, out) as usize)
+            .saturating_sub(SYS_PROMPT_RESERVE)
+            .max(8192);
         assert_eq!(a.context_budget(), expect, "budget must not drift from the model config");
+        assert!(
+            a.context_budget() > 0,
+            "a catalog entry with max_tokens == context must still leave room for the conversation"
+        );
+    }
+
+    /// The output budget must never over-commit the window, and must not lose
+    /// the window's last few percent either.
+    ///
+    /// This is the arithmetic behind "compaction failed: HTTP 400 (input +
+    /// requested output exceeds the context window)": the agent reserved the
+    /// catalog's `max_tokens` unconditionally, so for a 1M-context model that
+    /// declares a 1M output cap (the `ollama-cloud` fallback catalog) the reply
+    /// reserved the entire window and the input budget was zero; and for any
+    /// model it reserved the same amount at 1% full as at 99% full, so the
+    /// history could never use the last few percent — exactly where a session
+    /// sits when it needs compaction.
+    #[test]
+    fn output_budget_shrinks_as_the_history_fills_the_window() {
+        // A small conversation still gets the model's whole `max_tokens`.
+        assert_eq!(output_budget_for(1_000, 1_000_000, 32_768), 32_768);
+        // A nearly-full one asks for the remainder, never more than it: the
+        // request must fit the window by construction.
+        let ctx = 1_000_000;
+        let used = 918_101;
+        let out = output_budget_for(used, ctx, 131_072);
+        assert!(
+            (used as u64) + out + SYS_PROMPT_RESERVE as u64 <= ctx as u64,
+            "input {used} + output {out} must fit a {ctx}-token window"
+        );
+        assert!(out >= MIN_OUTPUT_FLOOR as u64, "still a usable reply budget: {out}");
+        // A catalog entry whose output cap equals its window reserves nothing
+        // for input at an empty history.
+        let ctx = 1_048_576;
+        let out = output_budget_for(0, ctx, 1_048_576);
+        assert_eq!(
+            out,
+            (ctx - SYS_PROMPT_RESERVE) as u64,
+            "a 1M output cap must not reserve more than the window: the reply gets \
+             whatever is left after the system prompt, never the cap itself"
+        );
+        assert!(
+            out + SYS_PROMPT_RESERVE as u64 <= ctx as u64,
+            "and it must never exceed the window"
+        );
+        // And the last few percent of a window are reachable: a history that a
+        // *fixed* 32k reserve would have declared over-budget still gets a
+        // (smaller) reply budget instead of a hard failure.
+        let ctx = 1_000_000;
+        let used = 970_000;
+        let out = output_budget_for(used, ctx, 131_072);
+        assert!(out > 0 && used + out as usize + SYS_PROMPT_RESERVE <= ctx);
+    }
+
+    /// `/compact` must send a transcript that FITS the window it is about to
+    /// summarise, however large the history is.
+    ///
+    /// Regression: the transcript was every tool result verbatim. A real
+    /// coding session (measured on `.pir/sessions/pir-20261019-133811…jsonl`:
+    /// 6 `read_file` results of 100k chars each plus tool inputs) is several
+    /// times a 1M-token window, so the summariser request exceeded the window
+    /// and `/compact` failed with the exact HTTP 400 it exists to recover from.
+    #[test]
+    fn compact_transcript_is_fitted_to_the_request_window() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut a = test_agent();
+        a.model.context = Some(100_000);
+        a.model.max_tokens = Some(131_072); // cap larger than the window: the live shape
+        // A history far larger than the window: 20 tool rounds of 100k-char
+        // results, i.e. ~500k tokens against a 100k window.
+        for i in 0..20 {
+            a.history.push(Message { role: Role::Assistant, blocks: vec![Block::Text(format!("round {i}: reading the big file"))] });
+            let mut m = Message::user(&format!("call {i}"));
+            m.blocks.push(Block::ToolUse {
+                id: format!("call_{i}"),
+                name: "read_file".to_string(),
+                input: serde_json::json!({ "path": "src/gui.rs" }),
+            });
+            a.history.push(m);
+            let mut r = Message::user("");
+            r.blocks.push(Block::ToolResult {
+                tool_use_id: format!("call_{i}"),
+                content: "x".repeat(100_000),
+                is_error: false,
+            });
+            a.history.push(r);
+        }
+        let history_tokens = approx_tokens(&a.history);
+        assert!(history_tokens > 100_000, "precondition: the history alone overflows the window");
+
+        let out_budget = output_budget_for(history_tokens, 100_000, 131_072);
+        let room = 100_000usize
+            .saturating_sub(a.system.len() / 4)
+            .saturating_sub(out_budget as usize)
+            .saturating_sub(SYS_PROMPT_RESERVE);
+        let transcript = a.compact_transcript(room);
+        let prompt = format!("{COMPACT_INSTRUCTIONS}\n\n{transcript}");
+        let sent = crate::provider::estimate_prompt_tokens(&a.system, &prompt);
+        assert!(
+            sent + out_budget <= 100_000,
+            "compaction request must fit the window: {sent} input + {out_budget} output > 100000"
+        );
+        // And it still carries the *content* a summary needs: every tool call by
+        // name, plus the head and tail of each result (not just a marker line).
+        assert!(transcript.contains("read_file"), "tool calls survive fitting");
+        assert!(
+            transcript.contains("output truncated") || transcript.contains("elided"),
+            "long results are abridged, and say so"
+        );
+        assert!(
+            a.context_budget() < history_tokens,
+            "precondition: the session really needs compacting"
+        );
+    }
+
+    /// The fitted transcript keeps the most recent end of the conversation and
+    /// every user prompt it can afford — a summary built from the *start* of a
+    /// session describes work that is already done.
+    #[test]
+    fn transcript_fitting_keeps_the_newest_messages_first() {
+        let mut history = Vec::new();
+        for i in 0..40 {
+            history.push(Message::user(&format!("PROMPT-{i}")));
+            history.push(Message {
+                role: Role::Assistant,
+                blocks: vec![Block::Text("y".repeat(4_000))],
+            });
+        }
+        let out = render_transcript(&history, 2_000);
+        assert!(out.len() / 4 <= 2_000, "fitted to the budget: {}", out.len() / 4);
+        assert!(out.contains("PROMPT-39"), "the newest prompt must survive");
+        assert!(out.contains("elided"), "what was dropped is stated, not silent");
+        assert!(!out.contains("PROMPT-0\n"), "the oldest of 40 is dropped when it must be");
     }
 
     /// `/compact on|off` is an operator switch over lossy summarisation, so it

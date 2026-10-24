@@ -133,11 +133,16 @@ const SCROLL_PAGE_LINES: usize = 20;
 /// out, because four `m`-commands leave `/m` with no common prefix and break
 /// `tab_completes_to_common_prefix`. Same reason the global table's short
 /// aliases stay out.
+///
+/// `/menu` is deliberately *in*: it was the one command the GUI implemented
+/// (a dialog, a bar of its own, every one of its actions in the menu bar) that
+/// Tab completion did not offer and `/help` did not list — which is how an
+/// operator concludes it does not exist.
 const COMMANDS: &[&str] = &[
-    "help", "model", "models", "goal", "continue", "clear", "undo", "finished",
-    "exit", "usage", "thinking", "cancel", "sessions", "reload", "reexec",
-    "fix", "shell", "sh", "bg", "jobs", "checkpoints", "rewind", "quarantine",
-    "limits", "resources", "skills", "scratchpad",
+    "help", "menu", "new-project", "model", "models", "goal", "continue", "clear", "undo",
+    "finished", "exit", "usage", "thinking", "cancel", "sessions", "reload",
+    "reexec", "fix", "shell", "sh", "bg", "jobs", "checkpoints", "rewind",
+    "quarantine", "limits", "resources", "skills", "scratchpad", "compact",
 ];
 
 /// `/thinking` sub-arguments: the levels `config::ThinkingLevel::parse`
@@ -160,6 +165,108 @@ fn complete_idle(buf: &str) -> Option<String> {
     }
     None
 }
+
+/// Every candidate Tab would choose between for `buf`, in list order.
+///
+/// This is what the GUI *shows* when Tab cannot decide on its own — see
+/// [`completion_hint`]. `complete_idle` and this function share the same
+/// filters, so the list can never offer something Tab would refuse; the pairing
+/// is pinned by `the_completion_list_is_exactly_what_tab_matches`.
+fn completion_candidates(buf: &str) -> Vec<String> {
+    if buf.starts_with("/thinking ") {
+        let arg = buf.trim_start_matches("/thinking ").trim_start();
+        return THINKING_ARGS
+            .iter()
+            .filter(|o| o.starts_with(arg))
+            .map(|o| format!("/thinking {o}"))
+            .collect();
+    }
+    if buf.starts_with('/') {
+        let frag = buf.trim_start_matches('/');
+        if frag.contains(' ') {
+            return Vec::new(); // past the command word
+        }
+        return COMMANDS
+            .iter()
+            .filter(|c| c.starts_with(frag))
+            .map(|c| format!("/{c}"))
+            .collect();
+    }
+    Vec::new()
+}
+
+/// The hint line for a draft while it is being typed: either what Tab just
+/// did, or — when Tab could not decide or has not been pressed — which
+/// completions exist.
+///
+/// The reported gap: `/men` completes to `/menu`, and nothing ever said so;
+/// `/m` matched several commands and Tab silently did nothing. A completion
+/// you have to already know about is not discoverable. This is the mirror of
+/// the terminal's list-under-the-prompt: the GUI has no room to print a list
+/// above the Entry, so the hint under the status bar names the candidates.
+///
+/// `tab_note` is set when Tab was pressed and could not complete. It is shown
+/// *with* the list (`[Tab] no match` style) so a second Tab never looks like
+/// the first one being lost.
+fn completion_hint(buf: &str, tab_note: Option<&str>, narrow: bool) -> String {
+    let cands = completion_candidates(buf);
+    let is_command_word = buf.starts_with('/') && !buf.trim_start_matches('/').contains(' ');
+    if cands.len() == 1 {
+        // Only one candidate: Tab completes it, so name the result, not the
+        // candidate list (they are the same command).
+        let c = &cands[0];
+        // Do not suggest completing something that is already complete.
+        if c == buf.trim_end() || format!("{c} ") == buf {
+            return tab_note.unwrap_or("").to_string();
+        }
+        return match tab_note {
+            // Tab just did it: the note already says so. Repeating the advice
+            // would read "completed to /menu — completes to /menu".
+            Some(n) if n.starts_with("[Tab] completed") => n.to_string(),
+            Some(n) => format!("{n} — [Tab] completes to {c}"),
+            None => format!("[Tab] completes to {c}"),
+        };
+    }
+    if cands.is_empty() {
+        // No candidate is normal prose; only a note after Tab is worth a hint.
+        return tab_note.unwrap_or("").to_string();
+    }
+    // Ambiguous (or a bare `/`): list them. Commands are short, so show them
+    // all up to `COMPLETION_HINT_MAX`; beyond that the count and the narrow
+    // instruction ("keep typing") are what matter. The `/model` argument list
+    // is long (full provider/model labels), so it is capped much lower and
+    // points at `/models` instead.
+    // The `/thinking <arg>` list is a *sub*-argument list: show the bare
+    // argument (`off`, `minimal`, …), not the command again on every entry.
+    let label = |c: &str| -> String {
+        if is_command_word {
+            c.to_string()
+        } else {
+            c.rsplit(' ').next().unwrap_or(c).to_string()
+        }
+    };
+    let cap = if is_command_word { COMPLETION_HINT_MAX } else { 7 };
+    let shown: Vec<String> = cands.iter().take(cap).map(|c| label(c)).collect();
+    let mut out = String::new();
+    if let Some(n) = tab_note {
+        out.push_str(n);
+        out.push_str(" — ");
+    } else {
+        out.push_str("[Tab] ");
+    }
+    out.push_str(&shown.join("  "));
+    if cands.len() > shown.len() {
+        out.push_str(&format!("  … +{}", cands.len() - shown.len()));
+    }
+    if narrow && cands.len() > 1 {
+        out.push_str("   (keep typing to narrow)");
+    }
+    out
+}
+
+/// How many completion candidates the hint line names before summarising the
+/// rest as `… +N`.
+const COMPLETION_HINT_MAX: usize = 6;
 
 /// Complete `frag` against `opts`, returning `Some(format!("{prefix}{match}"))`
 /// when exactly one (or a common) prefix exists, else `None`.
@@ -289,12 +396,16 @@ fn live_boundary(lines: &[ConvLine], from: usize) -> usize {
     let Some(last_nonblank) = lines.iter().rposition(|l| !l.text.trim().is_empty()) else {
         return 0;
     };
-    // The trailing block starts after the last blank line above it.
-    let block_start = lines[..last_nonblank]
-        .iter()
-        .rposition(|l| l.text.trim().is_empty())
-        .map_or(0, |i| i + 1);
-    if block_start <= from { last_nonblank + 1 } else { block_start }
+    // The trailing block (which starts after the last blank line above it) is
+    // painted WHOLE, from its start, even though it is still incomplete —
+    // otherwise a long streamed block (a table, a code fence) stays invisible
+    // until a blank line finally terminates it, which for a big table means the
+    // user sees nothing while it streams and then the entire thing appears at
+    // once. `sync_textview` rewinds its write cursor to that start after
+    // painting, so the block is re-rendered from the model each tick and never
+    // appears twice: `rendered` is the cursor, not a high-water mark.
+    let _ = from;
+    last_nonblank + 1
 }
 
 /// Widen a line window `(start, end)` outward to block boundaries, so a block
@@ -331,11 +442,29 @@ fn assistant_block_markup(kind: ConvKind, block: &[ConvLine]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     let body = crate::md::render_pango(&raw);
-    format!(
-        "<span foreground=\"{color}\">{}</span>{}",
-        escape_markup(prefix),
-        body.trim_end_matches('\n')
-    )
+    // The prefix must line up with EVERY line it introduces, not just the
+    // first. Emitting it once put it on the block's opening line only, so a
+    // multi-line construct (a table's `┌───` border, a fenced code block, a
+    // blockquote) had its first row shifted right by the prefix width while
+    // the rows below started at column 0 — the misaligned `/markup_demo`
+    // table. Prefixing each body line keeps the whole construct flush.
+    let body = body.trim_end_matches('\n');
+    let pad = escape_markup(prefix);
+    let body = body
+        .split('\n')
+        .map(|line| {
+            if line.is_empty() {
+                // Blank separator lines carry no prefix: trailing spaces in
+                // Pango markup are invisible, but they would also make the
+                // paragraph look non-empty to any future trim logic.
+                String::new()
+            } else {
+                format!("<span foreground=\"{color}\">{pad}</span>{line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    body
 }
 
 /// Strip the most common inline markdown markers for contexts that cannot
@@ -464,6 +593,17 @@ struct GuiState {
     /// cursor, a `/clear` or a scrollback trim in one tab would desync every
     /// other tab's cursor, and panes would stop matching their own models.
     rendered: usize,
+    /// Model index at which the trailing (still-growing) block starts once it
+    /// has been painted; `None` when no trailing block is currently in the
+    /// buffer. The next sync that sees that block grow clears the buffer and
+    /// repaints from here, because the GTK text buffer cannot delete lines —
+    /// without this the block would either stay invisible while it streams or
+    /// be appended twice.
+    trailing_from: Option<usize>,
+    /// How many model lines the buffer held at the last paint. Used to tell
+    /// "the trailing block grew" (repaint it) from "nothing arrived" (leave the
+    /// pane alone).
+    painted_len: usize,
     /// Set when the text buffer must be rebuilt from scratch (after `/clear`,
     /// or a trim that dropped lines from the front of the model).
     needs_rebuild: bool,
@@ -526,6 +666,11 @@ struct GuiState {
     /// Last hint string handed to the hint label, so `set_markup` is not called
     /// on every drain tick (which forces a relayout).
     last_hint: String,
+    /// Set when Tab was pressed and could not complete the draft, holding the
+    /// reason (an ambiguity, already listed, or no match at all). Cleared as
+    /// soon as the draft changes, so it describes *this* line only — a stale
+    /// "no match" over a line the operator has since edited would be a lie.
+    tab_note: Option<String>,
     /// Last window title set, for the same reason: `set_title` marks the window
     /// dirty, so it is only called when the running/idle state actually flips.
     last_title: String,
@@ -602,29 +747,41 @@ fn list_jobs(s: &mut GuiState) {
 const HELP_GUI: &str = "\
 commands:
   /help                 this list
-  /menu [action]        main menu: resume/model/thinking/security/…
-  /model [prefix]       recent-first picker   /models      list every model
+  /menu [action]        main menu in a dialog: resume/model/thinking/
+                        security/settings/worktrees/coverage/help/about/quit
+                        (the Menu bar above the tabs lists the same actions)
+  /model [prefix]       pick a model in a dialog
+  /models               list every model in the catalog
   /usage                tokens this session
   /goal [obj]           show or start the standing goal
   /continue             drive the goal to completion
   /thinking <lvl>       off|minimal|low|medium|high|xhigh|max  (+ show|hide)
-  /clear                clear the pane    /undo [all]  rewind the last turn
+  /clear                clear the pane
+  /undo [all]           revert the last file edit (or all) to its pre-edit state
   /finished             mark this session finished
   /fix                  repair the workspace VCS setup
-  /sh <cmd>             run a shell command   (/shell, and /! <cmd>, also work)
-  /bg <prompt>          start a background turn   /jobs   list them
+  /sh <cmd>             run a shell command (aliases: /shell; and ! <cmd>)
+  /bg <prompt>          start a background turn
+  /jobs                 list background jobs
   /cancel               stop the running turn
+  /compact [status|on|off]
+                        summarise the conversation so far and replace it with
+                        the summary (frees the context window); `status` shows
+                        usage without calling the model, `on`/`off` arm/disarm
+                        the automatic compaction before a near-cap auto-retry
   /checkpoints          list rewindable turn boundaries
   /rewind <#>           restore the tree and the conversation to a turn
   /quarantine [status|apply all|discard]
                          review / approve staged writes to the real filesystem
-  /limits               what the agent's commands are bounded by
+  /limits               what the agent's commands are bounded by (alias: /resources)
   /skills [name]        list the skill catalog, or print one
   /scratchpad           this session's scratch directory
   /reload               reload catalog, policy and extension commands
   /reexec               restart in place (idle only)
   /markup_demo          render a canned markdown demo (headings/code/table)
   /sessions             new|close|next|prev|<n>  multi-session tabs
+  /new-project [dir]    open a project directory in a new window (existing, or
+                        type a new path to create it); no arg opens a picker
   /exit                 quit
 
 keys:
@@ -661,6 +818,8 @@ impl GuiState {
                 .map(|b| b.generation)
                 .unwrap_or(0),
             rendered: 0,
+            trailing_from: None,
+            painted_len: 0,
             needs_rebuild: true,
             bg: Vec::new(),
             next_bg_id: 1,
@@ -681,6 +840,7 @@ impl GuiState {
             awaiting_input: false,
             draft: String::new(),
             last_hint: String::new(),
+            tab_note: None,
             last_title: String::new(),
         }
     }
@@ -1166,6 +1326,163 @@ fn question_dialog(
 }
 
 // ---------------------------------------------------------------------------
+// New Project: pick a directory, then open pir there
+// ---------------------------------------------------------------------------
+
+/// Report a New Project outcome in the pane (and never silently do nothing).
+fn report_new_project(state: &Arc<Mutex<GuiState>>, widgets: &GuiWidgets, kind: ConvKind, msg: &str) {
+    let mut s = state.lock().unwrap();
+    s.push(kind, msg);
+    sync_textview(widgets, &mut s);
+}
+
+/// Open a project directory from the GUI: resolve it, launch, report.
+///
+/// The single implementation behind the sidebar button, the Session menu item
+/// and `/new-project <path>` — all three call this, so they cannot disagree
+/// about what a project launch does or reports.
+fn open_project(
+    app: &App,
+    dir: &str,
+    create: bool,
+    state: &Arc<Mutex<GuiState>>,
+    widgets: &GuiWidgets,
+    full_auto: bool,
+) {
+    match crate::project_launch::target(dir, create) {
+        Ok(path) => match crate::project_launch::launch(&path, full_auto) {
+            Ok(pid) => report_new_project(
+                state,
+                widgets,
+                ConvKind::System,
+                &format!("· opening project {} (new window, pid {pid})", path.display()),
+            ),
+            Err(e) => report_new_project(state, widgets, ConvKind::Error, &format!("· {e}")),
+        },
+        Err(e) if !create => {
+            // The path does not exist (or is a file): never mkdir silently —
+            // open the picker, which offers the explicit "create" step.
+            open_project_picker(app, state, widgets, full_auto, Some(&e));
+        }
+        Err(e) => report_new_project(state, widgets, ConvKind::Error, &format!("· {e}")),
+    }
+}
+
+/// The New Project picker: a path in an `Entry` (pre-filled with the current
+/// workspace), a *Browse…* button for the native folder chooser, and
+/// Open / Cancel.
+///
+/// The typed path is what makes "new directory" work on every backend: a
+/// missing path is created, but only after a second, explicit confirmation
+/// (a picker that silently `mkdir`s a typo is worse than useless).
+fn open_project_picker(
+    app: &App,
+    state: &Arc<Mutex<GuiState>>,
+    widgets: &GuiWidgets,
+    full_auto: bool,
+    notice: Option<&str>,
+) {
+    let Ok(dialog) = app.create_dialog() else {
+        report_new_project(
+            state,
+            widgets,
+            ConvKind::Error,
+            "· could not open the New Project dialog — use /new-project <path>",
+        );
+        return;
+    };
+    dialog.set_title("pir — new project");
+    if let Some(n) = notice {
+        if let Ok(lbl) = app.create_label(n) {
+            #[cfg(all(target_os = "linux", not(windows)))]
+            lbl.set_xalign(0.0);
+            dialog.append_content_area(&lbl);
+        }
+    }
+    let Ok(lbl) = app.create_label("Open a project directory (an existing one, or a new one to create):") else {
+        return;
+    };
+    #[cfg(all(target_os = "linux", not(windows)))]
+    lbl.set_xalign(0.0);
+    dialog.append_content_area(&lbl);
+
+    let Ok(entry) = app.create_entry() else { return };
+    // Start at the workspace the operator is looking at, so "new project" from
+    // an existing project is usually a sibling edit away.
+    let start = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    entry.set_text(&start.to_string_lossy());
+    dialog.append_content_area(&entry);
+
+    // Browse…: the native folder chooser, which also lets the operator create
+    // a folder in place (GTK's and Win32's folder dialogs both offer that).
+    if let Ok(browse) = app.create_button("Browse…") {
+        let entry_b = entry.clone();
+        let browse_app = app.clone();
+        let _ = browse.on_click(move || {
+            if let Ok(Some(dir)) = browse_app.select_folder("pir — choose a project directory") {
+                entry_b.set_text(&dir);
+            }
+        });
+        dialog.append_content_area(&browse);
+    }
+
+    // Open: existing directory launches; a missing one asks first.
+    if let Ok(open) = app.create_button("Open") {
+        let st = state.clone();
+        let w = widgets.clone();
+        let e = entry.clone();
+        let dlg = dialog.clone();
+        let _ = open.on_click(move || {
+            let raw = e.get_text().unwrap_or_default();
+            let raw = raw.trim().to_string();
+            if raw.is_empty() {
+                return;
+            }
+            match crate::project_launch::target(&raw, false) {
+                Ok(path) => {
+                    dlg.close();
+                    match crate::project_launch::launch(&path, full_auto) {
+                        Ok(pid) => report_new_project(
+                            &st,
+                            &w,
+                            ConvKind::System,
+                            &format!("· opening project {} (new window, pid {pid})", path.display()),
+                        ),
+                        Err(e) => report_new_project(&st, &w, ConvKind::Error, &format!("· {e}")),
+                    }
+                }
+                Err(_) => {
+                    // Missing: confirm creation explicitly rather than mkdir a typo.
+                    dlg.close();
+                    match crate::project_launch::target(&raw, true) {
+                        Ok(path) => match crate::project_launch::launch(&path, full_auto) {
+                            Ok(pid) => report_new_project(
+                                &st,
+                                &w,
+                                ConvKind::System,
+                                &format!(
+                                    "· created project {} (new window, pid {pid})",
+                                    path.display()
+                                ),
+                            ),
+                            Err(e) => report_new_project(&st, &w, ConvKind::Error, &format!("· {e}")),
+                        },
+                        Err(e) => report_new_project(&st, &w, ConvKind::Error, &format!("· {e}")),
+                    }
+                }
+            }
+        });
+        dialog.append_content_area(&open);
+    }
+    if let Ok(cancel) = app.create_button("Cancel") {
+        let dlg = dialog.clone();
+        let _ = cancel.on_click(move || dlg.close());
+        dialog.append_content_area(&cancel);
+    }
+    dialog.present();
+}
+
+// ---------------------------------------------------------------------------
 // Left sessions tree (sidebar)
 // ---------------------------------------------------------------------------
 
@@ -1481,10 +1798,21 @@ pub fn run(
         .create_box(Orientation::Vertical, 2)
         .map_err(|e| format!("create_box sidebar: {e}"))?;
     sidebar.set_size_request(220, -1);
+    // Header row: [sessions] + [New Project…]. The button opens a directory
+    // (existing, or typed in and created) and launches pir there in a new
+    // process — see `launch_in_dir` for why a new process rather than a tab.
+    let side_head_row = app
+        .create_box(Orientation::Horizontal, 4)
+        .map_err(|e| format!("create_box head row: {e}"))?;
     let side_head = app.create_label("sessions").map_err(|e| format!("sidebar head: {e}"))?;
     #[cfg(all(target_os = "linux", not(windows)))]
     side_head.set_xalign(0.0);
-    sidebar.append(&side_head);
+    side_head_row.append(&side_head);
+    let new_project_btn = app
+        .create_button("New Project")
+        .map_err(|e| format!("create_button: {e}"))?;
+    side_head_row.append(&new_project_btn);
+    sidebar.append(&side_head_row);
     let side_rows = app
         .create_box(Orientation::Vertical, 1)
         .map_err(|e| format!("create_box rows: {e}"))?;
@@ -1547,6 +1875,24 @@ pub fn run(
 
     // One SessionView per open tab, indexed identically to the TabView.
 
+    // "New Project": pick a directory, then open pir there in a new process.
+    // Wired here (not at creation) because the picker reports into the
+    // *current* session's pane, which needs `sessions`/`tabs`.
+    {
+        let btn_sessions = sessions.clone();
+        let btn_tabs = tabs.clone();
+        let btn_app = app.clone();
+        let _ = new_project_btn.on_click(move || {
+            let sv = { btn_sessions.borrow().get(btn_tabs.current_tab()).cloned() };
+            // No current session would mean the tab list is empty, which only
+            // happens before the first `spawn_session`; nothing to report into
+            // then, so the picker simply is not opened.
+            if let Some(sv) = sv {
+                open_project_picker(&btn_app, &sv.state, &sv.widgets, _full_auto, None);
+            }
+        });
+    }
+
     // Switching tabs just moves keyboard focus to that tab's prompt. This is
     // the *only* place focus is moved deliberately — the old unconditional
     // focus-out re-grab was a trap (see `spawn_session`).
@@ -1560,6 +1906,22 @@ pub fn run(
                 sv.entry.grab_focus();
             }
         }));
+    }
+
+    // The terminal's `/menu` as a clickable bar, above the menu bar. The
+    // operator's report was "there isn't really an equivalent to all the
+    // /menu options in topbar": the options were reachable (typed `/menu
+    // <sub>`, or a Help item the old `HELP_GUI` did not mention), but nothing
+    // in the window showed them. One item per `/menu` action, in the
+    // terminal's own order, so the GUI's first look matches the terminal's.
+    match build_menu_strip(&app, &sessions, &tabs, providers, agent_slot) {
+        Ok(strip) => {
+            root.append(&strip);
+        }
+        Err(e) => {
+            // Degraded, not fatal — the menu bar and typed commands remain.
+            eprintln!("pir: /menu bar unavailable ({e}) — /menu <action> still works");
+        }
     }
 
     // The menu bar, built before the first session so its actions can dispatch
@@ -1780,6 +2142,7 @@ fn run_command_line(
             &sv.app,
             &sv.widgets,
             &sv.hist_nav,
+            sv,
         );
         return;
     }
@@ -2552,6 +2915,40 @@ fn spawn_session(
                     let provs: Vec<Provider> = entry_cb_providers_tab.clone();
                     crate::config::complete_model_buffer(&cur, &provs)
                 });
+                // Record what Tab did, so the hint line can *show* it (see
+                // `completion_hint`). Tab used to be completely silent: `/men`
+                // became `/menu` with no comment, and `/m` (three matches)
+                // changed nothing at all with no explanation.
+                {
+                    let mut s = state_for_keys.lock().unwrap();
+                    match &completed {
+                        Some(c) if *c != cur => {
+                            s.tab_note = Some(format!("[Tab] completed to {c}"));
+                        }
+                        _ => {
+                            // It could not complete: say why — several
+                            // candidates (listed by the hint), or none.
+                            let n = completion_candidates(&cur).len();
+                            s.tab_note = Some(match n {
+                                0 => "[Tab] no match".to_string(),
+                                1 => "[Tab] already complete".to_string(),
+                                n => format!("[Tab] {n} matches"),
+                            });
+                        }
+                    }
+                    // Repaint the hint now rather than waiting for the next
+                    // drain tick: the whole point is that the answer to Tab
+                    // appears while the operator is looking at it.
+                    let hint = completion_hint(&cur, s.tab_note.as_deref(), true);
+                    if s.last_hint != hint {
+                        if hint.is_empty() {
+                            widgets_for_keys.hint.set_markup("");
+                        } else {
+                            widgets_for_keys.hint.set_markup(&status_markup(&hint));
+                        }
+                        s.last_hint = hint;
+                    }
+                }
                 // Only claim the key when the completion actually *changed*
                 // something. The old handler returned `true` unconditionally,
                 // which killed GTK's default focus-move and made a second Tab
@@ -2851,7 +3248,14 @@ fn drain_once(
     // owns it — so it is copied in here, once per drain, rather than becoming a
     // second source of truth updated on every keystroke. The TUI owns the draft
     // outright and derives both directly (`tui.rs:684`).
-    s.draft = entry.get_text().unwrap_or_default();
+    let draft_now = entry.get_text().unwrap_or_default();
+    if draft_now != s.draft {
+        // A Tab note describes the line it was produced for. Editing the line
+        // (or Tab itself changing it) retires it, so "[Tab] no match" can never
+        // sit under a line the operator has since made matchable.
+        s.tab_note = None;
+    }
+    s.draft = draft_now;
 
     // The window title carries the TUI's pane title (T6): `pir — running` /
     // `pir — idle`. Only touched on a change — `set_title` marks the window for
@@ -3032,13 +3436,17 @@ fn window_title(running: bool) -> String {
 /// The transient hint under the status bar — a port of the TUI's
 /// `update_tui_hint` (`tui.rs:1140`), matched string for string so the two
 /// front-ends nudge identically.
-fn hint_text(draft: &str) -> String {
-    if draft == "/thinking" {
+///
+/// This covers what the *typed line* can be completed to. It used to answer
+/// only for exactly `/` and `/thinking`, so `/men` — which Tab happily
+/// completes to `/menu` — got no hint at all, and nothing in the window said
+/// which commands existed. [`completion_hint`] now answers for every draft with
+/// candidates, and carries the outcome of a Tab press (`state.tab_note`).
+fn hint_text(draft: &str, tab_note: Option<&str>) -> String {
+    if draft == "/thinking" && tab_note.is_none() {
         "[Tab] levels: off | minimal | low | medium | high | xhigh | max · show | hide".to_string()
-    } else if draft == "/" {
-        "[Tab] completes commands; try /thinking".to_string()
     } else {
-        String::new()
+        completion_hint(draft, tab_note, true)
     }
 }
 
@@ -3364,6 +3772,10 @@ struct MenuAction {
 const MENU_ACTIONS: &[MenuAction] = &[
     // Session
     MenuAction { menu: "Session", label: "New session", action: "session-new", command: "sessions", arg: "new" },
+    // Opens a project directory (existing, or a new one to create) in a new
+    // window. Goes through `handle_command` like every other item, so the menu,
+    // the sidebar button and `/new-project` share one implementation.
+    MenuAction { menu: "Session", label: "New project…", action: "session-new-project", command: "new-project", arg: "" },
     MenuAction { menu: "Session", label: "Close session", action: "session-close", command: "sessions", arg: "close" },
     MenuAction { menu: "Session", label: "List sessions", action: "session-list", command: "sessions", arg: "" },
     MenuAction { menu: "Session", label: "Run a shell command", action: "session-shell", command: "sh", arg: "" },
@@ -3386,6 +3798,8 @@ const MENU_ACTIONS: &[MenuAction] = &[
     MenuAction { menu: "Turn", label: "Undo last turn", action: "turn-undo", command: "undo", arg: "" },
     MenuAction { menu: "Turn", label: "Rewind", action: "turn-rewind", command: "rewind", arg: "" },
     MenuAction { menu: "Turn", label: "List checkpoints", action: "turn-checkpoints", command: "checkpoints", arg: "" },
+    MenuAction { menu: "Turn", label: "Compact conversation", action: "turn-compact", command: "compact", arg: "" },
+    MenuAction { menu: "Turn", label: "Context usage", action: "turn-compact-status", command: "compact", arg: "status" },
     // View
     MenuAction { menu: "View", label: "Clear pane", action: "view-clear", command: "clear", arg: "" },
     // Safety
@@ -3486,6 +3900,28 @@ fn spawn_turn(
 /// No `quiet` flag is threaded through because the GUI agent is already quiet —
 /// `main` calls `agent.set_quiet(true)` before handing it over — so goal output
 /// reaches the user through the session log, exactly like any other turn.
+/// Summarise the conversation on a worker thread, moving the agent out of the
+/// slot for the duration (the same shape as [`spawn_goal`]).
+///
+/// `/compact` is a full generation over the whole transcript — the slowest
+/// single call a session makes — so it must never run on the GTK main thread.
+/// The result reaches the operator through two channels the drain already
+/// handles: the agent's own `compact()` notice is appended to the session log,
+/// and the outcome line is written here as a `notice`-shaped log entry so the
+/// conversation pane shows it exactly like the terminal REPL does.
+fn spawn_compact(agent_slot: &AgentSlot) {
+    let slot = agent_slot.clone();
+    std::thread::spawn(move || {
+        let taken = slot.lock().unwrap().take();
+        let Some(mut agent) = taken else { return };
+        let out = agent.compact();
+        // Persist the outcome next to the summary so the pane reports it even
+        // though this thread cannot touch the widgets.
+        agent.log_notice(&out);
+        *slot.lock().unwrap() = Some(agent);
+    });
+}
+
 fn spawn_goal(agent_slot: &AgentSlot, attach_log: bool) {
     let slot = agent_slot.clone();
     std::thread::spawn(move || {
@@ -4027,13 +4463,36 @@ fn sync_textview(widgets: &GuiWidgets, state: &mut GuiState) {
         }
         // Assistant blocks are appended whole, so a block that is still
         // arriving (streamed into the model one drained line at a time) must
-        // not be painted in pieces: `live_boundary` paints every completed
-        // block, then the trailing block from the write cursor on. The cursor
-        // parks on the trailing block's first line, so that block is rendered
-        // again, whole, on each sync until more of it arrives — never as a
-        // second partial copy.
-        let (base, rest) = (state.rendered, &state.conv[state.rendered..]);
-        let end = base + live_boundary(rest, 0);
+        // not be painted in pieces. The trailing (still-growing) block is
+        // painted WHOLE from its start on every tick, so a big table or code
+        // fence is visible while it streams instead of appearing all at once
+        // at the end.
+        //
+        // The GTK text buffer has no "delete the last N lines" primitive, so a
+        // repaint of an already-painted trailing block rebuilds the tail: the
+        // cursor is rewound to the block's start and the buffer is cleared
+        // first. `repaint_from` records the model index the buffer's current
+        // contents start at (0 = whole conversation), which is what the
+        // rebuild clears from.
+        let mut end = {
+            let (base, rest) = (state.rendered, &state.conv[state.rendered..]);
+            base + live_boundary(rest, 0)
+        };
+        // A trailing block already in the buffer must be REPAINTED, not
+        // appended again. The text buffer cannot delete lines, so clear it and
+        // repaint from that block's start. Only when the model actually grew
+        // since the last paint — otherwise every 150ms tick would rebuild.
+        if let Some(from) = state.trailing_from
+            && state.conv.len() > state.painted_len
+        {
+            widgets.textview.set_text("");
+            state.buf_links.clear();
+            state.rendered = from;
+            end = from + live_boundary(&state.conv[from..], 0);
+        }
+        // One-past-the-last model line the buffer shows; the growth signal
+        // above compares against it.
+        state.painted_len = state.conv.len();
         let mut i = state.rendered;
         while i < end {
             let line = &state.conv[i];
@@ -4083,9 +4542,17 @@ fn sync_textview(widgets: &GuiWidgets, state: &mut GuiState) {
             state.buf_links.push(spans);
             i += 1;
         }
-        // The cursor parks on the first line of the trailing block, so the
-        // next sync re-renders that block (whole) rather than appending a
-        // second partial copy of it.
+        // Remember the trailing block's start when the paint stopped mid-block,
+        // so the next sync repaints it whole instead of appending a copy.
+        state.trailing_from = if end > 0 && end < state.conv.len() {
+            let mut start = end;
+            while start > 0 && continues_block(Some(&state.conv[start - 1]), &state.conv[start]) {
+                start -= 1;
+            }
+            (start < end).then_some(start)
+        } else {
+            None
+        };
         state.rendered = end;
         // Track the tail while live, so the first PageUp starts one full page
         // above the bottom rather than from a stale offset.
@@ -4172,7 +4639,7 @@ fn sync_textview(widgets: &GuiWidgets, state: &mut GuiState) {
         widgets.status.set_markup(&status_markup(&shown));
         state.last_status = shown;
     }
-    let hint = hint_text(&state.draft);
+    let hint = hint_text(&state.draft, state.tab_note.as_deref());
     if state.last_hint != hint {
         if hint.is_empty() {
             widgets.hint.set_markup("");
@@ -4223,7 +4690,7 @@ fn sync_textview(widgets: &GuiWidgets, state: &mut GuiState) {
         widgets.status.set_markup(&status_markup(&shown));
         state.last_status = shown;
     }
-    let hint = hint_text(&state.draft);
+    let hint = hint_text(&state.draft, state.tab_note.as_deref());
     if state.last_hint != hint {
         if hint.is_empty() {
             widgets.hint.set_markup("");
@@ -4372,6 +4839,16 @@ type GuiDialog = rustxwidgets::backends_gtk_adapter::Dialog;
 /// Buttons therefore act synchronously and close; every action below is fast
 /// (a flip, a switch, a save, a local file read) except goal-driving, which
 /// goes through `spawn_goal`'s worker like `/goal` and `/continue` do.
+/// Push one label+button row into a menu-style dialog. The button runs `act`,
+/// then closes the dialog. Every menu dialog in this file is built this way —
+/// fire-and-forget from the GTK main thread.
+///
+/// Blocking (like `question_dialog`'s `rx.recv()`) would freeze the UI here:
+/// that renderer runs on an agent *worker* thread, but menu actions run on the
+/// GTK main thread itself, so there is nothing else keeping the loop alive.
+/// Buttons therefore act synchronously and close; every action below is fast
+/// (a flip, a switch, a save, a local file read) except goal-driving, which
+/// goes through `spawn_goal`'s worker like `/goal` and `/continue` do.
 fn menu_dialog_button(
     app: &App,
     dialog: &GuiDialog,
@@ -4387,6 +4864,28 @@ fn menu_dialog_button(
         dialog_cb.close();
     });
     dialog.append_content_area(&btn);
+}
+
+/// [`menu_dialog_button`] with an explicit container: the button is put in
+/// `container` (a vertical box inside the dialog, so rows stack instead of
+/// lining up side by side across the dialog's content area) and still closes
+/// `dialog` when clicked.
+fn menu_box_button(
+    app: &App,
+    dialog: &GuiDialog,
+    container: &GuiBox,
+    label: &str,
+    mut act: impl FnMut() + 'static,
+) {
+    let Ok(btn) = app.create_button(label) else {
+        return;
+    };
+    let dialog_cb = dialog.clone();
+    let _ = btn.on_click(move || {
+        act();
+        dialog_cb.close();
+    });
+    container.append(&btn);
 }
 
 /// Resume a session log into the current agent, pane-native.
@@ -4598,13 +5097,53 @@ fn open_model_dialog(
         return;
     };
     dialog.set_title("pir — model");
-    for item in items {
+    // Recent models first, in the terminal's own order and numbering (`/modelN`
+    // picks row N, so the N is printed on the button), then the rest of the
+    // catalog. A recent label that no longer resolves against this catalog is
+    // dropped rather than offered as a button that switches to nothing.
+    let current = {
+        let g = agent_slot.lock().unwrap();
+        g.as_ref().map(|a| a.label()).unwrap_or_default()
+    };
+    let recent: Vec<String> = crate::model_history::top_matching("", crate::model_history::TOP_N)
+        .into_iter()
+        .filter(|l| crate::config::select(providers, l).is_ok())
+        .collect();
+    for (i, item) in recent.iter().enumerate() {
         let slot = agent_slot.clone();
         let provs = providers.to_vec();
         let st = state.clone();
         let w = widgets.clone();
         let label = item.clone();
-        menu_dialog_button(app, &dialog, &item, move || {
+        let shown = if *item == current {
+            format!("{}  ● {item} (current)", i + 1)
+        } else {
+            format!("{}  {item}", i + 1)
+        };
+        menu_dialog_button(app, &dialog, &shown, move || {
+            switch_model_in_gui(&slot, &provs, &label, &st, &w);
+        });
+    }
+    if !recent.is_empty()
+        && let Ok(sep) = app.create_label("all models:")
+    {
+        dialog.append_content_area(&sep);
+    }
+    for item in items {
+        if recent.contains(&item) {
+            continue; // already above, with its `/modelN` number
+        }
+        let slot = agent_slot.clone();
+        let provs = providers.to_vec();
+        let st = state.clone();
+        let w = widgets.clone();
+        let label = item.clone();
+        let shown = if item == current {
+            format!("● {item} (current)")
+        } else {
+            item.clone()
+        };
+        menu_dialog_button(app, &dialog, &shown, move || {
             switch_model_in_gui(&slot, &provs, &label, &st, &w);
         });
     }
@@ -4634,11 +5173,7 @@ fn open_thinking_dialog(
             sync_textview(widgets, &mut s);
             return;
         };
-        let kind = match agent.provider().api.as_deref() {
-            Some("anthropic") => Some(crate::config::ApiKind::Anthropic),
-            Some("openai") => Some(crate::config::ApiKind::OpenAi),
-            _ => None,
-        };
+        let kind = agent.provider().model_api(agent.model());
         let model = agent.model();
         (
             crate::modal::offered_thinking_levels(kind, model.context.unwrap_or(0), Some(&model)),
@@ -4992,11 +5527,7 @@ fn gui_settings_snapshot(
 ) -> Option<(String, Vec<String>, String, bool, bool, bool, bool)> {
     let g = agent_slot.lock().unwrap();
     let agent = g.as_ref()?;
-    let kind = match agent.provider().api.as_deref() {
-        Some("anthropic") => Some(crate::config::ApiKind::Anthropic),
-        Some("openai") => Some(crate::config::ApiKind::OpenAi),
-        _ => None,
-    };
+    let kind = agent.provider().model_api(agent.model());
     let model = agent.model();
     let levels = crate::modal::offered_thinking_levels(
         kind,
@@ -5196,17 +5727,17 @@ fn about_lines() -> Vec<String> {
 /// it as a direct value (mirroring the "fill the argument from the prompt"
 /// convention), the rest ignore it.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn run_menu_action(
     sub: &str,
     extra: &[&str],
     agent_slot: &AgentSlot,
     providers: &[Provider],
     app: &App,
-    state: &Arc<Mutex<GuiState>>,
-    widgets: &GuiWidgets,
-    hist_nav: &Arc<Mutex<HistoryNav>>,
+    sv: &SessionView,
 ) {
+    let state = &sv.state;
+    let widgets = &sv.widgets;
+    let hist_nav = &sv.hist_nav;
     match sub {
         "resume" => {
             let token = extra.join(" ");
@@ -5389,32 +5920,19 @@ fn open_menu_dialog(
     app: &App,
     agent_slot: &AgentSlot,
     providers: &[Provider],
-    state: &Arc<Mutex<GuiState>>,
-    widgets: &GuiWidgets,
-    hist_nav: &Arc<Mutex<HistoryNav>>,
+    sv: &SessionView,
 ) {
     let Ok(dialog) = app.create_dialog() else {
-        let mut s = state.lock().unwrap();
+        let mut s = sv.state.lock().unwrap();
         s.push(
             ConvKind::Error,
             "· could not open the menu — every action is still available as /menu <action>",
         );
-        sync_textview(widgets, &mut s);
+        sync_textview(&sv.widgets, &mut s);
         return;
     };
     dialog.set_title("pir — menu");
-    for (sub, label) in MENU_DIALOG_ACTIONS {
-        let sub = sub.to_string();
-        let slot = agent_slot.clone();
-        let provs = providers.to_vec();
-        let st = state.clone();
-        let w = widgets.clone();
-        let hn = hist_nav.clone();
-        let app2 = app.clone();
-        menu_dialog_button(app, &dialog, label, move || {
-            run_menu_action(&sub, &[], &slot, &provs, &app2, &st, &w, &hn);
-        });
-    }
+    fill_menu_list(app, &dialog, agent_slot, providers, sv);
     {
         let dialog_cancel = dialog.clone();
         menu_dialog_button(app, &dialog, "Cancel", move || {
@@ -5423,8 +5941,106 @@ fn open_menu_dialog(
     }
     dialog.present();
 }
+/// Fill `dialog` with the main menu's items — one button per
+/// [`MENU_DIALOG_ACTIONS`] row, stacked vertically. The terminal `/menu` is a
+/// single list of rows; appending the buttons straight into the dialog's
+/// content area (as this used to) put them side by side across one line.
+fn fill_menu_list(
+    app: &App,
+    dialog: &GuiDialog,
+    agent_slot: &AgentSlot,
+    providers: &[Provider],
+    sv: &SessionView,
+) {
+    let Ok(list) = app.create_box(Orientation::Vertical, 2) else {
+        return;
+    };
+    for (sub, label) in MENU_DIALOG_ACTIONS {
+        let sub = sub.to_string();
+        let slot = agent_slot.clone();
+        let provs = providers.to_vec();
+        let sv_cb = sv.clone();
+        let app2 = app.clone();
+        menu_box_button(app, dialog, &list, label, move || {
+            run_menu_action(&sub, &[], &slot, &provs, &app2, &sv_cb);
+        });
+    }
+    list.set_vexpand(true);
+    dialog.append_content_area(&list);
+}
+
+/// Build the `/menu` bar: one clickable item per [`MENU_DIALOG_ACTIONS`] row,
+/// in the terminal's own order.
+///
+/// Why this exists next to the menu bar: the menu bar sorts commands by
+/// *category* (Session / Model / Turn / View / Safety / Help), which is the
+/// right shape for finding a command you already know — but the operator's
+/// question was "where are all the /menu options?", and the answer used to be
+/// "behind a dialog nothing in the window mentioned". This strip is the
+/// terminal's menu made visible: `Resume / pick session`, `Backgrounded
+/// sessions`, `Model`, `Thinking`, `Security`, `Settings`, `Worktrees by
+/// default`, `Autoclean branch coverage`, `Help`, `About`, `Quit` — the same
+/// rows in the same order.
+///
+/// It is not a second implementation: each item runs [`run_menu_action`], the
+/// same function the dialog button and the typed `/menu <sub>` run.
+fn build_menu_strip(
+    app: &App,
+    sessions: &Rc<RefCell<Vec<SessionView>>>,
+    tabs: &TabView,
+    providers: &[Provider],
+    agent_slot: &AgentSlot,
+) -> Result<GuiBox, String> {
+    let strip = app
+        .create_box(Orientation::Horizontal, 2)
+        .map_err(|e| format!("create_box: {e}"))?;
+    for (sub, label) in MENU_DIALOG_ACTIONS {
+        let btn = app
+            .create_button(label)
+            .map_err(|e| format!("create_button({label}): {e}"))?;
+        let sub_cb = sub.to_string();
+        let sub_dbg = sub.to_string();
+        let sessions = sessions.clone();
+        let tabs = tabs.clone();
+        let providers = providers.to_vec();
+        let slot = agent_slot.clone();
+        // The `&App` this function borrows cannot be captured by a `'static`
+        // callback; carry its address as a `usize` and reborrow at the call
+        // site — the same technique and the same safety argument as
+        // `build_menu_bar`: `run` owns the `App` for as long as any callback
+        // can fire.
+        let app_addr: usize = app as *const App as usize;
+        if btn
+            .on_click(move || {
+                // Read the current tab at click time: the strip outlives any
+                // one tab, and a stale `SessionView` would paint into a closed
+                // one.
+                let sv = { sessions.borrow().get(tabs.current_tab()).cloned() };
+                let Some(sv) = sv else { return };
+                let mut s = sv.state.lock().unwrap();
+                s.push(ConvKind::System, &format!("· menu: {sub_dbg}"));
+                drop(s);
+                // SAFETY: `app_addr` is the `App` passed to `run`, which does
+                // not return while any callback can fire (see above).
+                let app_ref = unsafe { &*(app_addr as *const App) };
+                run_menu_action(&sub_cb, &[], &slot, &providers, app_ref, &sv);
+            })
+            .is_err()
+        {
+            // A button that never fires is exactly the "menu does nothing"
+            // report; say so rather than swallow it.
+            return Err(format!("menu item {sub:?} not connected"));
+        }
+        strip.append(&btn);
+    }
+    Ok(strip)
+}
+
 /// Handle a slash command inline (a GUI-appropriate subset). Mirrors the
 /// streaming REPL's commands but reads/writes the GUI's own state/agent slot.
+///
+/// `sv` is the tab's `SessionView`, passed only for `/menu`, which hands it to
+/// [`run_menu_action`] (the same view the strip items act on).
 fn handle_command(
     cmd: &str,
     agent_slot: &AgentSlot,
@@ -5436,7 +6052,12 @@ fn handle_command(
     app: &App,
     widgets: &GuiWidgets,
     hist_nav: &Arc<Mutex<HistoryNav>>,
+    sv: &SessionView,
 ) {
+    // `hist_nav` is the same `sv.hist_nav` the callers pass; `/menu` reads it
+    // off the view so the dispatch and the strip cannot disagree about which
+    // navigation state an action resets.
+    let _ = hist_nav;
     let mut parts = cmd.split_whitespace();
     let cmd = parts.next().unwrap_or("");
     let rest: Vec<&str> = parts.collect();
@@ -5462,6 +6083,113 @@ fn handle_command(
         "clear" => {
             s.clear();
             s.push(ConvKind::System, "pir · GTK GUI");
+        }
+        "compact" => {
+            // `/compact` — summarise the conversation so far and replace the
+            // history with that summary. The GUI had no arm for it at all: the
+            // command was neither completable nor implemented, so a session that
+            // ran into "input + requested output exceeds the context window" (the
+            // message the agent prints) had no way to recover inside the GUI.
+            //
+            // The summariser is a blocking model call over the whole
+            // conversation — the one call that can take minutes on a large
+            // session — so it runs on a worker that takes the agent out of the
+            // slot, exactly like `spawn_goal`. Running it inline froze every
+            // window and made `/cancel` untypable.
+            let arg = rest.first().copied().unwrap_or("").trim().to_ascii_lowercase();
+            match arg.as_str() {
+                "status" | "stat" => {
+                    let g = agent_slot.lock().unwrap();
+                    let Some(agent) = g.as_ref() else {
+                        s.push(ConvKind::System, "· agent busy (turn running) — try again when idle");
+                        return;
+                    };
+                    let used = agent.context_tokens() as u64;
+                    let cap = agent.context_budget() as u64;
+                    let pct = if cap > 0 { (used * 100) / cap } else { 0 };
+                    let mut line = format!(
+                        "· context ~{} / {} used ({pct}%) across {} messages",
+                        fmt_tok(used),
+                        fmt_tok(cap),
+                        agent.history_messages()
+                    );
+                    if agent.needs_compaction() {
+                        line.push_str(" — near the cap: /compact to summarise");
+                    }
+                    s.push(ConvKind::System, &line);
+                }
+                "on" | "auto" => {
+                    let mut g = agent_slot.lock().unwrap();
+                    match g.as_mut() {
+                        Some(agent) => {
+                            agent.set_auto_compact(true);
+                            s.push(ConvKind::System, "· auto-compact ON");
+                        }
+                        None => s.push(ConvKind::System, "· agent busy (turn running) — try again when idle"),
+                    }
+                }
+                "off" => {
+                    let mut g = agent_slot.lock().unwrap();
+                    match g.as_mut() {
+                        Some(agent) => {
+                            agent.set_auto_compact(false);
+                            s.push(ConvKind::System, "· auto-compact OFF");
+                        }
+                        None => s.push(ConvKind::System, "· agent busy (turn running) — try again when idle"),
+                    }
+                }
+                "" => {
+                    let busy = {
+                        let g = agent_slot.lock().unwrap();
+                        g.is_none()
+                    };
+                    if busy || s.running {
+                        s.push(ConvKind::System, "· agent busy (turn running) — /compact needs the history, try when idle");
+                        return;
+                    }
+                    let used = {
+                        let g = agent_slot.lock().unwrap();
+                        g.as_ref().map(|a| a.context_tokens()).unwrap_or(0)
+                    };
+                    s.push(
+                        ConvKind::System,
+                        &format!(
+                            "· compacting conversation (~{} est. tokens) — this calls the model, please wait…",
+                            fmt_tok(used as u64)
+                        ),
+                    );
+                    s.running = true;
+                    s.awaiting_input = false;
+                    s.status = running_status(&s, 0);
+                    sync_textview(widgets, &mut s);
+                    spawn_compact(agent_slot);
+                }
+                other => s.push(
+                    ConvKind::Error,
+                    &format!(
+                        "· usage: /compact [status|on|off]   (no arg = summarise now) — got {other:?}"
+                    ),
+                ),
+            }
+            sync_textview(widgets, &mut s);
+        }
+
+        "new-project" => {
+            // Open a project directory: an existing one, or a new one to
+            // create. With a path the launch is immediate; with no argument the
+            // picker opens (pre-filled with this workspace). The same three
+            // guards as the sidebar button and the Session menu item — all of
+            // them reach `open_project` / `open_project_picker`.
+            let path = rest.join(" ");
+            // Take the pane lock back only around the report; the dialog and
+            // any spawn must not run under it.
+            drop(s);
+            if path.trim().is_empty() {
+                open_project_picker(app, state, widgets, full_auto, None);
+            } else {
+                open_project(app, &path, false, state, widgets, full_auto);
+            }
+            return;
         }
         "reload" => {
             // Same in-process refresh as the streaming REPL: catalog +
@@ -5550,21 +6278,36 @@ fn handle_command(
             }
         }
         "model" | "m" => {
+            if rest.is_empty() {
+                // Bare `/model` is the browse. It used to print the current
+                // model and stop, so the only way to change models from the GUI
+                // was to type a selector from memory — while the terminal opened
+                // a picker for the same command. Opens the dialog the
+                // Model → "Pick model…" item runs.
+                let current = {
+                    let g = agent_slot.lock().unwrap();
+                    g.as_ref().map(|a| a.label())
+                };
+                let Some(label) = current else {
+                    s.push(ConvKind::System, "· agent busy (turn running) — try again when idle");
+                    return;
+                };
+                s.push(ConvKind::System, &format!("current model: {label}"));
+                drop(s);
+                open_model_dialog(app, agent_slot, providers, state, widgets);
+                return;
+            }
             let mut g = agent_slot.lock().unwrap();
             let Some(agent) = g.as_mut() else {
                 s.push(ConvKind::System, "· agent busy (turn running) — try again when idle");
                 return;
             };
-            if rest.is_empty() {
-                s.push(ConvKind::System, &format!("current model: {}", agent.label()));
-            } else {
-                match crate::config::select(providers, &rest.join(" ")) {
-                    Ok((p, m)) => match agent.switch(p.clone(), m.clone()) {
-                        Ok(()) => s.push(ConvKind::System, &format!("→ {}", agent.label())),
-                        Err(e) => s.push(ConvKind::Error, &format!("{e}")),
-                    },
+            match crate::config::select(providers, &rest.join(" ")) {
+                Ok((p, m)) => match agent.switch(p.clone(), m.clone()) {
+                    Ok(()) => s.push(ConvKind::System, &format!("→ {}", agent.label())),
                     Err(e) => s.push(ConvKind::Error, &format!("{e}")),
-                }
+                },
+                Err(e) => s.push(ConvKind::Error, &format!("{e}")),
             }
         }
         // NOTE: there is deliberately no `"sessions"` arm here. `/sessions` is
@@ -5846,11 +6589,11 @@ fn handle_command(
             let sub = rest.first().copied().unwrap_or("");
             if sub.trim().is_empty() {
                 drop(s);
-                open_menu_dialog(app, agent_slot, providers, state, widgets, hist_nav);
+                open_menu_dialog(app, agent_slot, providers, sv);
                 return;
             }
             drop(s);
-            run_menu_action(sub, &rest[1..], agent_slot, providers, app, state, widgets, hist_nav);
+            run_menu_action(sub, &rest[1..], agent_slot, providers, app, sv);
             return;
         }
         other => {
@@ -5862,7 +6605,15 @@ fn handle_command(
             };
             match agent.run_registered_command(other, rest.join(" ").trim()) {
                 Some(outcome) => s.push(ConvKind::System, &outcome.content),
-                None => s.push(ConvKind::Error, &format!("unknown command /{other} — try /help")),
+                // "try /help" was the streaming REPL's line, and in this GUI
+                // it pointed at a help text that did not list `/menu`.
+                None => s.push(
+                    ConvKind::Error,
+                    &format!(
+                        "unknown command /{other} — /help lists the GUI's commands \
+                         (unlisted terminal commands run in the streaming REPL: pir --no-tui)"
+                    ),
+                ),
             }
         }
     }
@@ -5899,7 +6650,11 @@ mod gui_completion_tests {
     #[test]
     fn tab_completes_to_common_prefix() {
         assert_eq!(complete_idle("/mod"), Some("/model".to_string()));
-        assert_eq!(complete_idle("/m"), Some("/model".to_string())); // model+models share LCP "model"
+        // `menu`, `model` and `models` share no prefix past `/m`, so `/m` has
+        // no common completion — the same rule that keeps `/markup_demo` out
+        // of the list. `/men` and `/mode` are unambiguous.
+        assert_eq!(complete_idle("/m"), None);
+        assert_eq!(complete_idle("/men"), Some("/menu".to_string()));
     }
 
     #[test]
@@ -6282,10 +7037,10 @@ mod gui_parity_tests {
         // implemented but not completable (the old state, where `/shell` was
         // completable and `/sh` was not) is caught.
         const TUI_COMMANDS: &[&str] = &[
-            "help", "model", "models", "goal", "continue", "clear", "undo",
-            "finished", "fix", "shell", "sh", "bg", "jobs", "thinking", "cancel",
-            "reload", "reexec", "exit", "checkpoints", "rewind", "quarantine",
-            "limits", "skills", "scratchpad",
+            "help", "menu", "model", "models", "goal", "continue", "clear",
+            "undo", "finished", "fix", "shell", "sh", "bg", "jobs", "thinking",
+            "cancel", "reload", "reexec", "exit", "checkpoints", "rewind",
+            "quarantine", "limits", "skills", "scratchpad",
         ];
         let handled = handled_commands();
         for cmd in TUI_COMMANDS {
@@ -6304,6 +7059,69 @@ mod gui_parity_tests {
                 "/{cmd} is handled but missing from the Tab-completion list"
             );
         }
+    }
+
+    /// Every command the GUI implements must be documented in its own `/help`
+    /// text. The failure this pins: `/menu` had a full `handle_command` arm, a
+    /// dialog, and a menu-bar entry for every one of its actions — but no line
+    /// in `HELP_GUI` and no entry in `COMMANDS`. An operator who ran `/help`
+    /// (or tab-completed `/m`) saw a GUI with no menu at all, and the "unknown
+    /// command /menu" a terminal build prints made that conclusion look
+    /// confirmed.
+    #[test]
+    fn every_gui_command_is_documented_in_its_own_help() {
+        let help: &str = HELP_GUI;
+        // A command is documented if its line starts with `/name`, or if that
+        // line names it in parens (`(aliases: /shell; …)`, `(alias: /resources)`).
+        let documented = |cmd: &str| {
+            let pat = format!("/{cmd}");
+            help.lines().any(|l| {
+                let t = l.trim_start();
+                t.starts_with(&pat)
+                    || t.contains(&format!("{pat} ")) && t.contains("alias")
+                    || t.contains(&format!("{pat},"))
+                    || t.contains(&format!("{pat})"))
+            })
+        };
+        // Aliases are documented under the canonical command's line (the same
+        // rule the menu bar follows), so check that line too.
+        let canonical = |cmd: &str| canonical_command(cmd);
+        for cmd in COMMANDS {
+            assert!(
+                documented(cmd) || documented(&canonical(cmd)),
+                "/{cmd} is completable but missing from HELP_GUI"
+            );
+        }
+        for cmd in handled_commands() {
+            // `/sessions` has no `handle_command` arm (see
+            // `every_completable_command_is_actually_handled`), so it is
+            // covered through `COMMANDS` above.
+            if cmd == "sessions" {
+                continue;
+            }
+            assert!(
+                documented(&cmd) || documented(&canonical(&cmd)),
+                "/{cmd} is handled but missing from HELP_GUI"
+            );
+        }
+    }
+
+    /// `/menu` must be discoverable from the two places an operator looks
+    /// without being told: Tab completion and its own `/help`. Both missed it
+    /// while the command worked, which is how it came to read as "unknown
+    /// command /menu".
+    #[test]
+    fn slash_menu_is_offered_by_tab_and_help() {
+        assert!(
+            COMMANDS.contains(&"menu"),
+            "/menu is implemented but Tab completion does not offer it"
+        );
+        assert_eq!(complete_idle("/me").or(complete_idle("/men")), Some("/menu".to_string()));
+        assert_eq!(complete_idle("/men"), Some("/menu".to_string()));
+        assert!(
+            HELP_GUI.lines().any(|l| l.trim_start().starts_with("/menu")),
+            "/help must list /menu — it is the GUI's whole command surface"
+        );
     }
 
     /// `/goal` and `/continue` must not run on the GTK main thread. Both used
@@ -6344,6 +7162,35 @@ mod gui_parity_tests {
             2,
             "both /goal <obj> and /continue must dispatch via spawn_goal()"
         );
+        // `/compact` is the longest single model call a session makes (a whole
+        // transcript in, a summary out), so it carries the same rule: the arm
+        // dispatches to a worker and never calls `agent.compact()` itself, or
+        // the window freezes for the entire summarisation and `/cancel` cannot
+        // even be typed. The GUI previously had no `/compact` at all.
+        assert!(
+            !body.contains(".compact()"),
+            "the /compact arm calls compact() inline, which blocks the GTK main thread — \
+             route it through spawn_compact()"
+        );
+        assert_eq!(
+            body.matches("spawn_compact(").count(),
+            1,
+            "/compact must dispatch via spawn_compact()"
+        );
+    }
+
+    /// `/compact` had no GUI arm, no completion entry and no help line, so a GUI
+    /// session that ran out of context window had no way to recover and the
+    /// agent's own "run /compact" advice named a command the GUI did not have.
+    #[test]
+    fn compact_is_reachable_from_the_gui() {
+        assert!(COMMANDS.contains(&"compact"), "/compact must be tab-completable");
+        assert!(
+            HELP_GUI.contains("/compact "),
+            "HELP_GUI must document /compact"
+        );
+        assert_eq!(complete_idle("/comp"), Some("/compact".to_string()));
+        assert_eq!(complete_idle("/com"), Some("/compact".to_string()));
     }
 }
 
@@ -6724,17 +7571,128 @@ mod gui_design_parity_tests {
 
     #[test]
     fn hint_offers_thinking_levels_then_completion_help() {
-        // T7: a port of the TUI's update_tui_hint (tui.rs:1140), string for
-        // string, so the two front-ends nudge identically.
+        // T7: a port of the TUI's update_tui_hint (tui.rs:1140) for the two
+        // drafts it special-cased. Everything else is derived from the
+        // completion candidates instead (next test).
         assert_eq!(
-            hint_text("/thinking"),
+            hint_text("/thinking", None),
             "[Tab] levels: off | minimal | low | medium | high | xhigh | max · show | hide"
         );
-        assert_eq!(hint_text("/"), "[Tab] completes commands; try /thinking");
-        // Everything else clears the hint.
-        for d in ["", "hello", "/thinking high", "/model x", "  "] {
-            assert_eq!(hint_text(d), "", "draft {d:?} must not show a hint");
+        // `/` is every command: listed (capped), and it says to keep typing.
+        let all = hint_text("/", None);
+        assert!(all.starts_with("[Tab] /help"), "got {all:?}");
+        assert!(all.contains("… +"), "a capped list must say how many are hidden: {all:?}");
+        assert!(all.contains("keep typing to narrow"), "got {all:?}");
+        // Prose and complete lines carry no hint.
+        for d in ["", "hello", "/thinking high", "/model x", "  ", "/sessions"] {
+            assert_eq!(hint_text(d, None), "", "draft {d:?} must not show a hint");
         }
+    }
+
+    /// The report: `/men` completes to `/menu`, and nothing anywhere said which
+    /// completions exist — Tab was silent whether it completed, was ambiguous,
+    /// or matched nothing.
+    #[test]
+    fn a_draft_shows_what_it_can_be_completed_to() {
+        // One candidate: name the completion Tab will produce.
+        assert_eq!(
+            completion_hint("/men", None, true),
+            "[Tab] completes to /menu",
+            "typing /men must say where Tab goes"
+        );
+        // Several: list them all — the GUI's stand-in for the terminal's list
+        // under the prompt.
+        let h = completion_hint("/m", None, true);
+        for c in ["/menu", "/model", "/models"] {
+            assert!(h.contains(c), "{c} missing from the ambiguity list: {h:?}");
+        }
+        assert!(!h.starts_with("[Tab] —"), "a list needs a lead-in: {h:?}");
+        // After Tab: say it could not complete, and still show the list.
+        let h = completion_hint("/m", Some("[Tab] 3 matches"), true);
+        assert!(h.starts_with("[Tab] 3 matches — "), "got {h:?}");
+        assert!(h.contains("/menu"), "the list must survive a failed Tab: {h:?}");
+        // A note with nothing left to offer is still shown (never swallowed).
+        assert_eq!(
+            completion_hint("hello", Some("[Tab] no match"), true),
+            "[Tab] no match"
+        );
+        // An already-complete command is not re-suggested.
+        assert_eq!(completion_hint("/menu", None, true), "");
+        // After a *successful* Tab the note is the whole hint — it must not
+        // then advise the completion it just performed.
+        assert_eq!(
+            completion_hint("/men", Some("[Tab] completed to /menu"), true),
+            "[Tab] completed to /menu"
+        );
+        // A sub-argument list shows the arguments, not the command again.
+        let think = completion_hint("/thinking ", None, true);
+        assert!(think.contains("off") && think.contains("minimal"), "got {think:?}");
+        assert!(!think.contains("/thinking off"), "the command repeats on every entry: {think:?}");
+    }
+
+    /// The live path, on real widgets: the Entry's text is what the hint is
+    /// derived from, so typing `/men` must put "completes to /menu" in the hint
+    /// label *through the same code the drain runs*, and pressing Tab must then
+    /// report what it did. The pure tests above cannot catch the hint being
+    /// wired to the wrong widget, or the draft mirror never seeing the text.
+    ///
+    /// Skips without a display, like every display-backed test here.
+    #[test]
+    fn typing_a_prefix_paints_the_completion_hint() {
+        let Some((app, _guard)) = gtk_test_app() else { return };
+        let entry = app.create_entry().expect("create_entry");
+        let status = app.create_label("x").expect("create_label");
+        let hint = app.create_label("").expect("create_label");
+        let tv = app.create_textview().expect("create_textview");
+        let scroller = app.create_scrolled_window().expect("create_scrolled_window");
+        let widgets = GuiWidgets { textview: tv, status, scroller, hint: hint.clone() };
+        let mut s = GuiState::new();
+
+        entry.set_text("/men");
+        // Exactly what the drain does with the Entry's text.
+        s.draft = entry.get_text().unwrap_or_default();
+        let shown = hint_text(&s.draft, s.tab_note.as_deref());
+        hint.set_markup(&status_markup(&shown));
+        assert_eq!(
+            hint.get_text().as_deref(),
+            Some("[Tab] completes to /menu"),
+            "typing /men must say where Tab goes"
+        );
+
+        // Tab could not decide on a shorter prefix: the note carries it.
+        s.tab_note = Some("[Tab] 3 matches".to_string());
+        let shown = hint_text(&s.draft, s.tab_note.as_deref());
+        hint.set_markup(&status_markup(&shown));
+        assert!(
+            hint.get_text().unwrap_or_default().starts_with("[Tab] 3 matches"),
+            "got {:?}",
+            hint.get_text()
+        );
+    }
+
+    /// The list the hint shows and the string Tab produces must come from the
+    /// same match set — otherwise the hint could advertise a command Tab
+    /// refuses, or hide one Tab would take.
+    #[test]
+    fn the_completion_list_is_exactly_what_tab_matches() {
+        let frags = ["", "/", "/m", "/men", "/mo", "/mode", "/models", "/th", "/thinking l", "/zzz", "hello"];
+        for f in frags {
+            let cands = completion_candidates(f);
+            // Whatever Tab completes to must be IN that list (or the list must
+            // be empty, meaning Tab has nothing to do).
+            match complete_idle(f) {
+                Some(done) => assert!(
+                    cands.iter().any(|c| c.starts_with(&done) || *c == done),
+                    "Tab completes {f:?} to {done:?}, which the hint does not list: {cands:?}"
+                ),
+                None => assert!(
+                    cands.len() != 1,
+                    "Tab refuses {f:?} but the hint names exactly one candidate {cands:?}"
+                ),
+            }
+        }
+        // And the specific report: `/men` -> one candidate, `/menu`.
+        assert_eq!(completion_candidates("/men"), vec!["/menu".to_string()]);
     }
 
     // -- T8: the done-placeholder -------------------------------------------
@@ -7265,6 +8223,38 @@ mod gui_design_parity_tests {
         assert_eq!(super::lookup_link(&[], 6), None, "no spans must miss");
     }
 
+    #[test]
+    fn link_spans_resolve_against_nwg_plain_line_text() {
+        // G6 (NWG): the Windows pane inserts `set_markup(line_markup(line))`,
+        // whose text is the markup with tags and entities stripped. Spans must
+        // resolve against THAT string, not the markup: a span computed on
+        // `<span foreground="#4ec9b0">· </span>see [docs](https://x.example/a)`
+        // would sit hundreds of columns off. The strip rule is mirrored here
+        // (same tag/entity grammar the adapter's `plain_line` implements) so
+        // the contract is pinned on Linux CI too, where the NWG adapter is not
+        // compiled.
+        let line = ConvLine {
+            kind: ConvKind::System,
+            text: "see [docs](https://x.example/a) & more".to_string(),
+        };
+        let markup = line_markup(&line);
+        let inserted = crate::md::pango_visible_text(&markup);
+        assert!(!inserted.contains('<'), "tags must be gone: {inserted:?}");
+        assert!(inserted.contains("& more"), "entities must be decoded: {inserted:?}");
+        let pairs = record_link_pairs(&line.text);
+        let spans = resolve_link_spans(&inserted, &pairs);
+        assert_eq!(spans.len(), 1, "got: {spans:?}");
+        let (line_no, scol, ecol, _url) = &spans[0];
+        // `\u{b7} ` (2 chars) + `see ` (4) + `[` (1) => `docs` starts at char 7,
+        // and is 4 chars wide. Columns are CHARS, not bytes: the `\u{b7}`
+        // prefix glyph is two bytes, so byte maths would put every span one
+        // column too far right — which is exactly the bug this pins.
+        assert_eq!((*line_no, *scol, *ecol), (0, 7, 11), "got: {spans:?}");
+        let hit: Vec<(u32, u32, String)> =
+            spans.iter().map(|(_, s, e, u)| (*s, *e, u.clone())).collect();
+        assert_eq!(lookup_link(&hit, *scol), Some("https://x.example/a"));
+    }
+
     // ================================================================
     // Layer 2 — source-level guards
     // ================================================================
@@ -7340,6 +8330,79 @@ mod gui_design_parity_tests {
     }
 
     #[test]
+    fn windows_sync_builds_link_spans_from_the_inserted_text() {
+        // G6 (NWG): the Windows `sync_textview` must record a span entry per
+        // inserted line, resolved against the markup-stripped text the EDIT
+        // control receives (`TextView::plain_line`), or `connect_link_clicks`
+        // has no map to look a click up in and links silently stop working.
+        let src = include_str!("gui.rs");
+        let start = src
+            .find("#[cfg(windows)]\nfn sync_textview(")
+            .expect("the Windows sync_textview definition not found")
+            + 1;
+        let body = src[start..]
+            .split("\n/// One row of the GUI's main menu")
+            .next()
+            .expect("the Windows sync_textview body not found");
+        assert!(
+            body.contains("plain_line("),
+            "the Windows sync must strip exactly as `set_markup` does (TextView::plain_line)"
+        );
+        assert!(
+            body.contains("buf_links.push("),
+            "the Windows sync must push one span entry per inserted line"
+        );
+        assert!(
+            body.contains("set_text(\"\")") && body.contains("buf_links.clear()"),
+            "a rebuild replaces the buffer, so it must clear the span map too"
+        );
+    }
+
+    #[test]
+    fn windows_click_handler_guards_like_the_gtk_one() {
+        // G6 (NWG): same guards as the GTK handler, in the same order — a
+        // release ending a selection is a copy gesture, and the position must
+        // land inside a recorded span before anything is opened. The two
+        // backends must not disagree about what a click means.
+        let src = include_str!("gui.rs");
+        let start = src
+            .find("#[cfg(windows)]\nfn connect_link_clicks(")
+            .expect("the Windows connect_link_clicks definition not found")
+            + 1;
+        let body = src[start..]
+            .split("\n/// Read a `ScrolledWindow`")
+            .next()
+            .expect("the Windows connect_link_clicks body not found");
+        let sel = body
+            .find("buffer_has_selection()")
+            .expect("the Windows click handler must guard on buffer_has_selection()");
+        let hit = body
+            .find("char_index_at(")
+            .expect("the Windows click handler must hit-test with char_index_at()");
+        let map = body
+            .find("buf_links")
+            .expect("the Windows click handler must consult the buf_links span map");
+        assert!(
+            sel < hit && hit < map,
+            "order must be: selection guard, hit-test, span lookup (got {sel} {hit} {map})"
+        );
+        // And the opener must be the same policy: re-validated, http/https only.
+        let opener = src
+            .find("#[cfg(windows)]\nfn open_link_safely(")
+            .expect("the Windows open_link_safely definition not found")
+            + 1;
+        let opener_body = &src[opener..];
+        let opener_body = opener_body
+            .split("\n/// Wire link clicks on")
+            .next()
+            .unwrap_or(opener_body);
+        assert!(
+            opener_body.contains("sanitize_url") && opener_body.contains("open_url("),
+            "the Windows opener must re-validate and call the adapter's open_url"
+        );
+    }
+
+    #[test]
     fn click_handler_checks_selection_before_opening() {
         // G6: a button release that ends a text selection is a copy gesture,
         // never a link activation — selecting link text must not launch a
@@ -7364,6 +8427,67 @@ mod gui_design_parity_tests {
             sel < map,
             "the selection guard must come before the span-map lookup, or a \
              drag-release over a link opens it mid-copy"
+        );
+    }
+
+    // ================================================================
+    // Layer 1/2 — G7: New Project
+    // ================================================================
+
+    #[test]
+    fn new_project_is_reachable_from_button_menu_and_command() {
+        // G7: one action, three ways in (the sidebar button, the Session menu,
+        // and `/new-project <dir>`) — the same rule every other GUI action
+        // follows. The menu item must route through `handle_command` like every
+        // other entry, so the menu and the typed line cannot diverge.
+        assert!(
+            COMMANDS.contains(&"new-project"),
+            "/new-project must be Tab-completable, or the command is undiscoverable"
+        );
+        let item = MENU_ACTIONS
+            .iter()
+            .find(|a| a.command == "new-project")
+            .expect("the Session menu must offer New project");
+        assert!(
+            item.label.to_lowercase().contains("project"),
+            "the menu label must say what it does: {:?}",
+            item.label
+        );
+        // The sidebar button: the label is the operator-facing entry point.
+        let src = include_str!("gui.rs");
+        assert!(
+            src.contains("create_button(\"New Project\")"),
+            "the sidebar must carry a literal `New Project` button"
+        );
+    }
+
+    #[test]
+    fn project_launch_detaches_and_never_moves_this_process() {
+        // G7: the launcher starts a *new* process in the chosen directory.
+        // It must not `set_current_dir` this process (that would repoint every
+        // open tab, since the Agent, Registry, session log and workspace label
+        // all read the process cwd), and it must detach with `setsid` — never
+        // `process_group(0)`, which makes the child a group leader and can leave
+        // it able to grab pir's terminal.
+        let src = include_str!("project_launch.rs");
+        assert!(
+            !src.contains("set_current_dir"),
+            "the launcher must not change this process's cwd — open a new process instead"
+        );
+        assert!(
+            src.contains("current_dir(dir)"),
+            "the child must run in the chosen directory"
+        );
+        assert!(
+            src.contains("libc::setsid()"),
+            "the child must detach with setsid()"
+        );
+        // Match the call form, not the bare name: the module doc explains why
+        // `process_group(0)` is avoided, so a bare-substring check would match
+        // its own rationale.
+        assert!(
+            !src.contains(".process_group("),
+            "setsid, not process_group(0): a group leader can still grab the terminal"
         );
     }
 
@@ -7530,6 +8654,17 @@ mod gui_design_parity_tests {
     }
 
     #[test]
+    fn the_sidebar_carries_a_new_project_button() {
+        // G7 (display): the button must exist as a real widget with the exact
+        // operator-facing label. It is the discoverable entry point for the
+        // whole New Project feature, so a rename or a wiring regression should
+        // fail here rather than as a "the button disappeared" report.
+        let Some((app, _guard)) = try_app() else { return };
+        let Ok(btn) = app.create_button("New Project") else { return };
+        assert_eq!(btn.get_text().as_deref(), Some("New Project"));
+    }
+
+    #[test]
     fn the_conversation_pane_and_status_bar_are_readable() {
         // S7/T1 (display): after a sync, the TextView actually contains the
         // model's text and the status label actually contains the status.
@@ -7682,15 +8817,49 @@ mod markup_demo_tests {
             got.contains("┌──────────┬──────────┬─────────┐"),
             "the table must render as a box-drawing grid, not raw `|` rows: {got:?}"
         );
+        // Alignment: every grid line carries the SAME assistant prefix, so the
+        // borders and the rows beneath them start in the same column. Emitting
+        // the prefix once per block (the old bug) shifted only the top border.
+        // Only box-drawing lines count — a blockquote also uses `│` but is not
+        // part of the grid (it has no second grid char on the line).
+        let is_grid_line = |l: &str| {
+            let t = l.trim_start();
+            t.starts_with(['┌', '├', '└'])
+                || (t.starts_with('│') && t.chars().skip(1).any(|c| c == '│' || c == '┐'))
+        };
+        let table: Vec<&str> = got.lines().filter(|l| is_grid_line(l)).collect();
+        assert_eq!(table.len(), 6, "the whole grid must be present: {got:?}");
+        let col_of = |l: &str| l.find(['┌', '├', '└', '│']).unwrap_or(0);
+        let col = table.iter().map(|l| col_of(l)).max().unwrap_or(0);
+        for l in &table {
+            assert_eq!(
+                col_of(l),
+                col,
+                "every table line must start in the same column (got {l:?}, expected col {col}): {got:?}"
+            );
+        }
         assert!(
             !got.lines().any(|l| l.trim_start().starts_with("| Language")),
             "no raw markdown table row may survive into the pane: {got:?}"
         );
-        assert_eq!(
+        // The write cursor deliberately parks on the trailing block (see
+        // `live_boundary`), repainted whole on the next sync — so a finished
+        // drain may leave at most that one block unmarked. What must hold is
+        // that the cursor never runs past the model and that nothing is
+        // painted twice (each table line appears exactly once).
+        assert!(
+            s.rendered <= s.conv.len(),
+            "the cursor must never pass the model: {} > {}",
             s.rendered,
-            s.conv.len(),
-            "a finished drain must leave nothing unpainted"
+            s.conv.len()
         );
+        for needle in ["│ Rust     │", "│ JS       │", "┌──────────┬──────────┬─────────┐"] {
+            assert_eq!(
+                got.matches(needle).count(),
+                1,
+                "each grid line must be painted exactly once ({needle:?}): {got:?}"
+            );
+        }
     }
 
     #[test]
@@ -7704,8 +8873,10 @@ mod markup_demo_tests {
         drain_session_text(&jsonl_assistant_line(crate::MARKUP_DEMO), &mut s);
         sync_textview(&w, &mut s);
         let got = tv.get_text().unwrap_or_default();
+        // Three fenced blocks (rust/js/json); the opening fence carries its
+        // language (` ```rust `), so only the closing fences are bare.
         let fences = got.lines().filter(|l| l.trim() == "```").count();
-        assert_eq!(fences, 6, "one closing fence per fenced block (rust/js/json): {got:?}");
+        assert_eq!(fences, 3, "one closing fence per fenced block (rust/js/json): {got:?}");
         // Indentation inside the fence survives (the block is not re-wrapped
         // line by line), and the opening brace is part of the code block.
         assert!(got.contains("fn main() {"), "the block's first line must render: {got:?}");
@@ -7741,20 +8912,34 @@ mod markup_demo_tests {
     fn a_streaming_block_is_not_painted_twice() {
         // The model grows one drained line at a time; a block is only whole
         // once its blank-line terminator arrives. Until then the live sync must
-        // show the block exactly once — not a partial copy per drain tick.
+        // show each block exactly once — not a partial copy per drain tick.
+        //
+        // "Exactly once" only means anything for text that has ALREADY
+        // streamed: on the first iteration only `## Heading` exists, so
+        // asserting `After.` is present then is unsatisfiable by any
+        // implementation (the old version of this test did, and failed on
+        // iteration 1 for that reason alone).
         let Some((_app, tv, w, _guard)) = pane() else { return };
         let raw = "## Heading\n\n- one\n- two\n\nAfter.";
         let mut s = GuiState::new();
+        let mut streamed: Vec<&str> = Vec::new();
         for line in raw.split('\n') {
             s.push(ConvKind::Assistant, line);
+            streamed.push(line);
             sync_textview(&w, &mut s);
             let got = tv.get_text().unwrap_or_default();
-            assert_eq!(
-                got.matches("After.").count(),
-                1,
-                "the trailing block must be painted once, got {got:?}"
-            );
-            assert_eq!(got.matches("- one").count(), 1, "got {got:?}");
+            // Anything already streamed and non-blank must appear exactly once —
+            // no duplicate, no partial-then-whole double paint.
+            for needle in ["Heading", "- one", "- two", "After."] {
+                if !streamed.iter().any(|l| l.contains(needle)) {
+                    continue;
+                }
+                assert_eq!(
+                    got.matches(needle).count(),
+                    1,
+                    "'{needle}' streamed already and must be painted exactly once, got {got:?}"
+                );
+            }
         }
         // And the finished document is complete: the list rendered, the
         // paragraph after it rendered.
@@ -7786,18 +8971,38 @@ mod gui_menu_tests {
         Some((app, tv, w, guard))
     }
 
+    /// A `SessionView` over a fresh pane and no agent: enough for the read-only
+    /// menu rows (about/help), which only touch the pane. The window is a real
+    /// (unpresented) one because the struct carries it; those rows never use it.
+    fn menu_view(app: &App, w: &GuiWidgets) -> (SessionView, AgentSlot) {
+        let slot: AgentSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let state = std::sync::Arc::new(std::sync::Mutex::new(GuiState::new()));
+        let (done_tx, _done_rx) = smol::channel::bounded::<()>(1);
+        let sv = SessionView {
+            state,
+            widgets: w.clone(),
+            entry: app.create_entry().expect("create_entry"),
+            window: app.create_window().expect("create_window"),
+            agent_slot: slot.clone(),
+            fg_cancel: Arc::new(AtomicBool::new(false)),
+            fg_quiet: Arc::new(AtomicBool::new(false)),
+            hist_nav: std::sync::Arc::new(std::sync::Mutex::new(HistoryNav::default())),
+            done_tx,
+            app: app.clone(),
+        };
+        (sv, slot)
+    }
+
     #[test]
     fn menu_about_and_help_paint_into_the_pane() {
         // `/menu about` and `/menu help` are read-only: they must paint into
         // the pane without an agent and without a display failure.
-        let Some((_app, tv, w, _guard)) = menu_pane() else { return };
-        let slot: AgentSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let state = std::sync::Arc::new(std::sync::Mutex::new(GuiState::new()));
-        let app2 = _app.clone();
-        let hn = std::sync::Arc::new(std::sync::Mutex::new(HistoryNav::default()));
-        run_menu_action("about", &[], &slot, &[], &app2, &state, &w, &hn);
-        run_menu_action("help", &[], &slot, &[], &app2, &state, &w, &hn);
-        sync_textview(&w, &mut state.lock().unwrap());
+        let Some((app, tv, w, _guard)) = menu_pane() else { return };
+        let (sv, slot) = menu_view(&app, &w);
+        let app2 = app.clone();
+        run_menu_action("about", &[], &slot, &[], &app2, &sv);
+        run_menu_action("help", &[], &slot, &[], &app2, &sv);
+        sync_textview(&w, &mut sv.state.lock().unwrap());
         let got = tv.get_text().unwrap_or_default();
         assert!(got.contains("pir ") && got.contains("license: GPL-3.0"), "about must print version + license: {got:?}");
         assert!(got.contains("/sessions"), "help must print the command list: {got:?}");
@@ -7808,13 +9013,11 @@ mod gui_menu_tests {
         // A typo'd subcommand (`/menu frobnicate`, or a stale topbar arg)
         // must be a pane error listing the valid subs — never a panic, never
         // silent.
-        let Some((_app, tv, w, _guard)) = menu_pane() else { return };
-        let slot: AgentSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let state = std::sync::Arc::new(std::sync::Mutex::new(GuiState::new()));
-        let app2 = _app.clone();
-        let hn = std::sync::Arc::new(std::sync::Mutex::new(HistoryNav::default()));
-        run_menu_action("frobnicate", &[], &slot, &[], &app2, &state, &w, &hn);
-        sync_textview(&w, &mut state.lock().unwrap());
+        let Some((app, tv, w, _guard)) = menu_pane() else { return };
+        let (sv, slot) = menu_view(&app, &w);
+        let app2 = app.clone();
+        run_menu_action("frobnicate", &[], &slot, &[], &app2, &sv);
+        sync_textview(&w, &mut sv.state.lock().unwrap());
         let got = tv.get_text().unwrap_or_default();
         assert!(got.contains("unknown menu action"), "got: {got:?}");
         assert!(got.contains("resume"), "the error must list valid subs: {got:?}");
@@ -7864,30 +9067,43 @@ mod gui_menu_tests {
 
     #[test]
     fn every_menu_action_has_a_topbar_entry() {
-        // G7: each /menu subcommand must be reachable from the topbar, not
-        // just the dialog. "help" and "quit" are covered by the pre-existing
-        // help-commands (/help) and help-quit (/exit) items; every other sub
-        // needs its own `command: "menu", arg: "<sub>"` entry, which routes
-        // `/menu <sub>` through the same `run_command_line` a typed line
-        // takes. A menu item that points nowhere is worse than no menu.
+        // The operator's report — "there isn't really an equivalent to all the
+        // /menu options in topbar" — pinned where it is checkable: the `/menu`
+        // strip must be built from `MENU_DIALOG_ACTIONS`, in order, and run the
+        // shared dispatcher. Building the strip needs a presented window, but
+        // the property is structural (which table the loop walks), so reading
+        // the source is a faithful check of what the UI does.
+        let src = include_str!("gui.rs");
+        let start = src
+            .find("\nfn build_menu_strip(")
+            .expect("build_menu_strip not found in gui.rs")
+            + 1;
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").expect("build_menu_strip body")];
+        assert!(
+            body.contains("for (sub, label) in MENU_DIALOG_ACTIONS"),
+            "the /menu strip must be built from MENU_DIALOG_ACTIONS, not a \n\
+             hand-kept copy of it — that copy is what drifts"
+        );
+        assert!(
+            body.contains("run_menu_action("),
+            "a strip item must run run_menu_action, the same path as /menu <sub>"
+        );
+        // And it is part of the window, not merely constructed.
+        assert!(
+            src.contains("build_menu_strip(&app, &sessions, &tabs, providers, agent_slot)"),
+            "the /menu strip is never added to the window"
+        );
+        // The menu bar keeps the categorised view of the same commands, so the
+        // whole menu must stay reachable there as well.
         let args: Vec<&str> = MENU_ACTIONS
             .iter()
             .filter(|a| a.command == "menu")
             .map(|a| a.arg)
             .collect();
-        for (sub, _) in MENU_DIALOG_ACTIONS {
-            if *sub == "help" || *sub == "quit" {
-                continue;
-            }
-            assert!(
-                args.contains(sub),
-                "no topbar item routes to /menu {sub}: {args:?}"
-            );
-        }
-        // The dialog itself is topbar-reachable too (Help → Menu…).
         assert!(
             args.contains(&""),
-            "no topbar item opens the whole menu dialog: {args:?}"
+            "no menu-bar item opens the whole menu dialog: {args:?}"
         );
         assert!(
             MENU_ACTIONS.iter().any(|a| a.command == "help"),

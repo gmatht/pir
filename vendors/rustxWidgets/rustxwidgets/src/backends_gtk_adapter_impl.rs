@@ -1206,6 +1206,22 @@ mod gtk_adapter {
         Ok(None)
     }
 
+    /// Opens a folder chooser and returns the selected directory.
+    ///
+    /// The GUI's "New Project" button uses this to pick a workspace. Same
+    /// result convention as `open_file`: `Ok(None)` means the operator
+    /// cancelled (or the host has no folder action), never an error.
+    pub fn select_folder(title: &str) -> Result<Option<String>, Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+        if let Ok(chooser) = unsafe { gtk_dynamic_loader::FileChooserNative::select_folder(loader.clone(), title, std::ptr::null_mut()) } {
+            if chooser.run() == -3 {
+                return Ok(chooser.get_filename());
+            }
+        }
+        Ok(None)
+    }
+
     /// Opens a file save dialog and returns the selected file path.
     pub fn save_file(title: &str) -> Result<Option<String>, Error> {
         let loader = crate::backends::gtk::loader()

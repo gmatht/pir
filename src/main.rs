@@ -22,6 +22,7 @@ mod picker;
 mod plans;
 mod plugin;
 mod project;
+mod project_launch;
 mod provider;
 mod notify_coalesce;
 mod retention;
@@ -4504,6 +4505,57 @@ fn handle_command(
                     "  knobs: PIR_RESOURCE_MEMORY_MIB, PIR_RESOURCE_PIDS, PIR_CGROUP=0 disables"
                 )
             );
+        }
+        "new-project" => {
+            // `/new-project <dir>` — open a project directory in a new pir
+            // process (the same rules as the GUI's New Project button: an
+            // existing directory opens, a missing one is created only after an
+            // explicit confirmation). The child is detached, so this REPL stays
+            // where it is; the GUI variant additionally offers a folder picker,
+            // which a terminal command has no equivalent for.
+            let typed = rest.join(" ");
+            let typed = typed.trim();
+            if typed.is_empty() {
+                println!(
+                    "{}",
+                    term::dim("· usage: /new-project <directory>   (an existing one, or a new path to create)")
+                );
+                return;
+            }
+            let dir = match crate::project_launch::target(typed, false) {
+                Ok(dir) => Some(dir),
+                Err(_) => {
+                    print!("{typed} does not exist — create it? [y/N] ");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    let mut ans = String::new();
+                    let _ = std::io::stdin().read_line(&mut ans);
+                    if matches!(ans.trim(), "y" | "Y" | "yes") {
+                        match crate::project_launch::target(typed, true) {
+                            Ok(dir) => {
+                                println!("{}", term::dim(&format!("· created {}", dir.display())));
+                                Some(dir)
+                            }
+                            Err(e) => {
+                                eprintln!("pir: {e}");
+                                None
+                            }
+                        }
+                    } else {
+                        println!("{}", term::dim("· cancelled"));
+                        None
+                    }
+                }
+            };
+            if let Some(dir) = dir {
+                match crate::project_launch::launch(&dir, false) {
+                    Ok(pid) => println!(
+                        "{} opening project {} in a new window (pid {pid})",
+                        term::cyan("·"),
+                        dir.display()
+                    ),
+                    Err(e) => eprintln!("pir: {e}"),
+                }
+            }
         }
         "scratchpad" | "scratch" => {
             // `/scratchpad` — show (and optionally open) the per-session scratch

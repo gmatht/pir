@@ -2477,6 +2477,28 @@ mod nwg_adapter {
         }
     }
 
+    /// Folder chooser (the GUI's "New Project"). `Ok(None)` = cancelled.
+    ///
+    /// NWG's `FileDialogAction::OpenDirectory` maps to the Win32 pick-folder
+    /// dialog, which returns the chosen directory as the "selected item".
+    pub fn select_folder(title: &str, parent: *mut c_void) -> Result<Option<String>, Error> {
+        let mut dialog = nwg::FileDialog::default();
+        nwg::FileDialog::builder()
+            .title(title)
+            .action(nwg::FileDialogAction::OpenDirectory)
+            .build(&mut dialog)
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+        let parent_handle = nwg::ControlHandle::Hwnd(parent as _);
+        if dialog.run(Some(&parent_handle)) {
+            match dialog.get_selected_item() {
+                Ok(path) => Ok(Some(path.to_string_lossy().into_owned())),
+                Err(_) => Ok(None),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn save_file(title: &str, parent: *mut c_void) -> Result<Option<String>, Error> {
         let mut dialog = nwg::FileDialog::default();
         nwg::FileDialog::builder()
