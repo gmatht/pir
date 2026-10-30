@@ -45,6 +45,8 @@ mod modal;
 mod model_history;
 mod security;
 mod titler;
+#[cfg(windows)]
+mod winhttp;
 mod wininfo;
 mod zellij;
 #[cfg(feature = "tui")]
@@ -1183,17 +1185,35 @@ fn main() {
     let explicit = model_sel.is_some();
     let selector = model_sel
         .or(pre_drop_selector)
-        .unwrap_or_else(|| providers[0].label(&providers[0].models[0]));
+        .unwrap_or_else(|| first_keyed_label(&providers).unwrap_or_else(|| providers[0].label(&providers[0].models[0])));
 
     let (provider, model) = match config::select(&providers, &selector) {
-        Ok(x) => x,
+        Ok((p, m)) => (p.clone(), m.clone()),
         Err(e) if explicit => die(&format!("{e}\n{}", list_models(&providers))),
         Err(e) => {
-            let fb = providers[0].label(&providers[0].models[0]);
-            eprintln!("pir: {e}; falling back to {fb}");
-            match config::select(&providers, &fb) {
-                Ok(x) => x,
-                Err(e2) => die(&format!("{e2}\n{}", list_models(&providers))),
+            // The saved default may name a model that moved providers (e.g. a
+            // catalog refresh moved `kimi-k2.6` out of `opencode-go` while the
+            // settings still say `opencode-go/kimi-k2.6`). Before falling back,
+            // retry the bare model id across the whole catalog — it often
+            // lives under a sibling provider with the same key.
+            let cross: Option<(Provider, crate::config::Model)> = selector
+                .split_once('/')
+                .and_then(|(_, mid)| config::select(&providers, mid.trim()).ok())
+                .map(|(p, m)| (p.clone(), m.clone()));
+            if let Some((p, m)) = cross {
+                eprintln!(
+                    "pir: {e}; found it under '{}' instead — using {}",
+                    p.pid(),
+                    p.label(&m)
+                );
+                (p, m)
+            } else {
+                let fb = first_keyed_label(&providers).unwrap_or_else(|| providers[0].label(&providers[0].models[0]));
+                eprintln!("pir: {e}; falling back to {fb}");
+                match config::select(&providers, &fb) {
+                    Ok((p, m)) => (p.clone(), m.clone()),
+                    Err(e2) => die(&format!("{e2}\n{}", list_models(&providers))),
+                }
             }
         }
     };
@@ -1307,7 +1327,26 @@ fn main() {
         typeahead.clone(),
     ) {
         Ok(a) => a,
-        Err(e) => die(&e),
+        // `make_client` fails when the resolved provider has no usable key
+        // (fresh deploy: no local auth.json and nothing embedded for it).
+        // Say what's actually wrong and how to fix it instead of printing the
+        // bare per-provider error, which reads like a bug rather than setup.
+        Err(e) => {
+            let keyed: Vec<String> = providers
+                .iter()
+                .filter(|p| !p.models.is_empty() && p.api_key().is_some_and(|k| !k.is_empty()))
+                .map(|p| p.pid().to_string())
+                .collect();
+            if keyed.is_empty() {
+                die(&format!(
+                    "{e}\nno provider has an API key — add one with `/login PROVIDER KEY` or \
+                     put it in {} ({{\"provider\": {{\"type\": \"api_key\", \"key\": \"...\"}}}})",
+                    config::pi_dir().join("agent").join("auth.json").display()
+                ));
+            } else {
+                die(&format!("{e}\nproviders with keys: {}", keyed.join(", ")));
+            }
+        }
     };
     // The session model counts as used (it is what every turn runs on),
     // seeding `/model` history from the very first launch.
@@ -3042,6 +3081,20 @@ fn parse_login_args(rest: &[&str]) -> (String, Option<String>, Option<String>) {
     (provider, key, model)
 }
 
+/// First `provider/model` label in the catalog whose provider has an API key
+/// (literal or `{env:VAR}` with the var set). Startup falls back to this
+/// instead of blindly taking `providers[0]`: on a fresh deploy the first
+/// catalog entry often has no key, and falling back to it only trades a
+/// "no model matches" warning for a fatal "no API key" exit one step later.
+/// Returns `None` when NO provider has a key, so the caller can say so
+/// plainly instead of dying on a misleading per-provider message.
+fn first_keyed_label(providers: &[Provider]) -> Option<String> {
+    providers
+        .iter()
+        .find(|p| !p.models.is_empty() && p.api_key().is_some_and(|k| !k.is_empty()))
+        .map(|p| p.label(&p.models[0]))
+}
+
 /// Resolve the model named by `/login PROVIDER KEY MODEL`.
 ///
 /// `config::select` already understands `provider/model`, a bare model id, a
@@ -4425,13 +4478,18 @@ fn handle_command(
             if was_raw {
                 term::raw::disable_raw();
             }
+            let started = std::time::Instant::now();
             let status = run_shell(args);
+            let took = crate::term::fmt_cmd_elapsed(started.elapsed());
             if was_raw {
                 term::raw::enable_raw();
             }
+            // Same `Elapsed …` readout as the bash tool, below the result.
             if let Some(code) = status {
                 if code != 0 {
-                    eprintln!("pir: shell exited with status {}", code);
+                    eprintln!("pir: shell exited with status {} (Elapsed {})", code, took);
+                } else {
+                    eprintln!("pir: Elapsed {}", took);
                 }
             } else {
                 eprintln!("pir: could not start shell");
@@ -4451,6 +4509,7 @@ fn handle_command(
             if was_raw {
                 term::raw::disable_raw();
             }
+            let started = std::time::Instant::now();
             #[cfg(unix)]
             let status = match resolve_shell() {
                 Some((shell, _)) => crate::user::spawn_shell_as(&shell, &args, None),
@@ -4463,7 +4522,9 @@ fn handle_command(
             }
             if let Some(code) = status {
                 if code != 0 {
-                    eprintln!("pir: shell exited with status {code}");
+                    eprintln!("pir: shell exited with status {code} (Elapsed {})", crate::term::fmt_cmd_elapsed(started.elapsed()));
+                } else {
+                    eprintln!("pir: Elapsed {}", crate::term::fmt_cmd_elapsed(started.elapsed()));
                 }
             } else {
                 eprintln!("pir: could not start shell");
@@ -7055,7 +7116,7 @@ mod model_command_wiring_tests {
 
 #[cfg(test)]
 mod login_command_tests {
-    use super::{parse_login_args, resolve_login_model};
+    use super::{first_keyed_label, parse_login_args, resolve_login_model};
 
     /// `/login PROVIDER KEY` and `/login PROVIDER KEY MODEL` are the two shapes
     /// the operator asked for; the third (`/login PROVIDER`) must still leave
@@ -7067,6 +7128,31 @@ mod login_command_tests {
         assert_eq!(p, "openrouter");
         assert_eq!(k.as_deref(), Some("sk-or-abc123"), "the inline key is carried, not prompted for");
         assert_eq!(m, None, "no model given => None, so the provider's first model is used");
+    }
+
+    /// Startup fallback skips keyless providers: a fresh deploy whose first
+    /// catalog entry has no key must not trade "no model matches" for a fatal
+    /// "no API key" one step later.
+    #[test]
+    fn first_keyed_label_skips_keyless_providers() {
+        let mut no_key = provider("keyless", &["m1"]);
+        no_key.api_key = None;
+        let mut keyed = provider("keyed", &["m2"]);
+        keyed.api_key = Some("sk-live".to_string());
+        assert_eq!(
+            first_keyed_label(&[no_key, keyed]).as_deref(),
+            Some("keyed/m2"),
+            "the keyless first provider must be skipped"
+        );
+    }
+
+    /// Nobody has a key: `None`, so startup can say "add a key" instead of
+    /// dying on a misleading per-provider message.
+    #[test]
+    fn first_keyed_label_is_none_when_nobody_has_a_key() {
+        let mut a = provider("a", &["m1"]);
+        a.api_key = None;
+        assert_eq!(first_keyed_label(&[a]), None);
     }
 
     #[test]

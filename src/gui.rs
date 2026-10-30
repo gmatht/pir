@@ -695,6 +695,7 @@ struct BackgroundTurn {
 /// filling with a runaway `cat` of a huge file, matching how tool output is
 /// echoed everywhere else.
 fn run_shell_guarded(cmdline: &str) -> Result<String, String> {
+    let started = std::time::Instant::now();
     let out = std::process::Command::new("sh")
         .arg("-c")
         .arg(cmdline)
@@ -719,6 +720,11 @@ fn run_shell_guarded(cmdline: &str) -> Result<String, String> {
             text.push_str(&format!("\n(exit {code})"));
         }
     }
+    // Wall time below the output, same `Elapsed …` readout as the bash tool.
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(&format!("Elapsed {}", crate::term::fmt_cmd_elapsed(started.elapsed())));
     Ok(text)
 }
 
@@ -1499,6 +1505,17 @@ struct SidebarRow {
     #[allow(dead_code)]
     is_group: bool,
     button: GuiButton,
+    /// The status icon at the left of a session row (`▶` running, `●` stopped
+    /// unseen, `○` stopped seen — see [`crate::session_tree::TreeStatus`]).
+    /// `None` for group headers, which carry no status. A separate label
+    /// rather than a glyph inside the button text so the icon can be coloured
+    /// (Pango markup) while the title stays plain text.
+    icon: Option<GuiLabel>,
+    /// Horizontal container holding `[icon][button]` side by side. `None`
+    /// for group headers (bare button). Without this the icon and button
+    /// are siblings in the vertical `rows_box`, so the icon stacks *above*
+    /// the button; the row box keeps them on one line with the icon left.
+    row_box: Option<GuiBox>,
 }
 
 #[derive(Default)]
@@ -1511,17 +1528,51 @@ struct SidebarState {
     /// Group keys the operator collapsed (persisted per cwd on toggle).
     collapsed: std::collections::HashSet<String>,
     loaded: bool,
+    /// Sticky acknowledgement of each session's status (session id →
+    /// [`crate::session_tree::TreeStatus`]). Lives with the sidebar, not in a
+    /// tab's `GuiState`: the tree is the sidebar's business, and a row must
+    /// stay amber while it is `StoppedUnseen` no matter which tab is active.
+    /// See [`sidebar_row_status`] for the settle edge and
+    /// [`SidebarState::acknowledge`] for the seen edge.
+    tree_status: std::collections::HashMap<String, crate::session_tree::TreeStatus>,
+}
+
+impl SidebarState {
+    /// The operator has looked at `id`: a stopped row settles from
+    /// `StoppedUnseen` to `StoppedSeen`. Clears the signature so the next tick
+    /// repaints the icon even if nothing else changed.
+    fn acknowledge(&mut self, id: &str) {
+        if let Some(s) = self.tree_status.get_mut(id)
+            && s.wants_attention()
+        {
+            *s = crate::session_tree::TreeStatus::StoppedSeen;
+            self.signature.clear();
+        }
+    }
 }
 
 /// Rebuild the sidebar's rows from the open tabs, grouped by project.
 ///
-/// Same model as `/sessions` (`session_tree::SessionPresence` + the same
-/// `▶/●/✓/·` glyphs): `running` comes from the tab's live `GuiState`, waiting
-/// from the status/verdict sidecars, unread from the bus's per-session feed
-/// (populated because `Agent::{turn_done,error,idle}_event` tags the session).
-/// Clicking a session row switches to its tab and focuses its prompt (which
-/// also marks the session seen, clearing the unread badge); clicking a group
-/// header collapses/expands it (persisted per cwd).
+/// Every session row carries a three-state status icon to the left of its
+/// title, from [`crate::session_tree::TreeStatus`]:
+///
+///   * `▶` blue — **running**: the tab is working (a turn, a background job,
+///     or a live pid), including a worker parked on a dialog it raised.
+///   * `●` amber — **stopped, unseen**: it came to rest since the operator
+///     last looked (turn finished in another tab, follow-up ended, the process
+///     exited). The only state that asks for a look.
+///   * `○` dim — **stopped, seen**: came to rest and the operator has seen
+///     that result (clicked its row, switched to its tab, or it was already
+///     resting).
+///
+/// The status is *sticky*: the "was running, now isn't" edge is the only thing
+/// that turns a row amber ([`sidebar_row_status`]), and only opening the
+/// session settles it ([`SidebarState::acknowledge`]) — a session that has
+/// finished never re-lights just because the liveness sidecar says "not
+/// running" on every later tick.
+///
+/// Clicking a session row switches to its tab, focuses its prompt and settles
+/// its icon; clicking a group header collapses/expands it (persisted per cwd).
 ///
 /// Cheap by construction: the whole tree flattens to one signature string and
 /// the widget pass only runs when it changed — a spinner tick repaints text,
@@ -1534,12 +1585,17 @@ fn sync_sidebar(
     tabs: &TabView,
     bus: &SharedBus,
 ) {
-    // Snapshot each tab: (session id, title, running, log path). The agent
-    // slot is only briefly locked per tab; the tree build below holds no locks.
+    // Snapshot each tab. The agent slot is only briefly locked per tab; the
+    // tree build below holds no locks. `active` is "something in this session
+    // is still working and has not come to rest": the foreground turn, a
+    // background turn/job, or a live pid in the status sidecar. A worker
+    // parked on a dialog it raised still counts as active — "waiting on you"
+    // is mid-work here, not stopped (the brief), and the settle edge is what
+    // turns a row amber once the worker actually comes to rest.
     struct TabSnap {
         id: String,
         title: String,
-        running: bool,
+        active: bool,
         log: Option<PathBuf>,
     }
     let snaps: Vec<TabSnap> = {
@@ -1552,13 +1608,16 @@ fn sync_sidebar(
                     sv.agent_slot.lock().unwrap().as_ref().and_then(|a| a.log_path.clone()),
                     sv.state.lock().map(|s| s.running).unwrap_or(false),
                 );
+                let bg = sv.state.lock().map(|st| tasks_running(&st)).unwrap_or(0);
+                let live_pid =
+                    log.as_ref().is_some_and(|p| crate::session_tree::live_session(p));
                 TabSnap {
                     id: log
                         .as_ref()
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_else(|| format!("tab:{i}")),
                     title,
-                    running,
+                    active: running || bg > 0 || live_pid,
                     log,
                 }
             })
@@ -1567,7 +1626,10 @@ fn sync_sidebar(
     if snaps.is_empty() {
         return;
     }
+    // The notification feed still drives `/sessions` and the TUI; the GUI
+    // sidebar's own three-state icon is derived from liveness below.
     let unread = bus.unread_counts();
+    let _ = &unread;
     // Group by project root: the session's recorded cwd, else the log's parent
     // dir, else "(no directory)". Same roots `session_tree::build_tree` uses.
     let mut groups: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
@@ -1593,8 +1655,12 @@ fn sync_sidebar(
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         st.collapsed = crate::session_tree::load_state(&cwd.to_string_lossy()).collapsed;
     }
-    // Flatten to (id, is_group, text) rows + signature.
+    // Flatten to (id, is_group, text) rows + signature. Session rows carry the
+    // three-state status icon *separately* (an `icon` label, so it can be
+    // coloured); the button text is the title alone.
     let mut flat: Vec<(String, bool, String)> = Vec::new();
+    // (session id, glyph, colour) for every visible session row.
+    let mut icons: Vec<(String, String, &'static str)> = Vec::new();
     let mut sig = String::new();
     for key in &order {
         let label = key.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or(key);
@@ -1609,21 +1675,11 @@ fn sync_sidebar(
         }
         for &i in &groups[key] {
             let sn = &snaps[i];
-            let live = sn.running
-                || sn.log.as_ref().is_some_and(|p| crate::session_tree::live_session(p));
-            let waiting = !live
-                && sn.log.as_ref().is_some_and(|p| crate::session_tree::waiting_session(p));
-            let n = unread.get(&sn.id).copied().unwrap_or(0);
-            let presence = crate::session_tree::presence_for(live, waiting, n);
-            let text = match presence {
-                crate::session_tree::SessionPresence::NeedsInputUnread(m) => {
-                    format!("  ●{m} {}", sn.title)
-                }
-                _ => format!("  {} {}", presence.glyph(), sn.title),
-            };
-            flat.push((sn.id.clone(), false, text));
+            let status = sidebar_row_status(&mut st.tree_status, &sn.id, sn.active);
+            icons.push((sn.id.clone(), status.glyph().to_string(), status.color()));
+            flat.push((sn.id.clone(), false, sn.title.clone()));
             sig.push_str(&sn.id);
-            sig.push_str(presence.glyph());
+            sig.push_str(status.glyph());
             sig.push_str(&sn.title);
         }
     }
@@ -1632,17 +1688,43 @@ fn sync_sidebar(
     }
     st.signature = sig;
     // Reconcile widgets: update text in place, append newcomers, hide the gone.
+    let icon_of = |id: &str| icons.iter().find(|(i, _, _)| i == id);
     let mut seen = std::collections::HashSet::new();
     for (id, is_group, text) in &flat {
         seen.insert(id.clone());
         if let Some(row) = st.rows.iter().find(|r| &r.id == id) {
             row.button.set_text(text);
             row.button.set_visible(true);
+            if let (Some(icon), Some(row_box), Some((_, glyph, colour))) =
+                (&row.icon, &row.row_box, icon_of(id))
+            {
+                icon.set_markup(&format!(
+                    "<span foreground=\"{colour}\" size=\"x-large\">{}</span>",
+                    escape_markup(glyph)
+                ));
+                // `show_child` instead of `set_visible`: these rows are
+                // appended after `window.present()`, whose blanket `show_all`
+                // never reaches late widgets — the rows box has to reveal each
+                // one explicitly (same reason the button uses `show_child`).
+                icon.set_visible(true);
+                row_box.show_child(icon);
+                // The row box itself may have been hidden when its tab closed
+                // and reopened; re-show it so the icon update is visible.
+                rows_box.show_child(row_box);
+            }
             continue;
         }
+        // A refused button is skipped for THIS tick, not dropped forever: the
+        // cached signature is cleared so the next tick retries the row. (A bare
+        // `continue` would have cached a signature that includes a row which
+        // was never built, leaving the session invisible until something else
+        // changed it.)
         let btn = match app.create_button(text) {
             Ok(b) => b,
-            Err(_) => continue,
+            Err(_) => {
+                st.signature.clear();
+                continue;
+            }
         };
         btn.set_hexpand(true);
         // Click behavior is fixed at creation: group headers toggle collapse,
@@ -1673,6 +1755,7 @@ fn sync_sidebar(
             let sess2 = sessions.clone();
             let tabs2 = tabs.clone();
             let bus2 = bus.clone();
+            let st2 = state.clone();
             let _ = btn.on_click(move || {
                 // Session id → tab index (tabs reorder as sessions open/close,
                 // so resolve at click time, not at row creation).
@@ -1693,6 +1776,9 @@ fn sync_sidebar(
                         .filter(|&i| i < sess2.borrow().len())
                 });
                 if let Some(i) = idx {
+                    // Selecting a session is an acknowledgement: its icon
+                    // settles from `●` (stopped, unseen) to `○`.
+                    st2.borrow_mut().acknowledge(&target_id);
                     tabs2.set_active(i);
                     if let Some(sv) = sess2.borrow().get(i) {
                         sv.entry.grab_focus();
@@ -1711,20 +1797,105 @@ fn sync_sidebar(
                 }
             });
         }
+        // Session rows get the status icon to the left of the title (group
+        // headers do not carry a status). Icon + button live inside a
+        // horizontal `row_box`, because the icon and button as siblings in
+        // the vertical `rows_box` stack: the icon above, the button below.
+        // The button is the one whose text `set_text` updates. Fall back to
+        // a bare button (no icon) if the toolkit refuses either widget: a
+        // missing icon must not hide the session.
+        if !*is_group {
+            let icon_label = app.create_label("").ok();
+            if let Some(icon_label) = icon_label {
+                icon_label.set_size_request(18, -1);
+                #[cfg(not(windows))]
+                icon_label.set_xalign(0.0);
+                if let Some((_, glyph, colour)) = icon_of(id) {
+                    icon_label.set_markup(&format!(
+                        "<span foreground=\"{colour}\" size=\"x-large\">{}</span>",
+                        escape_markup(glyph)
+                    ));
+                }
+                // [icon][button] side by side: a horizontal row box wraps
+                // both, and the row box is what is packed into the vertical
+                // rows box. Rows appear after `window.present()`, so each
+                // child must be revealed explicitly (`show_child`); the rows
+                // box then re-runs size negotiation for the newcomer.
+                let row_box = app
+                    .create_box(Orientation::Horizontal, 2)
+                    .expect("create_box sidebar row");
+                // The button carries the row's flexible width; the icon keeps
+                // its fixed 18px request, so the glyph cannot stretch the row.
+                btn.set_hexpand(true);
+                row_box.append(&icon_label);
+                row_box.show_child(&icon_label);
+                row_box.append(&btn);
+                row_box.show_child(&btn);
+                rows_box.append(&row_box);
+                rows_box.show_child(&row_box);
+                rows_box.queue_resize();
+                st.rows.push(SidebarRow {
+                    id: id.clone(),
+                    button: btn,
+                    is_group: false,
+                    icon: Some(icon_label),
+                    row_box: Some(row_box),
+                });
+                continue;
+            }
+        }
         rows_box.append(&btn);
         // Reveal the row itself (parent already visible) instead of
         // re-showing the whole box, and re-run size negotiation so the
         // newcomer is allocated now — not only after the next manual resize.
         rows_box.show_child(&btn);
         rows_box.queue_resize();
-        st.rows.push(SidebarRow { id: id.clone(), button: btn, is_group: *is_group });
+        st.rows.push(SidebarRow {
+            id: id.clone(),
+            button: btn,
+            is_group: *is_group,
+            icon: None,
+            row_box: None,
+        });
     }
     for row in &st.rows {
         if !seen.contains(&row.id) {
-            rows_box.hide_child(&row.button);
+            // Icon and button live inside `row_box`: hiding the row hides
+            // both, so a closed tab leaves no orphan glyph behind.
+            if let Some(rb) = &row.row_box {
+                rows_box.hide_child(rb);
+            } else {
+                rows_box.hide_child(&row.button);
+                if let Some(icon) = &row.icon {
+                    rows_box.hide_child(icon);
+                }
+            }
         }
     }
+}
 
+/// The sidebar's status-icon decision for one session row, applied to the
+/// sticky acknowledgement map (`SidebarState::tree_status`) and returned.
+///
+/// The only edge that *creates* work for the operator is running → inactive:
+/// the row becomes `StoppedUnseen` (amber). Everything else is sticky — an
+/// amber row stays amber until [`SidebarState::acknowledge`], and a settled
+/// row never re-lights on its own. A session first seen at rest is settled
+/// (`StoppedSeen`), so opening the GUI onto finished sessions paints no amber.
+fn sidebar_row_status(
+    seen: &mut std::collections::HashMap<String, crate::session_tree::TreeStatus>,
+    id: &str,
+    active: bool,
+) -> crate::session_tree::TreeStatus {
+    use crate::session_tree::TreeStatus;
+    let next = match seen.get(id).copied() {
+        _ if active => TreeStatus::Running,
+        Some(TreeStatus::Running) => TreeStatus::StoppedUnseen,
+        Some(s) => s,
+        None => TreeStatus::StoppedSeen,
+    };
+    seen.insert(id.to_string(), next);
+    next
 }
 
 /// Run the GTK GUI REPL. Returns `Ok(())` on a clean exit (`/exit` or window
@@ -1895,14 +2066,33 @@ pub fn run(
 
     // Switching tabs just moves keyboard focus to that tab's prompt. This is
     // the *only* place focus is moved deliberately — the old unconditional
-    // focus-out re-grab was a trap (see `spawn_session`).
+    // focus-out re-grab was a trap (see `spawn_session`). It also acknowledges
+    // the session being brought to the front: a `●` (stopped, unseen) sidebar
+    // icon settles to `○`, because switching to a tab means the operator has
+    // seen where it stopped.
     {
         let sessions_for_cb = sessions.clone();
         let active_for_cb = active.clone();
+        let bus_for_cb = bus.clone();
+        let side_state_for_cb = sidebar_state.clone();
         tabs.set_on_tab_changed(Box::new(move |idx: usize| {
             active_for_cb.set(idx);
             let s = sessions_for_cb.borrow();
             if let Some(sv) = s.get(idx) {
+                let id = sv
+                    .agent_slot
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|a| a.log_path.clone())
+                    .map(|p| p.to_string_lossy().into_owned());
+                // Bringing a session to the front acknowledges it: its sidebar
+                // icon settles `●` → `○` and its unread badge clears at the
+                // same moment.
+                if let Some(id) = id.as_deref() {
+                    side_state_for_cb.borrow_mut().acknowledge(id);
+                    bus_for_cb.mark_seen(id);
+                }
                 sv.entry.grab_focus();
             }
         }));
@@ -5173,8 +5363,8 @@ fn open_thinking_dialog(
             sync_textview(widgets, &mut s);
             return;
         };
-        let kind = agent.provider().model_api(agent.model());
         let model = agent.model();
+        let kind = agent.provider().model_api(&model);
         (
             crate::modal::offered_thinking_levels(kind, model.context.unwrap_or(0), Some(&model)),
             agent.thinking_level().as_str().to_string(),
@@ -5527,8 +5717,8 @@ fn gui_settings_snapshot(
 ) -> Option<(String, Vec<String>, String, bool, bool, bool, bool)> {
     let g = agent_slot.lock().unwrap();
     let agent = g.as_ref()?;
-    let kind = agent.provider().model_api(agent.model());
     let model = agent.model();
+    let kind = agent.provider().model_api(&model);
     let levels = crate::modal::offered_thinking_levels(
         kind,
         model.context.unwrap_or(0),
@@ -9218,6 +9408,127 @@ mod gui_menu_tests {
         assert_eq!(
             cycle_security_value("???", &["ask".to_string(), "auto-yes".to_string()]),
             "auto-yes"
+        );
+    }
+
+    // -- Sidebar status icon (running / stopped-unseen / stopped-seen) -------
+
+    /// The settle edge: a resting session is `○` until it is *seen* to run,
+    /// then amber `●` the moment it comes to rest, and `○` again — for good —
+    /// once acknowledged. Uses the same `sidebar_row_status` the sidebar tick
+    /// calls, so this asserts the value the widget pass actually paints.
+    #[test]
+    fn sidebar_icon_settles_from_running_to_unseen_then_seen() {
+        use crate::session_tree::TreeStatus;
+        let mut map = std::collections::HashMap::new();
+        let status = |m: &mut std::collections::HashMap<String, TreeStatus>, active: bool| {
+            sidebar_row_status(m, "s1", active)
+        };
+        // A session that has never been seen running is settled, not unread:
+        // opening the GUI onto finished sessions must not paint amber rows.
+        assert_eq!(status(&mut map, false), TreeStatus::StoppedSeen, "first sight, at rest");
+        // It starts working -> running.
+        assert_eq!(status(&mut map, true), TreeStatus::Running, "work in flight");
+        // It comes to rest in the background -> stopped, unseen.
+        assert_eq!(status(&mut map, false), TreeStatus::StoppedUnseen, "settled unseen");
+        // ...and *stays* amber on later ticks (the naive signal says "stopped"
+        // every tick; only looking at it may settle the row).
+        assert_eq!(status(&mut map, false), TreeStatus::StoppedUnseen, "sticky until seen");
+        // The operator selects it.
+        let mut side = SidebarState { tree_status: map.clone(), ..SidebarState::default() };
+        side.acknowledge("s1");
+        map = side.tree_status;
+        assert_eq!(status(&mut map, false), TreeStatus::StoppedSeen, "seen -> settled");
+        // A running session is not settled by looking at it.
+        assert_eq!(status(&mut map, true), TreeStatus::Running);
+        side = SidebarState { tree_status: map, ..SidebarState::default() };
+        side.acknowledge("s1");
+        assert_eq!(
+            side.tree_status.get("s1").copied(),
+            Some(TreeStatus::Running),
+            "acknowledging a running session must not mark it stopped"
+        );
+    }
+
+    /// Acknowledging settles only the session named, and clears the cached
+    /// signature so the next tick repaints the icon even if nothing else moved.
+    #[test]
+    fn sidebar_acknowledge_is_per_session_and_forces_a_repaint() {
+        use crate::session_tree::TreeStatus;
+        let mut side = SidebarState::default();
+        side.tree_status.insert("a".into(), TreeStatus::StoppedUnseen);
+        side.tree_status.insert("b".into(), TreeStatus::StoppedUnseen);
+        side.signature = "cached".into();
+        side.acknowledge("a");
+        assert_eq!(side.tree_status["a"], TreeStatus::StoppedSeen, "a settles");
+        assert_eq!(side.tree_status["b"], TreeStatus::StoppedUnseen, "b stays amber");
+        assert!(side.signature.is_empty(), "signature cleared => icon repaints");
+        // Acknowledging the same session twice is a no-op, not a repaint storm.
+        side.signature = "cached-again".into();
+        side.acknowledge("a");
+        assert_eq!(side.signature, "cached-again");
+    }
+
+    /// The icon label is built from the glyph + colour pair of the status the
+    /// row is in — the exact markup string `sync_sidebar` hands to the Label.
+    #[test]
+    fn sidebar_icon_markup_carries_the_status_glyph_and_colour() {
+        use crate::session_tree::TreeStatus;
+        let markup = |st: TreeStatus| {
+            format!(
+                "<span foreground=\"{}\" size=\"x-large\">{}</span>",
+                st.color(),
+                escape_markup(st.glyph())
+            )
+        };
+        let running = markup(TreeStatus::Running);
+        let unseen = markup(TreeStatus::StoppedUnseen);
+        let seen = markup(TreeStatus::StoppedSeen);
+        assert!(running.contains('▶') && unseen.contains('●') && seen.contains('○'));
+        assert_ne!(running, unseen);
+        assert_ne!(unseen, seen);
+        assert_ne!(running, seen);
+        for (st, colour) in [
+            (TreeStatus::Running, TreeStatus::Running.color()),
+            (TreeStatus::StoppedUnseen, TreeStatus::StoppedUnseen.color()),
+            (TreeStatus::StoppedSeen, TreeStatus::StoppedSeen.color()),
+        ] {
+            assert!(markup(st).contains(colour), "colour must be the status's own");
+        }
+    }
+
+    /// The status icon sits LEFT of the session title, not above it. Icon +
+    /// button packed as siblings into the vertical rows box stack (icon
+    /// above, button below); wrapping both in a horizontal row box keeps
+    /// them on one line with the icon left. A display is not needed: the
+    /// packing is a source property, and the shipped binary is built from
+    /// this source (same shape as the expand-flags order test above).
+    #[test]
+    fn sidebar_rows_pack_icon_and_button_side_by_side() {
+        let src = include_str!("gui.rs");
+        let mk = src
+            .find("create_box sidebar row")
+            .expect("a horizontal row box must wrap each session row");
+        let icon = src
+            .find("row_box.append(&icon_label);")
+            .expect("icon packed into the row box");
+        let btn = src
+            .find("row_box.append(&btn);")
+            .expect("button packed into the row box");
+        let pack = src
+            .find("rows_box.append(&row_box);")
+            .expect("row box packed into the rows box");
+        assert!(
+            mk < icon && icon < btn && btn < pack,
+            "icon then button into a horizontal row box, row box into the rows box"
+        );
+        // No session row may pack the icon straight into the vertical rows
+        // box — that is the above-not-left stacking this replaces. Built by
+        // concat so this very assertion does not itself contain the needle.
+        let stacked = ["rows_box.append(&", "icon_label);"].concat();
+        assert!(
+            !src.contains(&stacked),
+            "icon must not be a direct child of the vertical rows box (it stacks above the button)"
         );
     }
 }

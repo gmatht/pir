@@ -2083,7 +2083,9 @@ fn handle_command(
             let _ = disable_raw_mode();
             let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
             let _ = io::stdout().flush();
+            let started = std::time::Instant::now();
             let code = crate::run_shell(args);
+            let took = crate::term::fmt_cmd_elapsed(started.elapsed());
             // Re-enter the TUI: re-establish raw mode + alternate screen.
             let _ = enable_raw_mode();
             let _ = crossterm::execute!(io::stdout(), EnterAlternateScreen);
@@ -2099,8 +2101,11 @@ fn handle_command(
                 .and_then(|p| std::fs::metadata(&p).ok().map(|m| m.len()))
                 .unwrap_or(state.log_offset);
             if let Some(c) = code {
+                // Same `Elapsed …` readout as the bash tool, below the result.
                 if c != 0 {
-                    state.push(ConvKind::Error, &format!("· shell exited with status {c}"));
+                    state.push(ConvKind::Error, &format!("· shell exited with status {c} (Elapsed {took})"));
+                } else {
+                    state.push(ConvKind::System, &format!("· Elapsed {took}"));
                 }
             } else {
                 state.push(ConvKind::Error, "· could not start shell");

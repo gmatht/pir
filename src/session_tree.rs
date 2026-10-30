@@ -114,8 +114,116 @@ pub struct SessionNode {
     pub bytes: u64,
     pub preview: String,
     pub presence: SessionPresence,
+    /// The one-glyph "what is this session doing" status the GUI tree row
+    /// paints (`session_tree::tree_status_of`): running, stopped-unseen,
+    /// stopped-seen. Derived alongside `presence` in [`build_tree`] so a row
+    /// cannot show one state in the text lists and another in the GUI tree.
+    pub status: TreeStatus,
     pub live: bool,
     pub from_here: bool,
+}
+
+/// The GUI session-tree row status: three values, one icon, painted to the
+/// left of every session row in the sidebar.
+///
+/// This is the tree's own vocabulary, deliberately narrower than
+/// [`SessionPresence`] (which also distinguishes *why* a stopped session is
+/// stopped, and how many notifications are pending):
+///
+///   * `Running` — work is in flight: a turn is running, a background job is
+///     live, or the worker is parked on a dialog it raised (a tool approval, a
+///     question, plan review). "Waiting on you" still counts as running here:
+///     the session is mid-work and has not come to rest.
+///   * `StoppedUnseen` — the session came to rest and the operator has not
+///     looked at that since. The attention state: amber dot.
+///   * `StoppedSeen` — the session came to rest and the operator has seen the
+///     result (opened/selected the session, or it was resting last time we
+///     looked). The settled state: dim dot.
+///
+/// "Came to rest" is the only thing that ever moves a row out of `Running`:
+/// a stopped-but-unread session (a turn that finished while you were in
+/// another tab, an extension follow-up that ended, `pir` exiting) and a
+/// stopped-but-read one differ only in whether the finish was acknowledged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeStatus {
+    Running,
+    StoppedUnseen,
+    StoppedSeen,
+}
+
+impl TreeStatus {
+    /// The glyph painted in the tree. Three visually distinct shapes, so the
+    /// status survives a colour-less theme: filled right-pointing triangle
+    /// (in flight), filled circle (stopped, attention), hollow circle
+    /// (stopped, settled).
+    pub fn glyph(&self) -> &'static str {
+        match self {
+            TreeStatus::Running => "▶",
+            TreeStatus::StoppedUnseen => "●",
+            TreeStatus::StoppedSeen => "○",
+        }
+    }
+
+    /// Hex colour for the glyph on backends that render markup (the GUI uses
+    /// Pango). Kept next to [`TreeStatus::glyph`] so the two never disagree
+    /// about which state a row is in.
+    pub fn color(&self) -> &'static str {
+        match self {
+            TreeStatus::Running => "#3794ff",        // blue: work in flight
+            TreeStatus::StoppedUnseen => "#e0a63a",  // amber: needs a look
+            TreeStatus::StoppedSeen => "#6f6f6f",    // dim: settled
+        }
+    }
+
+    /// Plain-text word for the state (status hints, `/help`, tests).
+    pub fn label(&self) -> &'static str {
+        match self {
+            TreeStatus::Running => "running",
+            TreeStatus::StoppedUnseen => "stopped (unseen)",
+            TreeStatus::StoppedSeen => "stopped (seen)",
+        }
+    }
+
+    /// Whether this state asks the operator to look (`StoppedUnseen`).
+    pub fn wants_attention(&self) -> bool {
+        matches!(self, TreeStatus::StoppedUnseen)
+    }
+}
+
+/// Derive a row's [`TreeStatus`] from the live signals.
+///
+/// * `active` — something in this session is still working *and* has not come
+///   to rest: the foreground turn, a background turn/job, or the live pid in
+///   the status sidecar. A worker blocked on a dialog keeps this true.
+/// * `at_rest` — the session has settled (idle at the prompt, finished,
+///   interrupted, failed) *and* the GUI has already acknowledged it: the
+///   operator has it in front of them, or it was resting last time. A resting
+///   session that is not acknowledged is `StoppedUnseen`.
+///
+/// `active` wins: a session mid-work has nothing to acknowledge yet, even if a
+/// stale "seen" mark lingers from a previous run.
+pub fn tree_status_of(active: bool, at_rest: bool) -> TreeStatus {
+    if active {
+        TreeStatus::Running
+    } else if at_rest {
+        TreeStatus::StoppedSeen
+    } else {
+        TreeStatus::StoppedUnseen
+    }
+}
+
+/// [`TreeStatus`] derived from the presence / liveness signals [`build_tree`]
+/// already computes, for callers that have no GUI acknowledgements (the
+/// `/sessions` text tree, the flat lists). There, "stopped unseen" is exactly
+/// what `SessionPresence` calls `NeedsInputUnread`; everything else that is
+/// not running has been seen.
+pub fn tree_status_from_presence(presence: SessionPresence, live: bool) -> TreeStatus {
+    match presence {
+        _ if live => TreeStatus::Running,
+        SessionPresence::Running => TreeStatus::Running,
+        SessionPresence::NeedsInputUnread(_) => TreeStatus::StoppedUnseen,
+        SessionPresence::NeedsInputSeen | SessionPresence::Idle => TreeStatus::StoppedSeen,
+    }
 }
 
 /// One project group in the tree.
@@ -228,10 +336,19 @@ pub fn cwd_tail_of(cwd: &str) -> String {
     }
 }
 
-/// Whether the session at `log` currently has a live process driving it.
+/// Whether the session at `log` currently has a live process driving it:
+/// a turn in flight (`Active`) owned by a pid that still exists. A sidecar
+/// that says `Completed`/`Interrupted`/`Finished` is at rest even when its
+/// pid is still alive (the GUI writes its own pid on every turn, so the
+/// process outlives the turn) — without the status gate every idle session
+/// of a live process would read as running and its ▶ would never clear.
 pub(crate) fn live_session(log: &Path) -> bool {
     match crate::session::read_status(log) {
-        Some(m) => m.pid != 0 && crate::session::pid_alive(m.pid),
+        Some(m) => {
+            m.status == crate::session::SessionStatus::Active
+                && m.pid != 0
+                && crate::session::pid_alive(m.pid)
+        }
         None => false,
     }
 }
@@ -278,6 +395,7 @@ pub fn build_tree(rows: &[ScanRow], unread: &HashMap<String, u32>) -> Vec<Projec
         let live = live_session(&r.path);
         let waiting = !live && waiting_session(&r.path);
         let n = unread.get(&id).copied().unwrap_or(0);
+        let presence = presence_for(live, waiting, n);
         let node = SessionNode {
             id,
             title: title_for(&r.path, &r.preview, &r.name),
@@ -287,7 +405,8 @@ pub fn build_tree(rows: &[ScanRow], unread: &HashMap<String, u32>) -> Vec<Projec
             mtime_secs: mtime_secs(r.mtime),
             bytes: r.bytes,
             preview: r.preview.clone(),
-            presence: presence_for(live, waiting, n),
+            presence,
+            status: tree_status_from_presence(presence, live),
             live,
             from_here: r.from_here,
         };
@@ -349,8 +468,9 @@ pub fn render_text(groups: &[ProjectGroup], state: &TreeState) -> String {
             } else {
                 format!(" ({})", s.cwd_tail)
             };
-            out.push_str(&format!("  {sel} {badge}{s_title}{detail}\n",
-                s_title = truncate(&s.title, 60)));
+            out.push_str(&format!("  {sel} {badge}{s_title}{detail}  [{st}]\n",
+                s_title = truncate(&s.title, 60),
+                st = s.status.label()));
         }
     }
     out
@@ -586,6 +706,7 @@ mod tests {
                     bytes: 10,
                     preview: String::new(),
                     presence: SessionPresence::NeedsInputUnread(2),
+                    status: TreeStatus::StoppedUnseen,
                     live: false,
                     from_here: false,
                 },
@@ -599,6 +720,7 @@ mod tests {
                     bytes: 10,
                     preview: String::new(),
                     presence: SessionPresence::Running,
+                    status: TreeStatus::Running,
                     live: true,
                     from_here: true,
                 },
@@ -610,11 +732,102 @@ mod tests {
         assert!(out.contains("▾ proj"), "expanded group header:\n{out}");
         assert!(out.contains("●2 fix parser"), "unread badge + title:\n{out}");
         assert!(out.contains("▶"), "running glyph:\n{out}");
+        // The text list also carries the three-state status word, so the
+        // `/sessions` rows and the GUI sidebar icons tell one story.
+        assert!(out.contains("[stopped (unseen)]"), "unseen status:\n{out}");
+        assert!(out.contains("[running]"), "running status:\n{out}");
 
         st.set_expanded("k", false);
         let out2 = render_text(&groups, &st);
         assert!(out2.contains("▸ proj"), "collapsed header:\n{out2}");
         assert!(!out2.contains("fix parser"), "collapsed rows hidden:\n{out2}");
+    }
+
+    /// The three tree statuses stay visually distinct (glyph AND colour), and
+    /// only "stopped unseen" asks for attention.
+    #[test]
+    fn tree_status_glyphs_and_colours_are_distinct() {
+        let all = [TreeStatus::Running, TreeStatus::StoppedUnseen, TreeStatus::StoppedSeen];
+        let glyphs: HashSet<&str> = all.iter().map(|s| s.glyph()).collect();
+        let colours: HashSet<&str> = all.iter().map(|s| s.color()).collect();
+        assert_eq!(glyphs.len(), 3, "one glyph per status");
+        assert_eq!(colours.len(), 3, "one colour per status");
+        assert!(TreeStatus::StoppedUnseen.wants_attention());
+        assert!(!TreeStatus::Running.wants_attention());
+        assert!(!TreeStatus::StoppedSeen.wants_attention());
+    }
+
+    /// `tree_status_of`: active wins; otherwise "at rest" is settled.
+    #[test]
+    fn tree_status_of_prefers_running_then_rest() {
+        assert_eq!(tree_status_of(true, false), TreeStatus::Running);
+        assert_eq!(tree_status_of(true, true), TreeStatus::Running);
+        assert_eq!(tree_status_of(false, true), TreeStatus::StoppedSeen);
+        assert_eq!(tree_status_of(false, false), TreeStatus::StoppedUnseen);
+    }
+
+    /// `build_tree` stamps each node with a status consistent with its
+    /// presence (the value the text row then renders).
+    #[test]
+    fn build_tree_stamps_status_from_presence() {
+        // None of these fixture paths exist, so both are idle + not live.
+        let rows = vec![row("a", "/other/proj", 1, false)];
+        let groups = build_tree(&rows, &HashMap::new());
+        let n = &groups[0].sessions[0];
+        assert_eq!(n.presence, SessionPresence::Idle);
+        assert_eq!(n.status, TreeStatus::StoppedSeen, "idle = settled, not amber");
+        assert_eq!(
+            tree_status_from_presence(SessionPresence::NeedsInputUnread(1), false),
+            TreeStatus::StoppedUnseen
+        );
+        assert_eq!(
+            tree_status_from_presence(SessionPresence::Idle, true),
+            TreeStatus::Running,
+            "a live pid is running whatever the presence says"
+        );
+    }
+
+    /// A sidecar that says `Completed` is at rest even when its pid is still
+    /// alive: the GUI writes its own pid on every turn, so the process
+    /// outlives the turn. Without the status gate every idle session of a
+    /// live process reads as running and its ▶ never clears — the
+    /// stuck-play-icon bug. Asserts on what `live_session` itself reads back
+    /// from the sidecar, not a recomputation from the test's inputs.
+    #[test]
+    fn live_session_requires_an_active_sidecar() {
+        let dir = std::env::temp_dir().join(format!("pir_live_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let log = dir.join("s.jsonl");
+        let _ = std::fs::write(&log, "{}\n");
+        let me = std::process::id();
+        crate::session::write_status(
+            &log,
+            crate::session::SessionStatus::Active,
+            me,
+            "",
+            false,
+            "",
+        );
+        assert!(live_session(&log), "active + live pid = driven");
+        crate::session::write_status(
+            &log,
+            crate::session::SessionStatus::Completed,
+            me,
+            "",
+            false,
+            "",
+        );
+        assert!(!live_session(&log), "completed + live pid = at rest, or ▶ never clears");
+        crate::session::write_status(
+            &log,
+            crate::session::SessionStatus::Interrupted,
+            me,
+            "",
+            false,
+            "cancelled",
+        );
+        assert!(!live_session(&log), "interrupted + live pid = at rest");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     impl SessionNode {

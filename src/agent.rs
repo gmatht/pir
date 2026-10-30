@@ -1,11 +1,11 @@
 use crate::config::{self, ApiKind, Model, Provider};
 use crate::goal::{GoalStatus, GoalStore};
 use crate::notify::{AgentEvent, SharedBus};
-use crate::plugin::{EventKind, Outcome, Registry};
+use crate::plugin::{EventKind, Outcome, Registry, ToolSpec};
 use crate::provider::Client;
 use crate::security::SecurityContext;
 use crate::term;
-use crate::types::{Block, Message, Role, Usage};
+use crate::types::{Block, Message, Role, Usage, TOOL_RESULT_CHARS_PER_TOKEN};
 use crate::session::SessionStatus;
 use serde_json::{json, Value};
 use streamdown_ansi::sanitize::sanitize_for_terminal;
@@ -228,6 +228,13 @@ pub struct Agent {
     /// Consecutive stalled (empty) responses retried in the current turn. Reset
     /// by the turn loop as soon as a real answer arrives, and by `begin_turn`.
     stall_retries: usize,
+    /// Over-window recoveries used in the current turn (see the turn-error
+    /// arm). An over-window 400 sheds history and retries the model call, but
+    /// shedding must converge: after `MAX_WINDOW_RECOVERIES` the body is
+    /// broken for another reason (e.g. a protocol mismatch wearing the same
+    /// generic message) and the error surfaces instead of looping. Reset by
+    /// `begin_turn`, like `stall_retries`.
+    window_recoveries: usize,
     /// Test-only: how many times a *terminal* nudge notice fired — either
     /// "already nudged" or "no request_stop after N nudge(s)". Both are
     /// observable only through terminal output, which a quiet agent suppresses
@@ -616,6 +623,12 @@ pub(crate) const MIN_OUTPUT_FLOOR: usize = 4_096;
 /// visible, and the loop detector still applies once real-but-repeating text
 /// arrives).
 pub const MAX_STALL_RETRIES: usize = 3;
+
+/// How many times one turn may shed history and retry after an over-window
+/// rejection before surfacing the error. Two is enough for the genuine case
+/// (trim once, then compact-and-retry once); a third failure means the body is
+/// broken for another reason and further shedding only destroys context.
+pub const MAX_WINDOW_RECOVERIES: usize = 2;
 
 /// What `load_session` restored. The REPL (and `/fg`/`/resume`) renders
 /// [`SessionResume::banner`] so `-r` makes it clear which session came back,
@@ -1146,6 +1159,7 @@ impl Agent {
             stop_nudges: 0,
             pending_nudge: None,
             stall_retries: 0,
+            window_recoveries: 0,
             #[cfg(test)]
             stop_nudge_notices: 0,
             stop_nudged_for_prompt: None,
@@ -3350,7 +3364,13 @@ impl Agent {
                     return Ok(());
                 }
             }
-            self.trim();
+            // Trim against the full wire picture (history + this round's
+                // system prompt and tool specs), not the history-only budget:
+                // the history grows within the round (assistant pushes + tool
+                // results), so a later round can exceed what the first fitted.
+                // (`system` is cloned: `trim_wire` takes `&mut self`.)
+                let sys = self.system.clone();
+                self.trim_wire(Some(&sys), &specs);
 
             // Emit TurnStart so backends know an assistant turn is beginning
             // (this is the point the model stream starts).
@@ -3655,6 +3675,49 @@ impl Agent {
             let (assistant, usage) = match result {
                 Ok(r) => r,
                 Err(e) => {
+                    // An over-window rejection is recoverable: shed history
+                    // and retry the model call instead of killing the turn
+                    // with the gateway's opaque sentence. First recovery
+                    // trims against the wire budget; the second compacts when
+                    // armed (a summary is smaller than any trim tail). Past
+                    // `MAX_WINDOW_RECOVERIES` the body is broken for another
+                    // reason and the error surfaces. Only pre-output failures
+                    // qualify (mid-stream output must never be duplicated),
+                    // and only the narrow `is_over_window_error` shape — a
+                    // protocol or tool-pairing 400 wearing similar words must
+                    // never trigger history loss. Recovery is a `continue` of
+                    // the model-call loop, announced on the notice channel
+                    // (never as model text).
+                    if crate::provider::is_over_window_error(&e)
+                        && assistant_text.trim().is_empty()
+                        && self.window_recoveries < MAX_WINDOW_RECOVERIES
+                        && self.history.len() > 1
+                    {
+                        self.window_recoveries += 1;
+                        let what: String = if self.window_recoveries == 1 {
+                            let sys = self.system.clone();
+                            self.trim_wire(Some(&sys), &specs);
+                            "trimmed context".to_string()
+                        } else if self.auto_compact {
+                            self.compact()
+                        } else {
+                            let sys = self.system.clone();
+                            self.trim_wire(Some(&sys), &specs);
+                            "trimmed context (auto-compact off — /compact on enables summarising)".to_string()
+                        };
+                        let note = format!(
+                            "\n· over-window request rejected by the provider — {what}, retrying ({}/{})\n",
+                            self.window_recoveries, MAX_WINDOW_RECOVERIES,
+                        );
+                        if !self.silent() {
+                            term::out(&term::dim(&note));
+                        }
+                        log_notice(&mut self.log, &note);
+                        if let Some(mut s) = spinner.borrow_mut().take() {
+                            s.stop();
+                        }
+                        continue;
+                    }
                     // Surface the failure visibly in the main stream (red banner)
                     // as well as stderr, so a mid-turn provider error isn't lost
                     // below already-printed tokens. The on-screen notification
@@ -4253,9 +4316,20 @@ impl Agent {
         let user = format!(
             "Last user prompt: {last_user}\nLast assistant output: {last_asst}\nword (done or retry):"
         );
+        // The verdict prompt is tiny, but `complete` still guards against
+        // the combined window with the session model's real context — not a
+        // hardcoded default — so a smaller-window model refuses loudly
+        // instead of 400ing at the gateway.
         let resp = self
             .client
-            .complete(&self.model.id, system, &user, self.provider.model_api(&self.model))
+            .complete_with(
+                &self.model.id,
+                system,
+                &user,
+                12,
+                self.provider.model_api(&self.model),
+                self.model.context.unwrap_or(200_000),
+            )
             .unwrap_or_default();
         let w = resp.trim().to_lowercase();
         let first = w.split_whitespace().next().unwrap_or("").trim_matches(|c: char| !c.is_alphanumeric());
@@ -4529,6 +4603,7 @@ impl Agent {
         self.stop_nudges = 0;
         self.stop_nudged_for_prompt = None;
         self.pending_nudge = None;
+        self.window_recoveries = 0;
     }
 
     /// Build the `Idle` event (returned to the REPL prompt). Carries the same
@@ -4588,8 +4663,45 @@ impl Agent {
     /// `/compact status` reports and `needs_compaction` compares against, so the
     /// REPL never says "near the context cap" about a history `trim` considers
     /// fine.
+    ///
+    /// `wire_extra` is the part of the request `history` doesn't count: the
+    /// system prompt plus the serialized tool specs (see
+    /// `estimate_request_tokens`). The wire sends those alongside history, so
+    /// a history that passes a history-only budget can still be over-window
+    /// once they ride along — and the gateway answers with an opaque HTTP 400
+    /// (`invalid parameters`, param null). Callers that know the request's
+    /// system/tools pass them here; `trim` sheds until history fits what is
+    /// left. `None` keeps the legacy history-only behaviour (tests, paths
+    /// with no specs in scope).
     fn trim(&mut self) {
-        let budget = self.context_budget();
+        self.trim_wire(None, &[]);
+    }
+
+    /// [`Self::trim`] against the full wire picture: history must fit the
+    /// window minus `wire_extra` (system + tool specs, in tokens) minus the
+    /// output reserve. Used at the top of each model round, where `specs` is
+    /// in scope, and by the over-window recovery arm.
+    fn trim_wire(&mut self, system: Option<&str>, tools: &[ToolSpec]) {
+        let wire_extra = system.map(|s| s.len() / 4).unwrap_or(0)
+            + tools
+                .iter()
+                .map(|t| (t.name.len() + t.description.len() + t.schema.to_string().len()) / 4 + 16)
+                .sum::<usize>();
+        let out_reserve =
+            output_budget_for(0, self.model.context.unwrap_or(200_000) as usize, self.model.max_tokens.unwrap_or(8192)) as usize;
+        // History's share of the window: everything the wire carries besides
+        // it (system, tools, output reserve, prompt headroom) is spoken for
+        // first. Never below the legacy history-only budget's floor semantics:
+        // `context_budget` is floored at 8192 so a tiny catalog entry still
+        // leaves room to work — keep that floor here too.
+        let budget = self
+            .model
+            .context
+            .unwrap_or(200_000)
+            .saturating_sub(wire_extra as u64)
+            .saturating_sub(out_reserve as u64)
+            .saturating_sub(SYS_PROMPT_RESERVE as u64)
+            .max(8192) as usize;
         if approx_tokens(&self.history) <= budget {
             return;
         }
@@ -4661,18 +4773,21 @@ fn make_client(provider: &Provider, cancel: Arc<AtomicBool>) -> Result<Client, S
         // The `{env:VAR}` reference (if any) was already resolved by
         // `expand_env`; an `Err` here means the variable is unset/empty, which
         // we name explicitly so the user isn't left with a generic failure.
+        // Keys live in auth.json (or the store entry's own `apiKey`), never in
+        // models-store.json — the old message named the wrong file.
+        let auth_path = config::pi_dir().join("agent").join("auth.json");
         if let Some(k) = provider.api_key.as_deref()
             && let Some(var) = k.strip_prefix("{env:").and_then(|r| r.strip_suffix('}')) {
                 return format!(
                     "no API key for '{}' — the env var {var} is unset or empty (referenced in {}, or set apiKey directly)",
                     provider.pid(),
-                    config::pi_dir().join("models-store.json").display()
+                    auth_path.display()
                 );
             }
         format!(
-            "no API key for '{}' — export the env var referenced in {}, or set apiKey directly",
+            "no API key for '{}' — add it to {} or set apiKey directly",
             provider.pid(),
-            config::pi_dir().join("models-store.json").display()
+            auth_path.display()
         )
     })?;
     let mut client = Client::new(kind, &base, key);
@@ -4681,13 +4796,19 @@ fn make_client(provider: &Provider, cancel: Arc<AtomicBool>) -> Result<Client, S
     // the whole response arrives.
     client.set_cancel(cancel);
     // HTTP transport for the streaming core: `PIR_HTTP_BACKEND` or the
-    // `http_backend` settings.json key (single-transport build — every
-    // known name resolves to host libcurl; see HttpBackend::parse).
-    // Unknown values fall back to the default rather than failing startup.
+    // `http_backend` settings.json key (see HttpBackend::parse). Unknown
+    // values fall back to the default rather than failing startup. On
+    // Windows the host libcurl never loads, so native WinHTTP is the
+    // default there (in-process, no external binary); an explicit config
+    // value always wins over the platform default.
     if let Some(name) = config::http_backend_name()
         && let Some(backend) = crate::provider::HttpBackend::parse(&name) {
             client.set_backend(backend);
         }
+    #[cfg(windows)]
+    if config::http_backend_name().is_none() {
+        client.set_backend(crate::provider::HttpBackend::WinHttp);
+    }
     // Offline scripted model for tests/puppetry (see `crate::fake`): enabled
     // by provider id so a user catalog can never collide with it by model id.
     client.set_fake(provider.pid() == "fake");
@@ -4833,12 +4954,15 @@ fn render_message(m: &Message, budget: usize, used: usize) -> Option<(String, us
     // Cost what the message *is*, not what was shown of it: a 100k-char tool
     // result abridged to 30 lines still occupies the model's window, so
     // charging only the preview would let the fitter pass a transcript the
-    // provider rejects.
+    // provider rejects. The elided middle is code/logs (dense: /2); the
+    // surviving text (prose labels plus the abridged preview) stays /4, with
+    // the preview upgraded to /2 since it is code too — matching
+    // `approx_tokens`/`Block::est_tokens`.
     let mut cost = text.len() / 4;
     for b in &m.blocks {
         if let Block::ToolResult { content, .. } = b {
-            let shown = abridge_output(content).len() / 4;
-            cost += (content.len() / 4).saturating_sub(shown);
+            let shown = abridge_output(content).len();
+            cost += content.len() / TOOL_RESULT_CHARS_PER_TOKEN - shown / 4;
         }
     }
     if used + cost > budget {
@@ -4851,16 +4975,11 @@ fn approx_tokens(history: &[Message]) -> usize {
     history
         .iter()
         .map(|m| {
-            32 + m.blocks
+            32 + m
+                .blocks
                 .iter()
-                .map(|b| match b {
-                    Block::Text(t) => t.len(),
-                    Block::Thinking { text } => text.len(),
-                    Block::ToolUse { input, .. } => input.to_string().len() + 64,
-                    Block::ToolResult { content, .. } => content.len() + 64,
-                })
+                .map(|b| b.est_tokens())
                 .sum::<usize>()
-                / 4
         })
         .sum()
 }
@@ -5328,6 +5447,140 @@ mod reload_tests {
         assert!(!a.auto_compact(), "off must be honoured");
         a.set_auto_compact(true);
         assert!(a.auto_compact(), "on must re-arm it");
+    }
+
+    /// Dense tool results count near their real token cost. Measured live
+    /// 2026-10-27 on deepseek-v4.1-flash: 196,800 chars of Go source are
+    /// 68,431 real tokens (2.87 chars/token) and 270,000 chars of JSON logs
+    /// are 87,031 (3.10), both far denser than prose (~6). The old `bytes/4`
+    /// estimate undercounted a code-heavy session by 25-35%, so a history
+    /// that looked safely under budget was actually over the window — and the
+    /// gateway rejected the whole request with an opaque HTTP 400
+    /// (`invalid parameters`, param null). `est_tokens` must over-, not
+    /// under-, count tool results. Asserts on the estimator's own value, not
+    /// a recomputation from the test's inputs.
+    #[test]
+    fn tool_results_count_near_their_measured_token_density() {
+        use crate::types::TOOL_RESULT_CHARS_PER_TOKEN;
+        // A real tool result: 6,400 chars of Go-shaped code.
+        let code = "fn parsePrimary(p *Parser) Word {\n  x := p.next();\n}\n".repeat(128);
+        let b = Block::ToolResult {
+            tool_use_id: "call_1".to_string(),
+            content: code.clone(),
+            is_error: false,
+        };
+        let got = b.est_tokens();
+        let want_floor = code.len() / 3; // measured density is ~2.9 chars/token
+        let want_ceil = code.len() / 2 + 32; // estimator (/2 + 16 block overhead)
+        assert!(
+            got >= want_floor && got <= want_ceil,
+            "tool result must count near its real cost: got {got} for {} chars (want {want_floor}..={want_ceil})",
+            code.len(),
+        );
+        assert_eq!(TOOL_RESULT_CHARS_PER_TOKEN, 2, "margin over the measured ~2.9");
+        // Prose-like blocks keep the old /4 rule.
+        let prose = Block::Text("hello world, this is prose".to_string());
+        assert_eq!(prose.est_tokens(), "hello world, this is prose".len() / 4);
+        // And a history of one big code result prices near real cost.
+        let history = vec![Message {
+            role: Role::User,
+            blocks: vec![b],
+        }];
+        let hist = approx_tokens(&history);
+        assert!(
+            hist >= want_floor,
+            "history estimate must not undercount code: got {hist}, want >= {want_floor}"
+        );
+        // Wire-side estimate agrees (same shared estimator).
+        let sys = "sys";
+        let wire = crate::provider::estimate_request_tokens(sys, &history, &[]);
+        assert!(
+            wire >= (sys.len() / 4) as u64 + want_floor as u64,
+            "wire estimate must not undercount either: got {wire}"
+        );
+    }
+
+    /// `trim_wire` fits history to the window minus what the wire carries
+    /// besides it (system prompt + tool specs). A history that passes the
+    /// history-only `context_budget` can still be over-window once ~6k of
+    /// system prompt and ~10-20k of tool specs ride along — and the gateway
+    /// answers with an opaque HTTP 400. Asserts on the trim's own result
+    /// (message/token counts), not a recomputation from the test's inputs.
+    #[test]
+    fn trim_wire_counts_system_and_tools() {
+        let _env = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut a = test_agent();
+        a.model.context = Some(20_000);
+        a.model.max_tokens = Some(4_096);
+        // Ten rounds of ~1k-token tool traffic (~10.8k total): under the
+        // history-only budget (~13.9k at this window), so plain `trim` keeps
+        // all of it — but over the wire-aware budget once system + tools
+        // (~24k) ride along, so `trim_wire` must shed.
+        for i in 0..10 {
+            a.history.push(Message {
+                role: Role::Assistant,
+                blocks: vec![Block::ToolUse {
+                    id: format!("call_{i}"),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({"command": "echo hi"}),
+                }],
+            });
+            a.history.push(Message {
+                role: Role::User,
+                blocks: vec![Block::ToolResult {
+                    tool_use_id: format!("call_{i}"),
+                    content: "x".repeat(2_000),
+                    is_error: false,
+                }],
+            });
+        }
+        let history_only = a.context_budget();
+        assert!(
+            approx_tokens(&a.history) <= history_only,
+            "precondition: history-only budget passes ({} <= {history_only})",
+            approx_tokens(&a.history),
+        );
+        // …but with a large system prompt and tool specs in scope, the same
+        // history is over the wire budget and must shed.
+        let big_system = "s".repeat(4 * 8_000); // ~8k tokens
+        let big_desc: &'static str = Box::leak("d".repeat(4 * 4_000).into_boxed_str());
+        let tools = vec![
+            ToolSpec {
+                name: "bash",
+                description: big_desc,
+                schema: serde_json::json!({"type": "object"}),
+            };
+            4
+        ];
+        let before = a.history.len();
+        let before_tokens = approx_tokens(&a.history);
+        a.trim_wire(Some(&big_system), &tools);
+        assert!(
+            approx_tokens(&a.history) < before_tokens,
+            "wire-aware trim must shed tokens the history-only budget keeps ({} -> {})",
+            before_tokens,
+            approx_tokens(&a.history),
+        );
+        assert!(
+            a.history.len() <= before,
+            "trim must not grow history ({} -> {})",
+            before,
+            a.history.len(),
+        );
+        assert!(
+            a.history[0].text().contains("elided"),
+            "shedding is stated, not silent"
+        );
+    }
+
+    /// The over-window recovery arm is bounded: at most
+    /// `MAX_WINDOW_RECOVERIES` sheds per turn, so a non-window 400 wearing
+    /// similar words still surfaces instead of looping. A unit pin on the
+    /// constant (mirroring the `MAX_STALL_RETRIES` pin below) keeps a future
+    /// bump deliberate.
+    #[test]
+    fn window_recovery_budget_is_two() {
+        assert_eq!(MAX_WINDOW_RECOVERIES, 2, "two sheds (trim, then compact) per turn");
     }
 
     /// The flag was advertised in the slash-command help and tab-completion, so

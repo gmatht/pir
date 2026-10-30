@@ -32,6 +32,7 @@ windows-sys = { version = "0.61", default-features = false, features = [
   "Win32_System_Registry",
   "Win32_System_SystemInformation",
   "Win32_System_Threading",
+  "Win32_Networking_WinHttp",   # native HTTPS transport (src/winhttp.rs): WinHTTP + Schannel, no external curl.exe
   "Win32_UI_WindowsAndMessaging", # EnumWindows / GetWindowTextW for wininfo (/l)
 ] }
 

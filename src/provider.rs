@@ -120,12 +120,25 @@ fn stall_timeout() -> Duration {
 pub enum HttpBackend {
     #[default]
     LsbCurl,
+    /// Windows-native transport: shells out to the inbox `curl.exe`
+    /// (libcurl + Schannel, no new deps). Same semantics as `LsbCurl` —
+    /// buffered one-shot via captured stdout, streaming via `-N` with the
+    /// child's stdout piped into the shared `ChannelBody` pump. Selectable
+    /// with `PIR_HTTP_BACKEND=curl-exe`; kept as a fallback now that
+    /// `WinHttp` needs no external binary.
+    CurlExe,
+    /// Native Windows transport over `winhttp.dll` (see `crate::winhttp`):
+    /// in-process HTTPS with Schannel TLS, no subprocess, no PATH lookup.
+    /// Auto-selected on Windows; `PIR_HTTP_BACKEND=winhttp` pins it.
+    WinHttp,
 }
 
 impl HttpBackend {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "lsbcurl" | "lsb-curl" | "curl" | "isahc" | "ureq" => Some(HttpBackend::LsbCurl),
+            "curlexe" | "curl-exe" | "curl.exe" => Some(HttpBackend::CurlExe),
+            "winhttp" | "win-http" => Some(HttpBackend::WinHttp),
             _ => None,
         }
     }
@@ -133,6 +146,8 @@ impl HttpBackend {
     pub fn name(self) -> &'static str {
         match self {
             HttpBackend::LsbCurl => "lsb-curl",
+            HttpBackend::CurlExe => "curl-exe",
+            HttpBackend::WinHttp => "winhttp",
         }
     }
 }
@@ -402,6 +417,15 @@ impl Client {
         self.backend = backend;
     }
 
+    /// Whether the native WinHTTP transport serves this request: explicitly
+    /// selected, or the Windows default when no host libcurl loaded (which on
+    /// Windows is always — `libcurl.so.4` cannot exist there).
+    fn winhttp(&self) -> bool {
+        cfg!(windows)
+            && (self.backend == HttpBackend::WinHttp
+                || self.backend == HttpBackend::LsbCurl && self.lsb_curl.is_none())
+    }
+
     /// Attach the conversation's session id for `x-opencode-session` routing.
     /// Called by `make_client` for providers that want it; ignored elsewhere.
     pub fn set_session_id(&mut self, id: Option<String>) {
@@ -631,8 +655,22 @@ impl Client {
         }
         let mut last_err = String::new();
         for (i, eff) in kinds.iter().enumerate() {
+            // Verify the built body against the window before sending: the
+            // struct-level guard above can't count JSON framing or per-kind
+            // shapes, and a one-shot (notably `/compact`'s transcript) is
+            // exactly the call that carries a window-sized prompt. A body
+            // that can't fit refuses with the actionable `/compact` message
+            // instead of 400ing at the gateway. When the verifier shrinks
+            // the budget, rebuild so the body's own `max_*` field matches
+            // what the server will enforce.
             let (url, body) =
                 Self::complete_body(&self.base_url, model, system, prompt, max_out, *eff);
+            let verified = verify_wire_budget(&body, max_out, ctx.max(1))?;
+            let (url, body) = if verified == max_out {
+                (url, body)
+            } else {
+                Self::complete_body(&self.base_url, model, system, prompt, verified, *eff)
+            };
             match self.complete_once(&url, &body, *eff) {
                 Ok(v) => return Self::complete_text(&v, *eff),
                 Err(e) if i == 0 && is_protocol_mismatch(&e) && flipped.is_some() => {
@@ -651,6 +689,64 @@ impl Client {
     fn complete_once(&self, url: &str, body: &Value, kind: ApiKind) -> Result<Value, String> {
         let url = url.to_string();
         smol::block_on(async {
+            // Opencode key-pool failover for one-shot calls (titler, verdict
+            // classifiers): same current-usable-key rule as the streaming
+            // path, no rotation (one-shots don't retry — their callers treat
+            // a hard error as "no opinion").
+            let attempt_key: String = self
+                .key_pool_key()
+                .map(|(_, k)| k)
+                .unwrap_or_else(|| self.api_key.clone());
+            let headers = self.request_headers_with_key(kind, &attempt_key);
+            let body_str = body.to_string();
+            // Preferred Windows transport (in-process WinHTTP, no external
+            // binary), then the curl.exe fallback, then host libcurl.
+            if self.winhttp() {
+                let txt = smol::unblock(move || {
+                    let hrefs: Vec<(String, String)> =
+                        headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    match winhttp_buffered(&url, &hrefs, Some(body_str.as_bytes()), CONNECT_TIMEOUT, Duration::from_secs(30)) {
+                        Ok((status, body)) => {
+                            if (200..300).contains(&status) {
+                                String::from_utf8(body)
+                                    .map_err(|e| format!("complete: {e}"))
+                            } else {
+                                Err(http_status_detail(
+                                    status,
+                                    &String::from_utf8_lossy(&body),
+                                ))
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                })
+                .await?;
+                return serde_json::from_str(&txt).map_err(|e| format!("complete: {e}"));
+            }
+            // Windows curl.exe transport: no host libcurl to load, so the
+            // buffered one-shot goes through the inbox binary instead.
+            if self.backend == HttpBackend::CurlExe || self.lsb_curl.is_none() && cfg!(windows) {
+                let txt = smol::unblock(move || {
+                    let hrefs: Vec<(String, String)> =
+                        headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    match curlexe_request(&url, &hrefs, Some(body_str.as_bytes()), CONNECT_TIMEOUT, Duration::from_secs(30)) {
+                        Ok((status, body)) => {
+                            if (200..300).contains(&status) {
+                                String::from_utf8(body)
+                                    .map_err(|e| format!("complete: {e}"))
+                            } else {
+                                Err(http_status_detail(
+                                    status,
+                                    &String::from_utf8_lossy(&body),
+                                ))
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                })
+                .await?;
+                return serde_json::from_str(&txt).map_err(|e| format!("complete: {e}"));
+            }
             // Buffered POST through the host libcurl on a worker thread;
             // non-2xx maps through `http_status_detail`.
             let Some(curl) = self.lsb_curl.clone() else {
@@ -865,7 +961,7 @@ impl Client {
             .filter(|c| *c > 0)
             .or_else(|| if model_ctx > 0 { Some(model_ctx) } else { None })
             .unwrap_or(200_000);
-        let max_tokens = match fit_output_budget(
+        let mut max_tokens = match fit_output_budget(
             max_tokens,
             estimate_request_tokens(system, &clean, tools),
             eff_ctx,
@@ -875,59 +971,84 @@ impl Client {
         };
         smol::block_on(async {
         let kind = api_override.unwrap_or(self.kind);
-        let (url, body) = match kind {
-            ApiKind::Anthropic => self.anthropic_request(model, max_tokens, system, history, tools, thinking, model_ctx),
-            ApiKind::OpenAi => match url_override {
-                Some(u) => self.openai_request_at(
-                    u,
-                    model,
-                    max_tokens,
-                    system,
-                    history,
-                    tools,
-                    thinking,
-                    allow_reasoning_effort,
-                    model_meta,
-                ),
-                None => self.openai_request(model, max_tokens, system, history, tools, thinking, model_meta),
-            },
-            ApiKind::OpenAiResponses => match url_override {
-                Some(u) => self.responses_request_at(
-                    u,
-                    model,
-                    max_tokens,
-                    system,
-                    history,
-                    tools,
-                    thinking,
-                    allow_reasoning_effort,
-                    model_meta,
-                ),
-                None => self.responses_request(
-                    model,
-                    max_tokens,
-                    system,
-                    history,
-                    tools,
-                    thinking,
-                    allow_reasoning_effort,
-                    model_meta,
-                ),
-            },
-            // Google takes no thinking params and no per-call effort switch:
-            // the native `thinkingConfig` is unmodeled, so pir sends none
-            // (same rule as non-reasoning models) and ignores the effort flag.
-            // URL follows the same per-model-override convention as the other
-            // builders (see `openai_request_at`); the `:streamGenerateContent`
-            // action suffix is appended by `google_url`.
-            ApiKind::Google => {
-                let base = url_override.unwrap_or(&self.base_url).to_string();
-                (
-                    google_url(&base, model, true),
-                    google_stream_body(model, max_tokens, system, history, tools),
-                )
+        // Build-verify-rebuild: `max_tokens` above was clamped with a
+        // struct-level estimate, but the wire carries JSON framing, per-kind
+        // shapes, and thinking-budget fields no struct estimate counts.
+        // Measure the serialized body itself and rebuild once with the
+        // smaller budget when it doesn't fit (see `verify_wire_budget`); a
+        // second verify that still fails refuses before any socket opens, so
+        // an over-window body never reaches the gateway (it 400s `invalid
+        // parameters`, param null).
+        let build = |budget: u64| -> (String, Value) {
+            match kind {
+                ApiKind::Anthropic => self.anthropic_request(model, budget, system, history, tools, thinking, model_ctx),
+                ApiKind::OpenAi => match url_override {
+                    Some(u) => self.openai_request_at(
+                        u,
+                        model,
+                        budget,
+                        system,
+                        history,
+                        tools,
+                        thinking,
+                        allow_reasoning_effort,
+                        model_meta,
+                    ),
+                    None => self.openai_request(model, budget, system, history, tools, thinking, model_meta),
+                },
+                ApiKind::OpenAiResponses => match url_override {
+                    Some(u) => self.responses_request_at(
+                        u,
+                        model,
+                        budget,
+                        system,
+                        history,
+                        tools,
+                        thinking,
+                        allow_reasoning_effort,
+                        model_meta,
+                    ),
+                    None => self.responses_request(
+                        model,
+                        budget,
+                        system,
+                        history,
+                        tools,
+                        thinking,
+                        allow_reasoning_effort,
+                        model_meta,
+                    ),
+                },
+                // Google takes no thinking params and no per-call effort switch:
+                // the native `thinkingConfig` is unmodeled, so pir sends none
+                // (same rule as non-reasoning models) and ignores the effort flag.
+                // URL follows the same per-model-override convention as the other
+                // builders (see `openai_request_at`); the `:streamGenerateContent`
+                // action suffix is appended by `google_url`.
+                ApiKind::Google => {
+                    let base = url_override.unwrap_or(&self.base_url).to_string();
+                    (
+                        google_url(&base, model, true),
+                        google_stream_body(model, budget, system, history, tools),
+                    )
+                }
             }
         };
+        let (mut url, mut body) = build(max_tokens);
+        match verify_wire_budget(&body, max_tokens, eff_ctx) {
+            Ok(m) if m >= max_tokens => {}
+            Ok(m) => {
+                // The body's own `max_*` field is what the server enforces,
+                // so rebuild with the smaller budget rather than sending a
+                // body whose input already crowds the window.
+                let rebuilt = build(m);
+                url = rebuilt.0;
+                body = rebuilt.1;
+                verify_wire_budget(&body, m, eff_ctx)?;
+                max_tokens = m;
+            }
+            Err(e) => return Err(e),
+        }
         // Byte-identical replay support for speed diagnosis (see fn docs).
         maybe_dump_payload(&body);
         // Retry the whole request (connect + stream parse) on transient
@@ -973,11 +1094,6 @@ impl Client {
                 Body(Pin<Box<dyn AsyncBufRead + Unpin + Send>>, TransferFinish),
                 Err(String),
             }
-            let Some(curl) = self.lsb_curl.clone() else {
-                return Err(
-                    "lsb-curl backend unavailable (no loadable libcurl.so.4)".to_string(),
-                );
-            };
             let url = url.clone();
             // Opencode key-pool failover: each attempt sends with the pool's
             // current usable key (`activeKeyIndex` when usable, else the first
@@ -994,12 +1110,55 @@ impl Client {
             let cancel_flag = cancel.clone();
             // Non-blocking: just starts the transfer thread. A spawn failure
             // (resource exhaustion) is the only up-front error.
-            let outcome = match lsbcurl_send(&curl, &url, &headers, &body_str, &cancel_flag) {
-                Ok((pump, finish)) => {
-                    let reader: Pin<Box<dyn AsyncBufRead + Unpin + Send>> = Box::pin(pump);
-                    ConnectOutcome::Body(reader, finish)
+            let outcome = if self.winhttp() {
+                // Native WinHTTP transport (see HttpBackend::WinHttp): same
+                // ChannelBody contract, driven in-process by winhttp.dll.
+                match winhttp_send(
+                    &url,
+                    &headers,
+                    &body_str,
+                    &cancel_flag,
+                    CONNECT_TIMEOUT,
+                    request_timeout().unwrap_or(REQUEST_TIMEOUT),
+                ) {
+                    Ok((pump, finish)) => {
+                        let reader: Pin<Box<dyn AsyncBufRead + Unpin + Send>> = Box::pin(pump);
+                        ConnectOutcome::Body(reader, finish)
+                    }
+                    Err(e) => ConnectOutcome::Err(e),
                 }
-                Err(e) => ConnectOutcome::Err(e),
+            } else if self.backend == HttpBackend::CurlExe
+                || self.lsb_curl.is_none() && cfg!(windows)
+            {
+                // Windows curl.exe transport (see HttpBackend::CurlExe):
+                // same ChannelBody contract, driven by the inbox binary.
+                match curlexe_send(
+                    &url,
+                    &headers,
+                    &body_str,
+                    &cancel_flag,
+                    CONNECT_TIMEOUT,
+                    request_timeout().unwrap_or(REQUEST_TIMEOUT),
+                ) {
+                    Ok((pump, finish)) => {
+                        let reader: Pin<Box<dyn AsyncBufRead + Unpin + Send>> = Box::pin(pump);
+                        ConnectOutcome::Body(reader, finish)
+                    }
+                    Err(e) => ConnectOutcome::Err(e),
+                }
+            } else {
+                let Some(curl) = self.lsb_curl.clone() else {
+                    return Err(
+                        "lsb-curl backend unavailable (no loadable libcurl.so.4)".to_string(),
+                    );
+                };
+                match lsbcurl_send(&curl, &url, &headers, &body_str, &cancel_flag) {
+                    Ok((pump, finish)) => {
+                        let reader: Pin<Box<dyn AsyncBufRead + Unpin + Send>> = Box::pin(pump);
+                        ConnectOutcome::Body(reader, finish)
+                    }
+                    Err(e) => ConnectOutcome::Err(e),
+                }
             };
             // All three failure sources — a transport error, a non-2xx
             // status, or a stream parse failure — fold into the attempt
@@ -1804,6 +1963,37 @@ pub(crate) fn lsb_json(
     connect: Duration,
     total: Duration,
 ) -> Result<Value, String> {
+    // Native WinHTTP first on Windows (no external binary needed), then the
+    // curl.exe fallback — background JSON calls (titler, webhooks) use the
+    // same contract as the streaming core.
+    if cfg!(windows) {
+        let hrefs: Vec<(String, String)> =
+            headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let body_bytes;
+        let body_ref = match (method, body) {
+            (lsb_curl::Method::POST, Some(b)) => {
+                body_bytes = b.to_string();
+                Some(body_bytes.as_bytes())
+            }
+            _ => None,
+        };
+        // WinHTTP is in-process and always available; curl.exe only if asked.
+        let use_curlexe = std::env::var("PIR_HTTP_BACKEND")
+            .map(|v| v.trim().eq_ignore_ascii_case("curl-exe"))
+            .unwrap_or(false);
+        let (status, resp_body) = if use_curlexe {
+            curlexe_request(url, &hrefs, body_ref, connect, total)?
+        } else {
+            winhttp_buffered(url, &hrefs, body_ref, connect, total)?
+        };
+        if !(200..300).contains(&status) {
+            return Err(http_status_detail(status, &String::from_utf8_lossy(&resp_body)));
+        }
+        if resp_body.is_empty() {
+            return Err("winhttp: empty body in 200 response".to_string());
+        }
+        return serde_json::from_slice(&resp_body).map_err(|e| format!("winhttp: bad JSON: {e}"));
+    }
     let curl = lsb_curl::Curl::load().map_err(|e| format!("lsb-curl load: {e}"))?;
     let opts = lsb_curl::RequestOptions {
         connect_timeout_ms: as_curl_long(connect),
@@ -2016,6 +2206,346 @@ fn lsbcurl_send(
         })
         .map_err(|e| format!("lsb-curl stream thread: {e}"))?;
     Ok((ChannelBody::from_receiver(rx), finish))
+}
+
+/// Locate the `curl.exe` binary for the [`HttpBackend::CurlExe`] transport.
+/// `PATH` first (inbox `C:\Windows\System32\curl.exe` is always on it), then
+/// the well-known absolute path as a fallback.
+fn curlexe_path() -> Option<std::path::PathBuf> {
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            for name in ["curl.exe", "curl"] {
+                let p = dir.join(name);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let sys = std::path::PathBuf::from(r"C:\Windows\System32\curl.exe");
+        if sys.is_file() {
+            return Some(sys);
+        }
+    }
+    None
+}
+
+/// Shared `curl.exe` argument builder: method, timeouts, headers, body.
+/// The HTTP status is captured via `-w` on stdout's tail (see
+/// [`curlexe_split_status`]); callers must append the `-w` arg and the URL
+/// last. `Expect:` is suppressed so a 100-continue handshake can't stall
+/// small JSON POSTs behind a buffering proxy.
+fn curlexe_base_args(
+    cmd: &mut std::process::Command,
+    headers: &[(String, String)],
+    connect: Duration,
+    total: Duration,
+) {
+    cmd.arg("-sS") // silent but show errors (stderr carries them)
+        .arg("-X")
+        .arg("POST")
+        .arg("--connect-timeout")
+        .arg(connect.as_secs().max(1).to_string())
+        .arg("-m")
+        .arg(total.as_secs().max(1).to_string())
+        .arg("-H")
+        .arg("Expect:")
+        .arg("-H")
+        .arg("content-type: application/json")
+        .arg("--fail-with-body"); // non-2xx still yields the body; exit code carries the status
+    for (k, v) in headers {
+        cmd.arg("-H").arg(format!("{k}: {v}"));
+    }
+    // Body travels on stdin (`@-`): no argv length limit for long prompts,
+    // and the payload never appears in process listings. Callers pipe it in.
+    cmd.arg("--data-binary").arg("@-");
+    cmd.arg("-A").arg(Client::user_agent());
+}
+
+/// Split curl.exe's `-w "\n%{http_code}"` trailer off captured stdout into
+/// `(status, body)`. The trailing newline the format string adds is stripped
+/// with the code, so the body is byte-identical to what the server sent.
+fn curlexe_split_status(out: &[u8]) -> (u16, Vec<u8>) {
+    let code_len = 4; // 3 digits + the '\n' the -w format adds before them
+    if out.len() < code_len {
+        return (0, out.to_vec());
+    }
+    let (body, tail) = out.split_at(out.len() - code_len);
+    match std::str::from_utf8(tail).ok().and_then(|t| t.trim().parse::<u16>().ok()) {
+        Some(code) => (code, body.to_vec()),
+        None => (0, out.to_vec()),
+    }
+}
+
+/// Normalize a curl.exe failure into the shared error vocabulary so the
+/// retry loop treats it exactly like the lsb-curl equivalent: timeouts match
+/// `is_timeout` ("timed out"), cancels match ("request cancelled"), HTTP
+/// statuses become `HTTP {code}` via the caller, DNS/refused stay bare
+/// transport errors (retryable by `is_retryable`).
+fn curlexe_error(stderr: &str, code: Option<i32>) -> String {
+    let s = stderr.trim();
+    if s.contains("Operation timed out") || s.contains("Timeout was reached") || code == Some(28) {
+        return format!("timed out: {s}");
+    }
+    // curl exit code 28 is the operation timeout; 7 = connect refused, 6 = DNS.
+    if code == Some(28) {
+        return format!("timed out: {s}");
+    }
+    if !s.is_empty() {
+        return s.to_string();
+    }
+    match code {
+        Some(c) => format!("curl.exe failed with exit code {c}"),
+        None => "curl.exe failed".to_string(),
+    }
+}
+
+/// Buffered one-shot POST through native WinHTTP (see [`HttpBackend::WinHttp`]
+/// and `crate::winhttp`). Same contract as the other buffered paths:
+/// `(status, body)` on transport success. Non-Windows builds never call this
+/// (the module is `cfg(windows)`), so the fallback arm is unreachable — but
+/// returning an error there keeps the call sites platform-agnostic instead of
+/// scattering `cfg` blocks through the streaming core.
+#[allow(unused_variables)]
+fn winhttp_buffered(
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    connect: Duration,
+    total: Duration,
+) -> Result<(u16, Vec<u8>), String> {
+    #[cfg(windows)]
+    {
+        crate::winhttp::request(url, headers, body, connect, total, &Client::user_agent())
+    }
+    #[cfg(not(windows))]
+    {
+        Err("winhttp backend is Windows-only".to_string())
+    }
+}
+
+/// Buffered one-shot POST through `curl.exe` (see [`HttpBackend::CurlExe`]).
+/// Same contract as the lsb-curl buffered path: `(status, body)` on transport
+/// success, `Err` string on spawn/timeout failure. The body travels on stdin
+/// (`--data-binary @-`) so long prompts never hit command-line limits and the
+/// payload never appears in process listings.
+fn curlexe_request(
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    connect: Duration,
+    total: Duration,
+) -> Result<(u16, Vec<u8>), String> {
+    use std::io::Write;
+    let exe = curlexe_path().ok_or_else(|| "curl-exe backend unavailable (no curl.exe on PATH)".to_string())?;
+    let mut cmd = std::process::Command::new(exe);
+    curlexe_base_args(&mut cmd, headers, connect, total);
+    cmd.arg("-w").arg("\n%{http_code}");
+    cmd.arg(url);
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    // No console window on Windows when spawned from a GUI/TUI host.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("curl.exe spawn: {e}"))?;
+    if let Some(b) = body
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        // A broken pipe here means curl.exe already exited (bad args, instant
+        // connect refusal) — the wait below surfaces the real error.
+        let _ = stdin.write_all(b);
+    }
+    let out = child.wait_with_output().map_err(|e| format!("curl.exe wait: {e}"))?;
+    if out.status.success() {
+        let (status, body) = curlexe_split_status(&out.stdout);
+        return Ok((status, body));
+    }
+    // `--fail-with-body` makes HTTP errors exit non-zero *with* the body on
+    // stdout: recover the status from the trailer and report it as HTTP, not
+    // transport — the caller maps it through `http_status_detail` exactly like
+    // a non-2xx from lsb-curl.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let (status, _) = curlexe_split_status(&out.stdout);
+    if (400..600).contains(&status) {
+        let (_, body) = curlexe_split_status(&out.stdout);
+        return Ok((status, body));
+    }
+    Err(curlexe_error(&stderr, out.status.code()))
+}
+
+/// Start a streaming `curl.exe -N` POST on a dedicated thread and return its
+/// [`ChannelBody`] immediately, mirroring [`lsbcurl_send`]: the parser drains
+/// the body while the transfer is still running, cancel is checked per chunk,
+/// and the terminal status lands in the shared slot *before* the channel
+/// closes so EOF-after-drain always sees it.
+fn curlexe_send(
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+    cancel: &Arc<AtomicBool>,
+    connect: Duration,
+    total: Duration,
+) -> Result<(ChannelBody, TransferFinish), String> {
+    use std::io::{BufReader, Read, Write};
+    let exe = curlexe_path().ok_or_else(|| "curl-exe backend unavailable (no curl.exe on PATH)".to_string())?;
+    let (tx, rx) = smol::channel::bounded::<std::io::Result<Vec<u8>>>(8);
+    let finish: TransferFinish = Arc::new(Mutex::new(None));
+    let finish_prod = finish.clone();
+    let url = url.to_string();
+    let headers = headers.to_vec();
+    let body = body.to_string();
+    let cancel = cancel.clone();
+    thread::Builder::new()
+        .name("curl-exe-stream".to_string())
+        .spawn(move || {
+            let mut cmd = std::process::Command::new(&exe);
+            curlexe_base_args(&mut cmd, &headers, connect, total);
+            cmd.arg("-N"); // no buffering: SSE chunks arrive as sent
+            // Buffer the body in memory so the single reader below can parse
+            // the -w trailer off the tail and hand the parser clean chunks.
+            cmd.arg("-w").arg("\n%{http_code}");
+            cmd.arg(&url);
+            cmd.stdin(std::process::Stdio::piped());
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            }
+            let terminal: Option<String> = match cmd.spawn() {
+                Err(e) => Some(format!("curl.exe spawn: {e}")),
+                Ok(mut child) => {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = stdin.write_all(body.as_bytes());
+                    }
+                    let stdout = child.stdout.take();
+                    let result = (|| -> Result<(u16, Vec<u8>), String> {
+                        let mut raw: Vec<u8> = Vec::new();
+                        if let Some(out) = stdout {
+                            let mut rdr = BufReader::with_capacity(32 * 1024, out);
+                            let mut chunk = [0u8; 32 * 1024];
+                            loop {
+                                if cancel.load(Ordering::SeqCst) {
+                                    let _ = child.kill();
+                                    return Err("request cancelled".to_string());
+                                }
+                                match rdr.read(&mut chunk) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        raw.extend_from_slice(&chunk[..n]);
+                                        // Strip a trailing status trailer if the
+                                        // transfer already ended: only the
+                                        // final 4 bytes are the marker, and a
+                                        // mid-stream chunk can't end with it
+                                        // unless the body itself does — so
+                                        // forward everything and split once at
+                                        // EOF instead.
+                                        if tx.send_blocking(Ok(chunk[..n].to_vec())).is_err() {
+                                            let _ = child.kill();
+                                            break; // parser went away; detach
+                                        }
+                                    }
+                                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                                    Err(e) => {
+                                        let _ = child.kill();
+                                        return Err(format!("curl.exe stdout: {e}"));
+                                    }
+                                }
+                            }
+                        }
+                        let status = child.wait().map_err(|e| format!("curl.exe wait: {e}"))?;
+                        if status.success() {
+                            // 2xx (curl exits 0 only on success without
+                            // --fail semantics tripping; the -w trailer rides
+                            // at the tail of `raw`). The SSE parsers skip any
+                            // line without a `data:` prefix, so the trailing
+                            // "\nNNN" status line is ignored; the real status
+                            // for `chat` comes from the slot, never from
+                            // parsing the trailer.
+                            let (code, _) = curlexe_split_status(&raw);
+                            Ok((code, raw))
+                        } else {
+                            let (code, _) = curlexe_split_status(&raw);
+                            if (400..600).contains(&code) {
+                                Ok((code, raw))
+                            } else {
+                                let mut err = child
+                                    .stderr
+                                    .take()
+                                    .map(|mut s| {
+                                        let mut buf = String::new();
+                                        let _ = s.read_to_string(&mut buf);
+                                        buf
+                                    })
+                                    .unwrap_or_default();
+                                if err.is_empty() {
+                                    err = format!("exit {}", status.code().unwrap_or(-1));
+                                }
+                                Err(curlexe_error(&err, status.code()))
+                            }
+                        }
+                    })();
+                    match result {
+                        Ok((status, _)) if (200..300).contains(&status) || status == 0 => None,
+                        Ok((status, raw)) => {
+                            let (_, body) = curlexe_split_status(&raw);
+                            Some(http_status_detail(status, &String::from_utf8_lossy(&body)))
+                        }
+                        Err(e) => Some(e),
+                    }
+                }
+            };
+            *finish_prod.lock().unwrap() = terminal;
+            drop(tx); // clean EOF for the parsers
+        })
+        .map_err(|e| format!("curl-exe stream thread: {e}"))?;
+    Ok((ChannelBody::from_receiver(rx), finish))
+}
+
+/// Start a streaming native-WinHTTP POST and return its [`ChannelBody`]
+/// immediately, mirroring [`lsbcurl_send`]: the parser drains the body while
+/// the transfer runs, cancel is checked per chunk, and the terminal status
+/// lands in the shared slot *before* the channel closes so EOF-after-drain
+/// always sees it. On non-Windows builds this is unreachable (the module is
+/// `cfg(windows)`); the error keeps call sites platform-agnostic.
+#[allow(unused_variables)]
+fn winhttp_send(
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+    cancel: &Arc<AtomicBool>,
+    connect: Duration,
+    total: Duration,
+) -> Result<(ChannelBody, TransferFinish), String> {
+    #[cfg(windows)]
+    {
+        let (tx, rx) = smol::channel::bounded::<std::io::Result<Vec<u8>>>(8);
+        let finish: TransferFinish = Arc::new(Mutex::new(None));
+        crate::winhttp::stream_chunks(
+            url.to_string(),
+            headers.to_vec(),
+            body.as_bytes().to_vec(),
+            cancel.clone(),
+            connect,
+            total,
+            Client::user_agent(),
+            tx,
+            finish.clone(),
+            |status, text| Some(http_status_detail(status, text)),
+        )?;
+        Ok((ChannelBody::from_receiver(rx), finish))
+    }
+    #[cfg(not(windows))]
+    {
+        Err("winhttp backend is Windows-only".to_string())
+    }
 }
 
 /// True when an error represents a network timeout (read/connect). Used to
@@ -2234,31 +2764,29 @@ fn google_usage(v: &Value) -> Usage {
 }
 
 /// Cheap input-size estimate for a request about to go out: system prompt +
-/// history (same `bytes/4` rule as `agent::approx_tokens`, including its
-/// 32-token per-message overhead) + the serialized tool specs. The agent's
-/// `trim` budget only counts history, so system + tools are the uncounted
-/// remainder that can push a just-under-budget history over the window.
+/// history + the serialized tool specs. Tool results are code/logs/shell
+/// output and tokenize much denser than prose (measured ~2.9 chars/token on
+/// code vs ~6 on prose — see `TOOL_RESULT_CHARS_PER_TOKEN`), so the shared
+/// `Block::est_tokens` counts them at `/2` while prose-like blocks stay `/4`.
+/// The agent's `trim` budget only counts history, so system + tools are the
+/// uncounted remainder that can push a just-under-budget history over the
+/// window.
 ///
 /// `pub(crate)` so callers that build their own *complete* request (the
 /// `/compact` summariser) can size it with the same estimate the wire path
 /// uses, instead of guessing.
 pub(crate) fn estimate_request_tokens(system: &str, history: &[Message], tools: &[ToolSpec]) -> u64 {
-    let mut bytes = system.len();
+    let mut est = (system.len() / 4) as u64;
     for m in history {
-        bytes += 32;
+        est += 8; // per-message framing overhead (~32 bytes at /4)
         for b in &m.blocks {
-            bytes += match b {
-                Block::Text(t) => t.len(),
-                Block::Thinking { text } => text.len(),
-                Block::ToolUse { input, .. } => input.to_string().len() + 64,
-                Block::ToolResult { content, .. } => content.len() + 64,
-            };
+            est += b.est_tokens() as u64;
         }
     }
     for t in tools {
-        bytes += t.name.len() + t.description.len() + t.schema.to_string().len() + 64;
+        est += ((t.name.len() + t.description.len() + t.schema.to_string().len()) / 4 + 16) as u64;
     }
-    (bytes / 4) as u64
+    est.max(1)
 }
 
 /// Clamp the output budget so input + output provably fits `ctx`, or refuse
@@ -2278,6 +2806,53 @@ fn fit_output_budget(max_tokens: u64, est_input: u64, ctx: u64) -> Result<u64, S
     if room < 16 {
         return Err(format!(
             "request input is too large (~{est_input} tokens est.) for the model's              {ctx}-token context window — even the smallest reply won't fit              (the provider would reject this with HTTP 400); /compact the              session or trim history and retry"
+        ));
+    }
+    Ok(max_tokens.min(room))
+}
+
+/// True when a provider error is the gateway's generic over-window rejection:
+/// `invalid parameters` / `invalid_request_error` with a null param (verified
+/// live 2026-10-20: both `max_output_tokens >= contextWindow` and
+/// `input > ctx` 400 with exactly this shape). Matched case-insensitively
+/// over the already-formatted `http_status_detail` string, plus pir's own
+/// pre-send refusal (`request input is too large`), so both the never-sent
+/// and the slipped-through cases classify the same way.
+///
+/// Deliberately narrow: protocol mismatches (`ModelProtocolUnsupported`),
+/// tool-pairing 400s (`Duplicate function_call_output`, `tool_calls must be
+/// followed`), auth, and quota errors must NOT match — recovery sheds history,
+/// which can only help a window problem, and must never mask a real one.
+pub(crate) fn is_over_window_error(error: &str) -> bool {
+    let l = error.to_lowercase();
+    l.contains("request input is too large")
+        || l.contains("invalid_request_error")
+        || (l.contains("invalid parameters") && l.contains("request body"))
+}
+
+/// Verify a *built* request body against the window before any socket opens.
+///
+/// `fit_output_budget` guards with a heuristic over `Message` structs, but the
+/// wire carries JSON framing, per-kind shapes (`responses_input` vs
+/// `openai_message` vs Anthropic/Google), and thinking-budget fields that no
+/// struct-level estimate counts. Drift between estimate and wire bytes is an
+/// opaque gateway 400 — so measure the serialized body itself
+/// (`bytes/4`, the same conservative ratio as the struct estimators) and
+/// clamp the output to what actually fits. When even the smallest reply (16
+/// tokens, the Responses floor) cannot fit, refuse with the same actionable
+/// `/compact` message as `fit_output_budget` instead of sending a certain 400.
+///
+/// Pure over the body value, so tests assert on the exact payload the wire
+/// path sends. Returns the output budget to send with (possibly smaller than
+/// `max_tokens` — the caller rebuilds the body with it, since the body's own
+/// `max_*` field is what the server enforces).
+pub(crate) fn verify_wire_budget(body: &Value, max_tokens: u64, ctx: u64) -> Result<u64, String> {
+    let wire_in = (body.to_string().len() / 4) as u64;
+    let sys_head = 2_000u64; // tokenizer drift + framing, same headroom as `fit_output_budget`
+    let room = ctx.saturating_sub(wire_in).saturating_sub(sys_head);
+    if room < 16 {
+        return Err(format!(
+            "request input is too large (~{wire_in} tokens wire est.) for the model's              {ctx}-token context window — even the smallest reply won't fit              (the provider would reject this with HTTP 400); /compact the              session or trim history and retry"
         ));
     }
     Ok(max_tokens.min(room))
@@ -4086,18 +4661,24 @@ mod tests {
 
     #[test]
     fn http_backend_parse() {
-        // Single-transport build: every known name (current + legacy)
-        // resolves to LsbCurl so old configs keep working; unknown values
-        // stay None (caller falls back to the default).
+        // Every known name (current + legacy) resolves; unknown values stay
+        // None (caller falls back to the default).
         assert_eq!(HttpBackend::parse("lsb-curl"), Some(HttpBackend::LsbCurl));
         assert_eq!(HttpBackend::parse("curl"), Some(HttpBackend::LsbCurl));
         assert_eq!(HttpBackend::parse("isahc"), Some(HttpBackend::LsbCurl));
         assert_eq!(HttpBackend::parse("ureq"), Some(HttpBackend::LsbCurl));
         assert_eq!(HttpBackend::parse(" UREQ "), Some(HttpBackend::LsbCurl));
+        assert_eq!(HttpBackend::parse("curl-exe"), Some(HttpBackend::CurlExe));
+        assert_eq!(HttpBackend::parse("curl.exe"), Some(HttpBackend::CurlExe));
+        assert_eq!(HttpBackend::parse(" CURL-EXE "), Some(HttpBackend::CurlExe));
+        assert_eq!(HttpBackend::parse("winhttp"), Some(HttpBackend::WinHttp));
+        assert_eq!(HttpBackend::parse(" WINHTTP "), Some(HttpBackend::WinHttp));
         assert_eq!(HttpBackend::parse(""), None);
         assert_eq!(HttpBackend::parse("bogus"), None);
         assert_eq!(HttpBackend::default(), HttpBackend::LsbCurl);
         assert_eq!(HttpBackend::LsbCurl.name(), "lsb-curl");
+        assert_eq!(HttpBackend::CurlExe.name(), "curl-exe");
+        assert_eq!(HttpBackend::WinHttp.name(), "winhttp");
     }
 
     #[test]
@@ -6224,6 +6805,80 @@ mod tests {
     }
 
     /// Reasoning model builders mirroring `models-store.json` entries.
+    #[test]
+    fn over_window_matcher_is_narrow() {
+        // The recovery arm sheds history, so the matcher must fire ONLY on
+        // the window problem — never on a protocol, pairing, auth, or quota
+        // 400, where shedding would destroy context and still fail.
+        assert!(is_over_window_error(
+            "HTTP 400: The request contains invalid parameters. Check the request body for any errors or inconsistencies."
+        ));
+        assert!(is_over_window_error(
+            "HTTP 400: Error from provider (Console Go): Upstream request failed: [invalid_request_error] The request contains invalid parameters."
+        ));
+        assert!(is_over_window_error(
+            "request input is too large (~500000 tokens est.) for the model's 1048576-token context window — even the smallest reply won't fit (the provider would reject this with HTTP 400); /compact the session or trim history and retry"
+        ));
+        for other in [
+            "HTTP 400: ModelProtocolUnsupported: this model does not support this protocol",
+            "HTTP 400: Duplicate function_call_output for call_id 'abc'",
+            "HTTP 400: tool_calls must be followed by tool messages",
+            "HTTP 400: role 'tool' must be a response to a preceding message with 'tool_calls'",
+            "HTTP 400: `max_output_tokens` The number must be `>= 16`",
+            "HTTP 401: Unauthorized",
+            "HTTP 429: rate limited",
+            "request cancelled",
+        ] {
+            assert!(!is_over_window_error(other), "must not match: {other}");
+        }
+    }
+
+    #[test]
+    fn wire_verifier_measures_the_built_body() {
+        // `verify_wire_budget` measures the serialized body — the thing the
+        // server actually enforces — not a struct-level estimate. Assert on
+        // the verifier's own verdict for bodies the shipped builders made.
+        let client = Client::new(ApiKind::OpenAiResponses, "http://x", "k".to_string());
+        let m = reasoning_model(None, &[]);
+        let (_url, small) = client.responses_request(
+            "m",
+            16,
+            "sys",
+            &[user_text("hi")],
+            &[],
+            crate::config::ThinkingLevel::Off,
+            true,
+            Some(&m),
+        );
+        assert_eq!(
+            verify_wire_budget(&small, 16, 1_048_576).unwrap(),
+            16,
+            "a small body passes untouched"
+        );
+        // A body whose serialized bytes already crowd the window clamps the
+        // output to the room left — the caller rebuilds with it.
+        let big_prompt = "x".repeat(4 * 100_000); // ~100k wire tokens of input
+        let (_url, big) = client.responses_request(
+            "m",
+            131_072,
+            "sys",
+            &[user_text(&big_prompt)],
+            &[],
+            crate::config::ThinkingLevel::Off,
+            true,
+            Some(&m),
+        );
+        let clamped = verify_wire_budget(&big, 131_072, 131_072).unwrap();
+        assert!(
+            clamped < 131_072,
+            "must clamp below the ask when the wire input crowds the window: {clamped}"
+        );
+        // A body that already exceeds the window refuses fast (actionable,
+        // not the gateway's opaque sentence).
+        let err = verify_wire_budget(&big, 16, 1_000).unwrap_err();
+        assert!(err.contains("/compact"), "actionable message: {err}");
+    }
+
     #[test]
     fn full_window_output_budget_clamps_instead_of_400() {
         // Live gateway probe (2026-10-20, muse-spark `openai-responses`):

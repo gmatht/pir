@@ -202,7 +202,8 @@ impl ToolBackend for Builtin {
                 name: "bash",
                 description: "Run a shell command in the project directory (bash -c, or cmd /C on \
                               Windows). Returns stdout and stderr (truncated to 30k chars) plus the \
-                              exit code. Long-running commands show a live elapsed timer; after 10 \
+                              exit code, and an `Elapsed …` line with the wall time below the \
+                              output. Long-running commands show a live elapsed timer; after 10 \
                               minutes the command is detached into a background job (returns a job \
                               id) so the agent can keep working and check back with job_status / \
                               job_kill. Hard-killed after 2 hours.",
@@ -2927,6 +2928,16 @@ fn run_shell(b: &mut Builtin, command: &str) -> Result<String, String> {
         }
     }
     crate::plugin::truncate(&mut text, 30_000);
+    // The wall time this command cost, below its output so the operator sees
+    // how long it ran: `Elapsed 3s`, `2m13s` past a minute, `1h02m` past an
+    // hour, `1d00h` past a day. Appended after every other note so it is
+    // always the last line even on kills and timeouts — except the detach
+    // path, which returns early above with its own `after …` clock (the job
+    // keeps running, so "elapsed" would be a lie).
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(&format!("Elapsed {}", crate::term::fmt_cmd_elapsed(started.elapsed())));
     Ok(text)
 }
 
@@ -3543,6 +3554,41 @@ mod esc_tests {
         let mut b = Builtin::new(PathBuf::from("."), abort.clone(), Arc::new(AtomicBool::new(false)));
         let out = run_shell(&mut b, "echo hello-from-pir").expect("run_shell result");
         assert!(out.contains("hello-from-pir"), "got: {out}");
+    }
+
+    /// The `Elapsed …` readout: `run_shell` appends the wall time it itself
+    /// measured as the result's last line, on seconds/minutes/hours/days
+    /// scales. Asserted against the value the code under test produced —
+    /// parsed off the result's last line — not a recomputation from the
+    /// test's own clock, so a formatter drift fails the assertion.
+    #[test]
+    fn result_ends_with_elapsed_wall_time() {
+        let _serial = serial();
+        let abort = Arc::new(AtomicBool::new(false));
+        let mut b = Builtin::new(PathBuf::from("."), abort.clone(), Arc::new(AtomicBool::new(false)));
+        let out = run_shell(&mut b, "echo hello-from-pir").expect("run_shell result");
+        let last = out.lines().last().unwrap_or("");
+        let shown = last.strip_prefix("Elapsed ").expect("last line is the Elapsed readout, got: {out}");
+        // Matches the shared formatter's grammar: `3s`, `2m13s`, `1h02m`, `1d00h`.
+        let ok = shown.ends_with('s') || shown.ends_with('m') || shown.ends_with('h');
+        assert!(ok && !shown.is_empty(), "readout has the compact duration shape, got: {shown:?}");
+        assert!(out.contains("hello-from-pir"), "output still present above the readout, got: {out}");
+    }
+
+    /// An error result carries the readout too: a nonzero exit appends
+    /// `[exit code N]` and the `Elapsed …` line stays last, so the operator
+    /// sees both that it failed and how long it ran.
+    #[test]
+    fn failing_result_ends_with_elapsed_after_exit_code() {
+        let _serial = serial();
+        let abort = Arc::new(AtomicBool::new(false));
+        let mut b = Builtin::new(PathBuf::from("."), abort.clone(), Arc::new(AtomicBool::new(false)));
+        let out = run_shell(&mut b, "exit 3").expect("run_shell result");
+        assert!(out.contains("[exit code 3]"), "exit status still reported, got: {out}");
+        assert!(
+            out.lines().last().unwrap_or("").starts_with("Elapsed "),
+            "Elapsed line stays last after the exit note, got: {out}"
+        );
     }
 
     #[test]

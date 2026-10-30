@@ -1053,3 +1053,17 @@ field pir doesn't understand.
   `activeKeyIndex` + the timestamp maps immediately, and each attempt re-reads
   the file when the active index moved (adopting it only when the on-disk
   keys match, so a moved config can never cross-contaminate).
+
+## 19. `Elapsed …` below every command's output
+
+Every command reports the wall time it cost as the last line below its output:
+`Elapsed 3s`, `2m13s` past a minute, `1h02m` past an hour, `1d00h` past a day
+(sub-second runs read `0s`). The agent's `bash` tool result ends with it (after
+`[exit code N]` and every other note, so a failure still says both that it
+failed and how long it ran), and the same line follows `/sh` / `!` / `!!`
+output in the streaming REPL, the TUI pane, and the GUI pane. The one exception
+is a detached long-runner: its result returns at the 10-minute check-in with
+its own `after …` clock (`job_status` keeps its own `elapsed=`), because the
+job keeps running and a final "elapsed" would be a lie. One shared formatter
+(`term::fmt_cmd_elapsed`) backs every site, with unit tests pinning the
+seconds/minutes/hours/days grammar.

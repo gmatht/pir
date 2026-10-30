@@ -1208,6 +1208,25 @@ fn fmt_elapsed(d: Duration) -> String {
     }
 }
 
+/// Elapsed-time readout printed below every command's output: `Elapsed 3s`,
+/// `Elapsed 2m13s` past a minute, `Elapsed 1h02m` past an hour, `Elapsed 1d00h`
+/// past a day. Same compact clock as the footer, extended to days; sub-second
+/// runs read `0s`. The single source for the bash tool's `Elapsed …` line, the
+/// `/sh` / `!` / `!!` readouts, and the job clocks — so they can never drift
+/// apart. Pure for tests.
+pub fn fmt_cmd_elapsed(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else if s < 86400 {
+        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
+    } else {
+        format!("{}d{:02}h", s / 86400, (s % 86400) / 3600)
+    }
+}
+
 fn midturn_zone_lines(
     frame: &str,
     label: &str,
@@ -5132,6 +5151,19 @@ mod tests {
         assert_eq!(super::fmt_elapsed(Duration::from_secs(7384)), "2h03m");
     }
 
+    /// The `Elapsed …` readout below command output: seconds, then minutes,
+    /// then hours, then days.
+    #[test]
+    fn fmt_cmd_elapsed_days() {
+        assert_eq!(super::fmt_cmd_elapsed(Duration::from_secs(0)), "0s");
+        assert_eq!(super::fmt_cmd_elapsed(Duration::from_secs(7)), "7s");
+        assert_eq!(super::fmt_cmd_elapsed(Duration::from_secs(95)), "1m35s");
+        assert_eq!(super::fmt_cmd_elapsed(Duration::from_secs(7384)), "2h03m");
+        assert_eq!(super::fmt_cmd_elapsed(Duration::from_secs(86400)), "1d00h");
+        assert_eq!(super::fmt_cmd_elapsed(Duration::from_secs(90061)), "1d01h");
+        assert_eq!(super::fmt_cmd_elapsed(Duration::from_secs(172800 + 7200 + 61)), "2d02h");
+    }
+
     /// The footer's elapsed readout must measure the **turn**, not the spinner.
     ///
     /// A turn builds a fresh spinner on every model round (a `thinking` one
@@ -7065,7 +7097,7 @@ mod nonunix_term {
 
     impl Spinner {
         pub fn start(label: &str, ta: Arc<Mutex<String>>, enabled: bool) -> Spinner {
-            Spinner::start_with(label, ta, enabled, Arc::new(AtomicBool::new(false)))
+            Spinner::start_with(label, ta, enabled, Arc::new(AtomicBool::new(false)), std::time::Instant::now())
         }
 
         /// The shared footer status (see `Unix`'s `StatusCell`): the live retry
@@ -7079,8 +7111,9 @@ mod nonunix_term {
             ta: Arc<Mutex<String>>,
             enabled: bool,
             quiet: Arc<AtomicBool>,
+            since: std::time::Instant,
         ) -> Spinner {
-            Self::start_with_status(label, ta, enabled, quiet, Arc::new(super::StatusCell::default()))
+            Self::start_with_status(label, ta, enabled, quiet, Arc::new(super::StatusCell::default()), since)
         }
 
         pub fn start_with_status(
@@ -7089,6 +7122,7 @@ mod nonunix_term {
             enabled: bool,
             quiet: Arc<AtomicBool>,
             status: Arc<super::StatusCell>,
+            since: std::time::Instant,
         ) -> Spinner {
             if !enabled {
                 return Spinner { handle: None, alive: Arc::new(AtomicBool::new(false)), status };
@@ -7103,7 +7137,7 @@ mod nonunix_term {
                 let mut i = 0usize;
                 let mut out = io::stdout();
                 let cwd = crate::workspace_label();
-                let started = std::time::Instant::now();
+                let started = since;
                 let w = terminal_width().max(20);
                 let mut erased = false;
                 while a.load(Ordering::SeqCst) {
@@ -7146,7 +7180,7 @@ mod nonunix_term {
                 // so the next output (streamed model text) starts cleanly.
                 erase_footer();
             });
-            Spinner { handle: Some(handle), alive }
+            Spinner { handle: Some(handle), alive, status }
         }
 
         pub fn stop(&mut self) {
